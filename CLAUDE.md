@@ -82,6 +82,24 @@ These require explicit human direction; do not undertake them on your own initia
 - **Adoption of new dependencies.** Dependencies are debt; adding one is a project-level decision.
 - **Performance optimization that complicates code.** Until the compiler is functionally complete, simplicity beats speed. A correct slow compiler can be made fast; a fast incorrect one cannot be made correct.
 
+## Build toolchain
+
+The Bezel compiler is built with **clang++** linking against **LLVM** as
+shipped by Fedora's system packages. The C++ standard is C++20.
+
+This choice is for toolchain consistency: the compiler calls LLVM's C++
+API extensively, and LLVM is built and tested primarily with clang
+upstream. Using clang to build the compiler avoids cross-toolchain
+quirks that surface when g++ compiles LLVM headers at specific version
+combinations.
+
+Do not introduce CMake configuration, source files, or CI steps that
+assume g++ or that work only with g++. If a piece of code needs to
+detect the compiler, use clang-specific feature tests, not version
+checks against `__GNUC__`. The build is expected to be configurable
+with `cmake -DCMAKE_CXX_COMPILER=clang++ ...` or to set the compiler
+explicitly in the root CMakeLists.txt.
+
 ## When in doubt
 
 The project's overall discipline is: ship the part that fits cleanly now, decline-with-reasons the part that fights the foundations, keep adjacent open questions explicitly scoped. If you're not sure whether a given piece of work fits cleanly: stop, open an issue, describe what you're trying to do and what's giving you pause. The project has reached its current state by catching defects early and recording decisions with reasoning. That discipline continues to apply.

@@ -11,9 +11,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ ninja-build
+        # clang/LLVM per CLAUDE.md's "Build toolchain" section. (The reference
+        # toolchain is Fedora's; this runner installs the equivalent clang via
+        # apt. Revisit when codegen starts linking LLVM and version parity with
+        # Fedora's LLVM matters.)
+        run: sudo apt-get update && sudo apt-get install -y cmake clang llvm ninja-build
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DBEZEL_WERROR=ON -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBEZEL_WERROR=ON -DCMAKE_BUILD_TYPE=Debug
       - name: Build
         run: cmake --build build
       - name: Test
