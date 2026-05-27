@@ -17,13 +17,20 @@ own milestone (spec-derived tests first — see `CLAUDE.md`).
 
 ## Building
 
-The compiler is C++20, built with CMake (≥ 3.20). No external dependencies.
+The compiler is C++20, built with CMake (≥ 3.20) using **clang++**, the project
+toolchain (see `CLAUDE.md`, "Build toolchain"). No external dependencies yet.
+
+On Fedora, the toolchain is `sudo dnf install cmake clang llvm`.
 
 ```sh
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+`CMakeLists.txt` defaults `CMAKE_C_COMPILER`/`CMAKE_CXX_COMPILER` to clang, so a
+plain `cmake -B build` uses it. To build with a different compiler, override on
+the command line: `cmake -S . -B build -DCMAKE_CXX_COMPILER=...`.
 
 This produces the `bezelc` driver:
 

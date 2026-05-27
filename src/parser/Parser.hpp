@@ -21,8 +21,9 @@ public:
     std::unique_ptr<ast::Node> parseCompilationUnit();
 
 private:
-    Lexer& lexer_;
-    DiagnosticEngine& diagnostics_;
+    // Held for the parser milestone; clang flags them unused until then.
+    [[maybe_unused]] Lexer& lexer_;
+    [[maybe_unused]] DiagnosticEngine& diagnostics_;
 };
 
 } // namespace bezel

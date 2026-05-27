@@ -6,11 +6,24 @@
 
 cmake_minimum_required(VERSION 3.20)
 
+# Build toolchain: clang / clang++, per CLAUDE.md's "Build toolchain" section.
+# The compiler is set here — before project(), where CMake runs compiler
+# detection — so a plain `cmake -B build` uses clang without a separate
+# toolchain file. The guards leave any -DCMAKE_*_COMPILER=... override in place,
+# so the build stays configurable for environments where clang lives elsewhere.
+if(NOT DEFINED CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER clang CACHE FILEPATH "C compiler")
+endif()
+if(NOT DEFINED CMAKE_CXX_COMPILER)
+    set(CMAKE_CXX_COMPILER clang++ CACHE FILEPATH "C++ compiler")
+endif()
+
 project(bezel
     VERSION 0.0.0
     DESCRIPTION "The Bezel programming language compiler"
     LANGUAGES CXX)
 
+# C++20 per CLAUDE.md's "Build toolchain" section.
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
