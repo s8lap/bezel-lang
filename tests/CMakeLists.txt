@@ -3,7 +3,11 @@
 # are placeholders for them.
 set(BEZEL_TEST_SOURCES
     test_main.cpp
-    sanity_test.cpp)
+    sanity_test.cpp
+    lexer/identifiers_test.cpp
+    lexer/keywords_test.cpp
+    lexer/comments_test.cpp
+    lexer/whitespace_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

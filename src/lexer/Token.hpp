@@ -14,7 +14,9 @@ namespace bezel {
 enum class TokenKind {
     EndOfFile,
     Identifier,
-    // TODO(lexer milestone, §1/§17/§18, Appendix B): the real token set.
+    Keyword,
+    // Operator, punctuation, and literal kinds are added by their own lexer
+    // sub-milestones (§17, §18); see tests/lexer.
     Unknown,
 };
 
