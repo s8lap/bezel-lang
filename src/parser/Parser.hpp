@@ -109,6 +109,16 @@ private:
     // delegates to parsePattern, but also admits naked-binding Identifier
     // per A.7.
     ast::PositionalPattern parsePositionalPattern();
+    // Slice 44: ConstantPattern alternatives (`1, 2, 3` and
+    // `Color.Red, Color.Blue`). `isConstantStart` returns true for a token
+    // that could begin an A.8 Constant (literal or non-`_` Identifier).
+    // `parseConstantExpr` parses one Constant; `qualifiedNameToExpr`
+    // rebuilds a QualifiedName as the corresponding Identifier/MemberAccess
+    // expression chain.
+    bool isConstantStart(const Token& t) const;
+    std::unique_ptr<ast::Expr> parseConstantExpr();
+    std::unique_ptr<ast::Expr> qualifiedNameToExpr(
+        std::unique_ptr<ast::QualifiedName> qn);
     // Slice 39: statement-position `case` (A.6). Sibling of parseCaseExpr;
     // arms have Statement-form or `do … end` bodies.
     std::unique_ptr<ast::Stmt> parseCaseStmt();

@@ -1665,8 +1665,10 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern() {
         tp->type = parseType();
         return std::unique_ptr<ast::Pattern>(tp.release());
     }
-    // Identifier → QualifiedName. `(` after means DestructuringPattern,
-    // otherwise NamedPattern (sema resolves Constant vs Type-test).
+    // Identifier → QualifiedName. `(` after means DestructuringPattern.
+    // A `,` followed by another Constant means a multi-Constant alternatives
+    // pattern (slice 44). Otherwise it's a NamedPattern (sema resolves
+    // Constant-vs-Type-test).
     if (current_.kind == TokenKind::Identifier) {
         auto qn = parseQualifiedName();
         if (consumePunctuator("(")) {
@@ -1685,14 +1687,24 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern() {
             }
             return std::unique_ptr<ast::Pattern>(dp.release());
         }
+        if (isPunctuator(",") && isConstantStart(peekAt(1))) {
+            // Convert qn → IdentifierExpr/MemberAccess chain and continue
+            // as ConstantPattern alternatives.
+            auto cp = std::make_unique<ast::ConstantPattern>();
+            cp->constants.push_back(qualifiedNameToExpr(std::move(qn)));
+            while (consumePunctuator(",")) {
+                cp->constants.push_back(parseConstantExpr());
+                if (!(isPunctuator(",") && isConstantStart(peekAt(1)))) break;
+            }
+            return std::unique_ptr<ast::Pattern>(cp.release());
+        }
         auto np = std::make_unique<ast::NamedPattern>();
         np->name = std::move(qn);
         return std::unique_ptr<ast::Pattern>(np.release());
     }
     // Catch-all: parse an Expression and classify. A `..` / `..<` BinaryExpr
-    // at the root is a RangePattern with lower bound; otherwise wrap as
-    // a single-Constant ConstantPattern. `,` Constant-alternatives are
-    // deferred (small slice scope).
+    // at the root is a RangePattern with lower bound; otherwise wrap as a
+    // ConstantPattern with one or more `,`-separated constants (slice 44).
     auto e = parseExpression();
     if (auto* be = dynamic_cast<ast::BinaryExpr*>(e.get())) {
         if (be->op == ".." || be->op == "..<") {
@@ -1703,6 +1715,10 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern() {
     }
     auto cp = std::make_unique<ast::ConstantPattern>();
     cp->constants.push_back(std::move(e));
+    while (isPunctuator(",") && isConstantStart(peekAt(1))) {
+        advance(); // past `,`
+        cp->constants.push_back(parseConstantExpr());
+    }
     return std::unique_ptr<ast::Pattern>(cp.release());
 }
 
@@ -1763,6 +1779,50 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
                             "expected 'end' to close case expression");
     }
     return std::unique_ptr<ast::Expr>(ce.release());
+}
+
+// Slice 44: helpers for ConstantPattern alternatives.
+
+bool Parser::isConstantStart(const Token& t) const {
+    if (t.kind == TokenKind::IntLiteral ||
+        t.kind == TokenKind::FloatLiteral ||
+        t.kind == TokenKind::CharLiteral ||
+        t.kind == TokenKind::StringLiteral ||
+        t.kind == TokenKind::VerbatimStringLiteral) return true;
+    if (t.kind == TokenKind::Keyword &&
+        (t.text == "true" || t.text == "false" || t.text == "null")) {
+        return true;
+    }
+    // Identifier — could begin a QualifiedName Constant — but `_` is the
+    // DiscardPattern, not a Constant.
+    return t.kind == TokenKind::Identifier && t.text != "_";
+}
+
+std::unique_ptr<ast::Expr> Parser::parseConstantExpr() {
+    // A.8 Constant. Literals go through parsePrimaryExpression; QualifiedName
+    // is rebuilt as the equivalent IdentifierExpr / MemberAccessExpr chain.
+    // Note: `null` is a keyword the lexer emits as TokenKind::Keyword, and
+    // parsePrimaryExpression handles it as NullLiteral.
+    if (current_.kind == TokenKind::Identifier) {
+        auto qn = parseQualifiedName();
+        return qualifiedNameToExpr(std::move(qn));
+    }
+    return parsePrimaryExpression();
+}
+
+std::unique_ptr<ast::Expr> Parser::qualifiedNameToExpr(
+    std::unique_ptr<ast::QualifiedName> qn) {
+    if (!qn || qn->parts.empty()) return nullptr;
+    auto first = std::make_unique<ast::IdentifierExpr>();
+    first->name = qn->parts[0];
+    std::unique_ptr<ast::Expr> cur(first.release());
+    for (std::size_t i = 1; i < qn->parts.size(); ++i) {
+        auto ma = std::make_unique<ast::MemberAccessExpr>();
+        ma->target = std::move(cur);
+        ma->member = qn->parts[i];
+        cur = std::unique_ptr<ast::Expr>(ma.release());
+    }
+    return cur;
 }
 
 // Slice 39: statement-position `case`.
