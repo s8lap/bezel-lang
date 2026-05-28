@@ -375,6 +375,21 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         out += " end;";
         return out;
     }
+    if (auto* f = dynamic_cast<const ast::ForStmt*>(&s)) {
+        std::string out = "for var ";
+        out += std::string(f->varName);
+        if (f->varType) {
+            out += ": ";
+            out += typeToString(*f->varType);
+        }
+        out += " in ";
+        out += f->iterable ? exprToString(*f->iterable)
+                           : std::string("<null>");
+        out += " do ";
+        out += bodyToString(f->body);
+        out += " end;";
+        return out;
+    }
     if (auto* d = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         std::string out = "do ";
         out += bodyToString(d->body);

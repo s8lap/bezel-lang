@@ -889,6 +889,53 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
         return std::unique_ptr<ast::Stmt>(stmt.release());
     }
 
+    // ForStmt (A.6 synchronous form).
+    if (isKeyword("for")) {
+        advance(); // past `for`
+        auto stmt = std::make_unique<ast::ForStmt>();
+        if (!consumeKeyword("var")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'var' after 'for'");
+        }
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected loop variable name");
+        } else {
+            stmt->varName = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            stmt->varType = parseType();
+        }
+        if (!consumeKeyword("in")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'in' in for statement");
+        }
+        stmt->iterable = parseExpression();
+        if (!consumeKeyword("do")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'do' to begin 'for' body");
+        }
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto inner = parseStatement();
+            if (inner) {
+                stmt->body.push_back(std::move(inner));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'for' statement");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'for'");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
     // DoEndBlock (A.6) — plain statement-sequencing block, no value.
     if (isKeyword("do")) {
         advance();
