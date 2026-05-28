@@ -41,7 +41,8 @@ set(BEZEL_TEST_SOURCES
     parser/property_and_const_test.cpp
     parser/alias_generics_and_operators_test.cpp
     parser/empty_param_lambdas_test.cpp
-    parser/typeof_nameof_test.cpp)
+    parser/typeof_nameof_test.cpp
+    parser/await_and_move_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

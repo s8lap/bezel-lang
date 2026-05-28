@@ -857,10 +857,9 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
 }
 
 std::unique_ptr<ast::Expr> Parser::parseUnaryExpression() {
-    // §17.1 level 2 prefix unary. Right-associative — `--x` parses as
-    // `- (-x)`. `await` (also level 2) lands with the async slice.
+    // §17.1 level 2 prefix unary: `+ - ~ not await`. Right-associative.
     if (isPunctuator("+") || isPunctuator("-") || isPunctuator("~") ||
-        isKeyword("not")) {
+        isKeyword("not") || isKeyword("await")) {
         const Token opTok = current_;
         advance();
         auto u = std::make_unique<ast::UnaryExpr>();
@@ -952,6 +951,16 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
                                 "expected ')' to close 'nameof'");
         }
         return std::unique_ptr<ast::Expr>(ne.release());
+    }
+
+    // A.7 `MoveExpr ::= "move" PrimaryExpr` — primary-level prefix per §28.6
+    // for owned-field move-out.
+    if (isKeyword("move")) {
+        advance();
+        auto m = std::make_unique<ast::UnaryExpr>();
+        m->op = "move";
+        m->operand = parsePostfix(parsePrimaryExpression());
+        return std::unique_ptr<ast::Expr>(m.release());
     }
 
     // §22.3 `this` and `base` — reserved keywords (App. B.1) that name the
