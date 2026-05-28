@@ -15,7 +15,8 @@ set(BEZEL_TEST_SOURCES
     lexer/verbatim_strings_test.cpp
     lexer/locations_test.cpp
     parser/module_decl_test.cpp
-    parser/imports_test.cpp)
+    parser/imports_test.cpp
+    parser/empty_type_decls_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
