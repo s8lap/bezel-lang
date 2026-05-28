@@ -109,9 +109,12 @@ struct Stmt : Node {};
 // A.6: `LocalDecl ::= "var" Identifier (":" Type)? (":=" Expression)? ";"`
 //                  | `"using" "var" Identifier (":" Type)? ":=" Expression ";"`
 //                  | `"await" "using" "var" …`
-// Slice 11 covers the first two forms; `await using` waits on the async slice.
+// All three forms share this AST node; modifier bits distinguish them.
+// `isAwaitUsing` implies `isUsing` (the latter stays set for code that wants
+// to ask the disposing-form question without caring about sync vs async).
 struct LocalDecl : Stmt {
-    bool isUsing = false;  // `using var` form
+    bool isUsing = false;       // `using var` (sync) OR `await using var`
+    bool isAwaitUsing = false;  // `await using var` form (implies isUsing)
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `: Type`
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`
@@ -167,13 +170,15 @@ struct WhileStmt : Stmt {
 //                  | "await" "for" "var" Identifier (":" Type)? "in"
 //                    Expression ("with" Expression)? "do" Statement*
 //                    "end" ";"`
-// Slice 18 covers the synchronous form; the async `await for ... with`
-// form lands with the async slice (the keyword `with` requires more
-// thought re: §30.7).
+// Slice 18 covers the synchronous form; the async `await for ... with` form
+// landed later (slice 35). The `withExpr` is the optional cancellation token
+// after the iteration source per §30.7.
 struct ForStmt : Stmt {
+    bool isAwait = false;                // `await for ...`
     std::string_view varName;
     std::unique_ptr<Type> varType;       // null when no `: Type` annotation
     std::unique_ptr<Expr> iterable;
+    std::unique_ptr<Expr> withExpr;      // null when no `with EXPR` clause
     std::vector<std::unique_ptr<Stmt>> body;
 };
 

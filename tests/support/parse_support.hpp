@@ -383,7 +383,10 @@ inline std::string exprToString(const ast::Expr& e) {
 // LocalDecl, ReturnStmt, AssignmentStmt, ExpressionStmt.
 inline std::string stmtSummary(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        std::string out = ld->isUsing ? "using var " : "var ";
+        std::string out;
+        if (ld->isAwaitUsing) out = "await using var ";
+        else if (ld->isUsing) out = "using var ";
+        else                  out = "var ";
         out += std::string(ld->name);
         if (ld->type) {
             out += ": ";
@@ -462,7 +465,7 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         return out;
     }
     if (auto* f = dynamic_cast<const ast::ForStmt*>(&s)) {
-        std::string out = "for var ";
+        std::string out = f->isAwait ? "await for var " : "for var ";
         out += std::string(f->varName);
         if (f->varType) {
             out += ": ";
@@ -471,6 +474,10 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         out += " in ";
         out += f->iterable ? exprToString(*f->iterable)
                            : std::string("<null>");
+        if (f->withExpr) {
+            out += " with ";
+            out += exprToString(*f->withExpr);
+        }
         out += " do ";
         out += bodyToString(f->body);
         out += " end;";

@@ -9,6 +9,7 @@
 // attempts to recover; for slice 1 (module declarations) recovery is minimal.
 
 #include <memory>
+#include <optional>
 #include <string_view>
 
 #include "ast/Node.hpp"
@@ -31,6 +32,10 @@ private:
     // Recursive-descent primitives.
     void advance();
     const Token& peek() const { return current_; }
+    // One-token lookahead beyond `current_`. Use sparingly: parser is
+    // structurally one-token-lookahead and constructs should keep that shape
+    // wherever possible.
+    const Token& peekNext();
     bool isKeyword(std::string_view text) const;
     bool isPunctuator(std::string_view text) const;
     bool consumeKeyword(std::string_view text);
@@ -97,6 +102,7 @@ private:
     Lexer& lexer_;
     DiagnosticEngine& diagnostics_;
     Token current_{};
+    std::optional<Token> peeked_; // see peekNext()
 };
 
 } // namespace bezel

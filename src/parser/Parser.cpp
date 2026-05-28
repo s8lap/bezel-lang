@@ -27,7 +27,23 @@ Parser::Parser(Lexer& lexer, DiagnosticEngine& diagnostics)
 }
 
 void Parser::advance() {
-    current_ = lexer_.next();
+    if (peeked_) {
+        current_ = std::move(*peeked_);
+        peeked_.reset();
+    } else {
+        current_ = lexer_.next();
+    }
+}
+
+const Token& Parser::peekNext() {
+    // One-token lookahead beyond `current_`. Lazily populated; cleared by
+    // advance(). Used sparingly by constructs that need to distinguish a
+    // statement-starting `await` for an expression-stmt from `await using var`
+    // / `await for ...` LocalDecl / ForStmt variants.
+    if (!peeked_) {
+        peeked_ = lexer_.next();
+    }
+    return *peeked_;
 }
 
 bool Parser::isKeyword(std::string_view text) const {
@@ -1388,11 +1404,27 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
     // the expression-led shapes (AssignmentStmt vs ExpressionStmt, decided
     // after parsing the leading expression).
 
-    // LocalDecl: `var Identifier (":" Type)? (":=" Expression)? ";"` or
-    // `using var ...`. The async `await using var` form lands later.
-    if (isKeyword("var") || isKeyword("using")) {
+    // LocalDecl (A.6): `var Identifier (":" Type)? (":=" Expression)? ";"`,
+    // `using var ...`, or the async `await using var ...` form. The async
+    // form is detected by one-token lookahead on the leading `await` —
+    // without it, `await` would otherwise begin a unary-expression
+    // ExpressionStmt.
+    const bool awaitUsing =
+        isKeyword("await") &&
+        peekNext().kind == TokenKind::Keyword &&
+        peekNext().text == "using";
+    if (isKeyword("var") || isKeyword("using") || awaitUsing) {
         auto decl = std::make_unique<ast::LocalDecl>();
-        if (consumeKeyword("using")) {
+        if (awaitUsing) {
+            decl->isUsing = true;
+            decl->isAwaitUsing = true;
+            advance(); // past `await`
+            consumeKeyword("using"); // confirmed by lookahead
+            if (!consumeKeyword("var")) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected 'var' after 'await using'");
+            }
+        } else if (consumeKeyword("using")) {
             decl->isUsing = true;
             if (!consumeKeyword("var")) {
                 diagnostics_.report(Severity::Error, current_.location,
@@ -1416,7 +1448,10 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
         } else if (decl->isUsing) {
             diagnostics_.report(
                 Severity::Error, current_.location,
-                "`using var` requires an initializer (A.6 LocalDecl)");
+                decl->isAwaitUsing
+                    ? "`await using var` requires an initializer "
+                      "(A.6 LocalDecl)"
+                    : "`using var` requires an initializer (A.6 LocalDecl)");
         }
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
@@ -1587,10 +1622,21 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
         return std::unique_ptr<ast::Stmt>(stmt.release());
     }
 
-    // ForStmt (A.6 synchronous form).
-    if (isKeyword("for")) {
-        advance(); // past `for`
+    // ForStmt (A.6). Synchronous `for var ... in EXPR do ... end ;` and the
+    // async `await for var ... in EXPR (with EXPR)? do ... end ;` form
+    // (slice 35). The async form is detected by one-token lookahead on the
+    // leading `await`.
+    const bool awaitFor =
+        isKeyword("await") &&
+        peekNext().kind == TokenKind::Keyword &&
+        peekNext().text == "for";
+    if (isKeyword("for") || awaitFor) {
         auto stmt = std::make_unique<ast::ForStmt>();
+        if (awaitFor) {
+            stmt->isAwait = true;
+            advance(); // past `await`
+        }
+        advance(); // past `for`
         if (!consumeKeyword("var")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'var' after 'for'");
@@ -1610,6 +1656,16 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
                                 "expected 'in' in for statement");
         }
         stmt->iterable = parseExpression();
+        // Optional `with EXPR` cancellation-token clause — async form only
+        // (§30.7). Sema rejects it on the sync form.
+        if (consumeKeyword("with")) {
+            if (!stmt->isAwait) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "'with' clause is only valid on 'await for' (§30.7)");
+            }
+            stmt->withExpr = parseExpression();
+        }
         if (!consumeKeyword("do")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'do' to begin 'for' body");
