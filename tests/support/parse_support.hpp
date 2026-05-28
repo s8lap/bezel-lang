@@ -132,6 +132,18 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
             case ast::TypeDeclKind::Enum:      out += "enum ";      break;
         }
         out += std::string(td->name);
+        if (td->hasPositionalFields) {
+            out += '(';
+            for (std::size_t i = 0; i < td->positionalFields.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += std::string(td->positionalFields[i].name);
+                out += ": ";
+                out += td->positionalFields[i].type
+                           ? typeToString(*td->positionalFields[i].type)
+                           : std::string("<null>");
+            }
+            out += ')';
+        }
         if (!td->genericParams.empty()) {
             out += '<';
             for (std::size_t i = 0; i < td->genericParams.size(); ++i) {

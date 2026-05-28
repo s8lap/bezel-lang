@@ -190,7 +190,30 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     // parameters; the enum-specific shape is a later slice.
     if (decl->kind != ast::TypeDeclKind::Enum) {
         decl->genericParams = parseGenericParams();
+        // §A.3 RecordDecl: PositionalFields? appear between generic params
+        // and Inheritance for records only. Class PrimaryCtorParams have the
+        // same shape but live in a later slice.
+        if (decl->kind == ast::TypeDeclKind::Record &&
+            isPunctuator("(")) {
+            advance();
+            decl->hasPositionalFields = true;
+            if (!isPunctuator(")")) {
+                decl->positionalFields = parseParamList();
+            }
+            if (!consumePunctuator(")")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ')' to close positional-fields list");
+            }
+        }
         decl->baseTypes = parseInheritance();
+    }
+
+    // §A.3 RecordDecl shorthand body: `record Foo(...) ;` (no `end`).
+    if (decl->kind == ast::TypeDeclKind::Record &&
+        consumePunctuator(";")) {
+        decl->isRecordShorthand = true;
+        return decl;
     }
 
     // §A.4 Members: slice 6 covers class fields without initializers. Other
