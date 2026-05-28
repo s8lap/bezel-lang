@@ -102,6 +102,12 @@ inline std::string typeToString(const ast::Type& t) {
     return out;
 }
 
+// Forward declarations — topDeclSummary (and a few others below) renders
+// enum-constant values via exprToString, which itself is defined later in
+// the file (its body needs typeToString and is logically grouped with
+// stmtSummary below).
+inline std::string exprToString(const ast::Expr& e);
+
 // One-line human-readable summary of a top-level declaration, e.g.
 // "public sealed class Foo", "enum E", or "type X = List<int>". Lets tests
 // assert the visible shape of each decl in a single string comparison.
@@ -145,6 +151,18 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
                 out += td->baseTypes[i] ? typeToString(*td->baseTypes[i])
                                         : std::string("<null>");
             }
+        }
+        if (!td->enumConstants.empty()) {
+            out += " { ";
+            for (std::size_t i = 0; i < td->enumConstants.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += std::string(td->enumConstants[i].name);
+                if (td->enumConstants[i].value) {
+                    out += " := ";
+                    out += exprToString(*td->enumConstants[i].value);
+                }
+            }
+            out += " }";
         }
         return out;
     }

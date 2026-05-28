@@ -31,7 +31,8 @@ set(BEZEL_TEST_SOURCES
     parser/expressions_typetest_and_in_test.cpp
     parser/conditional_and_throw_test.cpp
     parser/for_stmt_test.cpp
-    parser/ctor_dtor_test.cpp)
+    parser/ctor_dtor_test.cpp
+    parser/enum_constants_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

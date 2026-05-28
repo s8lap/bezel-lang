@@ -195,7 +195,8 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
 
     // §A.4 Members: slice 6 covers class fields without initializers. Other
     // type kinds and other member forms come in later slices, so their
-    // bodies stay empty here.
+    // bodies stay empty here. Enums get their own constants-list parsing
+    // (slice 20); EnumMember (methods/properties on enums) is later.
     if (decl->kind == ast::TypeDeclKind::Class) {
         while (!isKeyword("end") &&
                current_.kind != TokenKind::EndOfFile) {
@@ -203,7 +204,43 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             if (member) {
                 decl->members.push_back(std::move(member));
             } else if (current_.kind != TokenKind::EndOfFile) {
-                advance(); // crude recovery; sync on `end` or `;` later.
+                advance();
+            }
+        }
+    } else if (decl->kind == ast::TypeDeclKind::Enum) {
+        // A.3: `EnumConstants ::= EnumConstant ("," EnumConstant)* ";"`.
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected enum constant name (enum body requires at least "
+                "one)");
+        } else {
+            ast::EnumConstant ec;
+            ec.name = current_.text;
+            advance();
+            if (consumePunctuator(":=")) {
+                ec.value = parseExpression();
+            }
+            decl->enumConstants.push_back(std::move(ec));
+            while (consumePunctuator(",")) {
+                if (current_.kind != TokenKind::Identifier) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected enum constant name after ','");
+                    break;
+                }
+                ast::EnumConstant ec2;
+                ec2.name = current_.text;
+                advance();
+                if (consumePunctuator(":=")) {
+                    ec2.value = parseExpression();
+                }
+                decl->enumConstants.push_back(std::move(ec2));
+            }
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after enum constants");
             }
         }
     }

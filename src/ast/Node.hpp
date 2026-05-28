@@ -246,6 +246,13 @@ struct DestructorDecl : Member {
     std::vector<std::unique_ptr<Stmt>> body;
 };
 
+// A.3 `EnumConstant ::= Identifier (":=" ConstExpr)? SerializedClause?`.
+// SerializedClause is deferred to its own slice.
+struct EnumConstant {
+    std::string_view name;
+    std::unique_ptr<Expr> value; // null when no `:= …`
+};
+
 // Class-like top-level declaration. Slice 3 introduced the empty body; slice
 // 5 adds generic parameters and a base-type list. Primary-constructor params
 // (classes), positional fields (records), serialization clauses, generic
@@ -267,6 +274,9 @@ struct TypeDecl : TopDecl {
     // and enum constants/members are separate grammar productions and land
     // in their own slices; for those kinds this vector stays empty.
     std::vector<std::unique_ptr<Member>> members;
+    // Enum-only: the comma-separated constants (`EnumConstants` per A.3).
+    // Empty for non-enum kinds.
+    std::vector<EnumConstant> enumConstants;
     std::string_view endLabel; // empty when the `end` had no label
 };
 
