@@ -162,6 +162,21 @@ struct WhileStmt : Stmt {
     std::vector<std::unique_ptr<Stmt>> body;
 };
 
+// A.6: `ForStmt ::= "for" "var" Identifier (":" Type)? "in" Expression
+//                    "do" Statement* "end" ";"
+//                  | "await" "for" "var" Identifier (":" Type)? "in"
+//                    Expression ("with" Expression)? "do" Statement*
+//                    "end" ";"`
+// Slice 18 covers the synchronous form; the async `await for ... with`
+// form lands with the async slice (the keyword `with` requires more
+// thought re: §30.7).
+struct ForStmt : Stmt {
+    std::string_view varName;
+    std::unique_ptr<Type> varType;       // null when no `: Type` annotation
+    std::unique_ptr<Expr> iterable;
+    std::vector<std::unique_ptr<Stmt>> body;
+};
+
 // A.6: `DoEndBlock ::= "do" Statement* "end" ";"`. Statement-sequencing
 // block of type `()`; no value produced (rationale §5.13).
 struct DoEndBlock : Stmt {
