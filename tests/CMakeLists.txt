@@ -8,7 +8,8 @@ set(BEZEL_TEST_SOURCES
     lexer/keywords_test.cpp
     lexer/comments_test.cpp
     lexer/whitespace_test.cpp
-    lexer/punctuators_test.cpp)
+    lexer/punctuators_test.cpp
+    lexer/numeric_literals_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

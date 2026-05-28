@@ -18,8 +18,16 @@ enum class TokenKind {
     // Operators and punctuation share a single Punctuator kind; the specific
     // symbol is carried in the token lexeme (`text`). Matches the keyword
     // model — per-symbol enum is deferred until the parser needs faster
-    // dispatch. Literal kinds arrive with the literal slices (§18).
+    // dispatch.
     Punctuator,
+    // Numeric literal kinds split int vs float to match the grammar's A.1
+    // distinction. Hex/binary integers carry their `0x`/`0b` prefix in the
+    // lexeme; decimal floats are FloatLiteral with an `m`/`M` suffix. Value
+    // parsing and range-check (e.g. §18.1's "3_000_000_000 without L is a
+    // compile error") are sema-level concerns.
+    IntLiteral,
+    FloatLiteral,
+    // Char/string literal kinds arrive with slice 4 (§18.3–§18.8).
     Unknown,
 };
 
