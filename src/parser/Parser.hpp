@@ -55,6 +55,13 @@ private:
     // type keyword (`int`, `string`, `bool`, …). Used only in type position;
     // module and import names go through parseQualifiedName.
     std::unique_ptr<ast::QualifiedName> parseTypeName();
+    // Slice 5: generic parameter list `<` (Variance? Identifier) (`,` ...)* `>`.
+    // Empty vector if no `<...>` is present at the current position.
+    std::vector<ast::GenericParam> parseGenericParams();
+    // Slice 5: inheritance clause `:` Type ("," Type)*. Optional
+    // base-class argument list `(...)` after each item is currently skipped
+    // (it contains expressions; see the inheritance slice notes in the PR).
+    std::vector<std::unique_ptr<ast::Type>> parseInheritance();
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
 
     Lexer& lexer_;

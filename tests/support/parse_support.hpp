@@ -113,6 +113,26 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
             case ast::TypeDeclKind::Enum:      out += "enum ";      break;
         }
         out += std::string(td->name);
+        if (!td->genericParams.empty()) {
+            out += '<';
+            for (std::size_t i = 0; i < td->genericParams.size(); ++i) {
+                if (i > 0) out += ", ";
+                if (!td->genericParams[i].variance.empty()) {
+                    out += std::string(td->genericParams[i].variance);
+                    out += ' ';
+                }
+                out += std::string(td->genericParams[i].name);
+            }
+            out += '>';
+        }
+        if (!td->baseTypes.empty()) {
+            out += ": ";
+            for (std::size_t i = 0; i < td->baseTypes.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += td->baseTypes[i] ? typeToString(*td->baseTypes[i])
+                                        : std::string("<null>");
+            }
+        }
         return out;
     }
     if (auto* ta = dynamic_cast<const ast::TypeAlias*>(&decl)) {
