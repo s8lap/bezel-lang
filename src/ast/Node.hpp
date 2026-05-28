@@ -336,6 +336,16 @@ struct UnaryExpr : Expr {
     std::unique_ptr<Expr> operand;
 };
 
+// §17.4: `is`, `is not`, `as` — relational-level keyword operators whose
+// right operand is a Type (not an expression). `is not` is a single
+// logical operator with a two-token spelling (parser consumes both keyword
+// tokens and stores the composite "is not" in `op`).
+struct TypeTestExpr : Expr {
+    std::unique_ptr<Expr> operand;
+    std::string_view op; // "is", "is not", or "as"
+    std::unique_ptr<Type> testType;
+};
+
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)
 //
 // `module` is required by the spec on every source file's first non-comment,
