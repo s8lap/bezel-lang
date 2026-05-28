@@ -206,10 +206,12 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     // parameters; the enum-specific shape is a later slice.
     if (decl->kind != ast::TypeDeclKind::Enum) {
         decl->genericParams = parseGenericParams();
-        // §A.3 RecordDecl: PositionalFields? appear between generic params
-        // and Inheritance for records only. Class PrimaryCtorParams have the
-        // same shape but live in a later slice.
-        if (decl->kind == ast::TypeDeclKind::Record &&
+        // §A.3 RecordDecl's PositionalFields and ClassDecl's
+        // PrimaryCtorParams share the exact same syntactic shape
+        // `"(" ParamList? ")"` at the same position (between generic params
+        // and inheritance). Same AST representation (`positionalFields`).
+        if ((decl->kind == ast::TypeDeclKind::Record ||
+             decl->kind == ast::TypeDeclKind::Class) &&
             isPunctuator("(")) {
             advance();
             decl->hasPositionalFields = true;
@@ -219,7 +221,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             if (!consumePunctuator(")")) {
                 diagnostics_.report(
                     Severity::Error, current_.location,
-                    "expected ')' to close positional-fields list");
+                    "expected ')' to close positional / primary-ctor list");
             }
         }
         decl->baseTypes = parseInheritance();
