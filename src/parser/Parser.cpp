@@ -1208,6 +1208,26 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
             std::make_unique<ast::ContinueStmt>().release());
     }
 
+    // YieldStmt (A.6): `yield return Expression ";"` or `yield break ";"`.
+    if (isKeyword("yield")) {
+        advance();
+        auto y = std::make_unique<ast::YieldStmt>();
+        if (consumeKeyword("break")) {
+            y->isBreak = true;
+        } else if (consumeKeyword("return")) {
+            y->value = parseExpression();
+        } else {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected 'return' or 'break' after 'yield'");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after yield statement");
+        }
+        return std::unique_ptr<ast::Stmt>(y.release());
+    }
+
     // ReturnStmt: `return Expression? ";"`.
     if (isKeyword("return")) {
         advance();
@@ -1236,9 +1256,25 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
         return std::unique_ptr<ast::Stmt>(th.release());
     }
 
-    // Otherwise parse an expression and decide: AssignmentStmt if it's
-    // followed by an assignment operator, ExpressionStmt otherwise.
+    // Otherwise parse an expression and decide between IncrementStmt (`++`/
+    // `--`), DiscardStmt (LHS is identifier `_` and the op is `:=`),
+    // AssignmentStmt (other assignment ops), and ExpressionStmt (fallback).
     auto lhs = parseExpression();
+
+    if (current_.kind == TokenKind::Punctuator &&
+        (current_.text == "++" || current_.text == "--")) {
+        auto inc = std::make_unique<ast::IncrementStmt>();
+        inc->target = std::move(lhs);
+        inc->op = current_.text;
+        advance();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after increment/decrement statement");
+        }
+        return std::unique_ptr<ast::Stmt>(inc.release());
+    }
+
     if (current_.kind == TokenKind::Punctuator &&
         (current_.text == ":="  || current_.text == "+="  ||
          current_.text == "-="  || current_.text == "*="  ||
@@ -1246,6 +1282,22 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
          current_.text == "|="  || current_.text == "^="  ||
          current_.text == "<<=" || current_.text == ">>=" ||
          current_.text == "??=")) {
+        // Discard form: LHS is the bare `_` identifier and the op is `:=`.
+        if (current_.text == ":=") {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(lhs.get())) {
+                if (id->name == "_") {
+                    advance(); // past `:=`
+                    auto d = std::make_unique<ast::DiscardStmt>();
+                    d->value = parseExpression();
+                    if (!consumePunctuator(";")) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected ';' after discard statement");
+                    }
+                    return std::unique_ptr<ast::Stmt>(d.release());
+                }
+            }
+        }
         auto a = std::make_unique<ast::AssignmentStmt>();
         a->target = std::move(lhs);
         a->op = current_.text;

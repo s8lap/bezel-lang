@@ -187,6 +187,27 @@ struct DoEndBlock : Stmt {
 struct BreakStmt : Stmt {};
 struct ContinueStmt : Stmt {};
 
+// A.6: `IncrementStmt ::= LValue ("++" | "--") ";"`. Statement-only per
+// §17.6 — `++`/`--` are not expression operators.
+struct IncrementStmt : Stmt {
+    std::unique_ptr<Expr> target;
+    std::string_view op; // "++" or "--"
+};
+
+// A.6: `DiscardStmt ::= "_" ":=" Expression ";"`. Lexically the `_` here is
+// the same Identifier token the lexer always produces for it; the parser
+// recognises the discard form when an expression statement's LHS is
+// IdentifierExpr "_" followed by `:=`.
+struct DiscardStmt : Stmt {
+    std::unique_ptr<Expr> value;
+};
+
+// A.6: `YieldStmt ::= "yield" "return" Expression ";" | "yield" "break" ";"`.
+struct YieldStmt : Stmt {
+    bool isBreak = false;            // true for `yield break;`
+    std::unique_ptr<Expr> value;     // populated for `yield return Expr;`
+};
+
 // A.6 CatchArm with the "with-binding" pattern only:
 //   `"var" Identifier ":" Type "=>" Statement`.
 // The no-binding form, multi-Type patterns (`Type1, Type2`), `when` guards,

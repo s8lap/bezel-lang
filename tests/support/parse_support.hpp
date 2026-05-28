@@ -448,6 +448,21 @@ inline std::string stmtSummary(const ast::Stmt& s) {
     }
     if (dynamic_cast<const ast::BreakStmt*>(&s))    return "break;";
     if (dynamic_cast<const ast::ContinueStmt*>(&s)) return "continue;";
+    if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        return (inc->target ? exprToString(*inc->target)
+                            : std::string("<null>")) +
+               std::string(inc->op) + ";";
+    }
+    if (auto* d = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        return "_ := " + (d->value ? exprToString(*d->value)
+                                   : std::string("<null>")) + ";";
+    }
+    if (auto* y = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (y->isBreak) return "yield break;";
+        return "yield return " +
+               (y->value ? exprToString(*y->value) : std::string("<null>")) +
+               ";";
+    }
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
         std::string out = "throw";
         if (th->value) {
