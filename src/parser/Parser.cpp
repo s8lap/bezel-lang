@@ -2347,6 +2347,35 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
     // the expression-led shapes (AssignmentStmt vs ExpressionStmt, decided
     // after parsing the leading expression).
 
+    // A.6 LocalConstDecl (slice 53):
+    //   "const" Identifier (":" Type)? ":=" ConstExpr ";"
+    if (isKeyword("const")) {
+        advance(); // past `const`
+        auto lc = std::make_unique<ast::LocalConstDecl>();
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected name in local const declaration");
+        } else {
+            lc->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            lc->type = parseType();
+        }
+        if (!consumePunctuator(":=")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "local const requires an initializer ':=' (A.6 LocalConstDecl)");
+        }
+        lc->value = parseExpression();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after local const declaration");
+        }
+        return std::unique_ptr<ast::Stmt>(lc.release());
+    }
+
     // LocalDecl (A.6): `var Identifier (":" Type)? (":=" Expression)? ";"`,
     // `using var ...`, or the async `await using var ...` form. The async
     // form is detected by one-token lookahead on the leading `await` —
