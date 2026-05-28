@@ -437,6 +437,34 @@ inline std::string exprToString(const ast::Expr& e) {
         out += ')';
         return out;
     }
+    if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
+        std::string out = "default(";
+        out += de->type ? typeToString(*de->type) : std::string("<null>");
+        out += ')';
+        return out;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        std::string out = "[";
+        if (cl->isDict) {
+            for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += i < cl->keys.size() && cl->keys[i]
+                           ? exprToString(*cl->keys[i])
+                           : std::string("<null>");
+                out += ": ";
+                out += cl->elements[i] ? exprToString(*cl->elements[i])
+                                       : std::string("<null>");
+            }
+        } else {
+            for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += cl->elements[i] ? exprToString(*cl->elements[i])
+                                       : std::string("<null>");
+            }
+        }
+        out += ']';
+        return out;
+    }
     if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
         std::string out = "case ";
         out += ce->scrutinee ? exprToString(*ce->scrutinee)
