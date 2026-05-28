@@ -1,0 +1,123 @@
+// Spec-derived parser tests for the §A.4 Argument grammar:
+//
+//   ArgList       ::= Argument ("," Argument)*
+//   Argument      ::= ArgModifiers? (Identifier ":=")? ArgExpression
+//   ArgModifiers  ::= "ref" | "out" "var"? | "out" "using" "var"
+//                   | "out" "owned" | "owned"
+//   ArgExpression ::= Expression | "_"
+//
+// Slice 49 extends call/new/null-cond-call argument lists with modifiers,
+// named arguments, and the `_` discard form. Earlier slices treated all
+// arguments as plain expressions.
+
+#include <string>
+
+#include "support/parse_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::exprToString;
+using bezel::test::parseAll;
+
+namespace {
+
+const bezel::ast::Expr* extract(const bezel::test::ParseResult& r) {
+    if (!r.sourceFile || r.sourceFile->topDecls.empty()) return nullptr;
+    const auto* td = dynamic_cast<const bezel::ast::TypeDecl*>(
+        r.sourceFile->topDecls[0].get());
+    if (!td || td->members.empty()) return nullptr;
+    const auto* md = dynamic_cast<const bezel::ast::MethodDecl*>(
+        td->members[0].get());
+    if (!md || md->stmts.empty()) return nullptr;
+    const auto* ds = dynamic_cast<const bezel::ast::DiscardStmt*>(
+        md->stmts[0].get());
+    if (!ds) return nullptr;
+    return ds->value.get();
+}
+
+std::string render(const std::string& expr) {
+    const std::string src = "module M; class C public method M() _ := " +
+                            expr + "; end M; end C;";
+    auto r = parseAll(src);
+    if (r.diagnostics.hasErrors()) return "<errors>";
+    const auto* e = extract(r);
+    return e ? exprToString(*e) : std::string("<no-expr>");
+}
+
+} // namespace
+
+BEZEL_TEST(parser_arg, ref_modifier) {
+    BEZEL_EXPECT_EQ(render("f(ref x)"), std::string("f(ref x)"));
+}
+
+BEZEL_TEST(parser_arg, out_modifier) {
+    BEZEL_EXPECT_EQ(render("f(out x)"), std::string("f(out x)"));
+}
+
+BEZEL_TEST(parser_arg, out_var_modifier) {
+    BEZEL_EXPECT_EQ(render("f(out var x)"), std::string("f(out var x)"));
+}
+
+BEZEL_TEST(parser_arg, out_using_var_modifier) {
+    BEZEL_EXPECT_EQ(
+        render("f(out using var r)"),
+        std::string("f(out using var r)"));
+}
+
+BEZEL_TEST(parser_arg, out_owned_modifier) {
+    BEZEL_EXPECT_EQ(
+        render("f(out owned r)"),
+        std::string("f(out owned r)"));
+}
+
+BEZEL_TEST(parser_arg, owned_modifier) {
+    BEZEL_EXPECT_EQ(
+        render("Take(owned resource)"),
+        std::string("Take(owned resource)"));
+}
+
+BEZEL_TEST(parser_arg, named_arg) {
+    BEZEL_EXPECT_EQ(
+        render("f(name := \"x\", age := 30)"),
+        std::string("f(name := \"x\", age := 30)"));
+}
+
+BEZEL_TEST(parser_arg, modifier_and_named) {
+    BEZEL_EXPECT_EQ(
+        render("f(ref x := source)"),
+        std::string("f(ref x := source)"));
+}
+
+BEZEL_TEST(parser_arg, discard_underscore) {
+    BEZEL_EXPECT_EQ(
+        render("f(out _, out var keep)"),
+        std::string("f(out _, out var keep)"));
+}
+
+BEZEL_TEST(parser_arg, mixed_args) {
+    BEZEL_EXPECT_EQ(
+        render(
+            "f(1, ref x, owned r, name := \"x\", out _, out using var d)"),
+        std::string(
+            "f(1, ref x, owned r, name := \"x\", "
+            "out _, out using var d)"));
+}
+
+BEZEL_TEST(parser_arg, new_with_modifiers) {
+    BEZEL_EXPECT_EQ(
+        render("new Foo(ref x, owned r)"),
+        std::string("new Foo(ref x, owned r)"));
+}
+
+BEZEL_TEST(parser_arg, null_cond_call_with_named) {
+    BEZEL_EXPECT_EQ(
+        render("obj?(name := \"x\")"),
+        std::string("obj?(name := \"x\")"));
+}
+
+BEZEL_TEST(parser_arg, plain_args_still_work) {
+    // Regression: ordinary argument shapes without modifiers/names continue
+    // to render unchanged.
+    BEZEL_EXPECT_EQ(
+        render("f(a + b, c * d, g(e))"),
+        std::string("f((a + b), (c * d), g(e))"));
+}

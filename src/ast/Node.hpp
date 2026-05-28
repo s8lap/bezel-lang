@@ -578,10 +578,24 @@ struct MemberAccessExpr : Expr {
     std::string_view member;
 };
 
+// A.4 / §A.5 Argument:
+//   Argument      ::= ArgModifiers? (Identifier ":=")? ArgExpression
+//   ArgModifiers  ::= "ref" | "out" "var"? | "out" "using" "var"
+//                   | "out" "owned" | "owned"
+//   ArgExpression ::= Expression | "_"
+// `isDiscard` is the `_` form (valid only in `out` positions per sema).
+struct CallArgument {
+    std::string_view modifier;  // "", "ref", "out", "out var",
+                                // "out using var", "out owned", "owned"
+    std::string_view name;      // "" when no `Identifier :=` named-arg prefix
+    bool isDiscard = false;
+    std::unique_ptr<Expr> value; // null when isDiscard
+};
+
 // A.5: `expr "(" ArgList? ")"`. Postfix call.
 struct CallExpr : Expr {
     std::unique_ptr<Expr> callee;
-    std::vector<std::unique_ptr<Expr>> args;
+    std::vector<CallArgument> args;
 };
 
 // A.5 / §17.1 level 1 postfix forms beyond `.` and `(`:
@@ -595,7 +609,7 @@ struct NullCondMemberExpr : Expr {
 };
 struct NullCondCallExpr : Expr {
     std::unique_ptr<Expr> callee;
-    std::vector<std::unique_ptr<Expr>> args;
+    std::vector<CallArgument> args;
 };
 struct IndexExpr : Expr {
     std::unique_ptr<Expr> target;
@@ -610,7 +624,7 @@ struct PostfixBangExpr : Expr {
 // in that case.
 struct NewExpr : Expr {
     std::unique_ptr<Type> type;
-    std::vector<std::unique_ptr<Expr>> args;
+    std::vector<CallArgument> args;
 };
 
 // §17.1 binary expressions. One AST struct for all of them; the operator

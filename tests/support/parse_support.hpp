@@ -327,14 +327,27 @@ inline std::string exprToString(const ast::Expr& e) {
         return (m->target ? exprToString(*m->target) : std::string("<null>")) +
                "." + std::string(m->member);
     }
+    auto renderArg = [&](const ast::CallArgument& a) -> std::string {
+        std::string s;
+        if (!a.modifier.empty()) {
+            s += std::string(a.modifier);
+            s += ' ';
+        }
+        if (!a.name.empty()) {
+            s += std::string(a.name);
+            s += " := ";
+        }
+        if (a.isDiscard) s += "_";
+        else s += a.value ? exprToString(*a.value) : std::string("<null>");
+        return s;
+    };
     if (auto* c = dynamic_cast<const ast::CallExpr*>(&e)) {
         std::string out = c->callee ? exprToString(*c->callee)
                                     : std::string("<null>");
         out += '(';
         for (std::size_t i = 0; i < c->args.size(); ++i) {
             if (i > 0) out += ", ";
-            out += c->args[i] ? exprToString(*c->args[i])
-                              : std::string("<null>");
+            out += renderArg(c->args[i]);
         }
         out += ')';
         return out;
@@ -444,8 +457,7 @@ inline std::string exprToString(const ast::Expr& e) {
         out += "?(";
         for (std::size_t i = 0; i < c->args.size(); ++i) {
             if (i > 0) out += ", ";
-            out += c->args[i] ? exprToString(*c->args[i])
-                              : std::string("<null>");
+            out += renderArg(c->args[i]);
         }
         out += ')';
         return out;
@@ -472,8 +484,7 @@ inline std::string exprToString(const ast::Expr& e) {
         out += '(';
         for (std::size_t i = 0; i < n->args.size(); ++i) {
             if (i > 0) out += ", ";
-            out += n->args[i] ? exprToString(*n->args[i])
-                              : std::string("<null>");
+            out += renderArg(n->args[i]);
         }
         out += ')';
         return out;

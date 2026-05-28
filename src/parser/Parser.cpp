@@ -1655,12 +1655,7 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
                 Severity::Error, current_.location,
                 "expected '(' to begin constructor argument list");
         } else {
-            if (!isPunctuator(")")) {
-                n->args.push_back(parseExpression());
-                while (consumePunctuator(",")) {
-                    n->args.push_back(parseExpression());
-                }
-            }
+            n->args = parseArgList();
             if (!consumePunctuator(")")) {
                 diagnostics_.report(
                     Severity::Error, current_.location,
@@ -2105,12 +2100,7 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
         } else if (consumePunctuator("(")) {
             auto call = std::make_unique<ast::CallExpr>();
             call->callee = std::move(head);
-            if (!isPunctuator(")")) {
-                call->args.push_back(parseExpression());
-                while (consumePunctuator(",")) {
-                    call->args.push_back(parseExpression());
-                }
-            }
+            call->args = parseArgList();
             if (!consumePunctuator(")")) {
                 diagnostics_.report(Severity::Error, current_.location,
                                     "expected ')' to close call argument list");
@@ -2119,12 +2109,7 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
         } else if (consumePunctuator("?(")) {
             auto call = std::make_unique<ast::NullCondCallExpr>();
             call->callee = std::move(head);
-            if (!isPunctuator(")")) {
-                call->args.push_back(parseExpression());
-                while (consumePunctuator(",")) {
-                    call->args.push_back(parseExpression());
-                }
-            }
+            call->args = parseArgList();
             if (!consumePunctuator(")")) {
                 diagnostics_.report(
                     Severity::Error, current_.location,
@@ -2813,6 +2798,64 @@ std::vector<ast::Param> Parser::parseParamList() {
         params.push_back(parseOne());
     }
     return params;
+}
+
+std::vector<ast::CallArgument> Parser::parseArgList() {
+    // A.4 ArgList ::= Argument ("," Argument)*
+    // Argument    ::= ArgModifiers? (Identifier ":=")? ArgExpression
+    // ArgModifiers ∈ { ref | out var? | out using var | out owned | owned }
+    // ArgExpression ::= Expression | "_"
+    std::vector<ast::CallArgument> args;
+    if (isPunctuator(")")) return args;
+    auto parseOne = [&]() -> ast::CallArgument {
+        ast::CallArgument a;
+        if (consumeKeyword("ref")) {
+            a.modifier = "ref";
+        } else if (consumeKeyword("out")) {
+            if (consumeKeyword("owned")) {
+                a.modifier = "out owned";
+            } else if (consumeKeyword("using")) {
+                if (!consumeKeyword("var")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected 'var' after 'out using'");
+                }
+                a.modifier = "out using var";
+            } else if (consumeKeyword("var")) {
+                a.modifier = "out var";
+            } else {
+                a.modifier = "out";
+            }
+        } else if (consumeKeyword("owned")) {
+            a.modifier = "owned";
+        }
+        // Named-arg prefix `Identifier :=`. peekAt(1) distinguishes from
+        // a bare-Identifier expression argument.
+        if (current_.kind == TokenKind::Identifier &&
+            peekAt(1).kind == TokenKind::Punctuator &&
+            peekAt(1).text == ":=") {
+            a.name = current_.text;
+            advance(); // identifier
+            advance(); // :=
+        }
+        // ArgExpression — `_` discard or full Expression. `_` is detected
+        // as a lone Identifier followed by `,` or `)`.
+        if (current_.kind == TokenKind::Identifier &&
+            current_.text == "_" &&
+            peekAt(1).kind == TokenKind::Punctuator &&
+            (peekAt(1).text == "," || peekAt(1).text == ")")) {
+            a.isDiscard = true;
+            advance();
+        } else {
+            a.value = parseExpression();
+        }
+        return a;
+    };
+    args.push_back(parseOne());
+    while (consumePunctuator(",")) {
+        args.push_back(parseOne());
+    }
+    return args;
 }
 
 std::vector<ast::Param> Parser::parsePositionalFieldList() {
