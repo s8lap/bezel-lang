@@ -118,6 +118,12 @@ private:
     // first — `serialized` is contextual so we identify by text.
     bool isSerializedClauseStart() const;
     std::unique_ptr<ast::SerializedClause> parseSerializedClause();
+    // Slice 42: parse `serialized ("tree"|"graph"|"cyclic") PolymorphicClause?`
+    // (A.3 SerializedClassClause). The "serialized" Identifier check
+    // overlaps with isSerializedClauseStart, but the disambiguator is what
+    // follows: tree/graph/cyclic vs. skip/string/optional. Used by
+    // parseTypeOrInterfaceDecl on the class/record path.
+    std::unique_ptr<ast::SerializedClassClause> parseSerializedClassClause();
     // Slice 36: peeks the matching `)` for the `(` at peekAt(startK) and
     // returns true iff a `=>` follows. Used to distinguish
     // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.
