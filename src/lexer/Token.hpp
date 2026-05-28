@@ -27,7 +27,11 @@ enum class TokenKind {
     // compile error") are sema-level concerns.
     IntLiteral,
     FloatLiteral,
-    // Char/string literal kinds arrive with slice 4 (§18.3–§18.8).
+    CharLiteral,
+    StringLiteral,
+    VerbatimStringLiteral,
+    // Interpolated-string kinds (§18.5 / §18.7) arrive once the parser exists
+    // — their `{...}` content needs full expression parsing.
     Unknown,
 };
 

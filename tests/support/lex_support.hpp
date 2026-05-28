@@ -42,6 +42,16 @@ struct ExpectedToken {
     std::string_view text;
 };
 
+// Convenience for tests that only care that some lexer diagnostic fired (e.g.
+// surrogate-escape rejection, unterminated literal). Tests that need to
+// inspect the token stream and the diagnostics together call lexAll(src, diag)
+// directly.
+inline void expectLexError(std::string_view source) {
+    DiagnosticEngine diagnostics;
+    (void)lexAll(source, diagnostics);
+    BEZEL_EXPECT_TRUE(diagnostics.hasErrors());
+}
+
 // Assert that `actual` is exactly `expected` followed by a terminal EndOfFile
 // token. Bounds-safe: a stub lexer that returns fewer tokens records assertion
 // failures rather than reading out of range.
