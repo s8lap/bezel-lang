@@ -304,6 +304,17 @@ struct DestructorDecl : Member {
     std::vector<std::unique_ptr<Stmt>> body;
 };
 
+// A.4 `EventDecl ::= Visibility "static"? "async"? "event" Identifier
+//                     (":" Type)? ";"`. The type is implicit when omitted
+// (sema picks it up).
+struct EventDecl : Member {
+    Visibility visibility = Visibility::None;
+    bool isStatic = false;
+    bool isAsync = false;
+    std::string_view name;
+    std::unique_ptr<Type> type; // null when no `: Type`
+};
+
 // A.4 `ConstDecl ::= Visibility "static"? "const" Identifier (":" Type)?
 //                     ":=" ConstExpr ";"`. The "Const" constraint on the
 // initializer is sema's; the parser uses ordinary Expression here.
