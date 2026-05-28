@@ -62,6 +62,8 @@ private:
     // base-class argument list `(...)` after each item is currently skipped
     // (it contains expressions; see the inheritance slice notes in the PR).
     std::vector<std::unique_ptr<ast::Type>> parseInheritance();
+    // Slice 24: zero or more `where T: Constraint, ...` clauses.
+    std::vector<ast::GenericConstraint> parseGenericConstraints();
     // Slice 6/10: a single class member. FieldDecl (with optional initializer)
     // and MethodDecl (with expression/block/abstract body); other Member forms
     // arrive with their slices.
