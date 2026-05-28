@@ -488,6 +488,38 @@ inline std::string memberSummary(const ast::Member& m) {
         }
         return out;
     }
+    if (auto* c = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
+        std::string out;
+        if (c->isStatic) out += "static ";
+        else             out += visibilityPrefix(c->visibility);
+        out += "constructor(";
+        for (std::size_t i = 0; i < c->params.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += std::string(c->params[i].name);
+            out += ": ";
+            out += c->params[i].type ? typeToString(*c->params[i].type)
+                                     : std::string("<null>");
+        }
+        out += ')';
+        out += " { ";
+        for (std::size_t i = 0; i < c->body.size(); ++i) {
+            if (i > 0) out += ' ';
+            out += c->body[i] ? stmtSummary(*c->body[i])
+                              : std::string("<null>");
+        }
+        out += " }";
+        return out;
+    }
+    if (auto* d = dynamic_cast<const ast::DestructorDecl*>(&m)) {
+        std::string out = "destructor { ";
+        for (std::size_t i = 0; i < d->body.size(); ++i) {
+            if (i > 0) out += ' ';
+            out += d->body[i] ? stmtSummary(*d->body[i])
+                              : std::string("<null>");
+        }
+        out += " }";
+        return out;
+    }
     return "<unknown member>";
 }
 
