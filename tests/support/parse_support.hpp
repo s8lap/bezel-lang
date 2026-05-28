@@ -178,10 +178,6 @@ inline std::string exprToString(const ast::Expr& e) {
         return std::string("null");
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
         return std::string(id->name);
-    if (auto* p = dynamic_cast<const ast::ParenExpr*>(&e)) {
-        return "(" + (p->inner ? exprToString(*p->inner)
-                               : std::string("<null>")) + ")";
-    }
     if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         return (m->target ? exprToString(*m->target) : std::string("<null>")) +
                "." + std::string(m->member);
@@ -195,6 +191,18 @@ inline std::string exprToString(const ast::Expr& e) {
             out += c->args[i] ? exprToString(*c->args[i])
                               : std::string("<null>");
         }
+        out += ')';
+        return out;
+    }
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        // Always wrap in explicit parens so precedence and associativity are
+        // observable in test assertions without ambiguity.
+        std::string out = "(";
+        out += b->left ? exprToString(*b->left) : std::string("<null>");
+        out += ' ';
+        out += std::string(b->op);
+        out += ' ';
+        out += b->right ? exprToString(*b->right) : std::string("<null>");
         out += ')';
         return out;
     }

@@ -102,12 +102,16 @@ BEZEL_TEST(parser_primary_expr, identifier_expression) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(parser_primary_expr, parenthesized_expression) {
+BEZEL_TEST(parser_primary_expr, parenthesized_expression_passes_through) {
+    // Source-level parens don't get their own AST node — they only group
+    // the parse — so `(42)` renders as `42`. The binary-expression slice's
+    // precedence tests still get unambiguous renderings via the
+    // always-paren-wrap in exprToString for BinaryExpr.
     auto r = parseAll(
         "module M; class Foo public x: int := (42); end Foo;");
     const auto ms = memberSummaries(r);
     if (ms.size() == 1)
-        BEZEL_EXPECT_EQ(ms[0], std::string("public x: int := (42)"));
+        BEZEL_EXPECT_EQ(ms[0], std::string("public x: int := 42"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

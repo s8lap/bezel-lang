@@ -344,10 +344,56 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     return std::unique_ptr<ast::Member>(field.release());
 }
 
+namespace {
+
+// Higher precedence = tighter binding. The numeric scale is internal — we
+// just need an ordering consistent with §17.1's precedence table. Returns 0
+// for tokens that aren't binary operators handled in this slice.
+int binaryPrecedence(const Token& tok) {
+    if (tok.kind == TokenKind::Punctuator) {
+        const std::string_view t = tok.text;
+        // §17.1 level 3 multiplicative.
+        if (t == "*" || t == "/") return 14;
+        // §17.1 level 4 additive.
+        if (t == "+" || t == "-") return 13;
+        // §17.1 level 10 relational (subset — `in`/`is`/`as` are keywords).
+        if (t == "<" || t == ">" || t == "<=" || t == ">=") return 7;
+        // §17.1 level 11 equality.
+        if (t == "=" || t == "<>") return 6;
+    }
+    if (tok.kind == TokenKind::Keyword) {
+        const std::string_view t = tok.text;
+        if (t == "mod") return 14; // multiplicative
+        if (t == "and") return 4;  // §17.1 level 13 logical AND
+        if (t == "or")  return 3;  // §17.1 level 14 logical OR
+    }
+    return 0;
+}
+
+} // namespace
+
 std::unique_ptr<ast::Expr> Parser::parseExpression() {
-    // Slice 7: primary plus postfix only. Unary, binary, etc. land in later
-    // slices.
-    return parsePostfix(parsePrimaryExpression());
+    return parseBinaryExpression(1);
+}
+
+std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
+    // Precedence climbing. All §17.1 operators handled in this slice are
+    // left-associative; we recurse on `prec + 1` for the right operand so
+    // same-precedence ops associate to the left.
+    auto left = parsePostfix(parsePrimaryExpression());
+    for (;;) {
+        const int prec = binaryPrecedence(current_);
+        if (prec < minPrecedence) break;
+        const Token opTok = current_;
+        advance();
+        auto right = parseBinaryExpression(prec + 1);
+        auto bin = std::make_unique<ast::BinaryExpr>();
+        bin->op = opTok.text;
+        bin->left = std::move(left);
+        bin->right = std::move(right);
+        left = std::unique_ptr<ast::Expr>(bin.release());
+    }
+    return left;
 }
 
 std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
@@ -404,14 +450,14 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
     }
 
     if (consumePunctuator("(")) {
+        // No ParenExpr node: source-level parens only group the parse; the
+        // resulting tree shape encodes the grouping directly. See Node.hpp.
         auto inner = parseExpression();
         if (!consumePunctuator(")")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ')' to close parenthesized expression");
         }
-        auto e = std::make_unique<ast::ParenExpr>();
-        e->inner = std::move(inner);
-        return std::unique_ptr<ast::Expr>(e.release());
+        return inner;
     }
 
     diagnostics_.report(Severity::Error, current_.location,
