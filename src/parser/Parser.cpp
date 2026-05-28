@@ -380,7 +380,7 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
     // Precedence climbing. All §17.1 operators handled in this slice are
     // left-associative; we recurse on `prec + 1` for the right operand so
     // same-precedence ops associate to the left.
-    auto left = parsePostfix(parsePrimaryExpression());
+    auto left = parseUnaryExpression();
     for (;;) {
         const int prec = binaryPrecedence(current_);
         if (prec < minPrecedence) break;
@@ -394,6 +394,21 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
         left = std::unique_ptr<ast::Expr>(bin.release());
     }
     return left;
+}
+
+std::unique_ptr<ast::Expr> Parser::parseUnaryExpression() {
+    // §17.1 level 2 prefix unary. Right-associative — `--x` parses as
+    // `- (-x)`. `await` (also level 2) lands with the async slice.
+    if (isPunctuator("+") || isPunctuator("-") || isPunctuator("~") ||
+        isKeyword("not")) {
+        const Token opTok = current_;
+        advance();
+        auto u = std::make_unique<ast::UnaryExpr>();
+        u->op = opTok.text;
+        u->operand = parseUnaryExpression();
+        return std::unique_ptr<ast::Expr>(u.release());
+    }
+    return parsePostfix(parsePrimaryExpression());
 }
 
 std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
