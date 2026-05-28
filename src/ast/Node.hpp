@@ -237,6 +237,21 @@ struct TryStmt : Stmt {
 // `ParamModifiers ::= "ref" | "out" "owned"? | "owned"`. Slice 24 adds
 // modifier (recorded as a single composite string like "out owned") and
 // default value.
+// A.3 SerializedClassClause:
+//   `serialized ("tree" | "graph" | "cyclic") PolymorphicClause?`
+//
+// PolymorphicClause is a closed registry of wire-discriminator -> concrete
+// type mappings. `serialized`, `tree`, `graph`, `cyclic`, `polymorphic`
+// are contextual keywords (App. B.2) lexed as Identifier.
+struct PolyCase {
+    std::string_view discriminator; // contents of the StringLiteral
+    std::unique_ptr<Type> type;
+};
+struct SerializedClassClause {
+    std::string_view shape;         // "tree" | "graph" | "cyclic"
+    std::vector<PolyCase> polyCases; // empty when no PolymorphicClause
+};
+
 // A.4 SerializedClause. `serialized` is a contextual keyword (App. B.2)
 // lexed as Identifier; `skip` and `optional` are also contextual. The
 // grammar admits this on PositionalField, EnumConstant, and auto-property
@@ -447,6 +462,8 @@ struct TypeDecl : TopDecl {
     // Record-only: `record Foo(...) ;` shorthand body (no `end`).
     bool isRecordShorthand = false;
     std::string_view endLabel; // empty when the `end` had no label
+    // A.3 SerializedClassClause (slice 42). Null when not present.
+    std::unique_ptr<SerializedClassClause> serializedClass;
 };
 
 // A.4 `NestedTypeDecl ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl`.

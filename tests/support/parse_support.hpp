@@ -179,6 +179,24 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
             }
             out += '>';
         }
+        if (td->serializedClass) {
+            out += " serialized ";
+            out += std::string(td->serializedClass->shape);
+            if (!td->serializedClass->polyCases.empty()) {
+                out += " polymorphic(";
+                for (std::size_t i = 0;
+                     i < td->serializedClass->polyCases.size(); ++i) {
+                    if (i > 0) out += ", ";
+                    const auto& pc = td->serializedClass->polyCases[i];
+                    out += '"';
+                    out += std::string(pc.discriminator);
+                    out += "\": ";
+                    out += pc.type ? typeToString(*pc.type)
+                                   : std::string("<null>");
+                }
+                out += ')';
+            }
+        }
         if (!td->baseTypes.empty()) {
             out += ": ";
             for (std::size_t i = 0; i < td->baseTypes.size(); ++i) {
