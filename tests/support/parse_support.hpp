@@ -110,6 +110,23 @@ inline std::string exprToString(const ast::Expr& e);
 inline std::string stmtSummary(const ast::Stmt& s);
 inline std::string patternToString(const ast::Pattern& p);
 
+// Render an A.4 SerializedClause. Leading space included so call sites can
+// just append unconditionally — they can guard on the null pointer.
+inline std::string serializedClauseString(const ast::SerializedClause& sc) {
+    std::string out = " serialized";
+    if (sc.isSkip) {
+        out += " skip";
+        return out;
+    }
+    if (!sc.name.empty()) {
+        out += " \"";
+        out += std::string(sc.name);
+        out += '"';
+    }
+    if (sc.isOptional) out += " optional";
+    return out;
+}
+
 // One-line human-readable summary of a top-level declaration, e.g.
 // "public sealed class Foo", "enum E", or "type X = List<int>". Lets tests
 // assert the visible shape of each decl in a single string comparison.
@@ -143,6 +160,10 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
                 out += td->positionalFields[i].type
                            ? typeToString(*td->positionalFields[i].type)
                            : std::string("<null>");
+                if (td->positionalFields[i].serialized) {
+                    out += serializedClauseString(
+                        *td->positionalFields[i].serialized);
+                }
             }
             out += ')';
         }
@@ -174,6 +195,10 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
                 if (td->enumConstants[i].value) {
                     out += " := ";
                     out += exprToString(*td->enumConstants[i].value);
+                }
+                if (td->enumConstants[i].serialized) {
+                    out += serializedClauseString(
+                        *td->enumConstants[i].serialized);
                 }
             }
             out += " }";
@@ -834,6 +859,9 @@ inline std::string memberSummary(const ast::Member& m) {
                 if (pd->autoInitializer) {
                     out += " := ";
                     out += exprToString(*pd->autoInitializer);
+                }
+                if (pd->serialized) {
+                    out += serializedClauseString(*pd->serialized);
                 }
                 break;
             case ast::PropertyBodyKind::Block: {
