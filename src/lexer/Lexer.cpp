@@ -136,9 +136,75 @@ Token Lexer::next() {
         return Token{kind, text, SourceLocation{}};
     }
 
-    // Unrecognized character: consume one byte and emit an Unknown token plus
-    // a diagnostic. Operators/punctuation are added by their own milestone, at
-    // which point most "unexpected" bytes become real tokens.
+    // §17 / Appendix A operators and punctuation. Maximal munch via a
+    // first-character switch with one- and two-char lookahead. `//` and `/*`
+    // never reach here — they are consumed by the trivia loop above — so the
+    // `/` case below only ever sees a real division-or-`/=` punctuator.
+    const std::size_t puStart = position_;
+    const char c1 =
+        (position_ + 1 < source_.size()) ? source_[position_ + 1] : '\0';
+    const char c2 =
+        (position_ + 2 < source_.size()) ? source_[position_ + 2] : '\0';
+    std::size_t puLen = 0;
+
+    switch (static_cast<char>(b)) {
+    case '(': case ')': case '[': case ']': case '{': case '}':
+    case ',': case ';': case '!': case '~':
+        puLen = 1;
+        break;
+    case ':':
+        puLen = (c1 == '=') ? 2 : 1;             // := or :
+        break;
+    case '.':
+        if (c1 == '.' && c2 == '<') puLen = 3;   // ..<
+        else if (c1 == '.')          puLen = 2;  // ..
+        else                         puLen = 1;  // .
+        break;
+    case '+':
+        if (c1 == '+' || c1 == '=')  puLen = 2;  // ++  +=
+        else                         puLen = 1;  // +
+        break;
+    case '-':
+        if (c1 == '-' || c1 == '=' || c1 == '>') puLen = 2;  // --  -=  ->
+        else                                     puLen = 1;  // -
+        break;
+    case '*':
+    case '/':
+    case '&':
+    case '|':
+    case '^':
+        puLen = (c1 == '=') ? 2 : 1;             // *= /= &= |= ^= or single
+        break;
+    case '<':
+        if (c1 == '<' && c2 == '=') puLen = 3;                       // <<=
+        else if (c1 == '<' || c1 == '=' || c1 == '>') puLen = 2;     // <<  <=  <>
+        else                                          puLen = 1;     // <
+        break;
+    case '>':
+        if (c1 == '>' && c2 == '=') puLen = 3;                       // >>=
+        else if (c1 == '>' || c1 == '=') puLen = 2;                  // >>  >=
+        else                             puLen = 1;                  // >
+        break;
+    case '=':
+        puLen = (c1 == '>') ? 2 : 1;             // => or =
+        break;
+    case '?':
+        if (c1 == '?' && c2 == '=') puLen = 3;                       // ??=
+        else if (c1 == '?' || c1 == '.' || c1 == '(') puLen = 2;     // ??  ?.  ?(
+        else                                          puLen = 1;     // ?
+        break;
+    default:
+        break;
+    }
+
+    if (puLen > 0) {
+        position_ += puLen;
+        return Token{TokenKind::Punctuator,
+                     source_.substr(puStart, puLen), SourceLocation{}};
+    }
+
+    // Unrecognized character. Once char/string literals (§18) arrive, `'` and
+    // `"` will be handled before this fallback; for now they still land here.
     std::size_t start = position_;
     ++position_;
     diagnostics_.report(Severity::Error, SourceLocation{},
