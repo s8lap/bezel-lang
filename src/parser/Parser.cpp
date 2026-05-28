@@ -509,9 +509,87 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         advance();
     }
 
-    // Member-kind keyword. `method` (slice 10), `constructor` / `destructor`
-    // (slice 19). `property`, `event`, `operator`, `const` come with their
-    // own slices.
+    // Member-kind keyword dispatch.
+    if (isKeyword("const")) {
+        if (visibility == ast::Visibility::None) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "const declarations require explicit visibility");
+        }
+        const bool isStatic =
+            std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("static")) != modifiers.end();
+        advance(); // past `const`
+        auto cd = std::make_unique<ast::ConstDecl>();
+        cd->visibility = visibility;
+        cd->isStatic = isStatic;
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected const name");
+        } else {
+            cd->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            cd->type = parseType();
+        }
+        if (!consumePunctuator(":=")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ':=' in const declaration");
+        }
+        cd->value = parseExpression();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after const declaration");
+        }
+        return std::unique_ptr<ast::Member>(cd.release());
+    }
+    if (isKeyword("property")) {
+        if (visibility == ast::Visibility::None) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "property declarations require explicit visibility");
+        }
+        advance(); // past `property`
+        auto pd = std::make_unique<ast::PropertyDecl>();
+        pd->visibility = visibility;
+        pd->modifiers = std::move(modifiers);
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected property name");
+        } else {
+            pd->name = current_.text;
+            advance();
+        }
+        if (!consumePunctuator(":")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ':' after property name");
+        }
+        pd->type = parseType();
+        // Body shape dispatch per A.4 PropertyBody.
+        if (consumePunctuator("=>")) {
+            pd->bodyKind = ast::PropertyBodyKind::Expression;
+            pd->exprBody = parseExpression();
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after expression-body property");
+            }
+        } else {
+            pd->bodyKind = ast::PropertyBodyKind::Auto;
+            if (consumePunctuator(":=")) {
+                pd->autoInitializer = parseExpression();
+            }
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after auto-property (accessor-block "
+                    "form not yet supported)");
+            }
+        }
+        return std::unique_ptr<ast::Member>(pd.release());
+    }
+    // `method` (slice 10), `constructor` / `destructor` (slice 19).
     if (isKeyword("method")) {
         return std::unique_ptr<ast::Member>(
             parseMethodDecl(visibility, std::move(modifiers)).release());

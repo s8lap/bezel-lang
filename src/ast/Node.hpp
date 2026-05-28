@@ -304,6 +304,38 @@ struct DestructorDecl : Member {
     std::vector<std::unique_ptr<Stmt>> body;
 };
 
+// A.4 `ConstDecl ::= Visibility "static"? "const" Identifier (":" Type)?
+//                     ":=" ConstExpr ";"`. The "Const" constraint on the
+// initializer is sema's; the parser uses ordinary Expression here.
+struct ConstDecl : Member {
+    Visibility visibility = Visibility::None;
+    bool isStatic = false;
+    std::string_view name;
+    std::unique_ptr<Type> type; // null if no `:` annotation
+    std::unique_ptr<Expr> value;
+};
+
+// A.4 PropertyBody alternative kinds. Slice 26 covers Expression and Auto;
+// accessor-blocks (`get`/`set` with bodies) come with their own slice.
+enum class PropertyBodyKind { Expression, Auto, Block };
+
+// A.4 `PropertyDecl ::= Visibility "static"? VirtualKind? "readonly"?
+//                        "property" Identifier ":" Type PropertyBody`.
+// Slice 26 supports:
+//   `=> Expression ;`          (Expression-body)
+//   `(":=" Expression)? ";"`   (Auto-property, with optional initializer)
+// Auto-accessor-vis (`public get`/etc.) and the SerializedClause modifier
+// on auto-properties are deferred to their slice.
+struct PropertyDecl : Member {
+    Visibility visibility = Visibility::None;
+    std::vector<std::string_view> modifiers; // static, readonly + VirtualKind
+    std::string_view name;
+    std::unique_ptr<Type> type;
+    PropertyBodyKind bodyKind = PropertyBodyKind::Auto;
+    std::unique_ptr<Expr> exprBody;        // Expression-body case
+    std::unique_ptr<Expr> autoInitializer; // Auto with `:= …`
+};
+
 // A.3 `EnumConstant ::= Identifier (":=" ConstExpr)? SerializedClause?`.
 // SerializedClause is deferred to its own slice.
 struct EnumConstant {

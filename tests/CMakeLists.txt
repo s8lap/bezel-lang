@@ -37,7 +37,8 @@ set(BEZEL_TEST_SOURCES
     parser/try_catch_test.cpp
     parser/inc_discard_yield_test.cpp
     parser/param_mods_and_constraints_test.cpp
-    parser/extensions_and_externs_test.cpp)
+    parser/extensions_and_externs_test.cpp
+    parser/property_and_const_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
