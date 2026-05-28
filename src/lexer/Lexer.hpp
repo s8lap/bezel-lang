@@ -22,8 +22,7 @@ public:
 
 private:
     std::string_view source_;
-    // Held for the lexer milestone; clang flags it unused until then.
-    [[maybe_unused]] DiagnosticEngine& diagnostics_;
+    DiagnosticEngine& diagnostics_;
     std::size_t position_ = 0;
 };
 
