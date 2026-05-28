@@ -321,9 +321,10 @@ inline std::string exprToString(const ast::Expr& e) {
         return out;
     }
     if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
-        // Keyword-spelled unary operators (`not`) need a space; the
-        // punctuator-spelled ones (`+ - ~`) don't.
-        const bool needsSpace = (u->op == "not");
+        // Keyword-spelled unary operators need a space; punctuator-spelled
+        // ones don't.
+        const bool needsSpace =
+            (u->op == "not" || u->op == "await" || u->op == "move");
         std::string out = "(";
         out += std::string(u->op);
         if (needsSpace) out += ' ';
