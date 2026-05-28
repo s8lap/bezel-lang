@@ -32,20 +32,56 @@ bool Parser::consumePunctuator(std::string_view text) {
 }
 
 std::unique_ptr<ast::SourceFile> Parser::parseCompilationUnit() {
-    // TODO(parser milestone slice 1, §2.1): parse module declaration.
-    // Returns an empty SourceFile so tests-first assertions fail meaningfully
-    // (e.g. `module == nullptr`) rather than crashing on a null result.
-    return std::make_unique<ast::SourceFile>();
+    auto sourceFile = std::make_unique<ast::SourceFile>();
+
+    // §2.1: "Every source file declares its module on its first non-comment,
+    // non-import line." The lexer has already skipped comments, so the very
+    // first token must be the `module` keyword.
+    if (isKeyword("module")) {
+        sourceFile->module = parseModuleDecl();
+    } else {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'module' declaration");
+    }
+
+    // Imports (§2.2) and top-level declarations (§2.4) are added by their own
+    // parser slices. Anything beyond the module declaration is ignored here.
+    return sourceFile;
 }
 
 std::unique_ptr<ast::ModuleDecl> Parser::parseModuleDecl() {
-    // TODO(parser milestone slice 1, §2.1).
-    return nullptr;
+    auto decl = std::make_unique<ast::ModuleDecl>();
+    // Caller has verified `current_` is the `module` keyword.
+    advance(); // past `module`
+    decl->name = parseQualifiedName();
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after module declaration");
+    }
+    return decl;
 }
 
 std::unique_ptr<ast::QualifiedName> Parser::parseQualifiedName() {
-    // TODO(parser milestone slice 1, §2.1).
-    return nullptr;
+    // A.2: `QualifiedName ::= Identifier ("." Identifier)*`
+    auto name = std::make_unique<ast::QualifiedName>();
+    if (current_.kind != TokenKind::Identifier) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected identifier");
+        return name;
+    }
+    name->parts.push_back(current_.text);
+    advance();
+    while (isPunctuator(".")) {
+        advance(); // past '.'
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected identifier after '.'");
+            break;
+        }
+        name->parts.push_back(current_.text);
+        advance();
+    }
+    return name;
 }
 
 } // namespace bezel

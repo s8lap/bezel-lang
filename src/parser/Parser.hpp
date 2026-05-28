@@ -41,8 +41,7 @@ private:
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
 
     Lexer& lexer_;
-    // Stub: not yet consulted in the tests-first slice; impl PR will use it.
-    [[maybe_unused]] DiagnosticEngine& diagnostics_;
+    DiagnosticEngine& diagnostics_;
     Token current_{};
 };
 
