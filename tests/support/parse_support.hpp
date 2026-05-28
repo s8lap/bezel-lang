@@ -641,6 +641,18 @@ inline std::string memberSummary(const ast::Member& m) {
         out += " }";
         return out;
     }
+    if (auto* ed = dynamic_cast<const ast::EventDecl*>(&m)) {
+        std::string out = visibilityPrefix(ed->visibility);
+        if (ed->isStatic) out += "static ";
+        if (ed->isAsync)  out += "async ";
+        out += "event ";
+        out += std::string(ed->name);
+        if (ed->type) {
+            out += ": ";
+            out += typeToString(*ed->type);
+        }
+        return out;
+    }
     if (auto* cd = dynamic_cast<const ast::ConstDecl*>(&m)) {
         std::string out = visibilityPrefix(cd->visibility);
         if (cd->isStatic) out += "static ";

@@ -550,6 +550,39 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         }
         return std::unique_ptr<ast::Member>(cd.release());
     }
+    if (isKeyword("event")) {
+        if (visibility == ast::Visibility::None) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "event declarations require explicit visibility");
+        }
+        const bool isStatic =
+            std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("static")) != modifiers.end();
+        const bool isAsync =
+            std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("async")) != modifiers.end();
+        advance(); // past `event`
+        auto ed = std::make_unique<ast::EventDecl>();
+        ed->visibility = visibility;
+        ed->isStatic = isStatic;
+        ed->isAsync = isAsync;
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected event name");
+        } else {
+            ed->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            ed->type = parseType();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after event declaration");
+        }
+        return std::unique_ptr<ast::Member>(ed.release());
+    }
     if (isKeyword("property")) {
         if (visibility == ast::Visibility::None) {
             diagnostics_.report(
