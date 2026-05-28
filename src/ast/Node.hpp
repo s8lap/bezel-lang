@@ -223,6 +223,29 @@ struct MethodDecl : Member {
     std::string_view endLabel;             // optional `end Identifier?` for Block
 };
 
+// A.4: `ConstructorDecl ::= Visibility "constructor" "(" ParamList? ")"
+//                            CtorChain? Statement* "end" "constructor"? ";"
+//                          | "static" "constructor" "(" ")"
+//                            Statement* "end" "constructor"? ";"`.
+// CtorChain: `("base" | "this") "(" ArgList? ")" ";"` — first statement when
+// present.
+// CtorChain (`base(...)` or `this(...)` at the body's start) is recognised
+// post-parse by sema, not as a distinct AST member — it surfaces as the body's
+// first ExpressionStmt-of-CallExpr-on-`this`/`base`. Avoids needing two-token
+// lookahead at parse time to disambiguate from `this.field := ...`.
+struct ConstructorDecl : Member {
+    Visibility visibility = Visibility::None; // none for the static form
+    bool isStatic = false;
+    std::vector<Param> params;
+    std::vector<std::unique_ptr<Stmt>> body;
+};
+
+// A.4: `DestructorDecl ::= "destructor" Statement* "end" "destructor"? ";"`.
+// No visibility or parameters per the grammar.
+struct DestructorDecl : Member {
+    std::vector<std::unique_ptr<Stmt>> body;
+};
+
 // Class-like top-level declaration. Slice 3 introduced the empty body; slice
 // 5 adds generic parameters and a base-type list. Primary-constructor params
 // (classes), positional fields (records), serialization clauses, generic

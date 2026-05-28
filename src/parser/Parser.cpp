@@ -1,5 +1,6 @@
 #include "parser/Parser.hpp"
 
+#include <algorithm>
 #include <string_view>
 
 namespace bezel {
@@ -288,20 +289,20 @@ std::unique_ptr<ast::Type> Parser::parseType() {
 }
 
 std::unique_ptr<ast::Member> Parser::parseMember() {
-    // §13: every member declares its visibility explicitly. Slice 6 only
-    // recognizes the FieldDecl shape after that.
-    ast::Visibility visibility;
-    if (isKeyword("public"))         visibility = ast::Visibility::Public;
-    else if (isKeyword("private"))   visibility = ast::Visibility::Private;
-    else if (isKeyword("internal"))  visibility = ast::Visibility::Internal;
-    else if (isKeyword("protected")) visibility = ast::Visibility::Protected;
-    else {
-        diagnostics_.report(Severity::Error, current_.location,
-                            "expected member visibility (public, private, "
-                            "internal, or protected)");
-        return nullptr;
+    // §13: most members declare their visibility explicitly. Destructors
+    // (no visibility per A.4) and the static-constructor form are
+    // exceptions, so we collect visibility optionally and validate per
+    // member-kind below.
+    ast::Visibility visibility = ast::Visibility::None;
+    if (isKeyword("public")) {
+        visibility = ast::Visibility::Public; advance();
+    } else if (isKeyword("private")) {
+        visibility = ast::Visibility::Private; advance();
+    } else if (isKeyword("internal")) {
+        visibility = ast::Visibility::Internal; advance();
+    } else if (isKeyword("protected")) {
+        visibility = ast::Visibility::Protected; advance();
     }
-    advance();
 
     // Member-modifier prefix. The set the member-kind-switch below recognises
     // includes A.4 FieldDecl modifiers (`static`, `owned`, `readonly`) and the
@@ -316,19 +317,108 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         advance();
     }
 
-    // Member-kind keyword (`method` for slice 10; `property`, `event`, …
-    // arrive with their slices). Without one of those, this is a FieldDecl
-    // and the next token must be its name.
+    // Member-kind keyword. `method` (slice 10), `constructor` / `destructor`
+    // (slice 19). `property`, `event`, `operator`, `const` come with their
+    // own slices.
     if (isKeyword("method")) {
         return std::unique_ptr<ast::Member>(
             parseMethodDecl(visibility, std::move(modifiers)).release());
     }
+    if (isKeyword("constructor")) {
+        // Static constructor form has no visibility per A.4; instance form
+        // requires visibility. Both share the parsing path.
+        const bool isStatic =
+            std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("static")) != modifiers.end();
+        if (!isStatic && visibility == ast::Visibility::None) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected member visibility before "
+                                "'constructor' (or `static constructor`)");
+        }
+        auto ctor = std::make_unique<ast::ConstructorDecl>();
+        ctor->visibility = visibility;
+        ctor->isStatic = isStatic;
+        advance(); // past `constructor`
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected '(' to begin constructor parameter list");
+        }
+        ctor->params = parseParamList();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ')' to close constructor parameter list");
+        }
+        // CtorChain (`base(args);` / `this(args);`) is folded into the body's
+        // first statement — sema recognises the pattern. Avoids parser
+        // ambiguity with `this.field := ...`.
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (s) {
+                ctor->body.push_back(std::move(s));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close constructor body");
+        }
+        // Optional `constructor` label after `end` per §1.6 keyword-labelled
+        // termination.
+        if (isKeyword("constructor")) advance();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after 'end' of constructor");
+        }
+        return std::unique_ptr<ast::Member>(ctor.release());
+    }
+    if (isKeyword("destructor")) {
+        if (visibility != ast::Visibility::None) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "destructor has no visibility per §A.4");
+        }
+        auto dtor = std::make_unique<ast::DestructorDecl>();
+        advance(); // past `destructor`
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (s) {
+                dtor->body.push_back(std::move(s));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close destructor body");
+        }
+        if (isKeyword("destructor")) advance();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after 'end' of destructor");
+        }
+        return std::unique_ptr<ast::Member>(dtor.release());
+    }
 
+    // FieldDecl: visibility required.
+    if (visibility == ast::Visibility::None) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expected member visibility (public, private, internal, or "
+            "protected) or member-kind keyword (method, constructor, "
+            "destructor)");
+        return nullptr;
+    }
     if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(
             Severity::Error, current_.location,
-            "expected field name or member kind keyword "
-            "(other member forms are not yet supported)");
+            "expected field name or member kind keyword");
         return nullptr;
     }
 
@@ -546,6 +636,16 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
     }
 
     if (current_.kind == TokenKind::Identifier) {
+        auto e = std::make_unique<ast::IdentifierExpr>();
+        e->name = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+
+    // §22.3 `this` and `base` — reserved keywords (App. B.1) that name the
+    // current instance and the base-class projection. The AST stores them as
+    // IdentifierExpr with the keyword as the lexeme; sema interprets.
+    if (isKeyword("this") || isKeyword("base")) {
         auto e = std::make_unique<ast::IdentifierExpr>();
         e->name = current_.text;
         advance();
