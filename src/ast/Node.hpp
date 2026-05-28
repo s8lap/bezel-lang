@@ -631,6 +631,25 @@ struct TypeOfExpr : Expr { std::unique_ptr<Type> queriedType; };
 // recorded; sema resolves it.
 struct NameOfExpr : Expr { std::unique_ptr<QualifiedName> name; };
 
+// A.7 `DefaultExpr ::= "default" "(" Type ")"`.
+struct DefaultExpr : Expr { std::unique_ptr<Type> type; };
+
+// A.7 `CollectionLiteral`:
+//   "[" (Expression ("," Expression)*)? "]"        sequence
+//   "[" DictEntry ("," DictEntry)* "]"             dictionary
+//   DictEntry ::= Expression ":" Expression
+// Discriminated by what follows the first element: a `:` means dict form,
+// `,`/`]` means sequence form. Both stored in the same node — `isDict` and
+// the parallel `keys` vector tell them apart.
+struct CollectionLiteralExpr : Expr {
+    bool isDict = false;
+    std::vector<std::unique_ptr<Expr>> elements;  // sequence form: values
+                                                  // dict form: values
+    std::vector<std::unique_ptr<Expr>> keys;      // dict form: keys (parallel
+                                                  // to elements); empty for
+                                                  // sequence form
+};
+
 // A.7 `LambdaExpr ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody`. Slices
 // 28 and 36 together cover the full form; the buffered-lookahead
 // discriminator is in parsePrimaryExpression.

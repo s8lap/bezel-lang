@@ -56,7 +56,8 @@ set(BEZEL_TEST_SOURCES
     parser/serialized_clause_test.cpp
     parser/serialized_class_clause_test.cpp
     parser/catch_patterns_test.cpp
-    parser/constant_alternatives_test.cpp)
+    parser/constant_alternatives_test.cpp
+    parser/collection_literals_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

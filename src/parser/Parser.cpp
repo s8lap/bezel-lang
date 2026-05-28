@@ -1422,6 +1422,59 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
         }
         return std::unique_ptr<ast::Expr>(ne.release());
     }
+    // §A.7 `DefaultExpr ::= "default" "(" Type ")"`.
+    if (isKeyword("default")) {
+        advance();
+        auto de = std::make_unique<ast::DefaultExpr>();
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected '(' after 'default'");
+        }
+        de->type = parseType();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ')' to close 'default'");
+        }
+        return std::unique_ptr<ast::Expr>(de.release());
+    }
+    // §A.7 CollectionLiteral — `[ ... ]`. Two forms (sequence / dict)
+    // discriminated by what follows the first element: `:` means dict,
+    // `,`/`]` means sequence. An empty `[]` is the empty sequence form
+    // (the empty dict has no syntactic shape and must be expressed via
+    // `default(IDictionary<K,V>)` or a target-type-explicit factory call).
+    if (consumePunctuator("[")) {
+        auto cl = std::make_unique<ast::CollectionLiteralExpr>();
+        if (consumePunctuator("]")) {
+            return std::unique_ptr<ast::Expr>(cl.release());
+        }
+        auto first = parseExpression();
+        if (consumePunctuator(":")) {
+            cl->isDict = true;
+            cl->keys.push_back(std::move(first));
+            cl->elements.push_back(parseExpression());
+            while (consumePunctuator(",")) {
+                if (isPunctuator("]")) break; // trailing `,` permitted
+                cl->keys.push_back(parseExpression());
+                if (!consumePunctuator(":")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected ':' in dictionary literal entry");
+                }
+                cl->elements.push_back(parseExpression());
+            }
+        } else {
+            cl->elements.push_back(std::move(first));
+            while (consumePunctuator(",")) {
+                if (isPunctuator("]")) break;
+                cl->elements.push_back(parseExpression());
+            }
+        }
+        if (!consumePunctuator("]")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ']' to close collection literal");
+        }
+        return std::unique_ptr<ast::Expr>(cl.release());
+    }
 
     // A.7 `MoveExpr ::= "move" PrimaryExpr` — primary-level prefix per §28.6
     // for owned-field move-out.
