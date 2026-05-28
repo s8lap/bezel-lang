@@ -663,11 +663,21 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         std::string out = "try ";
         out += bodyToString(t->body);
         for (const auto& arm : t->catches) {
-            out += " catch var ";
-            out += std::string(arm.varName);
-            out += ": ";
-            out += arm.type ? typeToString(*arm.type)
-                            : std::string("<null>");
+            out += " catch ";
+            if (arm.hasBinding) {
+                out += "var ";
+                out += std::string(arm.varName);
+                out += ": ";
+            }
+            for (std::size_t i = 0; i < arm.types.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += arm.types[i] ? typeToString(*arm.types[i])
+                                    : std::string("<null>");
+            }
+            if (arm.guard) {
+                out += " when ";
+                out += exprToString(*arm.guard);
+            }
             out += " => ";
             out += arm.body ? stmtSummary(*arm.body)
                             : std::string("<null>");

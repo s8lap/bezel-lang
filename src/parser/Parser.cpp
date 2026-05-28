@@ -2163,27 +2163,35 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
             }
         }
         while (consumeKeyword("catch")) {
+            // A.6 CatchPattern: `Type ("," Type)*` OR
+            //   `"var" Identifier ":" Type ("," Type)*`.
             ast::CatchArm arm;
-            if (!consumeKeyword("var")) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected 'var' in catch arm (binding form is the "
-                    "only supported pattern for now)");
+            if (consumeKeyword("var")) {
+                arm.hasBinding = true;
+                if (current_.kind != TokenKind::Identifier) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected exception-binding name");
+                } else {
+                    arm.varName = current_.text;
+                    advance();
+                }
+                if (!consumePunctuator(":")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected ':' after catch binding name");
+                }
             }
-            if (current_.kind != TokenKind::Identifier) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected exception-binding name");
-            } else {
-                arm.varName = current_.text;
-                advance();
+            arm.types.push_back(parseType());
+            while (consumePunctuator(",")) {
+                // `,` here joins additional Types in the catch pattern. The
+                // top-level CatchBlock arm-separator `,` only appears AFTER
+                // the body — at this point we're still inside the pattern.
+                arm.types.push_back(parseType());
             }
-            if (!consumePunctuator(":")) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected ':' after catch binding name");
+            if (consumeKeyword("when")) {
+                arm.guard = parseExpression();
             }
-            arm.type = parseType();
             if (!consumePunctuator("=>")) {
                 diagnostics_.report(
                     Severity::Error, current_.location,

@@ -213,15 +213,20 @@ struct YieldStmt : Stmt {
     std::unique_ptr<Expr> value;     // populated for `yield return Expr;`
 };
 
-// A.6 CatchArm with the "with-binding" pattern only:
-//   `"var" Identifier ":" Type "=>" Statement`.
-// The no-binding form, multi-Type patterns (`Type1, Type2`), `when` guards,
-// and the `do … end` / Expression arm bodies are deferred to a later slice
-// (they share grammar with the §19 case construct).
+// A.6 CatchArm (slice 22 + slice 43):
+//   CatchPattern ::= Type ("," Type)*                          /* no binding */
+//                  | "var" Identifier ":" Type ("," Type)*      /* binding */
+//   CatchArm     ::= CatchPattern ("when" Expression)? "=>" ArmBody
+//
+// ArmBody is parsed as a single Stmt (which can be a DoEndBlock —
+// `do Statement* end ;` — for multi-statement bodies). The Expression
+// form is admitted only inside CaseExpr, not catch arms.
 struct CatchArm {
-    std::string_view varName;
-    std::unique_ptr<Type> type;
-    std::unique_ptr<Stmt> body; // single Statement form
+    bool hasBinding = false;     // `var IDENT : ...` vs plain `Type, ...`
+    std::string_view varName;    // empty when !hasBinding
+    std::vector<std::unique_ptr<Type>> types; // 1+ entries (the CatchPattern)
+    std::unique_ptr<Expr> guard; // optional `when EXPR`
+    std::unique_ptr<Stmt> body;  // single Statement (may be DoEndBlock)
 };
 
 // A.6 TryStmt: `"try" Statement* CatchBlock FinallyClause? "end" ";"` or
