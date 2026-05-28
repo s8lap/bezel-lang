@@ -186,6 +186,35 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
                                : std::string("<null>");
         return out;
     }
+    if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&decl)) {
+        std::string out = visibilityPrefix(ext->visibility);
+        out += "extension ";
+        out += ext->targetType ? typeToString(*ext->targetType)
+                               : std::string("<null>");
+        return out;
+    }
+    if (auto* x = dynamic_cast<const ast::ExternBlock*>(&decl)) {
+        std::string out = "extern ";
+        out += std::string(x->library);
+        if (!x->convention.empty()) {
+            out += " convention ";
+            out += std::string(x->convention);
+        }
+        out += " { ";
+        for (std::size_t i = 0; i < x->methods.size(); ++i) {
+            if (i > 0) out += ' ';
+            out += "method ";
+            out += std::string(x->methods[i].name);
+            out += "()";
+            if (x->methods[i].returnType) {
+                out += ": ";
+                out += typeToString(*x->methods[i].returnType);
+            }
+            out += ';';
+        }
+        out += " }";
+        return out;
+    }
     return "<unknown>";
 }
 

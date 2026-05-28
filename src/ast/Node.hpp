@@ -480,6 +480,34 @@ struct ThrowExpr : Expr {
     std::unique_ptr<Expr> operand; // null for bare `throw`
 };
 
+// A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*
+//                          ExtensionMember* "end" ";"`.
+struct ExtensionDecl : TopDecl {
+    Visibility visibility = Visibility::None;
+    std::unique_ptr<Type> targetType;
+    std::vector<GenericConstraint> genericConstraints;
+    std::vector<std::unique_ptr<Member>> members;
+};
+
+// A.3 `ExternDecl ::= Visibility? "method" Identifier "(" ParamList? ")"
+//                      (":" "owned"? Type)? ";"`. Single FFI method
+// declaration inside an extern block.
+struct ExternDecl {
+    Visibility visibility = Visibility::None;
+    std::string_view name;
+    std::vector<Param> params;
+    std::unique_ptr<Type> returnType;
+    bool returnOwned = false;
+};
+
+// A.3 `ExternBlock ::= "extern" StringLiteral ("convention" StringLiteral)?
+//                       ExternDecl+ "end" ";"`. §32.
+struct ExternBlock : TopDecl {
+    std::string_view library;     // the StringLiteral lexeme (with quotes)
+    std::string_view convention;  // empty if no `convention "..."`
+    std::vector<ExternDecl> methods;
+};
+
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)
 //
 // `module` is required by the spec on every source file's first non-comment,
