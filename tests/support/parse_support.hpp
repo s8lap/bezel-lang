@@ -292,7 +292,23 @@ inline std::string exprToString(const ast::Expr& e) {
                                       : std::string("<null>")) + ")";
     }
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
-        std::string out = "(() => ";
+        std::string out = "(";
+        if (lam->isAsync) out += "async ";
+        out += '(';
+        for (std::size_t i = 0; i < lam->params.size(); ++i) {
+            if (i > 0) out += ", ";
+            const auto& p = lam->params[i];
+            if (!p.modifier.empty()) {
+                out += std::string(p.modifier);
+                out += ' ';
+            }
+            out += std::string(p.name);
+            if (p.type) {
+                out += ": ";
+                out += typeToString(*p.type);
+            }
+        }
+        out += ") => ";
         if (lam->isBlockBody) {
             out += "do { ";
             for (std::size_t i = 0; i < lam->stmts.size(); ++i) {
