@@ -78,6 +78,14 @@ struct TopDecl : Node {};
 struct Type; // defined after TypeDecl; used by TypeDecl::baseTypes.
 struct Expr; // defined further below; used by FieldDecl::initializer.
 
+// A.3 `GenericParam ::= Variance? Identifier`. Used by both type declarations
+// (via TypeDecl::genericParams) and methods (via MethodDecl::genericParams);
+// declared up here so MethodDecl can reference it before TypeDecl is defined.
+struct GenericParam {
+    std::string_view variance; // "in", "out", or empty
+    std::string_view name;
+};
+
 // Common base for type members (FieldDecl, MethodDecl, PropertyDecl, …).
 // Slice 6 introduces FieldDecl only; other kinds arrive with their slices.
 struct Member : Node {};
@@ -92,12 +100,45 @@ struct FieldDecl : Member {
     std::unique_ptr<Expr> initializer; // null if no `:= Expr` was written
 };
 
-// A.3 `GenericParam ::= Variance? Identifier` where Variance is `in` or `out`
-// (both reserved keywords per §B.1). Slice 5 covers the basic form;
-// constraints (`where T: ...`, A.3 GenericConstraints) are a later slice.
-struct GenericParam {
-    std::string_view variance; // "in", "out", or empty
+// Base for slice-11+ Statement nodes; placeholder so MethodDecl can already
+// hold a statement vector. Concrete subclasses arrive with the statements
+// slice.
+struct Stmt : Node {};
+
+// One parameter in a method's parameter list. Slice 10 covers
+// `Identifier ":" Type`; modifiers (`ref`/`out`/`out owned`/`owned`) and
+// default values come with later slices.
+struct Param {
     std::string_view name;
+    std::unique_ptr<Type> type;
+};
+
+// A.4: `MethodDecl ::= Visibility "static"? "async"? VirtualKind?
+//                      "method" Identifier GenericParams?
+//                      "(" ParamList? ")" (":" "owned"? Type)?
+//                      GenericConstraints*
+//                      MethodBody`
+// MethodBody has three shapes per A.4:
+//   `=> Expression ";"` (expression-body)
+//   `Statement* "end" Identifier? ";"` (block body)
+//   `";"` (abstract — body-less)
+enum class MethodBodyKind { Expression, Block, Abstract };
+
+struct MethodDecl : Member {
+    Visibility visibility = Visibility::None;
+    // Grammar `static`/`async`/VirtualKind keywords, recorded as the literal
+    // lexemes. Semantically valid combinations are sema's responsibility.
+    std::vector<std::string_view> modifiers;
+    std::string_view name;
+    std::vector<GenericParam> genericParams;
+    std::vector<Param> params;
+    std::unique_ptr<Type> returnType; // null when no `:` return type
+    bool returnOwned = false;
+
+    MethodBodyKind bodyKind = MethodBodyKind::Abstract;
+    std::unique_ptr<Expr> exprBody;        // populated when bodyKind=Expression
+    std::vector<std::unique_ptr<Stmt>> stmts; // for Block (empty until slice 11+)
+    std::string_view endLabel;             // optional `end Identifier?` for Block
 };
 
 // Class-like top-level declaration. Slice 3 introduced the empty body; slice

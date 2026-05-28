@@ -62,10 +62,13 @@ private:
     // base-class argument list `(...)` after each item is currently skipped
     // (it contains expressions; see the inheritance slice notes in the PR).
     std::vector<std::unique_ptr<ast::Type>> parseInheritance();
-    // Slice 6: a single class member. Currently only FieldDecl is supported
-    // (with optional initializer expression); other Member forms emit a
-    // diagnostic.
+    // Slice 6/10: a single class member. FieldDecl (with optional initializer)
+    // and MethodDecl (with expression/block/abstract body); other Member forms
+    // arrive with their slices.
     std::unique_ptr<ast::Member> parseMember();
+    std::unique_ptr<ast::MethodDecl> parseMethodDecl(
+        ast::Visibility visibility, std::vector<std::string_view> modifiers);
+    std::vector<ast::Param> parseParamList();
     // Slice 7: primary expressions plus postfix `.member` and `(args)`.
     // Slice 8: precedence-climbing binary expressions wrap primary+postfix.
     // Slice 9: unary prefix sits between binary and postfix.
