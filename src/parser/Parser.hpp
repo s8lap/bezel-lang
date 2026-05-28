@@ -71,7 +71,11 @@ private:
     // and MethodDecl (with expression/block/abstract body); other Member forms
     // arrive with their slices.
     std::unique_ptr<ast::Member> parseMember();
-    std::unique_ptr<ast::MethodDecl> parseMethodDecl(
+    // Caller has already consumed the `method` keyword.
+    std::unique_ptr<ast::MethodDecl> parseMethodDeclBody(
+        ast::Visibility visibility, std::vector<std::string_view> modifiers);
+    // Caller has already consumed `method operator`.
+    std::unique_ptr<ast::Member> parseOperatorDeclBody(
         ast::Visibility visibility, std::vector<std::string_view> modifiers);
     std::vector<ast::Param> parseParamList();
     // Slice 11: a single statement. Dispatches on the first token: `var` /

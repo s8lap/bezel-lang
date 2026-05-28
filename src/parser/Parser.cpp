@@ -233,11 +233,12 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         return decl;
     }
 
-    // §A.4 Members: slice 6 covers class fields without initializers. Other
-    // type kinds and other member forms come in later slices, so their
-    // bodies stay empty here. Enums get their own constants-list parsing
-    // (slice 20); EnumMember (methods/properties on enums) is later.
-    if (decl->kind == ast::TypeDeclKind::Class) {
+    // §A.4 Members. Classes and records share the same Member set per A.4;
+    // interface members (IfaceMethod/IfaceProperty/etc.) are a smaller set
+    // with a different grammar and land in their own slice. Enums get
+    // EnumConstants below.
+    if (decl->kind == ast::TypeDeclKind::Class ||
+        decl->kind == ast::TypeDeclKind::Record) {
         while (!isKeyword("end") &&
                current_.kind != TokenKind::EndOfFile) {
             auto member = parseMember();
@@ -426,8 +427,8 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
 
 std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
     // A.2: `TypeAliasDecl ::= "type" Identifier GenericParams? "=" Type
-    //                          GenericConstraints* ";"`.
-    // Slice 4: degenerate form — no generic params, no constraints.
+    //                          GenericConstraints* ";"`. Slice 27 completes
+    // the optional GenericParams and trailing GenericConstraints.
     auto alias = std::make_unique<ast::TypeAlias>();
     advance(); // past `type`
 
@@ -439,12 +440,15 @@ std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
         advance();
     }
 
+    alias->genericParams = parseGenericParams();
+
     if (!consumePunctuator("=")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected '=' in type alias");
     }
 
     alias->aliasedType = parseType();
+    alias->genericConstraints = parseGenericConstraints();
 
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
@@ -589,10 +593,18 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         }
         return std::unique_ptr<ast::Member>(pd.release());
     }
-    // `method` (slice 10), `constructor` / `destructor` (slice 19).
-    if (isKeyword("method")) {
+    // `method` (slice 10), `method operator` (slice 27),
+    // `constructor` / `destructor` (slice 19). `operator` is a contextual
+    // keyword (App. B.2) so the lexer emits it as Identifier; we check by
+    // identifier text rather than via isKeyword.
+    if (consumeKeyword("method")) {
+        if (current_.kind == TokenKind::Identifier &&
+            current_.text == "operator") {
+            advance();
+            return parseOperatorDeclBody(visibility, std::move(modifiers));
+        }
         return std::unique_ptr<ast::Member>(
-            parseMethodDecl(visibility, std::move(modifiers)).release());
+            parseMethodDeclBody(visibility, std::move(modifiers)).release());
     }
     if (isKeyword("constructor")) {
         // Static constructor form has no visibility per A.4; instance form
@@ -1044,13 +1056,13 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
     return head;
 }
 
-std::unique_ptr<ast::MethodDecl> Parser::parseMethodDecl(
+std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
     ast::Visibility visibility, std::vector<std::string_view> modifiers) {
-    // Caller has verified `current_` is the `method` keyword.
+    // Caller has already consumed the `method` keyword. We pick up at the
+    // method name.
     auto m = std::make_unique<ast::MethodDecl>();
     m->visibility = visibility;
     m->modifiers = std::move(modifiers);
-    advance(); // past `method`
 
     if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(Severity::Error, current_.location,
@@ -1529,6 +1541,80 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
                             "expected ';' after expression statement");
     }
     return std::unique_ptr<ast::Stmt>(es.release());
+}
+
+std::unique_ptr<ast::Member> Parser::parseOperatorDeclBody(
+    ast::Visibility visibility, std::vector<std::string_view> modifiers) {
+    // A.4 `OperatorDecl ::= Visibility "static" "method" "operator" OpToken
+    //                        "(" ParamList ")" ":" "owned"? Type
+    //                        OperatorBody`. Caller has consumed
+    // `method operator`.
+    auto op = std::make_unique<ast::OperatorDecl>();
+    op->visibility = visibility;
+    (void)modifiers; // `static` is grammar-required for operators; sema checks.
+    // OpToken: whatever punctuator (or keyword like `mod`) the operator is.
+    op->opToken = current_.text;
+    advance();
+    if (!consumePunctuator("(")) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expected '(' to begin operator parameter list");
+    }
+    op->params = parseParamList();
+    if (!consumePunctuator(")")) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expected ')' to close operator parameter list");
+    }
+    if (!consumePunctuator(":")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "operator overload requires a return type");
+    }
+    if (isKeyword("owned")) {
+        op->returnOwned = true;
+        advance();
+    }
+    op->returnType = parseType();
+    // OperatorBody mirrors MethodBody (Expression / Block / Abstract).
+    if (consumePunctuator("=>")) {
+        op->bodyKind = ast::MethodBodyKind::Expression;
+        op->exprBody = parseExpression();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after expression-body operator");
+        }
+    } else if (consumePunctuator(";")) {
+        op->bodyKind = ast::MethodBodyKind::Abstract;
+    } else {
+        op->bodyKind = ast::MethodBodyKind::Block;
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (s) {
+                op->stmts.push_back(std::move(s));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close operator body");
+        }
+        // §1.6 keyword-labelled construct: `end operator OpToken?`.
+        if (isKeyword("operator")) {
+            advance();
+            // The OpToken itself may also follow.
+            if (current_.kind == TokenKind::Punctuator) {
+                advance();
+            }
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of operator");
+        }
+    }
+    return std::unique_ptr<ast::Member>(op.release());
 }
 
 std::vector<ast::Param> Parser::parseParamList() {
