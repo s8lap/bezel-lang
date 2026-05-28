@@ -59,7 +59,8 @@ set(BEZEL_TEST_SOURCES
     parser/constant_alternatives_test.cpp
     parser/collection_literals_test.cpp
     parser/type_extensions_test.cpp
-    parser/enum_members_test.cpp)
+    parser/enum_members_test.cpp
+    parser/auto_accessor_vis_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

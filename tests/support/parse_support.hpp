@@ -953,6 +953,12 @@ inline std::string memberSummary(const ast::Member& m) {
                                     : std::string("<null>");
                 break;
             case ast::PropertyBodyKind::Auto:
+                if (pd->hasAutoAccessorVis) {
+                    out += ' ';
+                    out += visibilityPrefix(pd->autoAccessorVis);
+                    // visibilityPrefix() already adds a trailing space.
+                    out += pd->autoAccessorIsSet ? "set" : "get";
+                }
                 if (pd->autoInitializer) {
                     out += " := ";
                     out += exprToString(*pd->autoInitializer);
