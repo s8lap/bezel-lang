@@ -47,7 +47,8 @@ set(BEZEL_TEST_SOURCES
     parser/indexer_test.cpp
     parser/event_decl_test.cpp
     parser/interface_members_test.cpp
-    parser/await_using_and_for_test.cpp)
+    parser/await_using_and_for_test.cpp
+    parser/parameterised_lambdas_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

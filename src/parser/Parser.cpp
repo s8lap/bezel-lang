@@ -27,23 +27,24 @@ Parser::Parser(Lexer& lexer, DiagnosticEngine& diagnostics)
 }
 
 void Parser::advance() {
-    if (peeked_) {
-        current_ = std::move(*peeked_);
-        peeked_.reset();
+    if (!peeked_.empty()) {
+        current_ = std::move(peeked_.front());
+        peeked_.pop_front();
     } else {
         current_ = lexer_.next();
     }
 }
 
-const Token& Parser::peekNext() {
-    // One-token lookahead beyond `current_`. Lazily populated; cleared by
-    // advance(). Used sparingly by constructs that need to distinguish a
-    // statement-starting `await` for an expression-stmt from `await using var`
-    // / `await for ...` LocalDecl / ForStmt variants.
-    if (!peeked_) {
-        peeked_ = lexer_.next();
+const Token& Parser::peekAt(std::size_t k) {
+    // k=0 returns the current token; k>=1 reads from the buffered lookahead,
+    // filling it lazily from the lexer. Cheap for the small k typically
+    // needed; the discriminator for `(…) => …` may scan to the matching `)`
+    // before deciding lambda-vs-paren.
+    if (k == 0) return current_;
+    while (peeked_.size() < k) {
+        peeked_.push_back(lexer_.next());
     }
-    return *peeked_;
+    return peeked_[k - 1];
 }
 
 bool Parser::isKeyword(std::string_view text) const {
@@ -1188,39 +1189,64 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
         return std::unique_ptr<ast::Expr>(n.release());
     }
 
-    if (consumePunctuator("(")) {
-        // Empty-params lambda `() => …`. `(x) => …` and `(x: T, y) => …`
-        // need multi-token lookahead to disambiguate from paren expression
-        // and are deferred.
-        if (consumePunctuator(")")) {
-            if (consumePunctuator("=>")) {
-                auto lam = std::make_unique<ast::LambdaExpr>();
-                if (consumeKeyword("do")) {
-                    lam->isBlockBody = true;
-                    while (!isKeyword("end") &&
-                           current_.kind != TokenKind::EndOfFile) {
-                        auto s = parseStatement();
-                        if (s) {
-                            lam->stmts.push_back(std::move(s));
-                        } else if (current_.kind != TokenKind::EndOfFile) {
-                            advance();
-                        }
-                    }
-                    if (!consumeKeyword("end")) {
-                        diagnostics_.report(
-                            Severity::Error, current_.location,
-                            "expected 'end' to close lambda block body");
-                    }
-                } else {
-                    lam->exprBody = parseExpression();
-                }
-                return std::unique_ptr<ast::Expr>(lam.release());
-            }
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "'()' is not a valid expression");
-            return nullptr;
+    // Lambda: `async? "(" LambdaParams? ")" "=>" LambdaBody` (A.7). The
+    // discriminator is "what follows the matching `)`?": `=>` means lambda,
+    // anything else means parenthesised expression. We need to scan past the
+    // matching `)` before deciding — that is the parser's one use of
+    // unbounded buffered lookahead (peekAt).
+    const bool asyncLambdaCandidate =
+        isKeyword("async") &&
+        peekAt(1).kind == TokenKind::Punctuator && peekAt(1).text == "(" &&
+        tokensLookLikeLambda(1);
+    const bool plainLambdaCandidate =
+        isPunctuator("(") && tokensLookLikeLambda(0);
+
+    if (asyncLambdaCandidate || plainLambdaCandidate) {
+        auto lam = std::make_unique<ast::LambdaExpr>();
+        if (asyncLambdaCandidate) {
+            lam->isAsync = true;
+            advance(); // past `async`
         }
+        consumePunctuator("("); // confirmed by lookahead
+        if (!consumePunctuator(")")) {
+            // Non-empty LambdaParams.
+            lam->params.push_back(parseLambdaParam());
+            while (consumePunctuator(",")) {
+                lam->params.push_back(parseLambdaParam());
+            }
+            if (!consumePunctuator(")")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ')' to close lambda parameter list");
+            }
+        }
+        if (!consumePunctuator("=>")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected '=>' in lambda expression");
+        }
+        if (consumeKeyword("do")) {
+            lam->isBlockBody = true;
+            while (!isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto s = parseStatement();
+                if (s) {
+                    lam->stmts.push_back(std::move(s));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+            if (!consumeKeyword("end")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'end' to close lambda block body");
+            }
+        } else {
+            lam->exprBody = parseExpression();
+        }
+        return std::unique_ptr<ast::Expr>(lam.release());
+    }
+
+    if (consumePunctuator("(")) {
         // No ParenExpr node: source-level parens only group the parse; the
         // resulting tree shape encodes the grouping directly. See Node.hpp.
         auto inner = parseExpression();
@@ -1234,6 +1260,59 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
     diagnostics_.report(Severity::Error, current_.location,
                         "expected expression");
     return nullptr;
+}
+
+bool Parser::tokensLookLikeLambda(std::size_t startK) {
+    // peekAt(startK) must be `(`. Scan forward through balanced parens to
+    // find the matching `)`, then return true iff `=>` follows. Brackets
+    // `[]` and angles `<>` need not be balanced separately: they nest
+    // *inside* the outer `(...)` regardless, and we only care about which
+    // `)` matches the leading `(`. Bails out on EOF.
+    std::size_t depth = 1;
+    std::size_t k = startK + 1;
+    for (;;) {
+        const Token& t = peekAt(k);
+        if (t.kind == TokenKind::EndOfFile) return false;
+        if (t.kind == TokenKind::Punctuator) {
+            if (t.text == "(") ++depth;
+            else if (t.text == ")") {
+                if (--depth == 0) {
+                    const Token& after = peekAt(k + 1);
+                    return after.kind == TokenKind::Punctuator &&
+                           after.text == "=>";
+                }
+            }
+        }
+        ++k;
+    }
+}
+
+ast::Param Parser::parseLambdaParam() {
+    // A.7 `LambdaParam ::= FuncParamMods? Identifier (":" Type)?`. Type is
+    // optional (unlike A.4 method ParamList).
+    ast::Param p;
+    if (consumeKeyword("ref")) {
+        p.modifier = "ref";
+    } else if (consumeKeyword("out")) {
+        if (consumeKeyword("owned")) {
+            p.modifier = "out owned";
+        } else {
+            p.modifier = "out";
+        }
+    } else if (consumeKeyword("owned")) {
+        p.modifier = "owned";
+    }
+    if (current_.kind != TokenKind::Identifier) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected lambda parameter name");
+    } else {
+        p.name = current_.text;
+        advance();
+    }
+    if (consumePunctuator(":")) {
+        p.type = parseType();
+    }
+    return p;
 }
 
 std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head) {

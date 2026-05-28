@@ -8,8 +8,9 @@
 // `current_`. Errors are reported to the diagnostic engine and the parser
 // attempts to recover; for slice 1 (module declarations) recovery is minimal.
 
+#include <cstddef>
+#include <deque>
 #include <memory>
-#include <optional>
 #include <string_view>
 
 #include "ast/Node.hpp"
@@ -32,10 +33,14 @@ private:
     // Recursive-descent primitives.
     void advance();
     const Token& peek() const { return current_; }
-    // One-token lookahead beyond `current_`. Use sparingly: parser is
-    // structurally one-token-lookahead and constructs should keep that shape
-    // wherever possible.
-    const Token& peekNext();
+    // Multi-token lookahead. `peekAt(0)` is `current_`; `peekAt(k)` returns
+    // the k-th token beyond it. The buffer is lazily filled and drained by
+    // `advance()`. Use sparingly: the parser is one-token-lookahead almost
+    // everywhere; buffered lookahead exists for constructs that can't be
+    // disambiguated locally (e.g. `(...) => …` lambda vs. parenthesised
+    // expression, see parsePrimaryExpression).
+    const Token& peekAt(std::size_t k);
+    const Token& peekNext() { return peekAt(1); }
     bool isKeyword(std::string_view text) const;
     bool isPunctuator(std::string_view text) const;
     bool consumeKeyword(std::string_view text);
@@ -84,6 +89,13 @@ private:
     std::unique_ptr<ast::Member> parseOperatorDeclBody(
         ast::Visibility visibility, std::vector<std::string_view> modifiers);
     std::vector<ast::Param> parseParamList();
+    // Slice 36: a single LambdaParam (A.7). Differs from method ParamList
+    // in that the `: Type` ascription is optional.
+    ast::Param parseLambdaParam();
+    // Slice 36: peeks the matching `)` for the `(` at peekAt(startK) and
+    // returns true iff a `=>` follows. Used to distinguish
+    // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.
+    bool tokensLookLikeLambda(std::size_t startK);
     // Slice 11: a single statement. Dispatches on the first token: `var` /
     // `using` for LocalDecl, `return` for ReturnStmt, otherwise an
     // expression that may be the start of an AssignmentStmt or an
@@ -102,7 +114,7 @@ private:
     Lexer& lexer_;
     DiagnosticEngine& diagnostics_;
     Token current_{};
-    std::optional<Token> peeked_; // see peekNext()
+    std::deque<Token> peeked_; // see peekAt()
 };
 
 } // namespace bezel
