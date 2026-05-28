@@ -33,7 +33,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(BEZEL_WERROR "Treat compiler warnings as errors" OFF)
 
 add_library(bezel_warnings INTERFACE)
-target_compile_options(bezel_warnings INTERFACE -Wall -Wextra -Wpedantic)
+target_compile_options(bezel_warnings INTERFACE
+    -Wall -Wextra -Wpedantic
+    # Trigraphs were removed in C++17 (we build at C++20). Clang still warns
+    # on `??=` etc. as a portability hint, which is moot here and would force
+    # `"\?\?="`-style escapes throughout the lexer's punctuator match tables.
+    -Wno-trigraphs)
 if(BEZEL_WERROR)
     target_compile_options(bezel_warnings INTERFACE -Werror)
 endif()
