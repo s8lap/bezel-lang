@@ -1450,6 +1450,40 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
             tt->op = opText;
             tt->testType = parseType();
             left = std::unique_ptr<ast::Expr>(tt.release());
+        } else if (opText == ".." || opText == "..<") {
+            // §A.7 RangeExpr. The right (Shift) is optional — `a..` is the
+            // low-only form. An optional `step EXPR` may follow (contextual
+            // keyword per App. B.2).
+            auto re = std::make_unique<ast::RangeExpr>();
+            re->inclusive = (opText == "..");
+            re->lo = std::move(left);
+            auto isStopTok = [&]() {
+                if (current_.kind == TokenKind::EndOfFile) return true;
+                if (current_.kind == TokenKind::Punctuator) {
+                    return current_.text == ";" || current_.text == ")" ||
+                           current_.text == "]" || current_.text == "}" ||
+                           current_.text == "," || current_.text == "=>";
+                }
+                if (current_.kind == TokenKind::Keyword) {
+                    return current_.text == "do" || current_.text == "with" ||
+                           current_.text == "when" ||
+                           current_.text == "end" ||
+                           current_.text == "else" ||
+                           current_.text == "elif";
+                }
+                if (current_.kind == TokenKind::Identifier &&
+                    current_.text == "step") return true;
+                return false;
+            };
+            if (!isStopTok()) {
+                re->hi = parseBinaryExpression(prec + 1);
+            }
+            if (current_.kind == TokenKind::Identifier &&
+                current_.text == "step") {
+                advance();
+                re->step = parseBinaryExpression(prec + 1);
+            }
+            left = std::unique_ptr<ast::Expr>(re.release());
         } else {
             const int nextMin =
                 isRightAssociative(opText) ? prec : prec + 1;
@@ -1518,6 +1552,41 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
         e->text = current_.text;
         advance();
         return std::unique_ptr<ast::Expr>(e.release());
+    }
+    // §A.7 high-only and fully-open RangeExpr forms: `..b`, `..<b`, `..`.
+    // (Low-only `a..` and the with-bound forms `a..b` / `a..<b` arrive
+    // through parseBinaryExpression's range path.)
+    if (isPunctuator("..") || isPunctuator("..<")) {
+        auto re = std::make_unique<ast::RangeExpr>();
+        re->inclusive = (current_.text == "..");
+        advance();
+        auto isStopTok = [&]() {
+            if (current_.kind == TokenKind::EndOfFile) return true;
+            if (current_.kind == TokenKind::Punctuator) {
+                return current_.text == ";" || current_.text == ")" ||
+                       current_.text == "]" || current_.text == "}" ||
+                       current_.text == "," || current_.text == "=>";
+            }
+            if (current_.kind == TokenKind::Keyword) {
+                return current_.text == "do" || current_.text == "with" ||
+                       current_.text == "when" || current_.text == "end" ||
+                       current_.text == "else" || current_.text == "elif";
+            }
+            if (current_.kind == TokenKind::Identifier &&
+                current_.text == "step") return true;
+            return false;
+        };
+        if (!isStopTok()) {
+            // Use binary precedence 11+1 (one above range itself) so the
+            // hi-bound parses as a Shift expression per A.7.
+            re->hi = parseBinaryExpression(12);
+        }
+        if (current_.kind == TokenKind::Identifier &&
+            current_.text == "step") {
+            advance();
+            re->step = parseBinaryExpression(12);
+        }
+        return std::unique_ptr<ast::Expr>(re.release());
     }
 
     // §18.2 boolean and null keyword literals.
@@ -1902,16 +1971,15 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern() {
         np->name = std::move(qn);
         return std::unique_ptr<ast::Pattern>(np.release());
     }
-    // Catch-all: parse an Expression and classify. A `..` / `..<` BinaryExpr
-    // at the root is a RangePattern with lower bound; otherwise wrap as a
-    // ConstantPattern with one or more `,`-separated constants (slice 44).
+    // Catch-all: parse an Expression and classify. A RangeExpr at the root
+    // is a RangePattern (slice 52 — replaces the earlier BinaryExpr-based
+    // representation); otherwise wrap as a ConstantPattern with one or
+    // more `,`-separated constants (slice 44).
     auto e = parseExpression();
-    if (auto* be = dynamic_cast<ast::BinaryExpr*>(e.get())) {
-        if (be->op == ".." || be->op == "..<") {
-            auto rp = std::make_unique<ast::RangePattern>();
-            rp->rangeExpr = std::move(e);
-            return std::unique_ptr<ast::Pattern>(rp.release());
-        }
+    if (dynamic_cast<ast::RangeExpr*>(e.get())) {
+        auto rp = std::make_unique<ast::RangePattern>();
+        rp->rangeExpr = std::move(e);
+        return std::unique_ptr<ast::Pattern>(rp.release());
     }
     auto cp = std::make_unique<ast::ConstantPattern>();
     cp->constants.push_back(std::move(e));
