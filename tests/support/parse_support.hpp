@@ -206,6 +206,23 @@ inline std::string exprToString(const ast::Expr& e) {
         out += ')';
         return out;
     }
+    if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        std::string out = "(";
+        out += c->thenValue ? exprToString(*c->thenValue)
+                            : std::string("<null>");
+        out += " if ";
+        out += c->condition ? exprToString(*c->condition)
+                            : std::string("<null>");
+        out += " else ";
+        out += c->elseValue ? exprToString(*c->elseValue)
+                            : std::string("<null>");
+        out += ')';
+        return out;
+    }
+    if (auto* t = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (!t->operand) return std::string("(throw)");
+        return "(throw " + exprToString(*t->operand) + ")";
+    }
     if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         std::string out = "(";
         out += tt->operand ? exprToString(*tt->operand)
@@ -366,6 +383,15 @@ inline std::string stmtSummary(const ast::Stmt& s) {
     }
     if (dynamic_cast<const ast::BreakStmt*>(&s))    return "break;";
     if (dynamic_cast<const ast::ContinueStmt*>(&s)) return "continue;";
+    if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        std::string out = "throw";
+        if (th->value) {
+            out += ' ';
+            out += exprToString(*th->value);
+        }
+        out += ';';
+        return out;
+    }
     return "<unknown stmt>";
 }
 

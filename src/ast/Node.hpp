@@ -137,6 +137,11 @@ struct AssignmentStmt : Stmt {
     std::unique_ptr<Expr> value;
 };
 
+// A.6: `ThrowStmt ::= "throw" Expression? ";"`.
+struct ThrowStmt : Stmt {
+    std::unique_ptr<Expr> value;
+};
+
 // A.6: `IfStmt ::= "if" Expression "then" Statement*
 //                  ("elif" Expression "then" Statement*)*
 //                  ("else" Statement*)? "end" ";"`
@@ -344,6 +349,19 @@ struct TypeTestExpr : Expr {
     std::unique_ptr<Expr> operand;
     std::string_view op; // "is", "is not", or "as"
     std::unique_ptr<Type> testType;
+};
+
+// §17.1 L15 conditional: `X if cond else Y`. Right-associative.
+struct ConditionalExpr : Expr {
+    std::unique_ptr<Expr> thenValue;  // X
+    std::unique_ptr<Expr> condition;  // cond
+    std::unique_ptr<Expr> elseValue;  // Y
+};
+
+// §A.7 ThrowExpr: `throw Expression?`. Bare `throw` is valid only inside a
+// catch arm body; sema enforces context.
+struct ThrowExpr : Expr {
+    std::unique_ptr<Expr> operand; // null for bare `throw`
 };
 
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)

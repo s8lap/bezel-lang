@@ -399,6 +399,27 @@ bool isRightAssociative(std::string_view op) {
 } // namespace
 
 std::unique_ptr<ast::Expr> Parser::parseExpression() {
+    // §A.7 ThrowExpr: recognised here. Conditional `X if cond else Y` (§17.1
+    // L15, §A.7) is NOT implemented in this slice — naive `if`-suffix
+    // parsing on every expression gobbles the `if` of an IfStmt that lives
+    // in a statement-following-expression position (e.g. `while cond if foo
+    // then ... end;`). A clean fix probably needs either a body-start
+    // keyword on WhileStmt (a spec change) or required parens around the
+    // conditional. Left for a deliberate slice.
+    if (isKeyword("throw")) {
+        advance();
+        auto te = std::make_unique<ast::ThrowExpr>();
+        const bool atTerminator =
+            (current_.kind == TokenKind::EndOfFile) ||
+            (current_.kind == TokenKind::Punctuator &&
+             (current_.text == ";" || current_.text == ")" ||
+              current_.text == "," || current_.text == "]")) ||
+            (current_.kind == TokenKind::Keyword && current_.text == "end");
+        if (!atTerminator) {
+            te->operand = parseExpression();
+        }
+        return std::unique_ptr<ast::Expr>(te.release());
+    }
     return parseBinaryExpression(1);
 }
 
@@ -902,6 +923,20 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
                                 "expected ';' after return statement");
         }
         return std::unique_ptr<ast::Stmt>(ret.release());
+    }
+
+    // ThrowStmt (A.6): `throw Expression? ";"`.
+    if (isKeyword("throw")) {
+        advance();
+        auto th = std::make_unique<ast::ThrowStmt>();
+        if (!isPunctuator(";")) {
+            th->value = parseExpression();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after throw statement");
+        }
+        return std::unique_ptr<ast::Stmt>(th.release());
     }
 
     // Otherwise parse an expression and decide: AssignmentStmt if it's
