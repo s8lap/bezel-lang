@@ -51,15 +51,50 @@ struct Import : Node {
     std::unique_ptr<QualifiedName> name;
 };
 
+// §13 visibility keywords; `None` means the declaration carries no explicit
+// visibility (the default is type-context-dependent per §13).
+enum class Visibility {
+    None,
+    Public,
+    Private,
+    Internal,
+    Protected,
+};
+
+// Distinguishes the four class-like top-level declarations parsed in slice 3.
+// Extension declarations (§26), type aliases (§A.2 TypeAliasDecl), and
+// extern blocks (§32) get their own AST nodes in their own slices.
+enum class TypeDeclKind {
+    Class,     // §11
+    Interface, // §11.x / §A.3 InterfaceDecl
+    Record,    // §9
+    Enum,      // §10
+};
+
+// Slice 3: empty class-like top-level declaration. Members, inheritance,
+// generic parameters, primary-constructor parameters, and the serialization
+// clauses on classes/records are all left for later slices; the body parsed
+// here is just `end Identifier? ;`. The grammar productions
+// `ClassDecl`/`InterfaceDecl`/`RecordDecl`/`EnumDecl` share enough shape
+// (Visibility? Modifier* keyword Identifier ... body) that one struct with a
+// `kind` tag is the right model until per-kind members force a split.
+struct TypeDecl : Node {
+    TypeDeclKind kind = TypeDeclKind::Class;
+    Visibility visibility = Visibility::None;
+    std::vector<std::string_view> modifiers; // "abstract", "sealed", "static"
+    std::string_view name;
+    std::string_view endLabel; // empty when the `end` had no label
+};
+
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)
 //
 // `module` is required by the spec on every source file's first non-comment,
 // non-import line, but the parser allows it to be missing (reporting a
-// diagnostic) so later phases can still inspect what was parsed. `topDecls`
-// is introduced by a later parser slice.
+// diagnostic) so later phases can still inspect what was parsed.
 struct SourceFile : Node {
     std::unique_ptr<ModuleDecl> module;
     std::vector<std::unique_ptr<Import>> imports;
+    std::vector<std::unique_ptr<TypeDecl>> topDecls;
 };
 
 } // namespace bezel::ast

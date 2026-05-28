@@ -39,6 +39,7 @@ private:
     // Grammar productions.
     std::unique_ptr<ast::ModuleDecl> parseModuleDecl();
     std::unique_ptr<ast::Import> parseImport();
+    std::unique_ptr<ast::TypeDecl> parseTopDecl();
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
 
     Lexer& lexer_;

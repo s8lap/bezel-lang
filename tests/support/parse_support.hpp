@@ -71,4 +71,39 @@ inline std::vector<std::string> importNames(const ParseResult& result) {
     return out;
 }
 
+// One-line human-readable summary of a top-level type declaration, e.g.
+// "public sealed class Foo" or "enum E". Lets tests assert visibility,
+// modifiers, kind, and name without nested deref ladders.
+inline std::string topDeclSummary(const ast::TypeDecl& decl) {
+    std::string out;
+    switch (decl.visibility) {
+        case ast::Visibility::Public:    out += "public ";    break;
+        case ast::Visibility::Private:   out += "private ";   break;
+        case ast::Visibility::Internal:  out += "internal ";  break;
+        case ast::Visibility::Protected: out += "protected "; break;
+        case ast::Visibility::None: break;
+    }
+    for (std::string_view m : decl.modifiers) {
+        out += std::string(m);
+        out += ' ';
+    }
+    switch (decl.kind) {
+        case ast::TypeDeclKind::Class:     out += "class ";     break;
+        case ast::TypeDeclKind::Interface: out += "interface "; break;
+        case ast::TypeDeclKind::Record:    out += "record ";    break;
+        case ast::TypeDeclKind::Enum:      out += "enum ";      break;
+    }
+    out += std::string(decl.name);
+    return out;
+}
+
+inline std::vector<std::string> topDeclSummaries(const ParseResult& result) {
+    std::vector<std::string> out;
+    if (!result.sourceFile) return out;
+    for (const auto& d : result.sourceFile->topDecls) {
+        out.push_back(d ? topDeclSummary(*d) : std::string("<invalid>"));
+    }
+    return out;
+}
+
 } // namespace bezel::test
