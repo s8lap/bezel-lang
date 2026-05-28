@@ -67,10 +67,11 @@ private:
     std::vector<std::unique_ptr<ast::Type>> parseInheritance();
     // Slice 24: zero or more `where T: Constraint, ...` clauses.
     std::vector<ast::GenericConstraint> parseGenericConstraints();
-    // Slice 6/10: a single class member. FieldDecl (with optional initializer)
-    // and MethodDecl (with expression/block/abstract body); other Member forms
-    // arrive with their slices.
+    // Slice 6/10/19/...: a single class member.
     std::unique_ptr<ast::Member> parseMember();
+    // Slice 34: a single interface member (A.4 InterfaceMember). Smaller and
+    // different grammar than class Member — no visibility, signature only.
+    std::unique_ptr<ast::Member> parseInterfaceMember();
     // Caller has already consumed the `method` keyword.
     std::unique_ptr<ast::MethodDecl> parseMethodDeclBody(
         ast::Visibility visibility, std::vector<std::string_view> modifiers);
