@@ -217,10 +217,20 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         advance();
     }
 
+    // §A.3 EnumInheritance:
+    //   EnumInheritance ::= ":" IntegerType ("," InheritItem)*
+    //                     | ":" InheritItem ("," InheritItem)*
+    // Both forms parse through the regular Type machinery (IntegerType is
+    // a primitive-type keyword admitted by `parseTypeName`); sema picks
+    // the meaning by checking whether the first item is an IntegerType.
+    if (decl->kind == ast::TypeDeclKind::Enum && consumePunctuator(":")) {
+        decl->baseTypes.push_back(parseType());
+        while (consumePunctuator(",")) {
+            decl->baseTypes.push_back(parseType());
+        }
+    }
     // §A.3: GenericParams? and Inheritance? appear between the name and the
-    // body for classes, interfaces, and records. Enums use EnumInheritance
-    // (different grammar — `: IntegerType ...`) and do not admit generic
-    // parameters; the enum-specific shape is a later slice.
+    // body for classes, interfaces, and records.
     if (decl->kind != ast::TypeDeclKind::Enum) {
         decl->genericParams = parseGenericParams();
         // §A.3 RecordDecl's PositionalFields and ClassDecl's
