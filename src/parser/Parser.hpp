@@ -92,6 +92,11 @@ private:
     // Slice 36: a single LambdaParam (A.7). Differs from method ParamList
     // in that the `: Type` ascription is optional.
     ast::Param parseLambdaParam();
+    // Slice 37: peek-style helper — is the parser positioned at the start
+    // of a `get`/`set` accessor (with optional Visibility prefix)?
+    bool isPropertyAccessorStart();
+    // Slice 37: parse one Accessor within a PropertyBody block form.
+    ast::PropertyAccessor parsePropertyAccessor();
     // Slice 36: peeks the matching `)` for the `(` at peekAt(startK) and
     // returns true iff a `=>` follows. Used to distinguish
     // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.

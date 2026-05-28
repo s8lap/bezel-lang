@@ -105,11 +105,12 @@ BEZEL_TEST(parser_const_property, const_without_initializer_is_error) {
 }
 
 BEZEL_TEST(parser_const_property,
-           accessor_block_property_not_yet_supported) {
-    // `public property X: int get => x; set := value; end;` — accessor
-    // block syntax is its own slice and is rejected here.
+           accessor_block_property_parses_in_slice_37) {
+    // Accessor-block PropertyBody landed in slice 37 — now expected to
+    // parse cleanly. The detailed shape assertions live in
+    // `parser/property_accessor_blocks_test.cpp`.
     auto r = parseAll(
         "module M; class Foo "
         "public property X: int get => 0; end; end Foo;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

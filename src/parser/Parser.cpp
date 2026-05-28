@@ -641,7 +641,10 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                                 "expected ':' after property name");
         }
         pd->type = parseType();
-        // Body shape dispatch per A.4 PropertyBody.
+        // Body shape dispatch per A.4 PropertyBody. Three forms:
+        //   `=> Expression ;`                       Expression-body
+        //   `(":=" Expression)? SerializedClause? ";"`   Auto-property
+        //   `Accessor* "end" Identifier? ";"`            Accessor block
         if (consumePunctuator("=>")) {
             pd->bodyKind = ast::PropertyBodyKind::Expression;
             pd->exprBody = parseExpression();
@@ -649,6 +652,28 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 diagnostics_.report(
                     Severity::Error, current_.location,
                     "expected ';' after expression-body property");
+            }
+        } else if (isPropertyAccessorStart()) {
+            pd->bodyKind = ast::PropertyBodyKind::Block;
+            while (isPropertyAccessorStart()) {
+                pd->accessors.push_back(parsePropertyAccessor());
+            }
+            if (!consumeKeyword("end")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'end' to close property accessor block");
+            }
+            // §1.6 keyword-labelled construct. For a property, the Identifier
+            // after `end` should match the property name. The match check
+            // belongs to sema; we just record what was written.
+            if (current_.kind == TokenKind::Identifier) {
+                pd->blockEndLabel = current_.text;
+                advance();
+            }
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after 'end' of property accessor block");
             }
         } else {
             pd->bodyKind = ast::PropertyBodyKind::Auto;
@@ -658,8 +683,7 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             if (!consumePunctuator(";")) {
                 diagnostics_.report(
                     Severity::Error, current_.location,
-                    "expected ';' after auto-property (accessor-block "
-                    "form not yet supported)");
+                    "expected ';' after auto-property");
             }
         }
         return std::unique_ptr<ast::Member>(pd.release());
@@ -915,6 +939,107 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         Severity::Error, current_.location,
         "expected 'method', 'property', or 'event' in interface body");
     return nullptr;
+}
+
+bool Parser::isPropertyAccessorStart() {
+    // §A.4 Accessor: `Visibility? ("get" | "set")` opens an accessor in a
+    // PropertyBody block form. `get` and `set` are contextual keywords
+    // (App. B.2) so the lexer emits them as Identifier — checked by text.
+    auto isGetOrSet = [](const Token& t) {
+        return t.kind == TokenKind::Identifier &&
+               (t.text == "get" || t.text == "set");
+    };
+    if (isGetOrSet(current_)) return true;
+    if (isKeyword("public") || isKeyword("private") ||
+        isKeyword("internal") || isKeyword("protected")) {
+        return isGetOrSet(peekAt(1));
+    }
+    return false;
+}
+
+ast::PropertyAccessor Parser::parsePropertyAccessor() {
+    // §A.4 `Accessor ::= Visibility? "get" AccessorBody`
+    //                  | Visibility? "set" SetterParamSpec? GenericConstraints?
+    //                      AccessorBody`.
+    ast::PropertyAccessor acc;
+    if (consumeKeyword("public")) {
+        acc.visibility = ast::Visibility::Public;
+    } else if (consumeKeyword("private")) {
+        acc.visibility = ast::Visibility::Private;
+    } else if (consumeKeyword("internal")) {
+        acc.visibility = ast::Visibility::Internal;
+    } else if (consumeKeyword("protected")) {
+        acc.visibility = ast::Visibility::Protected;
+    }
+    if (current_.kind != TokenKind::Identifier ||
+        (current_.text != "get" && current_.text != "set")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'get' or 'set' in property accessor");
+        return acc;
+    }
+    acc.isSet = (current_.text == "set");
+    advance();
+    if (acc.isSet && consumePunctuator("(")) {
+        // SetterParamSpec ::= "(" ParamMod? Identifier? ")".
+        acc.hasSetterParamSpec = true;
+        if (consumeKeyword("ref")) {
+            acc.setterParamMod = "ref";
+        } else if (consumeKeyword("out")) {
+            if (consumeKeyword("owned")) {
+                acc.setterParamMod = "out owned";
+            } else {
+                acc.setterParamMod = "out";
+            }
+        } else if (consumeKeyword("owned")) {
+            acc.setterParamMod = "owned";
+        }
+        if (current_.kind == TokenKind::Identifier) {
+            acc.setterParamName = current_.text;
+            advance();
+        }
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ')' to close setter parameter spec");
+        }
+    }
+    // GenericConstraints? on set is admitted by the grammar; rare in
+    // practice — deferred. Sema will reject any leftover `where` that
+    // appears here in slice 37 since we currently don't consume it.
+    //
+    // AccessorBody dispatch.
+    if (consumePunctuator("=>")) {
+        if (consumeKeyword("do")) {
+            acc.bodyKind = ast::PropertyAccessorBodyKind::Block;
+            while (!isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto s = parseStatement();
+                if (s) {
+                    acc.stmts.push_back(std::move(s));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+            if (!consumeKeyword("end")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'end' to close accessor block body");
+            }
+        } else {
+            acc.bodyKind = ast::PropertyAccessorBodyKind::Expression;
+            acc.exprBody = parseExpression();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after accessor body");
+        }
+    } else if (consumePunctuator(";")) {
+        acc.bodyKind = ast::PropertyAccessorBodyKind::Abstract;
+    } else {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected '=>' or ';' in accessor body");
+    }
+    return acc;
 }
 
 namespace {

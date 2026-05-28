@@ -331,16 +331,38 @@ struct ConstDecl : Member {
     std::unique_ptr<Expr> value;
 };
 
-// A.4 PropertyBody alternative kinds. Slice 26 covers Expression and Auto;
-// accessor-blocks (`get`/`set` with bodies) come with their own slice.
+// A.4 PropertyBody alternative kinds.
 enum class PropertyBodyKind { Expression, Auto, Block };
+
+// A.4 AccessorBody kinds:
+//   `=> Expression ;`           PropertyAccessorBodyKind::Expression
+//   `=> do Statement* end ;`    PropertyAccessorBodyKind::Block
+//   `;`                          PropertyAccessorBodyKind::Abstract
+enum class PropertyAccessorBodyKind { Expression, Block, Abstract };
+
+// A.4 Accessor (one `get` or `set` arm inside an accessor block). Slice 37.
+struct PropertyAccessor {
+    Visibility visibility = Visibility::None;  // optional per A.4
+    bool isSet = false;                        // false = get, true = set
+    // SetterParamSpec (set-only): `( ParamMod? Identifier? )`. Both pieces
+    // are optional. Implicit param name is `value`; implicit modifier is
+    // none (borrow-taking) — sema substitutes the defaults.
+    std::string_view setterParamMod;           // "" / "owned" / "ref" / ...
+    std::string_view setterParamName;          // "" when only the modifier was given
+    bool hasSetterParamSpec = false;           // true if `(...)` was written at all
+    std::vector<GenericConstraint> setterConstraints; // set-only, optional
+    PropertyAccessorBodyKind bodyKind = PropertyAccessorBodyKind::Abstract;
+    std::unique_ptr<Expr> exprBody;
+    std::vector<std::unique_ptr<Stmt>> stmts;
+};
 
 // A.4 `PropertyDecl ::= Visibility "static"? VirtualKind? "readonly"?
 //                        "property" Identifier ":" Type PropertyBody`.
-// Slice 26 supports:
-//   `=> Expression ;`          (Expression-body)
-//   `(":=" Expression)? ";"`   (Auto-property, with optional initializer)
-// Auto-accessor-vis (`public get`/etc.) and the SerializedClause modifier
+// Forms supported:
+//   `=> Expression ;`               (Expression-body)
+//   `(":=" Expression)? ";"`        (Auto-property, with optional initializer)
+//   `Accessor* "end" Identifier? ";"` (slice 37 — accessor block)
+// AutoAccessorVis (`public get`/etc.) and the SerializedClause modifier
 // on auto-properties are deferred to their slice.
 struct PropertyDecl : Member {
     Visibility visibility = Visibility::None;
@@ -350,6 +372,8 @@ struct PropertyDecl : Member {
     PropertyBodyKind bodyKind = PropertyBodyKind::Auto;
     std::unique_ptr<Expr> exprBody;        // Expression-body case
     std::unique_ptr<Expr> autoInitializer; // Auto with `:= …`
+    std::vector<PropertyAccessor> accessors; // Block-body case
+    std::string_view blockEndLabel;          // optional Identifier after `end`
     // Indexer form (A.4 IndexerDecl): the index parameter list appears as
     // `[ParamList]` where a regular property would have an Identifier name.
     bool isIndexer = false;
