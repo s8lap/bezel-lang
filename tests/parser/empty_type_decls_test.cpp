@@ -92,23 +92,24 @@ BEZEL_TEST(parser_empty_type_decls, simple_record) {
 }
 
 BEZEL_TEST(parser_empty_type_decls, simple_enum) {
+    // §A.3 EnumDecl requires `EnumConstants` (at least one constant); the
+    // constants slice covers the populated form. Here we just verify the
+    // empty form is rejected.
     auto r = parseAll("module M; enum E end E;");
-    const auto s = topDeclSummaries(r);
-    if (s.size() == 1) BEZEL_EXPECT_EQ(s[0], std::string("enum E"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §2.4: many top-level declarations per source file.
 BEZEL_TEST(parser_empty_type_decls, multiple_top_decls_in_order) {
     auto r = parseAll("module M; class A end A; interface IB end IB; "
-                      "record C end C; enum D end D;");
+                      "record C end C; enum D X; end D;");
     const auto s = topDeclSummaries(r);
     BEZEL_EXPECT_EQ(s.size(), std::size_t{4});
     if (s.size() == 4) {
         BEZEL_EXPECT_EQ(s[0], std::string("class A"));
         BEZEL_EXPECT_EQ(s[1], std::string("interface IB"));
         BEZEL_EXPECT_EQ(s[2], std::string("record C"));
-        BEZEL_EXPECT_EQ(s[3], std::string("enum D"));
+        BEZEL_EXPECT_EQ(s[3], std::string("enum D { X }"));
     }
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
