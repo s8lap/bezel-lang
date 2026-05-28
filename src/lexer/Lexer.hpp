@@ -24,6 +24,13 @@ private:
     Token scanCharLiteral();
     Token scanStringLiteral();
     Token scanVerbatimString();
+    // Slice 51: `$"..."` and `$@"..."` interpolated-string literals (§18.5/
+    // §18.7). The scan tracks `{` / `}` balanced runs inside the string so
+    // `{ ... }` interpolation parts are taken as opaque (the parser will
+    // re-tokenize them when fragment splitting lands). `{{` and `}}` are
+    // literal-brace escapes.
+    Token scanInterpolatedString();
+    Token scanInterpolatedVerbatimString();
     void consumeEscape();
 
     // Convert a byte offset within `source_` to a 1-based line/column

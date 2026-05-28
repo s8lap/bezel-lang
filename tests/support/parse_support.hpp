@@ -317,6 +317,8 @@ inline std::string exprToString(const ast::Expr& e) {
         return std::string(s->text);
     if (auto* v = dynamic_cast<const ast::VerbatimStringExpr*>(&e))
         return std::string(v->text);
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e))
+        return std::string(is->text);
     if (auto* b = dynamic_cast<const ast::BoolLiteralExpr*>(&e))
         return std::string(b->value ? "true" : "false");
     if (dynamic_cast<const ast::NullLiteralExpr*>(&e))

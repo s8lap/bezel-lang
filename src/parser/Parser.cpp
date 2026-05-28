@@ -1510,6 +1510,15 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
         advance();
         return std::unique_ptr<ast::Expr>(e.release());
     }
+    if (current_.kind == TokenKind::InterpolatedString ||
+        current_.kind == TokenKind::InterpolatedVerbatimString) {
+        auto e = std::make_unique<ast::InterpolatedStringExpr>();
+        e->isVerbatim =
+            (current_.kind == TokenKind::InterpolatedVerbatimString);
+        e->text = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
 
     // §18.2 boolean and null keyword literals.
     if (isKeyword("true") || isKeyword("false")) {
