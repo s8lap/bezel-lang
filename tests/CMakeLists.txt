@@ -62,7 +62,8 @@ set(BEZEL_TEST_SOURCES
     parser/enum_members_test.cpp
     parser/auto_accessor_vis_test.cpp
     parser/arg_modifiers_test.cpp
-    parser/with_and_unit_value_test.cpp)
+    parser/with_and_unit_value_test.cpp
+    parser/interpolated_strings_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

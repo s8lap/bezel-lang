@@ -559,6 +559,14 @@ struct FloatLiteralExpr    : Expr { std::string_view text; };
 struct CharLiteralExpr     : Expr { std::string_view text; };
 struct StringLiteralExpr   : Expr { std::string_view text; };
 struct VerbatimStringExpr  : Expr { std::string_view text; };
+// Slice 51: §18.5 / §18.7 interpolated string. `text` holds the entire
+// `$"..."` (or `$@"..."`) lexeme including the surrounding quotes; a
+// follow-up slice will split it into alternating fragments and
+// `{ Expression }` parts. `isVerbatim` distinguishes the two prefixes.
+struct InterpolatedStringExpr : Expr {
+    bool isVerbatim = false;
+    std::string_view text;
+};
 
 // `true` / `false` decoded at parse time; null is a marker.
 struct BoolLiteralExpr : Expr { bool value = false; };

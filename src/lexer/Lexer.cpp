@@ -334,9 +334,7 @@ Token Lexer::next() {
                      locationAt(numStart)};
     }
 
-    // §18.3 char, §18.4 string, §18.6 verbatim string. Interpolation prefixes
-    // (`$"` and `$@"`, §18.5/§18.7) are not recognized in this slice —
-    // interpolation is deferred until the parser exists.
+    // §18.3 char, §18.4 string, §18.6 verbatim string, §18.5/§18.7 interp.
     if (b == '\'') {
         return scanCharLiteral();
     }
@@ -346,6 +344,16 @@ Token Lexer::next() {
     if (b == '@' && position_ + 1 < source_.size() &&
         source_[position_ + 1] == '"') {
         return scanVerbatimString();
+    }
+    if (b == '$' && position_ + 1 < source_.size() &&
+        source_[position_ + 1] == '"') {
+        return scanInterpolatedString();
+    }
+    if (b == '$' && position_ + 1 < source_.size() &&
+        source_[position_ + 1] == '@' &&
+        position_ + 2 < source_.size() &&
+        source_[position_ + 2] == '"') {
+        return scanInterpolatedVerbatimString();
     }
 
     // §17 / Appendix A operators and punctuation. Maximal munch via a
@@ -518,6 +526,156 @@ Token Lexer::scanVerbatimString() {
                             "unterminated verbatim string literal");
     }
     return Token{TokenKind::VerbatimStringLiteral,
+                 source_.substr(start, position_ - start),
+                 startLoc};
+}
+
+// §18.5 InterpString: `'$"' (InterpPart | StringContent)* '"'`. Slice 51
+// scans the whole `$"..."` as a single InterpolatedString token; the inner
+// `{ ... }` parts are taken opaquely (tracking only balanced brace nesting
+// so `{ "..." }` style interpolations don't terminate the string early).
+// `\{` and the literal-brace escapes `{{` / `}}` keep their literal meaning
+// inside non-verbatim interp strings; standard `\` escape sequences also
+// apply to the surrounding content. Detailed escape validation lives in
+// consumeEscape; this scan just bypasses escapes far enough to find the
+// closing `"`.
+Token Lexer::scanInterpolatedString() {
+    const std::size_t start = position_;
+    const SourceLocation startLoc = locationAt(start);
+    position_ += 2; // past '$' and '"'
+    bool terminated = false;
+    while (position_ < source_.size()) {
+        const char c = source_[position_];
+        if (c == '"') {
+            ++position_;
+            terminated = true;
+            break;
+        }
+        if (c == '\\') {
+            consumeEscape();
+            continue;
+        }
+        if (c == '{') {
+            if (position_ + 1 < source_.size() &&
+                source_[position_ + 1] == '{') {
+                // literal-brace escape
+                position_ += 2;
+                continue;
+            }
+            // Interpolation part — consume balanced braces.
+            ++position_; // past `{`
+            int depth = 1;
+            while (position_ < source_.size() && depth > 0) {
+                const char ic = source_[position_];
+                if (ic == '"') {
+                    // Nested string inside the interpolation — skip it as
+                    // a unit so its braces/quotes don't confuse the depth
+                    // counter. This is the slice-51 approximation; a true
+                    // re-entrant scan lands with the splitting slice.
+                    ++position_;
+                    while (position_ < source_.size() &&
+                           source_[position_] != '"') {
+                        if (source_[position_] == '\\') consumeEscape();
+                        else consumeOneScalar(source_, position_);
+                    }
+                    if (position_ < source_.size()) ++position_; // closing "
+                    continue;
+                }
+                if (ic == '{') ++depth;
+                else if (ic == '}') --depth;
+                ++position_;
+            }
+            continue;
+        }
+        if (c == '}') {
+            if (position_ + 1 < source_.size() &&
+                source_[position_ + 1] == '}') {
+                position_ += 2;
+                continue;
+            }
+            // Stray `}` — report and consume to avoid an infinite loop.
+            diagnostics_.report(Severity::Error, locationAt(position_),
+                                "unmatched '}' in interpolated string");
+            ++position_;
+            continue;
+        }
+        consumeOneScalar(source_, position_);
+    }
+    if (!terminated) {
+        diagnostics_.report(Severity::Error, startLoc,
+                            "unterminated interpolated string literal");
+    }
+    return Token{TokenKind::InterpolatedString,
+                 source_.substr(start, position_ - start),
+                 startLoc};
+}
+
+// §18.7 verbatim InterpString: `'$@"' (InterpPart | VerbatimContent)* '"'`.
+// Like scanInterpolatedString but with the verbatim-string content rules
+// (no `\` escapes; `""` is a literal `"`; line breaks are part of the
+// lexeme).
+Token Lexer::scanInterpolatedVerbatimString() {
+    const std::size_t start = position_;
+    const SourceLocation startLoc = locationAt(start);
+    position_ += 3; // past '$', '@', '"'
+    bool terminated = false;
+    while (position_ < source_.size()) {
+        const char c = source_[position_];
+        if (c == '"') {
+            if (position_ + 1 < source_.size() &&
+                source_[position_ + 1] == '"') {
+                position_ += 2;
+                continue;
+            }
+            ++position_;
+            terminated = true;
+            break;
+        }
+        if (c == '{') {
+            if (position_ + 1 < source_.size() &&
+                source_[position_ + 1] == '{') {
+                position_ += 2;
+                continue;
+            }
+            ++position_;
+            int depth = 1;
+            while (position_ < source_.size() && depth > 0) {
+                const char ic = source_[position_];
+                if (ic == '"') {
+                    ++position_;
+                    while (position_ < source_.size() &&
+                           source_[position_] != '"') {
+                        consumeOneScalar(source_, position_);
+                    }
+                    if (position_ < source_.size()) ++position_;
+                    continue;
+                }
+                if (ic == '{') ++depth;
+                else if (ic == '}') --depth;
+                ++position_;
+            }
+            continue;
+        }
+        if (c == '}') {
+            if (position_ + 1 < source_.size() &&
+                source_[position_ + 1] == '}') {
+                position_ += 2;
+                continue;
+            }
+            diagnostics_.report(
+                Severity::Error, locationAt(position_),
+                "unmatched '}' in interpolated verbatim string");
+            ++position_;
+            continue;
+        }
+        consumeOneScalar(source_, position_);
+    }
+    if (!terminated) {
+        diagnostics_.report(
+            Severity::Error, startLoc,
+            "unterminated interpolated verbatim string literal");
+    }
+    return Token{TokenKind::InterpolatedVerbatimString,
                  source_.substr(start, position_ - start),
                  startLoc};
 }

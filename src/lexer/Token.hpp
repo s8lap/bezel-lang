@@ -30,8 +30,14 @@ enum class TokenKind {
     CharLiteral,
     StringLiteral,
     VerbatimStringLiteral,
-    // Interpolated-string kinds (§18.5 / §18.7) arrive once the parser exists
-    // — their `{...}` content needs full expression parsing.
+    // Interpolated-string kinds (§18.5 / §18.7). Slice 51 lexes the entire
+    // `$"..."` (or `$@"..."`) lexeme as a single token; full
+    // fragment+expression splitting waits on a follow-up slice that wires
+    // the lexer's interp-mode dance to the parser. The InterpolatedString
+    // token's `text` includes the surrounding `$"` … `"` quotes; sema
+    // (and a future split-pass) decode the `{` … `}` interpolation parts.
+    InterpolatedString,
+    InterpolatedVerbatimString,
     Unknown,
 };
 
