@@ -167,7 +167,10 @@ struct NullLiteralExpr : Expr {};
 
 struct IdentifierExpr : Expr { std::string_view name; };
 
-struct ParenExpr : Expr { std::unique_ptr<Expr> inner; };
+// Source-level parentheses (`(expr)`) are NOT represented as their own AST
+// node — they only group the parse; the resulting tree shape already encodes
+// the grouping. exprToString always parenthesizes BinaryExpr, so reading any
+// expression's source-vs-AST shape is unambiguous in tests.
 
 // A.5: `expr "." Identifier`. Postfix; the `target` is whatever expression
 // preceded the dot.
@@ -180,6 +183,17 @@ struct MemberAccessExpr : Expr {
 struct CallExpr : Expr {
     std::unique_ptr<Expr> callee;
     std::vector<std::unique_ptr<Expr>> args;
+};
+
+// §17.1 binary expressions. One AST struct for all of them; the operator
+// lexeme distinguishes (matches our keyword/punctuator-by-lexeme model).
+// Slice 8 wires up multiplicative, additive, relational, equality, and the
+// `and`/`or` logical operators. Shift, range, bitwise, null-coalescing,
+// conditional, and assignment operators arrive in later slices.
+struct BinaryExpr : Expr {
+    std::string_view op;
+    std::unique_ptr<Expr> left;
+    std::unique_ptr<Expr> right;
 };
 
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)
