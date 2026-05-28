@@ -46,14 +46,20 @@ struct ModuleDecl : Node {
     std::unique_ptr<QualifiedName> name;
 };
 
+// A.2: `Import ::= "import" QualifiedName ";"`  (§2.2)
+struct Import : Node {
+    std::unique_ptr<QualifiedName> name;
+};
+
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)
 //
 // `module` is required by the spec on every source file's first non-comment,
 // non-import line, but the parser allows it to be missing (reporting a
-// diagnostic) so later phases can still inspect what was parsed. `imports`
-// and `topDecls` are introduced by their own parser slices.
+// diagnostic) so later phases can still inspect what was parsed. `topDecls`
+// is introduced by a later parser slice.
 struct SourceFile : Node {
     std::unique_ptr<ModuleDecl> module;
+    std::vector<std::unique_ptr<Import>> imports;
 };
 
 } // namespace bezel::ast

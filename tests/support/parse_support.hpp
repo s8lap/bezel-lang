@@ -55,4 +55,20 @@ inline std::string moduleName(const ParseResult& result) {
     return qualifiedNameString(*result.sourceFile->module->name);
 }
 
+// The source file's import names, in declaration order. Missing or malformed
+// imports produce a "<invalid>" placeholder so tests can still assert on the
+// shape of the import list.
+inline std::vector<std::string> importNames(const ParseResult& result) {
+    std::vector<std::string> out;
+    if (!result.sourceFile) return out;
+    for (const auto& imp : result.sourceFile->imports) {
+        if (imp && imp->name) {
+            out.push_back(qualifiedNameString(*imp->name));
+        } else {
+            out.push_back("<invalid>");
+        }
+    }
+    return out;
+}
+
 } // namespace bezel::test
