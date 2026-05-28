@@ -235,12 +235,21 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         return decl;
     }
 
-    // §A.4 Members. Classes and records share the same Member set per A.4;
-    // interface members (IfaceMethod/IfaceProperty/etc.) are a smaller set
-    // with a different grammar and land in their own slice. Enums get
-    // EnumConstants below.
-    if (decl->kind == ast::TypeDeclKind::Class ||
-        decl->kind == ast::TypeDeclKind::Record) {
+    // §A.4 Members. Classes and records share the same Member set; interfaces
+    // use the smaller signature-only InterfaceMember grammar; enums get the
+    // EnumConstants list (below).
+    if (decl->kind == ast::TypeDeclKind::Interface) {
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto m = parseInterfaceMember();
+            if (m) {
+                decl->members.push_back(std::move(m));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+    } else if (decl->kind == ast::TypeDeclKind::Class ||
+               decl->kind == ast::TypeDeclKind::Record) {
         while (!isKeyword("end") &&
                current_.kind != TokenKind::EndOfFile) {
             auto member = parseMember();
@@ -771,6 +780,124 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     // Reseat the raw pointer explicitly (Node's deleted move blocks the
     // implicit unique_ptr<Derived> -> unique_ptr<Base> conversion).
     return std::unique_ptr<ast::Member>(field.release());
+}
+
+std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
+    // §A.4 InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer |
+    // IfaceEvent. No visibility (interface members are implicitly public per
+    // §10.1), signatures only. The pre-keyword prefix is just `readonly?` (for
+    // property) and `async?` (for event); both are scanned tentatively then
+    // dispatched on the kind keyword.
+    bool readonlyMod = false;
+    bool asyncMod = false;
+    while (isKeyword("readonly") || isKeyword("async")) {
+        if (isKeyword("readonly")) {
+            readonlyMod = true;
+        } else {
+            asyncMod = true;
+        }
+        advance();
+    }
+
+    // IfaceProperty / IfaceIndexer.
+    if (consumeKeyword("property")) {
+        auto pd = std::make_unique<ast::PropertyDecl>();
+        pd->visibility = ast::Visibility::None; // implicit public in iface
+        if (readonlyMod) pd->modifiers.push_back("readonly");
+        if (consumePunctuator("[")) {
+            pd->isIndexer = true;
+            pd->indexerParams = parseParamList();
+            if (!consumePunctuator("]")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ']' to close interface indexer parameters");
+            }
+        } else if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected property name or '[' for indexer");
+        } else {
+            pd->name = current_.text;
+            advance();
+        }
+        if (!consumePunctuator(":")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ':' after interface property name");
+        }
+        pd->type = parseType();
+        pd->bodyKind = ast::PropertyBodyKind::Auto; // iface: signature only
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after interface property declaration");
+        }
+        return std::unique_ptr<ast::Member>(pd.release());
+    }
+
+    // IfaceEvent.
+    if (consumeKeyword("event")) {
+        auto ed = std::make_unique<ast::EventDecl>();
+        ed->visibility = ast::Visibility::None;
+        ed->isAsync = asyncMod;
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected event name");
+        } else {
+            ed->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            ed->type = parseType();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after interface event declaration");
+        }
+        return std::unique_ptr<ast::Member>(ed.release());
+    }
+
+    // IfaceMethod: shares the MethodDecl AST shape (signature + abstract body).
+    if (consumeKeyword("method")) {
+        auto m = std::make_unique<ast::MethodDecl>();
+        m->visibility = ast::Visibility::None;
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected method name");
+        } else {
+            m->name = current_.text;
+            advance();
+        }
+        m->genericParams = parseGenericParams();
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected '(' to begin parameter list");
+        }
+        m->params = parseParamList();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ')' to close parameter list");
+        }
+        if (consumePunctuator(":")) {
+            if (isKeyword("owned")) {
+                m->returnOwned = true;
+                advance();
+            }
+            m->returnType = parseType();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after interface method signature");
+        }
+        m->bodyKind = ast::MethodBodyKind::Abstract;
+        return std::unique_ptr<ast::Member>(m.release());
+    }
+
+    diagnostics_.report(
+        Severity::Error, current_.location,
+        "expected 'method', 'property', or 'event' in interface body");
+    return nullptr;
 }
 
 namespace {
