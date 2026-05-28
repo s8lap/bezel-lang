@@ -526,6 +526,18 @@ struct ThrowExpr : Expr {
     std::unique_ptr<Expr> operand; // null for bare `throw`
 };
 
+// A.7 `LambdaExpr ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody`.
+// Slice 28 covers ONLY the empty-params form `() => …` (with an Expression or
+// `do … end` body). Lambdas with parameters require multi-token lookahead to
+// disambiguate `(x) => …` from a parenthesised expression `(x)`; deferred.
+struct LambdaExpr : Expr {
+    bool isAsync = false;
+    std::vector<Param> params;       // empty for slice 28
+    bool isBlockBody = false;
+    std::unique_ptr<Expr> exprBody;  // populated when !isBlockBody
+    std::vector<std::unique_ptr<Stmt>> stmts; // populated when isBlockBody
+};
+
 // A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*
 //                          ExtensionMember* "end" ";"`.
 struct ExtensionDecl : TopDecl {
