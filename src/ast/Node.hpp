@@ -277,6 +277,14 @@ struct TypeDecl : TopDecl {
     // Enum-only: the comma-separated constants (`EnumConstants` per A.3).
     // Empty for non-enum kinds.
     std::vector<EnumConstant> enumConstants;
+    // Record-only: the parenthesised positional fields per A.3
+    // `PositionalFields ::= "(" PositionalField ("," PositionalField)* ")"`,
+    // `PositionalField ::= Identifier ":" Type SerializedClause?`. Reuses
+    // Param (same name+type shape). SerializedClause deferred.
+    std::vector<Param> positionalFields;
+    bool hasPositionalFields = false;
+    // Record-only: `record Foo(...) ;` shorthand body (no `end`).
+    bool isRecordShorthand = false;
     std::string_view endLabel; // empty when the `end` had no label
 };
 
