@@ -655,6 +655,19 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         out += ';';
         return out;
     }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        std::string out = "const ";
+        out += std::string(lc->name);
+        if (lc->type) {
+            out += ": ";
+            out += typeToString(*lc->type);
+        }
+        out += " := ";
+        out += lc->value ? exprToString(*lc->value)
+                         : std::string("<null>");
+        out += ';';
+        return out;
+    }
     if (auto* r = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         std::string out = "return";
         if (r->value) {

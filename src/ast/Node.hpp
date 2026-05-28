@@ -120,6 +120,15 @@ struct LocalDecl : Stmt {
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`
 };
 
+// A.6 `LocalConstDecl ::= "const" Identifier (":" Type)? ":=" ConstExpr ";"`.
+// Statement-position const declaration (no visibility, no static — those
+// belong to the member-level ConstDecl in A.4). Slice 53.
+struct LocalConstDecl : Stmt {
+    std::string_view name;
+    std::unique_ptr<Type> type;        // null when no `:` annotation
+    std::unique_ptr<Expr> value;
+};
+
 // A.6: `ReturnStmt ::= "return" Expression? ";"`.
 struct ReturnStmt : Stmt {
     std::unique_ptr<Expr> value;       // null for `return;`
