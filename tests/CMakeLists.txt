@@ -19,7 +19,8 @@ set(BEZEL_TEST_SOURCES
     parser/empty_type_decls_test.cpp
     parser/named_types_test.cpp
     parser/generics_and_inheritance_test.cpp
-    parser/field_decls_test.cpp)
+    parser/field_decls_test.cpp
+    parser/expressions_primary_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

@@ -159,8 +159,50 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
     return "<unknown>";
 }
 
-// Render one class member to a single string (currently only FieldDecl is
-// implemented; others land with their slices).
+// Render an expression AST back to a canonical string form. Recursive on
+// composite expressions (member access, call, paren).
+inline std::string exprToString(const ast::Expr& e) {
+    if (auto* i = dynamic_cast<const ast::IntLiteralExpr*>(&e))
+        return std::string(i->text);
+    if (auto* f = dynamic_cast<const ast::FloatLiteralExpr*>(&e))
+        return std::string(f->text);
+    if (auto* c = dynamic_cast<const ast::CharLiteralExpr*>(&e))
+        return std::string(c->text);
+    if (auto* s = dynamic_cast<const ast::StringLiteralExpr*>(&e))
+        return std::string(s->text);
+    if (auto* v = dynamic_cast<const ast::VerbatimStringExpr*>(&e))
+        return std::string(v->text);
+    if (auto* b = dynamic_cast<const ast::BoolLiteralExpr*>(&e))
+        return std::string(b->value ? "true" : "false");
+    if (dynamic_cast<const ast::NullLiteralExpr*>(&e))
+        return std::string("null");
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        return std::string(id->name);
+    if (auto* p = dynamic_cast<const ast::ParenExpr*>(&e)) {
+        return "(" + (p->inner ? exprToString(*p->inner)
+                               : std::string("<null>")) + ")";
+    }
+    if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        return (m->target ? exprToString(*m->target) : std::string("<null>")) +
+               "." + std::string(m->member);
+    }
+    if (auto* c = dynamic_cast<const ast::CallExpr*>(&e)) {
+        std::string out = c->callee ? exprToString(*c->callee)
+                                    : std::string("<null>");
+        out += '(';
+        for (std::size_t i = 0; i < c->args.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += c->args[i] ? exprToString(*c->args[i])
+                              : std::string("<null>");
+        }
+        out += ')';
+        return out;
+    }
+    return "<unknown expr>";
+}
+
+// Render one class member to a single string. Currently only FieldDecl is
+// implemented; others land with their slices.
 inline std::string memberSummary(const ast::Member& m) {
     if (auto* f = dynamic_cast<const ast::FieldDecl*>(&m)) {
         std::string out = visibilityPrefix(f->visibility);
@@ -171,6 +213,10 @@ inline std::string memberSummary(const ast::Member& m) {
         out += std::string(f->name);
         out += ": ";
         out += f->type ? typeToString(*f->type) : std::string("<null>");
+        if (f->initializer) {
+            out += " := ";
+            out += exprToString(*f->initializer);
+        }
         return out;
     }
     return "<unknown member>";

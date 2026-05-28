@@ -63,8 +63,13 @@ private:
     // (it contains expressions; see the inheritance slice notes in the PR).
     std::vector<std::unique_ptr<ast::Type>> parseInheritance();
     // Slice 6: a single class member. Currently only FieldDecl is supported
-    // (without initializer); other Member forms emit a diagnostic.
+    // (with optional initializer expression); other Member forms emit a
+    // diagnostic.
     std::unique_ptr<ast::Member> parseMember();
+    // Slice 7: primary expressions plus postfix `.member` and `(args)`.
+    std::unique_ptr<ast::Expr> parseExpression();
+    std::unique_ptr<ast::Expr> parsePrimaryExpression();
+    std::unique_ptr<ast::Expr> parsePostfix(std::unique_ptr<ast::Expr> head);
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
 
     Lexer& lexer_;
