@@ -119,6 +119,17 @@ std::unique_ptr<ast::TopDecl> Parser::parseTopDecl() {
         return std::unique_ptr<ast::TopDecl>(alias.release());
     }
 
+    // ExtensionDecl (§A.3, §26): `Visibility? "extension" Type
+    // GenericConstraints* ExtensionMember* "end" ";"`. Visibility is parsed
+    // first if present, then `extension`. Since visibility is also used by
+    // class/etc., we tentatively read it and dispatch.
+    if (isKeyword("extension")) {
+        return parseExtensionDecl(ast::Visibility::None);
+    }
+    if (isKeyword("extern")) {
+        return parseExternBlock();
+    }
+
     // §13 visibility keyword (optional, must precede modifiers).
     ast::Visibility visibility = ast::Visibility::None;
     if (isKeyword("public")) {
@@ -138,6 +149,11 @@ std::unique_ptr<ast::TopDecl> Parser::parseTopDecl() {
     // Grammar `Modifier* = ("abstract" | "sealed" | "static")*`. The set of
     // semantically valid combinations is constrained by §11.7 (sema's
     // problem); the parser admits any combination per the grammar.
+    // Now-after-visibility, check for `extension` (admits visibility prefix).
+    if (isKeyword("extension")) {
+        return parseExtensionDecl(visibility);
+    }
+
     std::vector<std::string_view> modifiers;
     while (isKeyword("abstract") || isKeyword("sealed") || isKeyword("static")) {
         modifiers.push_back(current_.text);
@@ -291,6 +307,121 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     }
 
     return decl;
+}
+
+std::unique_ptr<ast::TopDecl> Parser::parseExtensionDecl(
+    ast::Visibility visibility) {
+    // A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*
+    //                         ExtensionMember* "end" ";"`.
+    auto ext = std::make_unique<ast::ExtensionDecl>();
+    ext->visibility = visibility;
+    advance(); // past `extension`
+    ext->targetType = parseType();
+    ext->genericConstraints = parseGenericConstraints();
+    while (!isKeyword("end") &&
+           current_.kind != TokenKind::EndOfFile) {
+        auto m = parseMember();
+        if (m) {
+            ext->members.push_back(std::move(m));
+        } else if (current_.kind != TokenKind::EndOfFile) {
+            advance();
+        }
+    }
+    if (!consumeKeyword("end")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'end' to close extension block");
+    }
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after 'end' of extension block");
+    }
+    return std::unique_ptr<ast::TopDecl>(ext.release());
+}
+
+std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
+    // A.3 `ExternBlock ::= "extern" StringLiteral
+    //                        ("convention" StringLiteral)?
+    //                        ExternDecl+ "end" ";"`.
+    auto blk = std::make_unique<ast::ExternBlock>();
+    advance(); // past `extern`
+    if (current_.kind != TokenKind::StringLiteral) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected library-name string literal after "
+                            "'extern'");
+    } else {
+        blk->library = current_.text;
+        advance();
+    }
+    // `convention` is contextual (App. B.2) so the lexer emits Identifier.
+    if (current_.kind == TokenKind::Identifier &&
+        current_.text == "convention") {
+        advance();
+        if (current_.kind != TokenKind::StringLiteral) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected convention string literal");
+        } else {
+            blk->convention = current_.text;
+            advance();
+        }
+    }
+    while (!isKeyword("end") &&
+           current_.kind != TokenKind::EndOfFile) {
+        ast::ExternDecl decl;
+        // Visibility?
+        if (isKeyword("public"))         { decl.visibility = ast::Visibility::Public; advance(); }
+        else if (isKeyword("private"))   { decl.visibility = ast::Visibility::Private; advance(); }
+        else if (isKeyword("internal"))  { decl.visibility = ast::Visibility::Internal; advance(); }
+        else if (isKeyword("protected")) { decl.visibility = ast::Visibility::Protected; advance(); }
+        if (!consumeKeyword("method")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected 'method' in extern declaration");
+            advance(); // make progress
+            continue;
+        }
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected method name");
+        } else {
+            decl.name = current_.text;
+            advance();
+        }
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected '(' to begin parameter list");
+        }
+        decl.params = parseParamList();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ')' to close parameter list");
+        }
+        if (consumePunctuator(":")) {
+            if (isKeyword("owned")) {
+                decl.returnOwned = true;
+                advance();
+            }
+            decl.returnType = parseType();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after extern declaration");
+        }
+        blk->methods.push_back(std::move(decl));
+    }
+    if (blk->methods.empty()) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "extern block requires at least one ExternDecl (A.3)");
+    }
+    if (!consumeKeyword("end")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'end' to close extern block");
+    }
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after 'end' of extern block");
+    }
+    return std::unique_ptr<ast::TopDecl>(blk.release());
 }
 
 std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {

@@ -50,6 +50,9 @@ private:
     std::unique_ptr<ast::TypeDecl> parseTypeOrInterfaceDecl(
         ast::Visibility visibility, std::vector<std::string_view> modifiers);
     std::unique_ptr<ast::TypeAlias> parseTypeAlias();
+    // Slice 25.
+    std::unique_ptr<ast::TopDecl> parseExtensionDecl(ast::Visibility visibility);
+    std::unique_ptr<ast::TopDecl> parseExternBlock();
     std::unique_ptr<ast::Type> parseType();
     // Like parseQualifiedName, but the first component may be a primitive-
     // type keyword (`int`, `string`, `bool`, …). Used only in type position;
