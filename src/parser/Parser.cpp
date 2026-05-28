@@ -962,6 +962,38 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
     }
 
     if (consumePunctuator("(")) {
+        // Empty-params lambda `() => …`. `(x) => …` and `(x: T, y) => …`
+        // need multi-token lookahead to disambiguate from paren expression
+        // and are deferred.
+        if (consumePunctuator(")")) {
+            if (consumePunctuator("=>")) {
+                auto lam = std::make_unique<ast::LambdaExpr>();
+                if (consumeKeyword("do")) {
+                    lam->isBlockBody = true;
+                    while (!isKeyword("end") &&
+                           current_.kind != TokenKind::EndOfFile) {
+                        auto s = parseStatement();
+                        if (s) {
+                            lam->stmts.push_back(std::move(s));
+                        } else if (current_.kind != TokenKind::EndOfFile) {
+                            advance();
+                        }
+                    }
+                    if (!consumeKeyword("end")) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected 'end' to close lambda block body");
+                    }
+                } else {
+                    lam->exprBody = parseExpression();
+                }
+                return std::unique_ptr<ast::Expr>(lam.release());
+            }
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "'()' is not a valid expression");
+            return nullptr;
+        }
         // No ParenExpr node: source-level parens only group the parse; the
         // resulting tree shape encodes the grouping directly. See Node.hpp.
         auto inner = parseExpression();

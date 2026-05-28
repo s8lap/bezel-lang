@@ -102,11 +102,11 @@ inline std::string typeToString(const ast::Type& t) {
     return out;
 }
 
-// Forward declarations — topDeclSummary (and a few others below) renders
-// enum-constant values via exprToString, which itself is defined later in
-// the file (its body needs typeToString and is logically grouped with
-// stmtSummary below).
+// Forward declarations — exprToString and stmtSummary are mutually recursive
+// (lambdas hold statements; statements hold expressions) and both are also
+// called from earlier-defined topDeclSummary / memberSummary.
 inline std::string exprToString(const ast::Expr& e);
+inline std::string stmtSummary(const ast::Stmt& s);
 
 // One-line human-readable summary of a top-level declaration, e.g.
 // "public sealed class Foo", "enum E", or "type X = List<int>". Lets tests
@@ -281,6 +281,23 @@ inline std::string exprToString(const ast::Expr& e) {
     if (auto* t = dynamic_cast<const ast::ThrowExpr*>(&e)) {
         if (!t->operand) return std::string("(throw)");
         return "(throw " + exprToString(*t->operand) + ")";
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        std::string out = "(() => ";
+        if (lam->isBlockBody) {
+            out += "do { ";
+            for (std::size_t i = 0; i < lam->stmts.size(); ++i) {
+                if (i > 0) out += ' ';
+                out += lam->stmts[i] ? stmtSummary(*lam->stmts[i])
+                                     : std::string("<null>");
+            }
+            out += " } end";
+        } else {
+            out += lam->exprBody ? exprToString(*lam->exprBody)
+                                 : std::string("<null>");
+        }
+        out += ')';
+        return out;
     }
     if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         std::string out = "(";
