@@ -577,16 +577,99 @@ struct TypeOfExpr : Expr { std::unique_ptr<Type> queriedType; };
 // recorded; sema resolves it.
 struct NameOfExpr : Expr { std::unique_ptr<QualifiedName> name; };
 
-// A.7 `LambdaExpr ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody`.
-// Slice 28 covers ONLY the empty-params form `() => …` (with an Expression or
-// `do … end` body). Lambdas with parameters require multi-token lookahead to
-// disambiguate `(x) => …` from a parenthesised expression `(x)`; deferred.
+// A.7 `LambdaExpr ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody`. Slices
+// 28 and 36 together cover the full form; the buffered-lookahead
+// discriminator is in parsePrimaryExpression.
 struct LambdaExpr : Expr {
     bool isAsync = false;
-    std::vector<Param> params;       // empty for slice 28
+    std::vector<Param> params;
     bool isBlockBody = false;
     std::unique_ptr<Expr> exprBody;  // populated when !isBlockBody
     std::vector<std::unique_ptr<Stmt>> stmts; // populated when isBlockBody
+};
+
+// --- A.7 Patterns and CaseExpr (slice 38) --------------------------------
+//
+// Pattern is a small AST hierarchy. The kinds line up 1:1 with the grammar
+// alternatives in §A.7 `Pattern`. A few cases are intentionally
+// representation-collapsed:
+//
+//   * Single-Identifier `Constant` vs single-Identifier `Type` is
+//     deliberately ambiguous in the grammar (§A.7 note: "if `Dog` resolves
+//     to a type, the pattern is a type test; otherwise it is a constant
+//     pattern"). The parser emits a `NamedPattern` for both — sema picks
+//     between Type-test and Constant by resolving the name. The same applies
+//     to QualifiedNames (`Color.Red` vs `System.IO.Stream`).
+//   * `RangeExpr` patterns reuse the regular `Expr` AST (rangeExpr).
+//   * The destructuring form stores its arguments as a vector of
+//     PositionalPattern, each of which is either a real Pattern or a naked
+//     binding Identifier (per A.7 PositionalPattern).
+struct Pattern : Node {};
+
+struct DiscardPattern : Pattern {};                 // `_`
+struct NullPattern : Pattern {};                    // `null`
+
+struct BindingPattern : Pattern {                   // `var IDENT (: TYPE)?`
+    std::string_view name;
+    std::unique_ptr<Type> type;
+};
+
+struct ConstantPattern : Pattern {                  // literal alternatives
+    // One or more `Constant`s separated by `,`. Each holds the raw
+    // expression as parsed (literals or QualifiedName); sema enforces the
+    // §A.8 `Constant` restriction (compile-time evaluable, etc.).
+    std::vector<std::unique_ptr<Expr>> constants;
+};
+
+struct NamedPattern : Pattern {                     // QualifiedName as pattern
+    std::unique_ptr<QualifiedName> name;
+};
+
+struct RangePattern : Pattern {                     // RangeExpr in pattern pos
+    std::unique_ptr<Expr> rangeExpr;
+};
+
+struct RelOpPattern : Pattern {                     // `< EXPR`, `>= EXPR`, ...
+    std::string_view op;  // "<" | ">" | "<=" | ">="
+    std::unique_ptr<Expr> expr;
+};
+
+struct TypePattern : Pattern {                      // primitive-type-led
+    std::unique_ptr<Type> type;
+};
+
+struct PositionalPattern {
+    // Either `pattern` is populated (a sub-Pattern) or `nakedBinding` is
+    // (A.7 "Identifier" alternative — valid only in destructuring position;
+    // names a binding of the matched component).
+    std::unique_ptr<Pattern> pattern;
+    std::string_view nakedBinding;
+};
+
+struct DestructuringPattern : Pattern {             // `QualifiedName ( ... )`
+    std::unique_ptr<QualifiedName> typeName;
+    std::vector<PositionalPattern> subPatterns;
+};
+
+// A.7 `CaseArm ::= Pattern ("when" Expression)? "=>" ArmBody`. The body
+// kind matches `ArmBody`: Expression / Statement / `do Statement* end`.
+// Slice 38 covers only the Expression-body form (the Statement form is
+// valid only in statement-position case/catch; the `do … end` form for
+// type `()` lands with the statement-position case slice).
+enum class CaseArmBodyKind { Expression, Block };
+
+struct CaseArm {
+    std::unique_ptr<Pattern> pattern;
+    std::unique_ptr<Expr> guard;            // optional `when EXPR`
+    CaseArmBodyKind bodyKind = CaseArmBodyKind::Expression;
+    std::unique_ptr<Expr> exprBody;         // when bodyKind == Expression
+    std::vector<std::unique_ptr<Stmt>> stmts; // when bodyKind == Block
+};
+
+// A.7 `CaseExpr ::= "case" Expression? CaseArm ("," CaseArm)* ","? "end"`.
+struct CaseExpr : Expr {
+    std::unique_ptr<Expr> scrutinee;   // null when bare `case CaseArm*`
+    std::vector<CaseArm> arms;
 };
 
 // A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*

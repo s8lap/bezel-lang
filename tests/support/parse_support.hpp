@@ -104,9 +104,11 @@ inline std::string typeToString(const ast::Type& t) {
 
 // Forward declarations — exprToString and stmtSummary are mutually recursive
 // (lambdas hold statements; statements hold expressions) and both are also
-// called from earlier-defined topDeclSummary / memberSummary.
+// called from earlier-defined topDeclSummary / memberSummary. patternToString
+// is its own peer (used inside CaseExpr).
 inline std::string exprToString(const ast::Expr& e);
 inline std::string stmtSummary(const ast::Stmt& s);
+inline std::string patternToString(const ast::Pattern& p);
 
 // One-line human-readable summary of a top-level declaration, e.g.
 // "public sealed class Foo", "enum E", or "type X = List<int>". Lets tests
@@ -392,7 +394,88 @@ inline std::string exprToString(const ast::Expr& e) {
         out += ')';
         return out;
     }
+    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        std::string out = "case ";
+        out += ce->scrutinee ? exprToString(*ce->scrutinee)
+                             : std::string("<bare>");
+        out += " of {";
+        for (std::size_t i = 0; i < ce->arms.size(); ++i) {
+            if (i > 0) out += " | ";
+            else       out += ' ';
+            const auto& arm = ce->arms[i];
+            out += arm.pattern ? patternToString(*arm.pattern)
+                               : std::string("<null>");
+            if (arm.guard) {
+                out += " when ";
+                out += exprToString(*arm.guard);
+            }
+            out += " => ";
+            out += arm.exprBody ? exprToString(*arm.exprBody)
+                                : std::string("<null>");
+        }
+        out += " } end";
+        return out;
+    }
     return "<unknown expr>";
+}
+
+inline std::string patternToString(const ast::Pattern& p) {
+    if (dynamic_cast<const ast::DiscardPattern*>(&p)) return "_";
+    if (dynamic_cast<const ast::NullPattern*>(&p))    return "null";
+    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(&p)) {
+        std::string out = "var ";
+        out += std::string(bp->name);
+        if (bp->type) {
+            out += ": ";
+            out += typeToString(*bp->type);
+        }
+        return out;
+    }
+    if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(&p)) {
+        std::string out;
+        for (std::size_t i = 0; i < cp->constants.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += cp->constants[i] ? exprToString(*cp->constants[i])
+                                    : std::string("<null>");
+        }
+        return out;
+    }
+    if (auto* np = dynamic_cast<const ast::NamedPattern*>(&p)) {
+        return np->name ? qualifiedNameString(*np->name)
+                        : std::string("<null>");
+    }
+    if (auto* rp = dynamic_cast<const ast::RangePattern*>(&p)) {
+        return rp->rangeExpr ? exprToString(*rp->rangeExpr)
+                             : std::string("<null>");
+    }
+    if (auto* rop = dynamic_cast<const ast::RelOpPattern*>(&p)) {
+        std::string out = std::string(rop->op);
+        out += ' ';
+        out += rop->expr ? exprToString(*rop->expr) : std::string("<null>");
+        return out;
+    }
+    if (auto* tp = dynamic_cast<const ast::TypePattern*>(&p)) {
+        return tp->type ? typeToString(*tp->type) : std::string("<null>");
+    }
+    if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(&p)) {
+        std::string out = dp->typeName
+                              ? qualifiedNameString(*dp->typeName)
+                              : std::string("<null>");
+        out += '(';
+        for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
+            if (i > 0) out += ", ";
+            const auto& sp = dp->subPatterns[i];
+            if (!sp.nakedBinding.empty()) {
+                out += std::string(sp.nakedBinding);
+            } else {
+                out += sp.pattern ? patternToString(*sp.pattern)
+                                  : std::string("<null>");
+            }
+        }
+        out += ')';
+        return out;
+    }
+    return "<unknown pattern>";
 }
 
 // Render one statement to a single source-like string. Slice 11 covers

@@ -1287,6 +1287,15 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
         return std::unique_ptr<ast::Expr>(e.release());
     }
 
+    // §A.7 CaseExpr — `"case" Expression? CaseArm ("," CaseArm)* ","? "end"`.
+    // The bare form (no scrutinee) is admitted by the grammar; slice 38
+    // requires the scrutinee form (the bare-form lookahead requires deciding
+    // "is the next token a pattern or an expression" without backtracking,
+    // which lands later).
+    if (isKeyword("case")) {
+        return parseCaseExpr();
+    }
+
     // §A.5 NewExpr — `new Type "(" ArgList? ")"` or shorthand `new "(" … ")"`.
     if (isKeyword("new")) {
         advance(); // past `new`
@@ -1438,6 +1447,166 @@ ast::Param Parser::parseLambdaParam() {
         p.type = parseType();
     }
     return p;
+}
+
+// ===== Slice 38: patterns and case expressions (§A.7) =====================
+
+std::unique_ptr<ast::Pattern> Parser::parsePattern() {
+    // `_` discard. `_` is an Identifier per the lexer.
+    if (current_.kind == TokenKind::Identifier && current_.text == "_") {
+        advance();
+        return std::make_unique<ast::DiscardPattern>();
+    }
+    // `null` literal pattern.
+    if (consumeKeyword("null")) {
+        return std::make_unique<ast::NullPattern>();
+    }
+    // `var IDENT (: TYPE)?` binding pattern.
+    if (consumeKeyword("var")) {
+        auto bp = std::make_unique<ast::BindingPattern>();
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected identifier in `var` binding pattern");
+        } else {
+            bp->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) bp->type = parseType();
+        return std::unique_ptr<ast::Pattern>(bp.release());
+    }
+    // Relational pattern: `<`, `>`, `<=`, `>=` followed by Expression.
+    if (isPunctuator("<") || isPunctuator(">") ||
+        isPunctuator("<=") || isPunctuator(">=")) {
+        auto rop = std::make_unique<ast::RelOpPattern>();
+        rop->op = current_.text;
+        advance();
+        rop->expr = parseExpression();
+        return std::unique_ptr<ast::Pattern>(rop.release());
+    }
+    // Open-ended range patterns (`..`, `..<EXPR`, `..EXPR`) are not in this
+    // slice. The with-lower-bound forms (`a..b`, `a..<b`) are detected in
+    // the catch-all below.
+    if (isPunctuator("..") || isPunctuator("..<")) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "open-ended range patterns are not yet supported "
+            "(only `a..b` / `a..<b` for now)");
+        advance();
+        return nullptr;
+    }
+    // Primitive-type-led TypePattern. Other types (named) fall through to
+    // the Identifier branch as NamedPattern — sema disambiguates Constant
+    // vs Type by name resolution per the §A.7 note.
+    if (isKeyword("int")     || isKeyword("long")  ||
+        isKeyword("short")   || isKeyword("byte")  ||
+        isKeyword("sbyte")   || isKeyword("ushort")||
+        isKeyword("uint")    || isKeyword("ulong") ||
+        isKeyword("float")   || isKeyword("double")||
+        isKeyword("decimal") || isKeyword("bool")  ||
+        isKeyword("char")    || isKeyword("string")) {
+        auto tp = std::make_unique<ast::TypePattern>();
+        tp->type = parseType();
+        return std::unique_ptr<ast::Pattern>(tp.release());
+    }
+    // Identifier → QualifiedName. `(` after means DestructuringPattern,
+    // otherwise NamedPattern (sema resolves Constant vs Type-test).
+    if (current_.kind == TokenKind::Identifier) {
+        auto qn = parseQualifiedName();
+        if (consumePunctuator("(")) {
+            auto dp = std::make_unique<ast::DestructuringPattern>();
+            dp->typeName = std::move(qn);
+            if (!isPunctuator(")")) {
+                dp->subPatterns.push_back(parsePositionalPattern());
+                while (consumePunctuator(",")) {
+                    dp->subPatterns.push_back(parsePositionalPattern());
+                }
+            }
+            if (!consumePunctuator(")")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ')' to close destructuring pattern");
+            }
+            return std::unique_ptr<ast::Pattern>(dp.release());
+        }
+        auto np = std::make_unique<ast::NamedPattern>();
+        np->name = std::move(qn);
+        return std::unique_ptr<ast::Pattern>(np.release());
+    }
+    // Catch-all: parse an Expression and classify. A `..` / `..<` BinaryExpr
+    // at the root is a RangePattern with lower bound; otherwise wrap as
+    // a single-Constant ConstantPattern. `,` Constant-alternatives are
+    // deferred (small slice scope).
+    auto e = parseExpression();
+    if (auto* be = dynamic_cast<ast::BinaryExpr*>(e.get())) {
+        if (be->op == ".." || be->op == "..<") {
+            auto rp = std::make_unique<ast::RangePattern>();
+            rp->rangeExpr = std::move(e);
+            return std::unique_ptr<ast::Pattern>(rp.release());
+        }
+    }
+    auto cp = std::make_unique<ast::ConstantPattern>();
+    cp->constants.push_back(std::move(e));
+    return std::unique_ptr<ast::Pattern>(cp.release());
+}
+
+ast::PositionalPattern Parser::parsePositionalPattern() {
+    ast::PositionalPattern pp;
+    // A.7 PositionalPattern: a Pattern OR a naked binding Identifier (valid
+    // only inside destructuring position). Naked binding is detected as a
+    // single Identifier (not `_`) followed immediately by `,` or `)`. Any
+    // other shape (Identifier . ..., Identifier ( ..., literal, `var`, etc.)
+    // takes the Pattern path.
+    if (current_.kind == TokenKind::Identifier &&
+        current_.text != "_") {
+        const Token& nxt = peekAt(1);
+        if (nxt.kind == TokenKind::Punctuator &&
+            (nxt.text == "," || nxt.text == ")")) {
+            pp.nakedBinding = current_.text;
+            advance();
+            return pp;
+        }
+    }
+    pp.pattern = parsePattern();
+    return pp;
+}
+
+ast::CaseArm Parser::parseCaseArm() {
+    ast::CaseArm arm;
+    arm.pattern = parsePattern();
+    if (consumeKeyword("when")) {
+        arm.guard = parseExpression();
+    }
+    if (!consumePunctuator("=>")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected '=>' after case-arm pattern");
+    }
+    // Slice 38: only the Expression ArmBody form. Statement-form ArmBody is
+    // valid only in statement-position case (also deferred); the `do … end`
+    // ArmBody form lands with the statement-position case slice.
+    arm.bodyKind = ast::CaseArmBodyKind::Expression;
+    arm.exprBody = parseExpression();
+    return arm;
+}
+
+std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
+    advance(); // past `case`
+    auto ce = std::make_unique<ast::CaseExpr>();
+    // Slice 38 requires the scrutinee form. The bare-`case` form
+    // (`case CaseArm* end`, no scrutinee) is deferred.
+    ce->scrutinee = parseExpression();
+    ce->arms.push_back(parseCaseArm());
+    while (consumePunctuator(",")) {
+        // Trailing `","?` per the grammar — `,` followed immediately by
+        // `end` terminates the list.
+        if (isKeyword("end")) break;
+        ce->arms.push_back(parseCaseArm());
+    }
+    if (!consumeKeyword("end")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'end' to close case expression");
+    }
+    return std::unique_ptr<ast::Expr>(ce.release());
 }
 
 std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head) {
