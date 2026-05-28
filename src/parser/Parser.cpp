@@ -3044,8 +3044,10 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
 }
 
 std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
-    // A.3 `GenericConstraints ::= "where" Identifier ":" Constraint
-    //                              ("," Constraint)*`. Zero or more clauses.
+    // A.3 GenericConstraints two forms:
+    //   `where T : Constraint ("," Constraint)*`
+    //   `where T is ModifierConstraint`    /* slice 54 — §14.4 */
+    //   ModifierConstraint ::= "owned" | "not" "owned"
     std::vector<ast::GenericConstraint> all;
     while (isKeyword("where")) {
         advance(); // past `where`
@@ -3057,9 +3059,23 @@ std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
             clause.typeParam = current_.text;
             advance();
         }
+        // Modifier-constraint form: `is owned` / `is not owned`.
+        if (consumeKeyword("is")) {
+            const bool isNot = consumeKeyword("not");
+            if (consumeKeyword("owned")) {
+                clause.modifierConstraint = isNot ? "not owned" : "owned";
+            } else {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'owned' in ModifierConstraint "
+                    "(only `is owned` / `is not owned` are supported)");
+            }
+            all.push_back(std::move(clause));
+            continue;
+        }
         if (!consumePunctuator(":")) {
             diagnostics_.report(Severity::Error, current_.location,
-                                "expected ':' in generic constraint");
+                                "expected ':' or 'is' in generic constraint");
         }
 
         auto parseConstraintItem = [&]() -> ast::ConstraintItem {
