@@ -52,6 +52,15 @@ inline void expectLexError(std::string_view source) {
     BEZEL_EXPECT_TRUE(diagnostics.hasErrors());
 }
 
+// Assert a token's source location matches the expected 1-based line/column.
+// Convention (not in the spec): line and column are 1-based; CR, LF, and CRLF
+// each advance the line by one; tabs advance the column by one.
+inline void expectLocation(const Token& token,
+                           std::uint32_t line, std::uint32_t column) {
+    BEZEL_EXPECT_EQ(token.location.line, line);
+    BEZEL_EXPECT_EQ(token.location.column, column);
+}
+
 // Assert that `actual` is exactly `expected` followed by a terminal EndOfFile
 // token. Bounds-safe: a stub lexer that returns fewer tokens records assertion
 // failures rather than reading out of range.

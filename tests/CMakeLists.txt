@@ -12,7 +12,8 @@ set(BEZEL_TEST_SOURCES
     lexer/numeric_literals_test.cpp
     lexer/char_literals_test.cpp
     lexer/string_literals_test.cpp
-    lexer/verbatim_strings_test.cpp)
+    lexer/verbatim_strings_test.cpp
+    lexer/locations_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

@@ -50,80 +50,8 @@ void consumeOneScalar(std::string_view source, std::size_t& pos) {
     }
 }
 
-// Consume one escape sequence starting at source[pos] == '\\' (caller has
-// verified). Reports diagnostics for malformed escapes and for any escape
-// resolving to a surrogate code point (§18.3, §18.8). Advances pos past the
-// escape regardless of validity so the surrounding scan can keep going.
-void consumeEscape(std::string_view source, std::size_t& pos,
-                   DiagnosticEngine& diagnostics) {
-    if (pos + 1 >= source.size()) {
-        diagnostics.report(Severity::Error, SourceLocation{},
-                           "unterminated escape sequence");
-        ++pos;
-        return;
-    }
-    ++pos; // past the backslash
-    const char c = source[pos];
-    switch (c) {
-    case 'n': case 'r': case 't': case '\\': case '"': case '\'':
-    case '0': case 'a': case 'b': case 'f': case 'v':
-        // §18.8 named escapes; single character after `\`.
-        ++pos;
-        return;
-    case 'u':
-    case 'U': {
-        // §18.8 \u: 4 hex digits, BMP-only; \U: 8 hex digits, full range.
-        const int required = (c == 'u') ? 4 : 8;
-        ++pos;
-        std::uint32_t value = 0;
-        int count = 0;
-        while (count < required && pos < source.size() &&
-               isHexDigit(source[pos])) {
-            value = (value << 4) | hexValue(source[pos]);
-            ++pos;
-            ++count;
-        }
-        if (count < required) {
-            diagnostics.report(
-                Severity::Error, SourceLocation{},
-                std::string("\\") + c + " escape requires exactly " +
-                    (required == 4 ? "4" : "8") + " hex digits");
-        }
-        // §18.3 / §18.8: surrogate code points are compile errors.
-        if (value >= 0xD800 && value <= 0xDFFF) {
-            diagnostics.report(Severity::Error, SourceLocation{},
-                               "escape sequence resolves to a surrogate code point");
-        }
-        return;
-    }
-    case 'x': {
-        // §18.8 \x: 1–4 hex digits, greedy. Greediness matters for surrogate
-        // detection (e.g. `\xD800` decodes to U+D800).
-        ++pos;
-        std::uint32_t value = 0;
-        int count = 0;
-        while (count < 4 && pos < source.size() && isHexDigit(source[pos])) {
-            value = (value << 4) | hexValue(source[pos]);
-            ++pos;
-            ++count;
-        }
-        if (count == 0) {
-            diagnostics.report(Severity::Error, SourceLocation{},
-                               "\\x escape requires at least one hex digit");
-        }
-        if (value >= 0xD800 && value <= 0xDFFF) {
-            diagnostics.report(Severity::Error, SourceLocation{},
-                               "escape sequence resolves to a surrogate code point");
-        }
-        return;
-    }
-    default:
-        diagnostics.report(Severity::Error, SourceLocation{},
-                           "unrecognized escape sequence");
-        ++pos;
-        return;
-    }
-}
+// (consumeEscape moved to Lexer::consumeEscape so it can resolve diagnostic
+//  locations via locationAt; see below.)
 
 // Per v0.127 A.1, every numeric digit-run is `Digit ("_"* Digit)*`: the run
 // must end with a digit. Our scanners consume the digit-and-underscore set
@@ -208,13 +136,35 @@ bool isReservedKeyword(std::string_view text) {
 Lexer::Lexer(std::string_view source, DiagnosticEngine& diagnostics)
     : source_(source), diagnostics_(diagnostics) {}
 
+SourceLocation Lexer::locationAt(std::size_t offset) const {
+    std::uint32_t line = 1;
+    std::uint32_t column = 1;
+    const std::size_t limit = offset < source_.size() ? offset : source_.size();
+    for (std::size_t i = 0; i < limit; ++i) {
+        const char c = source_[i];
+        if (c == '\r') {
+            ++line;
+            column = 1;
+            if (i + 1 < limit && source_[i + 1] == '\n') {
+                ++i; // CRLF advances the line once, not twice
+            }
+        } else if (c == '\n') {
+            ++line;
+            column = 1;
+        } else {
+            ++column;
+        }
+    }
+    return SourceLocation{line, column, static_cast<std::uint32_t>(offset)};
+}
+
 Token Lexer::next() {
     // Skip whitespace and comments — both are trivia per §1.2 ("Whitespace
     // and comments separate tokens but are not themselves tokens"). The two
     // can interleave, so loop until we land on a real token.
     for (;;) {
         if (position_ >= source_.size()) {
-            return Token{TokenKind::EndOfFile, {}, SourceLocation{}};
+            return Token{TokenKind::EndOfFile, {}, locationAt(position_)};
         }
         unsigned char b = static_cast<unsigned char>(source_[position_]);
 
@@ -254,7 +204,7 @@ Token Lexer::next() {
                     ++position_;
                 }
                 if (!closed) {
-                    diagnostics_.report(Severity::Error, SourceLocation{},
+                    diagnostics_.report(Severity::Error, locationAt(position_),
                                         "unterminated block comment");
                 }
                 continue;
@@ -274,7 +224,7 @@ Token Lexer::next() {
         std::string_view text = source_.substr(start, position_ - start);
         TokenKind kind =
             isReservedKeyword(text) ? TokenKind::Keyword : TokenKind::Identifier;
-        return Token{kind, text, SourceLocation{}};
+        return Token{kind, text, locationAt(start)};
     }
 
     // §18.1 numeric literals (grammar A.1: IntLiteral, FloatLiteral). Value
@@ -301,7 +251,7 @@ Token Lexer::next() {
                 consumeIntSuffix(source_, position_);
                 return Token{TokenKind::IntLiteral,
                              source_.substr(numStart, position_ - numStart),
-                             SourceLocation{}};
+                             locationAt(numStart)};
             }
             if ((p == 'b' || p == 'B') && isBinDigit(source_[position_ + 2])) {
                 position_ += 2;
@@ -314,7 +264,7 @@ Token Lexer::next() {
                 consumeIntSuffix(source_, position_);
                 return Token{TokenKind::IntLiteral,
                              source_.substr(numStart, position_ - numStart),
-                             SourceLocation{}};
+                             locationAt(numStart)};
             }
         }
 
@@ -381,7 +331,7 @@ Token Lexer::next() {
 
         return Token{isFloat ? TokenKind::FloatLiteral : TokenKind::IntLiteral,
                      source_.substr(numStart, position_ - numStart),
-                     SourceLocation{}};
+                     locationAt(numStart)};
     }
 
     // §18.3 char, §18.4 string, §18.6 verbatim string. Interpolation prefixes
@@ -462,17 +412,17 @@ Token Lexer::next() {
     if (puLen > 0) {
         position_ += puLen;
         return Token{TokenKind::Punctuator,
-                     source_.substr(puStart, puLen), SourceLocation{}};
+                     source_.substr(puStart, puLen), locationAt(puStart)};
     }
 
     // Unrecognized character. Char/string/verbatim literal openers (`'`, `"`,
     // `@"`) are dispatched above; what reaches here is something the lexer
     // has no rule for at all.
     std::size_t start = position_;
+    const SourceLocation unknownLoc = locationAt(start);
     ++position_;
-    diagnostics_.report(Severity::Error, SourceLocation{},
-                        "unexpected character");
-    return Token{TokenKind::Unknown, source_.substr(start, 1), SourceLocation{}};
+    diagnostics_.report(Severity::Error, unknownLoc, "unexpected character");
+    return Token{TokenKind::Unknown, source_.substr(start, 1), unknownLoc};
 }
 
 // §18.3: `CharLiteral ::= "'" CharContent "'"`. The lexer scans for the
@@ -481,32 +431,33 @@ Token Lexer::next() {
 // detection is sema's responsibility.
 Token Lexer::scanCharLiteral() {
     const std::size_t start = position_;
+    const SourceLocation startLoc = locationAt(start);
     ++position_; // past opening '\''
     if (position_ >= source_.size()) {
-        diagnostics_.report(Severity::Error, SourceLocation{},
+        diagnostics_.report(Severity::Error, startLoc,
                             "unterminated character literal");
         return Token{TokenKind::CharLiteral,
                      source_.substr(start, position_ - start),
-                     SourceLocation{}};
+                     startLoc};
     }
     if (source_[position_] == '\'') {
         // Empty content — A.1 CharContent requires one scalar or escape.
-        diagnostics_.report(Severity::Error, SourceLocation{},
+        diagnostics_.report(Severity::Error, startLoc,
                             "empty character literal");
     } else if (source_[position_] == '\\') {
-        consumeEscape(source_, position_, diagnostics_);
+        consumeEscape();
     } else {
         consumeOneScalar(source_, position_);
     }
     if (position_ < source_.size() && source_[position_] == '\'') {
         ++position_;
     } else {
-        diagnostics_.report(Severity::Error, SourceLocation{},
+        diagnostics_.report(Severity::Error, startLoc,
                             "unterminated character literal");
     }
     return Token{TokenKind::CharLiteral,
                  source_.substr(start, position_ - start),
-                 SourceLocation{}};
+                 startLoc};
 }
 
 // §18.4: `StringLiteral ::= '"' StringContent* '"'`. Content is any code
@@ -515,6 +466,7 @@ Token Lexer::scanCharLiteral() {
 // `consumeEscape`, which also detects surrogate escapes per §18.8.
 Token Lexer::scanStringLiteral() {
     const std::size_t start = position_;
+    const SourceLocation startLoc = locationAt(start);
     ++position_; // past opening '"'
     bool terminated = false;
     while (position_ < source_.size()) {
@@ -525,18 +477,18 @@ Token Lexer::scanStringLiteral() {
             break;
         }
         if (c == '\\') {
-            consumeEscape(source_, position_, diagnostics_);
+            consumeEscape();
             continue;
         }
         consumeOneScalar(source_, position_);
     }
     if (!terminated) {
-        diagnostics_.report(Severity::Error, SourceLocation{},
+        diagnostics_.report(Severity::Error, startLoc,
                             "unterminated string literal");
     }
     return Token{TokenKind::StringLiteral,
                  source_.substr(start, position_ - start),
-                 SourceLocation{}};
+                 startLoc};
 }
 
 // §18.6: `'@"' VerbatimContent* '"'`. No `\` escape processing — backslashes
@@ -545,6 +497,7 @@ Token Lexer::scanStringLiteral() {
 // closing quote. Line breaks become part of the lexeme (multi-line).
 Token Lexer::scanVerbatimString() {
     const std::size_t start = position_;
+    const SourceLocation startLoc = locationAt(start);
     position_ += 2; // past '@' and '"'
     bool terminated = false;
     while (position_ < source_.size()) {
@@ -561,12 +514,89 @@ Token Lexer::scanVerbatimString() {
         consumeOneScalar(source_, position_);
     }
     if (!terminated) {
-        diagnostics_.report(Severity::Error, SourceLocation{},
+        diagnostics_.report(Severity::Error, startLoc,
                             "unterminated verbatim string literal");
     }
     return Token{TokenKind::VerbatimStringLiteral,
                  source_.substr(start, position_ - start),
-                 SourceLocation{}};
+                 startLoc};
+}
+
+// Consume one escape sequence starting at source_[position_] == '\\' (caller
+// has verified). Reports diagnostics for malformed escapes and for any escape
+// resolving to a surrogate code point (§18.3, §18.8). Advances position_ past
+// the escape regardless of validity so the surrounding scan can keep going.
+// All diagnostics raised from inside one escape point at the `\` for clarity.
+void Lexer::consumeEscape() {
+    const SourceLocation escapeLoc = locationAt(position_);
+    if (position_ + 1 >= source_.size()) {
+        diagnostics_.report(Severity::Error, escapeLoc,
+                            "unterminated escape sequence");
+        ++position_;
+        return;
+    }
+    ++position_; // past the backslash
+    const char c = source_[position_];
+    switch (c) {
+    case 'n': case 'r': case 't': case '\\': case '"': case '\'':
+    case '0': case 'a': case 'b': case 'f': case 'v':
+        // §18.8 named escapes; single character after `\`.
+        ++position_;
+        return;
+    case 'u':
+    case 'U': {
+        // §18.8 \u: 4 hex digits, BMP-only; \U: 8 hex digits, full range.
+        const int required = (c == 'u') ? 4 : 8;
+        ++position_;
+        std::uint32_t value = 0;
+        int count = 0;
+        while (count < required && position_ < source_.size() &&
+               isHexDigit(source_[position_])) {
+            value = (value << 4) | hexValue(source_[position_]);
+            ++position_;
+            ++count;
+        }
+        if (count < required) {
+            diagnostics_.report(
+                Severity::Error, escapeLoc,
+                std::string("\\") + c + " escape requires exactly " +
+                    (required == 4 ? "4" : "8") + " hex digits");
+        }
+        // §18.3 / §18.8: surrogate code points are compile errors.
+        if (value >= 0xD800 && value <= 0xDFFF) {
+            diagnostics_.report(Severity::Error, escapeLoc,
+                                "escape sequence resolves to a surrogate code point");
+        }
+        return;
+    }
+    case 'x': {
+        // §18.8 \x: 1–4 hex digits, greedy. Greediness matters for surrogate
+        // detection (e.g. `\xD800` decodes to U+D800).
+        ++position_;
+        std::uint32_t value = 0;
+        int count = 0;
+        while (count < 4 && position_ < source_.size() &&
+               isHexDigit(source_[position_])) {
+            value = (value << 4) | hexValue(source_[position_]);
+            ++position_;
+            ++count;
+        }
+        if (count == 0) {
+            diagnostics_.report(Severity::Error, escapeLoc,
+                                "\\x escape requires at least one hex digit");
+        }
+        if (value >= 0xD800 && value <= 0xDFFF) {
+            diagnostics_.report(Severity::Error, escapeLoc,
+                                "escape sequence resolves to a surrogate code point");
+        }
+        return;
+    }
+    default:
+        diagnostics_.report(Severity::Error, escapeLoc,
+                            "unrecognized escape sequence");
+        ++position_;
+        return;
+    }
 }
 
 } // namespace bezel
