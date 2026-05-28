@@ -187,6 +187,26 @@ struct DoEndBlock : Stmt {
 struct BreakStmt : Stmt {};
 struct ContinueStmt : Stmt {};
 
+// A.6 CatchArm with the "with-binding" pattern only:
+//   `"var" Identifier ":" Type "=>" Statement`.
+// The no-binding form, multi-Type patterns (`Type1, Type2`), `when` guards,
+// and the `do … end` / Expression arm bodies are deferred to a later slice
+// (they share grammar with the §19 case construct).
+struct CatchArm {
+    std::string_view varName;
+    std::unique_ptr<Type> type;
+    std::unique_ptr<Stmt> body; // single Statement form
+};
+
+// A.6 TryStmt: `"try" Statement* CatchBlock FinallyClause? "end" ";"` or
+// `"try" Statement* FinallyClause "end" ";"`.
+struct TryStmt : Stmt {
+    std::vector<std::unique_ptr<Stmt>> body;
+    std::vector<CatchArm> catches;
+    bool hasFinally = false;
+    std::vector<std::unique_ptr<Stmt>> finallyBody;
+};
+
 // One parameter in a method's parameter list. Slice 10 covers
 // `Identifier ":" Type`; modifiers (`ref`/`out`/`out owned`/`owned`) and
 // default values come with later slices.

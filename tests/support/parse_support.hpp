@@ -426,6 +426,26 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         out += " end;";
         return out;
     }
+    if (auto* t = dynamic_cast<const ast::TryStmt*>(&s)) {
+        std::string out = "try ";
+        out += bodyToString(t->body);
+        for (const auto& arm : t->catches) {
+            out += " catch var ";
+            out += std::string(arm.varName);
+            out += ": ";
+            out += arm.type ? typeToString(*arm.type)
+                            : std::string("<null>");
+            out += " => ";
+            out += arm.body ? stmtSummary(*arm.body)
+                            : std::string("<null>");
+        }
+        if (t->hasFinally) {
+            out += " finally ";
+            out += bodyToString(t->finallyBody);
+        }
+        out += " end;";
+        return out;
+    }
     if (dynamic_cast<const ast::BreakStmt*>(&s))    return "break;";
     if (dynamic_cast<const ast::ContinueStmt*>(&s)) return "continue;";
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
