@@ -228,12 +228,28 @@ struct TryStmt : Stmt {
     std::vector<std::unique_ptr<Stmt>> finallyBody;
 };
 
-// One parameter in a method's parameter list. Slice 10 covers
-// `Identifier ":" Type`; modifiers (`ref`/`out`/`out owned`/`owned`) and
-// default values come with later slices.
+// A.4: `Param ::= ParamModifiers? Identifier ":" Type (":=" Expression)?`.
+// `ParamModifiers ::= "ref" | "out" "owned"? | "owned"`. Slice 24 adds
+// modifier (recorded as a single composite string like "out owned") and
+// default value.
 struct Param {
+    std::string_view modifier; // "ref", "out", "out owned", "owned", or empty
     std::string_view name;
     std::unique_ptr<Type> type;
+    std::unique_ptr<Expr> defaultValue; // null when no `:= Expr`
+};
+
+// A.3 GenericConstraints. One `where T: c1, c2` clause; multiple clauses
+// stack in TypeDecl/MethodDecl::genericConstraints.
+struct ConstraintItem {
+    // "class" / "value" / "notnull" / "new" / "type". For "type", typeArg is
+    // populated; for the others, typeArg is null.
+    std::string_view kind;
+    std::unique_ptr<Type> typeArg;
+};
+struct GenericConstraint {
+    std::string_view typeParam; // T in `where T: ...`
+    std::vector<ConstraintItem> items;
 };
 
 // A.4: `MethodDecl ::= Visibility "static"? "async"? VirtualKind?
@@ -262,6 +278,7 @@ struct MethodDecl : Member {
     std::unique_ptr<Expr> exprBody;        // populated when bodyKind=Expression
     std::vector<std::unique_ptr<Stmt>> stmts; // for Block (empty until slice 11+)
     std::string_view endLabel;             // optional `end Identifier?` for Block
+    std::vector<GenericConstraint> genericConstraints; // A.4 `where T: …`
 };
 
 // A.4: `ConstructorDecl ::= Visibility "constructor" "(" ParamList? ")"
@@ -318,6 +335,8 @@ struct TypeDecl : TopDecl {
     // Enum-only: the comma-separated constants (`EnumConstants` per A.3).
     // Empty for non-enum kinds.
     std::vector<EnumConstant> enumConstants;
+    // §A.3 GenericConstraints* after the inheritance clause.
+    std::vector<GenericConstraint> genericConstraints;
     // Record-only: the parenthesised positional fields per A.3
     // `PositionalFields ::= "(" PositionalField ("," PositionalField)* ")"`,
     // `PositionalField ::= Identifier ":" Type SerializedClause?`. Reuses

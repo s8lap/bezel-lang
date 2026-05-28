@@ -207,6 +207,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             }
         }
         decl->baseTypes = parseInheritance();
+        decl->genericConstraints = parseGenericConstraints();
     }
 
     // §A.3 RecordDecl shorthand body: `record Foo(...) ;` (no `end`).
@@ -870,6 +871,8 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDecl(
         m->returnType = parseType();
     }
 
+    m->genericConstraints = parseGenericConstraints();
+
     // A.4 MethodBody: `=> Expression ";"` | `Statement* "end" Identifier? ";"`
     // | `";"`. (GenericConstraints* between signature and body land later.)
     if (consumePunctuator("=>")) {
@@ -1320,13 +1323,24 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
 }
 
 std::vector<ast::Param> Parser::parseParamList() {
-    // Slice 10: each param is `Identifier ":" Type`. ParamModifiers (ref,
-    // out, out owned, owned) and default values arrive with later slices.
+    // A.4 `Param ::= ParamModifiers? Identifier ":" Type (":=" Expression)?`
+    // ParamModifiers ∈ { ref | out owned? | owned }.
     std::vector<ast::Param> params;
     if (isPunctuator(")")) return params;
 
     auto parseOne = [&]() -> ast::Param {
         ast::Param p;
+        if (consumeKeyword("ref")) {
+            p.modifier = "ref";
+        } else if (consumeKeyword("out")) {
+            if (consumeKeyword("owned")) {
+                p.modifier = "out owned";
+            } else {
+                p.modifier = "out";
+            }
+        } else if (consumeKeyword("owned")) {
+            p.modifier = "owned";
+        }
         if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected parameter name");
@@ -1339,6 +1353,9 @@ std::vector<ast::Param> Parser::parseParamList() {
                                 "expected ':' after parameter name");
         }
         p.type = parseType();
+        if (consumePunctuator(":=")) {
+            p.defaultValue = parseExpression();
+        }
         return p;
     };
 
@@ -1347,6 +1364,62 @@ std::vector<ast::Param> Parser::parseParamList() {
         params.push_back(parseOne());
     }
     return params;
+}
+
+std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
+    // A.3 `GenericConstraints ::= "where" Identifier ":" Constraint
+    //                              ("," Constraint)*`. Zero or more clauses.
+    std::vector<ast::GenericConstraint> all;
+    while (isKeyword("where")) {
+        advance(); // past `where`
+        ast::GenericConstraint clause;
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected type-parameter name after 'where'");
+        } else {
+            clause.typeParam = current_.text;
+            advance();
+        }
+        if (!consumePunctuator(":")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ':' in generic constraint");
+        }
+
+        auto parseConstraintItem = [&]() -> ast::ConstraintItem {
+            ast::ConstraintItem item;
+            // A.3 Constraint ::= "class" | "value" | "notnull" | "new" "(" ")"
+            //                  | Type.
+            // `class` is reserved; `value` and `notnull` are contextual
+            // (App. B.2) so the lexer produces Identifier tokens.
+            if (consumeKeyword("class")) {
+                item.kind = "class";
+            } else if (current_.kind == TokenKind::Identifier &&
+                       (current_.text == "value" ||
+                        current_.text == "notnull")) {
+                item.kind = current_.text;
+                advance();
+            } else if (consumeKeyword("new")) {
+                item.kind = "new";
+                if (!consumePunctuator("(") ||
+                    !consumePunctuator(")")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected '()' after 'new' constraint");
+                }
+            } else {
+                item.kind = "type";
+                item.typeArg = parseType();
+            }
+            return item;
+        };
+
+        clause.items.push_back(parseConstraintItem());
+        while (consumePunctuator(",")) {
+            clause.items.push_back(parseConstraintItem());
+        }
+        all.push_back(std::move(clause));
+    }
+    return all;
 }
 
 std::vector<ast::GenericParam> Parser::parseGenericParams() {
