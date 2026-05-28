@@ -93,6 +93,10 @@ private:
     // SerializedClause?`. Distinct from ParamList: no modifiers, no default
     // value, but admits a SerializedClause per field.
     std::vector<ast::Param> parsePositionalFieldList();
+    // Slice 49: A.4 ArgList — `Argument ("," Argument)*`. Caller is
+    // positioned at the first token of the first argument; the closing `)`
+    // is left for the caller to consume.
+    std::vector<ast::CallArgument> parseArgList();
     // Slice 36: a single LambdaParam (A.7). Differs from method ParamList
     // in that the `: Type` ascription is optional.
     ast::Param parseLambdaParam();
