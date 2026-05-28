@@ -687,6 +687,25 @@ struct NameOfExpr : Expr { std::unique_ptr<QualifiedName> name; };
 // A.7 `DefaultExpr ::= "default" "(" Type ")"`.
 struct DefaultExpr : Expr { std::unique_ptr<Type> type; };
 
+// A.7 RangeExpr. Replaces the BinaryExpr `..` / `..<` representation as of
+// slice 52 to make the open-ended and `step` forms representable.
+//
+//   RangeExpr ::= Shift                                  /* no range */
+//               | Shift (".." | "..<") Shift ("step" Shift)?
+//               | Shift ".."                             /* low-only */
+//               | (".." | "..<") Shift                   /* high-only */
+//               | ".."                                   /* fully open */
+//
+// `lo` and `hi` may be null for the open-ended forms (low-only / high-only
+// / fully-open). `step` is optional (only valid when lo and hi are both
+// present per §17 — sema enforces).
+struct RangeExpr : Expr {
+    bool inclusive = false;       // true for `..`, false for `..<`
+    std::unique_ptr<Expr> lo;     // null on the high-only and fully-open forms
+    std::unique_ptr<Expr> hi;     // null on the low-only and fully-open forms
+    std::unique_ptr<Expr> step;   // null when no `step EXPR` suffix
+};
+
 // A.7 unit value `()`. A no-fields expression of the unit type. The
 // PrimaryAtom-level `"(" ")"` alternative in the grammar — distinct from
 // the unit-type form (slice 46) which is `()` in a type context.

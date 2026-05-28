@@ -492,6 +492,22 @@ inline std::string exprToString(const ast::Expr& e) {
         return out;
     }
     if (dynamic_cast<const ast::UnitExpr*>(&e)) return "()";
+    if (auto* r = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        // Render shape `(LO .. HI step S)` / `(LO ..< HI step S)`. Missing
+        // operands render as `<>` to keep the form visibly distinguished
+        // from the with-bounds version. Wrapped in parens for the same
+        // unambiguous-precedence reason as BinaryExpr.
+        std::string out = "(";
+        out += r->lo ? exprToString(*r->lo) : std::string("<>");
+        out += r->inclusive ? " .. " : " ..< ";
+        out += r->hi ? exprToString(*r->hi) : std::string("<>");
+        if (r->step) {
+            out += " step ";
+            out += exprToString(*r->step);
+        }
+        out += ')';
+        return out;
+    }
     if (auto* w = dynamic_cast<const ast::WithExpr*>(&e)) {
         std::string out = w->source ? exprToString(*w->source)
                                     : std::string("<null>");
