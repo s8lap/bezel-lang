@@ -514,12 +514,98 @@ std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
 }
 
 std::unique_ptr<ast::Type> Parser::parseType() {
-    // A.5 (slice-4 subset): `Type ::= QualifiedName GenericArgs? "?"?`. The
-    // qualified-name root may be a primitive-type keyword (§3.4), so we use
-    // parseTypeName rather than parseQualifiedName.
+    // A.5 Type ::= TypeNoNullable "?"?
+    // A.5 TypeNoNullable ::= QualifiedName GenericArgs?
+    //                      | InlineArrayType
+    //                      | FunctionType
+    //                      | "(" ")"            /* unit */
     auto type = std::make_unique<ast::Type>();
-    type->name = parseTypeName();
 
+    // InlineArrayType: `[ ConstIntExpr "owned"? ] Type`.
+    if (consumePunctuator("[")) {
+        type->kind = ast::TypeKind::InlineArray;
+        type->arraySize = parseExpression();
+        if (consumeKeyword("owned")) {
+            type->arrayOwned = true;
+        }
+        if (!consumePunctuator("]")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ']' to close inline-array size");
+        }
+        type->arrayElement = parseType();
+        if (isPunctuator("?")) {
+            // Per the §A.5 note, nullable inline-array types are not
+            // provided in this revision; admit syntactically and let
+            // sema diagnose.
+            type->nullable = true;
+            advance();
+        }
+        return type;
+    }
+
+    // Unit type `()` or FunctionType `(...) -> ...`.
+    if (consumePunctuator("(")) {
+        if (consumePunctuator(")")) {
+            // `()` followed by `->`: zero-param function type.
+            if (consumePunctuator("->")) {
+                type->kind = ast::TypeKind::Function;
+                if (consumeKeyword("owned")) type->funcReturnOwned = true;
+                type->funcReturn = parseType();
+            } else {
+                type->kind = ast::TypeKind::Unit;
+            }
+        } else {
+            // Non-empty params; must be function type.
+            type->kind = ast::TypeKind::Function;
+            auto parseFuncParam = [&]() -> ast::FuncParamType {
+                ast::FuncParamType fp;
+                if (consumeKeyword("ref")) {
+                    fp.modifier = "ref";
+                } else if (consumeKeyword("out")) {
+                    if (consumeKeyword("owned")) fp.modifier = "out owned";
+                    else                          fp.modifier = "out";
+                } else if (consumeKeyword("owned")) {
+                    fp.modifier = "owned";
+                }
+                // Optional `Identifier ":"` prefix per A.5 FuncParamType.
+                if (current_.kind == TokenKind::Identifier &&
+                    peekAt(1).kind == TokenKind::Punctuator &&
+                    peekAt(1).text == ":") {
+                    fp.name = current_.text;
+                    advance(); // past identifier
+                    advance(); // past ':'
+                }
+                fp.type = parseType();
+                return fp;
+            };
+            type->funcParams.push_back(parseFuncParam());
+            while (consumePunctuator(",")) {
+                type->funcParams.push_back(parseFuncParam());
+            }
+            if (!consumePunctuator(")")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ')' to close function-type parameter list");
+            }
+            if (!consumePunctuator("->")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected '->' after function-type parameter list");
+            }
+            if (consumeKeyword("owned")) type->funcReturnOwned = true;
+            type->funcReturn = parseType();
+        }
+        if (isPunctuator("?")) {
+            type->nullable = true;
+            advance();
+        }
+        return type;
+    }
+
+    // Default: NamedType.
+    type->kind = ast::TypeKind::Named;
+    type->name = parseTypeName();
     if (isPunctuator("<")) {
         advance(); // past '<'
         type->genericArgs.push_back(parseType());
@@ -532,7 +618,6 @@ std::unique_ptr<ast::Type> Parser::parseType() {
                                 "expected '>' to close generic arguments");
         }
     }
-
     if (isPunctuator("?")) {
         type->nullable = true;
         advance();

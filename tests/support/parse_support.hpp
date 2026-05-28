@@ -84,19 +84,60 @@ inline std::string visibilityPrefix(ast::Visibility v) {
     return "";
 }
 
-// Render a Type AST back to its canonical text form (e.g. `List<int?>?`).
-// Recursive over generic args.
+// Render a Type AST back to its canonical text form.
+// Recursive over generic args, inline-array elements, and function-type
+// component types.
+inline std::string exprToString(const ast::Expr& e); // forward
 inline std::string typeToString(const ast::Type& t) {
     std::string out;
-    if (t.name) out += qualifiedNameString(*t.name);
-    if (!t.genericArgs.empty()) {
-        out += '<';
-        for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
-            if (i > 0) out += ", ";
-            out += t.genericArgs[i] ? typeToString(*t.genericArgs[i])
-                                    : std::string("<null>");
+    switch (t.kind) {
+        case ast::TypeKind::Named: {
+            if (t.name) out += qualifiedNameString(*t.name);
+            if (!t.genericArgs.empty()) {
+                out += '<';
+                for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
+                    if (i > 0) out += ", ";
+                    out += t.genericArgs[i]
+                               ? typeToString(*t.genericArgs[i])
+                               : std::string("<null>");
+                }
+                out += '>';
+            }
+            break;
         }
-        out += '>';
+        case ast::TypeKind::Unit:
+            out += "()";
+            break;
+        case ast::TypeKind::InlineArray:
+            out += '[';
+            out += t.arraySize ? exprToString(*t.arraySize)
+                               : std::string("<null>");
+            if (t.arrayOwned) out += " owned";
+            out += ']';
+            out += t.arrayElement ? typeToString(*t.arrayElement)
+                                  : std::string("<null>");
+            break;
+        case ast::TypeKind::Function:
+            out += '(';
+            for (std::size_t i = 0; i < t.funcParams.size(); ++i) {
+                if (i > 0) out += ", ";
+                const auto& p = t.funcParams[i];
+                if (!p.modifier.empty()) {
+                    out += std::string(p.modifier);
+                    out += ' ';
+                }
+                if (!p.name.empty()) {
+                    out += std::string(p.name);
+                    out += ": ";
+                }
+                out += p.type ? typeToString(*p.type)
+                              : std::string("<null>");
+            }
+            out += ") -> ";
+            if (t.funcReturnOwned) out += "owned ";
+            out += t.funcReturn ? typeToString(*t.funcReturn)
+                                : std::string("<null>");
+            break;
     }
     if (t.nullable) out += '?';
     return out;

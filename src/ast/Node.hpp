@@ -484,10 +484,32 @@ struct NestedTypeMember : Member {
 // suffix. When inline-array and function types arrive, `Type` becomes the
 // polymorphic base and `NamedType` is split out as a subclass; for now a
 // single struct is the right fit.
+//
+// Slice 46: extended for the remaining A.5 TypeNoNullable alternatives —
+// `InlineArrayType`, `FunctionType`, and the unit type `()`. A `kind` tag
+// distinguishes them; only the matching field group is meaningful. A future
+// refactor will split these into a polymorphic hierarchy if the layered
+// shape becomes a burden.
+enum class TypeKind { Named, Unit, InlineArray, Function };
+struct FuncParamType {
+    std::string_view modifier;       // "", "ref", "out", "out owned", "owned"
+    std::string_view name;           // optional parameter name
+    std::unique_ptr<Type> type;
+};
 struct Type : Node {
+    TypeKind kind = TypeKind::Named;
+    bool nullable = false;           // `T?` suffix; applies to any kind
+    // Named:
     std::unique_ptr<QualifiedName> name;
-    std::vector<std::unique_ptr<Type>> genericArgs; // empty when not generic
-    bool nullable = false;
+    std::vector<std::unique_ptr<Type>> genericArgs;
+    // InlineArray (`[N]T` / `[N owned]T`):
+    std::unique_ptr<Expr> arraySize;
+    bool arrayOwned = false;
+    std::unique_ptr<Type> arrayElement;
+    // Function (`(T1, T2) -> T` / `(T1, T2) -> owned T`):
+    std::vector<FuncParamType> funcParams;
+    bool funcReturnOwned = false;
+    std::unique_ptr<Type> funcReturn;
 };
 
 // A.2: `TypeAliasDecl ::= "type" Identifier GenericParams? "=" Type
