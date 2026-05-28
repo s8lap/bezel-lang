@@ -476,6 +476,33 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
         return std::unique_ptr<ast::Expr>(e.release());
     }
 
+    // §A.5 NewExpr — `new Type "(" ArgList? ")"` or shorthand `new "(" … ")"`.
+    if (isKeyword("new")) {
+        advance(); // past `new`
+        auto n = std::make_unique<ast::NewExpr>();
+        if (!isPunctuator("(")) {
+            n->type = parseType();
+        }
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected '(' to begin constructor argument list");
+        } else {
+            if (!isPunctuator(")")) {
+                n->args.push_back(parseExpression());
+                while (consumePunctuator(",")) {
+                    n->args.push_back(parseExpression());
+                }
+            }
+            if (!consumePunctuator(")")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ')' to close constructor argument list");
+            }
+        }
+        return std::unique_ptr<ast::Expr>(n.release());
+    }
+
     if (consumePunctuator("(")) {
         // No ParenExpr node: source-level parens only group the parse; the
         // resulting tree shape encodes the grouping directly. See Node.hpp.
@@ -493,8 +520,9 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head) {
-    // §A.5 primary-level postfix chain. Only `.member` and `(args)` here;
-    // `[i]`, `?.`, `?(`, `!` (postfix) land with the postfix-extras slice.
+    // §A.5 / §17.1 level 1 postfix chain: `.member`, `(args)`, `?.member`,
+    // `?(args)`, `[indices]`, `!` (postfix null-forgiving). All bind to the
+    // expression on the left.
     for (;;) {
         if (consumePunctuator(".")) {
             if (current_.kind != TokenKind::Identifier) {
@@ -507,6 +535,17 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             access->member = current_.text;
             advance();
             head = std::unique_ptr<ast::Expr>(access.release());
+        } else if (consumePunctuator("?.")) {
+            if (current_.kind != TokenKind::Identifier) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected member name after '?.'");
+                break;
+            }
+            auto a = std::make_unique<ast::NullCondMemberExpr>();
+            a->target = std::move(head);
+            a->member = current_.text;
+            advance();
+            head = std::unique_ptr<ast::Expr>(a.release());
         } else if (consumePunctuator("(")) {
             auto call = std::make_unique<ast::CallExpr>();
             call->callee = std::move(head);
@@ -521,6 +560,37 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                                     "expected ')' to close call argument list");
             }
             head = std::unique_ptr<ast::Expr>(call.release());
+        } else if (consumePunctuator("?(")) {
+            auto call = std::make_unique<ast::NullCondCallExpr>();
+            call->callee = std::move(head);
+            if (!isPunctuator(")")) {
+                call->args.push_back(parseExpression());
+                while (consumePunctuator(",")) {
+                    call->args.push_back(parseExpression());
+                }
+            }
+            if (!consumePunctuator(")")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ')' to close '?(' argument list");
+            }
+            head = std::unique_ptr<ast::Expr>(call.release());
+        } else if (consumePunctuator("[")) {
+            auto idx = std::make_unique<ast::IndexExpr>();
+            idx->target = std::move(head);
+            idx->indices.push_back(parseExpression());
+            while (consumePunctuator(",")) {
+                idx->indices.push_back(parseExpression());
+            }
+            if (!consumePunctuator("]")) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected ']' to close index list");
+            }
+            head = std::unique_ptr<ast::Expr>(idx.release());
+        } else if (consumePunctuator("!")) {
+            auto bang = std::make_unique<ast::PostfixBangExpr>();
+            bang->operand = std::move(head);
+            head = std::unique_ptr<ast::Expr>(bang.release());
         } else {
             break;
         }

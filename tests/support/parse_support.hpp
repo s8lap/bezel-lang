@@ -217,6 +217,50 @@ inline std::string exprToString(const ast::Expr& e) {
         out += ')';
         return out;
     }
+    if (auto* a = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        return (a->target ? exprToString(*a->target) : std::string("<null>")) +
+               "?." + std::string(a->member);
+    }
+    if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        std::string out = c->callee ? exprToString(*c->callee)
+                                    : std::string("<null>");
+        out += "?(";
+        for (std::size_t i = 0; i < c->args.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += c->args[i] ? exprToString(*c->args[i])
+                              : std::string("<null>");
+        }
+        out += ')';
+        return out;
+    }
+    if (auto* idx = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        std::string out = idx->target ? exprToString(*idx->target)
+                                      : std::string("<null>");
+        out += '[';
+        for (std::size_t i = 0; i < idx->indices.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += idx->indices[i] ? exprToString(*idx->indices[i])
+                                   : std::string("<null>");
+        }
+        out += ']';
+        return out;
+    }
+    if (auto* b = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        return (b->operand ? exprToString(*b->operand)
+                           : std::string("<null>")) + "!";
+    }
+    if (auto* n = dynamic_cast<const ast::NewExpr*>(&e)) {
+        std::string out = "new ";
+        if (n->type) out += typeToString(*n->type);
+        out += '(';
+        for (std::size_t i = 0; i < n->args.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += n->args[i] ? exprToString(*n->args[i])
+                              : std::string("<null>");
+        }
+        out += ')';
+        return out;
+    }
     return "<unknown expr>";
 }
 
