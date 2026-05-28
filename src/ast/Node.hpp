@@ -100,10 +100,42 @@ struct FieldDecl : Member {
     std::unique_ptr<Expr> initializer; // null if no `:= Expr` was written
 };
 
-// Base for slice-11+ Statement nodes; placeholder so MethodDecl can already
-// hold a statement vector. Concrete subclasses arrive with the statements
-// slice.
+// Base for §A.6 Statement nodes. Slice 11 introduces ReturnStmt,
+// ExpressionStmt, LocalDecl, AssignmentStmt. Control-flow statements
+// (`if`/`while`/`for`/`do`/`try`), `throw`, `break`/`continue`/`yield`,
+// discard, and increment/decrement land in their own slices.
 struct Stmt : Node {};
+
+// A.6: `LocalDecl ::= "var" Identifier (":" Type)? (":=" Expression)? ";"`
+//                  | `"using" "var" Identifier (":" Type)? ":=" Expression ";"`
+//                  | `"await" "using" "var" …`
+// Slice 11 covers the first two forms; `await using` waits on the async slice.
+struct LocalDecl : Stmt {
+    bool isUsing = false;  // `using var` form
+    std::string_view name;
+    std::unique_ptr<Type> type;        // null when no `: Type`
+    std::unique_ptr<Expr> initializer; // null only when plain `var x;`
+};
+
+// A.6: `ReturnStmt ::= "return" Expression? ";"`.
+struct ReturnStmt : Stmt {
+    std::unique_ptr<Expr> value;       // null for `return;`
+};
+
+// A.6: `ExpressionStmt ::= Expression ";"`. Statement-position expression
+// whose value is discarded (call, increment, …).
+struct ExpressionStmt : Stmt {
+    std::unique_ptr<Expr> expr;
+};
+
+// A.6: `AssignmentStmt ::= AssignTarget AssignOp Expression ";"`. The
+// `target` is parsed as an expression in slice 11; sema decides which
+// expression shapes are valid lvalues.
+struct AssignmentStmt : Stmt {
+    std::unique_ptr<Expr> target;
+    std::string_view op;               // ":=", "+=", "-=", "*=", …
+    std::unique_ptr<Expr> value;
+};
 
 // One parameter in a method's parameter list. Slice 10 covers
 // `Identifier ":" Type`; modifiers (`ref`/`out`/`out owned`/`owned`) and

@@ -69,6 +69,11 @@ private:
     std::unique_ptr<ast::MethodDecl> parseMethodDecl(
         ast::Visibility visibility, std::vector<std::string_view> modifiers);
     std::vector<ast::Param> parseParamList();
+    // Slice 11: a single statement. Dispatches on the first token: `var` /
+    // `using` for LocalDecl, `return` for ReturnStmt, otherwise an
+    // expression that may be the start of an AssignmentStmt or an
+    // ExpressionStmt.
+    std::unique_ptr<ast::Stmt> parseStatement();
     // Slice 7: primary expressions plus postfix `.member` and `(args)`.
     // Slice 8: precedence-climbing binary expressions wrap primary+postfix.
     // Slice 9: unary prefix sits between binary and postfix.

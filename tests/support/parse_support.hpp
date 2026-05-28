@@ -220,6 +220,51 @@ inline std::string exprToString(const ast::Expr& e) {
     return "<unknown expr>";
 }
 
+// Render one statement to a single source-like string. Slice 11 covers
+// LocalDecl, ReturnStmt, AssignmentStmt, ExpressionStmt.
+inline std::string stmtSummary(const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        std::string out = ld->isUsing ? "using var " : "var ";
+        out += std::string(ld->name);
+        if (ld->type) {
+            out += ": ";
+            out += typeToString(*ld->type);
+        }
+        if (ld->initializer) {
+            out += " := ";
+            out += exprToString(*ld->initializer);
+        }
+        out += ';';
+        return out;
+    }
+    if (auto* r = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        std::string out = "return";
+        if (r->value) {
+            out += ' ';
+            out += exprToString(*r->value);
+        }
+        out += ';';
+        return out;
+    }
+    if (auto* a = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        std::string out = a->target ? exprToString(*a->target)
+                                    : std::string("<null>");
+        out += ' ';
+        out += std::string(a->op);
+        out += ' ';
+        out += a->value ? exprToString(*a->value) : std::string("<null>");
+        out += ';';
+        return out;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        std::string out = es->expr ? exprToString(*es->expr)
+                                   : std::string("<null>");
+        out += ';';
+        return out;
+    }
+    return "<unknown stmt>";
+}
+
 // Render one class member to a single string. Slice 10 covers FieldDecl and
 // MethodDecl; the other Member subclasses land with their slices.
 inline std::string memberSummary(const ast::Member& m) {
@@ -278,9 +323,20 @@ inline std::string memberSummary(const ast::Member& m) {
                 out += md->exprBody ? exprToString(*md->exprBody)
                                     : std::string("<null>");
                 break;
-            case ast::MethodBodyKind::Block:
-                out += " { … }";
+            case ast::MethodBodyKind::Block: {
+                if (md->stmts.empty()) {
+                    out += " { }";
+                } else {
+                    out += " { ";
+                    for (std::size_t i = 0; i < md->stmts.size(); ++i) {
+                        if (i > 0) out += ' ';
+                        out += md->stmts[i] ? stmtSummary(*md->stmts[i])
+                                            : std::string("<null>");
+                    }
+                    out += " }";
+                }
                 break;
+            }
             case ast::MethodBodyKind::Abstract:
                 out += " ; ";
                 break;
