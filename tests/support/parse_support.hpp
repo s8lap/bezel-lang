@@ -71,30 +71,59 @@ inline std::vector<std::string> importNames(const ParseResult& result) {
     return out;
 }
 
-// One-line human-readable summary of a top-level type declaration, e.g.
-// "public sealed class Foo" or "enum E". Lets tests assert visibility,
-// modifiers, kind, and name without nested deref ladders.
-inline std::string topDeclSummary(const ast::TypeDecl& decl) {
+// Render a Type AST back to its canonical text form (e.g. `List<int?>?`).
+// Recursive over generic args.
+inline std::string typeToString(const ast::Type& t) {
     std::string out;
-    switch (decl.visibility) {
-        case ast::Visibility::Public:    out += "public ";    break;
-        case ast::Visibility::Private:   out += "private ";   break;
-        case ast::Visibility::Internal:  out += "internal ";  break;
-        case ast::Visibility::Protected: out += "protected "; break;
-        case ast::Visibility::None: break;
+    if (t.name) out += qualifiedNameString(*t.name);
+    if (!t.genericArgs.empty()) {
+        out += '<';
+        for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += t.genericArgs[i] ? typeToString(*t.genericArgs[i])
+                                    : std::string("<null>");
+        }
+        out += '>';
     }
-    for (std::string_view m : decl.modifiers) {
-        out += std::string(m);
-        out += ' ';
-    }
-    switch (decl.kind) {
-        case ast::TypeDeclKind::Class:     out += "class ";     break;
-        case ast::TypeDeclKind::Interface: out += "interface "; break;
-        case ast::TypeDeclKind::Record:    out += "record ";    break;
-        case ast::TypeDeclKind::Enum:      out += "enum ";      break;
-    }
-    out += std::string(decl.name);
+    if (t.nullable) out += '?';
     return out;
+}
+
+// One-line human-readable summary of a top-level declaration, e.g.
+// "public sealed class Foo", "enum E", or "type X = List<int>". Lets tests
+// assert the visible shape of each decl in a single string comparison.
+inline std::string topDeclSummary(const ast::TopDecl& decl) {
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(&decl)) {
+        std::string out;
+        switch (td->visibility) {
+            case ast::Visibility::Public:    out += "public ";    break;
+            case ast::Visibility::Private:   out += "private ";   break;
+            case ast::Visibility::Internal:  out += "internal ";  break;
+            case ast::Visibility::Protected: out += "protected "; break;
+            case ast::Visibility::None: break;
+        }
+        for (std::string_view m : td->modifiers) {
+            out += std::string(m);
+            out += ' ';
+        }
+        switch (td->kind) {
+            case ast::TypeDeclKind::Class:     out += "class ";     break;
+            case ast::TypeDeclKind::Interface: out += "interface "; break;
+            case ast::TypeDeclKind::Record:    out += "record ";    break;
+            case ast::TypeDeclKind::Enum:      out += "enum ";      break;
+        }
+        out += std::string(td->name);
+        return out;
+    }
+    if (auto* ta = dynamic_cast<const ast::TypeAlias*>(&decl)) {
+        std::string out = "type ";
+        out += std::string(ta->name);
+        out += " = ";
+        out += ta->aliasedType ? typeToString(*ta->aliasedType)
+                               : std::string("<null>");
+        return out;
+    }
+    return "<unknown>";
 }
 
 inline std::vector<std::string> topDeclSummaries(const ParseResult& result) {

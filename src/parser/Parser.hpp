@@ -36,10 +36,25 @@ private:
     bool consumeKeyword(std::string_view text);
     bool consumePunctuator(std::string_view text);
 
+    // `>>` consumed by the lexer as one Punctuator must be split when it
+    // closes nested generic argument lists (e.g. `List<List<int>>`). This
+    // helper consumes a single closing `>`, splitting `>>` / `>>=` in place
+    // so the leftover stays in `current_` for the outer scope. Returns false
+    // when no closing angle is present.
+    bool consumeClosingAngle();
+
     // Grammar productions.
     std::unique_ptr<ast::ModuleDecl> parseModuleDecl();
     std::unique_ptr<ast::Import> parseImport();
-    std::unique_ptr<ast::TypeDecl> parseTopDecl();
+    std::unique_ptr<ast::TopDecl> parseTopDecl();
+    std::unique_ptr<ast::TypeDecl> parseTypeOrInterfaceDecl(
+        ast::Visibility visibility, std::vector<std::string_view> modifiers);
+    std::unique_ptr<ast::TypeAlias> parseTypeAlias();
+    std::unique_ptr<ast::Type> parseType();
+    // Like parseQualifiedName, but the first component may be a primitive-
+    // type keyword (`int`, `string`, `bool`, …). Used only in type position;
+    // module and import names go through parseQualifiedName.
+    std::unique_ptr<ast::QualifiedName> parseTypeName();
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
 
     Lexer& lexer_;
