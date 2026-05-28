@@ -105,6 +105,10 @@ private:
     // delegates to parsePattern, but also admits naked-binding Identifier
     // per A.7.
     ast::PositionalPattern parsePositionalPattern();
+    // Slice 39: statement-position `case` (A.6). Sibling of parseCaseExpr;
+    // arms have Statement-form or `do … end` bodies.
+    std::unique_ptr<ast::Stmt> parseCaseStmt();
+    ast::CaseArm parseCaseStmtArm();
     // Slice 36: peeks the matching `)` for the `(` at peekAt(startK) and
     // returns true iff a `=>` follows. Used to distinguish
     // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.

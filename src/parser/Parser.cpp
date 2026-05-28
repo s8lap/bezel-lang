@@ -1609,6 +1609,65 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
     return std::unique_ptr<ast::Expr>(ce.release());
 }
 
+// Slice 39: statement-position `case`.
+
+ast::CaseArm Parser::parseCaseStmtArm() {
+    ast::CaseArm arm;
+    arm.pattern = parsePattern();
+    if (consumeKeyword("when")) {
+        arm.guard = parseExpression();
+    }
+    if (!consumePunctuator("=>")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected '=>' after case-arm pattern");
+    }
+    // ArmBody in statement position: `do … end` block OR a single Statement
+    // (whose terminating `;` ends the arm body per the §A.7 ArmBody note).
+    arm.bodyKind = ast::CaseArmBodyKind::Block;
+    if (consumeKeyword("do")) {
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (s) {
+                arm.stmts.push_back(std::move(s));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected 'end' to close 'do' arm body");
+        }
+    } else {
+        // Single Statement. The Statement consumes its own `;`. After
+        // returning, the outer loop expects `,` or `end`.
+        auto s = parseStatement();
+        if (s) arm.stmts.push_back(std::move(s));
+    }
+    return arm;
+}
+
+std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
+    advance(); // past `case`
+    auto cs = std::make_unique<ast::CaseStmt>();
+    cs->scrutinee = parseExpression();
+    cs->arms.push_back(parseCaseStmtArm());
+    while (consumePunctuator(",")) {
+        if (isKeyword("end")) break;
+        cs->arms.push_back(parseCaseStmtArm());
+    }
+    if (!consumeKeyword("end")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'end' to close case statement");
+    }
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after 'end' of case statement");
+    }
+    return std::unique_ptr<ast::Stmt>(cs.release());
+}
+
 std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head) {
     // §A.5 / §17.1 level 1 postfix chain: `.member`, `(args)`, `?.member`,
     // `?(args)`, `[indices]`, `!` (postfix null-forgiving). All bind to the
@@ -1831,6 +1890,14 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
                                 "expected ';' after local declaration");
         }
         return std::unique_ptr<ast::Stmt>(decl.release());
+    }
+
+    // CaseStmt (A.6). Statement-position `case` admits Statement-form and
+    // `do … end` ArmBodies, unlike the Expression-position CaseExpr. We
+    // intercept before the expression fallthrough so the `;` terminator and
+    // the richer body forms work correctly.
+    if (isKeyword("case")) {
+        return parseCaseStmt();
     }
 
     // IfStmt (A.6).

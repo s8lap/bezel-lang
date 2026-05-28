@@ -672,6 +672,19 @@ struct CaseExpr : Expr {
     std::vector<CaseArm> arms;
 };
 
+// A.6 statement-position case. Same shape as CaseExpr but trailed by `;` and
+// admitting Statement-form / `do … end` ArmBody (in addition to Expression).
+// The grammar's ArmBody Statement-form note: "valid only in statement-position
+// case or in a catch arm; reads as a single statement whose terminating `;`
+// ends the arm body, the same as `do Statement end`." Slice 39 covers the
+// Statement-form and `do … end` forms; the Expression-form is not admitted
+// here (a value-producing arm in stmt-position would discard its result, the
+// canonical shape there is `do EXPR end` or wrapping it in `_ := …;`).
+struct CaseStmt : Stmt {
+    std::unique_ptr<Expr> scrutinee;
+    std::vector<CaseArm> arms;
+};
+
 // A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*
 //                          ExtensionMember* "end" ";"`.
 struct ExtensionDecl : TopDecl {

@@ -588,6 +588,34 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         out += " end;";
         return out;
     }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        std::string out = "case ";
+        out += cs->scrutinee ? exprToString(*cs->scrutinee)
+                             : std::string("<bare>");
+        out += " of {";
+        for (std::size_t i = 0; i < cs->arms.size(); ++i) {
+            if (i > 0) out += " | ";
+            else       out += ' ';
+            const auto& arm = cs->arms[i];
+            out += arm.pattern ? patternToString(*arm.pattern)
+                               : std::string("<null>");
+            if (arm.guard) {
+                out += " when ";
+                out += exprToString(*arm.guard);
+            }
+            out += " => ";
+            // Stmt-position arms are always Block kind.
+            out += "{ ";
+            for (std::size_t j = 0; j < arm.stmts.size(); ++j) {
+                if (j > 0) out += ' ';
+                out += arm.stmts[j] ? stmtSummary(*arm.stmts[j])
+                                    : std::string("<null>");
+            }
+            out += " }";
+        }
+        out += " } end;";
+        return out;
+    }
     if (auto* t = dynamic_cast<const ast::TryStmt*>(&s)) {
         std::string out = "try ";
         out += bodyToString(t->body);
