@@ -614,6 +614,48 @@ inline std::string memberSummary(const ast::Member& m) {
         out += " }";
         return out;
     }
+    if (auto* cd = dynamic_cast<const ast::ConstDecl*>(&m)) {
+        std::string out = visibilityPrefix(cd->visibility);
+        if (cd->isStatic) out += "static ";
+        out += "const ";
+        out += std::string(cd->name);
+        if (cd->type) {
+            out += ": ";
+            out += typeToString(*cd->type);
+        }
+        out += " := ";
+        out += cd->value ? exprToString(*cd->value)
+                         : std::string("<null>");
+        return out;
+    }
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
+        std::string out = visibilityPrefix(pd->visibility);
+        for (std::string_view mod : pd->modifiers) {
+            out += std::string(mod);
+            out += ' ';
+        }
+        out += "property ";
+        out += std::string(pd->name);
+        out += ": ";
+        out += pd->type ? typeToString(*pd->type) : std::string("<null>");
+        switch (pd->bodyKind) {
+            case ast::PropertyBodyKind::Expression:
+                out += " => ";
+                out += pd->exprBody ? exprToString(*pd->exprBody)
+                                    : std::string("<null>");
+                break;
+            case ast::PropertyBodyKind::Auto:
+                if (pd->autoInitializer) {
+                    out += " := ";
+                    out += exprToString(*pd->autoInitializer);
+                }
+                break;
+            case ast::PropertyBodyKind::Block:
+                out += " { … }";
+                break;
+        }
+        return out;
+    }
     return "<unknown member>";
 }
 
