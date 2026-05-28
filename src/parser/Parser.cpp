@@ -796,40 +796,79 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                     Severity::Error, current_.location,
                     "expected ';' after expression-body property");
             }
-        } else if (isPropertyAccessorStart()) {
-            pd->bodyKind = ast::PropertyBodyKind::Block;
-            while (isPropertyAccessorStart()) {
-                pd->accessors.push_back(parsePropertyAccessor());
-            }
-            if (!consumeKeyword("end")) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected 'end' to close property accessor block");
-            }
-            // §1.6 keyword-labelled construct. For a property, the Identifier
-            // after `end` should match the property name. The match check
-            // belongs to sema; we just record what was written.
-            if (current_.kind == TokenKind::Identifier) {
-                pd->blockEndLabel = current_.text;
-                advance();
-            }
-            if (!consumePunctuator(";")) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected ';' after 'end' of property accessor block");
-            }
         } else {
-            pd->bodyKind = ast::PropertyBodyKind::Auto;
-            if (consumePunctuator(":=")) {
-                pd->autoInitializer = parseExpression();
-            }
-            if (isSerializedClauseStart()) {
-                pd->serialized = parseSerializedClause();
-            }
-            if (!consumePunctuator(";")) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected ';' after auto-property");
+            // Distinguish AutoAccessorVis-bearing auto-property from a
+            // multi-arm accessor block. AutoAccessorVis is `Visibility
+            // get|set` immediately followed by `:=` or `;` (the auto-form
+            // continuation). Anything else after `Visibility get|set`
+            // (=>, (, …) belongs to an accessor block.
+            const bool autoAccVisCandidate =
+                (isKeyword("public") || isKeyword("private") ||
+                 isKeyword("internal") || isKeyword("protected")) &&
+                peekAt(1).kind == TokenKind::Identifier &&
+                (peekAt(1).text == "get" || peekAt(1).text == "set") &&
+                peekAt(2).kind == TokenKind::Punctuator &&
+                (peekAt(2).text == ":=" || peekAt(2).text == ";");
+            if (autoAccVisCandidate) {
+                pd->bodyKind = ast::PropertyBodyKind::Auto;
+                pd->hasAutoAccessorVis = true;
+                if (isKeyword("public")) pd->autoAccessorVis =
+                    ast::Visibility::Public;
+                else if (isKeyword("private")) pd->autoAccessorVis =
+                    ast::Visibility::Private;
+                else if (isKeyword("internal")) pd->autoAccessorVis =
+                    ast::Visibility::Internal;
+                else if (isKeyword("protected")) pd->autoAccessorVis =
+                    ast::Visibility::Protected;
+                advance(); // past visibility
+                pd->autoAccessorIsSet = (current_.text == "set");
+                advance(); // past get/set
+                if (consumePunctuator(":=")) {
+                    pd->autoInitializer = parseExpression();
+                }
+                if (isSerializedClauseStart()) {
+                    pd->serialized = parseSerializedClause();
+                }
+                if (!consumePunctuator(";")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected ';' after auto-property with "
+                        "AutoAccessorVis");
+                }
+            } else if (isPropertyAccessorStart()) {
+                pd->bodyKind = ast::PropertyBodyKind::Block;
+                while (isPropertyAccessorStart()) {
+                    pd->accessors.push_back(parsePropertyAccessor());
+                }
+                if (!consumeKeyword("end")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected 'end' to close property accessor block");
+                }
+                // §1.6 keyword-labelled construct. For a property, the
+                // Identifier after `end` should match the property name.
+                if (current_.kind == TokenKind::Identifier) {
+                    pd->blockEndLabel = current_.text;
+                    advance();
+                }
+                if (!consumePunctuator(";")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected ';' after 'end' of property accessor block");
+                }
+            } else {
+                pd->bodyKind = ast::PropertyBodyKind::Auto;
+                if (consumePunctuator(":=")) {
+                    pd->autoInitializer = parseExpression();
+                }
+                if (isSerializedClauseStart()) {
+                    pd->serialized = parseSerializedClause();
+                }
+                if (!consumePunctuator(";")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected ';' after auto-property");
+                }
             }
         }
         return std::unique_ptr<ast::Member>(pd.release());

@@ -400,10 +400,12 @@ struct PropertyAccessor {
 // A.4 `PropertyDecl ::= Visibility "static"? VirtualKind? "readonly"?
 //                        "property" Identifier ":" Type PropertyBody`.
 // Forms supported:
-//   `=> Expression ;`               (Expression-body)
-//   `(":=" Expression)? SerializedClause? ";"`  (Auto-property)
-//   `Accessor* "end" Identifier? ";"` (slice 37 — accessor block)
-// AutoAccessorVis (`public get`/etc.) is still deferred.
+//   `=> Expression ;`                                           (Expression)
+//   `AutoAccessorVis? (":=" Expression)? SerializedClause? ";"` (Auto)
+//   `Accessor* "end" Identifier? ";"`                            (Block)
+// AutoAccessorVis (`Visibility "get"|"set"`) carries a per-accessor
+// visibility override on the auto form — e.g. `property X: int private
+// set := 0;` is publicly-gettable / privately-settable.
 struct PropertyDecl : Member {
     Visibility visibility = Visibility::None;
     std::vector<std::string_view> modifiers; // static, readonly + VirtualKind
@@ -412,6 +414,13 @@ struct PropertyDecl : Member {
     PropertyBodyKind bodyKind = PropertyBodyKind::Auto;
     std::unique_ptr<Expr> exprBody;        // Expression-body case
     std::unique_ptr<Expr> autoInitializer; // Auto with `:= …`
+    // Slice 48: AutoAccessorVis on the auto-property form.
+    // `hasAutoAccessorVis` distinguishes the absent from the
+    // `Visibility::None get/set` case (the latter is invalid but the
+    // grammar requires Visibility).
+    bool hasAutoAccessorVis = false;
+    Visibility autoAccessorVis = Visibility::None;
+    bool autoAccessorIsSet = false; // true=set, false=get
     // Slice 41: SerializedClause on the auto-property form.
     std::unique_ptr<SerializedClause> serialized;
     std::vector<PropertyAccessor> accessors; // Block-body case
