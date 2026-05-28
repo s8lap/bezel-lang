@@ -20,6 +20,17 @@ bool isHexDigit(char c) {
 
 bool isBinDigit(char c) { return c == '0' || c == '1'; }
 
+// Per v0.127 A.1, every numeric digit-run is `Digit ("_"* Digit)*`: the run
+// must end with a digit. Our scanners consume the digit-and-underscore set
+// greedily and then call this to back off any trailing `_`s. The first
+// character of each scanned run is always a digit, so the backup cannot pass
+// the start of the literal.
+void trimTrailingUnderscores(std::string_view source, std::size_t& pos) {
+    while (pos > 0 && source[pos - 1] == '_') {
+        --pos;
+    }
+}
+
 // IntSuffix per A.1: "L" | "U" | "UL" | "LU", case-insensitive. Advances
 // `pos` past whichever suffix is found (if any).
 void consumeIntSuffix(std::string_view source, std::size_t& pos) {
@@ -181,6 +192,7 @@ Token Lexer::next() {
                         source_[position_] == '_')) {
                     ++position_;
                 }
+                trimTrailingUnderscores(source_, position_);
                 consumeIntSuffix(source_, position_);
                 return Token{TokenKind::IntLiteral,
                              source_.substr(numStart, position_ - numStart),
@@ -193,6 +205,7 @@ Token Lexer::next() {
                         source_[position_] == '_')) {
                     ++position_;
                 }
+                trimTrailingUnderscores(source_, position_);
                 consumeIntSuffix(source_, position_);
                 return Token{TokenKind::IntLiteral,
                              source_.substr(numStart, position_ - numStart),
@@ -206,6 +219,7 @@ Token Lexer::next() {
                 source_[position_] == '_')) {
             ++position_;
         }
+        trimTrailingUnderscores(source_, position_);
 
         bool isFloat = false;
 
@@ -221,6 +235,7 @@ Token Lexer::next() {
                     source_[position_] == '_')) {
                 ++position_;
             }
+            trimTrailingUnderscores(source_, position_);
         }
 
         // Exponent (A.1 forms 1 and 2): e/E with optional sign and required
@@ -243,6 +258,7 @@ Token Lexer::next() {
                         source_[position_] == '_')) {
                     ++position_;
                 }
+                trimTrailingUnderscores(source_, position_);
             }
         }
 

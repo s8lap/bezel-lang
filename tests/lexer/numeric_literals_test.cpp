@@ -208,3 +208,57 @@ BEZEL_TEST(lexer_numeric_integration,
                  {{TokenKind::Punctuator,    "-"},
                   {TokenKind::FloatLiteral,  "1.23e-4"}});
 }
+
+// --- v0.127: digit-run must end with a digit (no trailing `_`) --------------
+// Per grammar A.1, the four digit-run productions are `Digit ("_"* Digit)*`,
+// so a trailing `_` is not part of the literal. The bare `_` that follows is
+// a valid identifier (§1.3), so a trailing-`_` source like `42_` lexes as
+// IntLiteral "42" plus Identifier "_". Consecutive underscores between digits
+// remain legal.
+
+BEZEL_TEST(lexer_int_literals, v0_127_decimal_trailing_underscore_not_in_literal) {
+    expectTokens(lexAll("42_"),
+                 {{TokenKind::IntLiteral, "42"},
+                  {TokenKind::Identifier, "_"}});
+}
+
+BEZEL_TEST(lexer_int_literals, v0_127_hex_trailing_underscore_not_in_literal) {
+    expectTokens(lexAll("0xFF_"),
+                 {{TokenKind::IntLiteral, "0xFF"},
+                  {TokenKind::Identifier, "_"}});
+}
+
+BEZEL_TEST(lexer_int_literals, v0_127_binary_trailing_underscore_not_in_literal) {
+    expectTokens(lexAll("0b1010_"),
+                 {{TokenKind::IntLiteral, "0b1010"},
+                  {TokenKind::Identifier, "_"}});
+}
+
+BEZEL_TEST(lexer_float_literals, v0_127_fractional_trailing_underscore_not_in_literal) {
+    expectTokens(lexAll("1.0_"),
+                 {{TokenKind::FloatLiteral, "1.0"},
+                  {TokenKind::Identifier,   "_"}});
+}
+
+BEZEL_TEST(lexer_float_literals, v0_127_exponent_trailing_underscore_not_in_literal) {
+    expectTokens(lexAll("1e5_"),
+                 {{TokenKind::FloatLiteral, "1e5"},
+                  {TokenKind::Identifier,   "_"}});
+}
+
+// Consecutive underscores between digits are still allowed by the grammar
+// (`("_"* Digit)*` admits any number of `_`s before each subsequent digit).
+BEZEL_TEST(lexer_int_literals, v0_127_consecutive_separators_between_digits_legal) {
+    expectTokens(lexAll("1__2"),
+                 {{TokenKind::IntLiteral, "1__2"}});
+}
+
+// Trailing `_` immediately before an int suffix was valid in v0.126 (the
+// digit-run could end with `_`, then the suffix attached). In v0.127 the
+// digit-run cannot end with `_`, so `42_L` is `IntLiteral "42"` followed by
+// the identifier `_L`; the `L` is not interpreted as an int suffix.
+BEZEL_TEST(lexer_int_literals, v0_127_trailing_underscore_before_suffix_splits) {
+    expectTokens(lexAll("42_L"),
+                 {{TokenKind::IntLiteral, "42"},
+                  {TokenKind::Identifier, "_L"}});
+}
