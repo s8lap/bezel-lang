@@ -288,6 +288,35 @@ struct CallExpr : Expr {
     std::vector<std::unique_ptr<Expr>> args;
 };
 
+// A.5 / §17.1 level 1 postfix forms beyond `.` and `(`:
+//   `expr "?." Identifier`    — null-conditional member access (`?.`)
+//   `expr "?(" ArgList? ")"`  — null-conditional invocation (`?(`)
+//   `expr "[" IndexList "]"`  — indexing (multi-dim via comma list)
+//   `expr "!"`                — postfix null-forgiving operator
+struct NullCondMemberExpr : Expr {
+    std::unique_ptr<Expr> target;
+    std::string_view member;
+};
+struct NullCondCallExpr : Expr {
+    std::unique_ptr<Expr> callee;
+    std::vector<std::unique_ptr<Expr>> args;
+};
+struct IndexExpr : Expr {
+    std::unique_ptr<Expr> target;
+    std::vector<std::unique_ptr<Expr>> indices; // 1 or more for multi-dim
+};
+struct PostfixBangExpr : Expr {
+    std::unique_ptr<Expr> operand;
+};
+
+// A.5: `NewExpr ::= "new" Type "(" ArgList? ")" | "new" "(" ArgList? ")"`.
+// The shorthand form (no Type) is the target-typed `new(...)`; `type` is null
+// in that case.
+struct NewExpr : Expr {
+    std::unique_ptr<Type> type;
+    std::vector<std::unique_ptr<Expr>> args;
+};
+
 // §17.1 binary expressions. One AST struct for all of them; the operator
 // lexeme distinguishes (matches our keyword/punctuator-by-lexeme model).
 // Slice 8 wires up multiplicative, additive, relational, equality, and the
