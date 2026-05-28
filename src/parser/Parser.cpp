@@ -1049,6 +1049,77 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
         return std::unique_ptr<ast::Stmt>(stmt.release());
     }
 
+    // TryStmt (A.6). Slice 22 covers the binding catch arm only —
+    // `catch var Identifier : Type => Statement` — plus optional finally.
+    if (isKeyword("try")) {
+        advance(); // past `try`
+        auto stmt = std::make_unique<ast::TryStmt>();
+        while (!isKeyword("catch") && !isKeyword("finally") &&
+               !isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (s) {
+                stmt->body.push_back(std::move(s));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        while (consumeKeyword("catch")) {
+            ast::CatchArm arm;
+            if (!consumeKeyword("var")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'var' in catch arm (binding form is the "
+                    "only supported pattern for now)");
+            }
+            if (current_.kind != TokenKind::Identifier) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected exception-binding name");
+            } else {
+                arm.varName = current_.text;
+                advance();
+            }
+            if (!consumePunctuator(":")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ':' after catch binding name");
+            }
+            arm.type = parseType();
+            if (!consumePunctuator("=>")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected '=>' after catch pattern");
+            }
+            arm.body = parseStatement();
+            stmt->catches.push_back(std::move(arm));
+            // Optional trailing comma between arms; consumed here so the
+            // next catch keyword (or `finally`/`end`) is current.
+            (void)consumePunctuator(",");
+        }
+        if (consumeKeyword("finally")) {
+            stmt->hasFinally = true;
+            while (!isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto s = parseStatement();
+                if (s) {
+                    stmt->finallyBody.push_back(std::move(s));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'try' statement");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'try'");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
     // ForStmt (A.6 synchronous form).
     if (isKeyword("for")) {
         advance(); // past `for`
