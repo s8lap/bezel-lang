@@ -143,7 +143,7 @@ BEZEL_TEST(parser_method_decls, empty_block_body) {
     const auto ms = memberSummaries(r);
     if (ms.size() == 1)
         BEZEL_EXPECT_EQ(ms[0],
-                        std::string("public method run() { … }"));
+                        std::string("public method run() { }"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

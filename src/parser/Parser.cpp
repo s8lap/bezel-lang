@@ -577,14 +577,20 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDecl(
     } else if (consumePunctuator(";")) {
         m->bodyKind = ast::MethodBodyKind::Abstract;
     } else {
-        // Block body. Statement parsing arrives in the statements slice;
-        // until then the block is expected to be empty (an immediate `end`).
+        // Block body (A.4 MethodBody form 2): `Statement* "end" Identifier? ";"`.
         m->bodyKind = ast::MethodBodyKind::Block;
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (s) {
+                m->stmts.push_back(std::move(s));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance(); // crude recovery
+            }
+        }
         if (!consumeKeyword("end")) {
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "expected '=>', ';', or 'end' for method body "
-                "(statement bodies not yet supported)");
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close method body");
             return m;
         }
         if (current_.kind == TokenKind::Identifier) {
@@ -602,6 +608,93 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDecl(
         }
     }
     return m;
+}
+
+std::unique_ptr<ast::Stmt> Parser::parseStatement() {
+    // §A.6 Statement dispatch. Slice 11 covers LocalDecl, ReturnStmt, and
+    // the expression-led shapes (AssignmentStmt vs ExpressionStmt, decided
+    // after parsing the leading expression).
+
+    // LocalDecl: `var Identifier (":" Type)? (":=" Expression)? ";"` or
+    // `using var ...`. The async `await using var` form lands later.
+    if (isKeyword("var") || isKeyword("using")) {
+        auto decl = std::make_unique<ast::LocalDecl>();
+        if (consumeKeyword("using")) {
+            decl->isUsing = true;
+            if (!consumeKeyword("var")) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected 'var' after 'using'");
+            }
+        } else {
+            advance(); // past `var`
+        }
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected local-variable name");
+        } else {
+            decl->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            decl->type = parseType();
+        }
+        if (consumePunctuator(":=")) {
+            decl->initializer = parseExpression();
+        } else if (decl->isUsing) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`using var` requires an initializer (A.6 LocalDecl)");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after local declaration");
+        }
+        return std::unique_ptr<ast::Stmt>(decl.release());
+    }
+
+    // ReturnStmt: `return Expression? ";"`.
+    if (isKeyword("return")) {
+        advance();
+        auto ret = std::make_unique<ast::ReturnStmt>();
+        if (!isPunctuator(";")) {
+            ret->value = parseExpression();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after return statement");
+        }
+        return std::unique_ptr<ast::Stmt>(ret.release());
+    }
+
+    // Otherwise parse an expression and decide: AssignmentStmt if it's
+    // followed by an assignment operator, ExpressionStmt otherwise.
+    auto lhs = parseExpression();
+    if (current_.kind == TokenKind::Punctuator &&
+        (current_.text == ":="  || current_.text == "+="  ||
+         current_.text == "-="  || current_.text == "*="  ||
+         current_.text == "/="  || current_.text == "&="  ||
+         current_.text == "|="  || current_.text == "^="  ||
+         current_.text == "<<=" || current_.text == ">>=" ||
+         current_.text == "??=")) {
+        auto a = std::make_unique<ast::AssignmentStmt>();
+        a->target = std::move(lhs);
+        a->op = current_.text;
+        advance();
+        a->value = parseExpression();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after assignment");
+        }
+        return std::unique_ptr<ast::Stmt>(a.release());
+    }
+
+    auto es = std::make_unique<ast::ExpressionStmt>();
+    es->expr = std::move(lhs);
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after expression statement");
+    }
+    return std::unique_ptr<ast::Stmt>(es.release());
 }
 
 std::vector<ast::Param> Parser::parseParamList() {
