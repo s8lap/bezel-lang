@@ -393,12 +393,26 @@ struct Type : Node {
 };
 
 // A.2: `TypeAliasDecl ::= "type" Identifier GenericParams? "=" Type
-//                          GenericConstraints* ";"`. Slice 4 admits only the
-// degenerate form — no generic params, no constraints; those arrive with
-// the generics slice.
+//                          GenericConstraints* ";"`.
 struct TypeAlias : TopDecl {
     std::string_view name;
+    std::vector<GenericParam> genericParams;
     std::unique_ptr<Type> aliasedType;
+    std::vector<GenericConstraint> genericConstraints;
+};
+
+// A.4 `OperatorDecl ::= Visibility "static" "method" "operator" OpToken
+//                        "(" ParamList ")" ":" "owned"? Type OperatorBody`.
+// OperatorBody mirrors MethodBody's expression / block / abstract forms.
+struct OperatorDecl : Member {
+    Visibility visibility = Visibility::None;
+    std::string_view opToken;       // e.g. "+", "==", "<", "[]"
+    std::vector<Param> params;
+    std::unique_ptr<Type> returnType;
+    bool returnOwned = false;
+    MethodBodyKind bodyKind = MethodBodyKind::Abstract;
+    std::unique_ptr<Expr> exprBody;
+    std::vector<std::unique_ptr<Stmt>> stmts;
 };
 
 // --- Expressions (§17, A.5) -------------------------------------------------
