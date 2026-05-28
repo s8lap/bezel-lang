@@ -303,20 +303,32 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     }
     advance();
 
-    // A.4 FieldDecl optional modifiers: static, owned, readonly. Other member
-    // forms (method/property/const/event/destructor/constructor) start with
-    // their own keyword after the visibility/modifier prefix; for slice 6
-    // any of those is "not yet supported".
+    // Member-modifier prefix. The set the member-kind-switch below recognises
+    // includes A.4 FieldDecl modifiers (`static`, `owned`, `readonly`) and the
+    // method-only ones (`async`, `abstract`, `virtual`, `sealed`, `override`).
+    // The semantically valid combinations per member kind are sema's job.
     std::vector<std::string_view> modifiers;
-    while (isKeyword("static") || isKeyword("owned") || isKeyword("readonly")) {
+    while (isKeyword("static")   || isKeyword("owned")    ||
+           isKeyword("readonly") || isKeyword("async")    ||
+           isKeyword("abstract") || isKeyword("virtual")  ||
+           isKeyword("sealed")   || isKeyword("override")) {
         modifiers.push_back(current_.text);
         advance();
+    }
+
+    // Member-kind keyword (`method` for slice 10; `property`, `event`, …
+    // arrive with their slices). Without one of those, this is a FieldDecl
+    // and the next token must be its name.
+    if (isKeyword("method")) {
+        return std::unique_ptr<ast::Member>(
+            parseMethodDecl(visibility, std::move(modifiers)).release());
     }
 
     if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(
             Severity::Error, current_.location,
-            "expected field name (other member forms are not yet supported)");
+            "expected field name or member kind keyword "
+            "(other member forms are not yet supported)");
         return nullptr;
     }
 
@@ -514,6 +526,112 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
         }
     }
     return head;
+}
+
+std::unique_ptr<ast::MethodDecl> Parser::parseMethodDecl(
+    ast::Visibility visibility, std::vector<std::string_view> modifiers) {
+    // Caller has verified `current_` is the `method` keyword.
+    auto m = std::make_unique<ast::MethodDecl>();
+    m->visibility = visibility;
+    m->modifiers = std::move(modifiers);
+    advance(); // past `method`
+
+    if (current_.kind != TokenKind::Identifier) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected method name");
+    } else {
+        m->name = current_.text;
+        advance();
+    }
+
+    m->genericParams = parseGenericParams();
+
+    if (!consumePunctuator("(")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected '(' to begin parameter list");
+    }
+    m->params = parseParamList();
+    if (!consumePunctuator(")")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ')' to close parameter list");
+    }
+
+    if (consumePunctuator(":")) {
+        if (isKeyword("owned")) {
+            m->returnOwned = true;
+            advance();
+        }
+        m->returnType = parseType();
+    }
+
+    // A.4 MethodBody: `=> Expression ";"` | `Statement* "end" Identifier? ";"`
+    // | `";"`. (GenericConstraints* between signature and body land later.)
+    if (consumePunctuator("=>")) {
+        m->bodyKind = ast::MethodBodyKind::Expression;
+        m->exprBody = parseExpression();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after expression-body method");
+        }
+    } else if (consumePunctuator(";")) {
+        m->bodyKind = ast::MethodBodyKind::Abstract;
+    } else {
+        // Block body. Statement parsing arrives in the statements slice;
+        // until then the block is expected to be empty (an immediate `end`).
+        m->bodyKind = ast::MethodBodyKind::Block;
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected '=>', ';', or 'end' for method body "
+                "(statement bodies not yet supported)");
+            return m;
+        }
+        if (current_.kind == TokenKind::Identifier) {
+            m->endLabel = current_.text;
+            if (!m->name.empty() && m->endLabel != m->name) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "end label does not match the method name");
+            }
+            advance();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end'");
+        }
+    }
+    return m;
+}
+
+std::vector<ast::Param> Parser::parseParamList() {
+    // Slice 10: each param is `Identifier ":" Type`. ParamModifiers (ref,
+    // out, out owned, owned) and default values arrive with later slices.
+    std::vector<ast::Param> params;
+    if (isPunctuator(")")) return params;
+
+    auto parseOne = [&]() -> ast::Param {
+        ast::Param p;
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected parameter name");
+        } else {
+            p.name = current_.text;
+            advance();
+        }
+        if (!consumePunctuator(":")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ':' after parameter name");
+        }
+        p.type = parseType();
+        return p;
+    };
+
+    params.push_back(parseOne());
+    while (consumePunctuator(",")) {
+        params.push_back(parseOne());
+    }
+    return params;
 }
 
 std::vector<ast::GenericParam> Parser::parseGenericParams() {

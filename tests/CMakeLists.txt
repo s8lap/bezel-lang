@@ -22,7 +22,8 @@ set(BEZEL_TEST_SOURCES
     parser/field_decls_test.cpp
     parser/expressions_primary_test.cpp
     parser/expressions_binary_test.cpp
-    parser/expressions_unary_test.cpp)
+    parser/expressions_unary_test.cpp
+    parser/method_decls_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

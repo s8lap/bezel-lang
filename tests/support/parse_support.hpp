@@ -220,8 +220,8 @@ inline std::string exprToString(const ast::Expr& e) {
     return "<unknown expr>";
 }
 
-// Render one class member to a single string. Currently only FieldDecl is
-// implemented; others land with their slices.
+// Render one class member to a single string. Slice 10 covers FieldDecl and
+// MethodDecl; the other Member subclasses land with their slices.
 inline std::string memberSummary(const ast::Member& m) {
     if (auto* f = dynamic_cast<const ast::FieldDecl*>(&m)) {
         std::string out = visibilityPrefix(f->visibility);
@@ -235,6 +235,55 @@ inline std::string memberSummary(const ast::Member& m) {
         if (f->initializer) {
             out += " := ";
             out += exprToString(*f->initializer);
+        }
+        return out;
+    }
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+        std::string out = visibilityPrefix(md->visibility);
+        for (std::string_view mod : md->modifiers) {
+            out += std::string(mod);
+            out += ' ';
+        }
+        out += "method ";
+        out += std::string(md->name);
+        if (!md->genericParams.empty()) {
+            out += '<';
+            for (std::size_t i = 0; i < md->genericParams.size(); ++i) {
+                if (i > 0) out += ", ";
+                if (!md->genericParams[i].variance.empty()) {
+                    out += std::string(md->genericParams[i].variance);
+                    out += ' ';
+                }
+                out += std::string(md->genericParams[i].name);
+            }
+            out += '>';
+        }
+        out += '(';
+        for (std::size_t i = 0; i < md->params.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += std::string(md->params[i].name);
+            out += ": ";
+            out += md->params[i].type ? typeToString(*md->params[i].type)
+                                      : std::string("<null>");
+        }
+        out += ')';
+        if (md->returnType) {
+            out += ": ";
+            if (md->returnOwned) out += "owned ";
+            out += typeToString(*md->returnType);
+        }
+        switch (md->bodyKind) {
+            case ast::MethodBodyKind::Expression:
+                out += " => ";
+                out += md->exprBody ? exprToString(*md->exprBody)
+                                    : std::string("<null>");
+                break;
+            case ast::MethodBodyKind::Block:
+                out += " { … }";
+                break;
+            case ast::MethodBodyKind::Abstract:
+                out += " ; ";
+                break;
         }
         return out;
     }
