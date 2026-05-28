@@ -192,6 +192,21 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         decl->baseTypes = parseInheritance();
     }
 
+    // §A.4 Members: slice 6 covers class fields without initializers. Other
+    // type kinds and other member forms come in later slices, so their
+    // bodies stay empty here.
+    if (decl->kind == ast::TypeDeclKind::Class) {
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto member = parseMember();
+            if (member) {
+                decl->members.push_back(std::move(member));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance(); // crude recovery; sync on `end` or `;` later.
+            }
+        }
+    }
+
     // §1.6 named-construct termination: `end Identifier? ;`. The optional
     // identifier must match the declared name exactly when supplied.
     if (!consumeKeyword("end")) {
@@ -270,6 +285,60 @@ std::unique_ptr<ast::Type> Parser::parseType() {
         advance();
     }
     return type;
+}
+
+std::unique_ptr<ast::Member> Parser::parseMember() {
+    // §13: every member declares its visibility explicitly. Slice 6 only
+    // recognizes the FieldDecl shape after that.
+    ast::Visibility visibility;
+    if (isKeyword("public"))         visibility = ast::Visibility::Public;
+    else if (isKeyword("private"))   visibility = ast::Visibility::Private;
+    else if (isKeyword("internal"))  visibility = ast::Visibility::Internal;
+    else if (isKeyword("protected")) visibility = ast::Visibility::Protected;
+    else {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected member visibility (public, private, "
+                            "internal, or protected)");
+        return nullptr;
+    }
+    advance();
+
+    // A.4 FieldDecl optional modifiers: static, owned, readonly. Other member
+    // forms (method/property/const/event/destructor/constructor) start with
+    // their own keyword after the visibility/modifier prefix; for slice 6
+    // any of those is "not yet supported".
+    std::vector<std::string_view> modifiers;
+    while (isKeyword("static") || isKeyword("owned") || isKeyword("readonly")) {
+        modifiers.push_back(current_.text);
+        advance();
+    }
+
+    if (current_.kind != TokenKind::Identifier) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expected field name (other member forms are not yet supported)");
+        return nullptr;
+    }
+
+    auto field = std::make_unique<ast::FieldDecl>();
+    field->visibility = visibility;
+    field->modifiers = std::move(modifiers);
+    field->name = current_.text;
+    advance();
+
+    if (!consumePunctuator(":")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ':' after field name");
+    }
+    field->type = parseType();
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after field declaration");
+    }
+
+    // Reseat the raw pointer explicitly (Node's deleted move blocks the
+    // implicit unique_ptr<Derived> -> unique_ptr<Base> conversion).
+    return std::unique_ptr<ast::Member>(field.release());
 }
 
 std::vector<ast::GenericParam> Parser::parseGenericParams() {

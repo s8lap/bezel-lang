@@ -71,6 +71,19 @@ inline std::vector<std::string> importNames(const ParseResult& result) {
     return out;
 }
 
+// Render a visibility keyword (or empty for None). Trailing space included
+// when non-empty so it slots into a member summary cleanly.
+inline std::string visibilityPrefix(ast::Visibility v) {
+    switch (v) {
+        case ast::Visibility::Public:    return "public ";
+        case ast::Visibility::Private:   return "private ";
+        case ast::Visibility::Internal:  return "internal ";
+        case ast::Visibility::Protected: return "protected ";
+        case ast::Visibility::None:      return "";
+    }
+    return "";
+}
+
 // Render a Type AST back to its canonical text form (e.g. `List<int?>?`).
 // Recursive over generic args.
 inline std::string typeToString(const ast::Type& t) {
@@ -144,6 +157,40 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
         return out;
     }
     return "<unknown>";
+}
+
+// Render one class member to a single string (currently only FieldDecl is
+// implemented; others land with their slices).
+inline std::string memberSummary(const ast::Member& m) {
+    if (auto* f = dynamic_cast<const ast::FieldDecl*>(&m)) {
+        std::string out = visibilityPrefix(f->visibility);
+        for (std::string_view mod : f->modifiers) {
+            out += std::string(mod);
+            out += ' ';
+        }
+        out += std::string(f->name);
+        out += ": ";
+        out += f->type ? typeToString(*f->type) : std::string("<null>");
+        return out;
+    }
+    return "<unknown member>";
+}
+
+// The class members of the i-th top-level declaration, rendered. Returns
+// an empty vector if the index is out of range or the decl isn't a TypeDecl
+// with members.
+inline std::vector<std::string> memberSummaries(const ParseResult& result,
+                                                std::size_t topDeclIndex = 0) {
+    std::vector<std::string> out;
+    if (!result.sourceFile) return out;
+    if (topDeclIndex >= result.sourceFile->topDecls.size()) return out;
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(
+        result.sourceFile->topDecls[topDeclIndex].get());
+    if (!td) return out;
+    for (const auto& m : td->members) {
+        out.push_back(m ? memberSummary(*m) : std::string("<null>"));
+    }
+    return out;
 }
 
 inline std::vector<std::string> topDeclSummaries(const ParseResult& result) {

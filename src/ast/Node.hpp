@@ -77,6 +77,21 @@ struct TopDecl : Node {};
 
 struct Type; // defined after TypeDecl; used by TypeDecl::baseTypes.
 
+// Common base for type members (FieldDecl, MethodDecl, PropertyDecl, …).
+// Slice 6 introduces FieldDecl only; other kinds arrive with their slices.
+struct Member : Node {};
+
+// A.4: `FieldDecl ::= Visibility "static"? "owned"? "readonly"?
+//                     Identifier ":" Type (":=" Expression)? ";"`.
+// Slice 6 omits the optional initializer — initializer expressions arrive
+// with the expression slice.
+struct FieldDecl : Member {
+    Visibility visibility = Visibility::None;
+    std::vector<std::string_view> modifiers; // "static", "owned", "readonly"
+    std::string_view name;
+    std::unique_ptr<Type> type;
+};
+
 // A.3 `GenericParam ::= Variance? Identifier` where Variance is `in` or `out`
 // (both reserved keywords per §B.1). Slice 5 covers the basic form;
 // constraints (`where T: ...`, A.3 GenericConstraints) are a later slice.
@@ -101,6 +116,11 @@ struct TypeDecl : TopDecl {
     // list (only valid on the base class, semantically) is tokenized away in
     // this slice; full parsing waits on expressions.
     std::vector<std::unique_ptr<Type>> baseTypes; // empty if no `:` clause
+    // Class members (slice 6: fields only). Interface members
+    // (IfaceMethod/IfaceProperty/IfaceIndexer/IfaceEvent), record bodies,
+    // and enum constants/members are separate grammar productions and land
+    // in their own slices; for those kinds this vector stays empty.
+    std::vector<std::unique_ptr<Member>> members;
     std::string_view endLabel; // empty when the `end` had no label
 };
 
