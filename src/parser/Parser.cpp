@@ -44,9 +44,25 @@ std::unique_ptr<ast::SourceFile> Parser::parseCompilationUnit() {
                             "expected 'module' declaration");
     }
 
-    // Imports (§2.2) and top-level declarations (§2.4) are added by their own
-    // parser slices. Anything beyond the module declaration is ignored here.
+    // §2.2: zero or more import declarations follow the module declaration.
+    while (isKeyword("import")) {
+        sourceFile->imports.push_back(parseImport());
+    }
+
+    // Top-level declarations (§2.4) come in a later parser slice.
     return sourceFile;
+}
+
+std::unique_ptr<ast::Import> Parser::parseImport() {
+    auto decl = std::make_unique<ast::Import>();
+    // Caller has verified `current_` is the `import` keyword.
+    advance(); // past `import`
+    decl->name = parseQualifiedName();
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after import declaration");
+    }
+    return decl;
 }
 
 std::unique_ptr<ast::ModuleDecl> Parser::parseModuleDecl() {

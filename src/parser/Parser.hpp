@@ -36,8 +36,9 @@ private:
     bool consumeKeyword(std::string_view text);
     bool consumePunctuator(std::string_view text);
 
-    // Grammar productions implemented in this slice.
+    // Grammar productions.
     std::unique_ptr<ast::ModuleDecl> parseModuleDecl();
+    std::unique_ptr<ast::Import> parseImport();
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
 
     Lexer& lexer_;
