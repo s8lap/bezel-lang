@@ -21,6 +21,10 @@ public:
     Token next();
 
 private:
+    Token scanCharLiteral();
+    Token scanStringLiteral();
+    Token scanVerbatimString();
+
     std::string_view source_;
     DiagnosticEngine& diagnostics_;
     std::size_t position_ = 0;
