@@ -75,18 +75,32 @@ enum class TypeDeclKind {
 // subclasses follow.
 struct TopDecl : Node {};
 
-// Slice 3: empty class-like top-level declaration. Members, inheritance,
-// generic parameters, primary-constructor parameters, and the serialization
-// clauses on classes/records are all left for later slices; the body parsed
-// here is just `end Identifier? ;`. The grammar productions
-// `ClassDecl`/`InterfaceDecl`/`RecordDecl`/`EnumDecl` share enough shape
-// (Visibility? Modifier* keyword Identifier ... body) that one struct with a
+struct Type; // defined after TypeDecl; used by TypeDecl::baseTypes.
+
+// A.3 `GenericParam ::= Variance? Identifier` where Variance is `in` or `out`
+// (both reserved keywords per §B.1). Slice 5 covers the basic form;
+// constraints (`where T: ...`, A.3 GenericConstraints) are a later slice.
+struct GenericParam {
+    std::string_view variance; // "in", "out", or empty
+    std::string_view name;
+};
+
+// Class-like top-level declaration. Slice 3 introduced the empty body; slice
+// 5 adds generic parameters and a base-type list. Primary-constructor params
+// (classes), positional fields (records), serialization clauses, generic
+// constraints, members, and the enum-specific inheritance form are still
+// later-slice work. The four kinds share enough shape that one struct with a
 // `kind` tag is the right model until per-kind members force a split.
 struct TypeDecl : TopDecl {
     TypeDeclKind kind = TypeDeclKind::Class;
     Visibility visibility = Visibility::None;
     std::vector<std::string_view> modifiers; // "abstract", "sealed", "static"
     std::string_view name;
+    std::vector<GenericParam> genericParams; // empty if no `<...>`
+    // A.3 `InheritItem ::= Type ("(" ArgList? ")")?` — the optional argument
+    // list (only valid on the base class, semantically) is tokenized away in
+    // this slice; full parsing waits on expressions.
+    std::vector<std::unique_ptr<Type>> baseTypes; // empty if no `:` clause
     std::string_view endLabel; // empty when the `end` had no label
 };
 

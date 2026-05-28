@@ -114,7 +114,8 @@ std::unique_ptr<ast::TopDecl> Parser::parseTopDecl() {
     // per A.2 `TypeAliasDecl ::= "type" Identifier ...`, so we check for them
     // first; the class-like decls below all admit Visibility? Modifier*.
     if (isKeyword("type")) {
-        return parseTypeAlias();
+        auto alias = parseTypeAlias();
+        return std::unique_ptr<ast::TopDecl>(alias.release());
     }
 
     // §13 visibility keyword (optional, must precede modifiers).
@@ -142,7 +143,11 @@ std::unique_ptr<ast::TopDecl> Parser::parseTopDecl() {
         advance();
     }
 
-    return parseTypeOrInterfaceDecl(visibility, std::move(modifiers));
+    // unique_ptr<TypeDecl> -> unique_ptr<TopDecl>: the implicit converting
+    // constructor is blocked here (Node deletes its move constructor, which
+    // taints the derived classes). Reseat the raw pointer explicitly.
+    auto typeDecl = parseTypeOrInterfaceDecl(visibility, std::move(modifiers));
+    return std::unique_ptr<ast::TopDecl>(typeDecl.release());
 }
 
 std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
@@ -176,6 +181,15 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     } else {
         decl->name = current_.text;
         advance();
+    }
+
+    // §A.3: GenericParams? and Inheritance? appear between the name and the
+    // body for classes, interfaces, and records. Enums use EnumInheritance
+    // (different grammar — `: IntegerType ...`) and do not admit generic
+    // parameters; the enum-specific shape is a later slice.
+    if (decl->kind != ast::TypeDeclKind::Enum) {
+        decl->genericParams = parseGenericParams();
+        decl->baseTypes = parseInheritance();
     }
 
     // §1.6 named-construct termination: `end Identifier? ;`. The optional
@@ -256,6 +270,76 @@ std::unique_ptr<ast::Type> Parser::parseType() {
         advance();
     }
     return type;
+}
+
+std::vector<ast::GenericParam> Parser::parseGenericParams() {
+    // A.3: `GenericParams ::= "<" GenericParam ("," GenericParam)* ">"`.
+    // `GenericParam ::= Variance? Identifier`, Variance ∈ {`in`, `out`}.
+    std::vector<ast::GenericParam> params;
+    if (!isPunctuator("<")) return params;
+    advance(); // past '<'
+
+    auto parseOne = [&]() -> ast::GenericParam {
+        ast::GenericParam p;
+        if (isKeyword("in")) {
+            p.variance = current_.text;
+            advance();
+        } else if (isKeyword("out")) {
+            p.variance = current_.text;
+            advance();
+        }
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected type parameter name");
+            return p;
+        }
+        p.name = current_.text;
+        advance();
+        return p;
+    };
+
+    params.push_back(parseOne());
+    while (isPunctuator(",")) {
+        advance();
+        params.push_back(parseOne());
+    }
+    if (!consumeClosingAngle()) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected '>' to close generic parameter list");
+    }
+    return params;
+}
+
+std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance() {
+    // A.3: `Inheritance ::= ":" InheritItem ("," InheritItem)*`.
+    // `InheritItem ::= Type ("(" ArgList? ")")?` — the optional argument
+    // list is tokenized away here; ArgList contains expressions which
+    // arrive in the expression slice.
+    std::vector<std::unique_ptr<ast::Type>> items;
+    if (!isPunctuator(":")) return items;
+    advance(); // past ':'
+
+    auto parseOne = [&]() -> std::unique_ptr<ast::Type> {
+        auto t = parseType();
+        if (isPunctuator("(")) {
+            // Skip a balanced parenthesised group without parsing its contents.
+            int depth = 1;
+            advance();
+            while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+                if (isPunctuator("("))      ++depth;
+                else if (isPunctuator(")")) --depth;
+                advance();
+            }
+        }
+        return t;
+    };
+
+    items.push_back(parseOne());
+    while (isPunctuator(",")) {
+        advance();
+        items.push_back(parseOne());
+    }
+    return items;
 }
 
 bool Parser::consumeClosingAngle() {
