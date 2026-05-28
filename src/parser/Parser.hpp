@@ -97,6 +97,14 @@ private:
     bool isPropertyAccessorStart();
     // Slice 37: parse one Accessor within a PropertyBody block form.
     ast::PropertyAccessor parsePropertyAccessor();
+    // Slice 38: patterns and case expressions (§A.7).
+    std::unique_ptr<ast::Pattern> parsePattern();
+    ast::CaseArm parseCaseArm();
+    std::unique_ptr<ast::Expr> parseCaseExpr();
+    // The positional sub-pattern of `Name(p1, p2)` destructuring. Mostly
+    // delegates to parsePattern, but also admits naked-binding Identifier
+    // per A.7.
+    ast::PositionalPattern parsePositionalPattern();
     // Slice 36: peeks the matching `)` for the `(` at peekAt(startK) and
     // returns true iff a `=>` follows. Used to distinguish
     // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.
