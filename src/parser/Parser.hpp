@@ -161,6 +161,12 @@ private:
     DiagnosticEngine& diagnostics_;
     Token current_{};
     std::deque<Token> peeked_; // see peekAt()
+    // Slice 50: when true, the postfix `with` suffix (record copy-with /
+    // object initializer block) is *not* consumed by parsePostfix. Used to
+    // parse the iterable expression of an `await for` so its trailing
+    // `with EXPR` cancellation-token clause (§30.7) stays available to the
+    // for-statement parser.
+    bool disableWithSuffix_ = false;
 };
 
 } // namespace bezel
