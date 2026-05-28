@@ -360,26 +360,37 @@ namespace {
 
 // Higher precedence = tighter binding. The numeric scale is internal — we
 // just need an ordering consistent with §17.1's precedence table. Returns 0
-// for tokens that aren't binary operators handled in this slice.
+// for tokens that aren't binary operators recognised yet (deferred ops:
+// `in`/`is`/`as` keyword relationals, `is not` two-token relational,
+// conditional `expr if cond else expr`, assignments — assignments live in
+// AssignmentStmt at statement level).
 int binaryPrecedence(const Token& tok) {
     if (tok.kind == TokenKind::Punctuator) {
         const std::string_view t = tok.text;
-        // §17.1 level 3 multiplicative.
-        if (t == "*" || t == "/") return 14;
-        // §17.1 level 4 additive.
-        if (t == "+" || t == "-") return 13;
-        // §17.1 level 10 relational (subset — `in`/`is`/`as` are keywords).
+        if (t == "*" || t == "/")  return 14; // §17.1 L3 multiplicative
+        if (t == "+" || t == "-")  return 13; // §17.1 L4 additive
+        if (t == "<<" || t == ">>") return 12; // §17.1 L5 shift
+        if (t == ".." || t == "..<") return 11; // §17.1 L6 range
+        if (t == "&")              return 10; // §17.1 L7 bitwise AND
+        if (t == "^")              return 9;  // §17.1 L8 bitwise XOR
+        if (t == "|")              return 8;  // §17.1 L9 bitwise OR
         if (t == "<" || t == ">" || t == "<=" || t == ">=") return 7;
-        // §17.1 level 11 equality.
-        if (t == "=" || t == "<>") return 6;
+        if (t == "=" || t == "<>") return 6;  // §17.1 L11 equality
+        if (t == "??")             return 5;  // §17.1 L12 null-coalescing
     }
     if (tok.kind == TokenKind::Keyword) {
         const std::string_view t = tok.text;
-        if (t == "mod") return 14; // multiplicative
-        if (t == "and") return 4;  // §17.1 level 13 logical AND
-        if (t == "or")  return 3;  // §17.1 level 14 logical OR
+        if (t == "mod") return 14; // multiplicative (keyword-spelled)
+        if (t == "and") return 4;  // §17.1 L13 logical AND
+        if (t == "or")  return 3;  // §17.1 L14 logical OR
     }
     return 0;
+}
+
+// `??` (and only `??` at slice-14 scope) is right-associative per §17.1's
+// note on level 12.
+bool isRightAssociative(std::string_view op) {
+    return op == "??";
 }
 
 } // namespace
@@ -389,16 +400,18 @@ std::unique_ptr<ast::Expr> Parser::parseExpression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
-    // Precedence climbing. All §17.1 operators handled in this slice are
-    // left-associative; we recurse on `prec + 1` for the right operand so
-    // same-precedence ops associate to the left.
+    // Precedence climbing. Right-associative operators (`??`, slice 14) recurse
+    // with the same minPrec; left-associative ones (everything else) recurse
+    // with prec + 1 so same-precedence ops associate to the left.
     auto left = parseUnaryExpression();
     for (;;) {
         const int prec = binaryPrecedence(current_);
         if (prec < minPrecedence) break;
         const Token opTok = current_;
         advance();
-        auto right = parseBinaryExpression(prec + 1);
+        const int nextMin =
+            isRightAssociative(opTok.text) ? prec : prec + 1;
+        auto right = parseBinaryExpression(nextMin);
         auto bin = std::make_unique<ast::BinaryExpr>();
         bin->op = opTok.text;
         bin->left = std::move(left);
