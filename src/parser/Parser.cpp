@@ -560,9 +560,19 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         auto pd = std::make_unique<ast::PropertyDecl>();
         pd->visibility = visibility;
         pd->modifiers = std::move(modifiers);
-        if (current_.kind != TokenKind::Identifier) {
-            diagnostics_.report(Severity::Error, current_.location,
-                                "expected property name");
+        // A.4 IndexerDecl: `[ParamList]` in place of the Identifier name.
+        if (consumePunctuator("[")) {
+            pd->isIndexer = true;
+            pd->indexerParams = parseParamList();
+            if (!consumePunctuator("]")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ']' to close indexer parameter list");
+            }
+        } else if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected property name or '[' for indexer");
         } else {
             pd->name = current_.text;
             advance();

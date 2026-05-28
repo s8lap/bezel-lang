@@ -662,7 +662,20 @@ inline std::string memberSummary(const ast::Member& m) {
             out += ' ';
         }
         out += "property ";
-        out += std::string(pd->name);
+        if (pd->isIndexer) {
+            out += '[';
+            for (std::size_t i = 0; i < pd->indexerParams.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += std::string(pd->indexerParams[i].name);
+                out += ": ";
+                out += pd->indexerParams[i].type
+                           ? typeToString(*pd->indexerParams[i].type)
+                           : std::string("<null>");
+            }
+            out += ']';
+        } else {
+            out += std::string(pd->name);
+        }
         out += ": ";
         out += pd->type ? typeToString(*pd->type) : std::string("<null>");
         switch (pd->bodyKind) {

@@ -329,11 +329,15 @@ enum class PropertyBodyKind { Expression, Auto, Block };
 struct PropertyDecl : Member {
     Visibility visibility = Visibility::None;
     std::vector<std::string_view> modifiers; // static, readonly + VirtualKind
-    std::string_view name;
+    std::string_view name;                   // empty for indexers
     std::unique_ptr<Type> type;
     PropertyBodyKind bodyKind = PropertyBodyKind::Auto;
     std::unique_ptr<Expr> exprBody;        // Expression-body case
     std::unique_ptr<Expr> autoInitializer; // Auto with `:= …`
+    // Indexer form (A.4 IndexerDecl): the index parameter list appears as
+    // `[ParamList]` where a regular property would have an Identifier name.
+    bool isIndexer = false;
+    std::vector<Param> indexerParams;
 };
 
 // A.3 `EnumConstant ::= Identifier (":=" ConstExpr)? SerializedClause?`.
