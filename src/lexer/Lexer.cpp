@@ -13,6 +13,31 @@ bool isAsciiLetter(unsigned char b) {
 
 bool isAsciiDigit(unsigned char b) { return b >= '0' && b <= '9'; }
 
+bool isHexDigit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+bool isBinDigit(char c) { return c == '0' || c == '1'; }
+
+// IntSuffix per A.1: "L" | "U" | "UL" | "LU", case-insensitive. Advances
+// `pos` past whichever suffix is found (if any).
+void consumeIntSuffix(std::string_view source, std::size_t& pos) {
+    if (pos >= source.size()) return;
+    char c = source[pos];
+    if (c == 'L' || c == 'l') {
+        ++pos;
+        if (pos < source.size() && (source[pos] == 'U' || source[pos] == 'u')) {
+            ++pos; // LU
+        }
+    } else if (c == 'U' || c == 'u') {
+        ++pos;
+        if (pos < source.size() && (source[pos] == 'L' || source[pos] == 'l')) {
+            ++pos; // UL
+        }
+    }
+}
+
 // §1.3 / A.1: an identifier begins with a letter or underscore. We accept any
 // byte with the high bit set as the start of a UTF-8-encoded Unicode letter
 // — an approximation, since full Unicode letter classification is deferred to
@@ -134,6 +159,108 @@ Token Lexer::next() {
         TokenKind kind =
             isReservedKeyword(text) ? TokenKind::Keyword : TokenKind::Identifier;
         return Token{kind, text, SourceLocation{}};
+    }
+
+    // §18.1 numeric literals (grammar A.1: IntLiteral, FloatLiteral). Value
+    // parsing and range-checking (e.g. §18.1's "3_000_000_000 without L is a
+    // compile error") are sema-level concerns; the lexer recognizes the token
+    // and spans its full lexeme.
+    if (isAsciiDigit(b)) {
+        const std::size_t numStart = position_;
+
+        // Hex / binary prefix. The character after `0x` / `0b` must itself be
+        // a valid digit of that base — otherwise we don't enter the prefix
+        // path, and `0` falls through to plain decimal (so e.g. `0xz` lexes
+        // as IntLiteral "0" + Identifier "xz", not a malformed hex literal).
+        if (b == '0' && position_ + 2 < source_.size()) {
+            const char p = source_[position_ + 1];
+            if ((p == 'x' || p == 'X') && isHexDigit(source_[position_ + 2])) {
+                position_ += 2;
+                while (position_ < source_.size() &&
+                       (isHexDigit(source_[position_]) ||
+                        source_[position_] == '_')) {
+                    ++position_;
+                }
+                consumeIntSuffix(source_, position_);
+                return Token{TokenKind::IntLiteral,
+                             source_.substr(numStart, position_ - numStart),
+                             SourceLocation{}};
+            }
+            if ((p == 'b' || p == 'B') && isBinDigit(source_[position_ + 2])) {
+                position_ += 2;
+                while (position_ < source_.size() &&
+                       (isBinDigit(source_[position_]) ||
+                        source_[position_] == '_')) {
+                    ++position_;
+                }
+                consumeIntSuffix(source_, position_);
+                return Token{TokenKind::IntLiteral,
+                             source_.substr(numStart, position_ - numStart),
+                             SourceLocation{}};
+            }
+        }
+
+        // Decimal digit run.
+        while (position_ < source_.size() &&
+               (isAsciiDigit(static_cast<unsigned char>(source_[position_])) ||
+                source_[position_] == '_')) {
+            ++position_;
+        }
+
+        bool isFloat = false;
+
+        // Fractional part (A.1 form 1): `.` followed by a digit. The
+        // digit-required lookahead is what distinguishes `1.0` (float) from
+        // `1..10` (int, range, int) and `obj.member` (int, dot, identifier).
+        if (position_ + 1 < source_.size() && source_[position_] == '.' &&
+            isAsciiDigit(static_cast<unsigned char>(source_[position_ + 1]))) {
+            isFloat = true;
+            ++position_; // consume '.'
+            while (position_ < source_.size() &&
+                   (isAsciiDigit(static_cast<unsigned char>(source_[position_])) ||
+                    source_[position_] == '_')) {
+                ++position_;
+            }
+        }
+
+        // Exponent (A.1 forms 1 and 2): e/E with optional sign and required
+        // digit run. We peek past the sign before committing so a stray `e`
+        // (e.g. in `42e`) is left for the next iteration to lex as an
+        // identifier rather than producing a malformed literal.
+        if (position_ < source_.size() &&
+            (source_[position_] == 'e' || source_[position_] == 'E')) {
+            std::size_t peek = position_ + 1;
+            if (peek < source_.size() &&
+                (source_[peek] == '+' || source_[peek] == '-')) {
+                ++peek;
+            }
+            if (peek < source_.size() &&
+                isAsciiDigit(static_cast<unsigned char>(source_[peek]))) {
+                isFloat = true;
+                position_ = peek;
+                while (position_ < source_.size() &&
+                       (isAsciiDigit(static_cast<unsigned char>(source_[position_])) ||
+                        source_[position_] == '_')) {
+                    ++position_;
+                }
+            }
+        }
+
+        // Suffix: float suffix (f/F/m/M, A.1 forms 1–3) takes precedence over
+        // integer suffix; the grammar makes them mutually exclusive.
+        if (position_ < source_.size()) {
+            const char c = source_[position_];
+            if (c == 'f' || c == 'F' || c == 'm' || c == 'M') {
+                isFloat = true;
+                ++position_;
+            } else if (!isFloat) {
+                consumeIntSuffix(source_, position_);
+            }
+        }
+
+        return Token{isFloat ? TokenKind::FloatLiteral : TokenKind::IntLiteral,
+                     source_.substr(numStart, position_ - numStart),
+                     SourceLocation{}};
     }
 
     // §17 / Appendix A operators and punctuation. Maximal munch via a
