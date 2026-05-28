@@ -262,6 +262,54 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         out += ';';
         return out;
     }
+    auto bodyToString =
+        [](const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+            std::string b = "{ ";
+            for (std::size_t i = 0; i < body.size(); ++i) {
+                if (i > 0) b += ' ';
+                b += body[i] ? stmtSummary(*body[i]) : std::string("<null>");
+            }
+            b += " }";
+            return b;
+        };
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        std::string out = "if ";
+        out += ifs->ifBranch.condition
+                   ? exprToString(*ifs->ifBranch.condition)
+                   : std::string("<null>");
+        out += " then ";
+        out += bodyToString(ifs->ifBranch.body);
+        for (const auto& elif : ifs->elifBranches) {
+            out += " elif ";
+            out += elif.condition ? exprToString(*elif.condition)
+                                  : std::string("<null>");
+            out += " then ";
+            out += bodyToString(elif.body);
+        }
+        if (ifs->hasElse) {
+            out += " else ";
+            out += bodyToString(ifs->elseBody);
+        }
+        out += " end;";
+        return out;
+    }
+    if (auto* w = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        std::string out = "while ";
+        out += w->condition ? exprToString(*w->condition)
+                            : std::string("<null>");
+        out += ' ';
+        out += bodyToString(w->body);
+        out += " end;";
+        return out;
+    }
+    if (auto* d = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        std::string out = "do ";
+        out += bodyToString(d->body);
+        out += " end;";
+        return out;
+    }
+    if (dynamic_cast<const ast::BreakStmt*>(&s))    return "break;";
+    if (dynamic_cast<const ast::ContinueStmt*>(&s)) return "continue;";
     return "<unknown stmt>";
 }
 

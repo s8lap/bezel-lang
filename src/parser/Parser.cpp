@@ -652,6 +652,134 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
         return std::unique_ptr<ast::Stmt>(decl.release());
     }
 
+    // IfStmt (A.6).
+    if (isKeyword("if")) {
+        advance(); // past `if`
+        auto stmt = std::make_unique<ast::IfStmt>();
+        stmt->ifBranch.condition = parseExpression();
+        if (!consumeKeyword("then")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'then' after 'if' condition");
+        }
+        while (!isKeyword("elif") && !isKeyword("else") &&
+               !isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto inner = parseStatement();
+            if (inner) {
+                stmt->ifBranch.body.push_back(std::move(inner));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        while (consumeKeyword("elif")) {
+            ast::IfStmt::Branch elif;
+            elif.condition = parseExpression();
+            if (!consumeKeyword("then")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'then' after 'elif' condition");
+            }
+            while (!isKeyword("elif") && !isKeyword("else") &&
+                   !isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto inner = parseStatement();
+                if (inner) {
+                    elif.body.push_back(std::move(inner));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+            stmt->elifBranches.push_back(std::move(elif));
+        }
+        if (consumeKeyword("else")) {
+            stmt->hasElse = true;
+            while (!isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto inner = parseStatement();
+                if (inner) {
+                    stmt->elseBody.push_back(std::move(inner));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'if' statement");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'if'");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
+    // WhileStmt (A.6).
+    if (isKeyword("while")) {
+        advance();
+        auto stmt = std::make_unique<ast::WhileStmt>();
+        stmt->condition = parseExpression();
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto inner = parseStatement();
+            if (inner) {
+                stmt->body.push_back(std::move(inner));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'while' statement");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'while'");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
+    // DoEndBlock (A.6) — plain statement-sequencing block, no value.
+    if (isKeyword("do")) {
+        advance();
+        auto stmt = std::make_unique<ast::DoEndBlock>();
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto inner = parseStatement();
+            if (inner) {
+                stmt->body.push_back(std::move(inner));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'do' block");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'do' block");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
+    if (consumeKeyword("break")) {
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'break'");
+        }
+        return std::unique_ptr<ast::Stmt>(
+            std::make_unique<ast::BreakStmt>().release());
+    }
+    if (consumeKeyword("continue")) {
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'continue'");
+        }
+        return std::unique_ptr<ast::Stmt>(
+            std::make_unique<ast::ContinueStmt>().release());
+    }
+
     // ReturnStmt: `return Expression? ";"`.
     if (isKeyword("return")) {
         advance();

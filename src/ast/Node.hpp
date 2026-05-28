@@ -137,6 +137,36 @@ struct AssignmentStmt : Stmt {
     std::unique_ptr<Expr> value;
 };
 
+// A.6: `IfStmt ::= "if" Expression "then" Statement*
+//                  ("elif" Expression "then" Statement*)*
+//                  ("else" Statement*)? "end" ";"`
+struct IfStmt : Stmt {
+    struct Branch {
+        std::unique_ptr<Expr> condition;
+        std::vector<std::unique_ptr<Stmt>> body;
+    };
+    Branch ifBranch;
+    std::vector<Branch> elifBranches;
+    bool hasElse = false;
+    std::vector<std::unique_ptr<Stmt>> elseBody;
+};
+
+// A.6: `WhileStmt ::= "while" Expression Statement* "end" ";"`.
+struct WhileStmt : Stmt {
+    std::unique_ptr<Expr> condition;
+    std::vector<std::unique_ptr<Stmt>> body;
+};
+
+// A.6: `DoEndBlock ::= "do" Statement* "end" ";"`. Statement-sequencing
+// block of type `()`; no value produced (rationale §5.13).
+struct DoEndBlock : Stmt {
+    std::vector<std::unique_ptr<Stmt>> body;
+};
+
+// A.6 trivial transfer statements.
+struct BreakStmt : Stmt {};
+struct ContinueStmt : Stmt {};
+
 // One parameter in a method's parameter list. Slice 10 covers
 // `Identifier ":" Type`; modifiers (`ref`/`out`/`out owned`/`owned`) and
 // default values come with later slices.
