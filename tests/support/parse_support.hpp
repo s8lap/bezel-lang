@@ -282,6 +282,15 @@ inline std::string exprToString(const ast::Expr& e) {
         if (!t->operand) return std::string("(throw)");
         return "(throw " + exprToString(*t->operand) + ")";
     }
+    if (auto* tof = dynamic_cast<const ast::TypeOfExpr*>(&e)) {
+        return "typeof(" + (tof->queriedType
+                                ? typeToString(*tof->queriedType)
+                                : std::string("<null>")) + ")";
+    }
+    if (auto* nof = dynamic_cast<const ast::NameOfExpr*>(&e)) {
+        return "nameof(" + (nof->name ? qualifiedNameString(*nof->name)
+                                      : std::string("<null>")) + ")";
+    }
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         std::string out = "(() => ";
         if (lam->isBlockBody) {

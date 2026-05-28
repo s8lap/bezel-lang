@@ -924,6 +924,36 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
         return std::unique_ptr<ast::Expr>(e.release());
     }
 
+    // §A.7 typeof / nameof primary expressions.
+    if (isKeyword("typeof")) {
+        advance();
+        auto te = std::make_unique<ast::TypeOfExpr>();
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected '(' after 'typeof'");
+        }
+        te->queriedType = parseType();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ')' to close 'typeof'");
+        }
+        return std::unique_ptr<ast::Expr>(te.release());
+    }
+    if (isKeyword("nameof")) {
+        advance();
+        auto ne = std::make_unique<ast::NameOfExpr>();
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected '(' after 'nameof'");
+        }
+        ne->name = parseQualifiedName();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ')' to close 'nameof'");
+        }
+        return std::unique_ptr<ast::Expr>(ne.release());
+    }
+
     // §22.3 `this` and `base` — reserved keywords (App. B.1) that name the
     // current instance and the base-class projection. The AST stores them as
     // IdentifierExpr with the keyword as the lexeme; sema interprets.
