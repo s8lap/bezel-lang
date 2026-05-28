@@ -28,7 +28,8 @@ set(BEZEL_TEST_SOURCES
     parser/statements_control_flow_test.cpp
     parser/expressions_new_and_postfix_test.cpp
     parser/expressions_more_binary_test.cpp
-    parser/expressions_typetest_and_in_test.cpp)
+    parser/expressions_typetest_and_in_test.cpp
+    parser/conditional_and_throw_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
