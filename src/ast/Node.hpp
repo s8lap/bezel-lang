@@ -526,6 +526,13 @@ struct ThrowExpr : Expr {
     std::unique_ptr<Expr> operand; // null for bare `throw`
 };
 
+// A.7 `TypeOfExpr ::= "typeof" "(" Type ")"`.
+struct TypeOfExpr : Expr { std::unique_ptr<Type> queriedType; };
+
+// A.7 `NameOfExpr ::= "nameof" "(" QualifiedName ")"`. The QualifiedName is
+// recorded; sema resolves it.
+struct NameOfExpr : Expr { std::unique_ptr<QualifiedName> name; };
+
 // A.7 `LambdaExpr ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody`.
 // Slice 28 covers ONLY the empty-params form `() => …` (with an Expression or
 // `do … end` body). Lambdas with parameters require multi-token lookahead to
