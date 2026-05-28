@@ -71,6 +71,10 @@ enum class TypeDeclKind {
     Enum,      // §10
 };
 
+// Common base for the grammar's `TopDecl` alternatives (A.2). Concrete
+// subclasses follow.
+struct TopDecl : Node {};
+
 // Slice 3: empty class-like top-level declaration. Members, inheritance,
 // generic parameters, primary-constructor parameters, and the serialization
 // clauses on classes/records are all left for later slices; the body parsed
@@ -78,12 +82,33 @@ enum class TypeDeclKind {
 // `ClassDecl`/`InterfaceDecl`/`RecordDecl`/`EnumDecl` share enough shape
 // (Visibility? Modifier* keyword Identifier ... body) that one struct with a
 // `kind` tag is the right model until per-kind members force a split.
-struct TypeDecl : Node {
+struct TypeDecl : TopDecl {
     TypeDeclKind kind = TypeDeclKind::Class;
     Visibility visibility = Visibility::None;
     std::vector<std::string_view> modifiers; // "abstract", "sealed", "static"
     std::string_view name;
     std::string_view endLabel; // empty when the `end` had no label
+};
+
+// Slice 4: named type reference. The grammar (A.5) has more alternatives —
+// inline arrays, function types, and the unit type `()` — but this slice
+// covers only `QualifiedName GenericArgs?` with the optional `?` nullable
+// suffix. When inline-array and function types arrive, `Type` becomes the
+// polymorphic base and `NamedType` is split out as a subclass; for now a
+// single struct is the right fit.
+struct Type : Node {
+    std::unique_ptr<QualifiedName> name;
+    std::vector<std::unique_ptr<Type>> genericArgs; // empty when not generic
+    bool nullable = false;
+};
+
+// A.2: `TypeAliasDecl ::= "type" Identifier GenericParams? "=" Type
+//                          GenericConstraints* ";"`. Slice 4 admits only the
+// degenerate form — no generic params, no constraints; those arrive with
+// the generics slice.
+struct TypeAlias : TopDecl {
+    std::string_view name;
+    std::unique_ptr<Type> aliasedType;
 };
 
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)
@@ -94,7 +119,7 @@ struct TypeDecl : Node {
 struct SourceFile : Node {
     std::unique_ptr<ModuleDecl> module;
     std::vector<std::unique_ptr<Import>> imports;
-    std::vector<std::unique_ptr<TypeDecl>> topDecls;
+    std::vector<std::unique_ptr<TopDecl>> topDecls;
 };
 
 } // namespace bezel::ast
