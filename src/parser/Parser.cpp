@@ -399,13 +399,8 @@ bool isRightAssociative(std::string_view op) {
 } // namespace
 
 std::unique_ptr<ast::Expr> Parser::parseExpression() {
-    // §A.7 ThrowExpr: recognised here. Conditional `X if cond else Y` (§17.1
-    // L15, §A.7) is NOT implemented in this slice — naive `if`-suffix
-    // parsing on every expression gobbles the `if` of an IfStmt that lives
-    // in a statement-following-expression position (e.g. `while cond if foo
-    // then ... end;`). A clean fix probably needs either a body-start
-    // keyword on WhileStmt (a spec change) or required parens around the
-    // conditional. Left for a deliberate slice.
+    // §A.7 ConditionalExpr ::= LogicalOr ("if" Expression "else" Expression)?
+    //                         | ThrowExpr | CaseExpr (later slice)
     if (isKeyword("throw")) {
         advance();
         auto te = std::make_unique<ast::ThrowExpr>();
@@ -420,7 +415,27 @@ std::unique_ptr<ast::Expr> Parser::parseExpression() {
         }
         return std::unique_ptr<ast::Expr>(te.release());
     }
-    return parseBinaryExpression(1);
+    auto left = parseBinaryExpression(1);
+    // Conditional suffix. Now that statement constructs that contain an
+    // Expression-followed-by-Statement (`if cond then …`, `while cond do …`,
+    // `for var x in expr do …`) have body-start keywords, naive `if`-suffix
+    // parsing here can't gobble a statement's `if` — it'd just fail to find
+    // `else` and report a parse error.
+    if (consumeKeyword("if")) {
+        auto cond = parseExpression();
+        if (!consumeKeyword("else")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected 'else' after conditional 'if' condition");
+        }
+        auto right = parseExpression();
+        auto c = std::make_unique<ast::ConditionalExpr>();
+        c->thenValue = std::move(left);
+        c->condition = std::move(cond);
+        c->elseValue = std::move(right);
+        return std::unique_ptr<ast::Expr>(c.release());
+    }
+    return left;
 }
 
 std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
@@ -845,11 +860,15 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
         return std::unique_ptr<ast::Stmt>(stmt.release());
     }
 
-    // WhileStmt (A.6).
+    // WhileStmt (A.6): `"while" Expression "do" Statement* "end" ";"`.
     if (isKeyword("while")) {
         advance();
         auto stmt = std::make_unique<ast::WhileStmt>();
         stmt->condition = parseExpression();
+        if (!consumeKeyword("do")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'do' to begin 'while' body");
+        }
         while (!isKeyword("end") &&
                current_.kind != TokenKind::EndOfFile) {
             auto inner = parseStatement();

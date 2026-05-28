@@ -73,15 +73,15 @@ BEZEL_TEST(parser_control_flow, nested_if) {
 // --- WhileStmt --------------------------------------------------------------
 
 BEZEL_TEST(parser_control_flow, while_simple) {
-    BEZEL_EXPECT_EQ(parseBodyText("while cond x := x + 1; end;"),
+    BEZEL_EXPECT_EQ(parseBodyText("while cond do x := x + 1; end;"),
                     std::string(
-                        "{ while cond { x := (x + 1); } end; }"));
+                        "{ while cond do { x := (x + 1); } end; }"));
 }
 
 BEZEL_TEST(parser_control_flow, while_with_complex_condition) {
-    BEZEL_EXPECT_EQ(parseBodyText("while a and b x := 0; end;"),
+    BEZEL_EXPECT_EQ(parseBodyText("while a and b do x := 0; end;"),
                     std::string(
-                        "{ while (a and b) { x := 0; } end; }"));
+                        "{ while (a and b) do { x := 0; } end; }"));
 }
 
 // --- DoEndBlock -------------------------------------------------------------
@@ -96,16 +96,16 @@ BEZEL_TEST(parser_control_flow, do_end_block) {
 
 BEZEL_TEST(parser_control_flow, break_inside_while) {
     BEZEL_EXPECT_EQ(
-        parseBodyText("while cond if done then break; end; end;"),
+        parseBodyText("while cond do if done then break; end; end;"),
         std::string(
-            "{ while cond { if done then { break; } end; } end; }"));
+            "{ while cond do { if done then { break; } end; } end; }"));
 }
 
 BEZEL_TEST(parser_control_flow, continue_inside_while) {
     BEZEL_EXPECT_EQ(
-        parseBodyText("while cond if skip then continue; end; end;"),
+        parseBodyText("while cond do if skip then continue; end; end;"),
         std::string(
-            "{ while cond { if skip then { continue; } end; } end; }"));
+            "{ while cond do { if skip then { continue; } end; } end; }"));
 }
 
 // --- Error cases ------------------------------------------------------------
@@ -120,7 +120,14 @@ BEZEL_TEST(parser_control_flow, if_missing_then_is_error) {
 BEZEL_TEST(parser_control_flow, while_missing_end_is_error) {
     auto r = parseAll(
         "module M; class Foo public method run() "
-        "while cond x := 1; end run; end Foo;");
+        "while cond do x := 1; end run; end Foo;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(parser_control_flow, while_missing_do_is_error) {
+    auto r = parseAll(
+        "module M; class Foo public method run() "
+        "while cond x := 1; end; end run; end Foo;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 

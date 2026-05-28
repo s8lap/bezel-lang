@@ -370,7 +370,7 @@ inline std::string stmtSummary(const ast::Stmt& s) {
         std::string out = "while ";
         out += w->condition ? exprToString(*w->condition)
                             : std::string("<null>");
-        out += ' ';
+        out += " do ";
         out += bodyToString(w->body);
         out += " end;";
         return out;

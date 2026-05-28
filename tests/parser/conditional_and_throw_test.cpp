@@ -1,12 +1,11 @@
-// Spec-derived parser tests for `throw` in expression (A.7 ThrowExpr) and
-// statement (A.6 ThrowStmt) positions.
+// Spec-derived parser tests for `throw` in expression and statement
+// positions, and the conditional expression `X if cond else Y` (§17.1 L15).
 //
-// The conditional expression (`X if cond else Y`, §17.1 L15) is NOT
-// implemented in this slice — see the note in Parser.cpp's parseExpression.
-// It conflicts with statement-level `if cond then ...` because constructs
-// like WhileStmt have no body-start keyword: `while cond if foo then ... end;`
-// is ambiguous. A clean fix needs either a spec amendment (add a body-start
-// keyword like `do` to WhileStmt) or required parens around the conditional.
+// The conditional was previously deferred over a perceived spec ambiguity;
+// turns out my parser was just missing the `do` body-start keyword that
+// WhileStmt already requires per spec A.6. With that fixed, naive `if`-
+// suffix parsing on every expression can't gobble a statement's `if` — it'd
+// fail to find `else` and report a clear parse error.
 
 #include <string>
 
@@ -70,4 +69,38 @@ BEZEL_TEST(parser_throw, throw_inside_if_branch) {
     BEZEL_EXPECT_EQ(
         parseBodyText("if cond then throw err; end;"),
         std::string("{ if cond then { throw err; } end; }"));
+}
+
+// --- Conditional expression (§17.1 L15) ------------------------------------
+
+BEZEL_TEST(parser_conditional, simple) {
+    BEZEL_EXPECT_EQ(parseInitText("a if cond else b"),
+                    std::string("(a if cond else b)"));
+}
+
+BEZEL_TEST(parser_conditional, with_complex_branches) {
+    BEZEL_EXPECT_EQ(parseInitText("a + 1 if cond else b * 2"),
+                    std::string("((a + 1) if cond else (b * 2))"));
+}
+
+// §17.1: conditional is right-associative.
+BEZEL_TEST(parser_conditional, right_associative) {
+    BEZEL_EXPECT_EQ(
+        parseInitText("a if c1 else b if c2 else d"),
+        std::string("(a if c1 else (b if c2 else d))"));
+}
+
+BEZEL_TEST(parser_conditional, throw_as_else_branch) {
+    BEZEL_EXPECT_EQ(
+        parseInitText(
+            "value if value <> null else throw new Exception(\"nil\")"),
+        std::string(
+            "(value if (value <> null) else "
+            "(throw new Exception(\"nil\")))"));
+}
+
+BEZEL_TEST(parser_conditional, missing_else_is_error) {
+    auto r = parseAll(
+        "module M; class Foo public x: int := a if cond; end Foo;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
