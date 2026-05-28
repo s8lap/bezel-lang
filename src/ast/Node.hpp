@@ -637,7 +637,11 @@ struct NullCondCallExpr : Expr {
 };
 struct IndexExpr : Expr {
     std::unique_ptr<Expr> target;
-    std::vector<std::unique_ptr<Expr>> indices; // 1 or more for multi-dim
+    // §A.7 PrimarySuffix `[ ArgList ]`: indexer indices share the call
+    // ArgList grammar (slice 55) — admitting modifiers, named args, and
+    // the `_` discard. Sema enforces which apply to indexer setters vs
+    // getters.
+    std::vector<CallArgument> indices;
 };
 struct PostfixBangExpr : Expr {
     std::unique_ptr<Expr> operand;
