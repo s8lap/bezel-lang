@@ -24,6 +24,15 @@ private:
     Token scanCharLiteral();
     Token scanStringLiteral();
     Token scanVerbatimString();
+    void consumeEscape();
+
+    // Convert a byte offset within `source_` to a 1-based line/column
+    // SourceLocation. Lazy O(N) walk: we don't track line/column as the lexer
+    // advances; simplicity beats speed per CLAUDE.md until profiling says
+    // otherwise. Convention (not in the spec): line and column are 1-based;
+    // CR, LF, and CRLF each advance the line by one (CRLF is one line break,
+    // not two); tabs advance the column by one (no expansion).
+    SourceLocation locationAt(std::size_t offset) const;
 
     std::string_view source_;
     DiagnosticEngine& diagnostics_;
