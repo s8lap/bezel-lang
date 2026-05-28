@@ -339,6 +339,20 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                     Severity::Error, current_.location,
                     "expected ';' after enum constants");
             }
+            // EnumMember* after the constants list. Sema restricts the
+            // valid member kinds to MethodDecl, ExpressionPropertyDecl,
+            // StaticReadonlyDecl, and StaticConstDecl (A.3 EnumMember).
+            // We accept the full Member grammar at the parse level and let
+            // sema filter — keeps the dispatch shared with class/record.
+            while (!isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto m = parseMember();
+                if (m) {
+                    decl->members.push_back(std::move(m));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
         }
     }
 
