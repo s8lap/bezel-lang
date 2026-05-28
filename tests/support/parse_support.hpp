@@ -725,9 +725,51 @@ inline std::string memberSummary(const ast::Member& m) {
                     out += exprToString(*pd->autoInitializer);
                 }
                 break;
-            case ast::PropertyBodyKind::Block:
-                out += " { … }";
+            case ast::PropertyBodyKind::Block: {
+                // Accessor-block body: render each accessor compactly so
+                // tests can assert on the shape.
+                out += " { ";
+                for (std::size_t i = 0; i < pd->accessors.size(); ++i) {
+                    if (i > 0) out += ' ';
+                    const auto& a = pd->accessors[i];
+                    out += visibilityPrefix(a.visibility);
+                    out += (a.isSet ? "set" : "get");
+                    if (a.isSet && a.hasSetterParamSpec) {
+                        out += '(';
+                        if (!a.setterParamMod.empty()) {
+                            out += std::string(a.setterParamMod);
+                            if (!a.setterParamName.empty()) out += ' ';
+                        }
+                        if (!a.setterParamName.empty()) {
+                            out += std::string(a.setterParamName);
+                        }
+                        out += ')';
+                    }
+                    switch (a.bodyKind) {
+                        case ast::PropertyAccessorBodyKind::Abstract:
+                            out += ';';
+                            break;
+                        case ast::PropertyAccessorBodyKind::Expression:
+                            out += " => ";
+                            out += a.exprBody
+                                       ? exprToString(*a.exprBody)
+                                       : std::string("<null>");
+                            out += ';';
+                            break;
+                        case ast::PropertyAccessorBodyKind::Block:
+                            out += " => do { ";
+                            for (std::size_t s = 0; s < a.stmts.size(); ++s) {
+                                if (s > 0) out += ' ';
+                                out += a.stmts[s] ? stmtSummary(*a.stmts[s])
+                                                  : std::string("<null>");
+                            }
+                            out += " } end;";
+                            break;
+                    }
+                }
+                out += " }";
                 break;
+            }
         }
         return out;
     }
