@@ -51,7 +51,8 @@ set(BEZEL_TEST_SOURCES
     parser/parameterised_lambdas_test.cpp
     parser/property_accessor_blocks_test.cpp
     parser/case_and_patterns_test.cpp
-    parser/case_stmt_test.cpp)
+    parser/case_stmt_test.cpp
+    parser/nested_types_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

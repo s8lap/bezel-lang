@@ -541,6 +541,22 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         advance();
     }
 
+    // A.4 NestedTypeDecl as a Member: `class` / `interface` / `record` /
+    // `enum` keyword after Visibility?+Modifier*. The modifier set for
+    // top-level type-decls (`abstract`/`sealed`/`static`) overlaps with the
+    // member-modifier set we already collected, so we hand them down.
+    if (isKeyword("class") || isKeyword("interface") ||
+        isKeyword("record") || isKeyword("enum")) {
+        // Modifiers that are valid on nested types are the same as on
+        // top-level types per A.3 — `abstract`/`sealed`/`static`. The
+        // member-modifier set is a superset; semantic validation belongs
+        // to sema (§11.7).
+        auto td = parseTypeOrInterfaceDecl(visibility, std::move(modifiers));
+        auto ntm = std::make_unique<ast::NestedTypeMember>();
+        ntm->decl = std::move(td);
+        return std::unique_ptr<ast::Member>(ntm.release());
+    }
+
     // Member-kind keyword dispatch.
     if (isKeyword("const")) {
         if (visibility == ast::Visibility::None) {
