@@ -381,6 +381,9 @@ int binaryPrecedence(const Token& tok) {
     if (tok.kind == TokenKind::Keyword) {
         const std::string_view t = tok.text;
         if (t == "mod") return 14; // multiplicative (keyword-spelled)
+        // §17.1 L10 relational, keyword-spelled. `is not` is also relational
+        // and handled below as a two-token sequence starting at `is`.
+        if (t == "in" || t == "is" || t == "as") return 7;
         if (t == "and") return 4;  // §17.1 L13 logical AND
         if (t == "or")  return 3;  // §17.1 L14 logical OR
     }
@@ -400,23 +403,47 @@ std::unique_ptr<ast::Expr> Parser::parseExpression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
-    // Precedence climbing. Right-associative operators (`??`, slice 14) recurse
-    // with the same minPrec; left-associative ones (everything else) recurse
-    // with prec + 1 so same-precedence ops associate to the left.
+    // Precedence climbing. Right-associative operators (`??`) recurse with the
+    // same minPrec; left-associative ones recurse with prec + 1 so same-prec
+    // ops associate to the left. The keyword relationals `is`, `is not`, and
+    // `as` have a Type on the right-hand side and produce TypeTestExpr; `in`
+    // takes a regular expression on the right.
     auto left = parseUnaryExpression();
     for (;;) {
         const int prec = binaryPrecedence(current_);
         if (prec < minPrecedence) break;
         const Token opTok = current_;
         advance();
-        const int nextMin =
-            isRightAssociative(opTok.text) ? prec : prec + 1;
-        auto right = parseBinaryExpression(nextMin);
-        auto bin = std::make_unique<ast::BinaryExpr>();
-        bin->op = opTok.text;
-        bin->left = std::move(left);
-        bin->right = std::move(right);
-        left = std::unique_ptr<ast::Expr>(bin.release());
+
+        // §17.4: `is not` is one logical operator with a two-token spelling.
+        // The lexer emits `is` and `not` as separate Keyword tokens; we glue
+        // them back together here when they appear in relational position.
+        std::string_view opText = opTok.text;
+        if (opTok.text == "is" && isKeyword("not")) {
+            advance();
+            opText = "is not";
+        }
+
+        // §17.4: `is` / `is not` / `as` take a Type on the right. `in` takes
+        // an expression (it's a regular binary op).
+        const bool isTypeTest =
+            (opText == "is" || opText == "is not" || opText == "as");
+        if (isTypeTest) {
+            auto tt = std::make_unique<ast::TypeTestExpr>();
+            tt->operand = std::move(left);
+            tt->op = opText;
+            tt->testType = parseType();
+            left = std::unique_ptr<ast::Expr>(tt.release());
+        } else {
+            const int nextMin =
+                isRightAssociative(opText) ? prec : prec + 1;
+            auto right = parseBinaryExpression(nextMin);
+            auto bin = std::make_unique<ast::BinaryExpr>();
+            bin->op = opText;
+            bin->left = std::move(left);
+            bin->right = std::move(right);
+            left = std::unique_ptr<ast::Expr>(bin.release());
+        }
     }
     return left;
 }

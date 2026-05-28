@@ -206,6 +206,18 @@ inline std::string exprToString(const ast::Expr& e) {
         out += ')';
         return out;
     }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        std::string out = "(";
+        out += tt->operand ? exprToString(*tt->operand)
+                           : std::string("<null>");
+        out += ' ';
+        out += std::string(tt->op);
+        out += ' ';
+        out += tt->testType ? typeToString(*tt->testType)
+                            : std::string("<null>");
+        out += ')';
+        return out;
+    }
     if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         // Keyword-spelled unary operators (`not`) need a space; the
         // punctuator-spelled ones (`+ - ~`) don't.
