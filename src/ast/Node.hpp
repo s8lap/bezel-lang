@@ -76,6 +76,7 @@ enum class TypeDeclKind {
 struct TopDecl : Node {};
 
 struct Type; // defined after TypeDecl; used by TypeDecl::baseTypes.
+struct Expr; // defined further below; used by FieldDecl::initializer.
 
 // Common base for type members (FieldDecl, MethodDecl, PropertyDecl, …).
 // Slice 6 introduces FieldDecl only; other kinds arrive with their slices.
@@ -83,13 +84,12 @@ struct Member : Node {};
 
 // A.4: `FieldDecl ::= Visibility "static"? "owned"? "readonly"?
 //                     Identifier ":" Type (":=" Expression)? ";"`.
-// Slice 6 omits the optional initializer — initializer expressions arrive
-// with the expression slice.
 struct FieldDecl : Member {
     Visibility visibility = Visibility::None;
     std::vector<std::string_view> modifiers; // "static", "owned", "readonly"
     std::string_view name;
     std::unique_ptr<Type> type;
+    std::unique_ptr<Expr> initializer; // null if no `:= Expr` was written
 };
 
 // A.3 `GenericParam ::= Variance? Identifier` where Variance is `in` or `out`
@@ -143,6 +143,43 @@ struct Type : Node {
 struct TypeAlias : TopDecl {
     std::string_view name;
     std::unique_ptr<Type> aliasedType;
+};
+
+// --- Expressions (§17, A.5) -------------------------------------------------
+// Slice 7 covers primary expressions: literals (numeric/char/string/bool/null),
+// identifiers, parenthesized expressions, postfix member access (`.x`) and
+// call (`(...)`). Unary, binary, `new`, `?.`, `?(`, indexing, casts, and
+// everything else land in later slices.
+
+struct Expr : Node {};
+
+// Numeric / char / string literals carry the raw lexeme; value parsing and
+// type interpretation are sema's job (matches how the lexer handles literals).
+struct IntLiteralExpr      : Expr { std::string_view text; };
+struct FloatLiteralExpr    : Expr { std::string_view text; };
+struct CharLiteralExpr     : Expr { std::string_view text; };
+struct StringLiteralExpr   : Expr { std::string_view text; };
+struct VerbatimStringExpr  : Expr { std::string_view text; };
+
+// `true` / `false` decoded at parse time; null is a marker.
+struct BoolLiteralExpr : Expr { bool value = false; };
+struct NullLiteralExpr : Expr {};
+
+struct IdentifierExpr : Expr { std::string_view name; };
+
+struct ParenExpr : Expr { std::unique_ptr<Expr> inner; };
+
+// A.5: `expr "." Identifier`. Postfix; the `target` is whatever expression
+// preceded the dot.
+struct MemberAccessExpr : Expr {
+    std::unique_ptr<Expr> target;
+    std::string_view member;
+};
+
+// A.5: `expr "(" ArgList? ")"`. Postfix call.
+struct CallExpr : Expr {
+    std::unique_ptr<Expr> callee;
+    std::vector<std::unique_ptr<Expr>> args;
 };
 
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)

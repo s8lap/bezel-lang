@@ -331,6 +331,9 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                             "expected ':' after field name");
     }
     field->type = parseType();
+    if (consumePunctuator(":=")) {
+        field->initializer = parseExpression();
+    }
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after field declaration");
@@ -339,6 +342,117 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     // Reseat the raw pointer explicitly (Node's deleted move blocks the
     // implicit unique_ptr<Derived> -> unique_ptr<Base> conversion).
     return std::unique_ptr<ast::Member>(field.release());
+}
+
+std::unique_ptr<ast::Expr> Parser::parseExpression() {
+    // Slice 7: primary plus postfix only. Unary, binary, etc. land in later
+    // slices.
+    return parsePostfix(parsePrimaryExpression());
+}
+
+std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
+    // Literals from the lexer (§18 forms covered in lexer slices 3 and 4).
+    if (current_.kind == TokenKind::IntLiteral) {
+        auto e = std::make_unique<ast::IntLiteralExpr>();
+        e->text = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+    if (current_.kind == TokenKind::FloatLiteral) {
+        auto e = std::make_unique<ast::FloatLiteralExpr>();
+        e->text = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+    if (current_.kind == TokenKind::CharLiteral) {
+        auto e = std::make_unique<ast::CharLiteralExpr>();
+        e->text = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+    if (current_.kind == TokenKind::StringLiteral) {
+        auto e = std::make_unique<ast::StringLiteralExpr>();
+        e->text = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+    if (current_.kind == TokenKind::VerbatimStringLiteral) {
+        auto e = std::make_unique<ast::VerbatimStringExpr>();
+        e->text = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+
+    // §18.2 boolean and null keyword literals.
+    if (isKeyword("true") || isKeyword("false")) {
+        auto e = std::make_unique<ast::BoolLiteralExpr>();
+        e->value = (current_.text == "true");
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+    if (isKeyword("null")) {
+        advance();
+        return std::unique_ptr<ast::Expr>(
+            std::make_unique<ast::NullLiteralExpr>().release());
+    }
+
+    if (current_.kind == TokenKind::Identifier) {
+        auto e = std::make_unique<ast::IdentifierExpr>();
+        e->name = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+
+    if (consumePunctuator("(")) {
+        auto inner = parseExpression();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ')' to close parenthesized expression");
+        }
+        auto e = std::make_unique<ast::ParenExpr>();
+        e->inner = std::move(inner);
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+
+    diagnostics_.report(Severity::Error, current_.location,
+                        "expected expression");
+    return nullptr;
+}
+
+std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head) {
+    // §A.5 primary-level postfix chain. Only `.member` and `(args)` here;
+    // `[i]`, `?.`, `?(`, `!` (postfix) land with the postfix-extras slice.
+    for (;;) {
+        if (consumePunctuator(".")) {
+            if (current_.kind != TokenKind::Identifier) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected member name after '.'");
+                break;
+            }
+            auto access = std::make_unique<ast::MemberAccessExpr>();
+            access->target = std::move(head);
+            access->member = current_.text;
+            advance();
+            head = std::unique_ptr<ast::Expr>(access.release());
+        } else if (consumePunctuator("(")) {
+            auto call = std::make_unique<ast::CallExpr>();
+            call->callee = std::move(head);
+            if (!isPunctuator(")")) {
+                call->args.push_back(parseExpression());
+                while (consumePunctuator(",")) {
+                    call->args.push_back(parseExpression());
+                }
+            }
+            if (!consumePunctuator(")")) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected ')' to close call argument list");
+            }
+            head = std::unique_ptr<ast::Expr>(call.release());
+        } else {
+            break;
+        }
+    }
+    return head;
 }
 
 std::vector<ast::GenericParam> Parser::parseGenericParams() {
