@@ -89,6 +89,10 @@ private:
     std::unique_ptr<ast::Member> parseOperatorDeclBody(
         ast::Visibility visibility, std::vector<std::string_view> modifiers);
     std::vector<ast::Param> parseParamList();
+    // Slice 41: A.3 PositionalField list — `Identifier ":" Type
+    // SerializedClause?`. Distinct from ParamList: no modifiers, no default
+    // value, but admits a SerializedClause per field.
+    std::vector<ast::Param> parsePositionalFieldList();
     // Slice 36: a single LambdaParam (A.7). Differs from method ParamList
     // in that the `: Type` ascription is optional.
     ast::Param parseLambdaParam();
@@ -109,6 +113,11 @@ private:
     // arms have Statement-form or `do … end` bodies.
     std::unique_ptr<ast::Stmt> parseCaseStmt();
     ast::CaseArm parseCaseStmtArm();
+    // Slice 41: parse `serialized ( "skip" | StringLiteral? "optional"? )`
+    // (A.4 SerializedClause). The caller checks `isSerializedClauseStart()`
+    // first — `serialized` is contextual so we identify by text.
+    bool isSerializedClauseStart() const;
+    std::unique_ptr<ast::SerializedClause> parseSerializedClause();
     // Slice 36: peeks the matching `)` for the `(` at peekAt(startK) and
     // returns true iff a `=>` follows. Used to distinguish
     // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.

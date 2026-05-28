@@ -237,11 +237,32 @@ struct TryStmt : Stmt {
 // `ParamModifiers ::= "ref" | "out" "owned"? | "owned"`. Slice 24 adds
 // modifier (recorded as a single composite string like "out owned") and
 // default value.
+// A.4 SerializedClause. `serialized` is a contextual keyword (App. B.2)
+// lexed as Identifier; `skip` and `optional` are also contextual. The
+// grammar admits this on PositionalField, EnumConstant, and auto-property
+// PropertyBody — three sites only (slice 41). Sema enforces the
+// restrictions noted in the spec: `serialized` requires at least one of
+// the inner forms (bare `serialized` is a syntax error — enforced by
+// requiring `skip` / `optional` / a string in the parser); `skip` is
+// mutually exclusive with name or `optional`; enum constants reject
+// `skip` and `optional`.
+struct SerializedClause {
+    bool isSkip = false;            // `serialized skip`
+    bool isOptional = false;        // `optional` qualifier present
+    std::string_view name;          // empty when no StringLiteral was given.
+                                    // For `serialized "Foo"`, this is `Foo`
+                                    // (the string contents stripped of the
+                                    // surrounding quotes).
+};
+
 struct Param {
     std::string_view modifier; // "ref", "out", "out owned", "owned", or empty
     std::string_view name;
     std::unique_ptr<Type> type;
     std::unique_ptr<Expr> defaultValue; // null when no `:= Expr`
+    // A.4 PositionalField's SerializedClause. Only populated for record
+    // positional fields — other Param uses leave this null.
+    std::unique_ptr<SerializedClause> serialized;
 };
 
 // A.3 GenericConstraints. One `where T: c1, c2` clause; multiple clauses
@@ -360,10 +381,9 @@ struct PropertyAccessor {
 //                        "property" Identifier ":" Type PropertyBody`.
 // Forms supported:
 //   `=> Expression ;`               (Expression-body)
-//   `(":=" Expression)? ";"`        (Auto-property, with optional initializer)
+//   `(":=" Expression)? SerializedClause? ";"`  (Auto-property)
 //   `Accessor* "end" Identifier? ";"` (slice 37 — accessor block)
-// AutoAccessorVis (`public get`/etc.) and the SerializedClause modifier
-// on auto-properties are deferred to their slice.
+// AutoAccessorVis (`public get`/etc.) is still deferred.
 struct PropertyDecl : Member {
     Visibility visibility = Visibility::None;
     std::vector<std::string_view> modifiers; // static, readonly + VirtualKind
@@ -372,6 +392,8 @@ struct PropertyDecl : Member {
     PropertyBodyKind bodyKind = PropertyBodyKind::Auto;
     std::unique_ptr<Expr> exprBody;        // Expression-body case
     std::unique_ptr<Expr> autoInitializer; // Auto with `:= …`
+    // Slice 41: SerializedClause on the auto-property form.
+    std::unique_ptr<SerializedClause> serialized;
     std::vector<PropertyAccessor> accessors; // Block-body case
     std::string_view blockEndLabel;          // optional Identifier after `end`
     // Indexer form (A.4 IndexerDecl): the index parameter list appears as
@@ -381,10 +403,13 @@ struct PropertyDecl : Member {
 };
 
 // A.3 `EnumConstant ::= Identifier (":=" ConstExpr)? SerializedClause?`.
-// SerializedClause is deferred to its own slice.
 struct EnumConstant {
     std::string_view name;
     std::unique_ptr<Expr> value; // null when no `:= …`
+    // Slice 41: SerializedClause on an enum constant — sema restricts to the
+    // `serialized "name"` form (skip and optional are rejected per the §A.3
+    // grammar note).
+    std::unique_ptr<SerializedClause> serialized;
 };
 
 // Class-like top-level declaration. Slice 3 introduced the empty body; slice

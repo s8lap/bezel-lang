@@ -233,7 +233,13 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             advance();
             decl->hasPositionalFields = true;
             if (!isPunctuator(")")) {
-                decl->positionalFields = parseParamList();
+                // Records: PositionalField list (SerializedClause-bearing,
+                // no modifiers, no default). Classes: PrimaryCtorParam list
+                // (ParamList — modifiers + default, no SerializedClause).
+                decl->positionalFields =
+                    (decl->kind == ast::TypeDeclKind::Record)
+                        ? parsePositionalFieldList()
+                        : parseParamList();
             }
             if (!consumePunctuator(")")) {
                 diagnostics_.report(
@@ -290,6 +296,9 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             if (consumePunctuator(":=")) {
                 ec.value = parseExpression();
             }
+            if (isSerializedClauseStart()) {
+                ec.serialized = parseSerializedClause();
+            }
             decl->enumConstants.push_back(std::move(ec));
             while (consumePunctuator(",")) {
                 if (current_.kind != TokenKind::Identifier) {
@@ -303,6 +312,9 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                 advance();
                 if (consumePunctuator(":=")) {
                     ec2.value = parseExpression();
+                }
+                if (isSerializedClauseStart()) {
+                    ec2.serialized = parseSerializedClause();
                 }
                 decl->enumConstants.push_back(std::move(ec2));
             }
@@ -696,6 +708,9 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             if (consumePunctuator(":=")) {
                 pd->autoInitializer = parseExpression();
             }
+            if (isSerializedClauseStart()) {
+                pd->serialized = parseSerializedClause();
+            }
             if (!consumePunctuator(";")) {
                 diagnostics_.report(
                     Severity::Error, current_.location,
@@ -1056,6 +1071,52 @@ ast::PropertyAccessor Parser::parsePropertyAccessor() {
                             "expected '=>' or ';' in accessor body");
     }
     return acc;
+}
+
+// Slice 41: SerializedClause.
+
+bool Parser::isSerializedClauseStart() const {
+    return current_.kind == TokenKind::Identifier &&
+           current_.text == "serialized";
+}
+
+std::unique_ptr<ast::SerializedClause> Parser::parseSerializedClause() {
+    advance(); // past `serialized`
+    auto sc = std::make_unique<ast::SerializedClause>();
+    // `serialized skip` form. `skip` is contextual.
+    if (current_.kind == TokenKind::Identifier && current_.text == "skip") {
+        sc->isSkip = true;
+        advance();
+        return sc;
+    }
+    // SerializedName: `StringLiteral? "optional"?` with at least one of the
+    // two present.
+    bool gotSomething = false;
+    if (current_.kind == TokenKind::StringLiteral) {
+        // Strip the surrounding quotes if present. Escape decoding is sema's
+        // job — for our purposes the raw lexeme is the source-of-truth.
+        std::string_view txt = current_.text;
+        if (txt.size() >= 2 && txt.front() == '"' && txt.back() == '"') {
+            sc->name = txt.substr(1, txt.size() - 2);
+        } else {
+            sc->name = txt;
+        }
+        advance();
+        gotSomething = true;
+    }
+    if (current_.kind == TokenKind::Identifier &&
+        current_.text == "optional") {
+        sc->isOptional = true;
+        advance();
+        gotSomething = true;
+    }
+    if (!gotSomething) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "`serialized` requires `skip`, a name string, or `optional` "
+            "(A.4 SerializedClause)");
+    }
+    return sc;
 }
 
 namespace {
@@ -2414,6 +2475,37 @@ std::vector<ast::Param> Parser::parseParamList() {
         params.push_back(parseOne());
     }
     return params;
+}
+
+std::vector<ast::Param> Parser::parsePositionalFieldList() {
+    // A.3 PositionalField ::= Identifier ":" Type SerializedClause?
+    // No ParamModifiers and no default value (those belong to ParamList /
+    // PrimaryCtorParams).
+    std::vector<ast::Param> fields;
+    if (isPunctuator(")")) return fields;
+    auto parseOne = [&]() -> ast::Param {
+        ast::Param p;
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected positional field name");
+        } else {
+            p.name = current_.text;
+            advance();
+        }
+        if (!consumePunctuator(":")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ':' after positional field name");
+        }
+        p.type = parseType();
+        if (isSerializedClauseStart()) {
+            p.serialized = parseSerializedClause();
+        }
+        return p;
+    };
+    fields.push_back(parseOne());
+    while (consumePunctuator(",")) fields.push_back(parseOne());
+    return fields;
 }
 
 std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
