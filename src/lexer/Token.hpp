@@ -15,8 +15,11 @@ enum class TokenKind {
     EndOfFile,
     Identifier,
     Keyword,
-    // Operator, punctuation, and literal kinds are added by their own lexer
-    // sub-milestones (§17, §18); see tests/lexer.
+    // Operators and punctuation share a single Punctuator kind; the specific
+    // symbol is carried in the token lexeme (`text`). Matches the keyword
+    // model — per-symbol enum is deferred until the parser needs faster
+    // dispatch. Literal kinds arrive with the literal slices (§18).
+    Punctuator,
     Unknown,
 };
 
