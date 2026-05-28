@@ -196,6 +196,14 @@ struct BinaryExpr : Expr {
     std::unique_ptr<Expr> right;
 };
 
+// §17.1 level 2 unary prefix. `+ - not ~` for slice 9; `await` (and any
+// future prefix operators) come with their own slice. Right-associative —
+// `--x` parses as `-(-x)`.
+struct UnaryExpr : Expr {
+    std::string_view op;
+    std::unique_ptr<Expr> operand;
+};
+
 // A.2: `SourceFile ::= ModuleDecl Import* TopDecl*`  (§2.1 / §2.4)
 //
 // `module` is required by the spec on every source file's first non-comment,

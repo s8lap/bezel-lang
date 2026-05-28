@@ -206,6 +206,17 @@ inline std::string exprToString(const ast::Expr& e) {
         out += ')';
         return out;
     }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        // Keyword-spelled unary operators (`not`) need a space; the
+        // punctuator-spelled ones (`+ - ~`) don't.
+        const bool needsSpace = (u->op == "not");
+        std::string out = "(";
+        out += std::string(u->op);
+        if (needsSpace) out += ' ';
+        out += u->operand ? exprToString(*u->operand) : std::string("<null>");
+        out += ')';
+        return out;
+    }
     return "<unknown expr>";
 }
 

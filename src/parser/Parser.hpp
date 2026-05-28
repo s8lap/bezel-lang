@@ -68,8 +68,10 @@ private:
     std::unique_ptr<ast::Member> parseMember();
     // Slice 7: primary expressions plus postfix `.member` and `(args)`.
     // Slice 8: precedence-climbing binary expressions wrap primary+postfix.
+    // Slice 9: unary prefix sits between binary and postfix.
     std::unique_ptr<ast::Expr> parseExpression();
     std::unique_ptr<ast::Expr> parseBinaryExpression(int minPrecedence);
+    std::unique_ptr<ast::Expr> parseUnaryExpression();
     std::unique_ptr<ast::Expr> parsePrimaryExpression();
     std::unique_ptr<ast::Expr> parsePostfix(std::unique_ptr<ast::Expr> head);
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
