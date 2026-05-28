@@ -489,6 +489,22 @@ inline std::string exprToString(const ast::Expr& e) {
         out += ')';
         return out;
     }
+    if (dynamic_cast<const ast::UnitExpr*>(&e)) return "()";
+    if (auto* w = dynamic_cast<const ast::WithExpr*>(&e)) {
+        std::string out = w->source ? exprToString(*w->source)
+                                    : std::string("<null>");
+        out += " with ";
+        for (std::size_t i = 0; i < w->assigns.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += std::string(w->assigns[i].name);
+            out += " := ";
+            out += w->assigns[i].value
+                       ? exprToString(*w->assigns[i].value)
+                       : std::string("<null>");
+        }
+        out += " end";
+        return out;
+    }
     if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
         std::string out = "default(";
         out += de->type ? typeToString(*de->type) : std::string("<null>");

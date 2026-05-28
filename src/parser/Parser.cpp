@@ -1723,6 +1723,11 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
     }
 
     if (consumePunctuator("(")) {
+        // §A.7 unit value `()` — empty parens at PrimaryAtom level.
+        if (consumePunctuator(")")) {
+            return std::unique_ptr<ast::Expr>(
+                std::make_unique<ast::UnitExpr>().release());
+        }
         // No ParenExpr node: source-level parens only group the parse; the
         // resulting tree shape encodes the grouping directly. See Node.hpp.
         auto inner = parseExpression();
@@ -2132,6 +2137,43 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             auto bang = std::make_unique<ast::PostfixBangExpr>();
             bang->operand = std::move(head);
             head = std::unique_ptr<ast::Expr>(bang.release());
+        } else if (!disableWithSuffix_ && consumeKeyword("with")) {
+            // §A.7 `with` PrimarySuffix:
+            //   "with" InitAssign ("," InitAssign)* ","? "end"
+            //   InitAssign ::= Identifier ":=" Expression
+            // Source-type determines the semantic (record copy-with-overrides
+            // vs object initializer on `new C(...)`); sema disambiguates.
+            auto w = std::make_unique<ast::WithExpr>();
+            w->source = std::move(head);
+            auto parseInitAssign = [&]() -> ast::WithExpr::InitAssign {
+                ast::WithExpr::InitAssign ia;
+                if (current_.kind != TokenKind::Identifier) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected identifier in `with` init-assignment");
+                } else {
+                    ia.name = current_.text;
+                    advance();
+                }
+                if (!consumePunctuator(":=")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected ':=' in `with` init-assignment");
+                }
+                ia.value = parseExpression();
+                return ia;
+            };
+            w->assigns.push_back(parseInitAssign());
+            while (consumePunctuator(",")) {
+                if (isKeyword("end")) break; // trailing `,?`
+                w->assigns.push_back(parseInitAssign());
+            }
+            if (!consumeKeyword("end")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'end' to close `with` initializer block");
+            }
+            head = std::unique_ptr<ast::Expr>(w.release());
         } else {
             break;
         }
@@ -2495,7 +2537,13 @@ std::unique_ptr<ast::Stmt> Parser::parseStatement() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'in' in for statement");
         }
+        // Disable the postfix `with` suffix here so the for-stmt sees its
+        // own `with EXPR` cancellation-token clause rather than letting the
+        // expression parser consume it as a WithExpr (slice 50).
+        const bool prevDisable = disableWithSuffix_;
+        disableWithSuffix_ = true;
         stmt->iterable = parseExpression();
+        disableWithSuffix_ = prevDisable;
         // Optional `with EXPR` cancellation-token clause — async form only
         // (§30.7). Sema rejects it on the sync form.
         if (consumeKeyword("with")) {

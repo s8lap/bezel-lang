@@ -679,6 +679,25 @@ struct NameOfExpr : Expr { std::unique_ptr<QualifiedName> name; };
 // A.7 `DefaultExpr ::= "default" "(" Type ")"`.
 struct DefaultExpr : Expr { std::unique_ptr<Type> type; };
 
+// A.7 unit value `()`. A no-fields expression of the unit type. The
+// PrimaryAtom-level `"(" ")"` alternative in the grammar — distinct from
+// the unit-type form (slice 46) which is `()` in a type context.
+struct UnitExpr : Expr {};
+
+// A.7 `with` PrimarySuffix: `EXPR "with" InitAssign ("," InitAssign)* ","?
+// "end"` where `InitAssign ::= Identifier ":=" Expression`. Source-type
+// determines the semantic: record copy-with-overrides or object initializer
+// block on a freshly-constructed class (§22.11). The parser stores both
+// shapes in the same node — sema dispatches by the source's type.
+struct WithExpr : Expr {
+    struct InitAssign {
+        std::string_view name;
+        std::unique_ptr<Expr> value;
+    };
+    std::unique_ptr<Expr> source;
+    std::vector<InitAssign> assigns;
+};
+
 // A.7 `CollectionLiteral`:
 //   "[" (Expression ("," Expression)*)? "]"        sequence
 //   "[" DictEntry ("," DictEntry)* "]"             dictionary
