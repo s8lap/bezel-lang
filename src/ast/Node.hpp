@@ -304,7 +304,14 @@ struct ConstraintItem {
 };
 struct GenericConstraint {
     std::string_view typeParam; // T in `where T: ...`
+    // A.3 GenericConstraints has two forms:
+    //   `where T : Constraint, Constraint*`     (the regular form)
+    //   `where T is ModifierConstraint`         (slice 54; §14.4)
+    // The regular form populates `items`; the modifier-constraint form
+    // populates `modifierConstraint` ("owned" or "not owned") and leaves
+    // `items` empty.
     std::vector<ConstraintItem> items;
+    std::string_view modifierConstraint;  // "" / "owned" / "not owned"
 };
 
 // A.4: `MethodDecl ::= Visibility "static"? "async"? VirtualKind?
