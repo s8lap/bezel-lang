@@ -2201,9 +2201,11 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
         } else if (consumePunctuator("[")) {
             auto idx = std::make_unique<ast::IndexExpr>();
             idx->target = std::move(head);
-            idx->indices.push_back(parseExpression());
-            while (consumePunctuator(",")) {
-                idx->indices.push_back(parseExpression());
+            // §A.7 PrimarySuffix `[ ArgList ]` — share the call-arg grammar
+            // (slice 55). parseArgList stops on `)`; here we drive it until
+            // `]` instead by inlining the empty-check.
+            if (!isPunctuator("]")) {
+                idx->indices = parseArgList();
             }
             if (!consumePunctuator("]")) {
                 diagnostics_.report(Severity::Error, current_.location,

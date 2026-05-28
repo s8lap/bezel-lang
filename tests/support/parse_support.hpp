@@ -470,8 +470,7 @@ inline std::string exprToString(const ast::Expr& e) {
         out += '[';
         for (std::size_t i = 0; i < idx->indices.size(); ++i) {
             if (i > 0) out += ", ";
-            out += idx->indices[i] ? exprToString(*idx->indices[i])
-                                   : std::string("<null>");
+            out += renderArg(idx->indices[i]);
         }
         out += ']';
         return out;
