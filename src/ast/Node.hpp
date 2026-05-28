@@ -424,6 +424,13 @@ struct TypeDecl : TopDecl {
     std::string_view endLabel; // empty when the `end` had no label
 };
 
+// A.4 `NestedTypeDecl ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl`.
+// Wraps an inner TypeDecl declared as a Member of an enclosing class or
+// record (slice 40).
+struct NestedTypeMember : Member {
+    std::unique_ptr<TypeDecl> decl;
+};
+
 // Slice 4: named type reference. The grammar (A.5) has more alternatives —
 // inline arrays, function types, and the unit type `()` — but this slice
 // covers only `QualifiedName GenericArgs?` with the optional `?` nullable

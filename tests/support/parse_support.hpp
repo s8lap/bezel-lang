@@ -884,6 +884,11 @@ inline std::string memberSummary(const ast::Member& m) {
         }
         return out;
     }
+    if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
+        std::string out = "nested ";
+        out += nt->decl ? topDeclSummary(*nt->decl) : std::string("<null>");
+        return out;
+    }
     return "<unknown member>";
 }
 
