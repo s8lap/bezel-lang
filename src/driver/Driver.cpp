@@ -43,7 +43,7 @@ CompileResult Driver::compileFile(const std::string& path) {
     // the order in which the milestones will fill them in.
     Lexer lexer(source, diagnostics);
     Parser parser(lexer, diagnostics);
-    std::unique_ptr<ast::Node> unit = parser.parseCompilationUnit();
+    auto unit = parser.parseCompilationUnit();
 
     if (unit) {
         TypeChecker typeChecker(diagnostics);
