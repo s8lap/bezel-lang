@@ -22,6 +22,9 @@
 
 namespace bezel::sema {
 
+struct TypeRef;  // see TypeRef.hpp; forward-declared so LocalSymbol can
+                 // point at one without dragging the full header in.
+
 // Per-symbol scope identifier. Assigned by the symbol-collection pass in
 // scope-DFS order so a larger ScopeId is always nested inside a smaller
 // one's lifetime. The 0 value is reserved for "no scope" (used for
@@ -134,6 +137,12 @@ struct LocalSymbol : Symbol {
     bool isUsing = false;
     bool isAwaitUsing = false;
     bool isConst = false;
+    // Slice 3g: resolved type for the local. Set either from an
+    // explicit `: Type` ascription (via TypeResolution) or inferred
+    // from the initializer's exprType. Null when neither is available
+    // (e.g. plain `var x;` with no later assignment yet — caught by
+    // DefiniteAssignment when that pass lands).
+    TypeRef* declType = nullptr;
 };
 
 // A.4 Param — slice 1 collects method/ctor/property-setter params since
