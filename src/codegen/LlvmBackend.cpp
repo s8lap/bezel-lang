@@ -74,6 +74,9 @@ public:
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }
+        for (auto& [sym, fn] : ctorFns_) {
+            emitConstructorBody(sym, fn);
+        }
         return std::move(module_);
     }
 
@@ -96,6 +99,8 @@ private:
     std::unordered_map<const sema::Symbol*, llvm::AllocaInst*> paramSlots_;
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
+    // CG10: emitted LLVM function for each (non-static) constructor symbol.
+    std::unordered_map<sema::ConstructorSymbol*, llvm::Function*> ctorFns_;
 
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
@@ -223,6 +228,26 @@ private:
                 module_.get());
             methodFns_[ms] = fn;
         }
+
+        // CG10: declare each instance constructor — `void(this, params...)`.
+        for (const auto& sym : ctx_.symbols()) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym.get());
+            if (!cs || cs->isStatic) continue;
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (!cd) continue;
+            std::vector<llvm::Type*> paramTys;
+            paramTys.push_back(ptrTy());  // this
+            for (const auto& p : cd->params) {
+                paramTys.push_back(lowerType(p.type.get()));
+            }
+            auto* fnType = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), paramTys, /*isVarArg=*/false);
+            std::string cls = cs->parent ? std::string(cs->parent->name) : "";
+            auto* fn = llvm::Function::Create(
+                fnType, llvm::Function::ExternalLinkage, "bz$" + cls + "$ctor",
+                module_.get());
+            ctorFns_[cs] = fn;
+        }
     }
 
     // Pass 2: emit a function's body.
@@ -235,7 +260,8 @@ private:
         paramSlots_.clear();
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
-        bindParameters(md, fn, /*hasThis=*/!isStaticMethod(ms));
+        const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
+        bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), paramSyms);
 
         bool terminated = false;
         if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody) {
@@ -247,13 +273,28 @@ private:
         if (!terminated) emitImplicitReturn(fn);
     }
 
-    // Bind each parameter to an entry-block alloca. For an instance
-    // method the first arg is `this` (kept as a value in currentThis_,
-    // not a slot — it isn't reassignable). Remaining args map to the
-    // ParameterSymbols.
-    void bindParameters(const ast::MethodDecl* md, llvm::Function* fn,
-                        bool hasThis) {
-        const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
+    // CG10: emit a constructor body. Always an instance function (leading
+    // `this`); its params bind to the ConstructorSymbol's ParameterSymbols.
+    // Field initializers run in `lowerNew` before the call, so the body
+    // only runs the explicit statements. Returns void.
+    void emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* fn) {
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) return;
+        currentFn_ = fn;
+        currentThis_ = nullptr;
+        locals_.clear();
+        paramSlots_.clear();
+        builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+        bindParameters(fn, /*hasThis=*/true, &cs->params);
+        bool terminated = lowerBody(cd->body);
+        if (!terminated) builder_.CreateRetVoid();
+    }
+
+    // Bind each parameter to an entry-block alloca. When `hasThis`, the
+    // first arg is `this` (kept as a value in currentThis_, not a slot —
+    // it isn't reassignable). Remaining args map to `paramSyms`.
+    void bindParameters(llvm::Function* fn, bool hasThis,
+                        const std::vector<sema::Symbol*>* paramSyms) {
         std::size_t paramIdx = 0;
         bool first = true;
         for (auto& arg : fn->args()) {
@@ -633,7 +674,43 @@ private:
             builder_.CreateStore(
                 v, builder_.CreateStructGEP(st, obj, idxIt->second));
         }
+
+        // CG10: run the explicit constructor (if any) after the field
+        // initializers, passing the new instance as `this` plus the
+        // lowered positional arguments. (Constructor overloads and
+        // chained `base(...)`/`this(...)` calls are later slices — sema
+        // defers the overloaded case too, so at most one ctor reaches us.)
+        if (sema::ConstructorSymbol* cs = soleConstructor(t)) {
+            auto it = ctorFns_.find(cs);
+            if (it != ctorFns_.end()) {
+                std::vector<llvm::Value*> args;
+                args.push_back(obj);
+                for (const auto& a : ne.args) {
+                    if (!a.value) return obj;
+                    llvm::Value* v = lowerExpr(*a.value);
+                    if (!v) return obj;
+                    args.push_back(v);
+                }
+                if (args.size() == it->second->arg_size()) {
+                    builder_.CreateCall(it->second, args);
+                }
+            }
+        }
         return obj;
+    }
+
+    // CG10: the type's single non-static constructor, or null if it has
+    // none (implicit default) or more than one (overloaded — deferred).
+    sema::ConstructorSymbol* soleConstructor(const sema::TypeSymbol* t) {
+        sema::ConstructorSymbol* found = nullptr;
+        for (sema::Symbol* m : t->members) {
+            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
+                if (cs->isStatic) continue;
+                if (found) return nullptr;  // overloaded — defer
+                found = cs;
+            }
+        }
+        return found;
     }
 
     // CG8: address of a field access `obj.f`. Returns the GEP pointer and

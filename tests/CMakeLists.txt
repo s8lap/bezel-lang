@@ -135,6 +135,7 @@ set(BEZEL_TEST_SOURCES
     codegen/native_exe_test.cpp
     codegen/instances_test.cpp
     codegen/instance_methods_test.cpp
+    codegen/constructors_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
