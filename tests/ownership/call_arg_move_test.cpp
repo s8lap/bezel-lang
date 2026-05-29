@@ -78,7 +78,7 @@ BEZEL_TEST(own_call_arg, read_after_move_arg_diagnoses) {
 BEZEL_TEST(own_call_arg, owned_arg_in_initializer_consumes) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
-        "  public method Pass(owned x: T): owned T _ := move x; end Pass; "
+        "  public method Pass(owned x: T): owned T => move x; "
         "  public method M() "
         "    var x := new T(); "
         "    using var y := this.Pass(owned x); "

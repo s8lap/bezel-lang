@@ -60,7 +60,7 @@ BEZEL_TEST(sema_named, transitive_subtype_ok) {
 BEZEL_TEST(sema_named, implemented_interface_ok) {
     auto r = parseSemaAll(
         "module M; interface IShape method Area(): int; end IShape; "
-        "class Sq : IShape public method Area(): int _ := 1; end Area; end Sq; "
+        "class Sq : IShape public method Area(): int => 1; end Sq; "
         "class C public method M() var s: IShape := new Sq(); end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

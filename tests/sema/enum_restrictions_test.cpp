@@ -28,7 +28,7 @@ BEZEL_TEST(sema_enum, plain_enum_ok) {
 BEZEL_TEST(sema_enum, enum_static_method_ok) {
     auto r = parseSemaAll(
         "module M; enum E A, B; "
-        "  public static method Count(): int _ := 2; end Count; "
+        "  public static method Count(): int => 2; "
         "end E;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -62,7 +62,7 @@ BEZEL_TEST(sema_enum, virtual_method_diagnoses) {
 BEZEL_TEST(sema_enum, instance_method_ok) {
     auto r = parseSemaAll(
         "module M; enum E A, B; "
-        "  public method Describe(): int _ := 1; end Describe; "
+        "  public method Describe(): int => 1; "
         "end E;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

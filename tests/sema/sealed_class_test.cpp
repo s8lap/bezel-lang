@@ -47,7 +47,7 @@ BEZEL_TEST(sema_sealed, sealed_class_can_implement_interface) {
         "module M; "
         "interface IDoer method Do(): int; end IDoer; "
         "sealed class C : IDoer "
-        "  public method Do(): int _ := 1; end Do; "
+        "  public method Do(): int => 1; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

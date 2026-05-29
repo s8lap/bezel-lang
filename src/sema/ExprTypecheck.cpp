@@ -96,6 +96,83 @@ private:
             std::string(id.name) + "` (§22.8)");
     }
 
+    // Slice DR1 (§21.7): does control definitely leave this statement
+    // list abruptly (return / throw / non-terminating loop) before
+    // reaching its end? Conservatively returns true only when certain,
+    // so a value-method check that flags `!bodyAlwaysExits` never
+    // false-positives on a body that does always exit (modulo the
+    // noreturn-call case, which mainstream compilers also flag).
+    bool bodyAlwaysExits(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        for (const auto& s : body) {
+            if (s && stmtAlwaysExits(*s)) return true;
+        }
+        return false;
+    }
+
+    bool stmtAlwaysExits(const ast::Stmt& s) {
+        if (dynamic_cast<const ast::ReturnStmt*>(&s)) return true;
+        if (dynamic_cast<const ast::ThrowStmt*>(&s)) return true;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+            if (!ifs->hasElse) return false;  // false edge falls through
+            if (!bodyAlwaysExits(ifs->ifBranch.body)) return false;
+            for (const auto& el : ifs->elifBranches) {
+                if (!bodyAlwaysExits(el.body)) return false;
+            }
+            return bodyAlwaysExits(ifs->elseBody);
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+            // `while true do … end` without a reachable break never
+            // completes normally. We conservatively treat a literal-true
+            // condition as non-terminating (a break would let it fall
+            // through, which would only make us UNDER-report — never a
+            // false positive).
+            auto* lit =
+                dynamic_cast<const ast::BoolLiteralExpr*>(ws->condition.get());
+            return lit && lit->value;
+        }
+        if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+            return bodyAlwaysExits(dob->body);
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+            // §19.6: a non-exhaustive case STATEMENT falls through on no
+            // match. We can only be sure it exits when there is an
+            // unguarded `_` arm (full cover) AND every arm body exits.
+            bool hasWildcard = false;
+            for (const auto& arm : cs->arms) {
+                if (!armBodyAlwaysExits(arm)) return false;
+                if (!arm.guard &&
+                    dynamic_cast<const ast::DiscardPattern*>(
+                        arm.pattern.get())) {
+                    hasWildcard = true;
+                }
+            }
+            return hasWildcard;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+            // A finally that always exits dominates. Otherwise the try
+            // body and every catch arm must always exit.
+            if (ts->hasFinally && bodyAlwaysExits(ts->finallyBody)) {
+                return true;
+            }
+            if (!bodyAlwaysExits(ts->body)) return false;
+            for (const auto& arm : ts->catches) {
+                if (!arm.body || !stmtAlwaysExits(*arm.body)) return false;
+            }
+            return true;
+        }
+        return false;  // loops that may not run, plain stmts, etc.
+    }
+
+    bool armBodyAlwaysExits(const ast::CaseArm& arm) {
+        if (arm.bodyKind == ast::CaseArmBodyKind::Block) {
+            return bodyAlwaysExits(arm.stmts);
+        }
+        // Expression-bodied arm in statement position discards its value
+        // and falls through; treat as non-exiting.
+        return false;
+    }
+
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
     // resolves to the unit type → no. Anything else → yes.
@@ -434,6 +511,17 @@ private:
             currentReturnType_ = md->returnType
                 ? ctx_.resolvedType(*md->returnType) : nullptr;
             runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));
+            // Slice DR1 (§21.7): a value-returning method with a block
+            // body must return (or otherwise abruptly exit) on every
+            // path. Abstract / expression bodies are exempt.
+            if (stmts && returnCtx_ == ReturnCtx::ValueMethod &&
+                !bodyAlwaysExits(*stmts)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, md->span.begin,
+                    std::string("method `") + std::string(md->name) +
+                    "` has a return type but does not return a value on "
+                    "every path (§21.7)");
+            }
             currentReturnType_ = saveRetTy;
             returnCtx_ = saveRet;
             inStaticMember_ = save;

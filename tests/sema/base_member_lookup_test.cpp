@@ -83,7 +83,7 @@ BEZEL_TEST(sema_base, derived_inherits_base_field) {
 BEZEL_TEST(sema_base, derived_inherits_base_method) {
     auto r = parseSemaAll(
         "module M; "
-        "class Base public method Helper(): int _ := 1; end Helper; end Base; "
+        "class Base public method Helper(): int => 1; end Base; "
         "class Derived : Base "
         "  public method M() _ := this.Helper; end M; "
         "end Derived;");
@@ -138,7 +138,7 @@ BEZEL_TEST(sema_base, interface_member_resolves) {
         "module M; "
         "interface IDoer public method Do(): int; end IDoer; "
         "class C : IDoer "
-        "  public method Do(): int _ := 1; end Do; "
+        "  public method Do(): int => 1; "
         "  public method M() _ := this.Do; end M; "
         "end C;");
     auto* ma = findMemberAccess(r, "M");
