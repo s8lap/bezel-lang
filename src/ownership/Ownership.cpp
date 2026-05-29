@@ -287,7 +287,16 @@ private:
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args) {
-                if (a.value) recordMovesIn(*a.value);
+                if (!a.value) continue;
+                // Slice O14: `owned x` argument modifier consumes x.
+                if (a.modifier == "owned") {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            a.value.get())) {
+                        markMovedByName(id->name, id->span.begin);
+                        continue;
+                    }
+                }
+                recordMovesIn(*a.value);
             }
             return;
         }
@@ -302,10 +311,48 @@ private:
     // (the §28.3 "read of moved-from / disposed" rules).
     void handleDischarge(const ast::Expr& e) {
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-            // Walk arguments first — they're reads.
             if (call->callee) checkRead(*call->callee, /*selfTarget=*/true);
+            // Slice O14: argument-mode handling. Each argument's role
+            // determines whether the local it names is consumed or
+            // merely read:
+            //   * `owned x` (modifier on the argument) — caller transfers
+            //     ownership; x becomes MovedFrom.
+            //   * `move x` (UnaryExpr op=move on a bare identifier in
+            //     argument position) — same as above; x is consumed.
+            //   * everything else — ordinary read; checkRead applies.
             for (const auto& a : call->args) {
-                if (a.value) checkRead(*a.value, /*selfTarget=*/false);
+                if (!a.value) continue;
+                bool consumed = false;
+                if (a.modifier == "owned") {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            a.value.get())) {
+                        markMovedByName(id->name, id->span.begin);
+                        consumed = true;
+                    }
+                } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                               a.value.get())) {
+                    if (un->op == "move") {
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                un->operand.get())) {
+                            markMovedByName(id->name, id->span.begin);
+                            consumed = true;
+                        } else if (auto* ma =
+                                       dynamic_cast<const ast::MemberAccessExpr*>(
+                                           un->operand.get())) {
+                            // `M(move this.field)` — field-move at call site.
+                            if (auto* tid =
+                                    dynamic_cast<const ast::IdentifierExpr*>(
+                                        ma->target.get())) {
+                                if (tid->name == "this") {
+                                    fieldMovedFrom_[ma->member] = true;
+                                    fieldMoveLoc_[ma->member] = un->span.begin;
+                                    consumed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!consumed) checkRead(*a.value, /*selfTarget=*/false);
             }
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                     call->callee.get())) {
