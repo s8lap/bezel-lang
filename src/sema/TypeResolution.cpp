@@ -91,6 +91,21 @@ public:
             n == "Subscription" || n == "CancellationToken") {
             return 0;
         }
+        // Slice S25 (§31.4): language-built-in exception types, all
+        // nullary, available without import.
+        if (n == "Exception" || n == "ArgumentException" ||
+            n == "ArgumentNullException" || n == "ArithmeticException" ||
+            n == "OverflowException" || n == "DivideByZeroException" ||
+            n == "InvalidOperationException" ||
+            n == "NotImplementedException" ||
+            n == "NullReferenceException" ||
+            n == "IndexOutOfRangeException" ||
+            n == "MatchFailureException" ||
+            n == "OperationCanceledException" ||
+            n == "TypeInitializationException" ||
+            n == "FormatException" || n == "StackOverflowException") {
+            return 0;
+        }
         if (n == "Task") return kBuiltinTaskLike;
         if (n == "Array" || n == "OwnedArray" || n == "OwnedTask" ||
             n == "IEnumerable" || n == "IEnumerator" ||
