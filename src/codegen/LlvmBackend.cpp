@@ -1470,20 +1470,36 @@ private:
     // arm body. If no arm matches, the exception stays pending and
     // re-propagates to the enclosing unwind target.
     bool lowerTry(const ast::TryStmt& trys) {
+        bool hasFin = trys.hasFinally;
+        // CG21b: a `finally` runs on every exit from the try. The normal
+        // exits (body / arm fall-through) flow through finNormalBB; the
+        // exception exits (no arm matched, or an arm threw) flow through
+        // finUnwindBB, which re-propagates to the enclosing unwind target.
+        // (Deferred: a return/break/continue inside the try or a catch arm
+        // does not yet route through finally.)
+        llvm::BasicBlock* outerUnwind =
+            hasFin ? (unwindTarget_ ? unwindTarget_ : propagateBB()) : nullptr;
         auto* dispatchBB =
             llvm::BasicBlock::Create(llvm_, "catch.dispatch", currentFn_);
         auto* afterBB = llvm::BasicBlock::Create(llvm_, "try.after", currentFn_);
+        llvm::BasicBlock* finNormalBB =
+            hasFin ? llvm::BasicBlock::Create(llvm_, "finally", currentFn_)
+                   : nullptr;
+        llvm::BasicBlock* finUnwindBB =
+            hasFin ? llvm::BasicBlock::Create(llvm_, "finally.unwind",
+                                              currentFn_)
+                   : nullptr;
+        // Where a normal exit (body/arm fall-through) goes.
+        llvm::BasicBlock* normalExit = hasFin ? finNormalBB : afterBB;
 
         llvm::BasicBlock* savedUnwind = unwindTarget_;
         std::size_t savedDepth = unwindScopeDepth_;
         unwindTarget_ = dispatchBB;
-        // Unwinding into this try's catch disposes the try body's (and any
-        // nested) using-vars; the body scope is pushed at this depth.
         unwindScopeDepth_ = disposeStack_.size();
         bool bodyTerm = lowerScopedBlock(trys.body);
         unwindTarget_ = savedUnwind;
         unwindScopeDepth_ = savedDepth;
-        if (!bodyTerm) builder_.CreateBr(afterBB);
+        if (!bodyTerm) builder_.CreateBr(normalExit);
 
         // Catch dispatch: test arms in order against the in-flight exception.
         builder_.SetInsertPoint(dispatchBB);
@@ -1493,35 +1509,47 @@ private:
                                                    currentFn_);
             auto* nextBB = llvm::BasicBlock::Create(llvm_, "catch.next",
                                                     currentFn_);
-            // Arm matches if exc is-a any of the arm's types.
             llvm::Value* matched = builder_.getInt1(false);
             for (const auto& ty : arm.types) {
                 if (!ty) continue;
                 sema::TypeRef* rt = ctx_.resolvedType(*ty);
                 llvm::GlobalVariable* desc =
                     descriptorForTypeName(rt, ty.get());
-                if (!desc) continue;  // unknown type — can't match
+                if (!desc) continue;
                 matched = builder_.CreateOr(matched, emitIsA(exc, desc));
             }
             builder_.CreateCondBr(matched, armBB, nextBB);
 
             builder_.SetInsertPoint(armBB);
-            // Consume the exception (it is now handled). Keep its value so
-            // a bare `throw;` in the arm can re-raise it.
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), excGlobal());
             llvm::Value* savedCaught = currentCaughtExc_;
             currentCaughtExc_ = exc;
+            // An exception thrown by the arm body must still run finally.
+            if (hasFin) { unwindTarget_ = finUnwindBB; unwindScopeDepth_ =
+                              disposeStack_.size(); }
             bool armTerm = false;
             if (arm.body) armTerm = lowerStmt(*arm.body);
+            if (hasFin) { unwindTarget_ = savedUnwind;
+                          unwindScopeDepth_ = savedDepth; }
             currentCaughtExc_ = savedCaught;
-            if (!armTerm) builder_.CreateBr(afterBB);
+            if (!armTerm) builder_.CreateBr(normalExit);
 
             builder_.SetInsertPoint(nextBB);
         }
-        // No arm matched → the exception is still pending; re-propagate to
-        // the enclosing unwind target (outer try or function propagate).
-        builder_.CreateBr(unwindBB());
+        // No arm matched → exception still pending; run finally (if any)
+        // then re-propagate to the enclosing unwind target.
+        builder_.CreateBr(hasFin ? finUnwindBB : unwindBB());
+
+        if (hasFin) {
+            // Normal-exit finally → afterBB.
+            builder_.SetInsertPoint(finNormalBB);
+            if (!lowerScopedBlock(trys.finallyBody)) builder_.CreateBr(afterBB);
+            // Exception-exit finally → re-propagate (exc still set).
+            builder_.SetInsertPoint(finUnwindBB);
+            if (!lowerScopedBlock(trys.finallyBody))
+                builder_.CreateBr(outerUnwind);
+        }
 
         builder_.SetInsertPoint(afterBB);
         return false;
