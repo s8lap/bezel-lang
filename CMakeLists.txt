@@ -21,7 +21,9 @@ endif()
 project(bezel
     VERSION 0.0.0
     DESCRIPTION "The Bezel programming language compiler"
-    LANGUAGES CXX)
+    # C is enabled (alongside CXX) because LLVM's package config runs C
+    # feature checks (FindFFI / FindLibEdit) during find_package(LLVM).
+    LANGUAGES C CXX)
 
 # C++20 per CLAUDE.md's "Build toolchain" section.
 set(CMAKE_CXX_STANDARD 20)
@@ -43,6 +45,25 @@ if(BEZEL_WERROR)
     target_compile_options(bezel_warnings INTERFACE -Werror)
 endif()
 
+# --- LLVM (codegen backend) -------------------------------------------------
+# Decision #147: the back-end targets LLVM IR via the C++ API. LLVMConfig.cmake
+# lives under a versioned prefix on Fedora (/usr/lib64/llvmNN/...), so we ask
+# llvm-config where it is rather than hardcoding a path; an explicit
+# -DLLVM_DIR=... override still wins.
+execute_process(COMMAND llvm-config --cmakedir
+    OUTPUT_VARIABLE BEZEL_LLVM_CMAKEDIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+find_package(LLVM REQUIRED CONFIG HINTS "${BEZEL_LLVM_CMAKEDIR}")
+message(STATUS "Bezel: using LLVM ${LLVM_PACKAGE_VERSION} (cmake dir ${LLVM_DIR})")
+# Components needed: IR construction (core), the ORC JIT used by codegen tests,
+# and the native target (with its codegen/asm-printer) for JIT execution and
+# eventual object emission.
+llvm_map_components_to_libnames(BEZEL_LLVM_LIBS core orcjit native)
+# LLVM_DEFINITIONS is a space-separated flag string (e.g. -D_GNU_SOURCE …);
+# pass it as options, not as compile-definitions (which would re-prefix -D).
+separate_arguments(BEZEL_LLVM_DEFS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
+
 # --- Core library: every compilation phase ---------------------------------
 # One static library aggregates all phases. Phase boundaries are expressed as
 # directories (and namespaces), not separate packages; see CLAUDE.md and the
@@ -61,9 +82,14 @@ add_library(bezel_core STATIC
     src/ownership/OwnershipChecker.cpp
     src/ownership/Ownership.cpp
     src/codegen/CodeGen.cpp
+    src/codegen/LlvmBackend.cpp
     src/driver/Driver.cpp)
 target_include_directories(bezel_core PUBLIC src)
+# LLVM headers as SYSTEM so their warnings don't trip our -Wall/-Werror.
+target_include_directories(bezel_core SYSTEM PUBLIC ${LLVM_INCLUDE_DIRS})
+target_compile_options(bezel_core PUBLIC ${BEZEL_LLVM_DEFS})
 target_link_libraries(bezel_core PRIVATE bezel_warnings)
+target_link_libraries(bezel_core PUBLIC ${BEZEL_LLVM_LIBS})
 
 # --- Compiler driver executable --------------------------------------------
 add_executable(bezelc src/main.cpp)

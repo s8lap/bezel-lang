@@ -1,0 +1,26 @@
+// Codegen slice CG0 — toolchain smoke test. Proves the LLVM wiring: the
+// front-end runs, LlvmBackend emits a module, and the ORC JIT executes its
+// `main`. CG0's emitter always returns 0, so any well-formed program's `main`
+// exits 0 for now; real lowering arrives in CG1+.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+BEZEL_TEST(codegen_cg0, empty_main_runs_and_returns_zero) {
+    auto r = runJit(
+        "module M; class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+BEZEL_TEST(codegen_cg0, jit_runs_for_a_trivial_class) {
+    // The CG0 emitter ignores the body, so this also exits 0 — the point is
+    // that lowering + JIT execute end to end without error.
+    auto r = runJit(
+        "module M; class C public static method Main(): int => 7; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
