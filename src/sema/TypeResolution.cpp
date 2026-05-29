@@ -80,6 +80,47 @@ public:
         checkRecordRestrictions();
         // Slice S28: accessor visibility (§13.6).
         checkAccessorVisibility();
+        // Slice S30: const member type must be primitive or string.
+        checkConstTypes();
+    }
+
+    // Slice S30 (§22.12): a `const` declaration requires a primitive
+    // value type or `string`. Object, named types, arrays, functions,
+    // and unit are rejected. Only the explicit-ascription case is
+    // checked here; type-inferred consts (and the compile-time-constant
+    // requirement on the value) are deferred.
+    void checkConstTypes() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeConsts(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeConsts(nt->type);
+                }
+            }
+        }
+    }
+
+    void checkTypeConsts(TypeSymbol* t) {
+        for (Symbol* m : t->members) {
+            auto* cs = dynamic_cast<ConstMemberSymbol*>(m);
+            if (!cs) continue;
+            auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
+            if (!cd || !cd->type) continue;  // inferred — deferred
+            TypeRef* rt = ctx_.resolvedType(*cd->type);
+            if (!rt) continue;
+            bool ok = rt->kind == TypeRef::Kind::Primitive &&
+                      rt->primitive != PrimitiveType::Object;
+            if (!ok) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("const `") + std::string(cs->name) +
+                    "` must have a primitive value type or `string` "
+                    "(§22.12)");
+            }
+        }
     }
 
     // Slice S28 (§13.6): a property/indexer accessor's explicit
