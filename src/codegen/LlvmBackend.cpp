@@ -506,24 +506,21 @@ private:
         }
     }
 
-    // §28.5: dispose the class's owned class-typed fields in reverse
-    // declaration order, null-checking each (a null slot has nothing to
-    // dispose). Interface-typed owned fields need runtime dispatch
-    // (vtables) and owning-inline-array fields need per-slot disposal —
-    // both deferred; such fields are skipped here.
+    // CG18 (§28.5): dispose the class's owned reference fields (class- OR
+    // interface-typed) in reverse declaration order, null-checking each.
+    // Disposal is DYNAMIC — dispatched through the field object's own
+    // vtable slot 0 — so an owned field that holds a subclass (or, for an
+    // interface-typed field, whichever class implements it) runs the
+    // correct runtime Dispose (§28.4–28.5).
     void emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         std::vector<const sema::FieldSymbol*> owned;
         for (const sema::Symbol* m : ts->members) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-            if (!fs || !hasOwnedModifier(fs)) continue;
+            if (!fs || !isOwnedReferenceField(fs)) continue;
             if (fieldIndex_.find(fs) == fieldIndex_.end()) continue;
             owned.push_back(fs);
         }
         for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
-            const sema::TypeSymbol* fc = classOfField(*it);
-            if (!fc) continue;  // interface-typed / unresolved — deferred
-            auto fnIt = disposerFns_.find(fc);
-            if (fnIt == disposerFns_.end()) continue;
             llvm::StructType* st = classStruct(ts);
             unsigned idx = fieldIndex_[*it];
             llvm::Value* addr = builder_.CreateStructGEP(st, currentThis_, idx);
@@ -536,10 +533,21 @@ private:
                                                     currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
-            builder_.CreateCall(fnIt->second, {val});
+            emitDynamicDispose(val);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
         }
+    }
+
+    // CG18: call an object's Dispose dynamically — load its vtable pointer
+    // (instance slot 0), load vtable slot 0 (Dispose), and call it. The
+    // object must be non-null. Resolves to the runtime class's Dispose.
+    void emitDynamicDispose(llvm::Value* obj) {
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
+        llvm::Value* disposeFn = builder_.CreateLoad(ptrTy(), vptr);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                             {ptrTy()}, /*isVarArg=*/false);
+        builder_.CreateCall(fnTy, disposeFn, {obj});
     }
 
     // §28.4 step 3: chain to the base class's Dispose. baseTypes[0] is
@@ -561,16 +569,18 @@ private:
         return false;
     }
 
-    // The class type of a field, or null if its type isn't a class
-    // (interface-typed owned fields are deferred — see emitOwnedField…).
-    const sema::TypeSymbol* classOfField(const sema::FieldSymbol* fs) {
+    // CG18: an `owned` field whose type is a reference type (class or
+    // interface) — the kinds that carry a Dispose and can be disposed
+    // dynamically through the held object's vtable.
+    bool isOwnedReferenceField(const sema::FieldSymbol* fs) {
+        if (!hasOwnedModifier(fs)) return false;
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-        if (!fd || !fd->type) return nullptr;
+        if (!fd || !fd->type) return false;
         auto* rt = ctx_.resolvedType(*fd->type);
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
-            return nullptr;
-        if (rt->declaration->kind != ast::TypeDeclKind::Class) return nullptr;
-        return rt->declaration;
+            return false;
+        auto k = rt->declaration->kind;
+        return k == ast::TypeDeclKind::Class || k == ast::TypeDeclKind::Interface;
     }
 
     // Pass 2: emit a function's body.
@@ -843,10 +853,12 @@ private:
     // declaration order (§28.4 ordering).
     void emitDisposals(const std::vector<Disposal>& scope) {
         for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
-            auto fnIt = disposerFns_.find(it->cls);
-            if (fnIt == disposerFns_.end()) continue;
+            if (disposerFns_.find(it->cls) == disposerFns_.end()) continue;
+            // CG18: dispatch Dispose dynamically through the object's
+            // vtable, so a `using var` bound to a subclass instance runs
+            // the correct runtime Dispose.
             llvm::Value* obj = builder_.CreateLoad(ptrTy(), it->slot);
-            builder_.CreateCall(fnIt->second, {obj});
+            emitDynamicDispose(obj);
         }
     }
 
@@ -1300,9 +1312,6 @@ private:
         auto* ms = dynamic_cast<sema::MethodSymbol*>(
             ctx_.exprSymbol(*call.callee));
         if (!ms) return nullptr;
-        auto it = methodFns_.find(ms);
-        if (it == methodFns_.end()) return nullptr;
-        llvm::Function* callee = it->second;
 
         std::vector<llvm::Value*> args;
         bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
@@ -1328,23 +1337,46 @@ private:
             if (!v) return nullptr;
             args.push_back(v);
         }
-        if (args.size() != callee->arg_size()) return nullptr;
 
-        // CG17: virtual dispatch — load the receiver's vtable pointer
-        // (instance slot 0) and call through the method's slot. A
-        // `base.M()` call bypasses dispatch (calls the base impl directly,
-        // §12.3), as do non-virtual methods.
+        // CG17/CG18: virtual dispatch — load the receiver's vtable pointer
+        // (instance slot 0) and call through the method's slot. Works even
+        // when the statically-resolved method is `abstract` (no concrete
+        // function), since the slot is filled by the runtime override. A
+        // `base.M()` call bypasses dispatch (§12.3), as do non-virtual.
         auto slotIt = vtableSlot_.find(ms);
         if (!baseQualified && !isStaticMethod(ms) &&
             slotIt != vtableSlot_.end()) {
+            llvm::FunctionType* fnTy = methodFnType(ms);
+            if (!fnTy || args.size() != fnTy->getNumParams()) return nullptr;
             llvm::Value* recv = args[0];
             llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
             llvm::Value* slotPtr = builder_.CreateGEP(
                 ptrTy(), vptr, {builder_.getInt32(slotIt->second)});
             llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
-            return builder_.CreateCall(callee->getFunctionType(), fnPtr, args);
+            return builder_.CreateCall(fnTy, fnPtr, args);
         }
+
+        // Non-virtual (or base-qualified) → direct call to the function.
+        auto it = methodFns_.find(ms);
+        if (it == methodFns_.end()) return nullptr;
+        llvm::Function* callee = it->second;
+        if (args.size() != callee->arg_size()) return nullptr;
         return builder_.CreateCall(callee, args);
+    }
+
+    // CG18: the LLVM function type of an instance/static method — leading
+    // `this` for instance methods, then the declared parameters. Used for
+    // indirect (vtable) calls, including to abstract methods that have no
+    // concrete Function to read the type from.
+    llvm::FunctionType* methodFnType(const sema::MethodSymbol* ms) {
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md) return nullptr;
+        llvm::Type* retTy = lowerType(md->returnType.get());
+        std::vector<llvm::Type*> paramTys;
+        if (!isStaticMethod(const_cast<sema::MethodSymbol*>(ms)))
+            paramTys.push_back(ptrTy());
+        for (const auto& p : md->params) paramTys.push_back(lowerType(p.type.get()));
+        return llvm::FunctionType::get(retTy, paramTys, /*isVarArg=*/false);
     }
 
     // CG4: the conditional expression `thenValue if condition else
