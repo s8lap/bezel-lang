@@ -81,6 +81,44 @@ BEZEL_TEST(sema_ident, local_shadowing_takes_precedence) {
     }
 }
 
+// §12: an unqualified reference to an *inherited* member inside a
+// derived method resolves as an implicit-`this` reference — lookupName
+// must search base types, not just the enclosing type's own members.
+BEZEL_TEST(sema_ident, inherited_field_resolves_unqualified) {
+    using bezel::sema::FieldSymbol;
+    auto r = parseSema(
+        "module M; "
+        "class Derived : Base public method M() _ := _x; end M; end Derived; "
+        "class Base public _x: int := 1; end Base;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    const auto* ds = nthMethodStmt<bezel::ast::DiscardStmt>(r, 0);
+    BEZEL_EXPECT_TRUE(ds != nullptr);
+    if (ds && ds->value) {
+        Symbol* sym = r.ctx->exprSymbol(*ds->value);
+        BEZEL_EXPECT_TRUE(dynamic_cast<FieldSymbol*>(sym) != nullptr);
+    }
+}
+
+BEZEL_TEST(sema_ident, inherited_method_resolves_unqualified) {
+    using bezel::sema::MethodSymbol;
+    auto r = parseSema(
+        "module M; "
+        "class Derived : Base public method M() _ := Helper(); end M; "
+        "end Derived; "
+        "class Base public method Helper(): int => 1; end Base;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    const auto* ds = nthMethodStmt<bezel::ast::DiscardStmt>(r, 0);
+    if (ds && ds->value) {
+        const auto* call =
+            dynamic_cast<const bezel::ast::CallExpr*>(ds->value.get());
+        BEZEL_EXPECT_TRUE(call != nullptr);
+        if (call) {
+            Symbol* sym = r.ctx->exprSymbol(*call->callee);
+            BEZEL_EXPECT_TRUE(dynamic_cast<MethodSymbol*>(sym) != nullptr);
+        }
+    }
+}
+
 BEZEL_TEST(sema_ident, unresolved_identifier_in_body_diagnosed) {
     auto r = parseSema(
         "module M; class C public method M() "

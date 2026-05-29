@@ -401,10 +401,12 @@ private:
             auto it = s->names.find(name);
             if (it != s->names.end()) return it->second;
         }
+        // An unqualified member name resolves as an implicit-`this`
+        // reference — search the enclosing type AND its base types
+        // (§12 inheritance), mirroring lookupMember's transitive walk so
+        // an inherited field/method is reachable without `this.`/`base.`.
         if (currentType_) {
-            for (Symbol* m : currentType_->members) {
-                if (m && m->name == name) return m;
-            }
+            if (Symbol* m = lookupMember(currentType_, name)) return m;
         }
         return nullptr;
     }
