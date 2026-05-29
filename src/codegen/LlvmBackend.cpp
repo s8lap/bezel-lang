@@ -75,6 +75,7 @@ private:
     std::unordered_map<const ast::Node*, llvm::AllocaInst*> locals_;
 
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
+    llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
 
     // Create an alloca in the function's entry block (the conventional
     // home for locals, so they dominate all uses once control flow lands).
@@ -202,11 +203,17 @@ private:
                 static_cast<std::uint64_t>(parseIntLiteral(lit->text)),
                 /*isSigned=*/true);
         }
+        if (auto* boolLit = dynamic_cast<const ast::BoolLiteralExpr*>(&e)) {
+            return llvm::ConstantInt::get(i1(), boolLit->value ? 1 : 0);
+        }
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             return lowerBinary(*bin);
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             return lowerUnary(*un);
+        }
+        if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+            return lowerConditional(*cond);
         }
         // CG3: a reference to a local variable loads from its slot.
         if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
@@ -240,6 +247,20 @@ private:
         if (op == "^") return builder_.CreateXor(l, r);
         if (op == "<<") return builder_.CreateShl(l, r);
         if (op == ">>") return builder_.CreateAShr(l, r);  // signed types
+        // CG4: integer comparisons → i1 (Bezel uses `=` / `<>` for
+        // equality, signed relational ops).
+        if (op == "=") return builder_.CreateICmpEQ(l, r);
+        if (op == "<>") return builder_.CreateICmpNE(l, r);
+        if (op == "<") return builder_.CreateICmpSLT(l, r);
+        if (op == ">") return builder_.CreateICmpSGT(l, r);
+        if (op == "<=") return builder_.CreateICmpSLE(l, r);
+        if (op == ">=") return builder_.CreateICmpSGE(l, r);
+        // CG4: logical and/or on i1. NOTE: §17 specifies short-circuit
+        // evaluation; this eager form is observationally identical while
+        // operands are side-effect-free (no calls lowered yet) — true
+        // short-circuiting lands once call lowering exists.
+        if (op == "and") return builder_.CreateAnd(l, r);
+        if (op == "or") return builder_.CreateOr(l, r);
         return nullptr;
     }
 
@@ -251,7 +272,39 @@ private:
         if (op == "-") return builder_.CreateNeg(v);   // §6.1 checked; see above
         if (op == "~") return builder_.CreateNot(v);   // bitwise complement
         if (op == "+") return v;                       // identity
+        if (op == "not") return builder_.CreateNot(v); // i1 logical negation
         return nullptr;
+    }
+
+    // CG4: the conditional expression `thenValue if condition else
+    // elseValue` (§20). Lowers to a branch + phi so only the taken
+    // branch's value expression is evaluated (lazy, per spec).
+    llvm::Value* lowerConditional(const ast::ConditionalExpr& c) {
+        if (!c.condition || !c.thenValue || !c.elseValue) return nullptr;
+        llvm::Value* cond = lowerExpr(*c.condition);
+        if (!cond) return nullptr;
+
+        auto* thenBB = llvm::BasicBlock::Create(llvm_, "cond.then", currentFn_);
+        auto* elseBB = llvm::BasicBlock::Create(llvm_, "cond.else", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "cond.end", currentFn_);
+        builder_.CreateCondBr(cond, thenBB, elseBB);
+
+        builder_.SetInsertPoint(thenBB);
+        llvm::Value* tv = lowerExpr(*c.thenValue);
+        builder_.CreateBr(endBB);
+        llvm::BasicBlock* thenEnd = builder_.GetInsertBlock();
+
+        builder_.SetInsertPoint(elseBB);
+        llvm::Value* ev = lowerExpr(*c.elseValue);
+        builder_.CreateBr(endBB);
+        llvm::BasicBlock* elseEnd = builder_.GetInsertBlock();
+
+        builder_.SetInsertPoint(endBB);
+        if (!tv || !ev) return nullptr;
+        llvm::PHINode* phi = builder_.CreatePHI(tv->getType(), 2);
+        phi->addIncoming(tv, thenEnd);
+        phi->addIncoming(ev, elseEnd);
+        return phi;
     }
 };
 
