@@ -18,6 +18,7 @@
 
 #include "ast/Node.hpp"
 #include "sema/Symbol.hpp"
+#include "sema/TypeRef.hpp"
 #include "support/Diagnostic.hpp"
 
 namespace bezel::sema {
@@ -59,9 +60,34 @@ public:
     // attaching the ID to the symbols it creates inside that scope.
     ScopeId newScope() { return nextScope_++; }
 
+    // Allocate-and-own a resolved TypeRef. Returned pointer is stable
+    // for the lifetime of the context. Populated by type-resolution and
+    // queried by later passes via `resolvedType(...)`.
+    template <typename... Args>
+    TypeRef* makeTypeRef(Args&&... args) {
+        auto owned = std::make_unique<TypeRef>(std::forward<Args>(args)...);
+        TypeRef* raw = owned.get();
+        typeRefs_.push_back(std::move(owned));
+        return raw;
+    }
+
+    // Record that `ast` resolves to `ref`. Replaces any prior binding.
+    void setResolvedType(const ast::Type* ast, TypeRef* ref) {
+        resolvedTypes_[ast] = ref;
+    }
+
+    // Look up the resolved TypeRef for an AST type node. Null when
+    // type-resolution hasn't run or the node wasn't visitable.
+    TypeRef* resolvedType(const ast::Type& ast) const {
+        auto it = resolvedTypes_.find(&ast);
+        return it == resolvedTypes_.end() ? nullptr : it->second;
+    }
+
 private:
     DiagnosticEngine& diagnostics_;
     std::vector<std::unique_ptr<Symbol>> symbols_;
+    std::vector<std::unique_ptr<TypeRef>> typeRefs_;
+    std::unordered_map<const ast::Type*, TypeRef*> resolvedTypes_;
     ModuleSymbol* module_ = nullptr;
     // Scope IDs are assigned in DFS order. `kModuleScope` (=1) is the
     // initial module scope; everything nested gets a fresh ID > 1.
