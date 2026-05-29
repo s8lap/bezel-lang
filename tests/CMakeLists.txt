@@ -89,6 +89,7 @@ set(BEZEL_TEST_SOURCES
     sema/abstract_instantiation_test.cpp
     sema/inheritance_cycle_test.cpp
     sema/abstract_impl_test.cpp
+    sema/duplicate_member_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
