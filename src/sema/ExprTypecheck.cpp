@@ -549,6 +549,21 @@ private:
         } else if (auto* lc =
                        dynamic_cast<const ast::LocalConstDecl*>(&s)) {
             if (lc->value) visitExpr(*lc->value);
+            // Slice S31 (§21.1 / §22.12): a local const's explicit type
+            // must be a primitive value type or string.
+            if (lc->type) {
+                if (auto* rt = ctx_.resolvedType(*lc->type)) {
+                    bool ok = rt->kind == TypeRef::Kind::Primitive &&
+                              rt->primitive != PrimitiveType::Object;
+                    if (!ok) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, lc->span.begin,
+                            std::string("const `") + std::string(lc->name) +
+                            "` must have a primitive value type or "
+                            "`string` (§22.12)");
+                    }
+                }
+            }
             if (currentScope_ && !lc->name.empty()) {
                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                 lsym->name = lc->name;
