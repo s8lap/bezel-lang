@@ -109,6 +109,83 @@ private:
         }
     }
 
+    // Slice T1: §5.1 numeric/char implicit-widening table. Returns
+    // true iff `from` implicitly widens to `to` (both primitives,
+    // distinct). Identity is handled by the caller.
+    static bool primitiveWidens(PrimitiveType from, PrimitiveType to) {
+        using P = PrimitiveType;
+        auto isAny = [&](std::initializer_list<P> set) {
+            for (P p : set) if (p == to) return true;
+            return false;
+        };
+        switch (from) {
+            case P::SByte:
+                return isAny({P::Short, P::Int, P::Long, P::Float,
+                              P::Double, P::Decimal});
+            case P::Byte:
+                return isAny({P::Short, P::UShort, P::Int, P::UInt,
+                              P::Long, P::ULong, P::Float, P::Double,
+                              P::Decimal});
+            case P::Short:
+                return isAny({P::Int, P::Long, P::Float, P::Double,
+                              P::Decimal});
+            case P::UShort:
+                return isAny({P::Int, P::UInt, P::Long, P::ULong,
+                              P::Float, P::Double, P::Decimal});
+            case P::Int:
+                return isAny({P::Long, P::Float, P::Double, P::Decimal});
+            case P::UInt:
+                return isAny({P::Long, P::ULong, P::Float, P::Double,
+                              P::Decimal});
+            case P::Long:
+                return isAny({P::Float, P::Double, P::Decimal});
+            case P::ULong:
+                return isAny({P::Float, P::Double, P::Decimal});
+            case P::Float:
+                return isAny({P::Double});
+            case P::Char:
+                return isAny({P::Int, P::UInt, P::Long, P::ULong,
+                              P::Float, P::Double, P::Decimal});
+            default:
+                return false;
+        }
+    }
+
+    // Slice T1: primitive-to-primitive assignability check. Only fires
+    // when BOTH `from` and `to` are primitive TypeRefs (reference,
+    // named, generic, null, and Object-target cases are deliberately
+    // skipped — they need the full assignability lattice and would risk
+    // false positives). A non-nullable target accepting a nullable
+    // source is rejected (null would be lost); a nullable target
+    // accepting its non-nullable form is fine.
+    void checkPrimitiveAssignable(TypeRef* from, TypeRef* to,
+                                  SourceLocation loc,
+                                  const std::string& what) {
+        if (!from || !to) return;
+        if (from->kind != TypeRef::Kind::Primitive ||
+            to->kind != TypeRef::Kind::Primitive) {
+            return;
+        }
+        // `Object` accepts anything — skip (handled by the broader
+        // lattice later).
+        if (to->primitive == PrimitiveType::Object) return;
+        if (from->primitive == PrimitiveType::Object) return;
+        // Nullable source into non-nullable target loses null.
+        if (from->nullable && !to->nullable) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what +
+                " is nullable but the target type is non-nullable (§7)");
+            return;
+        }
+        if (from->primitive == to->primitive) return;  // identity
+        if (primitiveWidens(from->primitive, to->primitive)) return;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("the ") + what + " has a type that is not "
+            "implicitly convertible to the target type (§5.1)");
+    }
+
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
     // primitive type that is not bool — conditions whose type isn't yet
@@ -366,6 +443,16 @@ private:
                 // Either may be null (plain `var x;` with no init).
                 if (ld->type) {
                     lsym->declType = ctx_.resolvedType(*ld->type);
+                    // Slice T1: when an explicit ascription and an
+                    // initializer are both present and both primitive,
+                    // check primitive assignability (§5.1).
+                    if (ld->initializer) {
+                        checkPrimitiveAssignable(
+                            ctx_.exprType(*ld->initializer),
+                            lsym->declType, ld->initializer->span.begin,
+                            std::string("initializer for `") +
+                            std::string(ld->name) + "`");
+                    }
                 } else if (ld->initializer) {
                     lsym->declType = ctx_.exprType(*ld->initializer);
                 }
