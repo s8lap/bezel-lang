@@ -57,20 +57,26 @@ public:
         // other branches still normally exit). Future ownership CFG
         // refactor sharpens this to "every normal-exit path ends in
         // throw/return".
-        if (bodyEndsInThrow(body)) return;
         // Scope-exit: every plain `var` owned local must have been
         // discharged. `using var` locals carry implicit discharge.
-        for (const auto& [sym, st] : states_) {
-            if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
-                ctx_.diagnostics().report(
-                    Severity::Error,
-                    st.obligationOrigin ? st.obligationOrigin->span.begin
-                                        : SourceLocation{},
-                    std::string("owned value in `") +
-                    std::string(sym->name) +
-                    "` would be dropped here without disposal "
-                    "(§28.3 — consider `using var`, explicit "
-                    "`.Dispose()`, `move`, or `return`)");
+        // O11 (simple) suppresses *this* check when the body's last
+        // statement is throw — exception unwinding's implicit
+        // try/finally handles the discharge. The field-move check
+        // below is NOT suppressed: the enclosing object survives the
+        // throw and its field invariant must still hold.
+        if (!bodyEndsInThrow(body)) {
+            for (const auto& [sym, st] : states_) {
+                if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
+                    ctx_.diagnostics().report(
+                        Severity::Error,
+                        st.obligationOrigin ? st.obligationOrigin->span.begin
+                                            : SourceLocation{},
+                        std::string("owned value in `") +
+                        std::string(sym->name) +
+                        "` would be dropped here without disposal "
+                        "(§28.3 — consider `using var`, explicit "
+                        "`.Dispose()`, `move`, or `return`)");
+                }
             }
         }
         // Slice O8 / §28.6: a `move this.field` leaves the field in
