@@ -126,6 +126,7 @@ set(BEZEL_TEST_SOURCES
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     codegen/jit_smoke_test.cpp
+    codegen/int_literal_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
