@@ -1,5 +1,8 @@
 #include "sema/ExprTypecheck.hpp"
 
+#include <memory>
+#include <unordered_map>
+
 #include "ast/Node.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -8,11 +11,25 @@ namespace bezel::sema {
 
 namespace {
 
+// Per-walker scope for identifier lookups inside method bodies (slice 3b).
+struct Scope {
+    std::unordered_map<std::string_view, Symbol*> names;
+    Scope* parent = nullptr;
+};
+
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}
 
     void run(const ast::SourceFile& src) {
+        moduleScope_ = std::make_unique<Scope>();
+        if (ctx_.module()) {
+            for (Symbol* child : ctx_.module()->children) {
+                if (!child->name.empty()) {
+                    moduleScope_->names[child->name] = child;
+                }
+            }
+        }
         for (const auto& decl : src.topDecls) {
             if (!decl) continue;
             visitTopDecl(*decl);
@@ -21,87 +38,179 @@ public:
 
 private:
     SemaContext& ctx_;
+    std::unique_ptr<Scope> moduleScope_;
+    Scope* currentScope_ = nullptr;
+    TypeSymbol* currentType_ = nullptr;
+
+    Symbol* lookupName(std::string_view name) {
+        for (Scope* s = currentScope_; s; s = s->parent) {
+            auto it = s->names.find(name);
+            if (it != s->names.end()) return it->second;
+        }
+        if (currentType_) {
+            for (Symbol* m : currentType_->members) {
+                if (m && m->name == name) return m;
+            }
+        }
+        return nullptr;
+    }
 
     void visitTopDecl(const ast::TopDecl& d) {
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(&d)) {
+            TypeSymbol* tsym = nullptr;
+            if (ctx_.module()) {
+                for (Symbol* child : ctx_.module()->children) {
+                    if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                        if (ts->decl == td) { tsym = ts; break; }
+                    }
+                }
+            }
+            TypeSymbol* save = currentType_;
+            currentType_ = tsym;
             for (const auto& ec : td->enumConstants) {
                 if (ec.value) visitExpr(*ec.value);
             }
             for (const auto& m : td->members) {
                 if (m) visitMember(*m);
             }
+            currentType_ = save;
         } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
             for (const auto& m : ext->members) if (m) visitMember(*m);
         }
-        // TypeAlias, ExternBlock have no Expressions in their declarations
-        // (aside from default values in extern method params, which we'd
-        // pick up via Param iteration — extern doesn't admit defaults
-        // per the grammar).
+    }
+
+    // Param-symbol lookup for the in-progress method/ctor on currentType_.
+    const std::vector<Symbol*>* paramSymbolsOf(const ast::Member& m) const {
+        if (!currentType_) return nullptr;
+        for (Symbol* child : currentType_->members) {
+            if (!child->decl) continue;
+            if (child->decl == &m) {
+                if (auto* ms = dynamic_cast<MethodSymbol*>(child))
+                    return &ms->params;
+                if (auto* cs = dynamic_cast<ConstructorSymbol*>(child))
+                    return &cs->params;
+            }
+        }
+        return nullptr;
+    }
+
+    // Build a method scope (params on top of module scope), then visit
+    // body. Locals are registered into this scope as visitStmt walks
+    // LocalDecls.
+    void runMethodBody(
+        const std::vector<ast::Param>& params,
+        const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
+        const ast::Expr* exprBody,
+        const std::vector<Symbol*>* paramSyms) {
+        Scope methodScope;
+        methodScope.parent = moduleScope_.get();
+        if (paramSyms) {
+            for (std::size_t i = 0;
+                 i < params.size() && i < paramSyms->size(); ++i) {
+                if ((*paramSyms)[i] && !params[i].name.empty()) {
+                    methodScope.names[params[i].name] = (*paramSyms)[i];
+                }
+            }
+        }
+        Scope* save = currentScope_;
+        currentScope_ = &methodScope;
+        for (const auto& p : params) {
+            if (p.defaultValue) visitExpr(*p.defaultValue);
+        }
+        if (exprBody) visitExpr(*exprBody);
+        if (stmts) {
+            for (const auto& s : *stmts) {
+                if (s) visitStmt(*s);
+            }
+        }
+        currentScope_ = save;
     }
 
     void visitMember(const ast::Member& m) {
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
             if (fd->initializer) visitExpr(*fd->initializer);
         } else if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
-            for (const auto& p : md->params) {
-                if (p.defaultValue) visitExpr(*p.defaultValue);
-            }
-            if (md->bodyKind == ast::MethodBodyKind::Expression &&
-                md->exprBody) {
-                visitExpr(*md->exprBody);
-            } else if (md->bodyKind == ast::MethodBodyKind::Block) {
-                for (const auto& s : md->stmts) {
-                    if (s) visitStmt(*s);
-                }
-            }
+            const std::vector<std::unique_ptr<ast::Stmt>>* stmts =
+                (md->bodyKind == ast::MethodBodyKind::Block) ? &md->stmts
+                                                             : nullptr;
+            const ast::Expr* expr =
+                (md->bodyKind == ast::MethodBodyKind::Expression)
+                    ? md->exprBody.get() : nullptr;
+            runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));
         } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
-            for (const auto& p : od->params) {
-                if (p.defaultValue) visitExpr(*p.defaultValue);
-            }
-            if (od->bodyKind == ast::MethodBodyKind::Expression &&
-                od->exprBody) {
-                visitExpr(*od->exprBody);
-            } else if (od->bodyKind == ast::MethodBodyKind::Block) {
-                for (const auto& s : od->stmts) {
-                    if (s) visitStmt(*s);
-                }
-            }
+            const std::vector<std::unique_ptr<ast::Stmt>>* stmts =
+                (od->bodyKind == ast::MethodBodyKind::Block) ? &od->stmts
+                                                             : nullptr;
+            const ast::Expr* expr =
+                (od->bodyKind == ast::MethodBodyKind::Expression)
+                    ? od->exprBody.get() : nullptr;
+            runMethodBody(od->params, stmts, expr, paramSymbolsOf(m));
         } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
-            for (const auto& p : cd->params) {
-                if (p.defaultValue) visitExpr(*p.defaultValue);
-            }
-            for (const auto& s : cd->body) {
-                if (s) visitStmt(*s);
-            }
+            runMethodBody(cd->params, &cd->body, nullptr,
+                          paramSymbolsOf(m));
         } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
-            for (const auto& s : dd->body) {
-                if (s) visitStmt(*s);
-            }
+            std::vector<ast::Param> none;
+            runMethodBody(none, &dd->body, nullptr, nullptr);
         } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
-            if (pd->exprBody) visitExpr(*pd->exprBody);
-            if (pd->autoInitializer) visitExpr(*pd->autoInitializer);
+            std::vector<ast::Param> none;
+            if (pd->exprBody)
+                runMethodBody(none, nullptr, pd->exprBody.get(), nullptr);
+            if (pd->autoInitializer)
+                visitExpr(*pd->autoInitializer);
             for (const auto& a : pd->accessors) {
-                if (a.exprBody) visitExpr(*a.exprBody);
-                for (const auto& s : a.stmts) if (s) visitStmt(*s);
+                if (a.exprBody)
+                    runMethodBody(none, nullptr, a.exprBody.get(), nullptr);
+                if (!a.stmts.empty())
+                    runMethodBody(none, &a.stmts, nullptr, nullptr);
             }
         } else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(&m)) {
             if (cd->value) visitExpr(*cd->value);
         } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
             if (nt->decl) {
+                TypeSymbol* nested = nullptr;
+                if (currentType_) {
+                    for (Symbol* mem : currentType_->members) {
+                        if (auto* nts =
+                                dynamic_cast<NestedTypeSymbol*>(mem)) {
+                            if (nts->type &&
+                                nts->type->decl == nt->decl.get()) {
+                                nested = nts->type; break;
+                            }
+                        }
+                    }
+                }
+                TypeSymbol* save = currentType_;
+                currentType_ = nested;
                 for (const auto& innerM : nt->decl->members) {
                     if (innerM) visitMember(*innerM);
                 }
+                currentType_ = save;
             }
         }
-        // Event/EventDecl, indexer accessors handled by PropertyDecl path.
     }
 
     void visitStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+            // Initializer evaluates BEFORE the local comes into scope.
             if (ld->initializer) visitExpr(*ld->initializer);
+            if (currentScope_ && !ld->name.empty()) {
+                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                lsym->name = ld->name;
+                lsym->decl = ld;
+                lsym->isUsing = ld->isUsing;
+                lsym->isAwaitUsing = ld->isAwaitUsing;
+                currentScope_->names[ld->name] = lsym;
+            }
         } else if (auto* lc =
                        dynamic_cast<const ast::LocalConstDecl*>(&s)) {
             if (lc->value) visitExpr(*lc->value);
+            if (currentScope_ && !lc->name.empty()) {
+                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                lsym->name = lc->name;
+                lsym->decl = lc;
+                lsym->isConst = true;
+                currentScope_->names[lc->name] = lsym;
+            }
         } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
             if (rs->value) visitExpr(*rs->value);
         } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -155,6 +264,22 @@ private:
     }
 
     void visitExpr(const ast::Expr& e) {
+        // Slice 3b: IdentifierExpr name lookup. `this` / `base` are
+        // implicit-meaning identifiers — leave them unresolved
+        // (typecheck handles their semantics in a future slice).
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            if (id->name == "this" || id->name == "base") return;
+            Symbol* sym = lookupName(id->name);
+            if (sym) {
+                ctx_.setExprSymbol(&e, sym);
+            } else if (currentScope_) {
+                ctx_.diagnostics().report(
+                    Severity::Error, id->span.begin,
+                    std::string("unresolved identifier `") +
+                    std::string(id->name) + "`");
+            }
+            return;
+        }
         // Slice 3 main contract: every literal gets a type.
         if (dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
             ctx_.setExprType(&e, ctx_.primitiveTypeRef(PrimitiveType::Int));
