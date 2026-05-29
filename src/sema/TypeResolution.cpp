@@ -411,6 +411,69 @@ public:
         return false;
     }
 
+    // Slice S20 (§12.1): an override must match the base member's
+    // visibility, return type, parameter types, and parameter modifiers
+    // exactly. Parameter modifiers that must match: ref, out, owned.
+    // Return modifier that must match: owned. Only methods are handled
+    // here (property/indexer override-match is a later slice). When the
+    // base member of the same name is itself an overload set, this
+    // matches against the single representative S15 recorded — refining
+    // to overload-aware matching awaits the overload-resolution slice.
+    void checkOverrideSignatureMatch(MemberSymbol* derivedSym,
+                                     MemberSymbol* baseSym) {
+        auto* derived = dynamic_cast<MethodSymbol*>(derivedSym);
+        auto* base = dynamic_cast<MethodSymbol*>(baseSym);
+        if (!derived || !base) return;  // not a method pair — skip.
+        auto err = [&](const std::string& what) {
+            ctx_.diagnostics().report(
+                Severity::Error, derived->declLoc,
+                std::string("override of `") + std::string(derived->name) +
+                "` does not match the base member's " + what + " (§12.1)");
+        };
+        // Visibility must match exactly.
+        if (derived->visibility != base->visibility) {
+            err("visibility");
+        }
+        auto* dDecl = dynamic_cast<const ast::MethodDecl*>(derived->decl);
+        auto* bDecl = dynamic_cast<const ast::MethodDecl*>(base->decl);
+        if (dDecl && bDecl) {
+            // Return type (null == unit) and owned-return modifier.
+            TypeRef* dRet = dDecl->returnType
+                ? ctx_.resolvedType(*dDecl->returnType) : nullptr;
+            TypeRef* bRet = bDecl->returnType
+                ? ctx_.resolvedType(*bDecl->returnType) : nullptr;
+            bool bothNullReturn = !dDecl->returnType && !bDecl->returnType;
+            if (!bothNullReturn && !typeRefEqual(dRet, bRet)) {
+                err("return type");
+            }
+            if (dDecl->returnOwned != bDecl->returnOwned) {
+                err("`owned` return modifier");
+            }
+        }
+        // Parameters: count, exact modifier, exact type.
+        if (derived->params.size() != base->params.size()) {
+            err("parameter count");
+            return;
+        }
+        for (std::size_t i = 0; i < derived->params.size(); ++i) {
+            auto* dp = dynamic_cast<ParameterSymbol*>(derived->params[i]);
+            auto* bp = dynamic_cast<ParameterSymbol*>(base->params[i]);
+            if (!dp || !bp) continue;
+            if (dp->modifier != bp->modifier) {
+                err("parameter modifiers");
+                return;
+            }
+            TypeRef* dt = dp->declType ? ctx_.resolvedType(*dp->declType)
+                                       : nullptr;
+            TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
+                                       : nullptr;
+            if (dt && bt && !typeRefEqual(dt, bt)) {
+                err("parameter types");
+                return;
+            }
+        }
+    }
+
     // Slice S15: §12.2 forbids a derived class from reusing a base
     // CLASS member's name except to override a virtual/abstract base
     // member (§12.1). Interface members are excluded — re-declaring an
@@ -461,9 +524,11 @@ public:
                             "` is declared `override` but the base "
                             "member it would override is not `virtual`, "
                             "`abstract`, or `override` (§12.1)");
+                    } else {
+                        // Slice S20: a legal override must match the
+                        // base member's signature exactly.
+                        checkOverrideSignatureMatch(ms, base);
                     }
-                    // A legal override: signature-match checking is a
-                    // later slice.
                 } else {
                     ctx_.diagnostics().report(
                         Severity::Error, ms->declLoc,
