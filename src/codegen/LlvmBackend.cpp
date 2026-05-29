@@ -514,8 +514,119 @@ private:
         loopStack_.clear();
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
         bindParameters(fn, /*hasThis=*/true, &cs->params);
-        bool terminated = lowerScopedBlock(cd->body);
+
+        // CG16 (§12.8): a leading `base(...)`/`this(...)` chain call runs
+        // before the body. `this(...)` delegates to a sibling ctor (which
+        // runs the base chain); `base(...)` runs the base ctor. With
+        // neither written, an implicit `base()` runs the base class's
+        // parameterless ctor.
+        bool isThis = false;
+        std::size_t startIdx = 0;
+        if (!cd->body.empty()) {
+            if (const ast::CallExpr* chain =
+                    chainCallOf(*cd->body[0], isThis)) {
+                emitChainCall(chain, isThis, cs);
+                startIdx = 1;
+            } else {
+                emitImplicitBase(cs->parent, currentThis_);
+            }
+        } else {
+            emitImplicitBase(cs->parent, currentThis_);
+        }
+
+        bool terminated = lowerScopedBlock(cd->body, startIdx);
         if (!terminated) builder_.CreateRetVoid();
+    }
+
+    // CG16: if `s` is a leading constructor chain call (`base(...)` or
+    // `this(...)` as an ExpressionStmt-of-CallExpr), return the call and
+    // set `isThis`; else null.
+    const ast::CallExpr* chainCallOf(const ast::Stmt& s, bool& isThis) {
+        auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s);
+        if (!es || !es->expr) return nullptr;
+        auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
+        if (!call || !call->callee) return nullptr;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
+        if (!id) return nullptr;
+        if (id->name == "this") { isThis = true; return call; }
+        if (id->name == "base") { isThis = false; return call; }
+        return nullptr;
+    }
+
+    // CG16: the base class (baseTypes[0] when it is a class), else null.
+    const sema::TypeSymbol* baseClassOf(const sema::TypeSymbol* t) {
+        for (const sema::TypeSymbol* b : t->baseTypes) {
+            if (b && b->kind == ast::TypeDeclKind::Class) return b;
+        }
+        return nullptr;
+    }
+
+    // CG16: a non-static ctor of `cls` taking `n` parameters (excluding
+    // `exclude`). Overload resolution is by arity only for now.
+    sema::ConstructorSymbol* ctorByArity(const sema::TypeSymbol* cls,
+                                         std::size_t n,
+                                         const sema::ConstructorSymbol* exclude) {
+        if (!cls) return nullptr;
+        for (sema::Symbol* m : cls->members) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+            if (!cs || cs->isStatic || cs == exclude) continue;
+            if (cs->params.size() == n) return cs;
+        }
+        return nullptr;
+    }
+
+    bool hasAnyConstructor(const sema::TypeSymbol* t) {
+        for (sema::Symbol* m : t->members) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+            if (cs && !cs->isStatic) return true;
+        }
+        return false;
+    }
+
+    // CG16: emit a resolved chain call with `this` + lowered arguments.
+    void emitChainCall(const ast::CallExpr* call, bool isThis,
+                       sema::ConstructorSymbol* cs) {
+        const sema::TypeSymbol* targetCls =
+            isThis ? cs->parent : baseClassOf(cs->parent);
+        if (!targetCls) return;  // base() at the root (Object): nothing to run
+        std::size_t n = call->args.size();
+        sema::ConstructorSymbol* target =
+            ctorByArity(targetCls, n, isThis ? cs : nullptr);
+        if (!target) {
+            // Explicit `base()` with no matching base ctor: the base's own
+            // base may still need an implicit chain.
+            if (!isThis && n == 0) emitImplicitBase(targetCls, currentThis_);
+            return;
+        }
+        auto it = ctorFns_.find(target);
+        if (it == ctorFns_.end()) return;
+        std::vector<llvm::Value*> args;
+        args.push_back(currentThis_);
+        for (const auto& a : call->args) {
+            if (!a.value) return;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return;
+            args.push_back(v);
+        }
+        if (args.size() == it->second->arg_size()) {
+            builder_.CreateCall(it->second, args);
+        }
+    }
+
+    // CG16 (§12.8): the implicit `base()` — run the base class's
+    // parameterless ctor (which chains further). If the base has no ctor,
+    // recurse to its base so a deeper ctor still runs.
+    void emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
+        const sema::TypeSymbol* b = baseClassOf(cls);
+        if (!b) return;
+        if (sema::ConstructorSymbol* target = ctorByArity(b, 0, nullptr)) {
+            auto it = ctorFns_.find(target);
+            if (it != ctorFns_.end() && it->second->arg_size() == 1) {
+                builder_.CreateCall(it->second, {obj});
+            }
+        } else {
+            emitImplicitBase(b, obj);
+        }
     }
 
     // Bind each parameter to an entry-block alloca. When `hasThis`, the
@@ -617,9 +728,13 @@ private:
     // normal fall-through, disposes its `using var`s in reverse and pops.
     // If the block terminated early (return/break/continue), that
     // terminator already emitted the needed disposals, so we only pop.
-    bool lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    bool lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                          std::size_t startIdx = 0) {
         disposeStack_.emplace_back();
-        bool terminated = lowerBody(body);
+        bool terminated = false;
+        for (std::size_t i = startIdx; i < body.size(); ++i) {
+            if (body[i] && lowerStmt(*body[i])) { terminated = true; break; }
+        }
         if (!terminated) emitDisposals(disposeStack_.back());
         disposeStack_.pop_back();
         return terminated;
@@ -1025,7 +1140,11 @@ private:
         // lowered positional arguments. (Constructor overloads and
         // chained `base(...)`/`this(...)` calls are later slices — sema
         // defers the overloaded case too, so at most one ctor reaches us.)
-        if (sema::ConstructorSymbol* cs = soleConstructor(t)) {
+        // CG16: select the ctor by arity (covers single-ctor and
+        // arity-distinct overloads; full type-based overload resolution
+        // is deferred). The chosen ctor runs its own base/this chain.
+        if (sema::ConstructorSymbol* cs =
+                ctorByArity(t, ne.args.size(), nullptr)) {
             auto it = ctorFns_.find(cs);
             if (it != ctorFns_.end()) {
                 std::vector<llvm::Value*> args;
@@ -1040,22 +1159,12 @@ private:
                     builder_.CreateCall(it->second, args);
                 }
             }
+        } else if (!hasAnyConstructor(t)) {
+            // CG16: no explicit ctor → the implicit ctor runs an implicit
+            // `base()`, so a base-class ctor still runs on `new Derived()`.
+            emitImplicitBase(t, obj);
         }
         return obj;
-    }
-
-    // CG10: the type's single non-static constructor, or null if it has
-    // none (implicit default) or more than one (overloaded — deferred).
-    sema::ConstructorSymbol* soleConstructor(const sema::TypeSymbol* t) {
-        sema::ConstructorSymbol* found = nullptr;
-        for (sema::Symbol* m : t->members) {
-            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
-                if (cs->isStatic) continue;
-                if (found) return nullptr;  // overloaded — defer
-                found = cs;
-            }
-        }
-        return found;
     }
 
     // CG8: address of a field access `obj.f`. Returns the GEP pointer and
