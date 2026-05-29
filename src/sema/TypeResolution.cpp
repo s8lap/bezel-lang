@@ -58,14 +58,19 @@ public:
         }
         // Slice S12: after every base-type reference is resolved,
         // walk each TypeSymbol's inheritance chain and report cycles.
-        checkInheritanceCycles();
+        bool hadCycle = checkInheritanceCycles();
+        // Slice S13: a concrete class must implement every inherited
+        // abstract / interface member. Skipped when a cycle exists
+        // (the chain walk wouldn't terminate cleanly).
+        if (!hadCycle) checkAbstractImplementations();
     }
 
     // Slice S12: DFS over baseTypes; if we revisit a node already in
     // the current path, report a cycle anchored at the offending
     // TypeSymbol. Each cycle is reported once (at its smallest entry).
-    void checkInheritanceCycles() {
-        if (!ctx_.module()) return;
+    // Returns true if any cycle was found.
+    bool checkInheritanceCycles() {
+        if (!ctx_.module()) return false;
         std::unordered_set<TypeSymbol*> reported;
         for (Symbol* child : ctx_.module()->children) {
             auto* t = dynamic_cast<TypeSymbol*>(child);
@@ -73,6 +78,77 @@ public:
             std::unordered_set<TypeSymbol*> visited;
             std::vector<TypeSymbol*> path;
             checkCycleFrom(t, visited, path, reported);
+        }
+        return !reported.empty();
+    }
+
+    // Slice S13: is this method member abstract? A method is abstract
+    // when its parent is an interface (interface methods are implicitly
+    // abstract), when it carries the `abstract` modifier, or when its
+    // MethodDecl has an Abstract body.
+    bool methodIsAbstract(MethodSymbol* ms) {
+        if (ms->parent &&
+            ms->parent->kind == ast::TypeDeclKind::Interface) {
+            return true;
+        }
+        for (auto mod : ms->modifiers) {
+            if (mod == "abstract") return true;
+        }
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            if (md->bodyKind == ast::MethodBodyKind::Abstract) return true;
+        }
+        return false;
+    }
+
+    // Slice S13: walk a concrete class's inheritance chain; every
+    // abstract method name must be matched by a concrete method
+    // somewhere in the chain. Name-based (overload-aware matching is a
+    // later slice).
+    void checkAbstractImplementations() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            if (t->kind != ast::TypeDeclKind::Class) continue;
+            bool isAbstract = false;
+            for (auto mod : t->modifiers) {
+                if (mod == "abstract") { isAbstract = true; break; }
+            }
+            if (isAbstract) continue;  // abstract classes need not impl.
+
+            std::unordered_set<std::string_view> abstractNames;
+            std::unordered_set<std::string_view> concreteNames;
+            // BFS the chain.
+            std::vector<TypeSymbol*> frontier{t};
+            std::unordered_set<TypeSymbol*> seen{t};
+            std::size_t i = 0;
+            while (i < frontier.size()) {
+                TypeSymbol* cur = frontier[i++];
+                for (Symbol* m : cur->members) {
+                    if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                        if (methodIsAbstract(ms))
+                            abstractNames.insert(ms->name);
+                        else
+                            concreteNames.insert(ms->name);
+                    }
+                }
+                for (TypeSymbol* b : cur->baseTypes) {
+                    if (b && !seen.count(b)) {
+                        seen.insert(b);
+                        frontier.push_back(b);
+                    }
+                }
+            }
+            for (auto name : abstractNames) {
+                if (!concreteNames.count(name)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string("concrete class `") +
+                        std::string(t->name) +
+                        "` does not implement inherited abstract member `" +
+                        std::string(name) + "` (§11.4)");
+                }
+            }
         }
     }
 
