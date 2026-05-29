@@ -66,9 +66,10 @@ public:
           builder_(llvmCtx) {}
 
     std::unique_ptr<llvm::Module> run() {
-        // CG6: two passes — declare every static method's function first
-        // (so calls can reference callees defined later), then emit
-        // bodies.
+        // CG8: build every class's instance layout first (so field
+        // access and `new` see field indices). CG6: declare all static
+        // method functions, then emit bodies.
+        declareStructs();
         declareFunctions();
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
@@ -92,8 +93,15 @@ private:
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
 
+    // CG8: per-class instance layout (struct of instance fields) and each
+    // field's index within it.
+    std::unordered_map<const sema::TypeSymbol*, llvm::StructType*> structs_;
+    std::unordered_map<const sema::Symbol*, unsigned> fieldIndex_;
+
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
     llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
+    llvm::Type* i64() { return llvm::Type::getInt64Ty(llvm_); }
+    llvm::PointerType* ptrTy() { return llvm::PointerType::get(llvm_, 0); }
 
     // Create an alloca in the function's entry block (the conventional
     // home for locals, so they dominate all uses once control flow lands).
@@ -115,23 +123,61 @@ private:
         return ms->name == "Main" && isStaticMethod(ms);
     }
 
-    // Lower a Bezel type to its LLVM representation. CG6 covers the
-    // primitive scalars reachable so far; `()`/absent → void. Anything
-    // else falls back to i32 (refined as more types are lowered).
+    // Lower a Bezel type (AST node) to its LLVM representation.
     llvm::Type* lowerType(const ast::Type* t) {
         if (!t) return llvm::Type::getVoidTy(llvm_);
-        sema::TypeRef* rt = ctx_.resolvedType(*t);
+        return lowerTypeRef(ctx_.resolvedType(*t));
+    }
+
+    // Lower a resolved TypeRef. `()`/null → void; primitives → scalars;
+    // class/interface references → opaque pointer (heap reference).
+    // Other kinds fall back to i32 (refined as more types are lowered).
+    llvm::Type* lowerTypeRef(const sema::TypeRef* rt) {
         if (!rt) return i32();
-        if (rt->kind == sema::TypeRef::Kind::Unit) {
-            return llvm::Type::getVoidTy(llvm_);
+        switch (rt->kind) {
+            case sema::TypeRef::Kind::Unit:
+                return llvm::Type::getVoidTy(llvm_);
+            case sema::TypeRef::Kind::Primitive:
+                return rt->primitive == sema::PrimitiveType::Bool ? i1()
+                                                                  : i32();
+            case sema::TypeRef::Kind::Named:
+                if (rt->declaration &&
+                    (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                     rt->declaration->kind == ast::TypeDeclKind::Interface)) {
+                    return ptrTy();  // reference types are heap pointers
+                }
+                return i32();  // value-kind named (record/enum) — later
+            default:
+                return i32();
         }
-        if (rt->kind == sema::TypeRef::Kind::Primitive) {
-            switch (rt->primitive) {
-                case sema::PrimitiveType::Bool: return i1();
-                default: return i32();  // int and other scalars (CG6)
+    }
+
+    // CG8: the LLVM struct for a class's instance fields, built lazily.
+    // Fields are laid out in declaration order; their indices are
+    // recorded for member access. Static fields and non-field members
+    // are skipped.
+    llvm::StructType* classStruct(const sema::TypeSymbol* t) {
+        auto it = structs_.find(t);
+        if (it != structs_.end()) return it->second;
+        auto* st = llvm::StructType::create(
+            llvm_, std::string("class.") + std::string(t->name));
+        structs_[t] = st;  // record before filling (supports self-reference)
+        std::vector<llvm::Type*> fieldTys;
+        unsigned idx = 0;
+        for (const sema::Symbol* m : t->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (!fs) continue;
+            bool isStatic = false;
+            for (auto mod : fs->modifiers) {
+                if (mod == "static") { isStatic = true; break; }
             }
+            if (isStatic) continue;
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            fieldTys.push_back(fd ? lowerType(fd->type.get()) : i32());
+            fieldIndex_[fs] = idx++;
         }
-        return i32();
+        st->setBody(fieldTys);
+        return st;
     }
 
     // §33: the entry-point method's LLVM function is named `main`; every
@@ -140,6 +186,14 @@ private:
         if (isMain(ms)) return "main";
         std::string cls = ms->parent ? std::string(ms->parent->name) : "";
         return "bz$" + cls + "$" + std::string(ms->name);
+    }
+
+    // CG8: build the instance layout for every class up front.
+    void declareStructs() {
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (ts && ts->kind == ast::TypeDeclKind::Class) classStruct(ts);
+        }
     }
 
     // Pass 1: create a Function (no body) for every static method.
@@ -232,6 +286,20 @@ private:
             llvm::Constant::getNullValue(fn->getReturnType()));
     }
 
+    // CG3/CG8: a local/const declaration. The slot type comes from the
+    // initializer's lowered value (so pointer-typed locals like `var p
+    // := new T()` work); without an initializer it falls back to the
+    // declared type (or i32).
+    void lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
+                        const ast::Type* declType) {
+        llvm::Value* v = init ? lowerExpr(*init) : nullptr;
+        llvm::Type* slotTy =
+            v ? v->getType() : (declType ? lowerType(declType) : i32());
+        llvm::AllocaInst* slot = entryAlloca(slotTy);
+        locals_[declNode] = slot;
+        if (v) builder_.CreateStore(v, slot);
+    }
+
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).
     bool lowerBody(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
@@ -247,23 +315,11 @@ private:
     // ExpressionStmt, DiscardStmt.
     bool lowerStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-            llvm::AllocaInst* slot = entryAlloca(i32());
-            locals_[ld] = slot;
-            if (ld->initializer) {
-                if (llvm::Value* v = lowerExpr(*ld->initializer)) {
-                    builder_.CreateStore(v, slot);
-                }
-            }
+            lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
             return false;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
-            llvm::AllocaInst* slot = entryAlloca(i32());
-            locals_[lc] = slot;
-            if (lc->value) {
-                if (llvm::Value* v = lowerExpr(*lc->value)) {
-                    builder_.CreateStore(v, slot);
-                }
-            }
+            lowerLocalDecl(lc, lc->value.get(), lc->type.get());
             return false;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
@@ -271,6 +327,15 @@ private:
                 if (llvm::AllocaInst* slot = localSlot(*as->target)) {
                     if (llvm::Value* v = lowerExpr(*as->value)) {
                         builder_.CreateStore(v, slot);
+                    }
+                } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                               as->target.get())) {
+                    // CG8: field assignment `obj.f := v`.
+                    llvm::Type* elemTy = nullptr;
+                    if (llvm::Value* addr = fieldAddr(*ma, elemTy)) {
+                        if (llvm::Value* v = lowerExpr(*as->value)) {
+                            builder_.CreateStore(v, addr);
+                        }
                     }
                 }
             }
@@ -412,6 +477,16 @@ private:
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             return lowerCall(*call);
         }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+            return lowerNew(*ne);
+        }
+        // CG8: field read `obj.f`.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            llvm::Type* elemTy = nullptr;
+            if (llvm::Value* addr = fieldAddr(*ma, elemTy)) {
+                return builder_.CreateLoad(elemTy, addr);
+            }
+        }
         // CG3: a reference to a local variable loads from its slot.
         if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
             if (llvm::AllocaInst* slot = localSlot(e)) {
@@ -471,6 +546,66 @@ private:
         if (op == "+") return v;                       // identity
         if (op == "not") return builder_.CreateNot(v); // i1 logical negation
         return nullptr;
+    }
+
+    // Declare (once) `ptr @calloc(i64, i64)` from libc — zero-inits the
+    // allocation, matching value-type field defaults.
+    llvm::FunctionCallee callocFn() {
+        auto* fnTy = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        return module_->getOrInsertFunction("calloc", fnTy);
+    }
+
+    // CG8: `new T(...)` — heap-allocate (zeroed) an instance of T and run
+    // its field initializers. (Explicit constructors, ownership-driven
+    // disposal/free, and constructor args are later slices; trivial
+    // instances currently leak — freed once disposal lowering lands.)
+    llvm::Value* lowerNew(const ast::NewExpr& ne) {
+        if (!ne.type) return nullptr;
+        sema::TypeRef* rt = ctx_.resolvedType(*ne.type);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
+            return nullptr;
+        }
+        const sema::TypeSymbol* t = rt->declaration;
+        llvm::StructType* st = classStruct(t);
+
+        // sizeof(st) via the null-GEP / ptrtoint idiom (no DataLayout dep).
+        llvm::Value* sizeofSt = builder_.CreatePtrToInt(
+            builder_.CreateGEP(st, llvm::ConstantPointerNull::get(ptrTy()),
+                               {builder_.getInt32(1)}),
+            i64());
+        llvm::Value* obj = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), sizeofSt});
+
+        // Run field initializers (calloc already zeroed the rest).
+        for (const sema::Symbol* m : t->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (!fs) continue;
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->initializer) continue;
+            auto idxIt = fieldIndex_.find(fs);
+            if (idxIt == fieldIndex_.end()) continue;  // static field
+            llvm::Value* v = lowerExpr(*fd->initializer);
+            if (!v) continue;
+            builder_.CreateStore(
+                v, builder_.CreateStructGEP(st, obj, idxIt->second));
+        }
+        return obj;
+    }
+
+    // CG8: address of a field access `obj.f`. Returns the GEP pointer and
+    // sets `elemTy` to the field's type. Null if `ma` isn't a field
+    // access we can lower.
+    llvm::Value* fieldAddr(const ast::MemberAccessExpr& ma,
+                           llvm::Type*& elemTy) {
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(ma));
+        if (!fs || !fs->parent || !ma.target) return nullptr;
+        auto idxIt = fieldIndex_.find(fs);
+        if (idxIt == fieldIndex_.end()) return nullptr;
+        llvm::StructType* st = classStruct(fs->parent);
+        llvm::Value* obj = lowerExpr(*ma.target);
+        if (!obj) return nullptr;
+        elemTy = st->getElementType(idxIt->second);
+        return builder_.CreateStructGEP(st, obj, idxIt->second);
     }
 
     // CG6: a call whose callee resolves to a known static method →
