@@ -133,15 +133,30 @@ private:
                 }
             }
         }
+        // Slice S10: a class has at most one class-kind base; the
+        // rest must be interfaces. Records and enums don't take
+        // base classes (we don't enforce here — that's a separate
+        // syntactic/structural check).
+        std::size_t classBaseCount = 0;
         for (const auto& bt : td.baseTypes) {
             if (!bt) continue;
             TypeRef* ref = resolveType(*bt, &typeScope);
             if (tsym && ref && ref->kind == TypeRef::Kind::Named &&
                 ref->declaration) {
                 tsym->baseTypes.push_back(ref->declaration);
-                // Slice S9: a sealed class cannot be inherited from.
                 TypeSymbol* base = ref->declaration;
+                // Slice S9: a sealed class cannot be inherited from.
                 if (base->kind == ast::TypeDeclKind::Class) {
+                    ++classBaseCount;
+                    if (td.kind == ast::TypeDeclKind::Class &&
+                        classBaseCount > 1) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, bt->span.begin,
+                            std::string("class `") + std::string(td.name) +
+                            "` already has a base class; only the "
+                            "first base may be a class (single-"
+                            "inheritance — §11.3)");
+                    }
                     bool sealed = false;
                     for (auto mod : base->modifiers) {
                         if (mod == "sealed") { sealed = true; break; }
