@@ -60,18 +60,46 @@ private:
             if (ds->value) handleDischarge(*ds->value);
             return;
         }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+            handleAssignment(*as);
+            return;
+        }
         if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
             if (rs->value) handleReturn(*rs->value);
             return;
         }
-        // Statements that recurse into sub-statements: walk each sub-stmt
-        // linearly. For slice O1, we don't branch-join (later O slices do).
+        // Slice O4: if-then-else handling with branch-join semantics
+        // per §28.3. Each branch is walked with a snapshot of the
+        // pre-branch state; the post-branch states are joined into the
+        // current state. Owned/Borrowed mismatch at the join is a
+        // diagnostic.
         if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+            // Snapshot the state entering the if-statement.
+            auto entry = states_;
+            // Walk the if-branch.
             for (const auto& bs : ifs->ifBranch.body) if (bs) visitStmt(*bs);
+            auto branchEndStates = std::vector{states_};
+            // For each elif: restore entry, walk, snapshot.
             for (const auto& el : ifs->elifBranches) {
+                states_ = entry;
                 for (const auto& bs : el.body) if (bs) visitStmt(*bs);
+                branchEndStates.push_back(states_);
             }
-            for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
+            // Else branch (or implicit fall-through == entry).
+            if (ifs->hasElse) {
+                states_ = entry;
+                for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
+                branchEndStates.push_back(states_);
+            } else {
+                // No else: the false edge falls through with entry state.
+                branchEndStates.push_back(entry);
+            }
+            // Join all branches. Start from the first; reduce in pairs.
+            auto joined = branchEndStates.front();
+            for (std::size_t i = 1; i < branchEndStates.size(); ++i) {
+                joinInto(joined, branchEndStates[i], ifs->span.begin);
+            }
+            states_ = std::move(joined);
             return;
         }
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
@@ -221,6 +249,23 @@ private:
         // Other expression forms — not exhaustive; later slices extend.
     }
 
+    void handleAssignment(const ast::AssignmentStmt& as) {
+        // Slice O4: `x := EXPR` where x is a tracked local updates x's
+        // state to match the producer of EXPR. Other assignment shapes
+        // (`x.f := …`, `x[i] := …`) are handled in later slices.
+        if (as.op != ":=") return;
+        if (!as.target || !as.value) return;
+        const auto* id =
+            dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
+        if (!id) return;
+        for (auto& [sym, st] : states_) {
+            if (sym->name != id->name) continue;
+            st.state = producerState(*as.value);
+            st.obligationOrigin = &as;
+            return;
+        }
+    }
+
     void handleReturn(const ast::Expr& e) {
         // For slice O1, treat `return x;` (bare identifier) as a
         // discharge. The "is the method's return type owned T?" check
@@ -233,6 +278,48 @@ private:
         // For `move x` return arm: covered by handleDischarge inside
         // the expression — but we also call it here.
         handleDischarge(e);
+    }
+
+    // §28.3 join. Per the spec the join is asymmetric: matching states
+    // carry forward (with their auxiliary data, e.g. Owned's discharge
+    // obligation), but mismatched owned-vs-borrowed is rejected (the
+    // spec's "silently demoting an owned obligation to a borrowed state
+    // at the join would leak the resource"). Mutates `into` in place.
+    void joinInto(std::unordered_map<sema::LocalSymbol*, LocalOwnership>& into,
+                  const std::unordered_map<sema::LocalSymbol*,
+                                           LocalOwnership>& other,
+                  SourceLocation joinLoc) {
+        for (auto& [sym, st] : into) {
+            auto it = other.find(sym);
+            if (it == other.end()) continue;
+            const LocalOwnership& o = it->second;
+            if (st.state == o.state) continue;
+            // PolyNull absorbs: PolyNull ⊓ X = X.
+            if (st.state == OwnershipState::PolyNull) {
+                st = o;
+                continue;
+            }
+            if (o.state == OwnershipState::PolyNull) continue;
+            // Owned vs Borrowed is the spec-rejected case.
+            const bool ownedBorrowedClash =
+                (st.state == OwnershipState::Owned &&
+                 o.state == OwnershipState::Borrowed) ||
+                (st.state == OwnershipState::Borrowed &&
+                 o.state == OwnershipState::Owned);
+            if (ownedBorrowedClash) {
+                ctx_.diagnostics().report(
+                    Severity::Error, joinLoc,
+                    std::string("branch ownership conflict for `") +
+                    std::string(sym->name) +
+                    "`: one branch produced an owned value, the other a "
+                    "borrowed value (§28.3 — equalize the branches before "
+                    "the merge per the two Patterns)");
+                st.state = OwnershipState::Poisoned;
+                continue;
+            }
+            // Other mismatches (Disposed/MovedFrom on one side) — poison.
+            st.state = OwnershipState::Poisoned;
+        }
     }
 
     sema::LocalSymbol* findLocalSymbol(const ast::LocalDecl& ld) {
