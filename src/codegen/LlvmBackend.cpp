@@ -244,6 +244,17 @@ private:
         return false;
     }
 
+    // CG24: a primitive type's LLVM representation. Bool→i1, Float→f32,
+    // Double→f64; the integer types are all i32 until CG25 widens them.
+    llvm::Type* lowerPrimitive(sema::PrimitiveType p) {
+        switch (p) {
+            case sema::PrimitiveType::Bool:   return i1();
+            case sema::PrimitiveType::Float:  return llvm::Type::getFloatTy(llvm_);
+            case sema::PrimitiveType::Double: return llvm::Type::getDoubleTy(llvm_);
+            default:                          return i32();
+        }
+    }
+
     // Lower a Bezel type (AST node) to its LLVM representation.
     llvm::Type* lowerType(const ast::Type* t) {
         if (!t) return llvm::Type::getVoidTy(llvm_);
@@ -259,8 +270,7 @@ private:
             case sema::TypeRef::Kind::Unit:
                 return llvm::Type::getVoidTy(llvm_);
             case sema::TypeRef::Kind::Primitive:
-                return rt->primitive == sema::PrimitiveType::Bool ? i1()
-                                                                  : i32();
+                return lowerPrimitive(rt->primitive);
             case sema::TypeRef::Kind::Named:
                 if (rt->declaration &&
                     (rt->declaration->kind == ast::TypeDeclKind::Class ||
@@ -1549,6 +1559,23 @@ private:
         if (auto* boolLit = dynamic_cast<const ast::BoolLiteralExpr*>(&e)) {
             return llvm::ConstantInt::get(i1(), boolLit->value ? 1 : 0);
         }
+        // CG24: float/double literal — value parsed from the lexeme, type
+        // (f32/f64) from the expr's resolved type (default double).
+        if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(&e)) {
+            llvm::Type* ty = llvm::Type::getDoubleTy(llvm_);
+            if (auto* rt = ctx_.exprType(e))
+                if (rt->kind == sema::TypeRef::Kind::Primitive)
+                    ty = lowerPrimitive(rt->primitive);
+            std::string digits;
+            for (char c : fl->text) {
+                if (c == '_' || c == 'f' || c == 'F' || c == 'd' || c == 'D')
+                    continue;
+                digits.push_back(c);
+            }
+            double v = digits.empty() ? 0.0 : std::strtod(digits.c_str(),
+                                                          nullptr);
+            return llvm::ConstantFP::get(ty, v);
+        }
         // CG23: the `null` literal is a null reference pointer.
         if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
             return llvm::ConstantPointerNull::get(ptrTy());
@@ -1642,6 +1669,30 @@ private:
         llvm::Value* r = lowerExpr(*bin.right);
         if (!l || !r) return nullptr;
         const auto& op = bin.op;
+        // CG24 (§6.3): floating-point arithmetic and comparisons (IEEE 754,
+        // no overflow/div0 checks). If one operand is FP and the other an
+        // integer, promote the integer (§6.2 mixed-type promotion).
+        if (l->getType()->isFloatingPointTy() ||
+            r->getType()->isFloatingPointTy()) {
+            llvm::Type* fty = l->getType()->isFloatingPointTy()
+                                  ? l->getType()
+                                  : r->getType();
+            if (!l->getType()->isFloatingPointTy())
+                l = builder_.CreateSIToFP(l, fty);
+            if (!r->getType()->isFloatingPointTy())
+                r = builder_.CreateSIToFP(r, fty);
+            if (op == "+") return builder_.CreateFAdd(l, r);
+            if (op == "-") return builder_.CreateFSub(l, r);
+            if (op == "*") return builder_.CreateFMul(l, r);
+            if (op == "/") return builder_.CreateFDiv(l, r);
+            if (op == "=") return builder_.CreateFCmpOEQ(l, r);
+            if (op == "<>") return builder_.CreateFCmpONE(l, r);
+            if (op == "<") return builder_.CreateFCmpOLT(l, r);
+            if (op == ">") return builder_.CreateFCmpOGT(l, r);
+            if (op == "<=") return builder_.CreateFCmpOLE(l, r);
+            if (op == ">=") return builder_.CreateFCmpOGE(l, r);
+            return nullptr;
+        }
         // CG22 (§6.1): integer + - * are overflow-checked; / and mod also
         // raise on a zero divisor and on INT_MIN / -1. Applies to integer
         // operands only (bool uses and/or; floats — CG24 — are unchecked).
@@ -1706,6 +1757,8 @@ private:
         if (!v) return nullptr;
         const auto& op = un.op;
         if (op == "-") {
+            if (v->getType()->isFloatingPointTy())  // CG24: §6.3 IEEE negate
+                return builder_.CreateFNeg(v);
             // §6.1: unary negation overflows only at INT_MIN.
             if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(1)) {
                 emitGuardThrow(builder_.CreateICmpEQ(v, minIntLike(v)),
