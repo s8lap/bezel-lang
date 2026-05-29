@@ -205,8 +205,25 @@ private:
         if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
             return OwnershipState::PolyNull;
         }
-        // Default: Borrowed (slice O1 doesn't dig deeper — sema later
-        // refines by querying method-signature owned-return annotations).
+        // Slice O13: a call to a method with an `owned T` return type
+        // produces an Owned value. The callee MethodSymbol resolution
+        // comes from sema; we look at its MethodDecl::returnOwned to
+        // decide. A null callee symbol (overload not yet pickable, or
+        // a call on a value with no symbol) falls through to Borrowed.
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+            if (ce->callee) {
+                if (auto* sym = ctx_.exprSymbol(*ce->callee)) {
+                    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
+                        auto* md = dynamic_cast<const ast::MethodDecl*>(
+                            ms->decl);
+                        if (md && md->returnOwned) {
+                            return OwnershipState::Owned;
+                        }
+                    }
+                }
+            }
+        }
+        // Default: Borrowed.
         return OwnershipState::Borrowed;
     }
 
