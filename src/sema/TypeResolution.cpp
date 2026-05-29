@@ -88,6 +88,40 @@ public:
         checkMethodBodies();
         // Slice S34: static members may not be virtual (§12.1).
         checkStaticNotVirtual();
+        // Slice S35: `async abstract` is a compile error (§12.6).
+        checkAsyncModifiers();
+    }
+
+    // Slice S35 (§12.6 / Appendix C.6): `async` does not combine with
+    // `abstract` on a method. (An abstract async method declares a
+    // Task / Task<T> return type without `async` instead.)
+    void checkAsyncModifiers() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeAsyncModifiers(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeAsyncModifiers(nt->type);
+                }
+            }
+        }
+    }
+
+    void checkTypeAsyncModifiers(TypeSymbol* t) {
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms) continue;
+            if (hasMod(ms, "async") && hasMod(ms, "abstract")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("method `") + std::string(ms->name) +
+                    "` may not be both `async` and `abstract`; declare a "
+                    "`Task` / `Task<T>` return type without `async` "
+                    "(§12.6)");
+            }
+        }
     }
 
     // Slice S34 (§12.1): "Fields, constructors, destructors, and static
