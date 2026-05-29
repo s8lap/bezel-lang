@@ -83,6 +83,10 @@ private:
     std::unique_ptr<llvm::Module> module_;
     llvm::IRBuilder<> builder_;
     llvm::Function* currentFn_ = nullptr;
+    // CG9: the `this` pointer of the instance method currently being
+    // emitted (null in static methods). Kept as a value, not a slot —
+    // `this` is never reassignable.
+    llvm::Value* currentThis_ = nullptr;
     // CG3: each local's storage, keyed by its declaration node (a
     // LocalDecl/LocalConstDecl/ParameterSymbol). An IdentifierExpr
     // resolves to a Local/Parameter symbol whose `decl` is that node.
@@ -196,19 +200,19 @@ private:
         }
     }
 
-    // Pass 1: create a Function (no body) for every static method.
+    // Pass 1: create a Function (no body) for every method with a body.
+    // CG9: instance methods take an extra leading `this` pointer.
     void declareFunctions() {
         for (const auto& sym : ctx_.symbols()) {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(sym.get());
-            if (!ms || !isStaticMethod(ms)) continue;
+            if (!ms) continue;
             auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
             if (!md || md->bodyKind == ast::MethodBodyKind::Abstract) continue;
 
-            // Entry `main` is always () -> i32 (process exit code); other
-            // methods use their declared signature.
             llvm::Type* retTy = isMain(ms) ? i32()
                                            : lowerType(md->returnType.get());
             std::vector<llvm::Type*> paramTys;
+            if (!isStaticMethod(ms)) paramTys.push_back(ptrTy());  // this
             for (const auto& p : md->params) {
                 paramTys.push_back(lowerType(p.type.get()));
             }
@@ -226,15 +230,12 @@ private:
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         if (!md) return;
         currentFn_ = fn;
+        currentThis_ = nullptr;
         locals_.clear();
         paramSlots_.clear();
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
-        // Bind parameters: copy each arg into an alloca so the body can
-        // read (and assign) it uniformly with locals. Keyed by the
-        // ParameterSymbol's decl node = the owning MethodDecl... but
-        // params share that node, so key by the Param's address instead.
-        bindParameters(md, fn);
+        bindParameters(md, fn, /*hasThis=*/!isStaticMethod(ms));
 
         bool terminated = false;
         if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody) {
@@ -246,18 +247,29 @@ private:
         if (!terminated) emitImplicitReturn(fn);
     }
 
-    // Bind each parameter to an entry-block alloca holding its arg value,
-    // keyed by the matching ParameterSymbol so identifier reads resolve.
-    void bindParameters(const ast::MethodDecl* md, llvm::Function* fn) {
+    // Bind each parameter to an entry-block alloca. For an instance
+    // method the first arg is `this` (kept as a value in currentThis_,
+    // not a slot — it isn't reassignable). Remaining args map to the
+    // ParameterSymbols.
+    void bindParameters(const ast::MethodDecl* md, llvm::Function* fn,
+                        bool hasThis) {
         const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
-        std::size_t i = 0;
+        std::size_t paramIdx = 0;
+        bool first = true;
         for (auto& arg : fn->args()) {
+            if (hasThis && first) {
+                currentThis_ = &arg;
+                first = false;
+                continue;
+            }
+            first = false;
             llvm::AllocaInst* slot = entryAlloca(arg.getType());
             builder_.CreateStore(&arg, slot);
-            if (paramSyms && i < paramSyms->size() && (*paramSyms)[i]) {
-                paramSlots_[(*paramSyms)[i]] = slot;
+            if (paramSyms && paramIdx < paramSyms->size() &&
+                (*paramSyms)[paramIdx]) {
+                paramSlots_[(*paramSyms)[paramIdx]] = slot;
             }
-            ++i;
+            ++paramIdx;
         }
     }
 
@@ -333,6 +345,15 @@ private:
                     // CG8: field assignment `obj.f := v`.
                     llvm::Type* elemTy = nullptr;
                     if (llvm::Value* addr = fieldAddr(*ma, elemTy)) {
+                        if (llvm::Value* v = lowerExpr(*as->value)) {
+                            builder_.CreateStore(v, addr);
+                        }
+                    }
+                } else {
+                    // CG9: implicit-`this` field assignment `_f := v`.
+                    llvm::Type* elemTy = nullptr;
+                    if (llvm::Value* addr =
+                            implicitFieldAddr(*as->target, elemTy)) {
                         if (llvm::Value* v = lowerExpr(*as->value)) {
                             builder_.CreateStore(v, addr);
                         }
@@ -487,13 +508,36 @@ private:
                 return builder_.CreateLoad(elemTy, addr);
             }
         }
-        // CG3: a reference to a local variable loads from its slot.
-        if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            // CG9: `this` (and `base`, same instance) is the receiver ptr.
+            if (id->name == "this" || id->name == "base") return currentThis_;
+            // CG9: a bare identifier resolving to an instance field is an
+            // implicit-`this` field read.
+            llvm::Type* elemTy = nullptr;
+            if (llvm::Value* addr = implicitFieldAddr(e, elemTy)) {
+                return builder_.CreateLoad(elemTy, addr);
+            }
+            // CG3: a reference to a local variable loads from its slot.
             if (llvm::AllocaInst* slot = localSlot(e)) {
                 return builder_.CreateLoad(slot->getAllocatedType(), slot);
             }
         }
         return nullptr;
+    }
+
+    // CG9: address of an implicitly-`this`-qualified instance field
+    // referenced bare inside an instance method (`_x` rather than
+    // `this._x`). Returns the GEP and sets `elemTy`; null if `e` is not
+    // such a reference (not an identifier, not a field, or no `this`).
+    llvm::Value* implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy) {
+        if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) return nullptr;
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e));
+        if (!fs || !fs->parent || !currentThis_) return nullptr;
+        auto idxIt = fieldIndex_.find(fs);
+        if (idxIt == fieldIndex_.end()) return nullptr;  // static field
+        llvm::StructType* st = classStruct(fs->parent);
+        elemTy = st->getElementType(idxIt->second);
+        return builder_.CreateStructGEP(st, currentThis_, idxIt->second);
     }
 
     // Slice CG2: integer binary operators. NOTE (§6.1): `+ - * / mod`
@@ -608,9 +652,12 @@ private:
         return builder_.CreateStructGEP(st, obj, idxIt->second);
     }
 
-    // CG6: a call whose callee resolves to a known static method →
-    // direct LLVM call with lowered positional arguments. (Overloads,
-    // named/default args, and instance dispatch are later slices.)
+    // CG6/CG9: a call whose callee resolves to a known method → direct
+    // LLVM call with lowered positional arguments. An instance method
+    // (CG9) takes the receiver as an implicit leading `this` argument:
+    // `obj.M(a)` passes `obj`; a bare `M(a)` inside an instance method
+    // passes the current `this`. (Overloads, named/default args, and
+    // virtual dispatch are later slices — calls bind statically here.)
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
         auto* ms = dynamic_cast<sema::MethodSymbol*>(
@@ -621,6 +668,18 @@ private:
         llvm::Function* callee = it->second;
 
         std::vector<llvm::Value*> args;
+        if (!isStaticMethod(ms)) {
+            // Receiver: the member-access target, else the current `this`.
+            llvm::Value* recv = nullptr;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get())) {
+                recv = ma->target ? lowerExpr(*ma->target) : nullptr;
+            } else {
+                recv = currentThis_;
+            }
+            if (!recv) return nullptr;
+            args.push_back(recv);
+        }
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
