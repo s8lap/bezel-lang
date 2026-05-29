@@ -226,9 +226,15 @@ private:
     // flow constructs. Locals themselves are not registered here (that
     // happens later in ExprTypecheck); we only need their `: Type`
     // ascriptions resolved so identifier-on-local typing works.
+    //
+    // Slice 3f: also resolves types embedded in expressions —
+    // NewExpr::type, TypeTestExpr::testType, TypeOfExpr::queriedType,
+    // DefaultExpr::type, lambda return/param types — so ExprTypecheck
+    // can type those expressions.
     void resolveTypesInBody(
         const std::vector<std::unique_ptr<ast::Stmt>>& body, Scope* scope);
     void resolveTypesInStmt(const ast::Stmt& s, Scope* scope);
+    void resolveTypesInExpr(const ast::Expr& e, Scope* scope);
 
     TypeRef* resolveType(const ast::Type& t, Scope* scope) {
         auto* ref = ctx_.makeTypeRef();
@@ -360,25 +366,55 @@ void Resolver::resolveTypesInBody(
 void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         if (ld->type) resolveType(*ld->type, scope);
+        if (ld->initializer) resolveTypesInExpr(*ld->initializer, scope);
         return;
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         if (lc->type) resolveType(*lc->type, scope);
+        if (lc->value) resolveTypesInExpr(*lc->value, scope);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) resolveTypesInExpr(*rs->value, scope);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) resolveTypesInExpr(*es->expr, scope);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) resolveTypesInExpr(*as->target, scope);
+        if (as->value) resolveTypesInExpr(*as->value, scope);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) resolveTypesInExpr(*ds->value, scope);
+        return;
+    }
+    if (auto* tr = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (tr->value) resolveTypesInExpr(*tr->value, scope);
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            resolveTypesInExpr(*ifs->ifBranch.condition, scope);
         resolveTypesInBody(ifs->ifBranch.body, scope);
-        for (const auto& el : ifs->elifBranches)
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) resolveTypesInExpr(*el.condition, scope);
             resolveTypesInBody(el.body, scope);
+        }
         resolveTypesInBody(ifs->elseBody, scope);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) resolveTypesInExpr(*ws->condition, scope);
         resolveTypesInBody(ws->body, scope);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
         if (fs->varType) resolveType(*fs->varType, scope);
+        if (fs->iterable) resolveTypesInExpr(*fs->iterable, scope);
+        if (fs->withExpr) resolveTypesInExpr(*fs->withExpr, scope);
         resolveTypesInBody(fs->body, scope);
         return;
     }
@@ -389,13 +425,135 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
         resolveTypesInBody(ts->body, scope);
         for (const auto& arm : ts->catches) {
-            // Catch arm exception-type (when present) lives on the
-            // pattern; resolution of patterns isn't slice 3d's job.
             if (arm.body) resolveTypesInStmt(*arm.body, scope);
         }
         resolveTypesInBody(ts->finallyBody, scope);
         return;
     }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) resolveTypesInExpr(*is->target, scope);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) resolveTypesInExpr(*ys->value, scope);
+        return;
+    }
+}
+
+void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
+    // First handle expressions that own a Type node directly.
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        if (ne->type) resolveType(*ne->type, scope);
+        for (const auto& a : ne->args) {
+            if (a.value) resolveTypesInExpr(*a.value, scope);
+        }
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (te->testType) resolveType(*te->testType, scope);
+        if (te->operand) resolveTypesInExpr(*te->operand, scope);
+        return;
+    }
+    if (auto* to = dynamic_cast<const ast::TypeOfExpr*>(&e)) {
+        if (to->queriedType) resolveType(*to->queriedType, scope);
+        return;
+    }
+    if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
+        if (de->type) resolveType(*de->type, scope);
+        return;
+    }
+    // Recurse into children for everything else.
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) resolveTypesInExpr(*be->left, scope);
+        if (be->right) resolveTypesInExpr(*be->right, scope);
+        return;
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->operand) resolveTypesInExpr(*ue->operand, scope);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) resolveTypesInExpr(*ma->target, scope);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nc->target) resolveTypesInExpr(*nc->target, scope);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) resolveTypesInExpr(*ce->callee, scope);
+        for (const auto& a : ce->args) {
+            if (a.value) resolveTypesInExpr(*a.value, scope);
+        }
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) resolveTypesInExpr(*nc->callee, scope);
+        for (const auto& a : nc->args) {
+            if (a.value) resolveTypesInExpr(*a.value, scope);
+        }
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) resolveTypesInExpr(*ix->target, scope);
+        for (const auto& a : ix->indices) {
+            if (a.value) resolveTypesInExpr(*a.value, scope);
+        }
+        return;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (bg->operand) resolveTypesInExpr(*bg->operand, scope);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (ce->condition) resolveTypesInExpr(*ce->condition, scope);
+        if (ce->thenValue) resolveTypesInExpr(*ce->thenValue, scope);
+        if (ce->elseValue) resolveTypesInExpr(*ce->elseValue, scope);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) resolveTypesInExpr(*th->operand, scope);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // Lambda parameter types are themselves Types when present.
+        for (const auto& p : lam->params) {
+            if (p.type) resolveType(*p.type, scope);
+        }
+        if (lam->exprBody) resolveTypesInExpr(*lam->exprBody, scope);
+        for (const auto& s : lam->stmts) {
+            if (s) resolveTypesInStmt(*s, scope);
+        }
+        return;
+    }
+    if (auto* cae = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cae->scrutinee) resolveTypesInExpr(*cae->scrutinee, scope);
+        for (const auto& arm : cae->arms) {
+            if (arm.guard) resolveTypesInExpr(*arm.guard, scope);
+            if (arm.exprBody) resolveTypesInExpr(*arm.exprBody, scope);
+            for (const auto& s : arm.stmts) {
+                if (s) resolveTypesInStmt(*s, scope);
+            }
+        }
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) resolveTypesInExpr(*we->source, scope);
+        for (const auto& ia : we->assigns) {
+            if (ia.value) resolveTypesInExpr(*ia.value, scope);
+        }
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys) {
+            if (k) resolveTypesInExpr(*k, scope);
+        }
+        for (const auto& v : cl->elements) {
+            if (v) resolveTypesInExpr(*v, scope);
+        }
+        return;
+    }
+    // Literals + Identifier + ThisBaseTypeOf — no nested Types/Exprs.
 }
 
 } // namespace
