@@ -137,6 +137,7 @@ set(BEZEL_TEST_SOURCES
     codegen/instance_methods_test.cpp
     codegen/constructors_test.cpp
     codegen/loop_control_test.cpp
+    codegen/static_fields_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp

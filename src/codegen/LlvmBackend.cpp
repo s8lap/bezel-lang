@@ -12,6 +12,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -70,6 +71,7 @@ public:
         // access and `new` see field indices). CG6: declare all static
         // method functions, then emit bodies.
         declareStructs();
+        declareStatics();
         declareFunctions();
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
@@ -117,6 +119,10 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::StructType*> structs_;
     std::unordered_map<const sema::Symbol*, unsigned> fieldIndex_;
 
+    // CG12: each static field's backing global variable.
+    std::unordered_map<const sema::Symbol*, llvm::GlobalVariable*>
+        staticGlobals_;
+
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
     llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
     llvm::Type* i64() { return llvm::Type::getInt64Ty(llvm_); }
@@ -140,6 +146,13 @@ private:
 
     static bool isMain(sema::MethodSymbol* ms) {
         return ms->name == "Main" && isStaticMethod(ms);
+    }
+
+    static bool isStaticField(const sema::FieldSymbol* fs) {
+        for (auto mod : fs->modifiers) {
+            if (mod == "static") return true;
+        }
+        return false;
     }
 
     // Lower a Bezel type (AST node) to its LLVM representation.
@@ -205,6 +218,53 @@ private:
         if (isMain(ms)) return "main";
         std::string cls = ms->parent ? std::string(ms->parent->name) : "";
         return "bz$" + cls + "$" + std::string(ms->name);
+    }
+
+    // CG12: a static field becomes an internal global. Its initializer
+    // is the literal constant when present (int/bool literal), else the
+    // zero value. Non-literal static initializers (which the spec runs in
+    // a static constructor, §22) are deferred — the global is zeroed.
+    void declareStatics() {
+        for (const auto& sym : ctx_.symbols()) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(sym.get());
+            if (!fs || !isStaticField(fs)) continue;
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            llvm::Type* ty = fd ? lowerType(fd->type.get()) : i32();
+            std::string cls = fs->parent ? std::string(fs->parent->name) : "";
+            auto* gv = new llvm::GlobalVariable(
+                *module_, ty, /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage,
+                constInitFor(fd, ty),
+                "bz$" + cls + "$" + std::string(fs->name));
+            staticGlobals_[fs] = gv;
+        }
+    }
+
+    // The constant initializer for a static field, or zero if absent or
+    // non-literal (non-literal static init is deferred — see declareStatics).
+    llvm::Constant* constInitFor(const ast::FieldDecl* fd, llvm::Type* ty) {
+        if (fd && fd->initializer) {
+            const ast::Expr* e = fd->initializer.get();
+            if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(e)) {
+                return llvm::ConstantInt::get(
+                    ty, static_cast<std::uint64_t>(parseIntLiteral(lit->text)),
+                    /*isSigned=*/true);
+            }
+            if (auto* b = dynamic_cast<const ast::BoolLiteralExpr*>(e)) {
+                return llvm::ConstantInt::get(ty, b->value ? 1 : 0);
+            }
+        }
+        return llvm::Constant::getNullValue(ty);
+    }
+
+    // CG12: the backing global of a bare identifier that resolves to a
+    // static field, or null if `e` isn't such a reference.
+    llvm::GlobalVariable* staticFieldGlobal(const ast::Expr& e) {
+        if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) return nullptr;
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e));
+        if (!fs) return nullptr;
+        auto it = staticGlobals_.find(fs);
+        return it == staticGlobals_.end() ? nullptr : it->second;
     }
 
     // CG8: build the instance layout for every class up front.
@@ -400,6 +460,12 @@ private:
                             builder_.CreateStore(v, addr);
                         }
                     }
+                } else if (llvm::GlobalVariable* gv =
+                               staticFieldGlobal(*as->target)) {
+                    // CG12: static field assignment `_s := v`.
+                    if (llvm::Value* v = lowerExpr(*as->value)) {
+                        builder_.CreateStore(v, gv);
+                    }
                 } else {
                     // CG9: implicit-`this` field assignment `_f := v`.
                     llvm::Type* elemTy = nullptr;
@@ -581,6 +647,11 @@ private:
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
             // CG9: `this` (and `base`, same instance) is the receiver ptr.
             if (id->name == "this" || id->name == "base") return currentThis_;
+            // CG12: a bare identifier resolving to a static field reads
+            // its backing global.
+            if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
+                return builder_.CreateLoad(gv->getValueType(), gv);
+            }
             // CG9: a bare identifier resolving to an instance field is an
             // implicit-`this` field read.
             llvm::Type* elemTy = nullptr;
