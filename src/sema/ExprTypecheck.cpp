@@ -57,6 +57,10 @@ private:
     // Slice S26: enclosing-loop nesting depth, for the §21.5 rule that
     // `break`/`continue` are legal only inside a loop.
     int loopDepth_ = 0;
+    // Slice S27: enclosing catch-arm-body depth, for the §31.5 rule
+    // that a bare `throw;` / `throw` re-raise is valid only in a catch
+    // arm body.
+    int catchDepth_ = 0;
 
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
@@ -390,7 +394,16 @@ private:
         } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
             if (ds->value) visitExpr(*ds->value);
         } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-            if (ts->value) visitExpr(*ts->value);
+            if (ts->value) {
+                visitExpr(*ts->value);
+            } else if (catchDepth_ == 0) {
+                // Slice S27 (§21.8 / §31.5): bare `throw;` re-raise is
+                // valid only inside a catch arm body.
+                ctx_.diagnostics().report(
+                    Severity::Error, s.span.begin,
+                    "bare `throw;` (re-raise) is only valid inside a "
+                    "catch arm body (§31.5)");
+            }
         } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
             if (ifs->ifBranch.condition) {
                 visitExpr(*ifs->ifBranch.condition);
@@ -440,7 +453,11 @@ private:
             for (const auto& bs : trys->body) if (bs) visitStmt(*bs);
             for (const auto& arm : trys->catches) {
                 if (arm.guard) visitExpr(*arm.guard);
+                // Slice S27: a bare `throw;` is valid inside a catch
+                // arm body (but not in the try body or finally).
+                ++catchDepth_;
                 if (arm.body) visitStmt(*arm.body);
+                --catchDepth_;
             }
             for (const auto& bs : trys->finallyBody) if (bs) visitStmt(*bs);
         } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
@@ -860,7 +877,16 @@ private:
         } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
             if (te->operand) visitExpr(*te->operand);
         } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
-            if (th->operand) visitExpr(*th->operand);
+            if (th->operand) {
+                visitExpr(*th->operand);
+            } else if (catchDepth_ == 0) {
+                // Slice S27: bare `throw` expression re-raise is valid
+                // only inside a catch arm body (§31.5 / §17.12).
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    "bare `throw` (re-raise) is only valid inside a "
+                    "catch arm body (§31.5)");
+            }
         } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
             // §21.7: a `return` inside a lambda exits the lambda and
             // follows the lambda's own return type — which slice S21
@@ -871,12 +897,15 @@ private:
             // loop depth across the lambda boundary too.
             ReturnCtx saveRet = returnCtx_;
             int saveLoop = loopDepth_;
+            int saveCatch = catchDepth_;
             returnCtx_ = ReturnCtx::None;
             loopDepth_ = 0;
+            catchDepth_ = 0;
             if (lam->exprBody) visitExpr(*lam->exprBody);
             for (const auto& s : lam->stmts) if (s) visitStmt(*s);
             returnCtx_ = saveRet;
             loopDepth_ = saveLoop;
+            catchDepth_ = saveCatch;
         } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
             if (ce->scrutinee) visitExpr(*ce->scrutinee);
             for (const auto& arm : ce->arms) {
