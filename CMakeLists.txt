@@ -56,6 +56,7 @@ add_library(bezel_core STATIC
     src/sema/SymbolCollection.cpp
     src/sema/TypeResolution.cpp
     src/sema/ExprTypecheck.cpp
+    src/sema/DefiniteAssignment.cpp
     src/flow/CFG.cpp
     src/ownership/OwnershipChecker.cpp
     src/ownership/Ownership.cpp
