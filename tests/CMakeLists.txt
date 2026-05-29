@@ -145,6 +145,7 @@ set(BEZEL_TEST_SOURCES
     codegen/virtual_dispatch_test.cpp
     codegen/abstract_dynamic_dispose_test.cpp
     codegen/type_test_test.cpp
+    codegen/exceptions_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
