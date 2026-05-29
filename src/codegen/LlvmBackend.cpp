@@ -203,26 +203,41 @@ private:
         }
     }
 
-    // CG8: the LLVM struct for a class's instance fields, built lazily.
-    // Fields are laid out in declaration order; their indices are
-    // recorded for member access. Static fields and non-field members
-    // are skipped.
+    // CG15: collect a class's instance fields in layout order —
+    // base-class fields FIRST (prefix layout: a `Derived*` aliases a
+    // `Base*`), then own fields. Recurses the single base class
+    // (baseTypes[0] when it is a class). Static fields are excluded.
+    void collectInstanceFields(const sema::TypeSymbol* t,
+                               std::vector<const sema::FieldSymbol*>& out) {
+        for (const sema::TypeSymbol* b : t->baseTypes) {
+            if (b && b->kind == ast::TypeDeclKind::Class) {
+                collectInstanceFields(b, out);
+                break;  // a class has at most one base class
+            }
+        }
+        for (const sema::Symbol* m : t->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (fs && !isStaticField(fs)) out.push_back(fs);
+        }
+    }
+
+    // CG8/CG15: the LLVM struct for a class's instance, built lazily.
+    // Inherited fields come first (prefix layout), then own fields;
+    // fieldIndex_ records each field's absolute index. The prefix
+    // property means an inherited field has the same index in the base
+    // struct and every derived struct, so member access through
+    // fs->parent's struct is correct on a derived instance.
     llvm::StructType* classStruct(const sema::TypeSymbol* t) {
         auto it = structs_.find(t);
         if (it != structs_.end()) return it->second;
         auto* st = llvm::StructType::create(
             llvm_, std::string("class.") + std::string(t->name));
         structs_[t] = st;  // record before filling (supports self-reference)
+        std::vector<const sema::FieldSymbol*> fields;
+        collectInstanceFields(t, fields);
         std::vector<llvm::Type*> fieldTys;
         unsigned idx = 0;
-        for (const sema::Symbol* m : t->members) {
-            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-            if (!fs) continue;
-            bool isStatic = false;
-            for (auto mod : fs->modifiers) {
-                if (mod == "static") { isStatic = true; break; }
-            }
-            if (isStatic) continue;
+        for (const sema::FieldSymbol* fs : fields) {
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             fieldTys.push_back(fd ? lowerType(fd->type.get()) : i32());
             fieldIndex_[fs] = idx++;
@@ -988,14 +1003,17 @@ private:
         llvm::Value* obj = builder_.CreateCall(
             callocFn(), {builder_.getInt64(1), sizeofSt});
 
-        // Run field initializers (calloc already zeroed the rest).
-        for (const sema::Symbol* m : t->members) {
-            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-            if (!fs) continue;
+        // Run field initializers, inherited (base-first) then own, so a
+        // `new Derived()` initializes base fields too (calloc already
+        // zeroed the rest). CG16's base-ctor chaining runs ctor *bodies*,
+        // not these initializers, so there is no double-initialization.
+        std::vector<const sema::FieldSymbol*> fields;
+        collectInstanceFields(t, fields);
+        for (const sema::FieldSymbol* fs : fields) {
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             if (!fd || !fd->initializer) continue;
             auto idxIt = fieldIndex_.find(fs);
-            if (idxIt == fieldIndex_.end()) continue;  // static field
+            if (idxIt == fieldIndex_.end()) continue;
             llvm::Value* v = lowerExpr(*fd->initializer);
             if (!v) continue;
             builder_.CreateStore(
