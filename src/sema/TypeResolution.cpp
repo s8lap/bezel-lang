@@ -92,6 +92,38 @@ public:
         checkAsyncModifiers();
         // Slice S36: constructor chain-call placement (§12.8).
         checkConstructorChains();
+        // Slice S37: static constructor takes no parameters (§22.7).
+        checkStaticConstructorParams();
+    }
+
+    // Slice S37 (§22.7 / Appendix C.5): a static constructor takes no
+    // parameters. (The no-access-modifier rule is a parser concern.)
+    void checkStaticConstructorParams() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeStaticCtorParams(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeStaticCtorParams(nt->type);
+                }
+            }
+        }
+    }
+
+    void checkTypeStaticCtorParams(TypeSymbol* t) {
+        for (Symbol* m : t->members) {
+            auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+            if (!cs || !cs->isStatic) continue;
+            if (!cs->params.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("static constructor of `") +
+                    std::string(t->name) +
+                    "` may not declare parameters (§22.7)");
+            }
+        }
     }
 
     // Slice S36 (§12.8 / Appendix C.5): a constructor may contain at
