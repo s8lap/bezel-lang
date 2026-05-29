@@ -1,5 +1,5 @@
 // Spec-derived tests for Sema slice S7 — `readonly` field assignment
-// (§11.5). A `readonly` field is assignable only inside the declaring
+// (§22.8). A `readonly` field is assignable only inside the declaring
 // class's constructor (or its field initializer). Assignments to
 // `this.<readonly>` from a method body are diagnostics.
 

@@ -1,6 +1,6 @@
 // Spec-derived tests for Sema slice S11 — `new` on non-instantiable
 // types (abstract class, static class, interface) is an error
-// (§11.4 / §11).
+// (abstract: §12.5; static: §11.7; interface: §11.2).
 
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"

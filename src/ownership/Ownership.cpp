@@ -79,7 +79,7 @@ public:
                 }
             }
         }
-        // Slice O8 / §28.6: a `move this.field` leaves the field in
+        // Slice O8 / §28.8.1: a `move this.field` leaves the field in
         // moved-from state. The field must be reassigned before the
         // surrounding method exits — otherwise the field's invariant
         // is broken on method return.
@@ -92,7 +92,7 @@ public:
                         : SourceLocation{},
                     std::string("field `") + std::string(name) +
                     "` left in moved-from state at method exit "
-                    "(§28.6 — reassign the field before exiting)");
+                    "(§28.8.1 — reassign the field before exiting)");
             }
         }
     }
@@ -697,13 +697,14 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
     // PropertyDecl accessors and other forms join in later O slices.
 }
 
-// ---------- Slice O9: owned-field definite-assignment ----------
+// ---------- Slice O9: owned-field definite-assignment (§7.9) --------
 //
-// An `owned` field without an in-class initializer must be assigned by
-// every constructor's normal exit. A `this(...)` chained constructor
-// transfers the responsibility to the chained target. `base(...)`
-// chaining does not — the derived class's fields are still the
-// derived ctor's job.
+// Per §7.9 / Appendix C.1, every non-nullable field — which owned
+// class-typed fields are — must be assigned by a field initializer or
+// in every constructor. This slice enforces that for `owned` fields
+// specifically. A `this(...)` chained constructor transfers the
+// responsibility to the chained target. `base(...)` chaining does not
+// — the derived class's fields are still the derived ctor's job.
 //
 // This is a syntactic over-approximation: we accept any
 // `this.<field> := …` assignment anywhere in the body (not necessarily
@@ -824,7 +825,7 @@ void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
                 Severity::Error, f->span.begin,
                 std::string("owned field `") + std::string(f->name) +
                 "` needs an initializer or a constructor that assigns "
-                "it (§28.6)");
+                "it (§7.9)");
         }
         return;
     }
@@ -840,7 +841,7 @@ void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
                     std::string("constructor does not initialize owned "
                                 "field `") +
                     std::string(f->name) +
-                    "` (§28.6 — every constructor's normal-exit path "
+                    "` (§7.9 — every constructor's normal-exit path "
                     "must assign it, or chain to `this(…)`)");
             }
         }

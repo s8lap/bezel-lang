@@ -1,5 +1,5 @@
 // Spec-derived tests for Ownership slice O9 — owned-field definite
-// assignment in constructors (§28.6).
+// assignment in constructors (§7.9).
 //
 // An `owned` field without an in-class initializer is the constructor's
 // responsibility: every constructor must assign the field on every

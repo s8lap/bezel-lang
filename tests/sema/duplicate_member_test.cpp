@@ -1,5 +1,6 @@
 // Spec-derived tests for Sema slice S14 — duplicate member names
-// within a type (§11.2). Methods/constructors may overload; all other
+// within a type (§11.3 lists member kinds; uniqueness is a well-
+// formedness requirement). Methods/constructors may overload; all other
 // member kinds must have unique names and cannot collide with anything.
 
 #include "support/sema_support.hpp"

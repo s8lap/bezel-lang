@@ -74,7 +74,7 @@ private:
                     std::string("cannot assign to readonly field `") +
                     std::string(fs->name) +
                     "` outside the declaring class's constructor "
-                    "(§11.5)");
+                    "(§22.8)");
                 return;
             }
         }
@@ -358,7 +358,8 @@ private:
                         Severity::Error, id->span.begin,
                         std::string("`") + std::string(id->name) +
                         "` is not available in a static method or "
-                        "static constructor (§22.1)");
+                        "static constructor — it requires an instance "
+                        "receiver (§12.3)");
                 }
                 return;
             }
@@ -488,21 +489,21 @@ private:
                                 std::string("cannot instantiate abstract "
                                             "class `") +
                                 std::string(t->name) + "` with `new` "
-                                "(§11.4)");
+                                "(§12.5)");
                         } else if (isStatic) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ne->span.begin,
                                 std::string("cannot instantiate static "
                                             "class `") +
                                 std::string(t->name) + "` with `new` "
-                                "(§11.4)");
+                                "(§11.7)");
                         } else if (t->kind ==
                                    ast::TypeDeclKind::Interface) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ne->span.begin,
                                 std::string("cannot instantiate interface `") +
                                 std::string(t->name) +
-                                "` with `new` (§11)");
+                                "` with `new` (§11.2)");
                         }
                     }
                 }
@@ -625,7 +626,8 @@ private:
                     "` and not accessible from `" +
                     std::string(currentType_ ? currentType_->name
                                              : std::string_view("(global)")) +
-                    "` (§22.3 visibility)");
+                    "` (§13.1 — `private` is visible to the declaring "
+                    "class only)");
             }
         }
         ctx_.setExprSymbol(&ma, member);

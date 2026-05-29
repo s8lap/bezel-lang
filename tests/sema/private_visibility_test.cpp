@@ -1,5 +1,5 @@
 // Spec-derived tests for Sema slice S8 — `private` member visibility
-// (§22.3). A private member is accessible only from inside its
+// (§13.1). A private member is accessible only from inside its
 // declaring type's own bodies.
 
 #include "support/sema_support.hpp"
@@ -52,7 +52,7 @@ BEZEL_TEST(sema_priv, public_access_from_other_class_ok) {
 }
 
 BEZEL_TEST(sema_priv, private_inherited_diagnoses_from_derived) {
-    // Per §22.3 spec, `private` is type-local even on inheritance —
+    // Per §13.1, `private` is type-local even on inheritance —
     // a derived class cannot reach into the base's privates.
     auto r = parseSemaAll(
         "module M; "

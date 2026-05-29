@@ -1,5 +1,5 @@
 // Spec-derived tests for Ownership slice O8 — `move this.field`
-// semantics (§28.6).
+// semantics (§28.8.1; Appendix C.3).
 //
 // `move this.f` leaves `this.f` in moved-from state. The field must
 // be reassigned before the surrounding method exits — otherwise the

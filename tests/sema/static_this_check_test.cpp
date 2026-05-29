@@ -1,5 +1,5 @@
 // Spec-derived tests for Sema slice S6 — diagnose `this` / `base` in
-// static methods and static constructors (§22.1). Instance members
+// static methods and static constructors (§12.3). Instance members
 // don't exist in a static context; using `this` / `base` from one is
 // an error.
 
