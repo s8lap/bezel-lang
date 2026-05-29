@@ -1319,6 +1319,11 @@ private:
     void resolveMember(const ast::Member& m, Scope* parent) {
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
             if (fd->type) resolveType(*fd->type, parent);
+            // Issue #163: resolve types embedded in the initializer
+            // expression (e.g. `new T()`), so a class-typed field
+            // initializer is fully typed — mirrors what ctor/method
+            // bodies get via resolveTypesInBody below.
+            if (fd->initializer) resolveTypesInExpr(*fd->initializer, parent);
         } else if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
             Scope methodScope;
             methodScope.parent = parent;

@@ -51,7 +51,52 @@ const bezel::ast::Expr* firstDiscardValue(
     return nullptr;
 }
 
+// The initializer expression of the first field declared in the program.
+const bezel::ast::Expr* firstFieldInitializer(
+    const bezel::test::SemaResult& r) {
+    if (!r.sourceFile) return nullptr;
+    for (const auto& topD : r.sourceFile->topDecls) {
+        const auto* td = dynamic_cast<const bezel::ast::TypeDecl*>(topD.get());
+        if (!td) continue;
+        for (const auto& m : td->members) {
+            const auto* fd =
+                dynamic_cast<const bezel::ast::FieldDecl*>(m.get());
+            if (fd && fd->initializer) return fd->initializer.get();
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
+
+// Issue #163: TypeResolution must resolve Type nodes embedded in a field
+// initializer expression (e.g. the `T` in `new T()`), just as it does for
+// constructor/method bodies. Before the fix, a class-typed field
+// initializer had no resolved type and silently failed to lower in codegen.
+BEZEL_TEST(sema_new_expr, field_initializer_new_expr_typed) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class T end T; "
+        "class C public _t: T := new T(); end C;");
+    auto* e = firstFieldInitializer(r);
+    BEZEL_EXPECT_TRUE(dynamic_cast<const bezel::ast::NewExpr*>(e) != nullptr);
+    if (e) {
+        auto* t = r.ctx->exprType(*e);
+        BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named);
+    }
+}
+
+BEZEL_TEST(sema_new_expr, field_initializer_new_with_args_typed) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class T public constructor(x: int) end constructor; end T; "
+        "class C public _t: T := new T(7); end C;");
+    auto* e = firstFieldInitializer(r);
+    if (e) {
+        auto* t = r.ctx->exprType(*e);
+        BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named);
+    }
+}
 
 BEZEL_TEST(sema_new_expr, new_named_type) {
     auto r = parseSemaAll(
