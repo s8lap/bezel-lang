@@ -84,6 +84,65 @@ public:
         checkConstTypes();
         // Slice S32: enum member restrictions (§10.5).
         checkEnumRestrictions();
+        // Slice S33: method body-presence rules (§12.5 / §11.2).
+        checkMethodBodies();
+    }
+
+    // Slice S33: a method's body presence must match its kind.
+    //  - In a class: a method marked `abstract` must have no body, and
+    //    a non-abstract method must have one (§12.5).
+    //  - In an interface: methods have no body (§11.2); a body is an
+    //    error.
+    // Records / enums: treated like classes (their methods are
+    // concrete). Operators are always concrete and handled by the
+    // parser's body requirement.
+    void checkMethodBodies() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeMethodBodies(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeMethodBodies(nt->type);
+                }
+            }
+        }
+    }
+
+    void checkTypeMethodBodies(TypeSymbol* t) {
+        bool isInterface = t->kind == ast::TypeDeclKind::Interface;
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms) continue;
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (!md) continue;
+            bool noBody = md->bodyKind == ast::MethodBodyKind::Abstract;
+            bool isAbstract = hasMod(ms, "abstract");
+            if (isInterface) {
+                if (!noBody) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("interface method `") +
+                        std::string(ms->name) +
+                        "` may not have a body (§11.2)");
+                }
+                continue;
+            }
+            if (isAbstract && !noBody) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("abstract method `") +
+                    std::string(ms->name) +
+                    "` may not have a body (§12.5)");
+            } else if (!isAbstract && noBody) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("non-abstract method `") +
+                    std::string(ms->name) +
+                    "` must have a body (§12.5)");
+            }
+        }
     }
 
     // Slice S32 (§10.5): an enum may not declare instance fields,
