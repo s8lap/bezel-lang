@@ -74,8 +74,21 @@ BEZEL_TEST(codegen_cg18, owned_field_subclass_disposed_dynamically) {
         "end Owner;"), 101);
 }
 
-// NOTE: a `using var` statically typed as a base but holding a subclass
-// (via a factory method) also disposes dynamically — but exercising it
-// needs a factory like `Make(): Base => new Derived();`, whose embedded
-// `new Derived()` type is not resolved by the front-end for *expression*
-// bodies (only block bodies). Lands with that FE fix.
+BEZEL_TEST(codegen_cg18, using_var_subclass_disposed_dynamically) {
+    // A using var statically typed Base, holding a Derived (via a factory),
+    // disposes to Derived.Dispose dynamically → 101 (not 100).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Base "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 100; end destructor; "
+        "  public static method Make(): Base => new Derived(); "
+        "  public static method Main(): int "
+        "    do using var b: Base := Make(); end; "
+        "    return _n; "
+        "  end Main; "
+        "end Base; "
+        "class Derived : Base "
+        "  destructor _n := _n + 1; end destructor; "
+        "end Derived;"), 101);
+}
