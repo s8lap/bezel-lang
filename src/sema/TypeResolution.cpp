@@ -63,6 +63,65 @@ public:
         // abstract / interface member. Skipped when a cycle exists
         // (the chain walk wouldn't terminate cleanly).
         if (!hadCycle) checkAbstractImplementations();
+        // Slice S14: duplicate non-overloadable member names within a
+        // single type.
+        checkDuplicateMembers();
+    }
+
+    // Slice S14: within one type, two members that aren't both
+    // overloadable cannot share a name. Methods and constructors are
+    // overloadable (same name, different signature is fine); fields,
+    // properties, events, constants, and nested types are not. A
+    // collision between a non-overloadable member and ANY other member
+    // of the same name is an error.
+    void checkDuplicateMembers() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeDuplicates(t);
+        }
+    }
+
+    static bool isOverloadable(Symbol* m) {
+        return dynamic_cast<MethodSymbol*>(m) != nullptr ||
+               dynamic_cast<ConstructorSymbol*>(m) != nullptr;
+    }
+
+    void checkTypeDuplicates(TypeSymbol* t) {
+        // Map name → the first member seen with that name. When a later
+        // member collides and at least one side is non-overloadable,
+        // diagnose at the later member.
+        std::unordered_map<std::string_view, Symbol*> seen;
+        for (Symbol* m : t->members) {
+            if (!m || m->name.empty()) continue;
+            // Constructors share the empty/synthetic name in some
+            // designs, but here they carry the type name or are
+            // overloadable anyway — skip diagnosing constructor-vs
+            // collisions.
+            auto it = seen.find(m->name);
+            if (it == seen.end()) {
+                seen[m->name] = m;
+                continue;
+            }
+            Symbol* prior = it->second;
+            // If both are overloadable, it's a legal overload pair.
+            if (isOverloadable(m) && isOverloadable(prior)) {
+                continue;
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, m->declLoc,
+                std::string("duplicate member `") + std::string(m->name) +
+                "` in type `" + std::string(t->name) +
+                "` (a non-overloadable member cannot share a name with "
+                "another member — §11.2)");
+        }
+        // Recurse into nested types.
+        for (Symbol* m : t->members) {
+            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                if (nt->type) checkTypeDuplicates(nt->type);
+            }
+        }
     }
 
     // Slice S12: DFS over baseTypes; if we revisit a node already in
