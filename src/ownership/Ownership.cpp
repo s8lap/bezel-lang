@@ -292,9 +292,51 @@ private:
             markDisposedByName(id->name, id->span.begin);
             return;
         }
+        // Slice O7: borrow-escape check. `return localRef.M(...)` /
+        // `return localRef.f` returns a borrow whose source is the
+        // local. If the local is a `using var` (scope-bound), the
+        // borrow outlives its source — error per §28.3.
+        checkBorrowEscapesOnReturn(e);
         // For `move x` return arm: covered by handleDischarge inside
         // the expression — but we also call it here.
         handleDischarge(e);
+    }
+
+    // Walk the return value's expression and, for each path that ends
+    // in a local-identifier root, verify the root isn't a `using var`.
+    void checkBorrowEscapesOnReturn(const ast::Expr& e) {
+        const ast::IdentifierExpr* root = identifierRoot(e);
+        if (!root) return;
+        for (const auto& [sym, st] : states_) {
+            if (sym->name != root->name) continue;
+            if (!st.implicitDischarge) continue;  // only `using var`
+            ctx_.diagnostics().report(
+                Severity::Error, root->span.begin,
+                std::string("borrow returned from `") +
+                std::string(root->name) +
+                "` would outlive its source — `using var` `" +
+                std::string(root->name) +
+                "` is disposed at scope end (§28.3 borrow-lifetime "
+                "rule; bind the source in the caller's scope and "
+                "return the borrow from there instead)");
+            return;
+        }
+    }
+
+    // Find the identifier at the root of a chain like `x.f.g[i].M(...)`.
+    // Returns null if the root isn't a bare identifier.
+    const ast::IdentifierExpr* identifierRoot(const ast::Expr& e) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+            return id;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+            return ma->target ? identifierRoot(*ma->target) : nullptr;
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e))
+            return nm->target ? identifierRoot(*nm->target) : nullptr;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+            return ce->callee ? identifierRoot(*ce->callee) : nullptr;
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+            return ix->target ? identifierRoot(*ix->target) : nullptr;
+        return nullptr;
     }
 
     // §28.3 join. Per the spec the join is asymmetric: matching states
