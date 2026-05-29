@@ -121,6 +121,28 @@ BEZEL_TEST(sema_member, cross_class_static_method_resolves) {
     }
 }
 
+// §12.3: `base.M` resolves M against the base class, so an override in
+// the current type is bypassed and the base's member is found.
+BEZEL_TEST(sema_member, base_member_resolves_to_base_not_override) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Derived : Base "
+        "  public override method V(): int => 2; "
+        "  public method CallBase() _ := base.V; end CallBase; "
+        "end Derived; "
+        "class Base public virtual method V(): int => 1; end Base;");
+    // Find the `base.V` access in Derived.CallBase.
+    auto* ma = firstMemberAccess(r);
+    BEZEL_EXPECT_TRUE(ma != nullptr);
+    if (ma) {
+        auto* sym = r.ctx->exprSymbol(*ma);
+        auto* ms = dynamic_cast<MethodSymbol*>(sym);
+        BEZEL_EXPECT_TRUE(ms != nullptr);
+        // The resolved method's parent is Base, not Derived.
+        if (ms) BEZEL_EXPECT_TRUE(ms->parent && ms->parent->name == "Base");
+    }
+}
+
 BEZEL_TEST(sema_member, this_method_resolves_to_method_symbol) {
     auto r = parseSemaAll(
         "module M; "
