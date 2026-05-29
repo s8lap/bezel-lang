@@ -51,6 +51,22 @@ private:
     // S7 doesn't flag those — they're part of the initialization flow).
     bool inConstructor_ = false;
 
+    // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
+    // §20 if-expression). Only flags when the condition has a resolved
+    // primitive type that is not bool — conditions whose type isn't yet
+    // inferred (unresolved identifiers, un-typed calls) are left alone
+    // so this pass never produces false positives on incomplete typing.
+    void checkConditionIsBool(const ast::Expr& cond, std::string_view ctx) {
+        TypeRef* t = ctx_.exprType(cond);
+        if (!t) return;
+        if (t->kind != TypeRef::Kind::Primitive) return;
+        if (t->primitive == PrimitiveType::Bool) return;
+        ctx_.diagnostics().report(
+            Severity::Error, cond.span.begin,
+            std::string("the ") + std::string(ctx) +
+            " condition must be `bool` (§21.2)");
+    }
+
     // Slice S7: diagnose assignment to a readonly field outside the
     // declaring class's constructor. Tracks only the `this.<field>`
     // target shape; `other.f := X` would need cross-object readonly
@@ -307,17 +323,26 @@ private:
         } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
             if (ts->value) visitExpr(*ts->value);
         } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-            if (ifs->ifBranch.condition) visitExpr(*ifs->ifBranch.condition);
+            if (ifs->ifBranch.condition) {
+                visitExpr(*ifs->ifBranch.condition);
+                checkConditionIsBool(*ifs->ifBranch.condition, "if");
+            }
             for (const auto& bs : ifs->ifBranch.body) {
                 if (bs) visitStmt(*bs);
             }
             for (const auto& el : ifs->elifBranches) {
-                if (el.condition) visitExpr(*el.condition);
+                if (el.condition) {
+                    visitExpr(*el.condition);
+                    checkConditionIsBool(*el.condition, "elif");
+                }
                 for (const auto& bs : el.body) if (bs) visitStmt(*bs);
             }
             for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-            if (ws->condition) visitExpr(*ws->condition);
+            if (ws->condition) {
+                visitExpr(*ws->condition);
+                checkConditionIsBool(*ws->condition, "while");
+            }
             for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
         } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
             if (fs->iterable) visitExpr(*fs->iterable);
@@ -739,7 +764,11 @@ private:
                 if (a.value) visitExpr(*a.value);
             }
         } else if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
-            if (ce->condition) visitExpr(*ce->condition);
+            if (ce->condition) {
+                visitExpr(*ce->condition);
+                // §20: the `if` expression's condition must be bool.
+                checkConditionIsBool(*ce->condition, "if-expression");
+            }
             if (ce->thenValue) visitExpr(*ce->thenValue);
             if (ce->elseValue) visitExpr(*ce->elseValue);
         } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {

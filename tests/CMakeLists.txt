@@ -93,6 +93,7 @@ set(BEZEL_TEST_SOURCES
     sema/hiding_override_test.cpp
     sema/static_class_members_test.cpp
     sema/class_modifier_combos_test.cpp
+    sema/bool_condition_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
