@@ -98,6 +98,31 @@ BEZEL_TEST(sema_new_expr, field_initializer_new_with_args_typed) {
     }
 }
 
+// A `new T()` embedded in an *expression* body (`=> new T()`) must be
+// type-resolved just like in a block body — else a factory method's
+// result has no type and fails to lower in codegen.
+BEZEL_TEST(sema_new_expr, expression_body_new_expr_typed) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class T end T; "
+        "class C public static method Make(): T => new T(); end C;");
+    // Find the Make method's expression body.
+    const bezel::ast::Expr* e = nullptr;
+    for (const auto& topD : r.sourceFile->topDecls) {
+        auto* td = dynamic_cast<const bezel::ast::TypeDecl*>(topD.get());
+        if (!td) continue;
+        for (const auto& m : td->members) {
+            auto* md = dynamic_cast<const bezel::ast::MethodDecl*>(m.get());
+            if (md && md->exprBody) e = md->exprBody.get();
+        }
+    }
+    BEZEL_EXPECT_TRUE(dynamic_cast<const bezel::ast::NewExpr*>(e) != nullptr);
+    if (e) {
+        auto* t = r.ctx->exprType(*e);
+        BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named);
+    }
+}
+
 BEZEL_TEST(sema_new_expr, new_named_type) {
     auto r = parseSemaAll(
         "module M; "

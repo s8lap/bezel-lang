@@ -1344,6 +1344,12 @@ private:
             // ExprTypecheck can pick them up to type identifier uses.
             if (md->bodyKind == ast::MethodBodyKind::Block) {
                 resolveTypesInBody(md->stmts, &methodScope);
+            } else if (md->bodyKind == ast::MethodBodyKind::Expression &&
+                       md->exprBody) {
+                // Resolve types embedded in an expression body too (e.g.
+                // `=> new T()`), mirroring block bodies — otherwise a
+                // factory method's `new T()` has no resolved type.
+                resolveTypesInExpr(*md->exprBody, &methodScope);
             }
         } else if (auto* od =
                        dynamic_cast<const ast::OperatorDecl*>(&m)) {
@@ -1355,6 +1361,9 @@ private:
             if (od->returnType) resolveType(*od->returnType, &methodScope);
             if (od->bodyKind == ast::MethodBodyKind::Block) {
                 resolveTypesInBody(od->stmts, &methodScope);
+            } else if (od->bodyKind == ast::MethodBodyKind::Expression &&
+                       od->exprBody) {
+                resolveTypesInExpr(*od->exprBody, &methodScope);
             }
         } else if (auto* cd =
                        dynamic_cast<const ast::ConstructorDecl*>(&m)) {
