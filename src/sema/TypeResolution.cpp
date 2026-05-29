@@ -76,6 +76,71 @@ public:
         checkOverloadSignatures();
         // Slice S22: top-level types may only be public or internal.
         checkTopLevelVisibility();
+        // Slice S23: record restrictions (§9.7).
+        checkRecordRestrictions();
+    }
+
+    // Slice S23 (§9.7): a record may not have a destructor, an `owned`
+    // field, an inline-array field whose slots carry the `owned`
+    // marker, or implement `IDisposable`. Records have copy semantics
+    // only and never own a resource.
+    void checkRecordRestrictions() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t || t->kind != ast::TypeDeclKind::Record) continue;
+            for (Symbol* m : t->members) {
+                if (dynamic_cast<DestructorSymbol*>(m)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("record `") + std::string(t->name) +
+                        "` may not declare a destructor (§9.7)");
+                    continue;
+                }
+                if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                    if (hasMod(fs, "owned")) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, m->declLoc,
+                            std::string("record `") + std::string(t->name) +
+                            "` may not have an `owned` field `" +
+                            std::string(fs->name) + "` (§9.7)");
+                        continue;
+                    }
+                    // Inline-array field with owned slots.
+                    if (auto* fd =
+                            dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                        if (fd->type) {
+                            auto* rt = ctx_.resolvedType(*fd->type);
+                            if (rt &&
+                                rt->kind == TypeRef::Kind::InlineArray &&
+                                rt->arrayOwned) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, m->declLoc,
+                                    std::string("record `") +
+                                    std::string(t->name) +
+                                    "` may not have an owning inline-array "
+                                    "field `" + std::string(fs->name) +
+                                    "` (§9.7)");
+                            }
+                        }
+                    }
+                }
+            }
+            // IDisposable implementation: name-based check on the AST
+            // base-type list (the built-in IDisposable has no user
+            // TypeSymbol to resolve against).
+            if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
+                for (const auto& bt : td->baseTypes) {
+                    if (bt && bt->name && !bt->name->parts.empty() &&
+                        bt->name->parts.back() == "IDisposable") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            std::string("record `") + std::string(t->name) +
+                            "` may not implement `IDisposable` (§9.7)");
+                    }
+                }
+            }
+        }
     }
 
     // Slice S22 (§13.2): a top-level type may be `public` or `internal`
