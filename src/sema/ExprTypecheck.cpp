@@ -67,6 +67,34 @@ private:
     // that a bare `throw;` / `throw` re-raise is valid only in a catch
     // arm body.
     int catchDepth_ = 0;
+    // Slice S29: true while walking a field/auto-property initializer,
+    // for the §22.8 rule that initializers may not observe instance
+    // state (`this`, `base`, instance members).
+    bool inFieldInitializer_ = false;
+
+    // Slice S29: report when a bare identifier inside a field
+    // initializer resolves to a non-static member of the current type
+    // (an implicit-`this` reference, forbidden by §22.8). Static
+    // members, class constants, enum constants, locals, parameters,
+    // types, and free names are all permitted.
+    void checkNotInstanceMember(const ast::IdentifierExpr& id, Symbol* sym) {
+        auto* mem = dynamic_cast<MemberSymbol*>(sym);
+        if (!mem) return;
+        // ConstMemberSymbol is implicitly static (a class const).
+        if (dynamic_cast<ConstMemberSymbol*>(sym)) return;
+        bool isStatic = false;
+        for (auto mod : mem->modifiers) {
+            if (mod == "static") { isStatic = true; break; }
+        }
+        if (isStatic) return;
+        // Only flag members of the type we're initializing.
+        if (currentType_ && mem->parent != currentType_) return;
+        ctx_.diagnostics().report(
+            Severity::Error, id.span.begin,
+            std::string("a field initializer may not reference instance "
+                        "member `") +
+            std::string(id.name) + "` (§22.8)");
+    }
 
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
@@ -377,7 +405,14 @@ private:
 
     void visitMember(const ast::Member& m) {
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
-            if (fd->initializer) visitExpr(*fd->initializer);
+            if (fd->initializer) {
+                // Slice S29 (§22.8): a field initializer may not observe
+                // instance state.
+                bool save = inFieldInitializer_;
+                inFieldInitializer_ = true;
+                visitExpr(*fd->initializer);
+                inFieldInitializer_ = save;
+            }
         } else if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
             const std::vector<std::unique_ptr<ast::Stmt>>* stmts =
                 (md->bodyKind == ast::MethodBodyKind::Block) ? &md->stmts
@@ -442,8 +477,13 @@ private:
             std::vector<ast::Param> none;
             if (pd->exprBody)
                 runMethodBody(none, nullptr, pd->exprBody.get(), nullptr);
-            if (pd->autoInitializer)
+            if (pd->autoInitializer) {
+                // §22.8 applies to auto-property initializers too.
+                bool save = inFieldInitializer_;
+                inFieldInitializer_ = true;
                 visitExpr(*pd->autoInitializer);
+                inFieldInitializer_ = save;
+            }
             for (const auto& a : pd->accessors) {
                 if (a.exprBody)
                     runMethodBody(none, nullptr, a.exprBody.get(), nullptr);
@@ -640,11 +680,23 @@ private:
                         "static constructor — it requires an instance "
                         "receiver (§12.3)");
                 }
+                // Slice S29 (§22.8): a field initializer may not
+                // reference `this` / `base`.
+                if (inFieldInitializer_) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, id->span.begin,
+                        std::string("a field initializer may not "
+                                    "reference `") +
+                        std::string(id->name) + "` (§22.8)");
+                }
                 return;
             }
             Symbol* sym = lookupName(id->name);
             if (sym) {
                 ctx_.setExprSymbol(&e, sym);
+                // Slice S29 (§22.8): a field initializer may not observe
+                // an instance member (implicit-`this` reference).
+                if (inFieldInitializer_) checkNotInstanceMember(*id, sym);
                 // Slice 3d: also attach the symbol's resolved type to
                 // the identifier expr so MemberAccessExpr can pick it
                 // up when this identifier is the target.
