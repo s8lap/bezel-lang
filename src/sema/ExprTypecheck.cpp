@@ -850,6 +850,9 @@ private:
                                 std::string("cannot instantiate interface `") +
                                 std::string(t->name) +
                                 "` with `new` (§11.2)");
+                        } else if (t->kind == ast::TypeDeclKind::Class) {
+                            // Slice T7: constructor arity / arg types.
+                            checkNewExprArgs(*ne, t);
                         }
                     }
                 }
@@ -926,18 +929,34 @@ private:
             }
         }
         if (sameName != 1) return;
-        std::size_t total = md->params.size();
+        checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
+                               std::string("call to `") +
+                               std::string(ms->name) + "`");
+    }
+
+    // Slices T5/T6/T7: shared check of an all-positional argument list
+    // against a parameter list — argument count within [required,
+    // total] (optional params lower the minimum), then per-argument
+    // assignability. Callers must have already ruled out named args
+    // and overload ambiguity.
+    void checkArgsAgainstParams(const std::vector<ast::Param>& params,
+                                const std::vector<ast::CallArgument>& args,
+                                SourceLocation loc,
+                                const std::string& calleeDesc) {
+        for (const auto& a : args) {
+            if (!a.name.empty()) return;  // named-arg call — defer
+        }
+        std::size_t total = params.size();
         std::size_t required = 0;
-        for (const auto& p : md->params) {
+        for (const auto& p : params) {
             if (!p.defaultValue) ++required;
         }
-        std::size_t got = ce.args.size();
+        std::size_t got = args.size();
         if (got < required || got > total) {
             ctx_.diagnostics().report(
-                Severity::Error, ce.span.begin,
-                std::string("call to `") + std::string(ms->name) +
-                "` has " + std::to_string(got) +
-                " argument(s) but the method takes " +
+                Severity::Error, loc,
+                calleeDesc + " has " + std::to_string(got) +
+                " argument(s) but expects " +
                 (required == total
                      ? std::to_string(total)
                      : std::to_string(required) + "–" +
@@ -945,24 +964,60 @@ private:
                 " (§22.5)");
             return;
         }
-        // Slice T6: each positional argument must be assignable to the
-        // corresponding parameter type. checkAssignable is itself
-        // conservative (only flags clear primitive / named-subtype
-        // mismatches), so this never false-positives on cases it can't
-        // judge. Arguments with a modifier (ref/out/owned) are skipped
-        // — their binding rules are checked elsewhere.
         for (std::size_t i = 0; i < got && i < total; ++i) {
-            const ast::CallArgument& a = ce.args[i];
+            const ast::CallArgument& a = args[i];
             if (!a.value || !a.modifier.empty() || a.isDiscard) continue;
-            const ast::Param& p = md->params[i];
+            const ast::Param& p = params[i];
             if (!p.type) continue;
             checkAssignable(ctx_.exprType(*a.value),
                             ctx_.resolvedType(*p.type),
                             a.value->span.begin,
                             std::string("argument ") +
-                            std::to_string(i + 1) + " to `" +
-                            std::string(ms->name) + "`");
+                            std::to_string(i + 1) + " to " + calleeDesc);
         }
+    }
+
+    // Slice T7: check `new T(args)` against T's sole constructor (if
+    // any). Zero declared constructors → the implicit default ctor
+    // takes no arguments. Multiple constructors → overload resolution
+    // is deferred, so skip.
+    void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
+        // A class with a primary constructor (parenthesized params after
+        // the name) carries those params on the TypeDecl rather than as
+        // a ConstructorSymbol, and may combine with chained body
+        // constructors. That interaction is deferred — skip such types.
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
+            if (td->hasPositionalFields) return;
+        }
+        std::vector<ConstructorSymbol*> ctors;
+        for (Symbol* m : t->members) {
+            if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+                if (!cs->isStatic) ctors.push_back(cs);
+            }
+        }
+        if (ctors.size() > 1) return;  // overloaded — defer
+        if (ctors.empty()) {
+            // Implicit default constructor: zero parameters. (A primary
+            // constructor would surface as a ConstructorSymbol, so the
+            // empty case really is the no-arg default.)
+            for (const auto& a : ne.args) {
+                if (!a.name.empty()) return;
+            }
+            if (!ne.args.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    std::string("`new ") + std::string(t->name) +
+                    "` has " + std::to_string(ne.args.size()) +
+                    " argument(s) but the implicit default constructor "
+                    "takes 0 (§22.7)");
+            }
+            return;
+        }
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(ctors[0]->decl);
+        if (!cd) return;
+        checkArgsAgainstParams(cd->params, ne.args, ne.span.begin,
+                               std::string("`new ") + std::string(t->name) +
+                               "`");
     }
 
     // §17.1: postfix `.` member access. The target's type determines
