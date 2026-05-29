@@ -67,7 +67,12 @@ struct TypeSymbol : Symbol {
     // Scope inside which members and generic params live. Always greater
     // than `scope` (which is the type's own enclosing scope).
     ScopeId memberScope = kModuleScope;
-    // baseTypes are populated by Type Resolution (slice 2), not here.
+    // Slice S5: base types resolved by TypeResolution. The first entry
+    // (if the AST has any base types and the first resolves to a
+    // class) is conventionally the base class; remaining entries are
+    // interfaces. Sema slice 5 doesn't yet distinguish — member lookup
+    // walks all of them.
+    std::vector<TypeSymbol*> baseTypes;
 };
 
 // A.2 TypeAliasDecl — its target type is resolved by Type Resolution.
