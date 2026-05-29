@@ -39,7 +39,43 @@ const bezel::ast::Type* firstFieldType(const bezel::test::SemaResult& r) {
     return fd ? fd->type.get() : nullptr;
 }
 
+// The type named in a `catch T` arm must be resolved (else codegen can't
+// match the arm). Finds the first try statement's first catch arm type.
+const bezel::ast::Type* firstCatchArmType(const bezel::test::SemaResult& r) {
+    if (!r.sourceFile) return nullptr;
+    for (const auto& topD : r.sourceFile->topDecls) {
+        auto* td = dynamic_cast<const bezel::ast::TypeDecl*>(topD.get());
+        if (!td) continue;
+        for (const auto& m : td->members) {
+            auto* md = dynamic_cast<const bezel::ast::MethodDecl*>(m.get());
+            if (!md) continue;
+            for (const auto& s : md->stmts) {
+                auto* ts = dynamic_cast<const bezel::ast::TryStmt*>(s.get());
+                if (ts && !ts->catches.empty() &&
+                    !ts->catches[0].types.empty())
+                    return ts->catches[0].types[0].get();
+            }
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
+
+BEZEL_TEST(sema_types, catch_arm_type_resolved) {
+    auto r = parseAndResolve(
+        "module M; class E end E; "
+        "class C public static method Main(): int "
+        "  try return 0; catch E => return 1; end; return 2; "
+        "end Main; end C;");
+    const auto* ty = firstCatchArmType(r);
+    BEZEL_EXPECT_TRUE(ty != nullptr);
+    if (ty) {
+        auto* rt = r.ctx->resolvedType(*ty);
+        BEZEL_EXPECT_TRUE(rt && rt->kind == TypeRef::Kind::Named &&
+                          rt->declaration != nullptr);
+    }
+}
 
 BEZEL_TEST(sema_types, primitive_int) {
     auto r = parseAndResolve("module M; class C public x: int; end C;");
