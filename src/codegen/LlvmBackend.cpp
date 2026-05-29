@@ -79,6 +79,7 @@ public:
         declareFunctions();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
         setupBuiltinExceptions();  // CG22
+        computeEnumValues();  // CG30
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }
@@ -161,6 +162,9 @@ private:
     std::unordered_map<std::string, llvm::GlobalVariable*> builtinDesc_;
     std::unordered_map<std::string, llvm::GlobalVariable*> builtinVtable_;
     llvm::Function* builtinDisposeFn_ = nullptr;
+
+    // CG30: computed integer value of each enum constant (§10).
+    std::unordered_map<const sema::Symbol*, std::int64_t> enumValue_;
 
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
@@ -340,6 +344,46 @@ private:
     // is the literal constant when present (int/bool literal), else the
     // zero value. Non-literal static initializers (which the spec runs in
     // a static constructor, §22) are deferred — the global is zeroed.
+    // CG30: compute each enum constant's integer value (§10). Explicit
+    // `:= N` sets the value; otherwise it is the previous value + 1
+    // (starting at 0). Only integer-literal initializers are evaluated;
+    // other constant expressions are deferred.
+    void computeEnumValues() {
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!ts || ts->kind != ast::TypeDeclKind::Enum) continue;
+            auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+            if (!td) continue;
+            std::int64_t running = 0;
+            for (const auto& ec : td->enumConstants) {
+                std::int64_t val = running;
+                if (ec.value) {
+                    if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(
+                            ec.value.get()))
+                        val = parseIntLiteral(lit->text);
+                }
+                for (const sema::Symbol* m : ts->members) {
+                    if (dynamic_cast<const sema::EnumConstantSymbol*>(m) &&
+                        m->name == ec.name) {
+                        enumValue_[m] = val;
+                        break;
+                    }
+                }
+                running = val + 1;
+            }
+        }
+    }
+
+    // CG30: if `e` resolves to an enum constant, its integer value (i32).
+    llvm::Value* enumConstant(const ast::Expr& e) {
+        auto* sym = ctx_.exprSymbol(e);
+        if (!dynamic_cast<sema::EnumConstantSymbol*>(sym)) return nullptr;
+        auto it = enumValue_.find(sym);
+        if (it == enumValue_.end()) return nullptr;
+        return llvm::ConstantInt::get(
+            i32(), static_cast<std::uint64_t>(it->second), /*isSigned=*/true);
+    }
+
     void declareStatics() {
         for (const auto& sym : ctx_.symbols()) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(sym.get());
@@ -1550,6 +1594,8 @@ private:
     //   CG1: integer literals.
     //   CG2: integer arithmetic / bitwise / shift binary ops, unary -/~/+.
     llvm::Value* lowerExpr(const ast::Expr& e) {
+        // CG30: an enum constant (`Color.Green`) is its integer value.
+        if (llvm::Value* ev = enumConstant(e)) return ev;
         if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
             return llvm::ConstantInt::get(
                 i32(),
