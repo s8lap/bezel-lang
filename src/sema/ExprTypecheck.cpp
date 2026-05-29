@@ -285,14 +285,14 @@ private:
                         }
                     }
                 } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
-                    // ParameterSymbol::decl is the ast::Node* for the
-                    // owning member; the actual ParamList entry is
-                    // accessible via the paramSymbolsOf lookup but
-                    // doesn't itself live as a Node we can resolve a
-                    // TypeRef on. Slice 3d does NOT type parameter
-                    // identifiers — that needs a small refactor that
-                    // makes Param a Node.
-                    (void)par;
+                    // Slice 3e: ParameterSymbol::declType points at the
+                    // parameter's Type ast (set by symbol collection).
+                    // Look up its resolved TypeRef and attach.
+                    if (par->declType) {
+                        if (auto* rt = ctx_.resolvedType(*par->declType)) {
+                            ctx_.setExprType(&e, rt);
+                        }
+                    }
                 } else if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
                     // Implicit `this.<field>` form: bare identifier
                     // resolving to a class field. Same field-type rule
@@ -410,10 +410,13 @@ private:
                         }
                     }
                 } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
-                    // Same trick: parameter's declared type ast lives
-                    // on its decl ParamDecl-like node — slice 3d
-                    // doesn't reach that yet.
-                    (void)par;
+                    if (par->declType) {
+                        if (auto* rt = ctx_.resolvedType(*par->declType)) {
+                            if (rt->kind == TypeRef::Kind::Named) {
+                                targetType = rt->declaration;
+                            }
+                        }
+                    }
                 }
             }
         }
