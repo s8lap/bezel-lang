@@ -83,15 +83,48 @@ public:
         return it == resolvedTypes_.end() ? nullptr : it->second;
     }
 
+    // Record the typecheck-pass-inferred type of an expression. Used by
+    // the expression-typecheck pass and queried by later passes
+    // (ownership, definite-assignment).
+    void setExprType(const ast::Expr* e, TypeRef* t) {
+        exprTypes_[e] = t;
+    }
+    TypeRef* exprType(const ast::Expr& e) const {
+        auto it = exprTypes_.find(&e);
+        return it == exprTypes_.end() ? nullptr : it->second;
+    }
+
+    // A small primitive-type cache: looking up the same primitive shape
+    // (Int, Bool, String, …) should return the same TypeRef so equality
+    // comparisons are cheap. The cache is populated lazily on first
+    // request.
+    TypeRef* primitiveTypeRef(PrimitiveType p, bool nullable = false);
+
 private:
     DiagnosticEngine& diagnostics_;
     std::vector<std::unique_ptr<Symbol>> symbols_;
     std::vector<std::unique_ptr<TypeRef>> typeRefs_;
     std::unordered_map<const ast::Type*, TypeRef*> resolvedTypes_;
+    std::unordered_map<const ast::Expr*, TypeRef*> exprTypes_;
+    // Cache for the common primitive TypeRefs. Key is `(p << 1) | nullable`.
+    std::unordered_map<std::uint32_t, TypeRef*> primitiveCache_;
     ModuleSymbol* module_ = nullptr;
     // Scope IDs are assigned in DFS order. `kModuleScope` (=1) is the
     // initial module scope; everything nested gets a fresh ID > 1.
     ScopeId nextScope_ = kModuleScope + 1;
 };
+
+inline TypeRef* SemaContext::primitiveTypeRef(PrimitiveType p, bool nullable) {
+    const std::uint32_t key =
+        (static_cast<std::uint32_t>(p) << 1) | (nullable ? 1u : 0u);
+    auto it = primitiveCache_.find(key);
+    if (it != primitiveCache_.end()) return it->second;
+    auto* ref = makeTypeRef();
+    ref->kind = TypeRef::Kind::Primitive;
+    ref->primitive = p;
+    ref->nullable = nullable;
+    primitiveCache_.emplace(key, ref);
+    return ref;
+}
 
 } // namespace bezel::sema
