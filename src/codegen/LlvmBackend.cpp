@@ -79,6 +79,9 @@ public:
         for (auto& [sym, fn] : ctorFns_) {
             emitConstructorBody(sym, fn);
         }
+        for (auto& [ts, fn] : disposerFns_) {
+            emitDisposerBody(ts, fn);
+        }
         return std::move(module_);
     }
 
@@ -111,8 +114,23 @@ private:
     struct LoopTargets {
         llvm::BasicBlock* continueTarget;
         llvm::BasicBlock* breakTarget;
+        // CG13: disposal-scope depth just outside this loop's body, so
+        // break/continue dispose the body's (and any nested) using vars.
+        std::size_t scopeDepth;
     };
     std::vector<LoopTargets> loopStack_;
+
+    // CG13: a pending scope-based disposal — a `using var`'s storage slot
+    // and the class whose Dispose to call. Held in a stack of scopes; the
+    // innermost block is the back. Disposed in reverse declaration order
+    // at each scope's normal exit (§28.3).
+    struct Disposal {
+        llvm::AllocaInst* slot;
+        const sema::TypeSymbol* cls;
+    };
+    std::vector<std::vector<Disposal>> disposeStack_;
+    // CG13: the compiler-generated Dispose function for each class.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
 
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
@@ -318,6 +336,51 @@ private:
                 module_.get());
             ctorFns_[cs] = fn;
         }
+
+        // CG13: declare a Dispose function `void(this)` for every class.
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+            auto* fnType = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnType, llvm::Function::ExternalLinkage,
+                "bz$" + std::string(ts->name) + "$Dispose", module_.get());
+            disposerFns_[ts] = fn;
+        }
+    }
+
+    // CG13: the class's user destructor body, if it declares one.
+    const ast::DestructorDecl* findDestructor(const sema::TypeSymbol* ts) {
+        for (const sema::Symbol* m : ts->members) {
+            if (dynamic_cast<const sema::DestructorSymbol*>(m)) {
+                return dynamic_cast<const ast::DestructorDecl*>(m->decl);
+            }
+        }
+        return nullptr;
+    }
+
+    // CG13: emit the compiler-generated Dispose body. This slice runs the
+    // user destructor body (if any) over `this`. Idempotency (the
+    // run-once flag), owned-field auto-disposal (§28.5), and base-class
+    // chaining (§28.4) are deferred to later slices — so Dispose is
+    // currently correct for classes with a destructor and no owned fields
+    // or disposable base. `using var` (the only caller in this slice)
+    // invokes it exactly once, so the missing idempotency is not yet
+    // observable.
+    void emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
+        currentFn_ = fn;
+        currentThis_ = &*fn->args().begin();
+        locals_.clear();
+        paramSlots_.clear();
+        disposeStack_.clear();
+        loopStack_.clear();
+        builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+        bool terminated = false;
+        if (const ast::DestructorDecl* dd = findDestructor(ts)) {
+            terminated = lowerScopedBlock(dd->body);
+        }
+        if (!terminated) builder_.CreateRetVoid();
     }
 
     // Pass 2: emit a function's body.
@@ -328,6 +391,8 @@ private:
         currentThis_ = nullptr;
         locals_.clear();
         paramSlots_.clear();
+        disposeStack_.clear();
+        loopStack_.clear();
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
         const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
@@ -338,7 +403,7 @@ private:
             llvm::Value* v = lowerExpr(*md->exprBody);
             terminated = emitReturn(fn, v);
         } else if (md->bodyKind == ast::MethodBodyKind::Block) {
-            terminated = lowerBody(md->stmts);
+            terminated = lowerScopedBlock(md->stmts);
         }
         if (!terminated) emitImplicitReturn(fn);
     }
@@ -354,9 +419,11 @@ private:
         currentThis_ = nullptr;
         locals_.clear();
         paramSlots_.clear();
+        disposeStack_.clear();
+        loopStack_.clear();
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
         bindParameters(fn, /*hasThis=*/true, &cs->params);
-        bool terminated = lowerBody(cd->body);
+        bool terminated = lowerScopedBlock(cd->body);
         if (!terminated) builder_.CreateRetVoid();
     }
 
@@ -423,6 +490,76 @@ private:
         if (v) builder_.CreateStore(v, slot);
     }
 
+    // CG13: register a `using var`'s scope-based disposal (§28.3). The
+    // local is disposed at the end of its enclosing block in reverse
+    // declaration order. Recorded against the innermost open scope.
+    void registerUsingDisposal(const ast::LocalDecl* ld) {
+        if (disposeStack_.empty()) return;
+        const sema::TypeSymbol* cls = classOfLocal(ld);
+        auto it = locals_.find(ld);
+        if (!cls || it == locals_.end()) return;
+        if (disposerFns_.find(cls) == disposerFns_.end()) return;
+        disposeStack_.back().push_back({it->second, cls});
+    }
+
+    // CG13: the class type of a local — from its declared type, else the
+    // resolved type of a `new T(...)` initializer.
+    const sema::TypeSymbol* classOfLocal(const ast::LocalDecl* ld) {
+        if (ld->type) {
+            if (auto* rt = ctx_.resolvedType(*ld->type)) {
+                if (rt->kind == sema::TypeRef::Kind::Named) return rt->declaration;
+            }
+        }
+        if (auto* ne =
+                dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+            if (ne->type) {
+                if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                    if (rt->kind == sema::TypeRef::Kind::Named)
+                        return rt->declaration;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    // CG13: lower a block as a disposal scope. Pushes a fresh scope; on
+    // normal fall-through, disposes its `using var`s in reverse and pops.
+    // If the block terminated early (return/break/continue), that
+    // terminator already emitted the needed disposals, so we only pop.
+    bool lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        disposeStack_.emplace_back();
+        bool terminated = lowerBody(body);
+        if (!terminated) emitDisposals(disposeStack_.back());
+        disposeStack_.pop_back();
+        return terminated;
+    }
+
+    // CG13: emit Dispose calls for one scope's `using var`s, in reverse
+    // declaration order (§28.4 ordering).
+    void emitDisposals(const std::vector<Disposal>& scope) {
+        for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
+            auto fnIt = disposerFns_.find(it->cls);
+            if (fnIt == disposerFns_.end()) continue;
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), it->slot);
+            builder_.CreateCall(fnIt->second, {obj});
+        }
+    }
+
+    // CG13: dispose every open scope (innermost → outermost) — the
+    // cleanup a `return` runs before leaving the method.
+    void emitAllDisposals() {
+        for (auto it = disposeStack_.rbegin(); it != disposeStack_.rend(); ++it)
+            emitDisposals(*it);
+    }
+
+    // CG13: dispose scopes from the innermost down to (and including) the
+    // loop body's scope — the cleanup `break`/`continue` runs before
+    // jumping out of / around the loop body.
+    void emitLoopDisposals(std::size_t loopScopeDepth) {
+        for (std::size_t i = disposeStack_.size(); i-- > loopScopeDepth;)
+            emitDisposals(disposeStack_[i]);
+    }
+
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).
     bool lowerBody(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
@@ -439,6 +576,7 @@ private:
     bool lowerStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
             lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
+            if (ld->isUsing) registerUsingDisposal(ld);
             return false;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
@@ -480,8 +618,12 @@ private:
             return false;
         }
         if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+            // The return value is evaluated first, then in-scope `using
+            // var`s are disposed (§28.3), then control leaves — so the
+            // returned value reflects pre-disposal state.
             llvm::Value* v = rs->value ? lowerExpr(*rs->value) : nullptr;
-            builder_.CreateRet(v ? v : llvm::ConstantInt::get(i32(), 0));
+            emitAllDisposals();
+            emitReturn(currentFn_, v);
             return true;
         }
         if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -499,9 +641,11 @@ private:
             return lowerWhile(*ws);
         }
         // CG11: break / continue jump to the innermost loop's exit /
-        // condition block. Both terminate the current block.
+        // condition block. CG13: they first dispose the loop body's (and
+        // any nested) `using var`s. Both terminate the current block.
         if (dynamic_cast<const ast::BreakStmt*>(&s)) {
             if (!loopStack_.empty()) {
+                emitLoopDisposals(loopStack_.back().scopeDepth);
                 builder_.CreateBr(loopStack_.back().breakTarget);
                 return true;
             }
@@ -509,10 +653,15 @@ private:
         }
         if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
             if (!loopStack_.empty()) {
+                emitLoopDisposals(loopStack_.back().scopeDepth);
                 builder_.CreateBr(loopStack_.back().continueTarget);
                 return true;
             }
             return false;
+        }
+        // CG13: a `do … end` block is a disposal scope (§A.6, §28.3).
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+            return lowerScopedBlock(db->body);
         }
         return false;  // unhandled statement kinds land in later slices
     }
@@ -544,7 +693,7 @@ private:
             else builder_.CreateBr(nextBB);  // defensive
 
             builder_.SetInsertPoint(bodyBB);
-            if (!lowerBody(br->body)) {
+            if (!lowerScopedBlock(br->body)) {
                 allPathsTerminate = false;
                 builder_.CreateBr(merge());
             }
@@ -553,7 +702,7 @@ private:
 
         // The final fall-through block is the else (or an empty pass-through).
         if (ifs.hasElse) {
-            if (!lowerBody(ifs.elseBody)) {
+            if (!lowerScopedBlock(ifs.elseBody)) {
                 allPathsTerminate = false;
                 builder_.CreateBr(merge());
             }
@@ -583,8 +732,10 @@ private:
         else builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(bodyBB);
-        loopStack_.push_back({condBB, endBB});
-        bool bodyTerminated = lowerBody(ws.body);
+        // CG13: the loop body is a disposal scope; break/continue unwind
+        // down to this depth (the scope index the body will occupy).
+        loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+        bool bodyTerminated = lowerScopedBlock(ws.body);
         loopStack_.pop_back();
         if (!bodyTerminated) builder_.CreateBr(condBB);  // back-edge
 
