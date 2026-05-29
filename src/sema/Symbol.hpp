@@ -140,6 +140,11 @@ struct LocalSymbol : Symbol {
 // they're part of the type's surface.
 struct ParameterSymbol : Symbol {
     std::string_view modifier; // "", "ref", "out", "out owned", "owned"
+    // Pointer back to the ast::Type for this parameter (the ast::Param
+    // itself isn't a Node, so we hold its `type` pointer directly).
+    // Null if the parameter has no declared type (lambda params with
+    // inferred types — slice S3e/lambda only).
+    const ast::Type* declType = nullptr;
 };
 
 // A.3 ExtensionDecl — collected at module level. Its target type is

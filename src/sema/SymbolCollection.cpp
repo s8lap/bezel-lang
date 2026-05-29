@@ -55,6 +55,7 @@ std::vector<Symbol*> collectParams(const std::vector<ast::Param>& params,
         sym->name = p.name;
         sym->modifier = p.modifier;
         sym->scope = scope;
+        sym->declType = p.type.get();
         out.push_back(sym);
     }
     return out;
