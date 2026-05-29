@@ -77,7 +77,8 @@ set(BEZEL_TEST_SOURCES
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
-    ownership/branch_joins_test.cpp)
+    ownership/branch_joins_test.cpp
+    ownership/owned_params_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
