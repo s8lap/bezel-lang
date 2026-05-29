@@ -133,16 +133,23 @@ private:
     // Detect `local.Dispose()` patterns and mark the local as Disposed.
     // Also detects `local` consumed as a `return` value (handleReturn
     // path) and `move local` (UnaryExpr op=move on bare identifier).
+    //
+    // Slice O2: before marking, check the current state — re-disposing
+    // or re-moving an already-Disposed/MovedFrom local is a diagnostic
+    // (the §28.3 "read of moved-from / disposed" rules).
     void handleDischarge(const ast::Expr& e) {
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-            // Match `name.Dispose()` — callee is MemberAccess(IdentifierExpr,
-            // "Dispose"), zero args.
+            // Walk arguments first — they're reads.
+            if (call->callee) checkRead(*call->callee, /*selfTarget=*/true);
+            for (const auto& a : call->args) {
+                if (a.value) checkRead(*a.value, /*selfTarget=*/false);
+            }
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                     call->callee.get())) {
                 if (ma->member == "Dispose") {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                             ma->target.get())) {
-                        markDisposedByName(id->name);
+                        markDisposedByName(id->name, id->span.begin);
                     }
                 }
             }
@@ -152,11 +159,66 @@ private:
             if (un->op == "move") {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         un->operand.get())) {
-                    markMovedByName(id->name);
+                    markMovedByName(id->name, id->span.begin);
+                    return; // don't re-check the now-moved-from operand
                 }
+            }
+            // Other unary ops — sub-expression is a regular read.
+            if (un->operand) checkRead(*un->operand, /*selfTarget=*/false);
+            return;
+        }
+        // Fallback: just check the expression as a read.
+        checkRead(e, /*selfTarget=*/false);
+    }
+
+    // Recursively descend an expression and, at each IdentifierExpr that
+    // names a tracked local, verify the local's ownership state is
+    // readable. `selfTarget=true` for the `x` in `x.Dispose()` — we
+    // tolerate that as the discharge use site; the post-marking handles
+    // it. For everything else, MovedFrom / Disposed is a diagnostic.
+    void checkRead(const ast::Expr& e, bool selfTarget) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            if (selfTarget) return;  // tolerated for discharge target
+            auto* st = lookupState(id->name);
+            if (!st) return;
+            if (st->state == OwnershipState::MovedFrom) {
+                ctx_.diagnostics().report(
+                    Severity::Error, id->span.begin,
+                    std::string("owned value in `") + std::string(id->name) +
+                    "` was already moved out at this point (§28.3)");
+                st->state = OwnershipState::Poisoned;
+            } else if (st->state == OwnershipState::Disposed) {
+                ctx_.diagnostics().report(
+                    Severity::Error, id->span.begin,
+                    std::string("read of disposed local `") +
+                    std::string(id->name) + "` (§28.3)");
+                st->state = OwnershipState::Poisoned;
             }
             return;
         }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target) checkRead(*ma->target, /*selfTarget=*/false);
+            return;
+        }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            if (be->left) checkRead(*be->left, false);
+            if (be->right) checkRead(*be->right, false);
+            return;
+        }
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            // Treat the callee as a member-access-target for discharge
+            // tolerance (so `x.M(x)` doesn't flag x).
+            if (call->callee) checkRead(*call->callee, true);
+            for (const auto& a : call->args) {
+                if (a.value) checkRead(*a.value, false);
+            }
+            return;
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            if (un->operand) checkRead(*un->operand, false);
+            return;
+        }
+        // Other expression forms — not exhaustive; later slices extend.
     }
 
     void handleReturn(const ast::Expr& e) {
@@ -165,7 +227,7 @@ private:
         // is sema's; here we just satisfy the discharge requirement
         // pessimistically.
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-            markDisposedByName(id->name);
+            markDisposedByName(id->name, id->span.begin);
             return;
         }
         // For `move x` return arm: covered by handleDischarge inside
@@ -184,22 +246,66 @@ private:
         return nullptr;
     }
 
-    void markDisposedByName(std::string_view name) {
+    LocalOwnership* lookupState(std::string_view name) {
         for (auto& [sym, st] : states_) {
-            if (sym->name == name) {
-                st.state = OwnershipState::Disposed;
-                return;
-            }
+            if (sym->name == name) return &st;
         }
+        return nullptr;
     }
 
-    void markMovedByName(std::string_view name) {
-        for (auto& [sym, st] : states_) {
-            if (sym->name == name) {
-                st.state = OwnershipState::MovedFrom;
-                return;
-            }
+    void markDisposedByName(std::string_view name, SourceLocation loc) {
+        auto* st = lookupState(name);
+        if (!st) return;
+        if (st->state == OwnershipState::Disposed) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("local `") + std::string(name) +
+                "` was already disposed (§28.3 — `.Dispose()` is "
+                "idempotent but re-calling it on a known-disposed local "
+                "indicates a bug)");
+            st->state = OwnershipState::Poisoned;
+            return;
         }
+        if (st->state == OwnershipState::MovedFrom) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("cannot dispose `") + std::string(name) +
+                "`: it was already moved out (§28.3)");
+            st->state = OwnershipState::Poisoned;
+            return;
+        }
+        st->state = OwnershipState::Disposed;
+    }
+
+    void markMovedByName(std::string_view name, SourceLocation loc) {
+        auto* st = lookupState(name);
+        if (!st) return;
+        if (st->state == OwnershipState::MovedFrom) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("owned value in `") + std::string(name) +
+                "` was already moved out at this point (§28.3)");
+            st->state = OwnershipState::Poisoned;
+            return;
+        }
+        if (st->state == OwnershipState::Disposed) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("cannot move from disposed local `") +
+                std::string(name) + "` (§28.3)");
+            st->state = OwnershipState::Poisoned;
+            return;
+        }
+        if (st->implicitDischarge) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("cannot move out of `using var` `") +
+                std::string(name) +
+                "`; `using var` is scope-bound (§28.3)");
+            st->state = OwnershipState::Poisoned;
+            return;
+        }
+        st->state = OwnershipState::MovedFrom;
     }
 };
 
