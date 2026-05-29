@@ -27,11 +27,12 @@ BEZEL_TEST(sema_abs_impl, unimplemented_abstract_method_diagnoses) {
 }
 
 BEZEL_TEST(sema_abs_impl, implemented_abstract_method_ok) {
+    // Overriding an abstract base member requires `override` (§12.1).
     auto r = parseSemaAll(
         "module M; "
         "abstract class Base public abstract method Draw(); end Base; "
         "class C : Base "
-        "  public method Draw() _ := 1; end Draw; "
+        "  public override method Draw() _ := 1; end Draw; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -67,7 +68,7 @@ BEZEL_TEST(sema_abs_impl, implementation_in_intermediate_class_ok) {
     auto r = parseSemaAll(
         "module M; "
         "abstract class A public abstract method Draw(); end A; "
-        "class B : A public method Draw() _ := 1; end Draw; end B; "
+        "class B : A public override method Draw() _ := 1; end Draw; end B; "
         "class C : B end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

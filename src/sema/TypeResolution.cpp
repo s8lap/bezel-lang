@@ -63,6 +63,8 @@ public:
         // abstract / interface member. Skipped when a cycle exists
         // (the chain walk wouldn't terminate cleanly).
         if (!hadCycle) checkAbstractImplementations();
+        // Slice S15: hiding forbidden / override must target a virtual.
+        if (!hadCycle) checkHidingAndOverride();
         // Slice S14: duplicate non-overloadable member names within a
         // single type.
         checkDuplicateMembers();
@@ -146,6 +148,88 @@ public:
     // when its parent is an interface (interface methods are implicitly
     // abstract), when it carries the `abstract` modifier, or when its
     // MethodDecl has an Abstract body.
+    static bool hasMod(MemberSymbol* m, std::string_view want) {
+        for (auto mod : m->modifiers) {
+            if (mod == want) return true;
+        }
+        return false;
+    }
+
+    // Slice S15: a base member is overridable when it is `virtual`,
+    // `abstract`, or `override` — but not `sealed override` (which
+    // seals it against further overriding, §12.4).
+    static bool baseMemberOverridable(MemberSymbol* m) {
+        if (hasMod(m, "virtual") || hasMod(m, "abstract")) return true;
+        if (hasMod(m, "override")) return !hasMod(m, "sealed");
+        return false;
+    }
+
+    // Slice S15: §12.2 forbids a derived class from reusing a base
+    // CLASS member's name except to override a virtual/abstract base
+    // member (§12.1). Interface members are excluded — re-declaring an
+    // interface member is implementation (matching), not hiding.
+    void checkHidingAndOverride() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+            // Gather base CLASS members by name (transitive).
+            std::unordered_map<std::string_view, MemberSymbol*> baseMembers;
+            std::vector<TypeSymbol*> frontier;
+            for (TypeSymbol* b : t->baseTypes) {
+                if (b && b->kind == ast::TypeDeclKind::Class) {
+                    frontier.push_back(b);
+                }
+            }
+            std::unordered_set<TypeSymbol*> seen;
+            std::size_t i = 0;
+            while (i < frontier.size()) {
+                TypeSymbol* cur = frontier[i++];
+                if (!seen.insert(cur).second) continue;
+                for (Symbol* m : cur->members) {
+                    if (auto* ms = dynamic_cast<MemberSymbol*>(m)) {
+                        // First (most-derived) base wins on collision.
+                        baseMembers.emplace(ms->name, ms);
+                    }
+                }
+                for (TypeSymbol* b : cur->baseTypes) {
+                    if (b && b->kind == ast::TypeDeclKind::Class) {
+                        frontier.push_back(b);
+                    }
+                }
+            }
+            if (baseMembers.empty()) continue;
+            for (Symbol* m : t->members) {
+                auto* ms = dynamic_cast<MemberSymbol*>(m);
+                if (!ms || ms->name.empty()) continue;
+                auto it = baseMembers.find(ms->name);
+                if (it == baseMembers.end()) continue;
+                MemberSymbol* base = it->second;
+                bool isOverride = hasMod(ms, "override");
+                if (isOverride) {
+                    if (!baseMemberOverridable(base)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string("`") + std::string(ms->name) +
+                            "` is declared `override` but the base "
+                            "member it would override is not `virtual`, "
+                            "`abstract`, or `override` (§12.1)");
+                    }
+                    // A legal override: signature-match checking is a
+                    // later slice.
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ms->declLoc,
+                        std::string("member `") + std::string(ms->name) +
+                        "` hides an inherited member of the same name; "
+                        "hiding is forbidden — use `override` for a "
+                        "virtual base member, or choose a different "
+                        "name (§12.2)");
+                }
+            }
+        }
+    }
+
     bool methodIsAbstract(MethodSymbol* ms) {
         if (ms->parent &&
             ms->parent->kind == ast::TypeDeclKind::Interface) {
