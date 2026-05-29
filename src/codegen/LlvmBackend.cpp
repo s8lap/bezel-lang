@@ -1689,6 +1689,10 @@ private:
         if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
             return lowerTypeTest(*te);
         }
+        // CG28: `case` expression (§19).
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+            return lowerCaseExpr(*ce);
+        }
         // CG8: field read `obj.f`.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
             llvm::Type* elemTy = nullptr;
@@ -2050,6 +2054,102 @@ private:
     // CG4: the conditional expression `thenValue if condition else
     // elseValue` (§20). Lowers to a branch + phi so only the taken
     // branch's value expression is evaluated (lazy, per spec).
+    // CG28: a `case` expression (§19). The scrutinee is evaluated once;
+    // each arm's pattern (+ optional `when` guard) is tested in order; the
+    // first match's body value is the result. A non-matching value raises
+    // MatchFailureException (§19.6). Handles constant, relational-operator,
+    // and discard patterns; binding/type/range/destructure patterns and
+    // block-body arms are deferred.
+    llvm::Value* lowerCaseExpr(const ast::CaseExpr& ce) {
+        if (!ce.scrutinee) return nullptr;  // scrutinee-less form deferred
+        llvm::Value* scrut = lowerExpr(*ce.scrutinee);
+        if (!scrut) return nullptr;
+        llvm::Type* resultTy = i32();
+        if (auto* rt = ctx_.exprType(ce)) resultTy = lowerTypeRef(rt);
+
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "case.end", currentFn_);
+        std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incomings;
+
+        for (const auto& arm : ce.arms) {
+            if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
+                !arm.exprBody)
+                return nullptr;  // block-body arms deferred
+            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut);
+            if (!pm) return nullptr;
+            auto* bodyBB =
+                llvm::BasicBlock::Create(llvm_, "case.arm", currentFn_);
+            auto* nextBB =
+                llvm::BasicBlock::Create(llvm_, "case.next", currentFn_);
+            if (arm.guard) {
+                auto* guardBB =
+                    llvm::BasicBlock::Create(llvm_, "case.guard", currentFn_);
+                builder_.CreateCondBr(pm, guardBB, nextBB);
+                builder_.SetInsertPoint(guardBB);
+                llvm::Value* g = lowerExpr(*arm.guard);
+                if (!g) return nullptr;
+                builder_.CreateCondBr(g, bodyBB, nextBB);
+            } else {
+                builder_.CreateCondBr(pm, bodyBB, nextBB);
+            }
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* v = lowerExpr(*arm.exprBody);
+            if (!v) return nullptr;
+            incomings.push_back({v, builder_.GetInsertBlock()});
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(nextBB);
+        }
+        // No arm matched → MatchFailureException (§19.6).
+        emitThrowBuiltin("MatchFailureException");
+
+        builder_.SetInsertPoint(endBB);
+        if (incomings.empty()) return llvm::Constant::getNullValue(resultTy);
+        auto* phi = builder_.CreatePHI(incomings[0].first->getType(),
+                                       incomings.size());
+        for (auto& [v, bb] : incomings) phi->addIncoming(v, bb);
+        return phi;
+    }
+
+    // CG28: does `pattern` match `scrut`? Returns an i1.
+    llvm::Value* patternMatches(const ast::Pattern* pat, llvm::Value* scrut) {
+        if (dynamic_cast<const ast::DiscardPattern*>(pat))
+            return builder_.getInt1(true);
+        if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(pat)) {
+            llvm::Value* any = builder_.getInt1(false);
+            for (const auto& c : cp->constants) {
+                if (!c) continue;
+                llvm::Value* cv = lowerExpr(*c);
+                if (!cv) return nullptr;
+                any = builder_.CreateOr(any, emitEquals(scrut, cv));
+            }
+            return any;
+        }
+        if (auto* rp = dynamic_cast<const ast::RelOpPattern*>(pat)) {
+            llvm::Value* rv = rp->expr ? lowerExpr(*rp->expr) : nullptr;
+            if (!rv) return nullptr;
+            bool fp = scrut->getType()->isFloatingPointTy();
+            if (rp->op == "<")
+                return fp ? builder_.CreateFCmpOLT(scrut, rv)
+                          : builder_.CreateICmpSLT(scrut, rv);
+            if (rp->op == ">")
+                return fp ? builder_.CreateFCmpOGT(scrut, rv)
+                          : builder_.CreateICmpSGT(scrut, rv);
+            if (rp->op == "<=")
+                return fp ? builder_.CreateFCmpOLE(scrut, rv)
+                          : builder_.CreateICmpSLE(scrut, rv);
+            if (rp->op == ">=")
+                return fp ? builder_.CreateFCmpOGE(scrut, rv)
+                          : builder_.CreateICmpSGE(scrut, rv);
+        }
+        return nullptr;  // binding/type/range/null/destructure — deferred
+    }
+
+    // CG28: equality of two same-typed scalars (int or FP).
+    llvm::Value* emitEquals(llvm::Value* a, llvm::Value* b) {
+        return a->getType()->isFloatingPointTy()
+                   ? builder_.CreateFCmpOEQ(a, b)
+                   : builder_.CreateICmpEQ(a, b);
+    }
+
     llvm::Value* lowerConditional(const ast::ConditionalExpr& c) {
         if (!c.condition || !c.thenValue || !c.elseValue) return nullptr;
         llvm::Value* cond = lowerExpr(*c.condition);
