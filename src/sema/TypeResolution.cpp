@@ -72,6 +72,142 @@ public:
         checkStaticClassMembers();
         // Slice S17: class-level modifier mutual-exclusions.
         checkClassModifierCombinations();
+        // Slice S19: overloads must differ in signature.
+        checkOverloadSignatures();
+    }
+
+    // Slice S19: structural equality of two resolved TypeRefs. Returns
+    // false (conservatively) when either is null or an Error kind — the
+    // caller skips the overload-equality check rather than risk a false
+    // collision on a not-yet-resolvable type.
+    static bool typeRefEqual(const TypeRef* a, const TypeRef* b) {
+        if (!a || !b) return false;
+        if (a->kind != b->kind) return false;
+        if (a->nullable != b->nullable) return false;
+        switch (a->kind) {
+            case TypeRef::Kind::Error:
+                return false;
+            case TypeRef::Kind::Unit:
+                return true;
+            case TypeRef::Kind::Primitive:
+                return a->primitive == b->primitive;
+            case TypeRef::Kind::Named: {
+                if (a->declaration != b->declaration) return false;
+                if (a->genericArgs.size() != b->genericArgs.size())
+                    return false;
+                for (std::size_t i = 0; i < a->genericArgs.size(); ++i) {
+                    if (!typeRefEqual(a->genericArgs[i], b->genericArgs[i]))
+                        return false;
+                }
+                return true;
+            }
+            case TypeRef::Kind::InlineArray:
+                return a->arrayOwned == b->arrayOwned &&
+                       typeRefEqual(a->arrayElement, b->arrayElement);
+            case TypeRef::Kind::Function: {
+                if (a->funcParams.size() != b->funcParams.size())
+                    return false;
+                for (std::size_t i = 0; i < a->funcParams.size(); ++i) {
+                    if (a->funcParams[i].modifier != b->funcParams[i].modifier)
+                        return false;
+                    if (!typeRefEqual(a->funcParams[i].type,
+                                      b->funcParams[i].type))
+                        return false;
+                }
+                return a->funcReturnOwned == b->funcReturnOwned &&
+                       typeRefEqual(a->funcReturn, b->funcReturn);
+            }
+        }
+        return false;
+    }
+
+    // Slice S19: the overload-distinguishing form of a parameter
+    // modifier (§22.6). `owned` on an ordinary parameter does NOT
+    // distinguish overloads — it normalizes to the plain value form —
+    // so two overloads differing only by ordinary `owned` collide.
+    // `out owned` IS distinct from `out`.
+    static std::string_view overloadModifier(std::string_view mod) {
+        if (mod == "owned" || mod.empty()) return "value";
+        if (mod == "out owned") return "out owned";
+        if (mod == "out") return "out";
+        if (mod == "ref") return "ref";
+        return mod;
+    }
+
+    // Slice S19 (§22.6): within a type, two same-named methods (or two
+    // constructors) may not have signatures that are indistinguishable
+    // under overload resolution — same parameter count, the same
+    // overload-modifier on each parameter, and structurally equal
+    // parameter types. Conservatively skips a pair when any parameter
+    // type fails to resolve.
+    void checkOverloadSignatures() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeOverloads(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeOverloads(nt->type);
+                }
+            }
+        }
+    }
+
+    void checkTypeOverloads(TypeSymbol* t) {
+        using Overload = std::pair<const std::vector<Symbol*>*, Symbol*>;
+        // Methods grouped by name; constructors grouped separately
+        // (they overload as a single name-less family).
+        std::unordered_map<std::string_view, std::vector<Overload>> methods;
+        std::vector<Overload> ctors;
+        for (Symbol* m : t->members) {
+            if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                methods[ms->name].push_back({&ms->params, m});
+            } else if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+                if (!cs->isStatic) ctors.push_back({&cs->params, m});
+            }
+        }
+        auto checkGroup = [&](std::vector<Overload>& overloads,
+                              const std::string& label) {
+            for (std::size_t i = 0; i < overloads.size(); ++i) {
+                for (std::size_t j = i + 1; j < overloads.size(); ++j) {
+                    if (signaturesIndistinguishable(*overloads[i].first,
+                                                    *overloads[j].first)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, overloads[j].second->declLoc,
+                            std::string("overload of ") + label +
+                            " is indistinguishable from another overload "
+                            "— overloads must differ in parameter count, "
+                            "types, or `ref`/`out` modifiers; ordinary "
+                            "`owned` does not distinguish (§22.6)");
+                    }
+                }
+            }
+        };
+        for (auto& [name, overloads] : methods) {
+            checkGroup(overloads, std::string("`") + std::string(name) + "`");
+        }
+        checkGroup(ctors, "constructor");
+    }
+
+    bool signaturesIndistinguishable(const std::vector<Symbol*>& a,
+                                     const std::vector<Symbol*>& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            auto* pa = dynamic_cast<ParameterSymbol*>(a[i]);
+            auto* pb = dynamic_cast<ParameterSymbol*>(b[i]);
+            if (!pa || !pb) return false;
+            if (overloadModifier(pa->modifier) !=
+                overloadModifier(pb->modifier)) {
+                return false;
+            }
+            TypeRef* ta = pa->declType ? ctx_.resolvedType(*pa->declType)
+                                       : nullptr;
+            TypeRef* tb = pb->declType ? ctx_.resolvedType(*pb->declType)
+                                       : nullptr;
+            if (!typeRefEqual(ta, tb)) return false;
+        }
+        return true;
     }
 
     // Slice S17 (§11.7): `abstract` and `static` are mutually
