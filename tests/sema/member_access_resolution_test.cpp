@@ -86,6 +86,41 @@ BEZEL_TEST(sema_member, this_field_resolves_to_field_symbol) {
     }
 }
 
+// Static member access `Type.member` across classes: the target is a
+// type name (resolving to a TypeSymbol), so the member is looked up on
+// that type. Before this, the type-name target produced no targetType
+// and the access silently went unresolved.
+BEZEL_TEST(sema_member, cross_class_static_field_resolves) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method M() _ := Other._total; end M; "
+        "end C; "
+        "class Other public static _total: int := 5; end Other;");
+    auto* ma = firstMemberAccess(r);
+    BEZEL_EXPECT_TRUE(ma != nullptr);
+    if (ma) {
+        auto* sym = r.ctx->exprSymbol(*ma);
+        BEZEL_EXPECT_TRUE(dynamic_cast<FieldSymbol*>(sym) != nullptr);
+        auto* t = r.ctx->exprType(*ma);
+        BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int);
+    }
+}
+
+BEZEL_TEST(sema_member, cross_class_static_method_resolves) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method M() _ := Other.Val; end M; "
+        "end C; "
+        "class Other public static method Val(): int => 7; end Other;");
+    auto* ma = firstMemberAccess(r);
+    if (ma) {
+        auto* sym = r.ctx->exprSymbol(*ma);
+        BEZEL_EXPECT_TRUE(dynamic_cast<MethodSymbol*>(sym) != nullptr);
+    }
+}
+
 BEZEL_TEST(sema_member, this_method_resolves_to_method_symbol) {
     auto r = parseSemaAll(
         "module M; "

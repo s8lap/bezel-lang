@@ -1147,6 +1147,12 @@ private:
                             }
                         }
                     }
+                } else if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+                    // Static member access `Type.member`: the target is a
+                    // type name, so look the member up on that type. (The
+                    // static-vs-instance correctness of the member is
+                    // enforced by the static-context checks, not here.)
+                    targetType = ts;
                 }
             }
         }
