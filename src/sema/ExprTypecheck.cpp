@@ -54,6 +54,9 @@ private:
     // being walked, for the §21.7 form rules.
     enum class ReturnCtx { None, ValueMethod, VoidMethod, CtorDtor };
     ReturnCtx returnCtx_ = ReturnCtx::None;
+    // Slice S26: enclosing-loop nesting depth, for the §21.5 rule that
+    // `break`/`continue` are legal only inside a loop.
+    int loopDepth_ = 0;
 
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
@@ -409,11 +412,28 @@ private:
                 visitExpr(*ws->condition);
                 checkConditionIsBool(*ws->condition, "while");
             }
+            ++loopDepth_;
             for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
+            --loopDepth_;
         } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
             if (fs->iterable) visitExpr(*fs->iterable);
             if (fs->withExpr) visitExpr(*fs->withExpr);
+            ++loopDepth_;
             for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
+            --loopDepth_;
+        } else if (dynamic_cast<const ast::BreakStmt*>(&s)) {
+            // Slice S26 (§21.5): `break` is legal only inside a loop.
+            if (loopDepth_ == 0) {
+                ctx_.diagnostics().report(
+                    Severity::Error, s.span.begin,
+                    "`break` is not allowed outside a loop (§21.5)");
+            }
+        } else if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
+            if (loopDepth_ == 0) {
+                ctx_.diagnostics().report(
+                    Severity::Error, s.span.begin,
+                    "`continue` is not allowed outside a loop (§21.5)");
+            }
         } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
             for (const auto& bs : dob->body) if (bs) visitStmt(*bs);
         } else if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
@@ -846,11 +866,17 @@ private:
             // follows the lambda's own return type — which slice S21
             // does not yet infer. Suppress the enclosing callable's
             // return-form context while walking the lambda body.
+            // §21.5: a loop in the enclosing scope does not make
+            // `break`/`continue` legal inside the lambda, so reset the
+            // loop depth across the lambda boundary too.
             ReturnCtx saveRet = returnCtx_;
+            int saveLoop = loopDepth_;
             returnCtx_ = ReturnCtx::None;
+            loopDepth_ = 0;
             if (lam->exprBody) visitExpr(*lam->exprBody);
             for (const auto& s : lam->stmts) if (s) visitStmt(*s);
             returnCtx_ = saveRet;
+            loopDepth_ = saveLoop;
         } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
             if (ce->scrutinee) visitExpr(*ce->scrutinee);
             for (const auto& arm : ce->arms) {

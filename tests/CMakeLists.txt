@@ -101,6 +101,7 @@ set(BEZEL_TEST_SOURCES
     sema/record_restrictions_test.cpp
     sema/builtin_types_test.cpp
     sema/builtin_exceptions_test.cpp
+    sema/break_continue_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
