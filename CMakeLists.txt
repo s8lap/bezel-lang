@@ -59,7 +59,8 @@ message(STATUS "Bezel: using LLVM ${LLVM_PACKAGE_VERSION} (cmake dir ${LLVM_DIR}
 # Components needed: IR construction (core), the ORC JIT used by codegen tests,
 # and the native target (with its codegen/asm-printer) for JIT execution and
 # eventual object emission.
-llvm_map_components_to_libnames(BEZEL_LLVM_LIBS core orcjit native)
+llvm_map_components_to_libnames(BEZEL_LLVM_LIBS
+    core orcjit native nativecodegen target codegen mc)
 # LLVM_DEFINITIONS is a space-separated flag string (e.g. -D_GNU_SOURCE …);
 # pass it as options, not as compile-definitions (which would re-prefix -D).
 separate_arguments(BEZEL_LLVM_DEFS NATIVE_COMMAND "${LLVM_DEFINITIONS}")

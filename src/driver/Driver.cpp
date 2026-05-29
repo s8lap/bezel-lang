@@ -5,7 +5,10 @@
 #include <memory>
 #include <sstream>
 
+#include <cstdlib>
+
 #include "codegen/CodeGen.hpp"
+#include "codegen/LlvmBackend.hpp"
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
 #include "ownership/OwnershipChecker.hpp"
@@ -17,6 +20,9 @@
 #include "sema/TypeChecker.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 
 namespace bezel {
 
@@ -34,9 +40,18 @@ bool readFile(const std::string& path, std::string& out) {
     return true;
 }
 
+// Link a native object into an executable using clang (the project's
+// toolchain). Returns true on success.
+bool linkExecutable(const std::string& objectPath,
+                    const std::string& exePath) {
+    std::string cmd = "clang " + objectPath + " -o " + exePath;
+    return std::system(cmd.c_str()) == 0;
+}
+
 } // namespace
 
-CompileResult Driver::compileFile(const std::string& path) {
+CompileResult Driver::compileFile(const std::string& path,
+                                  const std::string& outputPath) {
     std::string source;
     if (!readFile(path, source)) {
         std::cerr << "bezelc: error: cannot open '" << path << "'\n";
@@ -75,8 +90,25 @@ CompileResult Driver::compileFile(const std::string& path) {
         OwnershipChecker ownershipChecker(diagnostics);
         ownershipChecker.check(*unit);
 
-        CodeGen codegen(diagnostics);
-        codegen.emit(*unit);
+        // Codegen: when an output path is requested and the front-end is
+        // clean, lower to LLVM, emit a native object, and link an
+        // executable with clang.
+        if (!outputPath.empty() && !diagnostics.hasErrors()) {
+            llvm::LLVMContext llvmCtx;
+            auto module = codegen::emitModule(*unit, semaCtx, llvmCtx);
+            std::string objectPath = outputPath + ".o";
+            std::string err;
+            if (!module || !codegen::emitObjectFile(*module, objectPath, err)) {
+                std::cerr << "bezelc: codegen error: " << err << "\n";
+                return CompileResult{false, diagnostics.errorCount() + 1};
+            }
+            if (!linkExecutable(objectPath, outputPath)) {
+                std::cerr << "bezelc: link error\n";
+                std::remove(objectPath.c_str());
+                return CompileResult{false, diagnostics.errorCount() + 1};
+            }
+            std::remove(objectPath.c_str());
+        }
     }
 
     for (const Diagnostic& diag : diagnostics.diagnostics()) {

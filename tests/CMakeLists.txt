@@ -132,6 +132,7 @@ set(BEZEL_TEST_SOURCES
     codegen/conditional_test.cpp
     codegen/control_flow_test.cpp
     codegen/static_call_test.cpp
+    codegen/native_exe_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
