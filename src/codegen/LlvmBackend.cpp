@@ -109,7 +109,9 @@ private:
         builder_.CreateRet(ret);
     }
 
-    // Lower an expression to an LLVM value. Slice CG1: integer literals.
+    // Lower an expression to an LLVM value.
+    //   CG1: integer literals.
+    //   CG2: integer arithmetic / bitwise / shift binary ops, unary -/~/+.
     llvm::Value* lowerExpr(const ast::Expr& e) {
         if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
             return llvm::ConstantInt::get(
@@ -117,6 +119,49 @@ private:
                 static_cast<std::uint64_t>(parseIntLiteral(lit->text)),
                 /*isSigned=*/true);
         }
+        if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            return lowerBinary(*bin);
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            return lowerUnary(*un);
+        }
+        return nullptr;
+    }
+
+    // Slice CG2: integer binary operators. NOTE (§6.1): `+ - * / mod`
+    // are *overflow-checked* in Bezel (raise OverflowException) and
+    // `/`÷0 raises DivideByZeroException — those checks need the
+    // exception runtime (§31), which is not built yet, so this slice
+    // emits the value computation only (correct for the non-overflowing,
+    // non-zero-divisor case). The checks land with exceptions codegen.
+    // Bitwise/shift ops are not overflow-checked, so they are exact now.
+    llvm::Value* lowerBinary(const ast::BinaryExpr& bin) {
+        if (!bin.left || !bin.right) return nullptr;
+        llvm::Value* l = lowerExpr(*bin.left);
+        llvm::Value* r = lowerExpr(*bin.right);
+        if (!l || !r) return nullptr;
+        const auto& op = bin.op;
+        if (op == "+") return builder_.CreateAdd(l, r);
+        if (op == "-") return builder_.CreateSub(l, r);
+        if (op == "*") return builder_.CreateMul(l, r);
+        if (op == "/") return builder_.CreateSDiv(l, r);
+        if (op == "mod") return builder_.CreateSRem(l, r);
+        if (op == "&") return builder_.CreateAnd(l, r);
+        if (op == "|") return builder_.CreateOr(l, r);
+        if (op == "^") return builder_.CreateXor(l, r);
+        if (op == "<<") return builder_.CreateShl(l, r);
+        if (op == ">>") return builder_.CreateAShr(l, r);  // signed types
+        return nullptr;
+    }
+
+    llvm::Value* lowerUnary(const ast::UnaryExpr& un) {
+        if (!un.operand) return nullptr;
+        llvm::Value* v = lowerExpr(*un.operand);
+        if (!v) return nullptr;
+        const auto& op = un.op;
+        if (op == "-") return builder_.CreateNeg(v);   // §6.1 checked; see above
+        if (op == "~") return builder_.CreateNot(v);   // bitwise complement
+        if (op == "+") return v;                       // identity
         return nullptr;
     }
 };
