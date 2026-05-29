@@ -30,6 +30,14 @@ public:
                 if (!child->name.empty()) {
                     moduleScope_->names[child->name] = child;
                 }
+                // §32: an extern block's methods are module-scoped names so
+                // that calls to them resolve like ordinary functions.
+                if (auto* xb = dynamic_cast<ExternBlockSymbol*>(child)) {
+                    for (Symbol* d : xb->decls) {
+                        if (d && !d->name.empty())
+                            moduleScope_->names[d->name] = d;
+                    }
+                }
             }
         }
         for (const auto& decl : src.topDecls) {
@@ -981,6 +989,16 @@ private:
                 }
             } else if (md && !md->returnType) {
                 // No return type ascription → unit.
+                auto* unit = ctx_.makeTypeRef();
+                unit->kind = TypeRef::Kind::Unit;
+                ctx_.setExprType(&ce, unit);
+            }
+        } else if (auto* xd = dynamic_cast<ExternDeclSymbol*>(calleeSym)) {
+            // §32: a call to an extern method takes its declared return type.
+            if (xd->externDecl && xd->externDecl->returnType) {
+                if (auto* rt = ctx_.resolvedType(*xd->externDecl->returnType))
+                    ctx_.setExprType(&ce, rt);
+            } else {
                 auto* unit = ctx_.makeTypeRef();
                 unit->kind = TypeRef::Kind::Unit;
                 ctx_.setExprType(&ce, unit);

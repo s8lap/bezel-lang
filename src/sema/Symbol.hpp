@@ -181,6 +181,8 @@ struct ExternBlockSymbol : Symbol {
 struct ExternDeclSymbol : Symbol {
     ast::Visibility visibility = ast::Visibility::None;
     std::vector<Symbol*> params;
+    // The originating extern method declaration (for its return type).
+    const ast::ExternDecl* externDecl = nullptr;
 };
 
 } // namespace bezel::sema
