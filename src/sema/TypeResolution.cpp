@@ -68,6 +68,84 @@ public:
         // Slice S14: duplicate non-overloadable member names within a
         // single type.
         checkDuplicateMembers();
+        // Slice S16: a static class may contain only static members.
+        checkStaticClassMembers();
+    }
+
+    // Slice S16 (§11.7): a class declared `static` may contain only
+    // static members — no instance fields, methods, properties,
+    // indexers, instance constructors, destructors, or owned fields.
+    // A static constructor, static members, class-level consts (which
+    // are implicitly static), and nested types are permitted.
+    void checkStaticClassMembers() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+            bool isStatic = false;
+            for (auto mod : t->modifiers) {
+                if (mod == "static") { isStatic = true; break; }
+            }
+            if (!isStatic) continue;
+            for (Symbol* m : t->members) {
+                checkStaticClassMember(t, m);
+            }
+        }
+    }
+
+    void checkStaticClassMember(TypeSymbol* t, Symbol* m) {
+        auto reportInstance = [&](std::string_view kind,
+                                  std::string_view name) {
+            ctx_.diagnostics().report(
+                Severity::Error,
+                m->declLoc,
+                std::string("static class `") + std::string(t->name) +
+                "` may not declare instance " + std::string(kind) +
+                " `" + std::string(name) + "` (§11.7 — a static class "
+                "contains only static members)");
+        };
+        if (auto* dd = dynamic_cast<DestructorSymbol*>(m)) {
+            (void)dd;
+            ctx_.diagnostics().report(
+                Severity::Error, m->declLoc,
+                std::string("static class `") + std::string(t->name) +
+                "` may not declare a destructor (§11.7)");
+            return;
+        }
+        if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+            if (!cs->isStatic) reportInstance("constructor", t->name);
+            return;
+        }
+        if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+            if (!hasMod(fs, "static")) {
+                reportInstance("field", fs->name);
+            } else if (hasMod(fs, "owned")) {
+                // §11.7: a static class may not have owned fields at all.
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("static class `") + std::string(t->name) +
+                    "` may not declare an owned field `" +
+                    std::string(fs->name) + "` (§11.7)");
+            }
+            return;
+        }
+        if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+            if (!hasMod(ms, "static")) reportInstance("method", ms->name);
+            return;
+        }
+        if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+            if (!hasMod(ps, "static")) {
+                reportInstance(ps->isIndexer ? "indexer" : "property",
+                               ps->name);
+            }
+            return;
+        }
+        if (auto* es = dynamic_cast<EventSymbol*>(m)) {
+            if (!hasMod(es, "static")) reportInstance("event", es->name);
+            return;
+        }
+        // ConstMemberSymbol (implicitly static), NestedTypeSymbol,
+        // EnumConstantSymbol — permitted.
     }
 
     // Slice S14: within one type, two members that aren't both
