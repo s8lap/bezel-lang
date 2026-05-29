@@ -2,9 +2,11 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
+#include "sema/Symbol.hpp"
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -66,8 +68,21 @@ private:
     llvm::LLVMContext& llvm_;
     std::unique_ptr<llvm::Module> module_;
     llvm::IRBuilder<> builder_;
+    llvm::Function* currentFn_ = nullptr;
+    // CG3: each local's storage, keyed by its declaration node (a
+    // LocalDecl/LocalConstDecl). An IdentifierExpr resolves to a
+    // LocalSymbol whose `decl` is that node.
+    std::unordered_map<const ast::Node*, llvm::AllocaInst*> locals_;
 
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
+
+    // Create an alloca in the function's entry block (the conventional
+    // home for locals, so they dominate all uses once control flow lands).
+    llvm::AllocaInst* entryAlloca(llvm::Type* ty) {
+        llvm::BasicBlock& entry = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> tmp(&entry, entry.begin());
+        return tmp.CreateAlloca(ty);
+    }
 
     // §33 entry point: the first `public static method Main` found in any
     // top-level class. Multi-/missing-Main diagnostics are a later concern.
@@ -93,20 +108,88 @@ private:
             llvm::FunctionType::get(i32(), /*isVarArg=*/false);
         llvm::Function* mainFn = llvm::Function::Create(
             fnType, llvm::Function::ExternalLinkage, "main", module_.get());
+        currentFn_ = mainFn;
         builder_.SetInsertPoint(
             llvm::BasicBlock::Create(llvm_, "entry", mainFn));
 
         const ast::MethodDecl* main = findMain();
-        llvm::Value* ret = nullptr;
-        // Slice CG1: an expression-bodied `Main(): int` returns its
-        // (integer) expression. Other shapes fall back to 0 until later
-        // slices lower them.
+        bool terminated = false;
         if (main && main->bodyKind == ast::MethodBodyKind::Expression &&
             main->exprBody) {
-            ret = lowerExpr(*main->exprBody);
+            // CG1/CG2: `Main(): int => <expr>`.
+            llvm::Value* v = lowerExpr(*main->exprBody);
+            builder_.CreateRet(v ? v : llvm::ConstantInt::get(i32(), 0));
+            terminated = true;
+        } else if (main && main->bodyKind == ast::MethodBodyKind::Block) {
+            // CG3: a block body — lower statements until one terminates.
+            for (const auto& s : main->stmts) {
+                if (s && lowerStmt(*s)) { terminated = true; break; }
+            }
         }
-        if (!ret) ret = llvm::ConstantInt::get(i32(), 0);
-        builder_.CreateRet(ret);
+        // Fall-through (void Main or unterminated path): exit 0.
+        if (!terminated) builder_.CreateRet(llvm::ConstantInt::get(i32(), 0));
+    }
+
+    // Lower one statement into the current block. Returns true if the
+    // statement terminated the block (a return), so the caller stops.
+    // CG3: LocalDecl/LocalConstDecl, AssignmentStmt, ReturnStmt,
+    // ExpressionStmt, DiscardStmt.
+    bool lowerStmt(const ast::Stmt& s) {
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+            llvm::AllocaInst* slot = entryAlloca(i32());
+            locals_[ld] = slot;
+            if (ld->initializer) {
+                if (llvm::Value* v = lowerExpr(*ld->initializer)) {
+                    builder_.CreateStore(v, slot);
+                }
+            }
+            return false;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+            llvm::AllocaInst* slot = entryAlloca(i32());
+            locals_[lc] = slot;
+            if (lc->value) {
+                if (llvm::Value* v = lowerExpr(*lc->value)) {
+                    builder_.CreateStore(v, slot);
+                }
+            }
+            return false;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+            if (as->op == ":=" && as->target && as->value) {
+                if (llvm::AllocaInst* slot = localSlot(*as->target)) {
+                    if (llvm::Value* v = lowerExpr(*as->value)) {
+                        builder_.CreateStore(v, slot);
+                    }
+                }
+            }
+            return false;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+            llvm::Value* v = rs->value ? lowerExpr(*rs->value) : nullptr;
+            builder_.CreateRet(v ? v : llvm::ConstantInt::get(i32(), 0));
+            return true;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+            if (es->expr) lowerExpr(*es->expr);  // side effects only (CG3: none)
+            return false;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+            if (ds->value) lowerExpr(*ds->value);
+            return false;
+        }
+        return false;  // unhandled statement kinds land in later slices
+    }
+
+    // If `e` names a local variable, return its storage slot; else null.
+    llvm::AllocaInst* localSlot(const ast::Expr& e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+        if (!id) return nullptr;
+        sema::Symbol* sym = ctx_.exprSymbol(e);
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!loc || !loc->decl) return nullptr;
+        auto it = locals_.find(loc->decl);
+        return it == locals_.end() ? nullptr : it->second;
     }
 
     // Lower an expression to an LLVM value.
@@ -124,6 +207,12 @@ private:
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             return lowerUnary(*un);
+        }
+        // CG3: a reference to a local variable loads from its slot.
+        if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            if (llvm::AllocaInst* slot = localSlot(e)) {
+                return builder_.CreateLoad(slot->getAllocatedType(), slot);
+            }
         }
         return nullptr;
     }
