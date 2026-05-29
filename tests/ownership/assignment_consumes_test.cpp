@@ -1,5 +1,5 @@
 // Spec-derived tests for Ownership slice O15 — assignment RHS records
-// move side-effects (§28.3 / §28.6).
+// move side-effects (§28.3 / §28.8.1).
 //
 // `target := move source;` should mark source as MovedFrom regardless
 // of what target is. This applies to both local-target and

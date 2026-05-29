@@ -1,5 +1,5 @@
 // Spec-derived tests for Sema slice S9 — sealed-class inheritance
-// prohibition (§11.4). A class marked `sealed` is not a valid base.
+// prohibition (§12.4). A class marked `sealed` is not a valid base.
 
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"

@@ -114,7 +114,8 @@ public:
                 std::string("duplicate member `") + std::string(m->name) +
                 "` in type `" + std::string(t->name) +
                 "` (a non-overloadable member cannot share a name with "
-                "another member — §11.2)");
+                "another member of the same type; §11.3 lists the member "
+                "kinds — uniqueness is a well-formedness requirement)");
         }
         // Recurse into nested types.
         for (Symbol* m : t->members) {
@@ -205,7 +206,7 @@ public:
                         std::string("concrete class `") +
                         std::string(t->name) +
                         "` does not implement inherited abstract member `" +
-                        std::string(name) + "` (§11.4)");
+                        std::string(name) + "` (§12.5)");
                 }
             }
         }
@@ -223,7 +224,9 @@ public:
                     Severity::Error, t->declLoc,
                     std::string("circular inheritance detected at `") +
                     std::string(t->name) +
-                    "` — base-type chain re-enters this type (§11.3)");
+                    "` — base-type chain re-enters this type "
+                    "(circular inheritance is ill-formed: the dispatch "
+                    "model of §12 presupposes a well-founded base chain)");
                 reported.insert(t);
             }
             return true;
@@ -335,7 +338,7 @@ private:
                             std::string("class `") + std::string(td.name) +
                             "` already has a base class; only the "
                             "first base may be a class (single-"
-                            "inheritance — §11.3)");
+                            "inheritance — §11.1)");
                     }
                     bool sealed = false;
                     for (auto mod : base->modifiers) {
@@ -345,7 +348,7 @@ private:
                         ctx_.diagnostics().report(
                             Severity::Error, bt->span.begin,
                             std::string("cannot inherit from sealed class `") +
-                            std::string(base->name) + "` (§11.4)");
+                            std::string(base->name) + "` (§12.4)");
                     }
                 }
             }

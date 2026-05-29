@@ -1,5 +1,5 @@
 // Spec-derived tests for Sema slice S10 — single-inheritance check
-// for classes (§11.3). A class may name at most one class-kind base;
+// for classes (§11.1). A class may name at most one class-kind base;
 // the remaining base entries must be interfaces.
 
 #include "support/sema_support.hpp"

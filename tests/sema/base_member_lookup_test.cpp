@@ -1,8 +1,9 @@
 // Spec-derived tests for Sema slice S5 — base-type member lookup.
 //
-// Per §13 / §14: a member access on a Derived instance can resolve to
-// a member declared on a base type (class or interface). Slice S5
-// adds breadth-first lookup over the base-type chain.
+// Per §12 (inheritance and dispatch) with §11.1/§11.2 (base class and
+// implemented interfaces): a member access on a Derived instance can
+// resolve to a member declared on a base type (class or interface).
+// Slice S5 adds breadth-first lookup over the base-type chain.
 
 #include "sema/ExprTypecheck.hpp"
 #include "sema/Symbol.hpp"

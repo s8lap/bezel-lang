@@ -1,5 +1,5 @@
 // Spec-derived tests for Sema slice S13 — a concrete class must
-// implement every inherited abstract / interface member (§11.4).
+// implement every inherited abstract / interface member (§12.5; C.1).
 
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
