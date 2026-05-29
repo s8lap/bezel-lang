@@ -58,11 +58,32 @@ public:
                     "`.Dispose()`, `move`, or `return`)");
             }
         }
+        // Slice O8 / §28.6: a `move this.field` leaves the field in
+        // moved-from state. The field must be reassigned before the
+        // surrounding method exits — otherwise the field's invariant
+        // is broken on method return.
+        for (const auto& [name, moved] : fieldMovedFrom_) {
+            if (moved) {
+                ctx_.diagnostics().report(
+                    Severity::Error,
+                    fieldMoveLoc_.count(name)
+                        ? fieldMoveLoc_[name]
+                        : SourceLocation{},
+                    std::string("field `") + std::string(name) +
+                    "` left in moved-from state at method exit "
+                    "(§28.6 — reassign the field before exiting)");
+            }
+        }
     }
 
 private:
     sema::SemaContext& ctx_;
     std::unordered_map<sema::Symbol*, LocalOwnership> states_;
+    // Slice O8: per-method tracker for `move this.field` — the field's
+    // name maps to its moved-from state. fieldMoveLoc_ stores the
+    // move-site location for diagnostics.
+    std::unordered_map<std::string_view, bool> fieldMovedFrom_;
+    std::unordered_map<std::string_view, SourceLocation> fieldMoveLoc_;
 
     void visitStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
@@ -173,6 +194,54 @@ private:
             lo.state = OwnershipState::Uninitialized;
         }
         states_[lsym] = lo;
+        // Slice O8: if the initializer involves `move this.field`, mark
+        // the field as moved-from (the move side-effect happens at
+        // initializer evaluation time, regardless of the local's `using`
+        // status). This lets `using var old := move this._log;` correctly
+        // record that `_log` is now empty.
+        if (ld.initializer) {
+            recordMovesIn(*ld.initializer);
+        }
+    }
+
+    // Walk an expression and side-effect any `move` operations it
+    // contains. Used by handleLocalDecl so `move`-in-initializer
+    // properly transitions the source's state.
+    void recordMovesIn(const ast::Expr& e) {
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            if (un->op == "move") {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        un->operand.get())) {
+                    markMovedByName(id->name, id->span.begin);
+                    return;
+                }
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        un->operand.get())) {
+                    if (auto* tid =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                ma->target.get())) {
+                        if (tid->name == "this") {
+                            fieldMovedFrom_[ma->member] = true;
+                            fieldMoveLoc_[ma->member] = un->span.begin;
+                            return;
+                        }
+                    }
+                }
+            }
+            if (un->operand) recordMovesIn(*un->operand);
+            return;
+        }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            if (be->left) recordMovesIn(*be->left);
+            if (be->right) recordMovesIn(*be->right);
+            return;
+        }
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            for (const auto& a : call->args) {
+                if (a.value) recordMovesIn(*a.value);
+            }
+            return;
+        }
     }
 
     // Detect `local.Dispose()` patterns and mark the local as Disposed.
@@ -206,6 +275,21 @@ private:
                         un->operand.get())) {
                     markMovedByName(id->name, id->span.begin);
                     return; // don't re-check the now-moved-from operand
+                }
+                // Slice O8: `move this.field` — mark the field as
+                // moved-from. The field must be reassigned before
+                // method exit.
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        un->operand.get())) {
+                    if (auto* tid =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                ma->target.get())) {
+                        if (tid->name == "this") {
+                            fieldMovedFrom_[ma->member] = true;
+                            fieldMoveLoc_[ma->member] = un->span.begin;
+                            return;
+                        }
+                    }
                 }
             }
             // Other unary ops — sub-expression is a regular read.
@@ -268,18 +352,31 @@ private:
 
     void handleAssignment(const ast::AssignmentStmt& as) {
         // Slice O4: `x := EXPR` where x is a tracked local updates x's
-        // state to match the producer of EXPR. Other assignment shapes
-        // (`x.f := …`, `x[i] := …`) are handled in later slices.
+        // state to match the producer of EXPR.
         if (as.op != ":=") return;
         if (!as.target || !as.value) return;
-        const auto* id =
-            dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
-        if (!id) return;
-        for (auto& [sym, st] : states_) {
-            if (sym->name != id->name) continue;
-            st.state = producerState(*as.value);
-            st.obligationOrigin = &as;
+        if (const auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+            for (auto& [sym, st] : states_) {
+                if (sym->name != id->name) continue;
+                st.state = producerState(*as.value);
+                st.obligationOrigin = &as;
+                return;
+            }
             return;
+        }
+        // Slice O8: `this.field := value` clears the moved-from mark
+        // on the field. (We track only `this.field` shape — `other.f`
+        // and indexer-set are sema's broader concern.)
+        if (const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(as.target.get())) {
+            if (const auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get())) {
+                if (tid->name == "this") {
+                    fieldMovedFrom_[ma->member] = false;
+                }
+            }
         }
     }
 
