@@ -1,6 +1,7 @@
 #include "sema/TypeResolution.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include "ast/Node.hpp"
 #include "sema/Symbol.hpp"
@@ -55,6 +56,50 @@ public:
             if (!decl) continue;
             resolveTopDecl(*decl, &moduleScope);
         }
+        // Slice S12: after every base-type reference is resolved,
+        // walk each TypeSymbol's inheritance chain and report cycles.
+        checkInheritanceCycles();
+    }
+
+    // Slice S12: DFS over baseTypes; if we revisit a node already in
+    // the current path, report a cycle anchored at the offending
+    // TypeSymbol. Each cycle is reported once (at its smallest entry).
+    void checkInheritanceCycles() {
+        if (!ctx_.module()) return;
+        std::unordered_set<TypeSymbol*> reported;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            std::unordered_set<TypeSymbol*> visited;
+            std::vector<TypeSymbol*> path;
+            checkCycleFrom(t, visited, path, reported);
+        }
+    }
+
+    bool checkCycleFrom(
+        TypeSymbol* t,
+        std::unordered_set<TypeSymbol*>& visited,
+        std::vector<TypeSymbol*>& path,
+        std::unordered_set<TypeSymbol*>& reported) {
+        if (visited.count(t)) {
+            // We're seeing t again on this DFS path → cycle.
+            if (!reported.count(t)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("circular inheritance detected at `") +
+                    std::string(t->name) +
+                    "` — base-type chain re-enters this type (§11.3)");
+                reported.insert(t);
+            }
+            return true;
+        }
+        visited.insert(t);
+        path.push_back(t);
+        for (TypeSymbol* b : t->baseTypes) {
+            if (b) checkCycleFrom(b, visited, path, reported);
+        }
+        path.pop_back();
+        return false;
     }
 
 private:
