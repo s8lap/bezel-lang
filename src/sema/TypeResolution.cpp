@@ -80,6 +80,32 @@ public:
         checkRecordRestrictions();
     }
 
+    // Slice S24 (§2.3): generic arity of the always-available built-in
+    // type names. kNotBuiltin means "not a built-in"; kBuiltinTaskLike
+    // marks `Task`, which is valid both bare (`Task`) and unary
+    // (`Task<T>`). `Object` is handled earlier as a primitive.
+    static constexpr int kNotBuiltin = -1;
+    static constexpr int kBuiltinTaskLike = -2;
+    static int builtinTypeArity(std::string_view n) {
+        if (n == "Type" || n == "IDisposable" || n == "IAsyncDisposable" ||
+            n == "Subscription" || n == "CancellationToken") {
+            return 0;
+        }
+        if (n == "Task") return kBuiltinTaskLike;
+        if (n == "Array" || n == "OwnedArray" || n == "OwnedTask" ||
+            n == "IEnumerable" || n == "IEnumerator" ||
+            n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
+            n == "OwnedEnumerable" || n == "OwnedEnumerator" ||
+            n == "OwnedAsyncEnumerable" || n == "OwnedAsyncEnumerator" ||
+            n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
+            n == "ICollection" || n == "IList" ||
+            n == "IOwnedCollection" || n == "IOwnedList" ||
+            n == "IEvent" || n == "IAsyncEvent") {
+            return 1;
+        }
+        return kNotBuiltin;
+    }
+
     // Slice S23 (§9.7): a record may not have a destructor, an `owned`
     // field, an inline-array field whose slots carry the `owned`
     // marker, or implement `IDisposable`. Records have copy semantics
@@ -1024,6 +1050,32 @@ private:
                 ref.kind = TypeRef::Kind::Named;
                 ref.declaration = nullptr;
                 return;
+            }
+            // Slice S24 (§2.3): always-available built-in type names
+            // resolve without import. They have no user TypeSymbol, so
+            // we record a Named ref with a null declaration and verify
+            // generic arity against the spec's declared form.
+            if (t.name->parts.size() == 1) {
+                int arity = builtinTypeArity(first);
+                if (arity != kNotBuiltin) {
+                    ref.kind = TypeRef::Kind::Named;
+                    ref.declaration = nullptr;
+                    int n = static_cast<int>(t.genericArgs.size());
+                    bool ok = (arity == kBuiltinTaskLike) ? (n == 0 || n == 1)
+                                                          : (n == arity);
+                    if (!ok) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("generic-argument count does not "
+                                        "match built-in type `") +
+                            std::string(first) + "`");
+                    }
+                    for (const auto& ga : t.genericArgs) {
+                        if (!ga) continue;
+                        ref.genericArgs.push_back(resolveType(*ga, scope));
+                    }
+                    return;
+                }
             }
             ctx_.diagnostics().report(
                 Severity::Error, t.span.begin,
