@@ -262,6 +262,7 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
             dsym->visibility = d.visibility;
             dsym->scope = xbScope;
             dsym->params = collectParams(d.params, ctx, xbScope);
+            dsym->externDecl = &d;
             sym->decls.push_back(dsym);
         }
         return sym;
