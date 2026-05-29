@@ -94,6 +94,17 @@ public:
         return it == exprTypes_.end() ? nullptr : it->second;
     }
 
+    // Slice 3b: per-Expression resolved symbol (IdentifierExpr →
+    // local/parameter/type/member). Null when the expression doesn't
+    // carry a symbol reference or lookup failed.
+    void setExprSymbol(const ast::Expr* e, Symbol* s) {
+        exprSymbols_[e] = s;
+    }
+    Symbol* exprSymbol(const ast::Expr& e) const {
+        auto it = exprSymbols_.find(&e);
+        return it == exprSymbols_.end() ? nullptr : it->second;
+    }
+
     // A small primitive-type cache: looking up the same primitive shape
     // (Int, Bool, String, …) should return the same TypeRef so equality
     // comparisons are cheap. The cache is populated lazily on first
@@ -106,6 +117,7 @@ private:
     std::vector<std::unique_ptr<TypeRef>> typeRefs_;
     std::unordered_map<const ast::Type*, TypeRef*> resolvedTypes_;
     std::unordered_map<const ast::Expr*, TypeRef*> exprTypes_;
+    std::unordered_map<const ast::Expr*, Symbol*> exprSymbols_;
     // Cache for the common primitive TypeRefs. Key is `(p << 1) | nullable`.
     std::unordered_map<std::uint32_t, TypeRef*> primitiveCache_;
     ModuleSymbol* module_ = nullptr;
