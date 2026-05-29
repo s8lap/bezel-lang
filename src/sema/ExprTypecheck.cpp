@@ -576,6 +576,24 @@ private:
             // exprSymbol/exprType, and later passes can still proceed.
             return;
         }
+        // Slice S8: visibility check. A `private` member is accessible
+        // only from inside the declaring type. Walk the member's
+        // parent TypeSymbol; if it isn't currentType_, diagnose.
+        // Other visibilities (internal/protected/public) are deferred.
+        if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
+            if (msym->visibility == ast::Visibility::Private &&
+                msym->parent && msym->parent != currentType_) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    std::string("`") + std::string(ma.member) +
+                    "` is private to type `" +
+                    std::string(msym->parent->name) +
+                    "` and not accessible from `" +
+                    std::string(currentType_ ? currentType_->name
+                                             : std::string_view("(global)")) +
+                    "` (§22.3 visibility)");
+            }
+        }
         ctx_.setExprSymbol(&ma, member);
         // Attach the member's type for field / property access. Methods
         // and constructors are deferred to the call-resolution slice.
