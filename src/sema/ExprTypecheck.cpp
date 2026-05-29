@@ -373,6 +373,23 @@ private:
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
             resolveMemberAccess(*ma);
         }
+        // Slice 3f: NewExpr is typed as its constructed type. `default`
+        // and `typeof` follow the same pattern (default(T) → T,
+        // typeof(T) → Type per §17.1).
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+            if (ne->type) {
+                if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                    ctx_.setExprType(&e, rt);
+                }
+            }
+        }
+        if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
+            if (de->type) {
+                if (auto* rt = ctx_.resolvedType(*de->type)) {
+                    ctx_.setExprType(&e, rt);
+                }
+            }
+        }
     }
 
     // §17.1: postfix `.` member access. The target's type determines
