@@ -10,6 +10,7 @@
 #include "ownership/Ownership.hpp"
 #include "ownership/OwnershipChecker.hpp"
 #include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
@@ -58,6 +59,9 @@ CompileResult Driver::compileFile(const std::string& path) {
         sema::collectSymbols(*unit, semaCtx);
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
+        // Definite-assignment runs after expression typecheck so it
+        // can see the same scope structure ExprTypecheck built.
+        sema::checkDefiniteAssignment(*unit, semaCtx);
 
         // Ownership milestone — runs after sema since it needs
         // resolved local symbols + producer info.
