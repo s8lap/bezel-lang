@@ -74,7 +74,8 @@ set(BEZEL_TEST_SOURCES
     sema/expr_literal_types_test.cpp
     sema/expr_identifier_resolution_test.cpp
     flow/cfg_basic_test.cpp
-    flow/cfg_try_catch_test.cpp)
+    flow/cfg_try_catch_test.cpp
+    ownership/linear_owned_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
