@@ -148,6 +148,11 @@ private:
     // CG20: the exception value caught by the enclosing catch arm, so a
     // bare `throw;` can re-raise it (the global was cleared on arm entry).
     llvm::Value* currentCaughtExc_ = nullptr;
+    // CG21: the disposeStack_ depth to unwind to when branching to
+    // unwindTarget_ — using-var scopes from here up are disposed as an
+    // exception propagates out of them (§28.3). 0 = dispose all (the
+    // function propagate path).
+    std::size_t unwindScopeDepth_ = 0;
 
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
@@ -637,6 +642,7 @@ private:
         propagateBB_ = nullptr;
         unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr;
+        unwindScopeDepth_ = 0;
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
         bool terminated = false;
         if (const ast::DestructorDecl* dd = findDestructor(ts)) {
@@ -722,14 +728,29 @@ private:
         return unwindTarget_ ? unwindTarget_ : propagateBB();
     }
 
-    // CG20: after a call that may throw, branch to the unwind target when
-    // the exception global is non-null, else continue.
+    // CG21: dispose the using-vars of the scopes being exited as an
+    // exception unwinds to the current unwind target — scopes from the
+    // top of the stack down to unwindScopeDepth_ (inclusive), innermost
+    // first (§28.3 reverse order; nested scopes inner-before-outer).
+    void emitUnwindDisposals() {
+        for (std::size_t i = disposeStack_.size(); i-- > unwindScopeDepth_;)
+            emitDisposals(disposeStack_[i]);
+    }
+
+    // CG20/CG21: after a call that may throw, branch to the unwind target
+    // when the exception global is non-null (disposing unwound using-vars
+    // first), else continue.
     void emitPendingCheck() {
         llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
         llvm::Value* pending = builder_.CreateICmpNE(
             exc, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* unwind =
+            llvm::BasicBlock::Create(llvm_, "call.unwind", currentFn_);
         auto* cont = llvm::BasicBlock::Create(llvm_, "call.cont", currentFn_);
-        builder_.CreateCondBr(pending, unwindBB(), cont);
+        builder_.CreateCondBr(pending, unwind, cont);
+        builder_.SetInsertPoint(unwind);
+        emitUnwindDisposals();
+        builder_.CreateBr(unwindBB());
         builder_.SetInsertPoint(cont);
     }
 
@@ -790,6 +811,7 @@ private:
         propagateBB_ = nullptr;
         unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr;
+        unwindScopeDepth_ = 0;
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
         const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
@@ -821,6 +843,7 @@ private:
         propagateBB_ = nullptr;
         unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr;
+        unwindScopeDepth_ = 0;
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
         bindParameters(fn, /*hasThis=*/true, &cs->params);
 
@@ -1191,6 +1214,7 @@ private:
                 // global was cleared when the arm was entered).
                 builder_.CreateStore(currentCaughtExc_, excGlobal());
             }
+            emitUnwindDisposals();  // CG21: dispose unwound using-vars
             builder_.CreateBr(unwindBB());
             return true;
         }
@@ -1215,9 +1239,14 @@ private:
         auto* afterBB = llvm::BasicBlock::Create(llvm_, "try.after", currentFn_);
 
         llvm::BasicBlock* savedUnwind = unwindTarget_;
+        std::size_t savedDepth = unwindScopeDepth_;
         unwindTarget_ = dispatchBB;
+        // Unwinding into this try's catch disposes the try body's (and any
+        // nested) using-vars; the body scope is pushed at this depth.
+        unwindScopeDepth_ = disposeStack_.size();
         bool bodyTerm = lowerScopedBlock(trys.body);
         unwindTarget_ = savedUnwind;
+        unwindScopeDepth_ = savedDepth;
         if (!bodyTerm) builder_.CreateBr(afterBB);
 
         // Catch dispatch: test arms in order against the in-flight exception.
