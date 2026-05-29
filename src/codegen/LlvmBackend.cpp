@@ -102,6 +102,16 @@ private:
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
     std::unordered_map<sema::ConstructorSymbol*, llvm::Function*> ctorFns_;
 
+    // CG11: enclosing-loop branch targets for `break`/`continue` (§A.6).
+    // `continue` jumps to `continueTarget` (the loop's condition block),
+    // `break` to `breakTarget` (the loop's exit block). Innermost loop is
+    // the back of the vector.
+    struct LoopTargets {
+        llvm::BasicBlock* continueTarget;
+        llvm::BasicBlock* breakTarget;
+    };
+    std::vector<LoopTargets> loopStack_;
+
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
     std::unordered_map<const sema::TypeSymbol*, llvm::StructType*> structs_;
@@ -422,6 +432,22 @@ private:
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
             return lowerWhile(*ws);
         }
+        // CG11: break / continue jump to the innermost loop's exit /
+        // condition block. Both terminate the current block.
+        if (dynamic_cast<const ast::BreakStmt*>(&s)) {
+            if (!loopStack_.empty()) {
+                builder_.CreateBr(loopStack_.back().breakTarget);
+                return true;
+            }
+            return false;
+        }
+        if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
+            if (!loopStack_.empty()) {
+                builder_.CreateBr(loopStack_.back().continueTarget);
+                return true;
+            }
+            return false;
+        }
         return false;  // unhandled statement kinds land in later slices
     }
 
@@ -477,8 +503,8 @@ private:
         return allPathsTerminate;
     }
 
-    // CG5: while loop. cond block tests, body block loops back. break /
-    // continue are not yet lowered (deferred; no test uses them).
+    // CG5: while loop. cond block tests, body block loops back.
+    // CG11: `continue` targets condBB, `break` targets endBB.
     bool lowerWhile(const ast::WhileStmt& ws) {
         auto* condBB = llvm::BasicBlock::Create(llvm_, "while.cond", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "while.body", currentFn_);
@@ -491,7 +517,10 @@ private:
         else builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(bodyBB);
-        if (!lowerBody(ws.body)) builder_.CreateBr(condBB);  // back-edge
+        loopStack_.push_back({condBB, endBB});
+        bool bodyTerminated = lowerBody(ws.body);
+        loopStack_.pop_back();
+        if (!bodyTerminated) builder_.CreateBr(condBB);  // back-edge
 
         builder_.SetInsertPoint(endBB);
         return false;  // control may always exit the loop
