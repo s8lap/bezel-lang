@@ -139,6 +139,20 @@ private:
             if (tsym && ref && ref->kind == TypeRef::Kind::Named &&
                 ref->declaration) {
                 tsym->baseTypes.push_back(ref->declaration);
+                // Slice S9: a sealed class cannot be inherited from.
+                TypeSymbol* base = ref->declaration;
+                if (base->kind == ast::TypeDeclKind::Class) {
+                    bool sealed = false;
+                    for (auto mod : base->modifiers) {
+                        if (mod == "sealed") { sealed = true; break; }
+                    }
+                    if (sealed) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, bt->span.begin,
+                            std::string("cannot inherit from sealed class `") +
+                            std::string(base->name) + "` (§11.4)");
+                    }
+                }
             }
         }
         // Generic constraints.
