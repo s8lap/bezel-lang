@@ -1549,6 +1549,23 @@ private:
         if (auto* boolLit = dynamic_cast<const ast::BoolLiteralExpr*>(&e)) {
             return llvm::ConstantInt::get(i1(), boolLit->value ? 1 : 0);
         }
+        // CG23: the `null` literal is a null reference pointer.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
+            return llvm::ConstantPointerNull::get(ptrTy());
+        }
+        // CG23: postfix `!` (null-forgiving) — raise NullReferenceException
+        // if the operand is null, otherwise yield it (§17.12).
+        if (auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+            llvm::Value* v = bang->operand ? lowerExpr(*bang->operand)
+                                           : nullptr;
+            if (!v) return nullptr;
+            if (v->getType()->isPointerTy()) {
+                emitGuardThrow(builder_.CreateICmpEQ(
+                                   v, llvm::ConstantPointerNull::get(ptrTy())),
+                               "NullReferenceException");
+            }
+            return v;
+        }
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             return lowerBinary(*bin);
         }
