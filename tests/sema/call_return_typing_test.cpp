@@ -60,7 +60,7 @@ BEZEL_TEST(sema_call, method_call_returns_int) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
-        "  public method Helper(): int _ := 1; end Helper; "
+        "  public method Helper(): int => 1; "
         "  public method M() _ := this.Helper(); end M; "
         "end C;");
     auto* e = firstCallDiscardValue(r);
@@ -76,7 +76,7 @@ BEZEL_TEST(sema_call, method_call_returns_named) {
         "module M; "
         "class T end T; "
         "class C "
-        "  public method Make(): T _ := new T(); end Make; "
+        "  public method Make(): T => new T(); "
         "  public method M() _ := this.Make(); end M; "
         "end C;");
     auto* e = firstCallDiscardValue(r);
@@ -103,7 +103,7 @@ BEZEL_TEST(sema_call, method_without_return_type_is_unit) {
 BEZEL_TEST(sema_call, call_on_param_resolves) {
     auto r = parseSemaAll(
         "module M; "
-        "class T public method Read(): int _ := 1; end Read; end T; "
+        "class T public method Read(): int => 1; end T; "
         "class C "
         "  public method M(t: T) _ := t.Read(); end M; "
         "end C;");
@@ -117,7 +117,7 @@ BEZEL_TEST(sema_call, call_on_param_resolves) {
 BEZEL_TEST(sema_call, call_on_inferred_local_resolves) {
     auto r = parseSemaAll(
         "module M; "
-        "class T public method Read(): int _ := 1; end Read; end T; "
+        "class T public method Read(): int => 1; end T; "
         "class C "
         "  public method M() "
         "    var t := new T(); "

@@ -22,7 +22,7 @@ BEZEL_TEST(sema_static_class, static_method_in_static_class_ok) {
     auto r = parseSemaAll(
         "module M; "
         "static class Utils "
-        "  public static method Max(a: int, b: int): int _ := a; end Max; "
+        "  public static method Max(a: int, b: int): int => a; "
         "end Utils;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

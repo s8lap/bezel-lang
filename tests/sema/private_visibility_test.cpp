@@ -66,7 +66,7 @@ BEZEL_TEST(sema_priv, private_inherited_diagnoses_from_derived) {
 BEZEL_TEST(sema_priv, private_method_call_from_outside_diagnoses) {
     auto r = parseSemaAll(
         "module M; "
-        "class A private method Helper(): int _ := 1; end Helper; end A; "
+        "class A private method Helper(): int => 1; end A; "
         "class B "
         "  public method M(a: A) _ := a.Helper; end M; "
         "end B;");
