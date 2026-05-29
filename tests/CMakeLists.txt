@@ -70,7 +70,8 @@ set(BEZEL_TEST_SOURCES
     parser/index_arglist_test.cpp
     parser/e2e_kitchen_sink_test.cpp
     sema/symbol_collection_test.cpp
-    sema/type_resolution_test.cpp)
+    sema/type_resolution_test.cpp
+    flow/cfg_basic_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
