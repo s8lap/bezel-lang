@@ -70,6 +70,39 @@ public:
         checkDuplicateMembers();
         // Slice S16: a static class may contain only static members.
         checkStaticClassMembers();
+        // Slice S17: class-level modifier mutual-exclusions.
+        checkClassModifierCombinations();
+    }
+
+    // Slice S17 (§11.7): `abstract` and `static` are mutually
+    // exclusive; `sealed` and `static` are mutually exclusive.
+    // `sealed abstract` is permitted (a closed abstract class).
+    void checkClassModifierCombinations() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+            bool isStatic = false, isAbstract = false, isSealed = false;
+            for (auto mod : t->modifiers) {
+                if (mod == "static") isStatic = true;
+                else if (mod == "abstract") isAbstract = true;
+                else if (mod == "sealed") isSealed = true;
+            }
+            if (isStatic && isAbstract) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("class `") + std::string(t->name) +
+                    "` may not be both `abstract` and `static` "
+                    "(mutually exclusive — §11.7)");
+            }
+            if (isStatic && isSealed) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("class `") + std::string(t->name) +
+                    "` may not be both `sealed` and `static` "
+                    "(mutually exclusive — §11.7)");
+            }
+        }
     }
 
     // Slice S16 (§11.7): a class declared `static` may contain only
