@@ -876,6 +876,25 @@ private:
                      : std::to_string(required) + "–" +
                            std::to_string(total)) +
                 " (§22.5)");
+            return;
+        }
+        // Slice T6: each positional argument must be assignable to the
+        // corresponding parameter type. checkAssignable is itself
+        // conservative (only flags clear primitive / named-subtype
+        // mismatches), so this never false-positives on cases it can't
+        // judge. Arguments with a modifier (ref/out/owned) are skipped
+        // — their binding rules are checked elsewhere.
+        for (std::size_t i = 0; i < got && i < total; ++i) {
+            const ast::CallArgument& a = ce.args[i];
+            if (!a.value || !a.modifier.empty() || a.isDiscard) continue;
+            const ast::Param& p = md->params[i];
+            if (!p.type) continue;
+            checkAssignable(ctx_.exprType(*a.value),
+                            ctx_.resolvedType(*p.type),
+                            a.value->span.begin,
+                            std::string("argument ") +
+                            std::to_string(i + 1) + " to `" +
+                            std::string(ms->name) + "`");
         }
     }
 

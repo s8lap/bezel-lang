@@ -109,6 +109,7 @@ set(BEZEL_TEST_SOURCES
     sema/named_assignability_test.cpp
     sema/accessor_visibility_test.cpp
     sema/call_arity_test.cpp
+    sema/call_arg_types_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
