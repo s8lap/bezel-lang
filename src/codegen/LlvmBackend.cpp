@@ -1,6 +1,7 @@
 #include "codegen/LlvmBackend.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -380,7 +381,82 @@ private:
         if (const ast::DestructorDecl* dd = findDestructor(ts)) {
             terminated = lowerScopedBlock(dd->body);
         }
-        if (!terminated) builder_.CreateRetVoid();
+        // §28.4: after the destructor body, dispose owned fields (reverse
+        // declaration order), then chain to the base class's Dispose.
+        // (A destructor that returns early skips this — destructors with
+        // both an early return and owned fields are a deferred corner.)
+        if (!terminated) {
+            emitOwnedFieldDisposals(ts);
+            emitBaseDisposeChain(ts);
+            builder_.CreateRetVoid();
+        }
+    }
+
+    // §28.5: dispose the class's owned class-typed fields in reverse
+    // declaration order, null-checking each (a null slot has nothing to
+    // dispose). Interface-typed owned fields need runtime dispatch
+    // (vtables) and owning-inline-array fields need per-slot disposal —
+    // both deferred; such fields are skipped here.
+    void emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
+        std::vector<const sema::FieldSymbol*> owned;
+        for (const sema::Symbol* m : ts->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (!fs || !hasOwnedModifier(fs)) continue;
+            if (fieldIndex_.find(fs) == fieldIndex_.end()) continue;
+            owned.push_back(fs);
+        }
+        for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
+            const sema::TypeSymbol* fc = classOfField(*it);
+            if (!fc) continue;  // interface-typed / unresolved — deferred
+            auto fnIt = disposerFns_.find(fc);
+            if (fnIt == disposerFns_.end()) continue;
+            llvm::StructType* st = classStruct(ts);
+            unsigned idx = fieldIndex_[*it];
+            llvm::Value* addr = builder_.CreateStructGEP(st, currentThis_, idx);
+            llvm::Value* val = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                val, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "owned.dispose",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "owned.cont",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            builder_.CreateCall(fnIt->second, {val});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        }
+    }
+
+    // §28.4 step 3: chain to the base class's Dispose. baseTypes[0] is
+    // conventionally the base class when it resolves to one.
+    void emitBaseDisposeChain(const sema::TypeSymbol* ts) {
+        for (const sema::TypeSymbol* base : ts->baseTypes) {
+            if (!base || base->kind != ast::TypeDeclKind::Class) continue;
+            auto it = disposerFns_.find(base);
+            if (it != disposerFns_.end()) builder_.CreateCall(it->second,
+                                                              {currentThis_});
+            return;  // single base class
+        }
+    }
+
+    static bool hasOwnedModifier(const sema::FieldSymbol* fs) {
+        for (auto mod : fs->modifiers) {
+            if (mod == "owned") return true;
+        }
+        return false;
+    }
+
+    // The class type of a field, or null if its type isn't a class
+    // (interface-typed owned fields are deferred — see emitOwnedField…).
+    const sema::TypeSymbol* classOfField(const sema::FieldSymbol* fs) {
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return nullptr;
+        auto* rt = ctx_.resolvedType(*fd->type);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+            return nullptr;
+        if (rt->declaration->kind != ast::TypeDeclKind::Class) return nullptr;
+        return rt->declaration;
     }
 
     // Pass 2: emit a function's body.
@@ -1059,7 +1135,9 @@ std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
     // its AST decl), so the SourceFile root isn't needed directly; the
     // parameter is kept for API stability / future use.
     (void)src;
-    return Emitter(ctx, llvmCtx).run();
+    auto m = Emitter(ctx, llvmCtx).run();
+    if (m && std::getenv("BEZEL_DUMP_IR")) m->print(llvm::errs(), nullptr);
+    return m;
 }
 
 bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
