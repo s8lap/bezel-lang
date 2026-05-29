@@ -54,6 +54,10 @@ private:
     // being walked, for the §21.7 form rules.
     enum class ReturnCtx { None, ValueMethod, VoidMethod, CtorDtor };
     ReturnCtx returnCtx_ = ReturnCtx::None;
+    // Slice T3: the resolved return type of the value-returning
+    // callable currently being walked (null otherwise), for primitive
+    // return-value assignability (§5.1).
+    TypeRef* currentReturnType_ = nullptr;
     // Slice S26: enclosing-loop nesting depth, for the §21.5 rule that
     // `break`/`continue` are legal only inside a loop.
     int loopDepth_ = 0;
@@ -353,9 +357,13 @@ private:
             bool save = inStaticMember_;
             inStaticMember_ = isStatic;
             ReturnCtx saveRet = returnCtx_;
+            TypeRef* saveRetTy = currentReturnType_;
             returnCtx_ = returnsValue(md->returnType.get())
                 ? ReturnCtx::ValueMethod : ReturnCtx::VoidMethod;
+            currentReturnType_ = md->returnType
+                ? ctx_.resolvedType(*md->returnType) : nullptr;
             runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));
+            currentReturnType_ = saveRetTy;
             returnCtx_ = saveRet;
             inStaticMember_ = save;
         } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
@@ -366,9 +374,13 @@ private:
                 (od->bodyKind == ast::MethodBodyKind::Expression)
                     ? od->exprBody.get() : nullptr;
             ReturnCtx saveRet = returnCtx_;
+            TypeRef* saveRetTy = currentReturnType_;
             returnCtx_ = returnsValue(od->returnType.get())
                 ? ReturnCtx::ValueMethod : ReturnCtx::VoidMethod;
+            currentReturnType_ = od->returnType
+                ? ctx_.resolvedType(*od->returnType) : nullptr;
             runMethodBody(od->params, stmts, expr, paramSymbolsOf(m));
+            currentReturnType_ = saveRetTy;
             returnCtx_ = saveRet;
         } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
             bool saveStatic = inStaticMember_;
@@ -471,6 +483,13 @@ private:
         } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
             if (rs->value) visitExpr(*rs->value);
             checkReturnForm(*rs);
+            // Slice T3: a returned value must be primitive-assignable to
+            // the callable's return type.
+            if (rs->value && returnCtx_ == ReturnCtx::ValueMethod) {
+                checkPrimitiveAssignable(
+                    ctx_.exprType(*rs->value), currentReturnType_,
+                    rs->value->span.begin, "returned value");
+            }
         } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
             if (es->expr) visitExpr(*es->expr);
         } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
@@ -992,14 +1011,17 @@ private:
             // `break`/`continue` legal inside the lambda, so reset the
             // loop depth across the lambda boundary too.
             ReturnCtx saveRet = returnCtx_;
+            TypeRef* saveRetTy = currentReturnType_;
             int saveLoop = loopDepth_;
             int saveCatch = catchDepth_;
             returnCtx_ = ReturnCtx::None;
+            currentReturnType_ = nullptr;
             loopDepth_ = 0;
             catchDepth_ = 0;
             if (lam->exprBody) visitExpr(*lam->exprBody);
             for (const auto& s : lam->stmts) if (s) visitStmt(*s);
             returnCtx_ = saveRet;
+            currentReturnType_ = saveRetTy;
             loopDepth_ = saveLoop;
             catchDepth_ = saveCatch;
         } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
