@@ -53,6 +53,7 @@ add_library(bezel_core STATIC
     src/lexer/Lexer.cpp
     src/parser/Parser.cpp
     src/sema/TypeChecker.cpp
+    src/sema/SymbolCollection.cpp
     src/ownership/OwnershipChecker.cpp
     src/codegen/CodeGen.cpp
     src/driver/Driver.cpp)
