@@ -396,6 +396,42 @@ private:
                 }
             }
         }
+        // Slice 3h: CallExpr return-type typing. When the callee
+        // resolves to a MethodSymbol (via slice 3d's MemberAccessExpr
+        // resolver or slice 3b's identifier resolver), the call's
+        // exprType is the method's resolved return type. Overload
+        // picking is not yet implemented — the first matching member
+        // wins, which can give the wrong result when overloads have
+        // distinct return types. Tightened with the overload-resolution
+        // slice.
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+            typeCall(*ce);
+        }
+    }
+
+    // Slice 3h: resolve a CallExpr's return type from the callee's
+    // resolved MethodSymbol.
+    void typeCall(const ast::CallExpr& ce) {
+        if (!ce.callee) return;
+        Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
+        if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (md && md->returnType) {
+                if (auto* rt = ctx_.resolvedType(*md->returnType)) {
+                    ctx_.setExprType(&ce, rt);
+                }
+            } else if (md && !md->returnType) {
+                // No return type ascription → unit.
+                auto* unit = ctx_.makeTypeRef();
+                unit->kind = TypeRef::Kind::Unit;
+                ctx_.setExprType(&ce, unit);
+            }
+        }
+        // CallExpr where the callee is a constructor reference (e.g.
+        // `T(args)` form — rare in Bezel since `new T(args)` is the
+        // canonical form), or the callee is a type symbol, are not yet
+        // handled. Likewise calls on lambda values await the
+        // function-type slice.
     }
 
     // §17.1: postfix `.` member access. The target's type determines
