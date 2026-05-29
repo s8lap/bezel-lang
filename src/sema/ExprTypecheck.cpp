@@ -1122,8 +1122,18 @@ private:
         // currentType_.
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                 ma.target.get())) {
-            if (id->name == "this" || id->name == "base") {
+            if (id->name == "this") {
                 targetType = currentType_;
+            } else if (id->name == "base" && currentType_) {
+                // §12.3: `base.X` resolves X against the base class, so an
+                // override in the current type is bypassed and the base
+                // member is found.
+                for (TypeSymbol* b : currentType_->baseTypes) {
+                    if (b && b->kind == ast::TypeDeclKind::Class) {
+                        targetType = b;
+                        break;
+                    }
+                }
             }
         }
         if (!targetType && ma.target) {
