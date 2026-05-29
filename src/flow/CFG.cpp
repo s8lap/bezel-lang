@@ -32,6 +32,16 @@ struct LoopContext {
     CFGBlock* afterEnd; // break target
 };
 
+// Try-statement handler context. Updated as the builder enters / exits
+// a `try` block. Throws inside a try statement route to the catch
+// dispatcher (F2). Normal exits route through the finally (if any) on
+// the way to the after-try block.
+struct TryHandlerContext {
+    CFGBlock* catchDispatch = nullptr; // first catch's entry (Branch)
+    CFGBlock* finallyEntry  = nullptr; // null when no finally
+    CFGBlock* afterTry      = nullptr; // post-finally continuation
+};
+
 class Builder {
 public:
     Builder(CFG& cfg) : cfg_(cfg) {}
@@ -72,6 +82,17 @@ public:
 private:
     CFG& cfg_;
     std::vector<LoopContext> loops_;
+    std::vector<TryHandlerContext> tryHandlers_;
+
+    // Where should an exception (from a throwable call or an explicit
+    // throw) route to? Nearest enclosing catch dispatcher, or the
+    // function-level exit if none. Used by ThrowStmt visit.
+    CFGBlock* exceptionTarget() const {
+        if (!tryHandlers_.empty()) {
+            return tryHandlers_.back().catchDispatch;
+        }
+        return cfg_.exit();
+    }
 
     // Visit one statement starting from `from`. Returns the block that
     // continues the linear thread after this statement (which may be
@@ -96,11 +117,15 @@ private:
             return nullptr;
         }
         if (dynamic_cast<const ast::ThrowStmt*>(&s)) {
-            // F1: throws are terminators routed to exit. Exception edges
-            // for try/catch handlers arrive in F2.
+            // F2: throws route to the nearest enclosing catch dispatcher,
+            // falling through to the function exit when no try frame is
+            // active.
             from->stmts.push_back(&s);
-            cfg_.addEdge(from, cfg_.exit());
+            cfg_.addEdge(from, exceptionTarget());
             return nullptr;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+            return visitTry(*trys, from);
         }
         if (dynamic_cast<const ast::BreakStmt*>(&s)) {
             from->stmts.push_back(&s);
@@ -211,6 +236,95 @@ private:
         CFGBlock* bodyEnd = inner.runInto(s.body, bodyEntry);
         if (bodyEnd) cfg_.addEdge(bodyEnd, header);
         return after;
+    }
+
+    CFGBlock* visitTry(const ast::TryStmt& s, CFGBlock* from) {
+        // CFG shape (F2):
+        //
+        //   from → tryEntry → (linear body) → ┬── normal-exit ──→ finally?
+        //                                     └── exception-edge ─→ catchDispatch
+        //
+        //   catchDispatch → catch1Body → finally?
+        //                 → catch2Body → finally?
+        //                 ...
+        //   finally → afterTry
+        //
+        // Finally is omitted when the try has no FinallyClause; in that
+        // case the normal/catch exits go directly to afterTry.
+        CFGBlock* tryEntry  = cfg_.makeBlock(CFGBlock::Kind::Linear);
+        CFGBlock* afterTry  = cfg_.makeBlock(CFGBlock::Kind::Linear);
+        CFGBlock* finallyEntry =
+            s.hasFinally ? cfg_.makeBlock(CFGBlock::Kind::Linear) : nullptr;
+        // Catch dispatch: a Branch block fanning out to each catch arm.
+        // Even when there are zero catches (try…finally form), we still
+        // need a dispatch placeholder so throws have somewhere to land —
+        // it just unconditionally routes to finally (or beyond).
+        CFGBlock* catchDispatch =
+            cfg_.makeBlock(CFGBlock::Kind::Branch);
+
+        cfg_.addEdge(from, tryEntry);
+
+        // Build try body with this handler context active.
+        Builder inner(cfg_);
+        inner.loops_ = loops_;
+        inner.tryHandlers_ = tryHandlers_;
+        inner.tryHandlers_.push_back({catchDispatch, finallyEntry, afterTry});
+        CFGBlock* tryBodyEnd = inner.runInto(s.body, tryEntry);
+        if (tryBodyEnd) {
+            // Normal exit from the try body: route through finally (if any)
+            // then to afterTry.
+            cfg_.addEdge(tryBodyEnd,
+                         finallyEntry ? finallyEntry : afterTry);
+            // Also model the "throwable call inside the try body" as a
+            // possible exception edge from the body's end. A more precise
+            // F2 would emit one edge per throwable call site; for now we
+            // over-approximate with a single edge — sound for ownership
+            // (it sees the throw-path as reachable from the body end).
+            cfg_.addEdge(tryBodyEnd, catchDispatch);
+        }
+
+        // Build each catch arm.
+        for (const auto& arm : s.catches) {
+            CFGBlock* armEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
+            cfg_.addEdge(catchDispatch, armEntry);
+            // The arm's body is a single statement (DoEndBlock or any
+            // other Stmt). Visit it with the outer (one-frame-popped)
+            // try handler stack — a throw in a catch handler shouldn't
+            // route back to this catch.
+            Builder armInner(cfg_);
+            armInner.loops_ = loops_;
+            armInner.tryHandlers_ = tryHandlers_;
+            CFGBlock* armEnd = armEntry;
+            if (arm.body) {
+                armEnd = armInner.visitStmt(*arm.body, armEntry);
+            }
+            if (armEnd) {
+                cfg_.addEdge(armEnd,
+                             finallyEntry ? finallyEntry : afterTry);
+            }
+        }
+
+        // If there are no catches, the dispatch acts as a pass-through
+        // (any incoming exception edge propagates through finally to
+        // outside).
+        if (s.catches.empty()) {
+            cfg_.addEdge(catchDispatch,
+                         finallyEntry ? finallyEntry : afterTry);
+        }
+
+        // Build the finally block (if present).
+        if (finallyEntry) {
+            Builder finallyInner(cfg_);
+            finallyInner.loops_ = loops_;
+            finallyInner.tryHandlers_ = tryHandlers_;
+            CFGBlock* finallyEnd =
+                finallyInner.runInto(s.finallyBody, finallyEntry);
+            if (finallyEnd) {
+                cfg_.addEdge(finallyEnd, afterTry);
+            }
+        }
+
+        return afterTry;
     }
 
     CFGBlock* visitDoEnd(const ast::DoEndBlock& s, CFGBlock* from) {
