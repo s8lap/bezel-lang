@@ -199,6 +199,14 @@ private:
                 lsym->decl = ld;
                 lsym->isUsing = ld->isUsing;
                 lsym->isAwaitUsing = ld->isAwaitUsing;
+                // Slice 3g: type inference. Explicit `: Type` wins;
+                // otherwise infer from the initializer's exprType.
+                // Either may be null (plain `var x;` with no init).
+                if (ld->type) {
+                    lsym->declType = ctx_.resolvedType(*ld->type);
+                } else if (ld->initializer) {
+                    lsym->declType = ctx_.exprType(*ld->initializer);
+                }
                 currentScope_->names[ld->name] = lsym;
             }
         } else if (auto* lc =
@@ -276,13 +284,11 @@ private:
                 // the identifier expr so MemberAccessExpr can pick it
                 // up when this identifier is the target.
                 if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
-                    if (auto* ld =
-                            dynamic_cast<const ast::LocalDecl*>(loc->decl)) {
-                        if (ld->type) {
-                            if (auto* rt = ctx_.resolvedType(*ld->type)) {
-                                ctx_.setExprType(&e, rt);
-                            }
-                        }
+                    // Slice 3g: prefer the LocalSymbol's resolved type
+                    // (which already accounts for inference) over re-
+                    // querying the LocalDecl's ascription.
+                    if (loc->declType) {
+                        ctx_.setExprType(&e, loc->declType);
                     }
                 } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
                     // Slice 3e: ParameterSymbol::declType points at the
@@ -419,12 +425,9 @@ private:
                 // exprSymbol whose decl gives the resolved type).
                 auto* sym = ctx_.exprSymbol(*ma.target);
                 if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
-                    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
-                    if (ld && ld->type) {
-                        auto* rt = ctx_.resolvedType(*ld->type);
-                        if (rt && rt->kind == TypeRef::Kind::Named) {
-                            targetType = rt->declaration;
-                        }
+                    if (loc->declType &&
+                        loc->declType->kind == TypeRef::Kind::Named) {
+                        targetType = loc->declType->declaration;
                     }
                 } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
                     if (par->declType) {
