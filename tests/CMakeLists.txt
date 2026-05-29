@@ -74,6 +74,7 @@ set(BEZEL_TEST_SOURCES
     sema/expr_literal_types_test.cpp
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp
+    sema/member_access_resolution_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp

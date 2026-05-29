@@ -18,7 +18,8 @@ namespace {
 // unrelated diagnostics.
 std::string wrap(const std::string& body, const std::string& sig = "M()") {
     return std::string("module M; "
-        "class T end T; class U end U; class Source end Source; "
+        "class T end T; class U end U; "
+        "class Source public method Read(): T _ := new T(); end Read; end Source; "
         "class C "
         "  public source: Source := null; "
         "  public method ") + sig + " " + body + " end; "

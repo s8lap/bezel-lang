@@ -19,7 +19,11 @@ namespace {
 // identifier-resolution pass doesn't emit unrelated diagnostics.
 std::string wrap(const std::string& body) {
     return std::string("module M; "
-        "class T end T; class Stream end Stream; "
+        "class T end T; "
+        "class Stream "
+        "  public Inner: Stream := null; "
+        "  public Other: Stream := null; "
+        "end Stream; "
         "class C "
         "  public source: Stream := null; "
         "  public method M(cond: bool, a: bool, b: bool) "

@@ -169,7 +169,12 @@ private:
                     if (item.typeArg) resolveType(*item.typeArg, &methodScope);
                 }
             }
-            // Body expressions/statements not visited in slice 2.
+            // Slice 3d: also resolve type ascriptions inside the method
+            // body (LocalDecl `: Type`, foreach iteration type, …) so
+            // ExprTypecheck can pick them up to type identifier uses.
+            if (md->bodyKind == ast::MethodBodyKind::Block) {
+                resolveTypesInBody(md->stmts, &methodScope);
+            }
         } else if (auto* od =
                        dynamic_cast<const ast::OperatorDecl*>(&m)) {
             Scope methodScope;
@@ -178,6 +183,9 @@ private:
                 if (p.type) resolveType(*p.type, &methodScope);
             }
             if (od->returnType) resolveType(*od->returnType, &methodScope);
+            if (od->bodyKind == ast::MethodBodyKind::Block) {
+                resolveTypesInBody(od->stmts, &methodScope);
+            }
         } else if (auto* cd =
                        dynamic_cast<const ast::ConstructorDecl*>(&m)) {
             Scope ctorScope;
@@ -185,6 +193,10 @@ private:
             for (const auto& p : cd->params) {
                 if (p.type) resolveType(*p.type, &ctorScope);
             }
+            resolveTypesInBody(cd->body, &ctorScope);
+        } else if (auto* dd =
+                       dynamic_cast<const ast::DestructorDecl*>(&m)) {
+            resolveTypesInBody(dd->body, parent);
         } else if (auto* pd =
                        dynamic_cast<const ast::PropertyDecl*>(&m)) {
             if (pd->type) resolveType(*pd->type, parent);
@@ -208,6 +220,15 @@ private:
         }
         return nullptr;
     }
+
+    // Slice 3d: walk a method/ctor body and resolve every type
+    // ascription on LocalDecl / catch arm. Recurses through control-
+    // flow constructs. Locals themselves are not registered here (that
+    // happens later in ExprTypecheck); we only need their `: Type`
+    // ascriptions resolved so identifier-on-local typing works.
+    void resolveTypesInBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body, Scope* scope);
+    void resolveTypesInStmt(const ast::Stmt& s, Scope* scope);
 
     TypeRef* resolveType(const ast::Type& t, Scope* scope) {
         auto* ref = ctx_.makeTypeRef();
@@ -328,6 +349,54 @@ private:
         }
     }
 };
+
+void Resolver::resolveTypesInBody(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body, Scope* scope) {
+    for (const auto& s : body) {
+        if (s) resolveTypesInStmt(*s, scope);
+    }
+}
+
+void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->type) resolveType(*ld->type, scope);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->type) resolveType(*lc->type, scope);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        resolveTypesInBody(ifs->ifBranch.body, scope);
+        for (const auto& el : ifs->elifBranches)
+            resolveTypesInBody(el.body, scope);
+        resolveTypesInBody(ifs->elseBody, scope);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        resolveTypesInBody(ws->body, scope);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->varType) resolveType(*fs->varType, scope);
+        resolveTypesInBody(fs->body, scope);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        resolveTypesInBody(dob->body, scope);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        resolveTypesInBody(ts->body, scope);
+        for (const auto& arm : ts->catches) {
+            // Catch arm exception-type (when present) lives on the
+            // pattern; resolution of patterns isn't slice 3d's job.
+            if (arm.body) resolveTypesInStmt(*arm.body, scope);
+        }
+        resolveTypesInBody(ts->finallyBody, scope);
+        return;
+    }
+}
 
 } // namespace
 
