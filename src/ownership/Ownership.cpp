@@ -43,19 +43,40 @@ public:
         for (const auto& s : body) {
             if (s) visitStmt(*s);
         }
+        // Slice O11 (simple): if the body's last statement is an
+        // unconditional terminator that does not reach scope exit on
+        // any normal path (throw or — for a method whose return type
+        // is `()` — return), the §28.3 "exception-path discharge" rule
+        // covers any still-undischarged owned locals via the implicit
+        // try/finally during stack unwinding. Skip the undischarged
+        // check in that case.
+        //
+        // The check is necessarily approximate without a CFG: we only
+        // honor it for the lexically-last statement being a ThrowStmt.
+        // A throw inside an if-branch doesn't suppress the check (the
+        // other branches still normally exit). Future ownership CFG
+        // refactor sharpens this to "every normal-exit path ends in
+        // throw/return".
         // Scope-exit: every plain `var` owned local must have been
         // discharged. `using var` locals carry implicit discharge.
-        for (const auto& [sym, st] : states_) {
-            if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
-                ctx_.diagnostics().report(
-                    Severity::Error,
-                    st.obligationOrigin ? st.obligationOrigin->span.begin
-                                        : SourceLocation{},
-                    std::string("owned value in `") +
-                    std::string(sym->name) +
-                    "` would be dropped here without disposal "
-                    "(§28.3 — consider `using var`, explicit "
-                    "`.Dispose()`, `move`, or `return`)");
+        // O11 (simple) suppresses *this* check when the body's last
+        // statement is throw — exception unwinding's implicit
+        // try/finally handles the discharge. The field-move check
+        // below is NOT suppressed: the enclosing object survives the
+        // throw and its field invariant must still hold.
+        if (!bodyEndsInThrow(body)) {
+            for (const auto& [sym, st] : states_) {
+                if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
+                    ctx_.diagnostics().report(
+                        Severity::Error,
+                        st.obligationOrigin ? st.obligationOrigin->span.begin
+                                            : SourceLocation{},
+                        std::string("owned value in `") +
+                        std::string(sym->name) +
+                        "` would be dropped here without disposal "
+                        "(§28.3 — consider `using var`, explicit "
+                        "`.Dispose()`, `move`, or `return`)");
+                }
             }
         }
         // Slice O8 / §28.6: a `move this.field` leaves the field in
@@ -74,6 +95,17 @@ public:
                     "(§28.6 — reassign the field before exiting)");
             }
         }
+    }
+
+    // Slice O11 approximation: returns true if the body's lexically-
+    // last reachable statement is a ThrowStmt. Skips trailing nulls.
+    bool bodyEndsInThrow(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        for (auto it = body.rbegin(); it != body.rend(); ++it) {
+            if (!*it) continue;
+            return dynamic_cast<const ast::ThrowStmt*>(it->get()) != nullptr;
+        }
+        return false;
     }
 
 private:
