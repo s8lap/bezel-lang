@@ -12,6 +12,7 @@
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -74,6 +75,7 @@ public:
         declareStructs();
         declareStatics();
         declareFunctions();
+        declareVtables();  // CG17: after functions exist (needs fn ptrs)
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }
@@ -142,6 +144,20 @@ private:
     std::unordered_map<const sema::Symbol*, llvm::GlobalVariable*>
         staticGlobals_;
 
+    // CG17: virtual dispatch. Each class's vtable is a constant array of
+    // function pointers: slot 0 is Dispose, slots 1+ are virtual methods
+    // (an override reuses its base method's slot). The hidden vtable
+    // pointer lives at instance struct index 0.
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> vtables_;
+    std::unordered_map<const sema::MethodSymbol*, unsigned> vtableSlot_;
+    // Per-class slot→method (vector index i = vtable slot i+1; slot 0 is
+    // Dispose) and the virtual-method-name→slot map used to inherit slots.
+    std::unordered_map<const sema::TypeSymbol*,
+                       std::vector<sema::MethodSymbol*>> vtableMethods_;
+    std::unordered_map<const sema::TypeSymbol*,
+                       std::unordered_map<std::string_view, unsigned>>
+        vtableNameSlot_;
+
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
     llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
     llvm::Type* i64() { return llvm::Type::getInt64Ty(llvm_); }
@@ -170,6 +186,16 @@ private:
     static bool isStaticField(const sema::FieldSymbol* fs) {
         for (auto mod : fs->modifiers) {
             if (mod == "static") return true;
+        }
+        return false;
+    }
+
+    // CG17: a method participates in virtual dispatch if it is `virtual`,
+    // `override`, or `abstract` (all imply a vtable slot; §12.1/§12.5).
+    static bool isVirtual(const sema::MethodSymbol* ms) {
+        for (auto mod : ms->modifiers) {
+            if (mod == "virtual" || mod == "override" || mod == "abstract")
+                return true;
         }
         return false;
     }
@@ -236,7 +262,9 @@ private:
         std::vector<const sema::FieldSymbol*> fields;
         collectInstanceFields(t, fields);
         std::vector<llvm::Type*> fieldTys;
-        unsigned idx = 0;
+        // CG17: slot 0 is the hidden vtable pointer; data fields follow.
+        fieldTys.push_back(ptrTy());
+        unsigned idx = 1;
         for (const sema::FieldSymbol* fs : fields) {
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             fieldTys.push_back(fd ? lowerType(fd->type.get()) : i32());
@@ -364,6 +392,77 @@ private:
                 "bz$" + std::string(ts->name) + "$Dispose", module_.get());
             disposerFns_[ts] = fn;
         }
+    }
+
+    // CG17: assign vtable slots for a class, base-first. Slot 0 is Dispose
+    // (handled at emit time); virtual methods take slots 1+. An override
+    // reuses the base method's slot (matched by name — overloaded virtuals
+    // are deferred). Records the slot for every virtual/override method so
+    // a statically-resolved call can index the runtime object's vtable.
+    void buildVtable(const sema::TypeSymbol* t) {
+        if (vtableMethods_.count(t)) return;
+        std::vector<sema::MethodSymbol*> slots;
+        std::unordered_map<std::string_view, unsigned> nameSlot;
+        if (const sema::TypeSymbol* base = baseClassOf(t)) {
+            buildVtable(base);
+            slots = vtableMethods_[base];
+            nameSlot = vtableNameSlot_[base];
+        }
+        for (sema::Symbol* m : t->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+            if (!ms || isStaticMethod(ms) || !isVirtual(ms)) continue;
+            auto it = nameSlot.find(ms->name);
+            if (it != nameSlot.end()) {       // override: reuse base slot
+                slots[it->second - 1] = ms;
+                vtableSlot_[ms] = it->second;
+            } else {                          // new virtual: fresh slot
+                unsigned slot = static_cast<unsigned>(slots.size()) + 1;
+                slots.push_back(ms);
+                nameSlot[ms->name] = slot;
+                vtableSlot_[ms] = slot;
+            }
+        }
+        vtableMethods_[t] = std::move(slots);
+        vtableNameSlot_[t] = std::move(nameSlot);
+    }
+
+    // CG17: build each class's vtable global (slot 0 = Dispose, then the
+    // virtual-method slots). Runs after declareFunctions so the function
+    // pointers exist.
+    void declareVtables() {
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (ts && ts->kind == ast::TypeDeclKind::Class) buildVtable(ts);
+        }
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+            const auto& slots = vtableMethods_[ts];
+            std::vector<llvm::Constant*> elems;
+            // slot 0: Dispose
+            auto dit = disposerFns_.find(ts);
+            elems.push_back(dit != disposerFns_.end()
+                                ? llvm::cast<llvm::Constant>(dit->second)
+                                : llvm::ConstantPointerNull::get(ptrTy()));
+            for (sema::MethodSymbol* ms : slots) {
+                auto mit = methodFns_.find(ms);
+                elems.push_back(
+                    mit != methodFns_.end()
+                        ? llvm::cast<llvm::Constant>(mit->second)
+                        : llvm::ConstantPointerNull::get(ptrTy()));
+            }
+            auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
+            auto* init = llvm::ConstantArray::get(arrTy, elems);
+            vtables_[ts] = new llvm::GlobalVariable(
+                *module_, arrTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage, init,
+                "vt$" + std::string(ts->name));
+        }
+    }
+
+    llvm::GlobalVariable* vtableOf(const sema::TypeSymbol* t) {
+        auto it = vtables_.find(t);
+        return it == vtables_.end() ? nullptr : it->second;
     }
 
     // CG13: the class's user destructor body, if it declares one.
@@ -1118,6 +1217,13 @@ private:
         llvm::Value* obj = builder_.CreateCall(
             callocFn(), {builder_.getInt64(1), sizeofSt});
 
+        // CG17: install the vtable pointer (instance slot 0) before field
+        // initializers / the constructor, so virtual dispatch on the new
+        // object resolves to its own class.
+        if (llvm::GlobalVariable* vt = vtableOf(t)) {
+            builder_.CreateStore(vt, builder_.CreateStructGEP(st, obj, 0));
+        }
+
         // Run field initializers, inherited (base-first) then own, so a
         // `new Derived()` initializes base fields too (calloc already
         // zeroed the rest). CG16's base-ctor chaining runs ctor *bodies*,
@@ -1199,11 +1305,16 @@ private:
         llvm::Function* callee = it->second;
 
         std::vector<llvm::Value*> args;
+        bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
         if (!isStaticMethod(ms)) {
             // Receiver: the member-access target, else the current `this`.
             llvm::Value* recv = nullptr;
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                     call.callee.get())) {
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get())) {
+                    if (tid->name == "base") baseQualified = true;
+                }
                 recv = ma->target ? lowerExpr(*ma->target) : nullptr;
             } else {
                 recv = currentThis_;
@@ -1218,6 +1329,21 @@ private:
             args.push_back(v);
         }
         if (args.size() != callee->arg_size()) return nullptr;
+
+        // CG17: virtual dispatch — load the receiver's vtable pointer
+        // (instance slot 0) and call through the method's slot. A
+        // `base.M()` call bypasses dispatch (calls the base impl directly,
+        // §12.3), as do non-virtual methods.
+        auto slotIt = vtableSlot_.find(ms);
+        if (!baseQualified && !isStaticMethod(ms) &&
+            slotIt != vtableSlot_.end()) {
+            llvm::Value* recv = args[0];
+            llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+            llvm::Value* slotPtr = builder_.CreateGEP(
+                ptrTy(), vptr, {builder_.getInt32(slotIt->second)});
+            llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+            return builder_.CreateCall(callee->getFunctionType(), fnPtr, args);
+        }
         return builder_.CreateCall(callee, args);
     }
 
