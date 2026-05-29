@@ -50,6 +50,57 @@ private:
     // be assigned. Field initializers are handled separately (slice
     // S7 doesn't flag those — they're part of the initialization flow).
     bool inConstructor_ = false;
+    // Slice S21: the return-form context of the callable currently
+    // being walked, for the §21.7 form rules.
+    enum class ReturnCtx { None, ValueMethod, VoidMethod, CtorDtor };
+    ReturnCtx returnCtx_ = ReturnCtx::None;
+
+    // Slice S21: does a callable with this return-type ascription
+    // produce a value? No ascription → no (unit). An ascription that
+    // resolves to the unit type → no. Anything else → yes.
+    bool returnsValue(const ast::Type* rt) {
+        if (!rt) return false;
+        TypeRef* r = ctx_.resolvedType(*rt);
+        if (r && r->kind == TypeRef::Kind::Unit) return false;
+        return true;
+    }
+
+    // Slice S21 (§21.7) return-statement form rules:
+    //  - constructor / destructor: `return expression;` is an error.
+    //  - value-returning method: bare `return;` is an error.
+    //  - unit method: `return expression;` is an error.
+    // The "every exit path returns" coverage rule needs flow analysis
+    // and is left to a definite-return slice.
+    void checkReturnForm(const ast::ReturnStmt& rs) {
+        switch (returnCtx_) {
+            case ReturnCtx::None:
+                return;
+            case ReturnCtx::CtorDtor:
+                if (rs.value) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, rs.span.begin,
+                        "a constructor or destructor may not return a "
+                        "value; use `return;` (§21.7)");
+                }
+                return;
+            case ReturnCtx::ValueMethod:
+                if (!rs.value) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, rs.span.begin,
+                        "this callable has a return type — `return;` "
+                        "must provide a value (§21.7)");
+                }
+                return;
+            case ReturnCtx::VoidMethod:
+                if (rs.value) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, rs.span.begin,
+                        "this callable has no return type — `return` "
+                        "may not carry a value (§21.7)");
+                }
+                return;
+        }
+    }
 
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
@@ -217,7 +268,11 @@ private:
             }
             bool save = inStaticMember_;
             inStaticMember_ = isStatic;
+            ReturnCtx saveRet = returnCtx_;
+            returnCtx_ = returnsValue(md->returnType.get())
+                ? ReturnCtx::ValueMethod : ReturnCtx::VoidMethod;
             runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));
+            returnCtx_ = saveRet;
             inStaticMember_ = save;
         } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
             const std::vector<std::unique_ptr<ast::Stmt>>* stmts =
@@ -226,21 +281,31 @@ private:
             const ast::Expr* expr =
                 (od->bodyKind == ast::MethodBodyKind::Expression)
                     ? od->exprBody.get() : nullptr;
+            ReturnCtx saveRet = returnCtx_;
+            returnCtx_ = returnsValue(od->returnType.get())
+                ? ReturnCtx::ValueMethod : ReturnCtx::VoidMethod;
             runMethodBody(od->params, stmts, expr, paramSymbolsOf(m));
+            returnCtx_ = saveRet;
         } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
             bool saveStatic = inStaticMember_;
             bool saveCtor = inConstructor_;
+            ReturnCtx saveRet = returnCtx_;
             // Slice S6: static constructor body has no `this`.
             inStaticMember_ = cd->isStatic;
             // Slice S7: readonly fields are assignable inside ctors.
             inConstructor_ = true;
+            returnCtx_ = ReturnCtx::CtorDtor;
             runMethodBody(cd->params, &cd->body, nullptr,
                           paramSymbolsOf(m));
+            returnCtx_ = saveRet;
             inStaticMember_ = saveStatic;
             inConstructor_ = saveCtor;
         } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
             std::vector<ast::Param> none;
+            ReturnCtx saveRet = returnCtx_;
+            returnCtx_ = ReturnCtx::CtorDtor;
             runMethodBody(none, &dd->body, nullptr, nullptr);
+            returnCtx_ = saveRet;
         } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
             std::vector<ast::Param> none;
             if (pd->exprBody)
@@ -311,6 +376,7 @@ private:
             }
         } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
             if (rs->value) visitExpr(*rs->value);
+            checkReturnForm(*rs);
         } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
             if (es->expr) visitExpr(*es->expr);
         } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
@@ -776,8 +842,15 @@ private:
         } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
             if (th->operand) visitExpr(*th->operand);
         } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+            // §21.7: a `return` inside a lambda exits the lambda and
+            // follows the lambda's own return type — which slice S21
+            // does not yet infer. Suppress the enclosing callable's
+            // return-form context while walking the lambda body.
+            ReturnCtx saveRet = returnCtx_;
+            returnCtx_ = ReturnCtx::None;
             if (lam->exprBody) visitExpr(*lam->exprBody);
             for (const auto& s : lam->stmts) if (s) visitStmt(*s);
+            returnCtx_ = saveRet;
         } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
             if (ce->scrutinee) visitExpr(*ce->scrutinee);
             for (const auto& arm : ce->arms) {
