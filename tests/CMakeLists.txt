@@ -97,6 +97,7 @@ set(BEZEL_TEST_SOURCES
     sema/overload_signature_test.cpp
     sema/override_signature_test.cpp
     sema/return_form_test.cpp
+    sema/toplevel_visibility_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
