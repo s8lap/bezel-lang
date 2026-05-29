@@ -161,6 +161,7 @@ BEZEL_TEST(sema_expr_lit, recursion_into_binary_subexprs) {
         auto* rt = r.ctx->exprType(*be->right);
         BEZEL_EXPECT_TRUE(rt && rt->primitive == PrimitiveType::Int);
     }
-    // The BinaryExpr itself has no type yet (slice 3 defers operator typing).
-    BEZEL_EXPECT_TRUE(r.ctx->exprType(*ds->value) == nullptr);
+    // Slice 3c typed the BinaryExpr itself — `int + int` is int.
+    auto* whole = r.ctx->exprType(*ds->value);
+    BEZEL_EXPECT_TRUE(whole && whole->primitive == PrimitiveType::Int);
 }

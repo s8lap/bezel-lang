@@ -322,9 +322,71 @@ private:
             return;
         }
         // For non-literal expressions, recurse into children so their
-        // own literals get typed. The expression itself gets no type
-        // (later slices wire it up).
+        // own literals get typed. The expression itself may also get a
+        // type from the operator's result rules (slice 3c).
         visitChildren(e);
+        // Slice 3c: binary / unary operator result typing.
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            typeBinary(*be);
+        }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            typeUnary(*ue);
+        }
+    }
+
+    // §17.1 result-type table for binary operators. Slice 3c covers the
+    // common cases with no operator-overload resolution: equality and
+    // relational ops produce bool; arithmetic / shift / bitwise produce
+    // the left operand's type (when the operands type-match); logical
+    // ops `and` / `or` produce bool; `??` produces the non-nullable
+    // result type of the LHS; range ops produce a Range value (slice 3c
+    // leaves Range as Error).
+    void typeBinary(const ast::BinaryExpr& be) {
+        const auto& op = be.op;
+        if (op == "=" || op == "<>" || op == "<" || op == ">" ||
+            op == "<=" || op == ">=" || op == "and" || op == "or") {
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+        // `in` is a membership test → bool.
+        if (op == "in") {
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+        // Arithmetic / shift / bitwise: result type follows the left
+        // operand's type when both sides are present and known.
+        if (op == "+" || op == "-" || op == "*" || op == "/" ||
+            op == "mod" || op == "&" || op == "|" || op == "^" ||
+            op == "<<" || op == ">>") {
+            TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+            if (lt) ctx_.setExprType(&be, lt);
+            return;
+        }
+        // `??` null-coalescing: result type is the non-nullable form of
+        // the LHS (sema-3c approximation: take RHS type if known, else
+        // LHS).
+        if (op == "??") {
+            TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+            if (rt) ctx_.setExprType(&be, rt);
+            return;
+        }
+        // Range ops, etc.: leave un-typed (later slices handle).
+    }
+
+    // §17.1 result-type table for unary operators (slice 3c).
+    void typeUnary(const ast::UnaryExpr& ue) {
+        const auto& op = ue.op;
+        if (op == "not") {
+            ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+        if (op == "+" || op == "-" || op == "~") {
+            TypeRef* ot = ue.operand ? ctx_.exprType(*ue.operand) : nullptr;
+            if (ot) ctx_.setExprType(&ue, ot);
+            return;
+        }
+        // `await`, `move` — result-type rules deeper (Task<T> -> T,
+        // move keeps the operand's type). Slice 3c doesn't type them.
     }
 
     void visitChildren(const ast::Expr& e) {
