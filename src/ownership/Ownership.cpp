@@ -712,9 +712,36 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
 // refactor; for now a constructor that initializes only on some paths
 // passes here but would fail under the stricter pass once landed.
 
-bool isFieldOwned(const ast::FieldDecl& f) {
-    for (auto m : f.modifiers) if (m == "owned") return true;
-    return false;
+// §7.9: a field of non-nullable *reference* type (class, interface,
+// string, function, non-nullable Object) has no default value and must
+// be assigned by a field initializer or in every constructor. Value
+// types (records, enums, primitives other than string/Object, inline
+// arrays, unit) have well-defined defaults and are exempt. A static
+// field is exempt here (static-init rules, §22.13). Generic-parameter
+// and unresolved types are conservatively treated as non-reference
+// (not flagged). `owned` fields are a subset (class-typed) and are
+// covered by this rule.
+bool isNonNullableReferenceField(const ast::FieldDecl& f,
+                                 sema::SemaContext& ctx) {
+    for (auto m : f.modifiers) {
+        if (m == "static") return false;
+    }
+    if (!f.type) return false;
+    auto* rt = ctx.resolvedType(*f.type);
+    if (!rt || rt->nullable) return false;
+    switch (rt->kind) {
+        case sema::TypeRef::Kind::Primitive:
+            return rt->primitive == sema::PrimitiveType::String ||
+                   rt->primitive == sema::PrimitiveType::Object;
+        case sema::TypeRef::Kind::Function:
+            return true;
+        case sema::TypeRef::Kind::Named:
+            if (!rt->declaration) return false;  // built-in/generic — skip
+            return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                   rt->declaration->kind == ast::TypeDeclKind::Interface;
+        default:
+            return false;  // Unit, InlineArray, Error → value/unknown
+    }
 }
 
 // True if `e` is a member-access whose root is the literal `this`
@@ -800,12 +827,13 @@ void collectThisFieldAssignments(
 }
 
 void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
-    // Gather owned fields without initializers.
+    // Gather non-nullable reference fields without initializers (§7.9).
+    // Owned fields are a subset.
     std::vector<const ast::FieldDecl*> ownedNoInit;
     for (const auto& m : td.members) {
         auto* f = dynamic_cast<const ast::FieldDecl*>(m.get());
         if (!f) continue;
-        if (!isFieldOwned(*f)) continue;
+        if (!isNonNullableReferenceField(*f, ctx)) continue;
         if (f->initializer) continue;
         ownedNoInit.push_back(f);
     }
@@ -823,7 +851,7 @@ void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
         for (auto* f : ownedNoInit) {
             ctx.diagnostics().report(
                 Severity::Error, f->span.begin,
-                std::string("owned field `") + std::string(f->name) +
+                std::string("non-nullable field `") + std::string(f->name) +
                 "` needs an initializer or a constructor that assigns "
                 "it (§7.9)");
         }
@@ -838,8 +866,8 @@ void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
             if (!assigned.count(f->name)) {
                 ctx.diagnostics().report(
                     Severity::Error, cd->span.begin,
-                    std::string("constructor does not initialize owned "
-                                "field `") +
+                    std::string("constructor does not initialize "
+                                "non-nullable field `") +
                     std::string(f->name) +
                     "` (§7.9 — every constructor's normal-exit path "
                     "must assign it, or chain to `this(…)`)");

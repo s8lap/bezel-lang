@@ -56,10 +56,36 @@ BEZEL_TEST(own_field_da, owned_field_with_initializer_ok_without_assignment) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(own_field_da, non_owned_field_not_required) {
+BEZEL_TEST(own_field_da, value_type_field_not_required) {
+    // §7.9: value-type fields (here `int`) have a well-defined default,
+    // so they need no initializer or constructor assignment.
+    auto r = parseAndCheckOwnership(mod(
+        "class C "
+        "  private _n: int;"
+        "  public constructor() "
+        "  end constructor; "
+        "end C;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(own_field_da, non_owned_reference_field_required) {
+    // §7.9: a non-nullable reference field (class type) without an
+    // initializer must be assigned in the constructor — even when not
+    // `owned`.
     auto r = parseAndCheckOwnership(mod(
         "class C "
         "  private _t: T;"
+        "  public constructor() "
+        "  end constructor; "
+        "end C;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(own_field_da, nullable_reference_field_not_required) {
+    // A nullable reference field defaults to null — no obligation.
+    auto r = parseAndCheckOwnership(mod(
+        "class C "
+        "  private _t: T?;"
         "  public constructor() "
         "  end constructor; "
         "end C;"));
