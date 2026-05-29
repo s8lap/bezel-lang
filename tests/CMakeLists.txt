@@ -86,6 +86,7 @@ set(BEZEL_TEST_SOURCES
     sema/private_visibility_test.cpp
     sema/sealed_class_test.cpp
     sema/multi_base_test.cpp
+    sema/abstract_instantiation_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp

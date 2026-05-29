@@ -471,6 +471,40 @@ private:
             if (ne->type) {
                 if (auto* rt = ctx_.resolvedType(*ne->type)) {
                     ctx_.setExprType(&e, rt);
+                    // Slice S11: forbid `new` on abstract or static
+                    // class types. Interfaces and (purely declarative)
+                    // static-only types are also non-instantiable.
+                    if (rt->kind == TypeRef::Kind::Named && rt->declaration) {
+                        TypeSymbol* t = rt->declaration;
+                        bool isAbstract = false;
+                        bool isStatic = false;
+                        for (auto mod : t->modifiers) {
+                            if (mod == "abstract") isAbstract = true;
+                            if (mod == "static") isStatic = true;
+                        }
+                        if (isAbstract) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ne->span.begin,
+                                std::string("cannot instantiate abstract "
+                                            "class `") +
+                                std::string(t->name) + "` with `new` "
+                                "(§11.4)");
+                        } else if (isStatic) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ne->span.begin,
+                                std::string("cannot instantiate static "
+                                            "class `") +
+                                std::string(t->name) + "` with `new` "
+                                "(§11.4)");
+                        } else if (t->kind ==
+                                   ast::TypeDeclKind::Interface) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ne->span.begin,
+                                std::string("cannot instantiate interface `") +
+                                std::string(t->name) +
+                                "` with `new` (§11)");
+                        }
+                    }
                 }
             }
         }
