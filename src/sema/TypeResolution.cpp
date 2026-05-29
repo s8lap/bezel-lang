@@ -78,6 +78,66 @@ public:
         checkTopLevelVisibility();
         // Slice S23: record restrictions (§9.7).
         checkRecordRestrictions();
+        // Slice S28: accessor visibility (§13.6).
+        checkAccessorVisibility();
+    }
+
+    // Slice S28 (§13.6): a property/indexer accessor's explicit
+    // visibility must be more restrictive than the property's overall
+    // visibility; an accessor that is *less* restrictive is a compile
+    // error. Restrictiveness rank: public(3) > internal/protected(2) >
+    // private(1). `internal` and `protected` are incomparable (same
+    // rank), so we only flag a strictly-less-restrictive accessor.
+    static int visRank(ast::Visibility v) {
+        switch (v) {
+            case ast::Visibility::Public: return 3;
+            case ast::Visibility::Internal: return 2;
+            case ast::Visibility::Protected: return 2;
+            case ast::Visibility::Private: return 1;
+            default: return 0;  // None — inherits; not checked
+        }
+    }
+
+    void checkAccessorVisibility() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeAccessorVisibility(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeAccessorVisibility(nt->type);
+                }
+            }
+        }
+    }
+
+    void checkTypeAccessorVisibility(TypeSymbol* t) {
+        for (Symbol* m : t->members) {
+            auto* ps = dynamic_cast<PropertySymbol*>(m);
+            if (!ps) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            int propRank = visRank(pd->visibility);
+            if (propRank == 0) continue;  // interface / no explicit vis
+            auto checkOne = [&](ast::Visibility av, SourceLocation loc) {
+                if (av == ast::Visibility::None) return;
+                if (visRank(av) > propRank) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("accessor of property `") +
+                        std::string(ps->name) +
+                        "` is less restrictive than the property's own "
+                        "visibility (§13.6)");
+                }
+            };
+            for (const auto& a : pd->accessors) {
+                checkOne(a.visibility, pd->span.begin);
+            }
+            if (pd->hasAutoAccessorVis) {
+                checkOne(pd->autoAccessorVis, pd->span.begin);
+            }
+        }
     }
 
     // Slice S24 (§2.3): generic arity of the always-available built-in
