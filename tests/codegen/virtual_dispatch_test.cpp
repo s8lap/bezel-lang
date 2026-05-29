@@ -75,10 +75,20 @@ BEZEL_TEST(codegen_cg17, non_overriding_derived_uses_base_impl) {
         "end Derived;"), 7);
 }
 
-// NOTE: `base.V()` non-virtual dispatch (§12.3) is exercised once the
-// front-end resolves `base.M` against the *base* class (today it resolves
-// like `this.M`, against currentType_). The codegen `baseQualified` path
-// is in place and bypasses the vtable; the test lands with that FE fix.
+BEZEL_TEST(codegen_cg17, base_call_bypasses_dispatch) {
+    // `base.V()` calls the base implementation directly even though V is
+    // overridden (§12.3) — base.V()=1, d.V()=2 → 12.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Base public virtual method V(): int => 1; end Base; "
+        "class Derived : Base "
+        "  public override method V(): int => 2; "
+        "  public method CallBase(): int => base.V(); "
+        "  public static method Main(): int "
+        "    var d := new Derived(); return d.CallBase() * 10 + d.V(); "
+        "  end Main; "
+        "end Derived;"), 12);
+}
 
 BEZEL_TEST(codegen_cg17, three_level_override) {
     // A : virtual; B : override; C : override. A C instance runs C's.
