@@ -151,6 +151,7 @@ set(BEZEL_TEST_SOURCES
     codegen/null_forgiving_test.cpp
     codegen/float_test.cpp
     codegen/enum_test.cpp
+    codegen/ffi_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp

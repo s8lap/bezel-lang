@@ -80,6 +80,7 @@ public:
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
         setupBuiltinExceptions();  // CG22
         computeEnumValues();  // CG30
+        declareExterns();  // CG26
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }
@@ -165,6 +166,10 @@ private:
 
     // CG30: computed integer value of each enum constant (§10).
     std::unordered_map<const sema::Symbol*, std::int64_t> enumValue_;
+
+    // CG26: external (FFI) function declared by an extern block (§32).
+    std::unordered_map<const sema::ExternDeclSymbol*, llvm::Function*>
+        externFns_;
 
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
@@ -344,6 +349,32 @@ private:
     // is the literal constant when present (int/bool literal), else the
     // zero value. Non-literal static initializers (which the spec runs in
     // a static constructor, §22) are deferred — the global is zeroed.
+    // CG26: declare an external (C-ABI) function for each extern method
+    // (§32). The function keeps the declared C name so the JIT/linker
+    // resolves it against the host process / libc. FFI types lower via
+    // lowerType (int → i32, void return for no type).
+    void declareExterns() {
+        for (const auto& sym : ctx_.symbols()) {
+            auto* xb = dynamic_cast<const sema::ExternBlockSymbol*>(sym.get());
+            if (!xb) continue;
+            for (sema::Symbol* d : xb->decls) {
+                auto* xd = dynamic_cast<sema::ExternDeclSymbol*>(d);
+                if (!xd || !xd->externDecl) continue;
+                const ast::ExternDecl* ed = xd->externDecl;
+                llvm::Type* retTy = ed->returnType
+                                        ? lowerType(ed->returnType.get())
+                                        : llvm::Type::getVoidTy(llvm_);
+                std::vector<llvm::Type*> paramTys;
+                for (const auto& p : ed->params)
+                    paramTys.push_back(lowerType(p.type.get()));
+                auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+                externFns_[xd] = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage,
+                    std::string(xd->name), module_.get());
+            }
+        }
+    }
+
     // CG30: compute each enum constant's integer value (§10). Explicit
     // `:= N` sets the value; otherwise it is the previous value + 1
     // (starting at 0). Only integer-literal initializers are evaluated;
@@ -1926,8 +1957,24 @@ private:
     // virtual dispatch are later slices — calls bind statically here.)
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
-        auto* ms = dynamic_cast<sema::MethodSymbol*>(
-            ctx_.exprSymbol(*call.callee));
+        sema::Symbol* calleeSym = ctx_.exprSymbol(*call.callee);
+        // CG26: a call to an extern (FFI) function — direct C-ABI call to
+        // the external declaration. (Native functions don't set the
+        // exception global, so no post-call unwind check is needed.)
+        if (auto* xd = dynamic_cast<sema::ExternDeclSymbol*>(calleeSym)) {
+            auto it = externFns_.find(xd);
+            if (it == externFns_.end()) return nullptr;
+            std::vector<llvm::Value*> args;
+            for (const auto& a : call.args) {
+                if (!a.value) return nullptr;
+                llvm::Value* v = lowerExpr(*a.value);
+                if (!v) return nullptr;
+                args.push_back(v);
+            }
+            if (args.size() != it->second->arg_size()) return nullptr;
+            return builder_.CreateCall(it->second, args);
+        }
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
         if (!ms) return nullptr;
 
         std::vector<llvm::Value*> args;

@@ -19,6 +19,7 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/LLVMContext.h"
@@ -71,6 +72,15 @@ inline JitResult runJit(std::string_view source) {
         return r;
     }
     auto jit = std::move(*jitOrErr);
+
+    // Resolve external symbols (calloc, and FFI calls like putchar/abs)
+    // against the host process so extern declarations can be invoked.
+    if (auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            jit->getDataLayout().getGlobalPrefix())) {
+        jit->getMainJITDylib().addGenerator(std::move(*gen));
+    } else {
+        llvm::consumeError(gen.takeError());
+    }
 
     // ThreadSafeModule takes ownership of both the module and its context.
     llvm::orc::ThreadSafeModule tsm(std::move(module), std::move(llvmCtx));
