@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -157,6 +158,14 @@ private:
     std::unordered_map<const sema::TypeSymbol*,
                        std::unordered_map<std::string_view, unsigned>>
         vtableNameSlot_;
+    // CG19: per-type runtime descriptor (class AND interface) — a
+    // null-terminated array of pointers to the descriptor globals of this
+    // type plus all its transitive base types. A type's identity is its
+    // own descriptor-array global address; `x is T` walks x's array for
+    // T's address. Reachable from an object via vtable index 0. Also used
+    // by catch type-matching (CG20).
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
+        descArray_;
 
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
     llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
@@ -411,12 +420,14 @@ private:
         for (sema::Symbol* m : t->members) {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
             if (!ms || isStaticMethod(ms) || !isVirtual(ms)) continue;
+            // Vtable index 0 = type descriptor, 1 = Dispose, 2+ = methods,
+            // so a method's slot is its position in `slots` + 2.
             auto it = nameSlot.find(ms->name);
             if (it != nameSlot.end()) {       // override: reuse base slot
-                slots[it->second - 1] = ms;
+                slots[it->second - 2] = ms;
                 vtableSlot_[ms] = it->second;
             } else {                          // new virtual: fresh slot
-                unsigned slot = static_cast<unsigned>(slots.size()) + 1;
+                unsigned slot = static_cast<unsigned>(slots.size()) + 2;
                 slots.push_back(ms);
                 nameSlot[ms->name] = slot;
                 vtableSlot_[ms] = slot;
@@ -426,25 +437,58 @@ private:
         vtableNameSlot_[t] = std::move(nameSlot);
     }
 
-    // CG17: build each class's vtable global (slot 0 = Dispose, then the
-    // virtual-method slots). Runs after declareFunctions so the function
-    // pointers exist.
+    // CG17/CG19: build each class's vtable global, laid out as
+    //   [0] type descriptor, [1] Dispose, [2+] virtual-method slots.
+    // Also builds a runtime type descriptor for every class and interface
+    // (CG19). Runs after declareFunctions so the function pointers exist.
     void declareVtables() {
+        // Pass A: assign vtable slots for all classes (base-first).
         for (const auto& sym : ctx_.symbols()) {
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
             if (ts && ts->kind == ast::TypeDeclKind::Class) buildVtable(ts);
         }
+        // Pass B: declare a descriptor-array global (correctly sized, no
+        // initializer yet) for every class/interface, so descriptors can
+        // cross-reference each other in pass C.
+        std::unordered_map<const sema::TypeSymbol*,
+                           std::vector<const sema::TypeSymbol*>> supersOf;
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!ts) continue;
+            if (ts->kind != ast::TypeDeclKind::Class &&
+                ts->kind != ast::TypeDeclKind::Interface)
+                continue;
+            std::vector<const sema::TypeSymbol*> supers;
+            collectTypeAndBases(ts, supers);
+            supersOf[ts] = supers;
+            auto* arrTy = llvm::ArrayType::get(ptrTy(), supers.size() + 1);
+            descArray_[ts] = new llvm::GlobalVariable(
+                *module_, arrTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage, nullptr,
+                "td$" + std::string(ts->name));
+        }
+        // Pass C: fill each descriptor with [self + transitive bases, null].
+        for (auto& [ts, supers] : supersOf) {
+            std::vector<llvm::Constant*> elems;
+            for (const sema::TypeSymbol* s : supers) elems.push_back(descArray_[s]);
+            elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+            auto* arrTy = llvm::cast<llvm::ArrayType>(
+                descArray_[ts]->getValueType());
+            descArray_[ts]->setInitializer(
+                llvm::ConstantArray::get(arrTy, elems));
+        }
+        // Pass D: build each class's vtable global.
         for (const auto& sym : ctx_.symbols()) {
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
             if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
             const auto& slots = vtableMethods_[ts];
             std::vector<llvm::Constant*> elems;
-            // slot 0: Dispose
-            auto dit = disposerFns_.find(ts);
+            elems.push_back(descArray_[ts]);  // [0] type descriptor
+            auto dit = disposerFns_.find(ts);  // [1] Dispose
             elems.push_back(dit != disposerFns_.end()
                                 ? llvm::cast<llvm::Constant>(dit->second)
                                 : llvm::ConstantPointerNull::get(ptrTy()));
-            for (sema::MethodSymbol* ms : slots) {
+            for (sema::MethodSymbol* ms : slots) {  // [2+] methods
                 auto mit = methodFns_.find(ms);
                 elems.push_back(
                     mit != methodFns_.end()
@@ -460,9 +504,96 @@ private:
         }
     }
 
+    // CG19: `ts` and all its transitive base types (classes + interfaces),
+    // BFS, cycle-guarded.
+    void collectTypeAndBases(const sema::TypeSymbol* ts,
+                             std::vector<const sema::TypeSymbol*>& out) {
+        std::vector<const sema::TypeSymbol*> frontier{ts};
+        std::unordered_set<const sema::TypeSymbol*> seen{ts};
+        std::size_t i = 0;
+        while (i < frontier.size()) {
+            const sema::TypeSymbol* t = frontier[i++];
+            out.push_back(t);
+            for (const sema::TypeSymbol* b : t->baseTypes) {
+                if (b && seen.insert(b).second) frontier.push_back(b);
+            }
+        }
+    }
+
     llvm::GlobalVariable* vtableOf(const sema::TypeSymbol* t) {
         auto it = vtables_.find(t);
         return it == vtables_.end() ? nullptr : it->second;
+    }
+
+    // CG19: lower `operand is T` / `operand is not T` / `operand as T`.
+    // `is`/`is not` yield bool; `as` yields the operand reference when the
+    // test holds, else null. The runtime check walks the operand's type
+    // descriptor for T's descriptor address (an is-a test over classes and
+    // implemented interfaces, §12.7).
+    llvm::Value* lowerTypeTest(const ast::TypeTestExpr& te) {
+        if (!te.operand || !te.testType) return nullptr;
+        llvm::Value* obj = lowerExpr(*te.operand);
+        if (!obj) return nullptr;
+        sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+            return nullptr;
+        auto dit = descArray_.find(rt->declaration);
+        if (dit == descArray_.end()) return nullptr;
+        llvm::Value* isA = emitIsA(obj, dit->second);
+        if (te.op == "is") return isA;
+        if (te.op == "is not")
+            return builder_.CreateXor(isA, builder_.getInt1(true));
+        if (te.op == "as")
+            return builder_.CreateSelect(
+                isA, obj, llvm::ConstantPointerNull::get(ptrTy()));
+        return nullptr;
+    }
+
+    // CG19: emit a runtime is-a test — is `targetDesc` present in `obj`'s
+    // type-descriptor array (vtable[0])? Null operand → false. Returns i1.
+    llvm::Value* emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc) {
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "isa.null", currentFn_);
+        auto* loadBB = llvm::BasicBlock::Create(llvm_, "isa.load", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "isa.body", currentFn_);
+        auto* matchBB = llvm::BasicBlock::Create(llvm_, "isa.match", currentFn_);
+        auto* nextBB = llvm::BasicBlock::Create(llvm_, "isa.next", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "isa.end", currentFn_);
+
+        llvm::Value* objIsNull = builder_.CreateICmpEQ(
+            obj, llvm::ConstantPointerNull::get(ptrTy()));
+        builder_.CreateCondBr(objIsNull, nullBB, loadBB);
+
+        builder_.SetInsertPoint(nullBB);
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(loadBB);
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
+        llvm::Value* desc = builder_.CreateLoad(ptrTy(), vptr);  // vtable[0]
+        builder_.CreateBr(bodyBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        auto* idx = builder_.CreatePHI(i32(), 2);
+        idx->addIncoming(builder_.getInt32(0), loadBB);
+        llvm::Value* elem = builder_.CreateLoad(
+            ptrTy(), builder_.CreateGEP(ptrTy(), desc, {idx}));
+        llvm::Value* atNull = builder_.CreateICmpEQ(
+            elem, llvm::ConstantPointerNull::get(ptrTy()));
+        builder_.CreateCondBr(atNull, endBB, matchBB);
+
+        builder_.SetInsertPoint(matchBB);
+        llvm::Value* match = builder_.CreateICmpEQ(elem, targetDesc);
+        builder_.CreateCondBr(match, endBB, nextBB);
+
+        builder_.SetInsertPoint(nextBB);
+        idx->addIncoming(builder_.CreateAdd(idx, builder_.getInt32(1)), nextBB);
+        builder_.CreateBr(bodyBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* result = builder_.CreatePHI(i1(), 3);
+        result->addIncoming(builder_.getInt1(false), nullBB);
+        result->addIncoming(builder_.getInt1(false), bodyBB);    // hit null
+        result->addIncoming(builder_.getInt1(true), matchBB);    // matched
+        return result;
     }
 
     // CG13: the class's user destructor body, if it declares one.
@@ -543,8 +674,11 @@ private:
     // (instance slot 0), load vtable slot 0 (Dispose), and call it. The
     // object must be non-null. Resolves to the runtime class's Dispose.
     void emitDynamicDispose(llvm::Value* obj) {
+        // vtable layout: [0]=type descriptor, [1]=Dispose, [2+]=methods.
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
-        llvm::Value* disposeFn = builder_.CreateLoad(ptrTy(), vptr);
+        llvm::Value* slot = builder_.CreateGEP(ptrTy(), vptr,
+                                               {builder_.getInt32(1)});
+        llvm::Value* disposeFn = builder_.CreateLoad(ptrTy(), slot);
         auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                              {ptrTy()}, /*isVarArg=*/false);
         builder_.CreateCall(fnTy, disposeFn, {obj});
@@ -1104,6 +1238,10 @@ private:
         }
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
             return lowerNew(*ne);
+        }
+        // CG19: `is` / `is not` / `as` type tests (§12.7).
+        if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+            return lowerTypeTest(*te);
         }
         // CG8: field read `obj.f`.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
