@@ -59,7 +59,13 @@ public:
           builder_(llvmCtx) {}
 
     std::unique_ptr<llvm::Module> run() {
-        emitMain();
+        // CG6: two passes — declare every static method's function first
+        // (so calls can reference callees defined later), then emit
+        // bodies.
+        declareFunctions();
+        for (auto& [sym, fn] : methodFns_) {
+            emitFunctionBody(sym, fn);
+        }
         return std::move(module_);
     }
 
@@ -71,9 +77,14 @@ private:
     llvm::IRBuilder<> builder_;
     llvm::Function* currentFn_ = nullptr;
     // CG3: each local's storage, keyed by its declaration node (a
-    // LocalDecl/LocalConstDecl). An IdentifierExpr resolves to a
-    // LocalSymbol whose `decl` is that node.
+    // LocalDecl/LocalConstDecl/ParameterSymbol). An IdentifierExpr
+    // resolves to a Local/Parameter symbol whose `decl` is that node.
     std::unordered_map<const ast::Node*, llvm::AllocaInst*> locals_;
+    // CG6: parameter storage, keyed by ParameterSymbol* (params share
+    // their owning method as `decl`, so the decl node can't disambiguate).
+    std::unordered_map<const sema::Symbol*, llvm::AllocaInst*> paramSlots_;
+    // CG6: emitted LLVM function for each static method symbol.
+    std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
 
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
     llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
@@ -86,48 +97,133 @@ private:
         return tmp.CreateAlloca(ty);
     }
 
-    // §33 entry point: the first `public static method Main` found in any
-    // top-level class. Multi-/missing-Main diagnostics are a later concern.
-    const ast::MethodDecl* findMain() {
-        for (const auto& d : src_.topDecls) {
-            auto* td = dynamic_cast<const ast::TypeDecl*>(d.get());
-            if (!td) continue;
-            for (const auto& m : td->members) {
-                auto* md = dynamic_cast<const ast::MethodDecl*>(m.get());
-                if (!md || md->name != "Main") continue;
-                bool isStatic = false;
-                for (auto mod : md->modifiers) {
-                    if (mod == "static") { isStatic = true; break; }
-                }
-                if (isStatic) return md;
+    // Is this member symbol a static method with a lowerable body?
+    static bool isStaticMethod(sema::MethodSymbol* ms) {
+        for (auto mod : ms->modifiers) {
+            if (mod == "static") return true;
+        }
+        return false;
+    }
+
+    static bool isMain(sema::MethodSymbol* ms) {
+        return ms->name == "Main" && isStaticMethod(ms);
+    }
+
+    // Lower a Bezel type to its LLVM representation. CG6 covers the
+    // primitive scalars reachable so far; `()`/absent → void. Anything
+    // else falls back to i32 (refined as more types are lowered).
+    llvm::Type* lowerType(const ast::Type* t) {
+        if (!t) return llvm::Type::getVoidTy(llvm_);
+        sema::TypeRef* rt = ctx_.resolvedType(*t);
+        if (!rt) return i32();
+        if (rt->kind == sema::TypeRef::Kind::Unit) {
+            return llvm::Type::getVoidTy(llvm_);
+        }
+        if (rt->kind == sema::TypeRef::Kind::Primitive) {
+            switch (rt->primitive) {
+                case sema::PrimitiveType::Bool: return i1();
+                default: return i32();  // int and other scalars (CG6)
+            }
+        }
+        return i32();
+    }
+
+    // §33: the entry-point method's LLVM function is named `main`; every
+    // other static method gets a mangled, collision-free name.
+    std::string functionName(sema::MethodSymbol* ms) {
+        if (isMain(ms)) return "main";
+        std::string cls = ms->parent ? std::string(ms->parent->name) : "";
+        return "bz$" + cls + "$" + std::string(ms->name);
+    }
+
+    // Pass 1: create a Function (no body) for every static method.
+    void declareFunctions() {
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym.get());
+            if (!ms || !isStaticMethod(ms)) continue;
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (!md || md->bodyKind == ast::MethodBodyKind::Abstract) continue;
+
+            // Entry `main` is always () -> i32 (process exit code); other
+            // methods use their declared signature.
+            llvm::Type* retTy = isMain(ms) ? i32()
+                                           : lowerType(md->returnType.get());
+            std::vector<llvm::Type*> paramTys;
+            for (const auto& p : md->params) {
+                paramTys.push_back(lowerType(p.type.get()));
+            }
+            auto* fnType = llvm::FunctionType::get(retTy, paramTys,
+                                                   /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnType, llvm::Function::ExternalLinkage, functionName(ms),
+                module_.get());
+            methodFns_[ms] = fn;
+        }
+    }
+
+    // Pass 2: emit a function's body.
+    void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md) return;
+        currentFn_ = fn;
+        locals_.clear();
+        paramSlots_.clear();
+        builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+
+        // Bind parameters: copy each arg into an alloca so the body can
+        // read (and assign) it uniformly with locals. Keyed by the
+        // ParameterSymbol's decl node = the owning MethodDecl... but
+        // params share that node, so key by the Param's address instead.
+        bindParameters(md, fn);
+
+        bool terminated = false;
+        if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody) {
+            llvm::Value* v = lowerExpr(*md->exprBody);
+            terminated = emitReturn(fn, v);
+        } else if (md->bodyKind == ast::MethodBodyKind::Block) {
+            terminated = lowerBody(md->stmts);
+        }
+        if (!terminated) emitImplicitReturn(fn);
+    }
+
+    // Bind each parameter to an entry-block alloca holding its arg value,
+    // keyed by the matching ParameterSymbol so identifier reads resolve.
+    void bindParameters(const ast::MethodDecl* md, llvm::Function* fn) {
+        const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
+        std::size_t i = 0;
+        for (auto& arg : fn->args()) {
+            llvm::AllocaInst* slot = entryAlloca(arg.getType());
+            builder_.CreateStore(&arg, slot);
+            if (paramSyms && i < paramSyms->size() && (*paramSyms)[i]) {
+                paramSlots_[(*paramSyms)[i]] = slot;
+            }
+            ++i;
+        }
+    }
+
+    // The ParameterSymbol list for a method (the MethodSymbol owning md).
+    const std::vector<sema::Symbol*>* paramSymbolsOf(const ast::MethodDecl* md) {
+        for (const auto& sym : ctx_.symbols()) {
+            if (sym->decl != md) continue;
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym.get())) {
+                return &ms->params;
             }
         }
         return nullptr;
     }
 
-    void emitMain() {
-        llvm::FunctionType* fnType =
-            llvm::FunctionType::get(i32(), /*isVarArg=*/false);
-        llvm::Function* mainFn = llvm::Function::Create(
-            fnType, llvm::Function::ExternalLinkage, "main", module_.get());
-        currentFn_ = mainFn;
-        builder_.SetInsertPoint(
-            llvm::BasicBlock::Create(llvm_, "entry", mainFn));
+    bool emitReturn(llvm::Function* fn, llvm::Value* v) {
+        if (fn->getReturnType()->isVoidTy()) builder_.CreateRetVoid();
+        else builder_.CreateRet(v ? v
+                                  : llvm::Constant::getNullValue(
+                                        fn->getReturnType()));
+        return true;
+    }
 
-        const ast::MethodDecl* main = findMain();
-        bool terminated = false;
-        if (main && main->bodyKind == ast::MethodBodyKind::Expression &&
-            main->exprBody) {
-            // CG1/CG2: `Main(): int => <expr>`.
-            llvm::Value* v = lowerExpr(*main->exprBody);
-            builder_.CreateRet(v ? v : llvm::ConstantInt::get(i32(), 0));
-            terminated = true;
-        } else if (main && main->bodyKind == ast::MethodBodyKind::Block) {
-            // CG3: a block body — lower statements until one terminates.
-            terminated = lowerBody(main->stmts);
-        }
-        // Fall-through (void Main or unterminated path): exit 0.
-        if (!terminated) builder_.CreateRet(llvm::ConstantInt::get(i32(), 0));
+    void emitImplicitReturn(llvm::Function* fn) {
+        if (fn->getReturnType()->isVoidTy()) builder_.CreateRetVoid();
+        else builder_.CreateRet(
+            llvm::Constant::getNullValue(fn->getReturnType()));
     }
 
     // Lower a statement list into the current block; returns true if the
@@ -268,15 +364,21 @@ private:
         return false;  // control may always exit the loop
     }
 
-    // If `e` names a local variable, return its storage slot; else null.
+    // If `e` names a local or parameter, return its storage slot; else null.
     llvm::AllocaInst* localSlot(const ast::Expr& e) {
-        auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
-        if (!id) return nullptr;
+        if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) return nullptr;
         sema::Symbol* sym = ctx_.exprSymbol(e);
-        auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
-        if (!loc || !loc->decl) return nullptr;
-        auto it = locals_.find(loc->decl);
-        return it == locals_.end() ? nullptr : it->second;
+        if (!sym) return nullptr;
+        if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            auto it = paramSlots_.find(sym);
+            return it == paramSlots_.end() ? nullptr : it->second;
+        }
+        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            if (!loc->decl) return nullptr;
+            auto it = locals_.find(loc->decl);
+            return it == locals_.end() ? nullptr : it->second;
+        }
+        return nullptr;
     }
 
     // Lower an expression to an LLVM value.
@@ -300,6 +402,9 @@ private:
         }
         if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
             return lowerConditional(*cond);
+        }
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            return lowerCall(*call);
         }
         // CG3: a reference to a local variable loads from its slot.
         if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
@@ -360,6 +465,29 @@ private:
         if (op == "+") return v;                       // identity
         if (op == "not") return builder_.CreateNot(v); // i1 logical negation
         return nullptr;
+    }
+
+    // CG6: a call whose callee resolves to a known static method →
+    // direct LLVM call with lowered positional arguments. (Overloads,
+    // named/default args, and instance dispatch are later slices.)
+    llvm::Value* lowerCall(const ast::CallExpr& call) {
+        if (!call.callee) return nullptr;
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(
+            ctx_.exprSymbol(*call.callee));
+        if (!ms) return nullptr;
+        auto it = methodFns_.find(ms);
+        if (it == methodFns_.end()) return nullptr;
+        llvm::Function* callee = it->second;
+
+        std::vector<llvm::Value*> args;
+        for (const auto& a : call.args) {
+            if (!a.value) return nullptr;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return nullptr;
+            args.push_back(v);
+        }
+        if (args.size() != callee->arg_size()) return nullptr;
+        return builder_.CreateCall(callee, args);
     }
 
     // CG4: the conditional expression `thenValue if condition else
