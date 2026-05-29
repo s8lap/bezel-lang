@@ -147,13 +147,16 @@ private:
     // expression that may be the start of an AssignmentStmt or an
     // ExpressionStmt.
     std::unique_ptr<ast::Stmt> parseStatement();
+    std::unique_ptr<ast::Stmt> parseStatementImpl();
     // Slice 7: primary expressions plus postfix `.member` and `(args)`.
     // Slice 8: precedence-climbing binary expressions wrap primary+postfix.
     // Slice 9: unary prefix sits between binary and postfix.
     std::unique_ptr<ast::Expr> parseExpression();
+    std::unique_ptr<ast::Expr> parseExpressionImpl();
     std::unique_ptr<ast::Expr> parseBinaryExpression(int minPrecedence);
     std::unique_ptr<ast::Expr> parseUnaryExpression();
     std::unique_ptr<ast::Expr> parsePrimaryExpression();
+    std::unique_ptr<ast::Expr> parsePrimaryExpressionImpl();
     std::unique_ptr<ast::Expr> parsePostfix(std::unique_ptr<ast::Expr> head);
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
 
