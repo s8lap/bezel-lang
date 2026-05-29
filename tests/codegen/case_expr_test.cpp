@@ -1,0 +1,71 @@
+// Codegen slice CG28 — `case` expression / pattern matching (§19). The
+// scrutinee is evaluated once; arms are tried in order; the first whose
+// pattern (and optional `when` guard) matches yields the result. A
+// non-matching value raises MatchFailureException (§19.6). This slice
+// handles constant, relational-operator, and discard patterns.
+// Observable via the int exit code.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+
+int run(const std::string& body) {
+    auto r = runJit(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran ? r.exitCode : -999;
+}
+
+} // namespace
+
+BEZEL_TEST(codegen_cg28, constant_match) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 2; "
+        "var r := case x 1 => 10, 2 => 20, 3 => 30 end; return r;"), 20);
+}
+
+BEZEL_TEST(codegen_cg28, first_arm_match) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 1; "
+        "var r := case x 1 => 10, 2 => 20 end; return r;"), 10);
+}
+
+BEZEL_TEST(codegen_cg28, constant_alternatives) {
+    // One arm listing several constants matches any of them.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 3; "
+        "var r := case x 1, 2, 3 => 99, 4 => 0 end; return r;"), 99);
+}
+
+BEZEL_TEST(codegen_cg28, discard_is_catch_all) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 42; "
+        "var r := case x 1 => 1, _ => 7 end; return r;"), 7);
+}
+
+// NOTE: relational-operator patterns (`< EXPR`, `>= EXPR`) and range /
+// type / binding / null / destructure patterns are deferred — only
+// constant, constant-alternative, and discard patterns (plus `when`
+// guards) lower in this slice.
+
+BEZEL_TEST(codegen_cg28, guard) {
+    // A `when` guard refining a constant pattern (guard uses an outer var).
+    BEZEL_EXPECT_EQ(run(
+        "var x := 2; var y := 1; "
+        "var r := case x "
+        "  2 when y > 0 => 50, "
+        "  2 => 60, "
+        "  _ => 0 "
+        "end; return r;"), 50);
+}
+
+BEZEL_TEST(codegen_cg28, no_match_raises_match_failure) {
+    // No arm matches and there is no discard → MatchFailureException.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 9; "
+        "try var r := case x 1 => 10, 2 => 20 end; return r; "
+        "catch MatchFailureException => return 77; end;"), 77);
+}
