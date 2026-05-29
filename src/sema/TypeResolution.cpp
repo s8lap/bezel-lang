@@ -94,6 +94,39 @@ public:
         checkConstructorChains();
         // Slice S37: static constructor takes no parameters (§22.7).
         checkStaticConstructorParams();
+        // Slice S38: base/interface visibility (§13.7).
+        checkBaseVisibility();
+    }
+
+    // Slice S38 (§13.7 / Appendix C.2): a class's base class and
+    // implemented interfaces must be at least as visible as the class.
+    // Effective top-level visibility defaults to `internal`. Restricted
+    // to top-level types (nested-type effective visibility per §11.6 is
+    // deferred). Bases resolving to a built-in (null declaration) are
+    // effectively public and skipped.
+    static int effVisRank(ast::Visibility v) {
+        int r = visRank(v);
+        return r == 0 ? 2 : r;  // None → internal
+    }
+
+    void checkBaseVisibility() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            int classRank = effVisRank(t->visibility);
+            for (TypeSymbol* b : t->baseTypes) {
+                if (!b) continue;  // built-in / unresolved — skip
+                if (effVisRank(b->visibility) < classRank) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string("base type `") + std::string(b->name) +
+                        "` is less visible than `" + std::string(t->name) +
+                        "` — a base class or implemented interface must be "
+                        "at least as visible as the type (§13.7)");
+                }
+            }
+        }
     }
 
     // Slice S37 (§22.7 / Appendix C.5): a static constructor takes no
