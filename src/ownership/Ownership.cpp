@@ -20,9 +20,26 @@ public:
     MethodOwnership(sema::SemaContext& ctx) : ctx_(ctx) {}
 
     // Run the linear walk. `body` is the method/ctor/lambda body's
-    // statement list. After walking, every undischarged owned local
-    // is reported.
-    void run(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    // statement list. `paramSyms` (slice O10) is the matching list of
+    // ParameterSymbols — `owned` params are introduced as Owned locals
+    // at method entry per §28.8 and must reach a discharge point on
+    // every normal-exit path (same rule as `var x := producer-of-owned;`).
+    void run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+             const std::vector<sema::Symbol*>* paramSyms = nullptr) {
+        if (paramSyms) {
+            for (sema::Symbol* sym : *paramSyms) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+                if (!ps) continue;
+                if (ps->modifier == "owned" ||
+                    ps->modifier == "out owned") {
+                    LocalOwnership lo;
+                    lo.state = OwnershipState::Owned;
+                    lo.implicitDischarge = false;
+                    lo.obligationOrigin = ps->decl;
+                    states_[sym] = lo;
+                }
+            }
+        }
         for (const auto& s : body) {
             if (s) visitStmt(*s);
         }
@@ -45,7 +62,7 @@ public:
 
 private:
     sema::SemaContext& ctx_;
-    std::unordered_map<sema::LocalSymbol*, LocalOwnership> states_;
+    std::unordered_map<sema::Symbol*, LocalOwnership> states_;
 
     void visitStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
@@ -285,8 +302,8 @@ private:
     // obligation), but mismatched owned-vs-borrowed is rejected (the
     // spec's "silently demoting an owned obligation to a borrowed state
     // at the join would leak the resource"). Mutates `into` in place.
-    void joinInto(std::unordered_map<sema::LocalSymbol*, LocalOwnership>& into,
-                  const std::unordered_map<sema::LocalSymbol*,
+    void joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>& into,
+                  const std::unordered_map<sema::Symbol*,
                                            LocalOwnership>& other,
                   SourceLocation joinLoc) {
         for (auto& [sym, st] : into) {
@@ -399,15 +416,30 @@ private:
 // Top-level walker — visits every method/ctor body in the source.
 void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx);
 
+// Find the sema symbol that wraps a given member AST and return its
+// param-list, or nullptr if the member doesn't have one (or wasn't
+// matched by symbol collection).
+const std::vector<sema::Symbol*>* paramSymsOf(
+    const ast::Member& m, sema::SemaContext& ctx) {
+    for (const auto& s : ctx.symbols()) {
+        if (s->decl != &m) continue;
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(s.get()))
+            return &ms->params;
+        if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(s.get()))
+            return &cs->params;
+    }
+    return nullptr;
+}
+
 void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
-            mo.run(md->stmts);
+            mo.run(md->stmts, paramSymsOf(m, ctx));
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
-        mo.run(cd->body);
+        mo.run(cd->body, paramSymsOf(m, ctx));
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
         mo.run(dd->body);
