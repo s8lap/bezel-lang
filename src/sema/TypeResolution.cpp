@@ -82,6 +82,56 @@ public:
         checkAccessorVisibility();
         // Slice S30: const member type must be primitive or string.
         checkConstTypes();
+        // Slice S32: enum member restrictions (§10.5).
+        checkEnumRestrictions();
+    }
+
+    // Slice S32 (§10.5): an enum may not declare instance fields,
+    // constructors, nested types, or indexers, and its methods may not
+    // be virtual / abstract / override / sealed override. Static
+    // fields and static methods are permitted (§10.4).
+    void checkEnumRestrictions() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t || t->kind != ast::TypeDeclKind::Enum) continue;
+            for (Symbol* m : t->members) {
+                auto bad = [&](std::string_view what) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("enum `") + std::string(t->name) +
+                        "` may not declare " + std::string(what) +
+                        " (§10.5)");
+                };
+                if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                    if (!hasMod(fs, "static")) bad("an instance field");
+                    continue;
+                }
+                if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+                    if (!cs->isStatic) bad("a constructor");
+                    continue;
+                }
+                if (dynamic_cast<NestedTypeSymbol*>(m)) {
+                    bad("a nested type");
+                    continue;
+                }
+                if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+                    if (ps->isIndexer) bad("an indexer");
+                    continue;
+                }
+                if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                    if (hasMod(ms, "virtual") || hasMod(ms, "abstract") ||
+                        hasMod(ms, "override")) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, m->declLoc,
+                            std::string("enum method `") +
+                            std::string(ms->name) +
+                            "` may not be virtual, abstract, or override "
+                            "— enums dispatch statically (§10.5)");
+                    }
+                }
+            }
+        }
     }
 
     // Slice S30 (§22.12): a `const` declaration requires a primitive
