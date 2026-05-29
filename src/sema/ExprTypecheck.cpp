@@ -42,6 +42,26 @@ private:
     Scope* currentScope_ = nullptr;
     TypeSymbol* currentType_ = nullptr;
 
+    // Slice S5: member lookup that walks the base-type chain.
+    // BFS over the inheritance graph (no cycle detection — the spec
+    // forbids cycles; sema's class-graph validation slice will catch
+    // them). First match wins; ambiguity resolution between sibling
+    // interfaces is a separate slice.
+    Symbol* lookupMember(TypeSymbol* type, std::string_view name) {
+        std::vector<TypeSymbol*> frontier{type};
+        std::size_t i = 0;
+        while (i < frontier.size()) {
+            TypeSymbol* t = frontier[i++];
+            for (Symbol* m : t->members) {
+                if (m && m->name == name) return m;
+            }
+            for (TypeSymbol* b : t->baseTypes) {
+                if (b) frontier.push_back(b);
+            }
+        }
+        return nullptr;
+    }
+
     Symbol* lookupName(std::string_view name) {
         for (Scope* s = currentScope_; s; s = s->parent) {
             auto it = s->names.find(name);
@@ -477,14 +497,10 @@ private:
             }
         }
         if (!targetType) return;
-        // Lookup member by name.
-        Symbol* member = nullptr;
-        for (Symbol* m : targetType->members) {
-            if (m && m->name == ma.member) {
-                member = m;
-                break;
-            }
-        }
+        // Lookup member by name. Slice S5: walks own members first,
+        // then transitively each base type — first match wins (no
+        // ambiguity resolution between base interfaces yet).
+        Symbol* member = lookupMember(targetType, ma.member);
         if (!member) {
             // Slice 3d intentionally does NOT diagnose unknown members
             // — base-type/inherited-member lookup and extension-method

@@ -123,9 +123,23 @@ private:
                 }
             }
         }
-        // Base types.
+        // Base types. Slice S5: cache the resolved TypeSymbols on the
+        // declaring TypeSymbol so member lookup can walk them.
+        TypeSymbol* tsym = nullptr;
+        if (ctx_.module()) {
+            for (Symbol* child : ctx_.module()->children) {
+                if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                    if (ts->decl == &td) { tsym = ts; break; }
+                }
+            }
+        }
         for (const auto& bt : td.baseTypes) {
-            if (bt) resolveType(*bt, &typeScope);
+            if (!bt) continue;
+            TypeRef* ref = resolveType(*bt, &typeScope);
+            if (tsym && ref && ref->kind == TypeRef::Kind::Named &&
+                ref->declaration) {
+                tsym->baseTypes.push_back(ref->declaration);
+            }
         }
         // Generic constraints.
         for (const auto& gc : td.genericConstraints) {
