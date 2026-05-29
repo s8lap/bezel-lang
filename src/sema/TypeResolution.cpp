@@ -86,6 +86,44 @@ public:
         checkEnumRestrictions();
         // Slice S33: method body-presence rules (§12.5 / §11.2).
         checkMethodBodies();
+        // Slice S34: static members may not be virtual (§12.1).
+        checkStaticNotVirtual();
+    }
+
+    // Slice S34 (§12.1): "Fields, constructors, destructors, and static
+    // members may not be virtual." A static method or property carrying
+    // `virtual` / `abstract` / `override` is rejected.
+    void checkStaticNotVirtual() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeStaticNotVirtual(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeStaticNotVirtual(nt->type);
+                }
+            }
+        }
+    }
+
+    void checkTypeStaticNotVirtual(TypeSymbol* t) {
+        for (Symbol* m : t->members) {
+            auto* mem = dynamic_cast<MemberSymbol*>(m);
+            if (!mem) continue;
+            if (!dynamic_cast<MethodSymbol*>(m) &&
+                !dynamic_cast<PropertySymbol*>(m)) {
+                continue;
+            }
+            if (!hasMod(mem, "static")) continue;
+            if (hasMod(mem, "virtual") || hasMod(mem, "abstract") ||
+                hasMod(mem, "override")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("static member `") + std::string(mem->name) +
+                    "` may not be virtual, abstract, or override (§12.1)");
+            }
+        }
     }
 
     // Slice S33: a method's body presence must match its kind.
