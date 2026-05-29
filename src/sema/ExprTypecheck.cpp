@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "ast/Node.hpp"
 #include "sema/Symbol.hpp"
@@ -155,39 +157,73 @@ private:
         }
     }
 
-    // Slice T1: primitive-to-primitive assignability check. Only fires
-    // when BOTH `from` and `to` are primitive TypeRefs (reference,
-    // named, generic, null, and Object-target cases are deliberately
-    // skipped — they need the full assignability lattice and would risk
-    // false positives). A non-nullable target accepting a nullable
-    // source is rejected (null would be lost); a nullable target
-    // accepting its non-nullable form is fine.
-    void checkPrimitiveAssignable(TypeRef* from, TypeRef* to,
-                                  SourceLocation loc,
-                                  const std::string& what) {
+    // Slice T4: is `from` a subtype of `to` — i.e. does `to` appear in
+    // `from`'s transitive base-type chain (base class or implemented
+    // interface)? BFS, cycle-guarded.
+    static bool isSubtype(TypeSymbol* from, TypeSymbol* to) {
+        std::vector<TypeSymbol*> frontier{from};
+        std::unordered_set<TypeSymbol*> seen{from};
+        std::size_t i = 0;
+        while (i < frontier.size()) {
+            TypeSymbol* t = frontier[i++];
+            if (t == to) return true;
+            for (TypeSymbol* b : t->baseTypes) {
+                if (b && seen.insert(b).second) frontier.push_back(b);
+            }
+        }
+        return false;
+    }
+
+    // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
+    // Handles two cases and conservatively skips everything else
+    // (mixed primitive/named, generics, null, Object target) so it
+    // never false-positives while the type lattice is incomplete:
+    //   - primitive → primitive: identity or §5.1 widening.
+    //   - named → named (non-generic): identity or subclass/interface.
+    // A non-nullable target accepting a nullable source is rejected.
+    void checkAssignable(TypeRef* from, TypeRef* to,
+                         SourceLocation loc, const std::string& what) {
         if (!from || !to) return;
-        if (from->kind != TypeRef::Kind::Primitive ||
-            to->kind != TypeRef::Kind::Primitive) {
+        // `Object` (the root) accepts anything — never flag.
+        if (to->kind == TypeRef::Kind::Primitive &&
+            to->primitive == PrimitiveType::Object) {
             return;
         }
-        // `Object` accepts anything — skip (handled by the broader
-        // lattice later).
-        if (to->primitive == PrimitiveType::Object) return;
-        if (from->primitive == PrimitiveType::Object) return;
-        // Nullable source into non-nullable target loses null.
-        if (from->nullable && !to->nullable) {
+        auto reportNullable = [&] {
             ctx_.diagnostics().report(
                 Severity::Error, loc,
                 std::string("the ") + what +
                 " is nullable but the target type is non-nullable (§7)");
+        };
+        auto reportNotConvertible = [&] {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what + " has a type that is not "
+                "implicitly convertible to the target type (§5.1)");
+        };
+        if (from->kind == TypeRef::Kind::Primitive &&
+            to->kind == TypeRef::Kind::Primitive) {
+            if (from->primitive == PrimitiveType::Object) return;
+            if (from->nullable && !to->nullable) { reportNullable(); return; }
+            if (from->primitive == to->primitive) return;
+            if (primitiveWidens(from->primitive, to->primitive)) return;
+            reportNotConvertible();
             return;
         }
-        if (from->primitive == to->primitive) return;  // identity
-        if (primitiveWidens(from->primitive, to->primitive)) return;
-        ctx_.diagnostics().report(
-            Severity::Error, loc,
-            std::string("the ") + what + " has a type that is not "
-            "implicitly convertible to the target type (§5.1)");
+        if (from->kind == TypeRef::Kind::Named &&
+            to->kind == TypeRef::Kind::Named &&
+            from->declaration && to->declaration) {
+            // Defer generic types to the variance slice.
+            if (!from->genericArgs.empty() || !to->genericArgs.empty()) {
+                return;
+            }
+            if (from->nullable && !to->nullable) { reportNullable(); return; }
+            if (from->declaration == to->declaration) return;
+            if (isSubtype(from->declaration, to->declaration)) return;
+            reportNotConvertible();
+            return;
+        }
+        // Mixed / generic-parameter / null-literal cases: skip.
     }
 
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
@@ -459,7 +495,7 @@ private:
                     // initializer are both present and both primitive,
                     // check primitive assignability (§5.1).
                     if (ld->initializer) {
-                        checkPrimitiveAssignable(
+                        checkAssignable(
                             ctx_.exprType(*ld->initializer),
                             lsym->declType, ld->initializer->span.begin,
                             std::string("initializer for `") +
@@ -486,7 +522,7 @@ private:
             // Slice T3: a returned value must be primitive-assignable to
             // the callable's return type.
             if (rs->value && returnCtx_ == ReturnCtx::ValueMethod) {
-                checkPrimitiveAssignable(
+                checkAssignable(
                     ctx_.exprType(*rs->value), currentReturnType_,
                     rs->value->span.begin, "returned value");
             }
@@ -501,7 +537,7 @@ private:
             // assignable (compound ops like `+=` have their own
             // operator semantics and are left to a later slice).
             if (as->op == ":=" && as->target && as->value) {
-                checkPrimitiveAssignable(
+                checkAssignable(
                     ctx_.exprType(*as->value),
                     ctx_.exprType(*as->target),
                     as->value->span.begin, "assigned value");
