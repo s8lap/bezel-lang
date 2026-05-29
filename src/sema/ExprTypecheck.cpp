@@ -41,6 +41,10 @@ private:
     std::unique_ptr<Scope> moduleScope_;
     Scope* currentScope_ = nullptr;
     TypeSymbol* currentType_ = nullptr;
+    // Slice S6: in-progress method static-ness, so visitExpr's
+    // IdentifierExpr handling can diagnose `this`/`base` in static
+    // member bodies.
+    bool inStaticMember_ = false;
 
     // Slice S5: member lookup that walks the base-type chain.
     // BFS over the inheritance graph (no cycle detection — the spec
@@ -156,7 +160,15 @@ private:
             const ast::Expr* expr =
                 (md->bodyKind == ast::MethodBodyKind::Expression)
                     ? md->exprBody.get() : nullptr;
+            // Slice S6: enter static context if this method is static.
+            bool isStatic = false;
+            for (auto mod : md->modifiers) {
+                if (mod == "static") { isStatic = true; break; }
+            }
+            bool save = inStaticMember_;
+            inStaticMember_ = isStatic;
             runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));
+            inStaticMember_ = save;
         } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
             const std::vector<std::unique_ptr<ast::Stmt>>* stmts =
                 (od->bodyKind == ast::MethodBodyKind::Block) ? &od->stmts
@@ -166,8 +178,12 @@ private:
                     ? od->exprBody.get() : nullptr;
             runMethodBody(od->params, stmts, expr, paramSymbolsOf(m));
         } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
+            bool save = inStaticMember_;
+            // Slice S6: static constructor body has no `this`.
+            inStaticMember_ = cd->isStatic;
             runMethodBody(cd->params, &cd->body, nullptr,
                           paramSymbolsOf(m));
+            inStaticMember_ = save;
         } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
             std::vector<ast::Param> none;
             runMethodBody(none, &dd->body, nullptr, nullptr);
@@ -296,7 +312,16 @@ private:
         // implicit-meaning identifiers — leave them unresolved
         // (typecheck handles their semantics in a future slice).
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-            if (id->name == "this" || id->name == "base") return;
+            if (id->name == "this" || id->name == "base") {
+                if (inStaticMember_) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, id->span.begin,
+                        std::string("`") + std::string(id->name) +
+                        "` is not available in a static method or "
+                        "static constructor (§22.1)");
+                }
+                return;
+            }
             Symbol* sym = lookupName(id->name);
             if (sym) {
                 ctx_.setExprSymbol(&e, sym);

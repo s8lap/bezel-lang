@@ -81,6 +81,7 @@ set(BEZEL_TEST_SOURCES
     sema/call_return_typing_test.cpp
     sema/definite_assignment_test.cpp
     sema/base_member_lookup_test.cpp
+    sema/static_this_check_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
