@@ -58,6 +58,7 @@ add_library(bezel_core STATIC
     src/sema/ExprTypecheck.cpp
     src/flow/CFG.cpp
     src/ownership/OwnershipChecker.cpp
+    src/ownership/Ownership.cpp
     src/codegen/CodeGen.cpp
     src/driver/Driver.cpp)
 target_include_directories(bezel_core PUBLIC src)
