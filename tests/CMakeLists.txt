@@ -105,6 +105,7 @@ set(BEZEL_TEST_SOURCES
     sema/bare_throw_test.cpp
     sema/primitive_assignability_test.cpp
     sema/assignment_assignability_test.cpp
+    sema/return_assignability_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
