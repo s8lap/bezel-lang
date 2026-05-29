@@ -95,6 +95,7 @@ set(BEZEL_TEST_SOURCES
     sema/class_modifier_combos_test.cpp
     sema/bool_condition_test.cpp
     sema/overload_signature_test.cpp
+    sema/override_signature_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
