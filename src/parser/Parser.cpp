@@ -1388,7 +1388,29 @@ bool isRightAssociative(std::string_view op) {
 
 } // namespace
 
+// Issue #135: span-stamping wrappers. Each captures the location of the
+// first token of the construct, delegates to the *Impl that builds the
+// node, then stamps `span = [start, current token)` if the node didn't
+// already carry a (tighter) span from a child parse. Spans flow to every
+// later phase's diagnostics, which previously all reported 0:0.
+namespace {
+template <typename NodePtr>
+NodePtr stampSpan(NodePtr node, const SourceLocation& start,
+                  const SourceLocation& end) {
+    if (node && node->span.begin.line == 0) {
+        node->span.begin = start;
+        node->span.end = end;
+    }
+    return node;
+}
+} // namespace
+
 std::unique_ptr<ast::Expr> Parser::parseExpression() {
+    SourceLocation start = current_.location;
+    return stampSpan(parseExpressionImpl(), start, current_.location);
+}
+
+std::unique_ptr<ast::Expr> Parser::parseExpressionImpl() {
     // §A.7 ConditionalExpr ::= LogicalOr ("if" Expression "else" Expression)?
     //                         | ThrowExpr | CaseExpr (later slice)
     if (isKeyword("throw")) {
@@ -1523,6 +1545,11 @@ std::unique_ptr<ast::Expr> Parser::parseUnaryExpression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
+    SourceLocation start = current_.location;
+    return stampSpan(parsePrimaryExpressionImpl(), start, current_.location);
+}
+
+std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
     // Literals from the lexer (§18 forms covered in lexer slices 3 and 4).
     if (current_.kind == TokenKind::IntLiteral) {
         auto e = std::make_unique<ast::IntLiteralExpr>();
@@ -2355,6 +2382,11 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
 }
 
 std::unique_ptr<ast::Stmt> Parser::parseStatement() {
+    SourceLocation start = current_.location;
+    return stampSpan(parseStatementImpl(), start, current_.location);
+}
+
+std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
     // §A.6 Statement dispatch. Slice 11 covers LocalDecl, ReturnStmt, and
     // the expression-led shapes (AssignmentStmt vs ExpressionStmt, decided
     // after parsing the leading expression).
