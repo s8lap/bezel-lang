@@ -130,6 +130,7 @@ set(BEZEL_TEST_SOURCES
     codegen/int_arithmetic_test.cpp
     codegen/locals_test.cpp
     codegen/conditional_test.cpp
+    codegen/control_flow_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp

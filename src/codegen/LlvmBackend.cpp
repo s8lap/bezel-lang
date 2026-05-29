@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
@@ -123,12 +124,19 @@ private:
             terminated = true;
         } else if (main && main->bodyKind == ast::MethodBodyKind::Block) {
             // CG3: a block body — lower statements until one terminates.
-            for (const auto& s : main->stmts) {
-                if (s && lowerStmt(*s)) { terminated = true; break; }
-            }
+            terminated = lowerBody(main->stmts);
         }
         // Fall-through (void Main or unterminated path): exit 0.
         if (!terminated) builder_.CreateRet(llvm::ConstantInt::get(i32(), 0));
+    }
+
+    // Lower a statement list into the current block; returns true if the
+    // list terminated the block (so the caller stops adding to it).
+    bool lowerBody(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        for (const auto& s : body) {
+            if (s && lowerStmt(*s)) return true;
+        }
+        return false;
     }
 
     // Lower one statement into the current block. Returns true if the
@@ -179,7 +187,85 @@ private:
             if (ds->value) lowerExpr(*ds->value);
             return false;
         }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+            return lowerIf(*ifs);
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+            return lowerWhile(*ws);
+        }
         return false;  // unhandled statement kinds land in later slices
+    }
+
+    // CG5: if / elif* / else. Each condition is tested in its own block;
+    // a branch that doesn't terminate falls through to a lazily-created
+    // merge block. Returns true only when every path terminates (no
+    // merge needed) — so we never leave a danging unterminated block.
+    bool lowerIf(const ast::IfStmt& ifs) {
+        llvm::BasicBlock* mergeBB = nullptr;
+        auto merge = [&]() -> llvm::BasicBlock* {
+            if (!mergeBB) mergeBB = llvm::BasicBlock::Create(
+                llvm_, "if.end", currentFn_);
+            return mergeBB;
+        };
+
+        // The if-branch and each elif form a (condition, body) test chain.
+        std::vector<const ast::IfStmt::Branch*> chain;
+        chain.push_back(&ifs.ifBranch);
+        for (const auto& el : ifs.elifBranches) chain.push_back(&el);
+
+        bool allPathsTerminate = true;
+        for (const ast::IfStmt::Branch* br : chain) {
+            llvm::Value* cond =
+                br->condition ? lowerExpr(*br->condition) : nullptr;
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "if.body", currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "if.next", currentFn_);
+            if (cond) builder_.CreateCondBr(cond, bodyBB, nextBB);
+            else builder_.CreateBr(nextBB);  // defensive
+
+            builder_.SetInsertPoint(bodyBB);
+            if (!lowerBody(br->body)) {
+                allPathsTerminate = false;
+                builder_.CreateBr(merge());
+            }
+            builder_.SetInsertPoint(nextBB);  // next test / else goes here
+        }
+
+        // The final fall-through block is the else (or an empty pass-through).
+        if (ifs.hasElse) {
+            if (!lowerBody(ifs.elseBody)) {
+                allPathsTerminate = false;
+                builder_.CreateBr(merge());
+            }
+        } else {
+            allPathsTerminate = false;
+            builder_.CreateBr(merge());
+        }
+
+        if (mergeBB) {
+            builder_.SetInsertPoint(mergeBB);
+            return false;
+        }
+        return allPathsTerminate;
+    }
+
+    // CG5: while loop. cond block tests, body block loops back. break /
+    // continue are not yet lowered (deferred; no test uses them).
+    bool lowerWhile(const ast::WhileStmt& ws) {
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "while.cond", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "while.body", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "while.end", currentFn_);
+
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* cond = ws.condition ? lowerExpr(*ws.condition) : nullptr;
+        if (cond) builder_.CreateCondBr(cond, bodyBB, endBB);
+        else builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        if (!lowerBody(ws.body)) builder_.CreateBr(condBB);  // back-edge
+
+        builder_.SetInsertPoint(endBB);
+        return false;  // control may always exit the loop
     }
 
     // If `e` names a local variable, return its storage slot; else null.
