@@ -103,6 +103,7 @@ set(BEZEL_TEST_SOURCES
     sema/builtin_exceptions_test.cpp
     sema/break_continue_test.cpp
     sema/bare_throw_test.cpp
+    sema/primitive_assignability_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
