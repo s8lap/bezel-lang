@@ -17,6 +17,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -77,6 +78,7 @@ public:
         declareStatics();
         declareFunctions();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
+        setupBuiltinExceptions();  // CG22
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }
@@ -153,6 +155,12 @@ private:
     // exception propagates out of them (§28.3). 0 = dispose all (the
     // function propagate path).
     std::size_t unwindScopeDepth_ = 0;
+    // CG22: per-built-in-exception-type descriptor and vtable globals
+    // (§31.4 hierarchy), keyed by type name (built-in exception types have
+    // no user TypeSymbol). A shared no-op Dispose serves all of them.
+    std::unordered_map<std::string, llvm::GlobalVariable*> builtinDesc_;
+    std::unordered_map<std::string, llvm::GlobalVariable*> builtinVtable_;
+    llvm::Function* builtinDisposeFn_ = nullptr;
 
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
@@ -189,6 +197,15 @@ private:
     llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
     llvm::Type* i64() { return llvm::Type::getInt64Ty(llvm_); }
     llvm::PointerType* ptrTy() { return llvm::PointerType::get(llvm_, 0); }
+    // CG22: zero / signed-minimum constants matching an integer value's type.
+    llvm::Constant* zeroLike(llvm::Value* v) {
+        return llvm::ConstantInt::get(v->getType(), 0);
+    }
+    llvm::Constant* minIntLike(llvm::Value* v) {
+        unsigned bits = v->getType()->getIntegerBitWidth();
+        return llvm::ConstantInt::get(
+            v->getContext(), llvm::APInt::getSignedMinValue(bits));
+    }
 
     // Create an alloca in the function's entry block (the conventional
     // home for locals, so they dominate all uses once control flow lands).
@@ -541,6 +558,140 @@ private:
     llvm::GlobalVariable* vtableOf(const sema::TypeSymbol* t) {
         auto it = vtables_.find(t);
         return it == vtables_.end() ? nullptr : it->second;
+    }
+
+    // CG22: the §31.4 built-in exception hierarchy (child → parent).
+    static const std::vector<std::pair<const char*, const char*>>&
+    builtinExceptionHierarchy() {
+        static const std::vector<std::pair<const char*, const char*>> h = {
+            {"Exception", ""},
+            {"ArgumentException", "Exception"},
+            {"ArgumentNullException", "ArgumentException"},
+            {"ArithmeticException", "Exception"},
+            {"OverflowException", "ArithmeticException"},
+            {"DivideByZeroException", "ArithmeticException"},
+            {"InvalidOperationException", "Exception"},
+            {"NotImplementedException", "Exception"},
+            {"NullReferenceException", "Exception"},
+            {"IndexOutOfRangeException", "Exception"},
+            {"MatchFailureException", "Exception"},
+            {"OperationCanceledException", "Exception"},
+            {"TypeInitializationException", "Exception"},
+            {"FormatException", "Exception"},
+            {"StackOverflowException", "Exception"},
+        };
+        return h;
+    }
+
+    // CG22: build descriptor + vtable globals for the built-in exception
+    // types (which have no user TypeSymbol). A type's descriptor lists its
+    // own and all ancestor descriptors so `catch Ancestor` matches.
+    void setupBuiltinExceptions() {
+        const auto& hier = builtinExceptionHierarchy();
+        std::unordered_map<std::string, std::string> parent;
+        for (const auto& [name, par] : hier) parent[name] = par;
+
+        // Shared no-op Dispose (built-in exceptions own nothing).
+        auto* dispTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                               {ptrTy()}, false);
+        builtinDisposeFn_ = llvm::Function::Create(
+            dispTy, llvm::Function::InternalLinkage, "bz$exDispose",
+            module_.get());
+        {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry",
+                                                builtinDisposeFn_);
+            llvm::IRBuilder<> b(bb);
+            b.CreateRetVoid();
+        }
+
+        // Pass 1: declare descriptor globals (sized by ancestor-chain len).
+        std::unordered_map<std::string, std::vector<std::string>> chainOf;
+        for (const auto& [name, par] : hier) {
+            std::vector<std::string> chain;
+            for (std::string c = name; !c.empty(); c = parent[c])
+                chain.push_back(c);
+            chainOf[name] = chain;
+            auto* arrTy = llvm::ArrayType::get(ptrTy(), chain.size() + 1);
+            builtinDesc_[name] = new llvm::GlobalVariable(
+                *module_, arrTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage, nullptr,
+                std::string("btd$") + name);
+        }
+        // Pass 2: fill descriptors [self..Exception, null].
+        for (const auto& [name, chain] : chainOf) {
+            std::vector<llvm::Constant*> elems;
+            for (const std::string& c : chain) elems.push_back(builtinDesc_[c]);
+            elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+            auto* arrTy = llvm::cast<llvm::ArrayType>(
+                builtinDesc_[name]->getValueType());
+            builtinDesc_[name]->setInitializer(
+                llvm::ConstantArray::get(arrTy, elems));
+        }
+        // Pass 3: vtable per built-in = [descriptor, Dispose].
+        for (const auto& [name, par] : hier) {
+            std::vector<llvm::Constant*> v = {builtinDesc_[name],
+                                              builtinDisposeFn_};
+            auto* arrTy = llvm::ArrayType::get(ptrTy(), v.size());
+            builtinVtable_[name] = new llvm::GlobalVariable(
+                *module_, arrTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantArray::get(arrTy, v),
+                std::string("bvt$") + name);
+        }
+    }
+
+    // CG22: descriptor global for a catch-arm/throw type name — a user
+    // type's descArray_ or a built-in exception's descriptor.
+    llvm::GlobalVariable* descriptorForTypeName(const sema::TypeRef* rt,
+                                                const ast::Type* tyNode) {
+        if (rt && rt->declaration) {
+            auto it = descArray_.find(rt->declaration);
+            if (it != descArray_.end()) return it->second;
+        }
+        if (tyNode && tyNode->name && !tyNode->name->parts.empty()) {
+            auto it = builtinDesc_.find(
+                std::string(tyNode->name->parts.back()));
+            if (it != builtinDesc_.end()) return it->second;
+        }
+        return nullptr;
+    }
+
+    // CG22: construct + throw a built-in exception by name, then unwind.
+    void emitThrowBuiltin(const char* name) {
+        auto vit = builtinVtable_.find(name);
+        if (vit == builtinVtable_.end()) return;
+        // Minimal object: one pointer (the vtable) — built-ins have no
+        // fields. 8 bytes covers the pointer on the host.
+        llvm::Value* obj = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+        builder_.CreateStore(vit->second, obj);
+        builder_.CreateStore(obj, excGlobal());
+        emitUnwindDisposals();
+        builder_.CreateBr(unwindBB());
+    }
+
+    // CG22: if `cond` (i1, true = error) holds, throw `name`; otherwise
+    // continue. Splits the current block.
+    void emitGuardThrow(llvm::Value* cond, const char* name) {
+        auto* errBB = llvm::BasicBlock::Create(llvm_, "chk.err", currentFn_);
+        auto* cont = llvm::BasicBlock::Create(llvm_, "chk.cont", currentFn_);
+        builder_.CreateCondBr(cond, errBB, cont);
+        builder_.SetInsertPoint(errBB);
+        emitThrowBuiltin(name);
+        builder_.SetInsertPoint(cont);
+    }
+
+    // CG22: a checked add/sub/mul via the with-overflow intrinsic; raises
+    // OverflowException when the operation overflows (§6.1).
+    llvm::Value* emitCheckedArith(llvm::Intrinsic::ID id, llvm::Value* l,
+                                  llvm::Value* r) {
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(
+            module_.get(), id, {l->getType()});
+        llvm::Value* pair = builder_.CreateCall(fn, {l, r});
+        llvm::Value* res = builder_.CreateExtractValue(pair, 0);
+        llvm::Value* ovf = builder_.CreateExtractValue(pair, 1);
+        emitGuardThrow(ovf, "OverflowException");
+        return res;
     }
 
     // CG19: lower `operand is T` / `operand is not T` / `operand as T`.
@@ -1262,11 +1413,10 @@ private:
             for (const auto& ty : arm.types) {
                 if (!ty) continue;
                 sema::TypeRef* rt = ctx_.resolvedType(*ty);
-                if (!rt || !rt->declaration) continue;
-                auto dit = descArray_.find(rt->declaration);
-                if (dit == descArray_.end()) continue;
-                matched = builder_.CreateOr(matched,
-                                            emitIsA(exc, dit->second));
+                llvm::GlobalVariable* desc =
+                    descriptorForTypeName(rt, ty.get());
+                if (!desc) continue;  // unknown type — can't match
+                matched = builder_.CreateOr(matched, emitIsA(exc, desc));
             }
             builder_.CreateCondBr(matched, armBB, nextBB);
 
@@ -1475,6 +1625,37 @@ private:
         llvm::Value* r = lowerExpr(*bin.right);
         if (!l || !r) return nullptr;
         const auto& op = bin.op;
+        // CG22 (§6.1): integer + - * are overflow-checked; / and mod also
+        // raise on a zero divisor and on INT_MIN / -1. Applies to integer
+        // operands only (bool uses and/or; floats — CG24 — are unchecked).
+        bool checkedInt = l->getType()->isIntegerTy() &&
+                          !l->getType()->isIntegerTy(1);
+        if (checkedInt) {
+            if (op == "+")
+                return emitCheckedArith(llvm::Intrinsic::sadd_with_overflow,
+                                        l, r);
+            if (op == "-")
+                return emitCheckedArith(llvm::Intrinsic::ssub_with_overflow,
+                                        l, r);
+            if (op == "*")
+                return emitCheckedArith(llvm::Intrinsic::smul_with_overflow,
+                                        l, r);
+            if (op == "/" || op == "mod") {
+                emitGuardThrow(
+                    builder_.CreateICmpEQ(r, zeroLike(r)),
+                    "DivideByZeroException");
+                // INT_MIN / -1 (and mod) overflow the result type.
+                llvm::Value* minV = minIntLike(r);
+                llvm::Value* negOne =
+                    llvm::ConstantInt::getSigned(r->getType(), -1);
+                emitGuardThrow(
+                    builder_.CreateAnd(builder_.CreateICmpEQ(l, minV),
+                                       builder_.CreateICmpEQ(r, negOne)),
+                    "OverflowException");
+                return op == "/" ? builder_.CreateSDiv(l, r)
+                                 : builder_.CreateSRem(l, r);
+            }
+        }
         if (op == "+") return builder_.CreateAdd(l, r);
         if (op == "-") return builder_.CreateSub(l, r);
         if (op == "*") return builder_.CreateMul(l, r);
@@ -1507,7 +1688,14 @@ private:
         llvm::Value* v = lowerExpr(*un.operand);
         if (!v) return nullptr;
         const auto& op = un.op;
-        if (op == "-") return builder_.CreateNeg(v);   // §6.1 checked; see above
+        if (op == "-") {
+            // §6.1: unary negation overflows only at INT_MIN.
+            if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(1)) {
+                emitGuardThrow(builder_.CreateICmpEQ(v, minIntLike(v)),
+                               "OverflowException");
+            }
+            return builder_.CreateNeg(v);
+        }
         if (op == "~") return builder_.CreateNot(v);   // bitwise complement
         if (op == "+") return v;                       // identity
         if (op == "not") return builder_.CreateNot(v); // i1 logical negation

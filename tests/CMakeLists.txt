@@ -147,6 +147,7 @@ set(BEZEL_TEST_SOURCES
     codegen/type_test_test.cpp
     codegen/exceptions_test.cpp
     codegen/exception_dispose_test.cpp
+    codegen/checked_arith_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
