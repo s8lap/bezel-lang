@@ -112,6 +112,7 @@ set(BEZEL_TEST_SOURCES
     sema/call_arg_types_test.cpp
     sema/field_init_restrictions_test.cpp
     sema/const_type_test.cpp
+    sema/local_const_type_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
