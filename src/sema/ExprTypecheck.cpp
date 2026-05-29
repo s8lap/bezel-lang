@@ -831,6 +831,52 @@ private:
         // canonical form), or the callee is a type symbol, are not yet
         // handled. Likewise calls on lambda values await the
         // function-type slice.
+
+        // Slice T5: argument-count check (§22.5). Only when the callee
+        // resolves to a method that is the SOLE overload of its name in
+        // its type, and the call uses all-positional arguments. Named
+        // arguments and overload sets are skipped (overload resolution
+        // is a later slice). Optional parameters (those with a default)
+        // set the minimum; the total is the maximum (no variadics in
+        // Bezel — §22.5).
+        if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
+            checkCallArity(ce, ms);
+        }
+    }
+
+    void checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md || !ms->parent) return;
+        // Bail if any argument is named (named-arg matching is deferred).
+        for (const auto& a : ce.args) {
+            if (!a.name.empty()) return;
+        }
+        // Bail if the name has more than one method overload in the type.
+        int sameName = 0;
+        for (Symbol* m : ms->parent->members) {
+            if (dynamic_cast<MethodSymbol*>(m) && m->name == ms->name) {
+                ++sameName;
+            }
+        }
+        if (sameName != 1) return;
+        std::size_t total = md->params.size();
+        std::size_t required = 0;
+        for (const auto& p : md->params) {
+            if (!p.defaultValue) ++required;
+        }
+        std::size_t got = ce.args.size();
+        if (got < required || got > total) {
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                std::string("call to `") + std::string(ms->name) +
+                "` has " + std::to_string(got) +
+                " argument(s) but the method takes " +
+                (required == total
+                     ? std::to_string(total)
+                     : std::to_string(required) + "–" +
+                           std::to_string(total)) +
+                " (§22.5)");
+        }
     }
 
     // §17.1: postfix `.` member access. The target's type determines
