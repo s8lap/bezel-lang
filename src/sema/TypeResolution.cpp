@@ -90,6 +90,64 @@ public:
         checkStaticNotVirtual();
         // Slice S35: `async abstract` is a compile error (§12.6).
         checkAsyncModifiers();
+        // Slice S36: constructor chain-call placement (§12.8).
+        checkConstructorChains();
+    }
+
+    // Slice S36 (§12.8 / Appendix C.5): a constructor may contain at
+    // most one `base(...)` / `this(...)` chain call, and it must be the
+    // first statement (the chaining position).
+    void checkConstructorChains() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            checkTypeConstructorChains(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeConstructorChains(nt->type);
+                }
+            }
+        }
+    }
+
+    // True if `s` is a constructor chain call: an expression statement
+    // whose expression is a call on the bare identifier `this`/`base`.
+    static bool isChainCall(const ast::Stmt* s) {
+        auto* es = dynamic_cast<const ast::ExpressionStmt*>(s);
+        if (!es || !es->expr) return false;
+        auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
+        if (!call || !call->callee) return false;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+            call->callee.get());
+        return id && (id->name == "this" || id->name == "base");
+    }
+
+    void checkTypeConstructorChains(TypeSymbol* t) {
+        for (Symbol* m : t->members) {
+            auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+            if (!cs) continue;
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (!cd) continue;
+            int chainCount = 0;
+            for (std::size_t i = 0; i < cd->body.size(); ++i) {
+                if (!cd->body[i] || !isChainCall(cd->body[i].get())) continue;
+                ++chainCount;
+                if (i != 0) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, cd->body[i]->span.begin,
+                        "a `base(...)` / `this(...)` constructor chain "
+                        "call may appear only as the first statement "
+                        "(§12.8)");
+                }
+            }
+            if (chainCount > 1) {
+                ctx_.diagnostics().report(
+                    Severity::Error, cd->span.begin,
+                    "a constructor may contain at most one `base(...)` "
+                    "or `this(...)` chain call (§12.8)");
+            }
+        }
     }
 
     // Slice S35 (§12.6 / Appendix C.6): `async` does not combine with
@@ -907,6 +965,12 @@ public:
                 TypeSymbol* cur = frontier[i++];
                 if (!seen.insert(cur).second) continue;
                 for (Symbol* m : cur->members) {
+                    // Constructors and destructors are not inherited, so
+                    // they never participate in hiding/override.
+                    if (dynamic_cast<ConstructorSymbol*>(m) ||
+                        dynamic_cast<DestructorSymbol*>(m)) {
+                        continue;
+                    }
                     if (auto* ms = dynamic_cast<MemberSymbol*>(m)) {
                         // First (most-derived) base wins on collision.
                         baseMembers.emplace(ms->name, ms);
@@ -920,6 +984,10 @@ public:
             }
             if (baseMembers.empty()) continue;
             for (Symbol* m : t->members) {
+                if (dynamic_cast<ConstructorSymbol*>(m) ||
+                    dynamic_cast<DestructorSymbol*>(m)) {
+                    continue;
+                }
                 auto* ms = dynamic_cast<MemberSymbol*>(m);
                 if (!ms || ms->name.empty()) continue;
                 auto it = baseMembers.find(ms->name);
