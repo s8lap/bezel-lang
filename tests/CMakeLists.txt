@@ -141,6 +141,7 @@ set(BEZEL_TEST_SOURCES
     codegen/disposal_test.cpp
     codegen/owned_field_disposal_test.cpp
     codegen/inherited_fields_test.cpp
+    codegen/ctor_chaining_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
