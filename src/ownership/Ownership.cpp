@@ -629,8 +629,162 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
     // PropertyDecl accessors and other forms join in later O slices.
 }
 
+// ---------- Slice O9: owned-field definite-assignment ----------
+//
+// An `owned` field without an in-class initializer must be assigned by
+// every constructor's normal exit. A `this(...)` chained constructor
+// transfers the responsibility to the chained target. `base(...)`
+// chaining does not — the derived class's fields are still the
+// derived ctor's job.
+//
+// This is a syntactic over-approximation: we accept any
+// `this.<field> := …` assignment anywhere in the body (not necessarily
+// on every CFG path). The full DA check awaits the CFG-based ownership
+// refactor; for now a constructor that initializes only on some paths
+// passes here but would fail under the stricter pass once landed.
+
+bool isFieldOwned(const ast::FieldDecl& f) {
+    for (auto m : f.modifiers) if (m == "owned") return true;
+    return false;
+}
+
+// True if `e` is a member-access whose root is the literal `this`
+// identifier — i.e. `this.<member>` (and recursively `this.x.y` etc.,
+// though for O9 we only care about depth-1).
+bool isDirectThisFieldRef(const ast::Expr& e, std::string_view& outName) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
+    if (!ma || !ma->target) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id || id->name != "this") return false;
+    outName = ma->member;
+    return true;
+}
+
+// Returns true if the constructor body's first statement is a
+// `this(...)` call (chained-ctor delegation). Per spec the chained
+// target carries the field-initialization burden.
+bool ctorChainsToThis(const ast::ConstructorDecl& cd) {
+    if (cd.body.empty() || !cd.body.front()) return false;
+    auto* es = dynamic_cast<const ast::ExpressionStmt*>(cd.body.front().get());
+    if (!es || !es->expr) return false;
+    auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
+    if (!call || !call->callee) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
+    return id && id->name == "this";
+}
+
+// Walk the body collecting every owned-field name that gets an
+// outright assignment `this.<f> := …` somewhere in it. This walks
+// recursively into control-flow blocks; over-approximates by counting
+// any path-assignment as definitely-assigned.
+void collectThisFieldAssignments(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    std::unordered_set<std::string_view>& assigned);
+
+void collectThisFieldAssignmentsStmt(
+    const ast::Stmt& s,
+    std::unordered_set<std::string_view>& assigned) {
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->op == ":=" && as->target) {
+            std::string_view name;
+            if (isDirectThisFieldRef(*as->target, name)) {
+                assigned.insert(name);
+            }
+        }
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        collectThisFieldAssignments(ifs->ifBranch.body, assigned);
+        for (const auto& el : ifs->elifBranches)
+            collectThisFieldAssignments(el.body, assigned);
+        collectThisFieldAssignments(ifs->elseBody, assigned);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        collectThisFieldAssignments(ws->body, assigned);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        collectThisFieldAssignments(fs->body, assigned);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        collectThisFieldAssignments(dob->body, assigned);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        collectThisFieldAssignments(ts->body, assigned);
+        for (const auto& arm : ts->catches) {
+            if (arm.body) collectThisFieldAssignmentsStmt(*arm.body, assigned);
+        }
+        collectThisFieldAssignments(ts->finallyBody, assigned);
+        return;
+    }
+}
+
+void collectThisFieldAssignments(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    std::unordered_set<std::string_view>& assigned) {
+    for (const auto& s : body) {
+        if (s) collectThisFieldAssignmentsStmt(*s, assigned);
+    }
+}
+
+void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
+    // Gather owned fields without initializers.
+    std::vector<const ast::FieldDecl*> ownedNoInit;
+    for (const auto& m : td.members) {
+        auto* f = dynamic_cast<const ast::FieldDecl*>(m.get());
+        if (!f) continue;
+        if (!isFieldOwned(*f)) continue;
+        if (f->initializer) continue;
+        ownedNoInit.push_back(f);
+    }
+    if (ownedNoInit.empty()) return;
+    // Collect ctors.
+    std::vector<const ast::ConstructorDecl*> ctors;
+    for (const auto& m : td.members) {
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.get())) {
+            if (!cd->isStatic) ctors.push_back(cd);
+        }
+    }
+    // No ctors at all: each owned-without-init field is reported at
+    // its declaration site as needing initialization.
+    if (ctors.empty()) {
+        for (auto* f : ownedNoInit) {
+            ctx.diagnostics().report(
+                Severity::Error, f->span.begin,
+                std::string("owned field `") + std::string(f->name) +
+                "` needs an initializer or a constructor that assigns "
+                "it (§28.6)");
+        }
+        return;
+    }
+    // Per-ctor: walk body and check assignments cover ownedNoInit.
+    for (auto* cd : ctors) {
+        if (ctorChainsToThis(*cd)) continue; // delegated
+        std::unordered_set<std::string_view> assigned;
+        collectThisFieldAssignments(cd->body, assigned);
+        for (auto* f : ownedNoInit) {
+            if (!assigned.count(f->name)) {
+                ctx.diagnostics().report(
+                    Severity::Error, cd->span.begin,
+                    std::string("constructor does not initialize owned "
+                                "field `") +
+                    std::string(f->name) +
+                    "` (§28.6 — every constructor's normal-exit path "
+                    "must assign it, or chain to `this(…)`)");
+            }
+        }
+    }
+}
+
 void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&d)) {
+        // O9: per-class owned-field DA check (classes only).
+        if (td->kind == ast::TypeDeclKind::Class) {
+            checkOwnedFieldDA(*td, ctx);
+        }
         for (const auto& m : td->members) {
             if (m) checkMember(*m, ctx);
         }
