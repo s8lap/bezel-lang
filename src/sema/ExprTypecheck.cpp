@@ -478,6 +478,15 @@ private:
             if (as->value) visitExpr(*as->value);
             // Slice S7: readonly field assignment outside a ctor.
             checkReadonlyAssignment(*as);
+            // Slice T2: plain `:=` assignment must be primitive-
+            // assignable (compound ops like `+=` have their own
+            // operator semantics and are left to a later slice).
+            if (as->op == ":=" && as->target && as->value) {
+                checkPrimitiveAssignable(
+                    ctx_.exprType(*as->value),
+                    ctx_.exprType(*as->target),
+                    as->value->span.begin, "assigned value");
+            }
         } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
             if (ds->value) visitExpr(*ds->value);
         } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
