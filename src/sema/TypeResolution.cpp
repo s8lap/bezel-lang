@@ -1630,6 +1630,13 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
         resolveTypesInBody(ts->body, scope);
         for (const auto& arm : ts->catches) {
+            // Resolve the catch pattern's type(s) and guard, not just the
+            // body — else `catch T => …` leaves T with no resolved
+            // TypeRef and codegen cannot match the arm.
+            for (const auto& ty : arm.types) {
+                if (ty) resolveType(*ty, scope);
+            }
+            if (arm.guard) resolveTypesInExpr(*arm.guard, scope);
             if (arm.body) resolveTypesInStmt(*arm.body, scope);
         }
         resolveTypesInBody(ts->finallyBody, scope);
