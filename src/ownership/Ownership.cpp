@@ -451,6 +451,10 @@ private:
         // state to match the producer of EXPR.
         if (as.op != ":=") return;
         if (!as.target || !as.value) return;
+        // Slice O15: side-effects in the RHS — `x := move y` should
+        // transition y to MovedFrom. recordMovesIn handles `move local`,
+        // `move this.field`, and `f(owned z)` in any position.
+        recordMovesIn(*as.value);
         if (const auto* id =
                 dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
             for (auto& [sym, st] : states_) {
