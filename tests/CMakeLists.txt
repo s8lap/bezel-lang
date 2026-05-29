@@ -87,6 +87,7 @@ set(BEZEL_TEST_SOURCES
     sema/sealed_class_test.cpp
     sema/multi_base_test.cpp
     sema/abstract_instantiation_test.cpp
+    sema/inheritance_cycle_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     ownership/linear_owned_test.cpp
