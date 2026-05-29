@@ -9,6 +9,7 @@
 // to prove the LLVM toolchain wiring before real lowering begins.
 
 #include <memory>
+#include <string>
 
 namespace llvm {
 class Module;
@@ -31,4 +32,11 @@ std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
                                          sema::SemaContext& ctx,
                                          llvm::LLVMContext& llvmCtx);
 
+// Emit `module` as a native object file at `objectPath` (host target).
+// Returns true on success; on failure returns false and sets `error`.
+// Initializes the native target on first use.
+bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
+                    std::string& error);
+
 }  // namespace bezel::codegen
+

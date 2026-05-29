@@ -13,8 +13,16 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/CodeGen.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Host.h"
 
 namespace bezel::codegen {
 
@@ -52,9 +60,8 @@ std::int64_t parseIntLiteral(std::string_view text) {
 // checked AST. Grows one expression/statement kind per codegen slice.
 class Emitter {
 public:
-    Emitter(const ast::SourceFile& src, sema::SemaContext& ctx,
-            llvm::LLVMContext& llvmCtx)
-        : src_(src), ctx_(ctx), llvm_(llvmCtx),
+    Emitter(sema::SemaContext& ctx, llvm::LLVMContext& llvmCtx)
+        : ctx_(ctx), llvm_(llvmCtx),
           module_(std::make_unique<llvm::Module>("bezel", llvmCtx)),
           builder_(llvmCtx) {}
 
@@ -70,7 +77,6 @@ public:
     }
 
 private:
-    const ast::SourceFile& src_;
     sema::SemaContext& ctx_;
     llvm::LLVMContext& llvm_;
     std::unique_ptr<llvm::Module> module_;
@@ -527,7 +533,54 @@ private:
 std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
                                          sema::SemaContext& ctx,
                                          llvm::LLVMContext& llvmCtx) {
-    return Emitter(src, ctx, llvmCtx).run();
+    // Codegen works off the SemaContext symbol table (each symbol points at
+    // its AST decl), so the SourceFile root isn't needed directly; the
+    // parameter is kept for API stability / future use.
+    (void)src;
+    return Emitter(ctx, llvmCtx).run();
+}
+
+bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
+                    std::string& error) {
+    static const bool inited = [] {
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        return true;
+    }();
+    (void)inited;
+
+    llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
+    const llvm::Target* target =
+        llvm::TargetRegistry::lookupTarget(triple.str(), error);
+    if (!target) return false;
+
+    llvm::TargetOptions opts;
+    std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
+        triple, "generic", "", opts, llvm::Reloc::PIC_));
+    if (!tm) {
+        error = "could not create target machine";
+        return false;
+    }
+
+    module.setTargetTriple(triple);
+    module.setDataLayout(tm->createDataLayout());
+
+    std::error_code ec;
+    llvm::raw_fd_ostream os(objectPath, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+        error = "could not open '" + objectPath + "': " + ec.message();
+        return false;
+    }
+
+    llvm::legacy::PassManager pm;
+    if (tm->addPassesToEmitFile(pm, os, nullptr,
+                                llvm::CodeGenFileType::ObjectFile)) {
+        error = "target cannot emit an object file";
+        return false;
+    }
+    pm.run(module);
+    os.flush();
+    return true;
 }
 
 }  // namespace bezel::codegen

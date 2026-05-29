@@ -20,7 +20,10 @@ class Driver {
 public:
     // Compiles a single source file identified by path. The file is read, then
     // handed through the phase pipeline. Diagnostics are printed to stderr.
-    CompileResult compileFile(const std::string& path);
+    // When `outputPath` is non-empty and the front-end produces no errors, a
+    // native executable is emitted there (object via LLVM + link via clang).
+    CompileResult compileFile(const std::string& path,
+                              const std::string& outputPath = "");
 };
 
 } // namespace bezel
