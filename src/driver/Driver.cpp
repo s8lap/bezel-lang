@@ -7,9 +7,14 @@
 
 #include "codegen/CodeGen.hpp"
 #include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
 #include "ownership/OwnershipChecker.hpp"
 #include "parser/Parser.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
 #include "sema/TypeChecker.hpp"
+#include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 
 namespace bezel {
@@ -46,6 +51,20 @@ CompileResult Driver::compileFile(const std::string& path) {
     auto unit = parser.parseCompilationUnit();
 
     if (unit) {
+        // Sema milestone — runs in pass order: symbol collection,
+        // type resolution, expression typecheck. Each pass annotates
+        // the AST via side-tables on SemaContext.
+        sema::SemaContext semaCtx(diagnostics);
+        sema::collectSymbols(*unit, semaCtx);
+        sema::resolveTypes(*unit, semaCtx);
+        sema::typecheckExpressions(*unit, semaCtx);
+
+        // Ownership milestone — runs after sema since it needs
+        // resolved local symbols + producer info.
+        ownership::checkOwnership(*unit, semaCtx);
+
+        // Stub passes kept around so the milestone scaffolding doesn't
+        // bit-rot — they no-op until their own sub-milestones land.
         TypeChecker typeChecker(diagnostics);
         typeChecker.check(*unit);
 
