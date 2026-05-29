@@ -272,6 +272,40 @@ private:
             Symbol* sym = lookupName(id->name);
             if (sym) {
                 ctx_.setExprSymbol(&e, sym);
+                // Slice 3d: also attach the symbol's resolved type to
+                // the identifier expr so MemberAccessExpr can pick it
+                // up when this identifier is the target.
+                if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
+                    if (auto* ld =
+                            dynamic_cast<const ast::LocalDecl*>(loc->decl)) {
+                        if (ld->type) {
+                            if (auto* rt = ctx_.resolvedType(*ld->type)) {
+                                ctx_.setExprType(&e, rt);
+                            }
+                        }
+                    }
+                } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
+                    // ParameterSymbol::decl is the ast::Node* for the
+                    // owning member; the actual ParamList entry is
+                    // accessible via the paramSymbolsOf lookup but
+                    // doesn't itself live as a Node we can resolve a
+                    // TypeRef on. Slice 3d does NOT type parameter
+                    // identifiers — that needs a small refactor that
+                    // makes Param a Node.
+                    (void)par;
+                } else if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
+                    // Implicit `this.<field>` form: bare identifier
+                    // resolving to a class field. Same field-type rule
+                    // as MemberAccessExpr below.
+                    if (auto* fd =
+                            dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                        if (fd->type) {
+                            if (auto* rt = ctx_.resolvedType(*fd->type)) {
+                                ctx_.setExprType(&e, rt);
+                            }
+                        }
+                    }
+                }
             } else if (currentScope_) {
                 ctx_.diagnostics().report(
                     Severity::Error, id->span.begin,
@@ -331,6 +365,94 @@ private:
         }
         if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             typeUnary(*ue);
+        }
+        // Slice 3d: MemberAccessExpr resolution. Runs after the target
+        // is visited (so its TypeRef is available), looks the member up
+        // on the target's TypeSymbol, and annotates the access with the
+        // resolved member symbol and field/property type.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            resolveMemberAccess(*ma);
+        }
+    }
+
+    // §17.1: postfix `.` member access. The target's type determines
+    // the lookup scope. For now we handle `this.member` (lookup in the
+    // current type) and `<expr>.member` where the expression has a
+    // resolved Named or Primitive-Object type. Generics and inherited
+    // members from base types are deferred to a later slice.
+    void resolveMemberAccess(const ast::MemberAccessExpr& ma) {
+        TypeSymbol* targetType = nullptr;
+        // `this.X` — currentType_ takes precedence over name lookup so
+        // we don't have to teach `this` to be an expression with type
+        // currentType_.
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                ma.target.get())) {
+            if (id->name == "this" || id->name == "base") {
+                targetType = currentType_;
+            }
+        }
+        if (!targetType && ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            if (tt && tt->kind == TypeRef::Kind::Named) {
+                targetType = tt->declaration;
+            } else if (!tt) {
+                // Target had no resolvable type — fall back to the
+                // exprSymbol path (e.g. local declared with `var d: D`
+                // when locals don't carry exprType yet but DO carry
+                // exprSymbol whose decl gives the resolved type).
+                auto* sym = ctx_.exprSymbol(*ma.target);
+                if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
+                    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+                    if (ld && ld->type) {
+                        auto* rt = ctx_.resolvedType(*ld->type);
+                        if (rt && rt->kind == TypeRef::Kind::Named) {
+                            targetType = rt->declaration;
+                        }
+                    }
+                } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
+                    // Same trick: parameter's declared type ast lives
+                    // on its decl ParamDecl-like node — slice 3d
+                    // doesn't reach that yet.
+                    (void)par;
+                }
+            }
+        }
+        if (!targetType) return;
+        // Lookup member by name.
+        Symbol* member = nullptr;
+        for (Symbol* m : targetType->members) {
+            if (m && m->name == ma.member) {
+                member = m;
+                break;
+            }
+        }
+        if (!member) {
+            // Slice 3d intentionally does NOT diagnose unknown members
+            // — base-type/inherited-member lookup and extension-method
+            // dispatch are later slices. A user-typed `obj.Dispose()`
+            // against `Stream` would otherwise mis-flag a method that
+            // really lives on the IDisposable interface. The lookup
+            // failure is non-fatal: the expression simply lacks an
+            // exprSymbol/exprType, and later passes can still proceed.
+            return;
+        }
+        ctx_.setExprSymbol(&ma, member);
+        // Attach the member's type for field / property access. Methods
+        // and constructors are deferred to the call-resolution slice.
+        if (auto* fs = dynamic_cast<FieldSymbol*>(member)) {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (fd && fd->type) {
+                if (auto* rt = ctx_.resolvedType(*fd->type)) {
+                    ctx_.setExprType(&ma, rt);
+                }
+            }
+        } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (pd && pd->type) {
+                if (auto* rt = ctx_.resolvedType(*pd->type)) {
+                    ctx_.setExprType(&ma, rt);
+                }
+            }
         }
     }
 
