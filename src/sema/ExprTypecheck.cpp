@@ -45,6 +45,40 @@ private:
     // IdentifierExpr handling can diagnose `this`/`base` in static
     // member bodies.
     bool inStaticMember_ = false;
+    // Slice S7: tracks whether we're inside a constructor (or static
+    // constructor) body — the only places where `this.<readonly>` may
+    // be assigned. Field initializers are handled separately (slice
+    // S7 doesn't flag those — they're part of the initialization flow).
+    bool inConstructor_ = false;
+
+    // Slice S7: diagnose assignment to a readonly field outside the
+    // declaring class's constructor. Tracks only the `this.<field>`
+    // target shape; `other.f := X` would need cross-object readonly
+    // tracking that we don't have yet (and rarely matters in practice).
+    void checkReadonlyAssignment(const ast::AssignmentStmt& as) {
+        if (inConstructor_) return;
+        if (!as.target) return;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(as.target.get());
+        if (!ma) return;
+        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!tid || tid->name != "this") return;
+        if (!currentType_) return;
+        Symbol* m = lookupMember(currentType_, ma->member);
+        auto* fs = dynamic_cast<FieldSymbol*>(m);
+        if (!fs) return;
+        // Check the readonly modifier on the field's MemberSymbol.
+        for (auto mod : fs->modifiers) {
+            if (mod == "readonly") {
+                ctx_.diagnostics().report(
+                    Severity::Error, as.span.begin,
+                    std::string("cannot assign to readonly field `") +
+                    std::string(fs->name) +
+                    "` outside the declaring class's constructor "
+                    "(§11.5)");
+                return;
+            }
+        }
+    }
 
     // Slice S5: member lookup that walks the base-type chain.
     // BFS over the inheritance graph (no cycle detection — the spec
@@ -178,12 +212,16 @@ private:
                     ? od->exprBody.get() : nullptr;
             runMethodBody(od->params, stmts, expr, paramSymbolsOf(m));
         } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
-            bool save = inStaticMember_;
+            bool saveStatic = inStaticMember_;
+            bool saveCtor = inConstructor_;
             // Slice S6: static constructor body has no `this`.
             inStaticMember_ = cd->isStatic;
+            // Slice S7: readonly fields are assignable inside ctors.
+            inConstructor_ = true;
             runMethodBody(cd->params, &cd->body, nullptr,
                           paramSymbolsOf(m));
-            inStaticMember_ = save;
+            inStaticMember_ = saveStatic;
+            inConstructor_ = saveCtor;
         } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
             std::vector<ast::Param> none;
             runMethodBody(none, &dd->body, nullptr, nullptr);
@@ -262,6 +300,8 @@ private:
         } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
             if (as->target) visitExpr(*as->target);
             if (as->value) visitExpr(*as->value);
+            // Slice S7: readonly field assignment outside a ctor.
+            checkReadonlyAssignment(*as);
         } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
             if (ds->value) visitExpr(*ds->value);
         } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
