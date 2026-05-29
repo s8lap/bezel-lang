@@ -74,6 +74,28 @@ public:
         checkClassModifierCombinations();
         // Slice S19: overloads must differ in signature.
         checkOverloadSignatures();
+        // Slice S22: top-level types may only be public or internal.
+        checkTopLevelVisibility();
+    }
+
+    // Slice S22 (§13.2): a top-level type may be `public` or `internal`
+    // (the latter is also the default when no visibility keyword is
+    // written). `protected` and `private` are rejected — there is no
+    // enclosing class for `protected` and no file-scope concept for
+    // `private`.
+    void checkTopLevelVisibility() {
+        if (!ctx_.module()) return;
+        for (Symbol* child : ctx_.module()->children) {
+            auto* t = dynamic_cast<TypeSymbol*>(child);
+            if (!t) continue;
+            if (t->visibility == ast::Visibility::Private ||
+                t->visibility == ast::Visibility::Protected) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("top-level type `") + std::string(t->name) +
+                    "` may only be `public` or `internal` (§13.2)");
+            }
+        }
     }
 
     // Slice S19: structural equality of two resolved TypeRefs. Returns
