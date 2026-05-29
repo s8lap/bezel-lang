@@ -1,0 +1,134 @@
+// Codegen slice CG20 — throw + try/catch (§31.1–31.2, §31.4). Exceptions
+// use an explicit-unwinding model: a module global holds the in-flight
+// exception; `throw` stores it and branches to the enclosing catch
+// dispatch (or the function's propagate path); a call that leaves the
+// global set unwinds the same way. Catch arms match by the exception's
+// runtime type (reusing the CG19 type descriptors), first match wins.
+// Observable via the int exit code.
+//
+// User-defined exception classes are used: the built-in exception types
+// (§31.4) have no runtime descriptor yet, and catch-arm variable binding
+// (`catch var e: T`) is a separate front-end gap — both deferred.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+
+int run(const std::string& program) {
+    auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+
+} // namespace
+
+BEZEL_TEST(codegen_cg20, throw_caught_by_type) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppError end AppError; "
+        "class C public static method Main(): int "
+        "  try throw new AppError(); catch AppError => return 42; end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+BEZEL_TEST(codegen_cg20, normal_path_skips_catch) {
+    // No throw → the catch arm does not run; control falls past the try.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppError end AppError; "
+        "class C public static method Main(): int "
+        "  try return 7; catch AppError => return 42; end; "
+        "  return 0; "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(codegen_cg20, caught_by_base_type) {
+    // Throw a subclass, catch by its (user-defined) base.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppError end AppError; "
+        "class IoError : AppError end IoError; "
+        "class C public static method Main(): int "
+        "  try throw new IoError(); catch AppError => return 5; end; "
+        "  return 0; "
+        "end Main; end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg20, first_matching_arm_wins) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A1 end A1; class A2 end A2; "
+        "class C public static method Main(): int "
+        "  try throw new A2(); "
+        "  catch A1 => return 1; "
+        "  catch A2 => return 2; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 2);
+}
+
+BEZEL_TEST(codegen_cg20, multi_type_arm) {
+    // One arm listing several types matches any of them.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A1 end A1; class A2 end A2; "
+        "class C public static method Main(): int "
+        "  try throw new A2(); catch A1, A2 => return 9; end; "
+        "  return 0; "
+        "end Main; end C;"), 9);
+}
+
+BEZEL_TEST(codegen_cg20, unmatched_arm_propagates_to_outer_try) {
+    // Inner try doesn't match A2; it re-propagates to the outer try.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A1 end A1; class A2 end A2; "
+        "class C public static method Main(): int "
+        "  try "
+        "    try throw new A2(); catch A1 => return 1; end; "
+        "  catch A2 => return 22; end; "
+        "  return 0; "
+        "end Main; end C;"), 22);
+}
+
+BEZEL_TEST(codegen_cg20, exception_propagates_across_calls) {
+    // A callee throws; the caller's try catches after the call returns.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppError end AppError; "
+        "class C "
+        "  public static method Boom() throw new AppError(); end Boom; "
+        "  public static method Main(): int "
+        "    try Boom(); catch AppError => return 13; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 13);
+}
+
+BEZEL_TEST(codegen_cg20, rethrow_propagates) {
+    // A bare `throw;` inside a catch arm re-raises to the outer try.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppError end AppError; "
+        "class C public static method Main(): int "
+        "  try "
+        "    try throw new AppError(); catch AppError => throw; end; "
+        "  catch AppError => return 99; end; "
+        "  return 0; "
+        "end Main; end C;"), 99);
+}
+
+BEZEL_TEST(codegen_cg20, code_after_catch_runs_on_normal_path) {
+    // When the try completes normally, execution continues after the try.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppError end AppError; "
+        "class C public static method Main(): int "
+        "  var x := 0; "
+        "  try x := 1; catch AppError => x := 2; end; "
+        "  return x + 40; "
+        "end Main; end C;"), 41);
+}

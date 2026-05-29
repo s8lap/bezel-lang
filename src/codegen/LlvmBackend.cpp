@@ -136,6 +136,19 @@ private:
     // CG13: the compiler-generated Dispose function for each class.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
 
+    // CG20: exception handling (explicit-unwinding model). A module-level
+    // global holds the in-flight exception (null when none). A `throw` and
+    // any call that leaves the global non-null branch to the current
+    // unwind target — the enclosing try's catch dispatch, or (when none)
+    // the function's propagate block, which returns so the caller's
+    // post-call check unwinds further.
+    llvm::GlobalVariable* excGlobal_ = nullptr;
+    llvm::BasicBlock* unwindTarget_ = nullptr;   // innermost catch dispatch
+    llvm::BasicBlock* propagateBB_ = nullptr;    // per-function, lazy
+    // CG20: the exception value caught by the enclosing catch arm, so a
+    // bare `throw;` can re-raise it (the global was cleared on arm entry).
+    llvm::Value* currentCaughtExc_ = nullptr;
+
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
     std::unordered_map<const sema::TypeSymbol*, llvm::StructType*> structs_;
@@ -621,6 +634,9 @@ private:
         paramSlots_.clear();
         disposeStack_.clear();
         loopStack_.clear();
+        propagateBB_ = nullptr;
+        unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr;
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
         bool terminated = false;
         if (const ast::DestructorDecl* dd = findDestructor(ts)) {
@@ -673,6 +689,50 @@ private:
     // CG18: call an object's Dispose dynamically — load its vtable pointer
     // (instance slot 0), load vtable slot 0 (Dispose), and call it. The
     // object must be non-null. Resolves to the runtime class's Dispose.
+    // CG20: the module global holding the in-flight exception (lazy).
+    llvm::GlobalVariable* excGlobal() {
+        if (!excGlobal_) {
+            excGlobal_ = new llvm::GlobalVariable(
+                *module_, ptrTy(), /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantPointerNull::get(ptrTy()), "bz$exc");
+        }
+        return excGlobal_;
+    }
+
+    // CG20: the per-function propagate block — entered when an exception
+    // is pending and not caught here. It returns a dummy value so the
+    // caller's post-call check can unwind further. (CG21 will dispose live
+    // owned locals here first.) Built lazily.
+    llvm::BasicBlock* propagateBB() {
+        if (!propagateBB_) {
+            auto* save = builder_.GetInsertBlock();
+            propagateBB_ = llvm::BasicBlock::Create(llvm_, "propagate",
+                                                    currentFn_);
+            builder_.SetInsertPoint(propagateBB_);
+            emitImplicitReturn(currentFn_);
+            if (save) builder_.SetInsertPoint(save);
+        }
+        return propagateBB_;
+    }
+
+    // CG20: where to branch when an exception becomes pending — the
+    // innermost try's catch dispatch, else the function propagate block.
+    llvm::BasicBlock* unwindBB() {
+        return unwindTarget_ ? unwindTarget_ : propagateBB();
+    }
+
+    // CG20: after a call that may throw, branch to the unwind target when
+    // the exception global is non-null, else continue.
+    void emitPendingCheck() {
+        llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
+        llvm::Value* pending = builder_.CreateICmpNE(
+            exc, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* cont = llvm::BasicBlock::Create(llvm_, "call.cont", currentFn_);
+        builder_.CreateCondBr(pending, unwindBB(), cont);
+        builder_.SetInsertPoint(cont);
+    }
+
     void emitDynamicDispose(llvm::Value* obj) {
         // vtable layout: [0]=type descriptor, [1]=Dispose, [2+]=methods.
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
@@ -727,6 +787,9 @@ private:
         paramSlots_.clear();
         disposeStack_.clear();
         loopStack_.clear();
+        propagateBB_ = nullptr;
+        unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr;
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
         const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
@@ -755,6 +818,9 @@ private:
         paramSlots_.clear();
         disposeStack_.clear();
         loopStack_.clear();
+        propagateBB_ = nullptr;
+        unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr;
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
         bindParameters(fn, /*hasThis=*/true, &cs->params);
 
@@ -1114,7 +1180,87 @@ private:
         if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
             return lowerScopedBlock(db->body);
         }
+        // CG20: throw — store the exception (a plain `throw;` re-raises the
+        // one already in flight) and branch to the unwind target.
+        if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+            if (th->value) {
+                if (llvm::Value* e = lowerExpr(*th->value))
+                    builder_.CreateStore(e, excGlobal());
+            } else if (currentCaughtExc_) {
+                // Bare `throw;` re-raises the arm's caught exception (the
+                // global was cleared when the arm was entered).
+                builder_.CreateStore(currentCaughtExc_, excGlobal());
+            }
+            builder_.CreateBr(unwindBB());
+            return true;
+        }
+        // CG20: try / catch.
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+            return lowerTry(*trys);
+        }
         return false;  // unhandled statement kinds land in later slices
+    }
+
+    // CG20: lower try/catch (no finally yet — CG21). The protected body is
+    // lowered with the unwind target set to a catch-dispatch block; a
+    // throw or a pending exception after a call lands there. The dispatch
+    // tests each arm's type(s) against the in-flight exception's runtime
+    // type (emitIsA on the type descriptor) plus any `when` guard; the
+    // first match consumes the exception (clears the global) and runs the
+    // arm body. If no arm matches, the exception stays pending and
+    // re-propagates to the enclosing unwind target.
+    bool lowerTry(const ast::TryStmt& trys) {
+        auto* dispatchBB =
+            llvm::BasicBlock::Create(llvm_, "catch.dispatch", currentFn_);
+        auto* afterBB = llvm::BasicBlock::Create(llvm_, "try.after", currentFn_);
+
+        llvm::BasicBlock* savedUnwind = unwindTarget_;
+        unwindTarget_ = dispatchBB;
+        bool bodyTerm = lowerScopedBlock(trys.body);
+        unwindTarget_ = savedUnwind;
+        if (!bodyTerm) builder_.CreateBr(afterBB);
+
+        // Catch dispatch: test arms in order against the in-flight exception.
+        builder_.SetInsertPoint(dispatchBB);
+        llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
+        for (const auto& arm : trys.catches) {
+            auto* armBB = llvm::BasicBlock::Create(llvm_, "catch.arm",
+                                                   currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "catch.next",
+                                                    currentFn_);
+            // Arm matches if exc is-a any of the arm's types.
+            llvm::Value* matched = builder_.getInt1(false);
+            for (const auto& ty : arm.types) {
+                if (!ty) continue;
+                sema::TypeRef* rt = ctx_.resolvedType(*ty);
+                if (!rt || !rt->declaration) continue;
+                auto dit = descArray_.find(rt->declaration);
+                if (dit == descArray_.end()) continue;
+                matched = builder_.CreateOr(matched,
+                                            emitIsA(exc, dit->second));
+            }
+            builder_.CreateCondBr(matched, armBB, nextBB);
+
+            builder_.SetInsertPoint(armBB);
+            // Consume the exception (it is now handled). Keep its value so
+            // a bare `throw;` in the arm can re-raise it.
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), excGlobal());
+            llvm::Value* savedCaught = currentCaughtExc_;
+            currentCaughtExc_ = exc;
+            bool armTerm = false;
+            if (arm.body) armTerm = lowerStmt(*arm.body);
+            currentCaughtExc_ = savedCaught;
+            if (!armTerm) builder_.CreateBr(afterBB);
+
+            builder_.SetInsertPoint(nextBB);
+        }
+        // No arm matched → the exception is still pending; re-propagate to
+        // the enclosing unwind target (outer try or function propagate).
+        builder_.CreateBr(unwindBB());
+
+        builder_.SetInsertPoint(afterBB);
+        return false;
     }
 
     // CG5: if / elif* / else. Each condition is tested in its own block;
@@ -1491,7 +1637,9 @@ private:
             llvm::Value* slotPtr = builder_.CreateGEP(
                 ptrTy(), vptr, {builder_.getInt32(slotIt->second)});
             llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
-            return builder_.CreateCall(fnTy, fnPtr, args);
+            llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
+            emitPendingCheck();  // CG20: a callee may have thrown
+            return r;
         }
 
         // Non-virtual (or base-qualified) → direct call to the function.
@@ -1499,7 +1647,9 @@ private:
         if (it == methodFns_.end()) return nullptr;
         llvm::Function* callee = it->second;
         if (args.size() != callee->arg_size()) return nullptr;
-        return builder_.CreateCall(callee, args);
+        llvm::Value* r = builder_.CreateCall(callee, args);
+        emitPendingCheck();  // CG20: a callee may have thrown
+        return r;
     }
 
     // CG18: the LLVM function type of an instance/static method — leading
