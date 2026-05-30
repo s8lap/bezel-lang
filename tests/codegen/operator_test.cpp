@@ -72,3 +72,33 @@ BEZEL_TEST(codegen_cg48, primitive_operators_unchanged) {
         "  return 3 + 4 * 2 - 1; "
         "end Main; end C;"), 10);
 }
+
+// §25.1: unary operator overloads (`-`, `~`) on a user type.
+BEZEL_TEST(codegen_cg48, unary_minus_overload) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class V "
+        "  public X: int := 0; "
+        "  public static method operator -(a: V): int => 0 - a.X; "
+        "end V; "
+        "class C public static method Main(): int "
+        "  var v := new V(); v.X := 5; return 0 - (-v); "
+        "end Main; end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg48, unary_complement_overload) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class V "
+        "  public X: int := 0; "
+        "  public static method operator ~(a: V): int => ~a.X; "
+        "end V; "
+        "class C public static method Main(): int "
+        "  var v := new V(); v.X := 0; return ~v; "
+        "end Main; end C;"), -1);
+}
+
+BEZEL_TEST(codegen_cg48, primitive_unary_unchanged) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x := 5; return -x; "
+        "end Main; end C;"), -5);
+}

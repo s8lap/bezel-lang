@@ -2557,6 +2557,18 @@ private:
 
     llvm::Value* lowerUnary(const ast::UnaryExpr& un) {
         if (!un.operand) return nullptr;
+        // §25: a user-defined unary operator overload — sema resolved this
+        // unary expression to a static `operator` method; call it with the
+        // operand.
+        if (auto* opm =
+                dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(un))) {
+            if (opm->isOperator) {
+                llvm::Value* ov = lowerExpr(*un.operand);
+                if (!ov) return nullptr;
+                std::vector<llvm::Value*> args{ov};
+                return emitMethodCall(opm, args, /*baseQualified=*/false);
+            }
+        }
         llvm::Value* v = lowerExpr(*un.operand);
         if (!v) return nullptr;
         const auto& op = un.op;

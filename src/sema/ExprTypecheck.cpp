@@ -1620,8 +1620,33 @@ private:
     }
 
     // §17.1 result-type table for unary operators (slice 3c).
+    // §25: a user-defined unary `operator <op>` (one parameter) declared on
+    // the operand's type. Overloadable prefix unary operators are `-`/`~`.
+    MethodSymbol* findUnaryOperator(const ast::UnaryExpr& ue) {
+        if (ue.op != "-" && ue.op != "~") return nullptr;
+        TypeSymbol* ts = ue.operand ? memberTargetType(ue.operand.get())
+                                    : nullptr;
+        if (!ts) return nullptr;
+        for (Symbol* m : ts->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (ms && ms->isOperator && ms->operatorToken == ue.op &&
+                ms->params.size() == 1)
+                return ms;
+        }
+        return nullptr;
+    }
+
     void typeUnary(const ast::UnaryExpr& ue) {
         const auto& op = ue.op;
+        // §25: a user-defined unary operator overload.
+        if (MethodSymbol* opm = findUnaryOperator(ue)) {
+            ctx_.setExprSymbol(&ue, opm);
+            if (auto* od = dynamic_cast<const ast::OperatorDecl*>(opm->decl))
+                if (od->returnType)
+                    if (auto* rt = ctx_.resolvedType(*od->returnType))
+                        ctx_.setExprType(&ue, rt);
+            return;
+        }
         if (op == "not") {
             ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
             return;
