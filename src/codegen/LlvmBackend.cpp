@@ -177,6 +177,12 @@ private:
     // CG20: the exception value caught by the enclosing catch arm, so a
     // bare `throw;` can re-raise it (the global was cleared on arm entry).
     llvm::Value* currentCaughtExc_ = nullptr;
+    // CG40: set true by lowering a `throw` expression (§31.2) — the
+    // expression diverges (branches to the unwind target), leaving the
+    // current block terminated. Phi-building consumers (conditional, `??`)
+    // read this immediately after lowering a sub-expression to exclude a
+    // diverged branch from the join.
+    bool diverged_ = false;
     // CG21: the disposeStack_ depth to unwind to when branching to
     // unwindTarget_ — using-var scopes from here up are disposed as an
     // exception propagates out of them (§28.3). 0 = dispose all (the
@@ -993,6 +999,22 @@ private:
         builder_.CreateBr(unwindBB());
     }
 
+    // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
+    // exception when `excVal` is null and one is in flight): store it to
+    // the exception global, dispose the unwound using-vars, and branch to
+    // the unwind target. Leaves the current block terminated.
+    void emitThrowValue(llvm::Value* excVal) {
+        if (excVal) {
+            builder_.CreateStore(excVal, excGlobal());
+        } else if (currentCaughtExc_) {
+            // Bare `throw` re-raises the arm's caught exception (the global
+            // was cleared when the arm was entered).
+            builder_.CreateStore(currentCaughtExc_, excGlobal());
+        }
+        emitUnwindDisposals();  // CG21: dispose unwound using-vars
+        builder_.CreateBr(unwindBB());
+    }
+
     // CG22: if `cond` (i1, true = error) holds, throw `name`; otherwise
     // continue. Splits the current block.
     void emitGuardThrow(llvm::Value* cond, const char* name) {
@@ -1491,6 +1513,9 @@ private:
     void lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         const ast::Type* declType) {
         llvm::Value* v = init ? lowerExpr(*init) : nullptr;
+        // CG40: a diverging initializer (`var x := throw E;`) terminated the
+        // block; allocate the slot but emit no store.
+        if (diverged_) return;
         llvm::Type* slotTy =
             v ? v->getType() : (declType ? lowerType(declType) : i32());
         llvm::AllocaInst* slot = entryAlloca(slotTy);
@@ -1590,12 +1615,13 @@ private:
     bool lowerStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
             lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
+            if (diverged_) return true;  // CG40: diverging initializer
             if (ld->isUsing) registerUsingDisposal(ld);
             return false;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
             lowerLocalDecl(lc, lc->value.get(), lc->type.get());
-            return false;
+            return diverged_;  // CG40
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
             if (as->target && as->value) {
@@ -1647,17 +1673,18 @@ private:
             // var`s are disposed (§28.3), then control leaves — so the
             // returned value reflects pre-disposal state.
             llvm::Value* v = rs->value ? lowerExpr(*rs->value) : nullptr;
+            if (diverged_) return true;  // CG40: the value expression threw
             emitAllDisposals();
             emitReturn(currentFn_, v);
             return true;
         }
         if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
             if (es->expr) lowerExpr(*es->expr);  // side effects only (CG3: none)
-            return false;
+            return diverged_;  // CG40: a throw-expression terminated the block
         }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
             if (ds->value) lowerExpr(*ds->value);
-            return false;
+            return diverged_;  // CG40
         }
         if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
             return lowerIf(*ifs);
@@ -1691,16 +1718,8 @@ private:
         // CG20: throw — store the exception (a plain `throw;` re-raises the
         // one already in flight) and branch to the unwind target.
         if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-            if (th->value) {
-                if (llvm::Value* e = lowerExpr(*th->value))
-                    builder_.CreateStore(e, excGlobal());
-            } else if (currentCaughtExc_) {
-                // Bare `throw;` re-raises the arm's caught exception (the
-                // global was cleared when the arm was entered).
-                builder_.CreateStore(currentCaughtExc_, excGlobal());
-            }
-            emitUnwindDisposals();  // CG21: dispose unwound using-vars
-            builder_.CreateBr(unwindBB());
+            llvm::Value* e = th->value ? lowerExpr(*th->value) : nullptr;
+            emitThrowValue(e);
             return true;
         }
         // CG20: try / catch.
@@ -1906,6 +1925,7 @@ private:
     //   CG1: integer literals.
     //   CG2: integer arithmetic / bitwise / shift binary ops, unary -/~/+.
     llvm::Value* lowerExpr(const ast::Expr& e) {
+        diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
         // CG30: an enum constant (`Color.Green`) is its integer value.
         if (llvm::Value* ev = enumConstant(e)) return ev;
         if (llvm::Value* cv = constMemberValue(e)) return cv;
@@ -1966,6 +1986,18 @@ private:
                                "NullReferenceException");
             }
             return v;
+        }
+        // CG40: `throw` in expression position (§31.2). Evaluate the
+        // exception (if any), store + unwind exactly like the statement
+        // form, then mark the expression as diverged: the current block is
+        // now terminated, so phi-building consumers exclude this branch.
+        // A poison placeholder is returned so non-null checks pass; it is
+        // never consumed (the block does not reach any join).
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+            llvm::Value* exc = th->operand ? lowerExpr(*th->operand) : nullptr;
+            emitThrowValue(exc);
+            diverged_ = true;
+            return llvm::PoisonValue::get(ptrTy());
         }
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             return lowerBinary(*bin);
@@ -2243,11 +2275,21 @@ private:
 
         builder_.SetInsertPoint(rhsBB);
         llvm::Value* r = lowerExpr(*bin.right);
+        bool rhsDiverged = diverged_;  // CG40: e.g. `a ?? throw E`
         if (!r) return nullptr;
-        auto* rhsEndBB = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
+        llvm::BasicBlock* rhsEndBB = nullptr;
+        if (!rhsDiverged) {
+            rhsEndBB = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+        }
 
         builder_.SetInsertPoint(endBB);
+        diverged_ = false;  // the result is reachable via the non-null path
+        if (rhsDiverged) {
+            // The right operand branched away (threw); endBB is reached only
+            // by the non-null left path, so the result is always `l`.
+            return l;
+        }
         auto* phi = builder_.CreatePHI(ptrTy(), 2);
         phi->addIncoming(l, entryBB);  // left was non-null
         phi->addIncoming(r, rhsEndBB);
@@ -2676,16 +2718,25 @@ private:
 
         builder_.SetInsertPoint(thenBB);
         llvm::Value* tv = lowerExpr(*c.thenValue);
-        builder_.CreateBr(endBB);
+        bool thenDiv = diverged_;  // CG40: e.g. `cond ? throw E : b`
         llvm::BasicBlock* thenEnd = builder_.GetInsertBlock();
+        if (!thenDiv) builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(elseBB);
         llvm::Value* ev = lowerExpr(*c.elseValue);
-        builder_.CreateBr(endBB);
+        bool elseDiv = diverged_;
         llvm::BasicBlock* elseEnd = builder_.GetInsertBlock();
+        if (!elseDiv) builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(endBB);
         if (!tv || !ev) return nullptr;
+        // CG40: a branch that diverged (threw) does not reach endBB, so it
+        // is excluded from the join. When only one branch reaches, its
+        // value is the result; when both diverge, endBB is unreachable.
+        diverged_ = thenDiv && elseDiv;
+        if (thenDiv && elseDiv) return llvm::PoisonValue::get(tv->getType());
+        if (thenDiv) return ev;
+        if (elseDiv) return tv;
         llvm::PHINode* phi = builder_.CreatePHI(tv->getType(), 2);
         phi->addIncoming(tv, thenEnd);
         phi->addIncoming(ev, elseEnd);
