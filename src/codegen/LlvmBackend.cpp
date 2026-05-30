@@ -61,6 +61,31 @@ std::int64_t parseIntLiteral(std::string_view text) {
     return static_cast<std::int64_t>(std::strtoll(digits.c_str(), nullptr, base));
 }
 
+// CG32: decode a char literal lexeme (`'A'`, `'\n'`, …) to its code point.
+// The lexer already validated the form; quotes are stripped and a leading
+// backslash selects a simple escape. Multi-byte UTF-8 yields its first
+// byte (full code-point decoding is deferred with string support).
+std::int64_t parseCharLiteral(std::string_view text) {
+    if (text.size() >= 2 && text.front() == '\'') text.remove_prefix(1);
+    if (!text.empty() && text.back() == '\'') text.remove_suffix(1);
+    if (text.empty()) return 0;
+    if (text[0] != '\\') return static_cast<unsigned char>(text[0]);
+    if (text.size() < 2) return 0;
+    switch (text[1]) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case '0': return '\0';
+        case '\\': return '\\';
+        case '\'': return '\'';
+        case '"': return '"';
+        case 'b': return '\b';
+        case 'f': return '\f';
+        case 'v': return '\v';
+        default: return static_cast<unsigned char>(text[1]);
+    }
+}
+
 // Per-module emitter. Holds the LLVM context/module/builder and lowers the
 // checked AST. Grows one expression/statement kind per codegen slice.
 class Emitter {
@@ -1778,6 +1803,12 @@ private:
         }
         if (auto* boolLit = dynamic_cast<const ast::BoolLiteralExpr*>(&e)) {
             return llvm::ConstantInt::get(i1(), boolLit->value ? 1 : 0);
+        }
+        // CG32: a char literal is its (i32) code point.
+        if (auto* ch = dynamic_cast<const ast::CharLiteralExpr*>(&e)) {
+            return llvm::ConstantInt::get(
+                i32(), static_cast<std::uint64_t>(parseCharLiteral(ch->text)),
+                /*isSigned=*/false);
         }
         // CG24: float/double literal — value parsed from the lexeme, type
         // (f32/f64) from the expr's resolved type (default double).
