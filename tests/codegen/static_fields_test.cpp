@@ -5,9 +5,9 @@
 // initializer becomes the global's constant initial value. Observable via
 // the int exit code.
 //
-// (Cross-class `Type.field` static access and non-literal static
-// initializers — which the spec runs in a static constructor, §22 — are
-// deferred; tests reference statics bare within the declaring class.)
+// Cross-class / qualified `Type.field` static access reads and writes the
+// same backing global (#213). Non-literal static initializers — which the
+// spec runs in a static constructor, §22 — remain deferred.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -79,4 +79,43 @@ BEZEL_TEST(codegen_cg12, two_static_fields_independent) {
         "public static method Main(): int "
         "  _a := _a + 5; return _a + _b; "
         "end Main;"), 35);
+}
+
+// #213: a qualified static-field access `Type.Field` reads and writes the
+// same backing global (it has no instance slot, so the read path must
+// consult the static global directly — previously the read returned the
+// initializer value and the write was dropped).
+namespace {
+int runProg(const std::string& program) {
+    auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+} // namespace
+
+BEZEL_TEST(codegen_cg12, qualified_static_write_then_read) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class N public static Count: int := 0; end N; "
+        "class C public static method Main(): int "
+        "  N.Count := 5; return N.Count; "
+        "end Main; end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg12, instance_method_mutates_own_static) {
+    // A bare static reference inside an instance method targets the static
+    // backing global; the mutation is visible via `Type.Field` afterwards.
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class N "
+        "  public static Count: int := 0; "
+        "  public method Bump() Count := Count + 1; end Bump; "
+        "end N; "
+        "class C public static method Main(): int "
+        "  var n := new N(); n.Bump(); n.Bump(); n.Bump(); return N.Count; "
+        "end Main; end C;"), 3);
+}
+
+BEZEL_TEST(codegen_cg12, cross_class_static_read) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class N public static V: int := 42; end N; "
+        "class C public static method Main(): int => N.V; "
+        "end C;"), 42);
 }
