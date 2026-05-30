@@ -385,6 +385,8 @@ private:
     // local/parameter slot, a static-field global, a `this.f`/`obj.f`
     // field, or a bare implicit-`this` field. Null if not assignable.
     llvm::Value* lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
+        // CG50: a ref/out parameter — its address is the incoming pointer.
+        if (llvm::Value* a = refParamAddr(target, elemTy)) return a;
         if (llvm::AllocaInst* slot = localSlot(target)) {
             elemTy = slot->getAllocatedType();
             return slot;
