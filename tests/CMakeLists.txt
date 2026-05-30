@@ -164,6 +164,7 @@ set(BEZEL_TEST_SOURCES
     codegen/with_init_test.cpp
     codegen/interface_dispatch_test.cpp
     codegen/const_member_test.cpp
+    codegen/default_expr_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
