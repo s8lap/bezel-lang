@@ -1335,6 +1335,14 @@ private:
                     ctx_.setExprType(&ma, rt);
                 }
             }
+        } else if (dynamic_cast<EnumConstantSymbol*>(member) && targetType) {
+            // §10: an enum-constant access `E.Green` has the enum type, so a
+            // local inferred from it (`var e := E.Green`) and a `case`
+            // scrutinee both carry the enum type.
+            TypeRef* et = ctx_.makeTypeRef();
+            et->kind = TypeRef::Kind::Named;
+            et->declaration = targetType;
+            ctx_.setExprType(&ma, et);
         }
     }
 
