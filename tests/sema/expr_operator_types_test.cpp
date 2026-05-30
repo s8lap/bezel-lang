@@ -189,3 +189,14 @@ BEZEL_TEST(sema_ops, null_conditional_member_is_nullable) {
     auto* t = typeOf(r);
     BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && t->nullable);
 }
+
+// §20: the `if` expression has the common type of its branches — recording
+// it lets member access on the result (`(a if c else b).M`) resolve.
+BEZEL_TEST(sema_ops, conditional_expression_takes_branch_type) {
+    auto r = parseSema(
+        "module M; "
+        "class C public method M(a: N, b: N, c: bool) _ := (a if c else b); "
+        "end M; end C; class N end N;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);
+}
