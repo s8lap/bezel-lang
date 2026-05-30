@@ -596,6 +596,16 @@ private:
             i32(), static_cast<std::uint64_t>(it->second), /*isSigned=*/true);
     }
 
+    // CG36: a const member (`const X := …`) lowers to its initializer's
+    // value (a compile-time constant). Covers bare `X` and `Type.X`.
+    llvm::Value* constMemberValue(const ast::Expr& e) {
+        auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(ctx_.exprSymbol(e));
+        if (!cs) return nullptr;
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
+        if (!cd || !cd->value) return nullptr;
+        return lowerExpr(*cd->value);
+    }
+
     void declareStatics() {
         for (const auto& sym : ctx_.symbols()) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(sym.get());
@@ -1894,6 +1904,7 @@ private:
     llvm::Value* lowerExpr(const ast::Expr& e) {
         // CG30: an enum constant (`Color.Green`) is its integer value.
         if (llvm::Value* ev = enumConstant(e)) return ev;
+        if (llvm::Value* cv = constMemberValue(e)) return cv;
         if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
             // CG25: the literal's width comes from its resolved type
             // (e.g. an `L`-suffixed literal is i64).
