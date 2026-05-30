@@ -1,0 +1,85 @@
+// Codegen slice CG39 — null-coalescing `??` (§17.1 L12). `a ?? b` yields
+// `a` when it is a non-null reference, otherwise `b`. The right operand is
+// evaluated only when the left is null (short-circuit). Reference-typed
+// operands; nullable value types are deferred. Observable via exit code.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+
+// Body of `C.Main(): int`, wrapped with a helper class `T { V: int }`.
+int run(const std::string& body) {
+    auto r = runJit(
+        std::string("module M; class T public V: int := 0; end T; "
+                    "class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran ? r.exitCode : -999;
+}
+
+// A whole program (for tests that need an auxiliary method).
+int runProg(const std::string& program) {
+    auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+
+} // namespace
+
+BEZEL_TEST(codegen_cg39, left_null_yields_right) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: T? := null; "
+        "var b := new T(); b.V := 42; "
+        "var r := a ?? b; return r.V;"), 42);
+}
+
+BEZEL_TEST(codegen_cg39, left_non_null_yields_left) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := new T(); x.V := 7; var a: T? := x; "
+        "var b := new T(); b.V := 99; "
+        "var r := a ?? b; return r.V;"), 7);
+}
+
+BEZEL_TEST(codegen_cg39, chained_coalesce) {
+    // `a ?? b ?? c` is right-associative; the first non-null wins.
+    BEZEL_EXPECT_EQ(run(
+        "var a: T? := null; "
+        "var b: T? := null; "
+        "var c := new T(); c.V := 33; "
+        "var r := a ?? b ?? c; return r.V;"), 33);
+}
+
+BEZEL_TEST(codegen_cg39, right_not_evaluated_when_left_non_null) {
+    // Short-circuit: `Boom()` divides by zero (would raise
+    // DivideByZeroException) but is never called because the left is
+    // non-null, so the result is the left's V.
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class T public V: int := 0; end T; "
+        "class C "
+        "  public static method Boom(): T "
+        "    var z := 1 / 0; var t := new T(); t.V := z; return t; "
+        "  end Boom; "
+        "  public static method Main(): int "
+        "    var x := new T(); x.V := 5; var a: T? := x; "
+        "    var r := a ?? Boom(); return r.V; "
+        "  end Main; "
+        "end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg39, right_evaluated_when_left_null) {
+    // Complement: when the left is null the right operand IS evaluated —
+    // `Boom()` runs and its DivideByZeroException is observed.
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class T public V: int := 0; end T; "
+        "class C "
+        "  public static method Boom(): T "
+        "    var z := 1 / 0; return new T(); "
+        "  end Boom; "
+        "  public static method Main(): int "
+        "    var a: T? := null; "
+        "    try var r := a ?? Boom(); return 1; "
+        "    catch DivideByZeroException => return 7; end; "
+        "  end Main; "
+        "end C;"), 7);
+}
