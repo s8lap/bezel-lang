@@ -1946,6 +1946,10 @@ private:
         if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
             return llvm::ConstantPointerNull::get(ptrTy());
         }
+        // CG37: `default(T)` is the zero value of T (0 / false / 0.0 / null).
+        if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
+            return llvm::Constant::getNullValue(lowerType(de->type.get()));
+        }
         // CG23: postfix `!` (null-forgiving) — raise NullReferenceException
         // if the operand is null, otherwise yield it (§17.12).
         if (auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
