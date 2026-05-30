@@ -73,3 +73,16 @@ BEZEL_TEST(codegen_cg24, no_overflow_check_on_float) {
     BEZEL_EXPECT_EQ(run(
         "var x := 1.0e300; return (1 if x * x > x else 0);"), 1);
 }
+
+// §6.2: a `float` mixed with a `double` widens the float to double — the
+// operands must share a width before the FP op (previously an f32 and an
+// f64 reached the comparison with mismatched types).
+BEZEL_TEST(codegen_cg24, float_double_mixed_comparison) {
+    BEZEL_EXPECT_EQ(run("var d := 3.5; var f := float(d); "
+                        "return (1 if f = 3.5 else 0);"), 1);
+}
+
+BEZEL_TEST(codegen_cg24, float_double_mixed_arithmetic) {
+    BEZEL_EXPECT_EQ(run("var f := float(2.5); var d := 1.0; "
+                        "return (1 if f + d = 3.5 else 0);"), 1);
+}

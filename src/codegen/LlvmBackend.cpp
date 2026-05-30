@@ -2227,13 +2227,26 @@ private:
         // integer, promote the integer (§6.2 mixed-type promotion).
         if (l->getType()->isFloatingPointTy() ||
             r->getType()->isFloatingPointTy()) {
-            llvm::Type* fty = l->getType()->isFloatingPointTy()
-                                  ? l->getType()
-                                  : r->getType();
-            if (!l->getType()->isFloatingPointTy())
-                l = builder_.CreateSIToFP(l, fty);
-            if (!r->getType()->isFloatingPointTy())
-                r = builder_.CreateSIToFP(r, fty);
+            bool lFP = l->getType()->isFloatingPointTy();
+            bool rFP = r->getType()->isFloatingPointTy();
+            // The result FP type is the wider of two FP operands (so `float`
+            // mixed with `double` widens the float), else the lone FP type.
+            llvm::Type* fty =
+                (lFP && rFP)
+                    ? (l->getType()->getPrimitiveSizeInBits() >=
+                               r->getType()->getPrimitiveSizeInBits()
+                           ? l->getType()
+                           : r->getType())
+                    : (lFP ? l->getType() : r->getType());
+            auto toFP = [&](llvm::Value* v) -> llvm::Value* {
+                if (!v->getType()->isFloatingPointTy())
+                    return builder_.CreateSIToFP(v, fty);  // §6.2 int promote
+                if (v->getType() != fty)
+                    return builder_.CreateFPExt(v, fty);   // float → double
+                return v;
+            };
+            l = toFP(l);
+            r = toFP(r);
             if (op == "+") return builder_.CreateFAdd(l, r);
             if (op == "-") return builder_.CreateFSub(l, r);
             if (op == "*") return builder_.CreateFMul(l, r);
