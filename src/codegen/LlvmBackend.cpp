@@ -2009,6 +2009,13 @@ private:
             return lowerConditional(*cond);
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            // CG42: `x?.M(args)` — a call whose callee is a null-conditional
+            // member access skips the call when the receiver is null.
+            if (call->callee) {
+                if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                        call->callee.get()))
+                    return lowerNullCondCall(*call, *nm);
+            }
             return lowerCall(*call);
         }
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
@@ -2540,13 +2547,20 @@ private:
             args.push_back(v);
         }
 
-        // CG17/CG18/CG35: dynamic dispatch — load the receiver's vtable
-        // pointer (instance slot 0) and call through the method's slot.
-        // The slot is the interface-method slot when the static method is
-        // an interface method (CG35), else the virtual slot (CG17). Works
-        // for abstract/interface methods (no concrete function) since the
-        // slot is filled by the runtime class. A `base.M()` call bypasses
-        // dispatch (§12.3), as do non-virtual non-interface methods.
+        return emitMethodCall(ms, args, baseQualified);
+    }
+
+    // CG17/CG18/CG35: emit a call to `ms` with fully-built `args` (receiver
+    // first for instance methods). Dynamic dispatch loads the receiver's
+    // vtable pointer (instance slot 0) and calls through the method's slot
+    // — the interface-method slot when `ms` is an interface method (CG35),
+    // else the virtual slot (CG17); works for abstract/interface methods
+    // (no concrete function) since the slot is filled by the runtime class.
+    // A `base.M()` call (baseQualified) bypasses dispatch (§12.3), as do
+    // non-virtual non-interface methods.
+    llvm::Value* emitMethodCall(sema::MethodSymbol* ms,
+                                std::vector<llvm::Value*>& args,
+                                bool baseQualified) {
         bool canDispatch = !baseQualified && !isStaticMethod(ms);
         unsigned dispatchSlot = 0;
         if (canDispatch) {
@@ -2580,6 +2594,57 @@ private:
         llvm::Value* r = builder_.CreateCall(callee, args);
         emitPendingCheck();  // CG20: a callee may have thrown
         return r;
+    }
+
+    // CG42: null-conditional call `x?.M(args)` (§7.5) — the callee is a
+    // null-conditional member access. If the receiver is null the call is
+    // skipped (result null / no effect); otherwise the method is invoked.
+    // Handles void-returning calls (the `user?.Log(...)` idiom — result
+    // discarded) and reference-returning calls (result is the nullable
+    // pointer, null when the receiver was null). Value-typed returns need a
+    // nullable-value representation and are deferred.
+    llvm::Value* lowerNullCondCall(const ast::CallExpr& call,
+                                   const ast::NullCondMemberExpr& nm) {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+        if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;
+        llvm::FunctionType* fnTy = methodFnType(ms);
+        if (!fnTy) return nullptr;
+        llvm::Type* retTy = fnTy->getReturnType();
+        bool refResult = retTy->isPointerTy();
+        if (!retTy->isVoidTy() && !refResult)
+            return nullptr;  // value-typed result deferred
+        llvm::Value* recv = lowerExpr(*nm.target);
+        if (!recv || !recv->getType()->isPointerTy()) return nullptr;
+
+        auto* entryBB = builder_.GetInsertBlock();
+        auto* callBB =
+            llvm::BasicBlock::Create(llvm_, "nullcall.do", currentFn_);
+        auto* endBB =
+            llvm::BasicBlock::Create(llvm_, "nullcall.end", currentFn_);
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            recv, llvm::ConstantPointerNull::get(ptrTy()));
+        builder_.CreateCondBr(isNull, endBB, callBB);
+
+        builder_.SetInsertPoint(callBB);
+        std::vector<llvm::Value*> args;
+        args.push_back(recv);
+        for (const auto& a : call.args) {
+            if (!a.value) return nullptr;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return nullptr;
+            args.push_back(v);
+        }
+        llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false);
+        if (!r && refResult) return nullptr;
+        auto* callEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        if (!refResult) return nullptr;  // void: result discarded by caller
+        auto* phi = builder_.CreatePHI(ptrTy(), 2);
+        phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), entryBB);
+        phi->addIncoming(r, callEnd);
+        return phi;
     }
 
     // CG18: the LLVM function type of an instance/static method — leading
