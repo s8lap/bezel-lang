@@ -471,7 +471,16 @@ private:
                      rt->declaration->kind == ast::TypeDeclKind::Interface)) {
                     return ptrTy();  // reference types are heap pointers
                 }
-                return i32();  // value-kind named (record/enum) — later
+                // §9.4: a record is a value type. CG29 represents it as a
+                // pointer to a stack-allocated struct — so locals, parameters,
+                // returns, and field access reuse the class machinery (GEP on a
+                // pointer); record value semantics (copy-on-assign) are applied
+                // at assignment. The pointee layout is `recordStruct`.
+                if (rt->declaration &&
+                    rt->declaration->kind == ast::TypeDeclKind::Record) {
+                    return ptrTy();
+                }
+                return i32();  // other value-kind named (enum) — int
             default:
                 return i32();
         }
@@ -598,6 +607,11 @@ private:
     // The LLVM type backing an instance-storage member (field or
     // auto-property).
     llvm::Type* storageType(const sema::Symbol* m) {
+        // §9.1: a record's positional field carries its type on the
+        // originating Param, not a FieldDecl (its `decl` is the TypeDecl).
+        if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
+            if (fs->posParam)
+                return lowerType(fs->posParam->type.get());
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
             return lowerType(fd->type.get());
         if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
@@ -644,6 +658,30 @@ private:
         for (const sema::Symbol* m : storage) {
             fieldTys.push_back(storageType(m));
             fieldIndex_[m] = idx++;
+        }
+        st->setBody(fieldTys);
+        return st;
+    }
+
+    // CG29 (§9.4): the LLVM struct backing a record value. Unlike a class,
+    // a record has no vtable header — its data fields start at index 0. The
+    // fields are the record's non-static FieldSymbols in declaration order
+    // (positional fields plus any body fields). `fieldIndex_` is populated so
+    // field access reuses the same GEP path as classes. Records do not
+    // inherit (§9.6), so there is no prefix-layout walk.
+    llvm::StructType* recordStruct(const sema::TypeSymbol* t) {
+        auto it = structs_.find(t);
+        if (it != structs_.end()) return it->second;
+        auto* st = llvm::StructType::create(
+            llvm_, std::string("record.") + std::string(t->name));
+        structs_[t] = st;  // before filling, to support self-reference
+        std::vector<llvm::Type*> fieldTys;
+        unsigned idx = 0;
+        for (const sema::Symbol* m : t->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (!fs || isStaticField(fs)) continue;
+            fieldTys.push_back(storageType(fs));
+            fieldIndex_[fs] = idx++;
         }
         st->setBody(fieldTys);
         return st;
