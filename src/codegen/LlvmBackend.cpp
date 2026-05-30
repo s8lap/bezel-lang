@@ -112,6 +112,9 @@ public:
         for (auto& [sym, fn] : ctorFns_) {
             emitConstructorBody(sym, fn);
         }
+        for (auto& [cs, fn] : staticCtors_) {
+            emitStaticConstructorBody(cs, fn);
+        }
         for (auto& [ts, fn] : disposerFns_) {
             emitDisposerBody(ts, fn);
         }
@@ -139,6 +142,11 @@ private:
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
     std::unordered_map<sema::ConstructorSymbol*, llvm::Function*> ctorFns_;
+    // CG47: static constructors (§22.7) — `void()` functions run once before
+    // `main` (in declaration order). Kept ordered (not a map) for a stable
+    // run order.
+    std::vector<std::pair<sema::ConstructorSymbol*, llvm::Function*>>
+        staticCtors_;
 
     // CG11: enclosing-loop branch targets for `break`/`continue` (§A.6).
     // `continue` jumps to `continueTarget` (the loop's condition block),
@@ -761,6 +769,20 @@ private:
             ctorFns_[cs] = fn;
         }
 
+        // CG47: declare static constructors (§22.7) as `void()` functions.
+        for (const auto& sym : ctx_.symbols()) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym.get());
+            if (!cs || !cs->isStatic) continue;
+            if (!dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) continue;
+            std::string cls = cs->parent ? std::string(cs->parent->name) : "";
+            auto* fnType = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnType, llvm::Function::ExternalLinkage, "bz$" + cls + "$cctor",
+                module_.get());
+            staticCtors_.push_back({cs, fn});
+        }
+
         // CG13: declare a Dispose function `void(this)` for every class.
         for (const auto& sym : ctx_.symbols()) {
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
@@ -1367,6 +1389,13 @@ private:
         const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
         bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), paramSyms);
 
+        // CG47: run every static constructor once, before the program's
+        // body. The entry point Main is the single root, so calling them at
+        // its start runs them before any user code (§22.7).
+        if (isMain(ms)) {
+            for (auto& [cs, sfn] : staticCtors_) builder_.CreateCall(sfn, {});
+        }
+
         bool terminated = false;
         if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody) {
             llvm::Value* v = lowerExpr(*md->exprBody);
@@ -1381,6 +1410,27 @@ private:
     // `this`); its params bind to the ConstructorSymbol's ParameterSymbols.
     // Field initializers run in `lowerNew` before the call, so the body
     // only runs the explicit statements. Returns void.
+    // CG47: emit a static constructor body (§22.7). No `this`, no
+    // parameters, no base/this chain — it runs the body statements once to
+    // initialize the type's static state.
+    void emitStaticConstructorBody(sema::ConstructorSymbol* cs,
+                                   llvm::Function* fn) {
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) return;
+        currentFn_ = fn;
+        currentThis_ = nullptr;
+        locals_.clear();
+        paramSlots_.clear();
+        disposeStack_.clear();
+        loopStack_.clear();
+        propagateBB_ = nullptr;
+        unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr;
+        unwindScopeDepth_ = 0;
+        builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+        if (!lowerScopedBlock(cd->body)) builder_.CreateRetVoid();
+    }
+
     void emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* fn) {
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) return;
