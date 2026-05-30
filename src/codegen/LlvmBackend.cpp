@@ -1465,6 +1465,23 @@ private:
         return false;
     }
 
+    // §22.4/§22.7: select the constructor of `cls` whose parameters the
+    // given arguments can fill (named/positional + defaults). Prefers an
+    // exact-arity match, else the first that argsCanFill accepts.
+    sema::ConstructorSymbol* ctorForArgs(
+        const sema::TypeSymbol* cls,
+        const std::vector<ast::CallArgument>& args) {
+        if (!cls) return nullptr;
+        if (auto* exact = ctorByArity(cls, args.size(), nullptr)) return exact;
+        for (sema::Symbol* m : cls->members) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+            if (!cs || cs->isStatic) continue;
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (cd && argsCanFill(cd->params, args)) return cs;
+        }
+        return nullptr;
+    }
+
     // CG16: emit a resolved chain call with `this` + lowered arguments.
     void emitChainCall(const ast::CallExpr* call, bool isThis,
                        sema::ConstructorSymbol* cs) {
@@ -2557,19 +2574,16 @@ private:
         // CG16: select the ctor by arity (covers single-ctor and
         // arity-distinct overloads; full type-based overload resolution
         // is deferred). The chosen ctor runs its own base/this chain.
-        if (sema::ConstructorSymbol* cs =
-                ctorByArity(t, ne.args.size(), nullptr)) {
+        if (sema::ConstructorSymbol* cs = ctorForArgs(t, ne.args)) {
             auto it = ctorFns_.find(cs);
-            if (it != ctorFns_.end()) {
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (it != ctorFns_.end() && cd) {
                 std::vector<llvm::Value*> args;
                 args.push_back(obj);
-                for (const auto& a : ne.args) {
-                    if (!a.value) return obj;
-                    llvm::Value* v = lowerExpr(*a.value);
-                    if (!v) return obj;
-                    args.push_back(v);
-                }
-                if (args.size() == it->second->arg_size()) {
+                // §22.4/§22.7: named arguments and default values, as for a
+                // method call.
+                if (buildOrderedArgs(cd->params, ne.args, args) &&
+                    args.size() == it->second->arg_size()) {
                     builder_.CreateCall(it->second, args);
                 }
             }
@@ -2667,6 +2681,68 @@ private:
         return src;
     }
 
+    // §22.4/§22.7: can the given call arguments fill the parameter list?
+    // (named arguments matched by name, positionals by position, every
+    // remaining parameter defaulted). Pure check — no IR emitted — used to
+    // pick a constructor/method overload before lowering its arguments.
+    static bool argsCanFill(const std::vector<ast::Param>& params,
+                            const std::vector<ast::CallArgument>& args) {
+        std::vector<bool> filled(params.size(), false);
+        std::size_t pos = 0;
+        for (const auto& a : args) {
+            std::size_t idx;
+            if (a.name.empty()) {
+                if (pos >= params.size()) return false;
+                idx = pos++;
+            } else {
+                idx = params.size();
+                for (std::size_t j = 0; j < params.size(); ++j)
+                    if (params[j].name == a.name) { idx = j; break; }
+                if (idx >= params.size()) return false;
+            }
+            if (filled[idx]) return false;
+            filled[idx] = true;
+        }
+        for (std::size_t j = 0; j < params.size(); ++j)
+            if (!filled[j] && !params[j].defaultValue) return false;
+        return true;
+    }
+
+    // §22.4/§22.7: lower the call arguments into parameter order, honoring
+    // named arguments and default values. Provided arguments are evaluated
+    // in source order; defaults afterward in parameter order. Appends to
+    // `out`; returns false if an argument can't be placed.
+    bool buildOrderedArgs(const std::vector<ast::Param>& params,
+                          const std::vector<ast::CallArgument>& args,
+                          std::vector<llvm::Value*>& out) {
+        std::vector<llvm::Value*> ordered(params.size(), nullptr);
+        std::size_t pos = 0;
+        for (const auto& a : args) {
+            if (!a.value) return false;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return false;
+            std::size_t idx = params.size();
+            if (a.name.empty()) {
+                idx = pos++;
+            } else {
+                for (std::size_t j = 0; j < params.size(); ++j)
+                    if (params[j].name == a.name) { idx = j; break; }
+            }
+            if (idx >= params.size() || ordered[idx]) return false;
+            ordered[idx] = v;
+        }
+        for (std::size_t j = 0; j < params.size(); ++j) {
+            if (!ordered[j]) {
+                const ast::Expr* dv = params[j].defaultValue.get();
+                if (!dv) return false;
+                ordered[j] = lowerExpr(*dv);
+                if (!ordered[j]) return false;
+            }
+            out.push_back(ordered[j]);
+        }
+        return true;
+    }
+
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
         // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
@@ -2724,37 +2800,10 @@ private:
             if (!recv) return nullptr;
             args.push_back(recv);
         }
-        // §22.4/§22.7: place arguments into parameter order, honoring named
-        // arguments (`p := expr`) and filling omitted parameters with their
-        // default values. Provided arguments are evaluated in source order
-        // (side effects left-to-right as written); defaults are evaluated
-        // afterward in parameter order.
+        // §22.4/§22.7: place arguments into parameter order (named by name,
+        // positional by position, omitted parameters defaulted).
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-            std::vector<llvm::Value*> ordered(md->params.size(), nullptr);
-            std::size_t pos = 0;
-            for (const auto& a : call.args) {
-                if (!a.value) return nullptr;
-                llvm::Value* v = lowerExpr(*a.value);
-                if (!v) return nullptr;
-                std::size_t idx = md->params.size();
-                if (a.name.empty()) {
-                    idx = pos++;
-                } else {
-                    for (std::size_t j = 0; j < md->params.size(); ++j)
-                        if (md->params[j].name == a.name) { idx = j; break; }
-                }
-                if (idx >= md->params.size() || ordered[idx]) return nullptr;
-                ordered[idx] = v;
-            }
-            for (std::size_t j = 0; j < md->params.size(); ++j) {
-                if (!ordered[j]) {
-                    const ast::Expr* dv = md->params[j].defaultValue.get();
-                    if (!dv) return nullptr;  // required parameter omitted
-                    ordered[j] = lowerExpr(*dv);
-                    if (!ordered[j]) return nullptr;
-                }
-                args.push_back(ordered[j]);
-            }
+            if (!buildOrderedArgs(md->params, call.args, args)) return nullptr;
         } else {
             for (const auto& a : call.args) {
                 if (!a.value) return nullptr;
