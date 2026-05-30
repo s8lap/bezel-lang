@@ -272,8 +272,33 @@ private:
 
     // Is this member symbol a static method with a lowerable body?
     static bool isStaticMethod(sema::MethodSymbol* ms) {
+        if (ms->isOperator) return true;  // §25: operators are always static
         for (auto mod : ms->modifiers) {
             if (mod == "static") return true;
+        }
+        return false;
+    }
+
+    // §25: the callable's parameters / return / body, abstracting over a
+    // MethodDecl vs an OperatorDecl (an operator overload's symbol points at
+    // an OperatorDecl, which has the same shape).
+    struct CallableInfo {
+        const std::vector<ast::Param>* params = nullptr;
+        const ast::Type* returnType = nullptr;
+        ast::MethodBodyKind bodyKind = ast::MethodBodyKind::Abstract;
+        const ast::Expr* exprBody = nullptr;
+        const std::vector<std::unique_ptr<ast::Stmt>>* stmts = nullptr;
+    };
+    static bool callableInfo(const sema::MethodSymbol* ms, CallableInfo& out) {
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            out = {&md->params, md->returnType.get(), md->bodyKind,
+                   md->exprBody.get(), &md->stmts};
+            return true;
+        }
+        if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl)) {
+            out = {&od->params, od->returnType.get(), od->bodyKind,
+                   od->exprBody.get(), &od->stmts};
+            return true;
         }
         return false;
     }
@@ -537,6 +562,10 @@ private:
     std::string functionName(sema::MethodSymbol* ms) {
         if (isMain(ms)) return "main";
         std::string cls = ms->parent ? std::string(ms->parent->name) : "";
+        // §25: an operator's name is empty; build a unique, collision-free
+        // name from its token (a type may declare several operators).
+        if (ms->isOperator)
+            return "bz$" + cls + "$op$" + std::string(ms->operatorToken);
         return "bz$" + cls + "$" + std::string(ms->name);
     }
 
@@ -731,14 +760,16 @@ private:
         for (const auto& sym : ctx_.symbols()) {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(sym.get());
             if (!ms) continue;
-            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-            if (!md || md->bodyKind == ast::MethodBodyKind::Abstract) continue;
+            CallableInfo ci;
+            if (!callableInfo(ms, ci) ||
+                ci.bodyKind == ast::MethodBodyKind::Abstract)
+                continue;
 
             llvm::Type* retTy = isMain(ms) ? i32()
-                                           : lowerType(md->returnType.get());
+                                           : lowerType(ci.returnType);
             std::vector<llvm::Type*> paramTys;
             if (!isStaticMethod(ms)) paramTys.push_back(ptrTy());  // this
-            for (const auto& p : md->params) {
+            for (const auto& p : *ci.params) {
                 paramTys.push_back(lowerType(p.type.get()));
             }
             auto* fnType = llvm::FunctionType::get(retTy, paramTys,
@@ -1372,8 +1403,8 @@ private:
 
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
-        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-        if (!md) return;
+        CallableInfo ci;
+        if (!callableInfo(ms, ci)) return;
         currentFn_ = fn;
         currentThis_ = nullptr;
         locals_.clear();
@@ -1386,8 +1417,7 @@ private:
         unwindScopeDepth_ = 0;
         builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
-        const std::vector<sema::Symbol*>* paramSyms = paramSymbolsOf(md);
-        bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), paramSyms);
+        bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
 
         // CG47: run every static constructor once, before the program's
         // body. The entry point Main is the single root, so calling them at
@@ -1397,11 +1427,11 @@ private:
         }
 
         bool terminated = false;
-        if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody) {
-            llvm::Value* v = lowerExpr(*md->exprBody);
+        if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
+            llvm::Value* v = lowerExpr(*ci.exprBody);
             terminated = emitReturn(fn, v);
-        } else if (md->bodyKind == ast::MethodBodyKind::Block) {
-            terminated = lowerScopedBlock(md->stmts);
+        } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
+            terminated = lowerScopedBlock(*ci.stmts);
         }
         if (!terminated) emitImplicitReturn(fn);
     }
@@ -2315,6 +2345,19 @@ private:
         // operand is evaluated only when the left is null.
         if (bin.op == "??")
             return lowerCoalesce(bin);
+        // §25: a user-defined operator overload — sema resolved the binary
+        // expression to a static `operator` method; call it with the two
+        // operands.
+        if (auto* opm =
+                dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(bin))) {
+            if (opm->isOperator) {
+                llvm::Value* ol = lowerExpr(*bin.left);
+                llvm::Value* orr = lowerExpr(*bin.right);
+                if (!ol || !orr) return nullptr;
+                std::vector<llvm::Value*> args{ol, orr};
+                return emitMethodCall(opm, args, /*baseQualified=*/false);
+            }
+        }
         llvm::Value* l = lowerExpr(*bin.left);
         llvm::Value* r = lowerExpr(*bin.right);
         if (!l || !r) return nullptr;

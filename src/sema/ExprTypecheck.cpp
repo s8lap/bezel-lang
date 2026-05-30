@@ -1536,8 +1536,44 @@ private:
     // ops `and` / `or` produce bool; `??` produces the non-nullable
     // result type of the LHS; range ops produce a Range value (slice 3c
     // leaves Range as Error).
+    // §25: the user-defined `static operator <op>` method that applies to a
+    // binary expression, if either operand's type (class or record)
+    // declares one. `=`/`<>` on classes are excluded (they invoke Equals,
+    // §25.2).
+    MethodSymbol* findBinaryOperator(const ast::BinaryExpr& be) {
+        auto onType = [&](const ast::Expr* operand) -> MethodSymbol* {
+            if (!operand) return nullptr;
+            TypeSymbol* ts = memberTargetType(operand);
+            if (!ts) return nullptr;
+            if ((be.op == "=" || be.op == "<>") &&
+                ts->kind == ast::TypeDeclKind::Class)
+                return nullptr;
+            for (Symbol* m : ts->members) {
+                auto* ms = dynamic_cast<MethodSymbol*>(m);
+                if (ms && ms->isOperator && ms->operatorToken == be.op &&
+                    ms->params.size() == 2)
+                    return ms;
+            }
+            return nullptr;
+        };
+        if (auto* m = onType(be.left.get())) return m;
+        return onType(be.right.get());
+    }
+
     void typeBinary(const ast::BinaryExpr& be) {
         const auto& op = be.op;
+        // §25: a user-defined operator overload takes precedence over the
+        // built-in result-type rules; the expression is that method's call.
+        if (op != "and" && op != "or" && op != "in") {
+            if (MethodSymbol* opm = findBinaryOperator(be)) {
+                ctx_.setExprSymbol(&be, opm);
+                if (auto* od = dynamic_cast<const ast::OperatorDecl*>(opm->decl))
+                    if (od->returnType)
+                        if (auto* rt = ctx_.resolvedType(*od->returnType))
+                            ctx_.setExprType(&be, rt);
+                return;
+            }
+        }
         if (op == "=" || op == "<>" || op == "<" || op == ">" ||
             op == "<=" || op == ">=" || op == "and" || op == "or") {
             ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));

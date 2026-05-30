@@ -181,6 +181,7 @@ set(BEZEL_TEST_SOURCES
     codegen/overload_test.cpp
     codegen/ctor_args_test.cpp
     codegen/static_ctor_test.cpp
+    codegen/operator_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
