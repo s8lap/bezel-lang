@@ -196,6 +196,23 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
             sym->members.push_back(member);
         }
     }
+    // §9.1: a record's positional fields become public read-only members,
+    // alongside any body-declared members. They carry no body `FieldDecl`, so
+    // the FieldSymbol's `decl` is the owning TypeDecl and its type is read
+    // from `posParam->type` (resolved by TypeResolution, which already walks
+    // td.positionalFields).
+    if (td.hasPositionalFields) {
+        for (const auto& pf : td.positionalFields) {
+            auto* fs = ctx.makeSymbol<FieldSymbol>();
+            fs->name = pf.name;
+            fs->visibility = ast::Visibility::Public;
+            fs->parent = sym;
+            fs->decl = &td;
+            fs->posParam = &pf;
+            fs->scope = sym->memberScope;
+            sym->members.push_back(fs);
+        }
+    }
     // Enum constants live alongside members.
     for (const auto& ec : td.enumConstants) {
         auto* esym = ctx.makeSymbol<EnumConstantSymbol>();
