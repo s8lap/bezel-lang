@@ -420,17 +420,46 @@ private:
     // base-class fields FIRST (prefix layout: a `Derived*` aliases a
     // `Base*`), then own fields. Recurses the single base class
     // (baseTypes[0] when it is a class). Static fields are excluded.
-    void collectInstanceFields(const sema::TypeSymbol* t,
-                               std::vector<const sema::FieldSymbol*>& out) {
+    // CG33: an auto-property (`Name: T { get; set; }`) — no indexer, no
+    // explicit accessor bodies, no arrow/block getter — is backed by a
+    // compiler-generated instance field, so it gets storage like a field.
+    bool isAutoProperty(const sema::Symbol* m) {
+        auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
+        if (!ps || ps->isIndexer) return false;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->isIndexer || pd->hasExplicitAccessors ||
+            pd->getterExpr || pd->getterBody)
+            return false;
+        for (auto mod : ps->modifiers)
+            if (mod == "static") return false;
+        return true;
+    }
+
+    // The LLVM type backing an instance-storage member (field or
+    // auto-property).
+    llvm::Type* storageType(const sema::Symbol* m) {
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+            return lowerType(fd->type.get());
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+            return lowerType(pd->type.get());
+        return i32();
+    }
+
+    // CG15/CG33: a class's instance storage in layout order — base-class
+    // storage first (prefix layout), then own. Storage = non-static fields
+    // and auto-properties.
+    void collectInstanceStorage(const sema::TypeSymbol* t,
+                                std::vector<const sema::Symbol*>& out) {
         for (const sema::TypeSymbol* b : t->baseTypes) {
             if (b && b->kind == ast::TypeDeclKind::Class) {
-                collectInstanceFields(b, out);
+                collectInstanceStorage(b, out);
                 break;  // a class has at most one base class
             }
         }
         for (const sema::Symbol* m : t->members) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-            if (fs && !isStaticField(fs)) out.push_back(fs);
+            if (fs && !isStaticField(fs)) { out.push_back(m); continue; }
+            if (isAutoProperty(m)) out.push_back(m);
         }
     }
 
@@ -446,16 +475,15 @@ private:
         auto* st = llvm::StructType::create(
             llvm_, std::string("class.") + std::string(t->name));
         structs_[t] = st;  // record before filling (supports self-reference)
-        std::vector<const sema::FieldSymbol*> fields;
-        collectInstanceFields(t, fields);
+        std::vector<const sema::Symbol*> storage;
+        collectInstanceStorage(t, storage);
         std::vector<llvm::Type*> fieldTys;
         // CG17: slot 0 is the hidden vtable pointer; data fields follow.
         fieldTys.push_back(ptrTy());
         unsigned idx = 1;
-        for (const sema::FieldSymbol* fs : fields) {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            fieldTys.push_back(fd ? lowerType(fd->type.get()) : i32());
-            fieldIndex_[fs] = idx++;
+        for (const sema::Symbol* m : storage) {
+            fieldTys.push_back(storageType(m));
+            fieldIndex_[m] = idx++;
         }
         st->setBody(fieldTys);
         return st;
@@ -1900,13 +1928,22 @@ private:
     // referenced bare inside an instance method (`_x` rather than
     // `this._x`). Returns the GEP and sets `elemTy`; null if `e` is not
     // such a reference (not an identifier, not a field, or no `this`).
+    // CG33: the instance-storage member (field or auto-property) a symbol
+    // refers to, or null.
+    sema::MemberSymbol* storageMemberOf(sema::Symbol* sym) {
+        if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym)) return fs;
+        if (isAutoProperty(sym))
+            return dynamic_cast<sema::PropertySymbol*>(sym);
+        return nullptr;
+    }
+
     llvm::Value* implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy) {
         if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) return nullptr;
-        auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e));
-        if (!fs || !fs->parent || !currentThis_) return nullptr;
-        auto idxIt = fieldIndex_.find(fs);
+        auto* ms = storageMemberOf(ctx_.exprSymbol(e));
+        if (!ms || !ms->parent || !currentThis_) return nullptr;
+        auto idxIt = fieldIndex_.find(ms);
         if (idxIt == fieldIndex_.end()) return nullptr;  // static field
-        llvm::StructType* st = classStruct(fs->parent);
+        llvm::StructType* st = classStruct(ms->parent);
         elemTy = st->getElementType(idxIt->second);
         return builder_.CreateStructGEP(st, currentThis_, idxIt->second);
     }
@@ -2114,12 +2151,12 @@ private:
         // `new Derived()` initializes base fields too (calloc already
         // zeroed the rest). CG16's base-ctor chaining runs ctor *bodies*,
         // not these initializers, so there is no double-initialization.
-        std::vector<const sema::FieldSymbol*> fields;
-        collectInstanceFields(t, fields);
-        for (const sema::FieldSymbol* fs : fields) {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (!fd || !fd->initializer) continue;
-            auto idxIt = fieldIndex_.find(fs);
+        std::vector<const sema::Symbol*> storage;
+        collectInstanceStorage(t, storage);
+        for (const sema::Symbol* m : storage) {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl);
+            if (!fd || !fd->initializer) continue;  // auto-props: zero-init
+            auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
             llvm::Value* v = lowerExpr(*fd->initializer);
             if (!v) continue;
@@ -2164,11 +2201,11 @@ private:
     // access we can lower.
     llvm::Value* fieldAddr(const ast::MemberAccessExpr& ma,
                            llvm::Type*& elemTy) {
-        auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(ma));
-        if (!fs || !fs->parent || !ma.target) return nullptr;
-        auto idxIt = fieldIndex_.find(fs);
+        auto* ms = storageMemberOf(ctx_.exprSymbol(ma));
+        if (!ms || !ms->parent || !ma.target) return nullptr;
+        auto idxIt = fieldIndex_.find(ms);
         if (idxIt == fieldIndex_.end()) return nullptr;
-        llvm::StructType* st = classStruct(fs->parent);
+        llvm::StructType* st = classStruct(ms->parent);
         llvm::Value* obj = lowerExpr(*ma.target);
         if (!obj) return nullptr;
         elemTy = st->getElementType(idxIt->second);
