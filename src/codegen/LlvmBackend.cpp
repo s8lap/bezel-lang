@@ -2349,7 +2349,10 @@ private:
             if (op == "*") return builder_.CreateFMul(l, r);
             if (op == "/") return builder_.CreateFDiv(l, r);
             if (op == "=") return builder_.CreateFCmpOEQ(l, r);
-            if (op == "<>") return builder_.CreateFCmpONE(l, r);
+            // §6.3 (IEEE 754): `<>` is the negation of `=`, so it is true
+            // when either operand is NaN — an *unordered* not-equal (UNE).
+            // (`=` stays ordered-equal: `NaN = NaN` is false.)
+            if (op == "<>") return builder_.CreateFCmpUNE(l, r);
             if (op == "<") return builder_.CreateFCmpOLT(l, r);
             if (op == ">") return builder_.CreateFCmpOGT(l, r);
             if (op == "<=") return builder_.CreateFCmpOLE(l, r);
