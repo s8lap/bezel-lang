@@ -503,6 +503,54 @@ private:
         return nullptr;
     }
 
+    // §22.9: the block-form setter accessor of the property `target` names,
+    // or null (auto-properties have backing storage and use the normal
+    // store path; a non-property target is not one). Used to run a custom
+    // setter on `obj.P := v`.
+    const ast::PropertyAccessor* computedSetterOf(const ast::Expr& target) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
+        if (!ps || ps->isIndexer || isAutoProperty(ps)) return nullptr;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->bodyKind != ast::PropertyBodyKind::Block) return nullptr;
+        for (const auto& acc : pd->accessors) {
+            if (acc.isSet &&
+                acc.bodyKind != ast::PropertyAccessorBodyKind::Abstract)
+                return &acc;
+        }
+        return nullptr;
+    }
+
+    // §22.9: run a block-form property setter for `obj.P := value`. Binds
+    // `value` (anchored on the PropertyDecl in sema) to a slot, sets `this`
+    // to the receiver, and lowers the setter body. Returns false (so the
+    // caller falls through to the normal store path) when `target` is not a
+    // block-setter property.
+    bool lowerPropertySet(const ast::Expr& target, const ast::Expr& value) {
+        const ast::PropertyAccessor* setter = computedSetterOf(target);
+        if (!setter) return false;
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        llvm::Value* recv = currentThis_;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target))
+            recv = ma->target ? lowerExpr(*ma->target) : currentThis_;
+        if (!recv) return false;
+        llvm::Value* v = lowerExpr(value);
+        if (!v) return false;
+        // Bind `value` — sema anchored its symbol's decl on the PropertyDecl.
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        locals_[pd] = slot;
+        llvm::Value* savedThis = currentThis_;
+        currentThis_ = recv;
+        if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+            setter->exprBody)
+            lowerExpr(*setter->exprBody);
+        else
+            lowerScopedBlock(setter->stmts);
+        currentThis_ = savedThis;
+        return true;
+    }
+
     // The LLVM type backing an instance-storage member (field or
     // auto-property).
     llvm::Type* storageType(const sema::Symbol* m) {
@@ -1779,6 +1827,12 @@ private:
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
             if (as->target && as->value) {
+                // §22.9: `obj.P := v` where P is a block-form property runs
+                // its setter body (with `value` = v). Compound assignment on
+                // such a property is deferred.
+                if (as->op == ":=" &&
+                    lowerPropertySet(*as->target, *as->value))
+                    return false;
                 llvm::Type* elemTy = nullptr;
                 llvm::Value* addr = lvalueAddr(*as->target, elemTy);
                 if (!addr) return false;

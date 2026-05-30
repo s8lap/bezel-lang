@@ -1,0 +1,73 @@
+// Codegen slice CG49 — block-form property setters (§22.9). A property with
+// a `set => do … end` (or `set => expr`) accessor runs that body on
+// `obj.P := v`, with the implicit `value` parameter (renamable via
+// `set(name)`) bound to the assigned value. The getter side (CG33c) and
+// auto-properties are unchanged. Observable via the int exit code.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+int run(const std::string& program) {
+    auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+} // namespace
+
+BEZEL_TEST(codegen_cg49, block_setter_stores_value) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property P: int get => _x; set => do _x := value; end; end; "
+        "  public static method Main(): int "
+        "    var c := new C(); c.P := 42; return c.P; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+BEZEL_TEST(codegen_cg49, setter_transforms_value) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property P: int "
+        "    get => _x; set => do _x := value * 2; end; end; "
+        "  public static method Main(): int "
+        "    var c := new C(); c.P := 5; return c.P; "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+BEZEL_TEST(codegen_cg49, renamed_setter_parameter) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property P: int "
+        "    get => _x; set(v) => do _x := v + 1; end; end; "
+        "  public static method Main(): int "
+        "    var c := new C(); c.P := 7; return c.P; "
+        "  end Main; "
+        "end C;"), 8);
+}
+
+BEZEL_TEST(codegen_cg49, setter_via_implicit_this) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property P: int get => _x; set => do _x := value; end; end; "
+        "  public method Init() P := 33; end Init; "
+        "  public static method Main(): int "
+        "    var c := new C(); c.Init(); return c.P; "
+        "  end Main; "
+        "end C;"), 33);
+}
+
+BEZEL_TEST(codegen_cg49, auto_property_unchanged) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public property V: int; "
+        "  public static method Main(): int "
+        "    var c := new C(); c.V := 99; return c.V; "
+        "  end Main; "
+        "end C;"), 99);
+}
