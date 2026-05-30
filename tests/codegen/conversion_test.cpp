@@ -35,8 +35,32 @@ BEZEL_TEST(codegen_cg44, long_to_int) {
     BEZEL_EXPECT_EQ(run("var x := 300L; return int(x);"), 300);
 }
 
-BEZEL_TEST(codegen_cg44, int_to_byte_truncates) {
-    BEZEL_EXPECT_EQ(run("var n := 258; var b := byte(n); return int(b);"), 2);
+BEZEL_TEST(codegen_cg44, int_to_byte_in_range) {
+    BEZEL_EXPECT_EQ(run("var n := 200; var b := byte(n); return int(b);"), 200);
+}
+
+// §5.2: integer narrowing raises OverflowException when the value does
+// not fit the target type.
+BEZEL_TEST(codegen_cg44, int_to_byte_overflow_raises) {
+    BEZEL_EXPECT_EQ(run(
+        "var n := 258; "
+        "try var b := byte(n); return int(b); "
+        "catch OverflowException => return 99; end;"), 99);
+}
+
+BEZEL_TEST(codegen_cg44, int_to_short_overflow_raises) {
+    BEZEL_EXPECT_EQ(run(
+        "var n := 70000; "
+        "try var s := short(n); return int(s); "
+        "catch OverflowException => return 77; end;"), 77);
+}
+
+BEZEL_TEST(codegen_cg44, signed_narrowing_overflow_raises) {
+    // 200 does not fit a signed sbyte (range −128..127).
+    BEZEL_EXPECT_EQ(run(
+        "var n := 200; "
+        "try var b := sbyte(n); return int(b); "
+        "catch OverflowException => return 88; end;"), 88);
 }
 
 BEZEL_TEST(codegen_cg44, int_to_long_widens) {

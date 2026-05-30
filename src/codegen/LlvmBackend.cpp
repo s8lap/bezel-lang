@@ -2609,7 +2609,18 @@ private:
         // int → int.
         unsigned sb = srcTy->getIntegerBitWidth();
         unsigned db = dstTy->getIntegerBitWidth();
-        if (db < sb) return builder_.CreateTrunc(src, dstTy);
+        if (db < sb) {
+            // §5.2: integer narrowing raises OverflowException if the value
+            // does not fit the target. Truncate, extend back with the
+            // target's signedness, and compare to the original — a mismatch
+            // means the value was out of range.
+            llvm::Value* trunc = builder_.CreateTrunc(src, dstTy);
+            llvm::Value* back = dstUns ? builder_.CreateZExt(trunc, srcTy)
+                                       : builder_.CreateSExt(trunc, srcTy);
+            emitGuardThrow(builder_.CreateICmpNE(back, src),
+                           "OverflowException");
+            return trunc;
+        }
         if (db > sb)
             return srcUns ? builder_.CreateZExt(src, dstTy)
                           : builder_.CreateSExt(src, dstTy);
