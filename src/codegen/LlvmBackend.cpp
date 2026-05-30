@@ -1465,6 +1465,9 @@ private:
         } else {
             emitImplicitBase(cs->parent, currentThis_);
         }
+        // CG20: a base/this constructor (the chain) may throw — unwind
+        // before running the rest of this constructor's body.
+        emitPendingCheck();
 
         bool terminated = lowerScopedBlock(cd->body, startIdx);
         if (!terminated) builder_.CreateRetVoid();
@@ -2635,12 +2638,14 @@ private:
                 if (buildOrderedArgs(cd->params, ne.args, args) &&
                     args.size() == it->second->arg_size()) {
                     builder_.CreateCall(it->second, args);
+                    emitPendingCheck();  // CG20: a constructor may throw
                 }
             }
         } else if (!hasAnyConstructor(t)) {
             // CG16: no explicit ctor → the implicit ctor runs an implicit
             // `base()`, so a base-class ctor still runs on `new Derived()`.
             emitImplicitBase(t, obj);
+            emitPendingCheck();  // CG20: the base constructor may throw
         }
         return obj;
     }
