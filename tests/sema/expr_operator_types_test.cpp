@@ -200,3 +200,16 @@ BEZEL_TEST(sema_ops, conditional_expression_takes_branch_type) {
     auto* t = typeOf(r);
     BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);
 }
+
+// §10: an enum-constant access `E.Green` has the enum type — so a local
+// inferred from it carries the enum type (needed e.g. for a `case`
+// scrutinee to resolve its arms' enum-constant patterns).
+BEZEL_TEST(sema_ops, enum_constant_access_has_enum_type) {
+    auto r = parseSema(
+        "module M; "
+        "class C public method M() _ := E.Green; end M; end C; "
+        "enum E Red, Green, Blue; end E;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named &&
+                      t->declaration && t->declaration->name == "E");
+}
