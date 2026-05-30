@@ -177,3 +177,47 @@ BEZEL_TEST(codegen_cg20, catch_when_guard_true_enters_arm) {
         "  catch E => return 9; end; return 0; "
         "end Main; end C;"), 5);
 }
+
+// CG20: an exception thrown during construction (`new T()`) propagates to
+// the surrounding try — from the constructor body itself, from a `base(...)`
+// / `this(...)` chained constructor, and from an implicit base constructor.
+BEZEL_TEST(codegen_cg20, exception_from_constructor_body) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E end E; "
+        "class N public constructor() throw new E(); end constructor; end N; "
+        "class C public static method Main(): int "
+        "  try var n := new N(); return 0; catch E => return 7; end; "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(codegen_cg20, exception_from_base_constructor) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E end E; "
+        "class B public constructor() throw new E(); end constructor; end B; "
+        "class D : B public constructor() base(); end constructor; end D; "
+        "class C public static method Main(): int "
+        "  try var d := new D(); return 0; catch E => return 5; end; "
+        "end Main; end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg20, exception_from_this_chained_constructor) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E end E; "
+        "class P "
+        "  public constructor() this(1); end constructor; "
+        "  public constructor(x: int) throw new E(); end constructor; "
+        "end P; "
+        "class C public static method Main(): int "
+        "  try var p := new P(); return 0; catch E => return 6; end; "
+        "end Main; end C;"), 6);
+}
+
+BEZEL_TEST(codegen_cg20, exception_from_implicit_base_constructor) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E end E; "
+        "class B public constructor() throw new E(); end constructor; end B; "
+        "class D : B end D; "
+        "class C public static method Main(): int "
+        "  try var d := new D(); return 0; catch E => return 4; end; "
+        "end Main; end C;"), 4);
+}
