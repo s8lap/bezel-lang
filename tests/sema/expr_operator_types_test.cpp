@@ -177,3 +177,15 @@ BEZEL_TEST(sema_ops, postfix_bang_yields_nonnull) {
     auto* t = typeOf(r);
     BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);
 }
+
+// §7.5 null-conditional member access `x?.M` — the result type is always
+// nullable (the access yields null when the target is null).
+BEZEL_TEST(sema_ops, null_conditional_member_is_nullable) {
+    auto r = parseSema(
+        "module M; "
+        "class C public method M(t: T) _ := t?.n; end M; end C; "
+        "class T public n: N := new N(); end T; "
+        "class N end N;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && t->nullable);
+}
