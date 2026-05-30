@@ -178,6 +178,7 @@ set(BEZEL_TEST_SOURCES
     codegen/move_expr_test.cpp
     codegen/default_args_test.cpp
     codegen/named_args_test.cpp
+    codegen/overload_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp

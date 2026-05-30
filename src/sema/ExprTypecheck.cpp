@@ -1149,6 +1149,24 @@ private:
                 return;
             }
         }
+        // §22.6: arity-based overload resolution. The callee resolved to one
+        // method of its name; when that one's parameter count doesn't match
+        // this call's argument count, re-select the same-named overload
+        // whose parameter count does. (Type-based tie-breaking between
+        // equal-arity overloads is a later refinement.)
+        if (auto* ms0 = dynamic_cast<MethodSymbol*>(calleeSym)) {
+            if (ms0->parent && ms0->params.size() != ce.args.size()) {
+                for (Symbol* m : ms0->parent->members) {
+                    auto* cand = dynamic_cast<MethodSymbol*>(m);
+                    if (cand && cand->name == ms0->name &&
+                        cand->params.size() == ce.args.size()) {
+                        ctx_.setExprSymbol(ce.callee.get(), cand);
+                        calleeSym = cand;
+                        break;
+                    }
+                }
+            }
+        }
         if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
             auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
             if (md && md->returnType) {
