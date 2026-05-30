@@ -842,6 +842,10 @@ private:
                         }
                     }
                 }
+            } else if (primitiveFromName(id->name) != PrimitiveType::None) {
+                // §5.2: a primitive type name used in expression position is
+                // a conversion callee (`int(x)`). It has no value symbol;
+                // the enclosing call resolves the conversion (typeCall).
             } else if (currentScope_) {
                 ctx_.diagnostics().report(
                     Severity::Error, id->span.begin,
@@ -1060,6 +1064,17 @@ private:
     // resolved MethodSymbol.
     void typeCall(const ast::CallExpr& ce) {
         if (!ce.callee) return;
+        // §5.2: an explicit conversion `int(x)` — the callee is a primitive
+        // type name with no symbol. The call's type is that primitive type.
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get())) {
+            if (!ctx_.exprSymbol(*ce.callee)) {
+                PrimitiveType pt = primitiveFromName(id->name);
+                if (pt != PrimitiveType::None) {
+                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(pt));
+                    return;
+                }
+            }
+        }
         Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
         if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
             auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
