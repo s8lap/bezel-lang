@@ -1282,12 +1282,27 @@ private:
             if (lt) ctx_.setExprType(&be, lt);
             return;
         }
-        // `??` null-coalescing: result type is the non-nullable form of
-        // the LHS (sema-3c approximation: take RHS type if known, else
-        // LHS).
+        // `??` null-coalescing (§17.1 L12): the result is the non-nullable
+        // form of the LHS — `a ?? b` is `a` when non-null, else `b`, and the
+        // spec requires the RHS to be compatible with the non-nullable form
+        // of the left (§ null-coalescing). Deriving the result from the LHS
+        // (rather than the RHS) keeps the whole `??` typed even when the RHS
+        // is a call or postfix-`!` expression whose own type is not recorded.
         if (op == "??") {
-            TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
-            if (rt) ctx_.setExprType(&be, rt);
+            TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+            if (lt) {
+                if (lt->nullable) {
+                    TypeRef* nn = ctx_.makeTypeRef(*lt);
+                    nn->nullable = false;
+                    ctx_.setExprType(&be, nn);
+                } else {
+                    ctx_.setExprType(&be, lt);  // already non-nullable
+                }
+            } else if (be.right) {
+                // LHS untyped — fall back to the RHS type when available.
+                if (TypeRef* rt = ctx_.exprType(*be.right))
+                    ctx_.setExprType(&be, rt);
+            }
             return;
         }
         // Range ops, etc.: leave un-typed (later slices handle).
