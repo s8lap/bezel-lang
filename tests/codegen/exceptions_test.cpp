@@ -7,8 +7,8 @@
 // Observable via the int exit code.
 //
 // User-defined exception classes are used: the built-in exception types
-// (§31.4) have no runtime descriptor yet, and catch-arm variable binding
-// (`catch var e: T`) is a separate front-end gap — both deferred.
+// (§31.4) have no runtime descriptor yet (deferred). Catch-arm variable
+// binding (`catch var e: T`) and `when` guards are exercised below.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -131,4 +131,49 @@ BEZEL_TEST(codegen_cg20, code_after_catch_runs_on_normal_path) {
         "  try x := 1; catch AppError => x := 2; end; "
         "  return x + 40; "
         "end Main; end C;"), 41);
+}
+
+// §31.2: a `catch var e: T` arm binds the caught exception to `e` (a
+// borrow of the caught type), usable in the arm body and in a `when` guard.
+BEZEL_TEST(codegen_cg20, catch_binding_in_body) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E public Code: int := 0; end E; "
+        "class C public static method Main(): int "
+        "  try var e := new E(); e.Code := 7; throw e; "
+        "  catch var ex: E => return ex.Code; end; return 0; "
+        "end Main; end C;"), 7);
+}
+
+// §31.2: a `when` guard must be evaluated — a false guard skips the arm and
+// the exception continues to the next arm (it is not silently caught).
+BEZEL_TEST(codegen_cg20, catch_when_guard_false_skips_arm) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E end E; "
+        "class C public static method Main(): int "
+        "  try throw new E(); "
+        "  catch E when false => return 1; "
+        "  catch E => return 9; end; return 0; "
+        "end Main; end C;"), 9);
+}
+
+BEZEL_TEST(codegen_cg20, catch_guard_reads_binding) {
+    // The guard reads the bound exception; the first matching guard wins.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E public Code: int := 0; end E; "
+        "class C public static method Main(): int "
+        "  try var e := new E(); e.Code := 2; throw e; "
+        "  catch var ex: E when ex.Code = 1 => return 1; "
+        "  catch var ex: E when ex.Code = 2 => return 7; "
+        "  catch var ex: E => return 9; end; return 0; "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(codegen_cg20, catch_when_guard_true_enters_arm) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class E end E; "
+        "class C public static method Main(): int "
+        "  try throw new E(); "
+        "  catch E when true => return 5; "
+        "  catch E => return 9; end; return 0; "
+        "end Main; end C;"), 5);
 }

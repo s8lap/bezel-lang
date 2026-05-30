@@ -1844,7 +1844,34 @@ private:
                 if (!desc) continue;
                 matched = builder_.CreateOr(matched, emitIsA(exc, desc));
             }
-            builder_.CreateCondBr(matched, armBB, nextBB);
+            // CG: a binding (`catch var e: T`) and/or a `when` guard run in a
+            // prep block reached only on a type match. The binding stores the
+            // exception value to a slot for `e`; the guard is evaluated there
+            // (so it can read `e`) and, if false, control falls to the next
+            // arm with the exception still pending. The global is consumed
+            // only once an arm is actually entered.
+            bool needsPrep =
+                arm.guard || (arm.hasBinding && arm.body);
+            if (needsPrep) {
+                auto* prepBB = llvm::BasicBlock::Create(llvm_, "catch.prep",
+                                                        currentFn_);
+                builder_.CreateCondBr(matched, prepBB, nextBB);
+                builder_.SetInsertPoint(prepBB);
+                if (arm.hasBinding && arm.body) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    builder_.CreateStore(exc, slot);
+                    locals_[arm.body.get()] = slot;
+                }
+                if (arm.guard) {
+                    llvm::Value* g = lowerExpr(*arm.guard);
+                    if (!g) g = builder_.getInt1(false);
+                    builder_.CreateCondBr(g, armBB, nextBB);
+                } else {
+                    builder_.CreateBr(armBB);
+                }
+            } else {
+                builder_.CreateCondBr(matched, armBB, nextBB);
+            }
 
             builder_.SetInsertPoint(armBB);
             builder_.CreateStore(

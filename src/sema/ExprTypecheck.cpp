@@ -788,12 +788,29 @@ private:
         } else if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
             for (const auto& bs : trys->body) if (bs) visitStmt(*bs);
             for (const auto& arm : trys->catches) {
+                // §31.2: a `catch var e: T` arm binds the caught exception
+                // to `e` (a borrow of the caught type) in the guard and
+                // body scope. The binding's decl anchors on the arm body so
+                // codegen can map it to the exception value.
+                Scope armScope;
+                armScope.parent = currentScope_;
+                if (arm.hasBinding && !arm.varName.empty() &&
+                    !arm.types.empty() && arm.types[0] && arm.body) {
+                    auto* bnd = ctx_.makeSymbol<LocalSymbol>();
+                    bnd->name = arm.varName;
+                    bnd->decl = arm.body.get();
+                    bnd->declType = ctx_.resolvedType(*arm.types[0]);
+                    armScope.names[arm.varName] = bnd;
+                }
+                Scope* saveScope = currentScope_;
+                currentScope_ = &armScope;
                 if (arm.guard) visitExpr(*arm.guard);
                 // Slice S27: a bare `throw;` is valid inside a catch
                 // arm body (but not in the try body or finally).
                 ++catchDepth_;
                 if (arm.body) visitStmt(*arm.body);
                 --catchDepth_;
+                currentScope_ = saveScope;
             }
             for (const auto& bs : trys->finallyBody) if (bs) visitStmt(*bs);
         } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
