@@ -213,3 +213,32 @@ BEZEL_TEST(sema_ops, enum_constant_access_has_enum_type) {
     BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named &&
                       t->declaration && t->declaration->name == "E");
 }
+
+// §17.4: `x as T` has the nullable form of T; `x is T` is bool. Recording
+// the `as` type lets member access on its result (`(x as T)!.M`) resolve.
+BEZEL_TEST(sema_ops, as_cast_is_nullable_target_type) {
+    auto r = parseSema(
+        "module M; class C public method M(o: N) _ := (o as N); end M; "
+        "end C; class N end N;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && t->nullable);
+}
+
+BEZEL_TEST(sema_ops, is_test_is_bool) {
+    auto r = parseSema(
+        "module M; class C public method M(o: N) _ := (o is N); end M; "
+        "end C; class N end N;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Bool);
+}
+
+// §19: a `case` expression's type is its arm bodies' common type, so member
+// access on the result resolves.
+BEZEL_TEST(sema_ops, case_expression_takes_arm_type) {
+    auto r = parseSema(
+        "module M; class C public method M(k: int, a: N, b: N) "
+        "  _ := case k 1 => a, _ => b, end; "
+        "end M; end C; class N end N;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);
+}
