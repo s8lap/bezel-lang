@@ -2730,6 +2730,19 @@ private:
             if (!v) return nullptr;
             args.push_back(v);
         }
+        // §22.7: fill omitted trailing parameters with their default-value
+        // expressions, evaluated at the call site. (Named arguments — which
+        // would reorder/skip — are a separate slice; this covers positional
+        // calls that omit trailing defaulted parameters.)
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            for (std::size_t i = call.args.size(); i < md->params.size(); ++i) {
+                const ast::Expr* dv = md->params[i].defaultValue.get();
+                if (!dv) return nullptr;  // a required parameter was omitted
+                llvm::Value* v = lowerExpr(*dv);
+                if (!v) return nullptr;
+                args.push_back(v);
+            }
+        }
 
         return emitMethodCall(ms, args, baseQualified);
     }
