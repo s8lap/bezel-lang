@@ -156,6 +156,7 @@ set(BEZEL_TEST_SOURCES
     codegen/finally_test.cpp
     codegen/long_int_test.cpp
     codegen/short_circuit_test.cpp
+    codegen/integration_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
