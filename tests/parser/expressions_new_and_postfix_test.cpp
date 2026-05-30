@@ -108,3 +108,16 @@ BEZEL_TEST(parser_new_postfix, mixed_call_and_index_chain) {
     BEZEL_EXPECT_EQ(parseInitText("f(a)[i].g(b)"),
                     std::string("f(a)[i].g(b)"));
 }
+
+// §5.2 explicit conversion `int(x)` — a primitive type keyword in
+// expression position parses as a conversion applied with call syntax.
+// (Regression: a primitive keyword was previously left unconsumed in
+// expression position, spinning the enclosing statement-list parser.)
+BEZEL_TEST(parser_new_postfix, primitive_conversion_call) {
+    BEZEL_EXPECT_EQ(parseInitText("int(x)"), std::string("int(x)"));
+}
+
+BEZEL_TEST(parser_new_postfix, primitive_conversion_in_arithmetic) {
+    BEZEL_EXPECT_EQ(parseInitText("int(d) + 1"),
+                    std::string("(int(d) + 1)"));
+}
