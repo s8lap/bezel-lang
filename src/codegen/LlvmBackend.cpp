@@ -471,14 +471,18 @@ private:
                      rt->declaration->kind == ast::TypeDeclKind::Interface)) {
                     return ptrTy();  // reference types are heap pointers
                 }
-                // §9.4: a record is a value type, lowered to a first-class
-                // LLVM struct value. Locals/params/returns hold the struct by
-                // value (copy-on-assign and copy-on-return are automatic);
-                // field reads take the address of the value via a spill (record
-                // fields are read-only, §9.2, so reads never alias a mutation).
+                // §9.4: a record is a value type. CG29 represents it as a
+                // pointer to a stack-allocated struct — the same shape as a
+                // class instance (minus the vtable), so construction, field
+                // access, method `this`, and arguments all reuse the class
+                // (pointer) machinery without first-class struct values.
+                // Records are immutable (§9.2), so pointer aliasing is
+                // observationally identical to copying: value semantics come
+                // for free (a re-binding `p := R(...)` repoints to a fresh
+                // value; it never mutates through an existing reference).
                 if (rt->declaration &&
                     rt->declaration->kind == ast::TypeDeclKind::Record) {
-                    return recordStruct(rt->declaration);
+                    return ptrTy();
                 }
                 return i32();  // other value-kind named (enum) — int
             default:
@@ -2893,31 +2897,9 @@ private:
         auto idxIt = fieldIndex_.find(ms);
         if (idxIt == fieldIndex_.end()) return nullptr;
         llvm::StructType* st = classStruct(ms->parent);
-        // CG29: a record value is a first-class struct, not a pointer. To take
-        // the address of one of its fields, GEP the record's storage:
-        //  - an addressable target (record local/parameter) → GEP its slot
-        //    directly, the natural value-type access;
-        //  - a `this` pointer inside a record method, or any already-pointer
-        //    target → GEP it as-is;
-        //  - a temporary record value (e.g. a returned record) → spill to a
-        //    stack slot and GEP that.
-        // Records are immutable (§9.2), so none of these can lose a write.
-        if (ms->parent->kind == ast::TypeDeclKind::Record) {
-            llvm::Value* base = localSlot(*ma.target);
-            if (!base) {
-                llvm::Value* obj = lowerExpr(*ma.target);
-                if (!obj) return nullptr;
-                if (obj->getType()->isPointerTy()) {
-                    base = obj;
-                } else {
-                    llvm::Value* tmp = entryAlloca(st);
-                    builder_.CreateStore(obj, tmp);
-                    base = tmp;
-                }
-            }
-            elemTy = st->getElementType(idxIt->second);
-            return builder_.CreateStructGEP(st, base, idxIt->second);
-        }
+        // CG29: a record is referenced by pointer (value-as-pointer), the same
+        // as a class instance, so `obj.f` lowers identically: evaluate the
+        // target to its pointer and GEP the field.
         llvm::Value* obj = lowerExpr(*ma.target);
         if (!obj) return nullptr;
         elemTy = st->getElementType(idxIt->second);
@@ -3088,7 +3070,7 @@ private:
             builder_.CreateStore(
                 v, builder_.CreateStructGEP(st, slot, idxIt->second));
         }
-        return builder_.CreateLoad(st, slot);  // the record value (by value)
+        return slot;  // pointer to the constructed record (value-as-pointer)
     }
 
     llvm::Value* lowerCall(const ast::CallExpr& call) {
