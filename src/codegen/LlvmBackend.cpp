@@ -1707,6 +1707,10 @@ private:
         if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
             return lowerTry(*trys);
         }
+        // CG38: statement-position `case`.
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+            return lowerCaseStmt(*cs);
+        }
         return false;  // unhandled statement kinds land in later slices
     }
 
@@ -2489,6 +2493,52 @@ private:
     // MatchFailureException (§19.6). Handles constant, relational-operator,
     // and discard patterns; binding/type/range/destructure patterns and
     // block-body arms are deferred.
+    // CG38: statement-position `case` (§19.4, §19.6). Evaluates the
+    // scrutinee once, tests each arm's pattern (+ optional `when` guard) in
+    // order, and runs the first matching arm's body (a single statement or
+    // a `do … end` block — both parsed as a `Block` arm). An unmatched
+    // value falls through with no action (§19.6) — unlike the expression
+    // form, no MatchFailureException. Returns false: the fall-through edge
+    // keeps the post-case block reachable.
+    bool lowerCaseStmt(const ast::CaseStmt& cs) {
+        if (!cs.scrutinee) return false;  // scrutinee-less form deferred
+        llvm::Value* scrut = lowerExpr(*cs.scrutinee);
+        if (!scrut) return false;
+        auto* endBB =
+            llvm::BasicBlock::Create(llvm_, "casestmt.end", currentFn_);
+        for (const auto& arm : cs.arms) {
+            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut);
+            if (!pm) {  // deferred pattern kind — degrade to no-op
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+                return false;
+            }
+            auto* bodyBB =
+                llvm::BasicBlock::Create(llvm_, "casestmt.arm", currentFn_);
+            auto* nextBB =
+                llvm::BasicBlock::Create(llvm_, "casestmt.next", currentFn_);
+            if (arm.guard) {
+                auto* guardBB = llvm::BasicBlock::Create(
+                    llvm_, "casestmt.guard", currentFn_);
+                builder_.CreateCondBr(pm, guardBB, nextBB);
+                builder_.SetInsertPoint(guardBB);
+                llvm::Value* g = lowerExpr(*arm.guard);
+                if (!g) return false;
+                builder_.CreateCondBr(g, bodyBB, nextBB);
+            } else {
+                builder_.CreateCondBr(pm, bodyBB, nextBB);
+            }
+            builder_.SetInsertPoint(bodyBB);
+            bool armTerm = lowerScopedBlock(arm.stmts);
+            if (!armTerm) builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(nextBB);
+        }
+        // No arm matched → fall through (§19.6).
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return false;
+    }
+
     llvm::Value* lowerCaseExpr(const ast::CaseExpr& ce) {
         if (!ce.scrutinee) return nullptr;  // scrutinee-less form deferred
         llvm::Value* scrut = lowerExpr(*ce.scrutinee);
