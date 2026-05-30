@@ -1756,6 +1756,20 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         return std::unique_ptr<ast::Expr>(e.release());
     }
 
+    // §5.2 explicit conversion `int(x)`, `double(m)`, … — a primitive type
+    // keyword in expression position names a conversion applied with
+    // call syntax. Emit it as an IdentifierExpr so parsePostfix forms the
+    // `(arg)` call; sema/codegen interpret the call as a conversion. (This
+    // also ensures a stray primitive keyword is consumed rather than left
+    // to spin the enclosing statement-list parser.)
+    if (current_.kind == TokenKind::Keyword &&
+        isPrimitiveTypeKeyword(current_.text)) {
+        auto e = std::make_unique<ast::IdentifierExpr>();
+        e->name = current_.text;
+        advance();
+        return std::unique_ptr<ast::Expr>(e.release());
+    }
+
     // §A.7 CaseExpr — `"case" Expression? CaseArm ("," CaseArm)* ","? "end"`.
     // The bare form (no scrutinee) is admitted by the grammar; slice 38
     // requires the scrutinee form (the bare-form lookahead requires deciding
