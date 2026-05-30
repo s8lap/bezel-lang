@@ -499,11 +499,39 @@ private:
         handleDischarge(e);
     }
 
+    // A returned value is only a *borrow* of its local root when it has
+    // reference type; a value-typed projection (e.g. `r.V` where V is an
+    // int, or `r.Size()` returning int) is a copy and cannot dangle. Be
+    // conservative: an unknown/generic type is treated as a possible
+    // borrow so the escape check still fires.
+    static bool isBorrowableType(const sema::TypeRef* rt) {
+        if (!rt) return true;            // unknown → conservative
+        if (rt->nullable) return true;   // nullable reference
+        switch (rt->kind) {
+            case sema::TypeRef::Kind::Primitive:
+                return rt->primitive == sema::PrimitiveType::String ||
+                       rt->primitive == sema::PrimitiveType::Object;
+            case sema::TypeRef::Kind::Function:
+                return true;
+            case sema::TypeRef::Kind::Named:
+                if (!rt->declaration) return true;  // generic/unknown
+                return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                       rt->declaration->kind == ast::TypeDeclKind::Interface;
+            case sema::TypeRef::Kind::Error:
+                return true;             // unresolved → conservative
+            default:
+                return false;            // Unit, InlineArray, enum, record
+        }
+    }
+
     // Walk the return value's expression and, for each path that ends
     // in a local-identifier root, verify the root isn't a `using var`.
     void checkBorrowEscapesOnReturn(const ast::Expr& e) {
         const ast::IdentifierExpr* root = identifierRoot(e);
         if (!root) return;
+        // A value-typed return is a copy, not a borrow of the local — it
+        // cannot outlive its source (§28.3 governs borrows).
+        if (!isBorrowableType(ctx_.exprType(e))) return;
         for (const auto& [sym, st] : states_) {
             if (sym->name != root->name) continue;
             if (!st.implicitDischarge) continue;  // only `using var`
