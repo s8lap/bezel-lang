@@ -471,14 +471,14 @@ private:
                      rt->declaration->kind == ast::TypeDeclKind::Interface)) {
                     return ptrTy();  // reference types are heap pointers
                 }
-                // §9.4: a record is a value type. CG29 represents it as a
-                // pointer to a stack-allocated struct — so locals, parameters,
-                // returns, and field access reuse the class machinery (GEP on a
-                // pointer); record value semantics (copy-on-assign) are applied
-                // at assignment. The pointee layout is `recordStruct`.
+                // §9.4: a record is a value type, lowered to a first-class
+                // LLVM struct value. Locals/params/returns hold the struct by
+                // value (copy-on-assign and copy-on-return are automatic);
+                // field reads take the address of the value via a spill (record
+                // fields are read-only, §9.2, so reads never alias a mutation).
                 if (rt->declaration &&
                     rt->declaration->kind == ast::TypeDeclKind::Record) {
-                    return ptrTy();
+                    return recordStruct(rt->declaration);
                 }
                 return i32();  // other value-kind named (enum) — int
             default:
@@ -644,6 +644,9 @@ private:
     // struct and every derived struct, so member access through
     // fs->parent's struct is correct on a derived instance.
     llvm::StructType* classStruct(const sema::TypeSymbol* t) {
+        // CG29: a record has no vtable header; route to recordStruct so every
+        // classStruct caller (field access, etc.) gets the right layout.
+        if (t->kind == ast::TypeDeclKind::Record) return recordStruct(t);
         auto it = structs_.find(t);
         if (it != structs_.end()) return it->second;
         auto* st = llvm::StructType::create(
@@ -2890,6 +2893,31 @@ private:
         auto idxIt = fieldIndex_.find(ms);
         if (idxIt == fieldIndex_.end()) return nullptr;
         llvm::StructType* st = classStruct(ms->parent);
+        // CG29: a record value is a first-class struct, not a pointer. To take
+        // the address of one of its fields, GEP the record's storage:
+        //  - an addressable target (record local/parameter) → GEP its slot
+        //    directly, the natural value-type access;
+        //  - a `this` pointer inside a record method, or any already-pointer
+        //    target → GEP it as-is;
+        //  - a temporary record value (e.g. a returned record) → spill to a
+        //    stack slot and GEP that.
+        // Records are immutable (§9.2), so none of these can lose a write.
+        if (ms->parent->kind == ast::TypeDeclKind::Record) {
+            llvm::Value* base = localSlot(*ma.target);
+            if (!base) {
+                llvm::Value* obj = lowerExpr(*ma.target);
+                if (!obj) return nullptr;
+                if (obj->getType()->isPointerTy()) {
+                    base = obj;
+                } else {
+                    llvm::Value* tmp = entryAlloca(st);
+                    builder_.CreateStore(obj, tmp);
+                    base = tmp;
+                }
+            }
+            elemTy = st->getElementType(idxIt->second);
+            return builder_.CreateStructGEP(st, base, idxIt->second);
+        }
         llvm::Value* obj = lowerExpr(*ma.target);
         if (!obj) return nullptr;
         elemTy = st->getElementType(idxIt->second);
@@ -3036,6 +3064,33 @@ private:
         return true;
     }
 
+    // CG29 (§9.1): construct a record value `R(a, b, …)`. Positional
+    // arguments map to the record's fields in declaration order. The value is
+    // materialized in a stack slot and a pointer to it is returned — the
+    // value-as-pointer representation records share with the class machinery.
+    // (Named arguments and defaults for records are a later refinement.)
+    llvm::Value* lowerRecordConstruction(const sema::TypeSymbol* t,
+                                         const ast::CallExpr& call) {
+        llvm::StructType* st = recordStruct(t);
+        llvm::Value* slot = entryAlloca(st);
+        std::vector<const sema::Symbol*> fields;
+        for (const sema::Symbol* m : t->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (fs && !isStaticField(fs)) fields.push_back(fs);
+        }
+        if (call.args.size() != fields.size()) return nullptr;
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+            if (!call.args[i].value) return nullptr;
+            llvm::Value* v = lowerExpr(*call.args[i].value);
+            if (!v) return nullptr;
+            auto idxIt = fieldIndex_.find(fields[i]);
+            if (idxIt == fieldIndex_.end()) return nullptr;
+            builder_.CreateStore(
+                v, builder_.CreateStructGEP(st, slot, idxIt->second));
+        }
+        return builder_.CreateLoad(st, slot);  // the record value (by value)
+    }
+
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
         // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
@@ -3055,6 +3110,11 @@ private:
         if (auto* ets = dynamic_cast<sema::TypeSymbol*>(calleeSym)) {
             if (ets->kind == ast::TypeDeclKind::Enum)
                 return lowerEnumCast(call);
+            // CG29 (§9.1): record construction `Point(3, 4)` — the callee is
+            // a record type name. Build the value on the stack and return a
+            // pointer to it (the value-as-pointer representation).
+            if (ets->kind == ast::TypeDeclKind::Record)
+                return lowerRecordConstruction(ets, call);
         }
         // CG26: a call to an extern (FFI) function — direct C-ABI call to
         // the external declaration. (Native functions don't set the
@@ -3091,6 +3151,15 @@ private:
                 recv = currentThis_;
             }
             if (!recv) return nullptr;
+            // CG29: a record method receives `this` as a pointer to the record
+            // value; if the receiver is a struct value (the usual case), spill
+            // it to a stack slot and pass its address.
+            if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Record &&
+                !recv->getType()->isPointerTy()) {
+                llvm::Value* tmp = entryAlloca(recordStruct(ms->parent));
+                builder_.CreateStore(recv, tmp);
+                recv = tmp;
+            }
             args.push_back(recv);
         }
         // §22.4/§22.7: place arguments into parameter order (named by name,
