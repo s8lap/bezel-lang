@@ -1397,6 +1397,12 @@ private:
             for (const auto& ia : we->assigns) {
                 if (ia.value) visitExpr(*ia.value);
             }
+            // §A.7: a `source with …` expression has the same type as its
+            // source (an object initializer / record copy preserves type).
+            if (we->source) {
+                if (auto* st = ctx_.exprType(*we->source))
+                    ctx_.setExprType(&e, st);
+            }
         } else if (auto* cl =
                        dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
             for (const auto& k : cl->keys) if (k) visitExpr(*k);
