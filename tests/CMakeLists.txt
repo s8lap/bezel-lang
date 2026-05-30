@@ -174,6 +174,7 @@ set(BEZEL_TEST_SOURCES
     codegen/conditional_member_test.cpp
     codegen/enum_case_test.cpp
     codegen/expr_result_member_test.cpp
+    codegen/conversion_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp

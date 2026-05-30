@@ -2560,8 +2560,58 @@ private:
     // `obj.M(a)` passes `obj`; a bare `M(a)` inside an instance method
     // passes the current `this`. (Overloads, named/default args, and
     // virtual dispatch are later slices — calls bind statically here.)
+    // CG44: lower an explicit conversion `T(x)` (§5.2). Converts the single
+    // argument to the target primitive's LLVM type: integer width changes
+    // via trunc / sext / zext (signedness from the operand), int↔float via
+    // si/ui<->fp, and float↔double via fpext / fptrunc. (Narrowing overflow
+    // checks — §5.2 raises OverflowException — are deferred.)
+    llvm::Value* lowerConversion(sema::PrimitiveType target,
+                                 const ast::CallExpr& call) {
+        if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+        const ast::Expr& argE = *call.args[0].value;
+        llvm::Value* src = lowerExpr(argE);
+        if (!src) return nullptr;
+        llvm::Type* dstTy = lowerPrimitive(target);
+        llvm::Type* srcTy = src->getType();
+        if (srcTy == dstTy) return src;
+        bool dstFP = dstTy->isFloatingPointTy();
+        bool srcFP = srcTy->isFloatingPointTy();
+        bool dstUns = isUnsignedPrim(target);
+        bool srcUns = isUnsignedTargetExpr(argE);
+        if (srcFP && dstFP) {
+            return srcTy->getPrimitiveSizeInBits() <
+                           dstTy->getPrimitiveSizeInBits()
+                       ? builder_.CreateFPExt(src, dstTy)
+                       : builder_.CreateFPTrunc(src, dstTy);
+        }
+        if (srcFP)  // float → int
+            return dstUns ? builder_.CreateFPToUI(src, dstTy)
+                          : builder_.CreateFPToSI(src, dstTy);
+        if (dstFP)  // int → float
+            return srcUns ? builder_.CreateUIToFP(src, dstTy)
+                          : builder_.CreateSIToFP(src, dstTy);
+        // int → int.
+        unsigned sb = srcTy->getIntegerBitWidth();
+        unsigned db = dstTy->getIntegerBitWidth();
+        if (db < sb) return builder_.CreateTrunc(src, dstTy);
+        if (db > sb)
+            return srcUns ? builder_.CreateZExt(src, dstTy)
+                          : builder_.CreateSExt(src, dstTy);
+        return src;  // same width, differing signedness (e.g. int ↔ uint)
+    }
+
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
+        // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
+        // primitive type name (no resolved symbol) converts its argument.
+        if (auto* cid =
+                dynamic_cast<const ast::IdentifierExpr*>(call.callee.get())) {
+            if (!ctx_.exprSymbol(*call.callee)) {
+                sema::PrimitiveType pt = sema::primitiveFromName(cid->name);
+                if (pt != sema::PrimitiveType::None)
+                    return lowerConversion(pt, call);
+            }
+        }
         sema::Symbol* calleeSym = ctx_.exprSymbol(*call.callee);
         // CG26: a call to an extern (FFI) function — direct C-ABI call to
         // the external declaration. (Native functions don't set the
