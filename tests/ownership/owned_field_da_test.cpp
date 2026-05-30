@@ -159,3 +159,29 @@ BEZEL_TEST(own_field_da, multiple_owned_fields_all_required) {
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §7.9 requires the field be "assigned" — it does not mandate `this.`
+// qualification. A bare (implicit-`this`) field assignment in the
+// constructor satisfies definite assignment, just as `this.<field>` does.
+BEZEL_TEST(own_field_da, owned_field_assigned_bare_implicit_this_ok) {
+    auto r = parseAndCheckOwnership(mod(
+        "class C "
+        "  private owned _t: T;"
+        "  public constructor() "
+        "    _t := new T(); "
+        "  end constructor; "
+        "end C;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The same for a plain (non-owned) non-nullable reference field.
+BEZEL_TEST(own_field_da, nonnull_field_assigned_bare_implicit_this_ok) {
+    auto r = parseAndCheckOwnership(mod(
+        "class C "
+        "  public _t: T;"
+        "  public constructor() "
+        "    _t := new T(); "
+        "  end constructor; "
+        "end C;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

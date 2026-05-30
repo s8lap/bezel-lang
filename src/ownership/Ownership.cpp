@@ -744,16 +744,27 @@ bool isNonNullableReferenceField(const ast::FieldDecl& f,
     }
 }
 
-// True if `e` is a member-access whose root is the literal `this`
-// identifier — i.e. `this.<member>` (and recursively `this.x.y` etc.,
-// though for O9 we only care about depth-1).
-bool isDirectThisFieldRef(const ast::Expr& e, std::string_view& outName) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
-    if (!ma || !ma->target) return false;
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    if (!id || id->name != "this") return false;
-    outName = ma->member;
-    return true;
+// True if `e` assigns a field of the current instance — either
+// `this.<member>` (explicit) or a bare `<field>` that resolves to a field
+// of the declaring class (implicit `this`). §7.9 requires the field to be
+// "assigned"; it does not mandate `this.` qualification, and the bare form
+// resolves to the field in sema and codegen alike.
+bool isDirectThisFieldRef(const ast::Expr& e, std::string_view& outName,
+                          sema::SemaContext& ctx) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!id || id->name != "this") return false;
+        outName = ma->member;
+        return true;
+    }
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (auto* fs =
+                dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*id))) {
+            outName = fs->name;
+            return true;
+        }
+    }
+    return false;
 }
 
 // Returns true if the constructor body's first statement is a
@@ -775,54 +786,55 @@ bool ctorChainsToThis(const ast::ConstructorDecl& cd) {
 // any path-assignment as definitely-assigned.
 void collectThisFieldAssignments(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
-    std::unordered_set<std::string_view>& assigned);
+    std::unordered_set<std::string_view>& assigned, sema::SemaContext& ctx);
 
 void collectThisFieldAssignmentsStmt(
     const ast::Stmt& s,
-    std::unordered_set<std::string_view>& assigned) {
+    std::unordered_set<std::string_view>& assigned, sema::SemaContext& ctx) {
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         if (as->op == ":=" && as->target) {
             std::string_view name;
-            if (isDirectThisFieldRef(*as->target, name)) {
+            if (isDirectThisFieldRef(*as->target, name, ctx)) {
                 assigned.insert(name);
             }
         }
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        collectThisFieldAssignments(ifs->ifBranch.body, assigned);
+        collectThisFieldAssignments(ifs->ifBranch.body, assigned, ctx);
         for (const auto& el : ifs->elifBranches)
-            collectThisFieldAssignments(el.body, assigned);
-        collectThisFieldAssignments(ifs->elseBody, assigned);
+            collectThisFieldAssignments(el.body, assigned, ctx);
+        collectThisFieldAssignments(ifs->elseBody, assigned, ctx);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        collectThisFieldAssignments(ws->body, assigned);
+        collectThisFieldAssignments(ws->body, assigned, ctx);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        collectThisFieldAssignments(fs->body, assigned);
+        collectThisFieldAssignments(fs->body, assigned, ctx);
         return;
     }
     if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        collectThisFieldAssignments(dob->body, assigned);
+        collectThisFieldAssignments(dob->body, assigned, ctx);
         return;
     }
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        collectThisFieldAssignments(ts->body, assigned);
+        collectThisFieldAssignments(ts->body, assigned, ctx);
         for (const auto& arm : ts->catches) {
-            if (arm.body) collectThisFieldAssignmentsStmt(*arm.body, assigned);
+            if (arm.body)
+                collectThisFieldAssignmentsStmt(*arm.body, assigned, ctx);
         }
-        collectThisFieldAssignments(ts->finallyBody, assigned);
+        collectThisFieldAssignments(ts->finallyBody, assigned, ctx);
         return;
     }
 }
 
 void collectThisFieldAssignments(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
-    std::unordered_set<std::string_view>& assigned) {
+    std::unordered_set<std::string_view>& assigned, sema::SemaContext& ctx) {
     for (const auto& s : body) {
-        if (s) collectThisFieldAssignmentsStmt(*s, assigned);
+        if (s) collectThisFieldAssignmentsStmt(*s, assigned, ctx);
     }
 }
 
@@ -861,7 +873,7 @@ void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
     for (auto* cd : ctors) {
         if (ctorChainsToThis(*cd)) continue; // delegated
         std::unordered_set<std::string_view> assigned;
-        collectThisFieldAssignments(cd->body, assigned);
+        collectThisFieldAssignments(cd->body, assigned, ctx);
         for (auto* f : ownedNoInit) {
             if (!assigned.count(f->name)) {
                 ctx.diagnostics().report(
