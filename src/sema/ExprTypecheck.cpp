@@ -615,6 +615,27 @@ private:
                 inFieldInitializer_ = save;
             }
             for (const auto& a : pd->accessors) {
+                // §22.9: a setter accessor has an implicit `value` parameter
+                // (renamable via a SetterParamSpec) of the property's type.
+                // Its decl anchors on the PropertyDecl so codegen can map it
+                // to the assigned value.
+                if (a.isSet) {
+                    std::string_view vname = a.setterParamName.empty()
+                        ? std::string_view("value")
+                        : a.setterParamName;
+                    std::vector<ast::Param> sp(1);
+                    sp[0].name = vname;
+                    auto* vsym = ctx_.makeSymbol<LocalSymbol>();
+                    vsym->name = vname;
+                    vsym->decl = pd;
+                    if (pd->type) vsym->declType = ctx_.resolvedType(*pd->type);
+                    std::vector<Symbol*> ssyms{vsym};
+                    if (a.exprBody)
+                        runMethodBody(sp, nullptr, a.exprBody.get(), &ssyms);
+                    if (!a.stmts.empty())
+                        runMethodBody(sp, &a.stmts, nullptr, &ssyms);
+                    continue;
+                }
                 if (a.exprBody)
                     runMethodBody(none, nullptr, a.exprBody.get(), nullptr);
                 if (!a.stmts.empty())
