@@ -2026,6 +2026,42 @@ private:
         if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
             return lowerCaseExpr(*ce);
         }
+        // CG41: null-conditional member access `x?.M` (§7.5). Evaluate the
+        // target; if null, the result is null, otherwise read the member.
+        // The result is always nullable. Reference-typed storage members
+        // only — value-typed results (`int?`, …) and computed-getter /
+        // method `?.` are deferred.
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+            if (!nm->target) return nullptr;
+            llvm::Value* obj = lowerExpr(*nm->target);
+            if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+            auto* ms = storageMemberOf(ctx_.exprSymbol(e));
+            if (!ms || !ms->parent) return nullptr;
+            auto idxIt = fieldIndex_.find(ms);
+            if (idxIt == fieldIndex_.end()) return nullptr;
+            llvm::StructType* st = classStruct(ms->parent);
+            llvm::Type* memTy = st->getElementType(idxIt->second);
+            if (!memTy->isPointerTy()) return nullptr;  // value result deferred
+            auto* entryBB = builder_.GetInsertBlock();
+            auto* accessBB =
+                llvm::BasicBlock::Create(llvm_, "nullcond.access", currentFn_);
+            auto* endBB =
+                llvm::BasicBlock::Create(llvm_, "nullcond.end", currentFn_);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            builder_.CreateCondBr(isNull, endBB, accessBB);
+            builder_.SetInsertPoint(accessBB);
+            llvm::Value* addr =
+                builder_.CreateStructGEP(st, obj, idxIt->second);
+            llvm::Value* val = builder_.CreateLoad(memTy, addr);
+            auto* accessEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(ptrTy(), 2);
+            phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), entryBB);
+            phi->addIncoming(val, accessEnd);
+            return phi;
+        }
         // CG33b: a computed (arrow-getter) property read `obj.P` evaluates
         // the getter with `this` = obj.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
