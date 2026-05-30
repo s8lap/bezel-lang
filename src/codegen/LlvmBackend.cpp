@@ -427,12 +427,25 @@ private:
         auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
         if (!ps || ps->isIndexer) return false;
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-        if (!pd || pd->isIndexer || pd->hasExplicitAccessors ||
-            pd->getterExpr || pd->getterBody)
+        if (!pd || pd->isIndexer ||
+            pd->bodyKind != ast::PropertyBodyKind::Auto)
             return false;
         for (auto mod : ps->modifiers)
             if (mod == "static") return false;
         return true;
+    }
+
+    // CG33b: the arrow-getter expression of a computed property, or null
+    // (auto-properties, indexers, and block/explicit-accessor getters
+    // are not arrow getters).
+    const ast::Expr* computedGetterOf(sema::Symbol* sym) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+        if (!ps || ps->isIndexer) return nullptr;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->isIndexer ||
+            pd->bodyKind != ast::PropertyBodyKind::Expression)
+            return nullptr;
+        return pd->exprBody.get();
     }
 
     // The LLVM type backing an instance-storage member (field or
@@ -1549,7 +1562,7 @@ private:
                            : llvm::cast<llvm::Value>(
                                  llvm::ConstantInt::get(elemTy, 1));
                     llvm::Value* res = emitCompoundOp(
-                        inc->isIncrement ? "+" : "-", cur, one, fp,
+                        inc->op == "++" ? "+" : "-", cur, one, fp,
                         isUnsignedTargetExpr(*inc->target));
                     if (res) builder_.CreateStore(res, addr);
                 }
@@ -1895,6 +1908,20 @@ private:
         if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
             return lowerCaseExpr(*ce);
         }
+        // CG33b: a computed (arrow-getter) property read `obj.P` evaluates
+        // the getter with `this` = obj.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(*ma))) {
+                if (!ma->target) return nullptr;
+                llvm::Value* obj = lowerExpr(*ma->target);
+                if (!obj) return nullptr;
+                llvm::Value* saved = currentThis_;
+                currentThis_ = obj;
+                llvm::Value* v = lowerExpr(*getter);
+                currentThis_ = saved;
+                return v;
+            }
+        }
         // CG8: field read `obj.f`.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
             llvm::Type* elemTy = nullptr;
@@ -1905,6 +1932,10 @@ private:
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
             // CG9: `this` (and `base`, same instance) is the receiver ptr.
             if (id->name == "this" || id->name == "base") return currentThis_;
+            // CG33b: a bare computed-property read evaluates its getter
+            // against the current `this`.
+            if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e)))
+                return lowerExpr(*getter);
             // CG12: a bare identifier resolving to a static field reads
             // its backing global.
             if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
@@ -2014,19 +2045,24 @@ private:
                           !l->getType()->isIntegerTy(1);
         if (checkedInt) {
             if (op == "+")
-                return emitCheckedArith(llvm::Intrinsic::sadd_with_overflow,
-                                        l, r);
+                return emitCheckedArith(
+                    uns ? llvm::Intrinsic::uadd_with_overflow
+                        : llvm::Intrinsic::sadd_with_overflow, l, r);
             if (op == "-")
-                return emitCheckedArith(llvm::Intrinsic::ssub_with_overflow,
-                                        l, r);
+                return emitCheckedArith(
+                    uns ? llvm::Intrinsic::usub_with_overflow
+                        : llvm::Intrinsic::ssub_with_overflow, l, r);
             if (op == "*")
-                return emitCheckedArith(llvm::Intrinsic::smul_with_overflow,
-                                        l, r);
+                return emitCheckedArith(
+                    uns ? llvm::Intrinsic::umul_with_overflow
+                        : llvm::Intrinsic::smul_with_overflow, l, r);
             if (op == "/" || op == "mod") {
-                emitGuardThrow(
-                    builder_.CreateICmpEQ(r, zeroLike(r)),
-                    "DivideByZeroException");
-                // INT_MIN / -1 (and mod) overflow the result type.
+                emitGuardThrow(builder_.CreateICmpEQ(r, zeroLike(r)),
+                               "DivideByZeroException");
+                if (uns)
+                    return op == "/" ? builder_.CreateUDiv(l, r)
+                                     : builder_.CreateURem(l, r);
+                // Signed: INT_MIN / -1 (and mod) overflow the result type.
                 llvm::Value* minV = minIntLike(r);
                 llvm::Value* negOne =
                     llvm::ConstantInt::getSigned(r->getType(), -1);
@@ -2041,21 +2077,27 @@ private:
         if (op == "+") return builder_.CreateAdd(l, r);
         if (op == "-") return builder_.CreateSub(l, r);
         if (op == "*") return builder_.CreateMul(l, r);
-        if (op == "/") return builder_.CreateSDiv(l, r);
-        if (op == "mod") return builder_.CreateSRem(l, r);
+        if (op == "/") return uns ? builder_.CreateUDiv(l, r)
+                                  : builder_.CreateSDiv(l, r);
+        if (op == "mod") return uns ? builder_.CreateURem(l, r)
+                                    : builder_.CreateSRem(l, r);
         if (op == "&") return builder_.CreateAnd(l, r);
         if (op == "|") return builder_.CreateOr(l, r);
         if (op == "^") return builder_.CreateXor(l, r);
         if (op == "<<") return builder_.CreateShl(l, r);
-        if (op == ">>") return builder_.CreateAShr(l, r);  // signed types
-        // CG4: integer comparisons → i1 (Bezel uses `=` / `<>` for
-        // equality, signed relational ops).
+        if (op == ">>") return uns ? builder_.CreateLShr(l, r)
+                                   : builder_.CreateAShr(l, r);
+        // CG4: integer comparisons → i1.
         if (op == "=") return builder_.CreateICmpEQ(l, r);
         if (op == "<>") return builder_.CreateICmpNE(l, r);
-        if (op == "<") return builder_.CreateICmpSLT(l, r);
-        if (op == ">") return builder_.CreateICmpSGT(l, r);
-        if (op == "<=") return builder_.CreateICmpSLE(l, r);
-        if (op == ">=") return builder_.CreateICmpSGE(l, r);
+        if (op == "<") return uns ? builder_.CreateICmpULT(l, r)
+                                  : builder_.CreateICmpSLT(l, r);
+        if (op == ">") return uns ? builder_.CreateICmpUGT(l, r)
+                                  : builder_.CreateICmpSGT(l, r);
+        if (op == "<=") return uns ? builder_.CreateICmpULE(l, r)
+                                   : builder_.CreateICmpSLE(l, r);
+        if (op == ">=") return uns ? builder_.CreateICmpUGE(l, r)
+                                   : builder_.CreateICmpSGE(l, r);
         // CG4: logical and/or on i1. NOTE: §17 specifies short-circuit
         // evaluation; this eager form is observationally identical while
         // operands are side-effect-free (no calls lowered yet) — true
@@ -2154,11 +2196,15 @@ private:
         std::vector<const sema::Symbol*> storage;
         collectInstanceStorage(t, storage);
         for (const sema::Symbol* m : storage) {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl);
-            if (!fd || !fd->initializer) continue;  // auto-props: zero-init
+            const ast::Expr* init = nullptr;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                init = fd->initializer.get();
+            else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                init = pd->autoInitializer.get();  // CG33: `property X := v;`
+            if (!init) continue;  // no initializer → calloc-zeroed
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
-            llvm::Value* v = lowerExpr(*fd->initializer);
+            llvm::Value* v = lowerExpr(*init);
             if (!v) continue;
             builder_.CreateStore(
                 v, builder_.CreateStructGEP(st, obj, idxIt->second));
