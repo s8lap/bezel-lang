@@ -940,6 +940,10 @@ private:
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
             resolveMemberAccess(*ma);
         }
+        // §17.5 null-conditional member access `x?.M`.
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+            resolveNullCondMember(*nm);
+        }
         // Slice 3f: NewExpr is typed as its constructed type. `default`
         // and `typeof` follow the same pattern (default(T) → T,
         // typeof(T) → Type per §17.1).
@@ -1164,6 +1168,56 @@ private:
     // current type) and `<expr>.member` where the expression has a
     // resolved Named or Primitive-Object type. Generics and inherited
     // members from base types are deferred to a later slice.
+    // The TypeSymbol a member-access target denotes (for `.` and `?.`):
+    // `this`/`base` keywords, then the target's exprType, then a fallback
+    // through its exprSymbol (local/parameter declared type, or a type name
+    // for static access). Returns null when it can't be determined.
+    TypeSymbol* memberTargetType(const ast::Expr* target) {
+        TypeSymbol* targetType = nullptr;
+        // `this.X` — currentType_ takes precedence over name lookup so
+        // we don't have to teach `this` to be an expression with type
+        // currentType_.
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+            if (id->name == "this") {
+                return currentType_;
+            } else if (id->name == "base" && currentType_) {
+                // §12.3: `base.X` resolves X against the base class, so an
+                // override in the current type is bypassed and the base
+                // member is found.
+                for (TypeSymbol* b : currentType_->baseTypes) {
+                    if (b && b->kind == ast::TypeDeclKind::Class) return b;
+                }
+            }
+        }
+        if (target) {
+            auto* tt = ctx_.exprType(*target);
+            if (tt && tt->kind == TypeRef::Kind::Named) {
+                targetType = tt->declaration;
+            } else if (!tt) {
+                auto* sym = ctx_.exprSymbol(*target);
+                if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
+                    if (loc->declType &&
+                        loc->declType->kind == TypeRef::Kind::Named) {
+                        targetType = loc->declType->declaration;
+                    }
+                } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
+                    if (par->declType) {
+                        if (auto* rt = ctx_.resolvedType(*par->declType)) {
+                            if (rt->kind == TypeRef::Kind::Named) {
+                                targetType = rt->declaration;
+                            }
+                        }
+                    }
+                } else if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+                    // Static member access `Type.member`: the target is a
+                    // type name, so look the member up on that type.
+                    targetType = ts;
+                }
+            }
+        }
+        return targetType;
+    }
+
     void resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         TypeSymbol* targetType = nullptr;
         // `this.X` — currentType_ takes precedence over name lookup so
@@ -1268,6 +1322,51 @@ private:
                     ctx_.setExprType(&ma, rt);
                 }
             }
+        }
+    }
+
+    // §7.5 null-conditional member access `x?.M`. Resolves the member on
+    // the target's (non-nullable) type exactly like `.`, but the result
+    // type is ALWAYS nullable (the access yields null when the target is
+    // null). The member's own type is looked up; its nullable form is the
+    // expression's type, so member access chains (`a?.b?.c`) resolve.
+    void resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
+        if (!nm.target) return;
+        TypeSymbol* targetType = memberTargetType(nm.target.get());
+        if (!targetType) return;
+        Symbol* member = lookupMember(targetType, nm.member);
+        if (!member) return;
+        if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
+            if (msym->visibility == ast::Visibility::Private &&
+                msym->parent && msym->parent != currentType_) {
+                ctx_.diagnostics().report(
+                    Severity::Error, nm.span.begin,
+                    std::string("`") + std::string(nm.member) +
+                    "` is private to type `" +
+                    std::string(msym->parent->name) +
+                    "` and not accessible from `" +
+                    std::string(currentType_ ? currentType_->name
+                                             : std::string_view("(global)")) +
+                    "` (§13.1 — `private` is visible to the declaring "
+                    "class only)");
+            }
+        }
+        ctx_.setExprSymbol(&nm, member);
+        TypeRef* memberTy = nullptr;
+        if (auto* fs = dynamic_cast<FieldSymbol*>(member)) {
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+                if (fd->type) memberTy = ctx_.resolvedType(*fd->type);
+        } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+                if (pd->type) memberTy = ctx_.resolvedType(*pd->type);
+        }
+        if (!memberTy) return;
+        if (memberTy->nullable) {
+            ctx_.setExprType(&nm, memberTy);  // already nullable
+        } else {
+            TypeRef* nn = ctx_.makeTypeRef(*memberTy);
+            nn->nullable = true;
+            ctx_.setExprType(&nm, nn);
         }
     }
 
