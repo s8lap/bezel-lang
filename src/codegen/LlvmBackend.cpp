@@ -2724,21 +2724,41 @@ private:
             if (!recv) return nullptr;
             args.push_back(recv);
         }
-        for (const auto& a : call.args) {
-            if (!a.value) return nullptr;
-            llvm::Value* v = lowerExpr(*a.value);
-            if (!v) return nullptr;
-            args.push_back(v);
-        }
-        // §22.7: fill omitted trailing parameters with their default-value
-        // expressions, evaluated at the call site. (Named arguments — which
-        // would reorder/skip — are a separate slice; this covers positional
-        // calls that omit trailing defaulted parameters.)
+        // §22.4/§22.7: place arguments into parameter order, honoring named
+        // arguments (`p := expr`) and filling omitted parameters with their
+        // default values. Provided arguments are evaluated in source order
+        // (side effects left-to-right as written); defaults are evaluated
+        // afterward in parameter order.
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-            for (std::size_t i = call.args.size(); i < md->params.size(); ++i) {
-                const ast::Expr* dv = md->params[i].defaultValue.get();
-                if (!dv) return nullptr;  // a required parameter was omitted
-                llvm::Value* v = lowerExpr(*dv);
+            std::vector<llvm::Value*> ordered(md->params.size(), nullptr);
+            std::size_t pos = 0;
+            for (const auto& a : call.args) {
+                if (!a.value) return nullptr;
+                llvm::Value* v = lowerExpr(*a.value);
+                if (!v) return nullptr;
+                std::size_t idx = md->params.size();
+                if (a.name.empty()) {
+                    idx = pos++;
+                } else {
+                    for (std::size_t j = 0; j < md->params.size(); ++j)
+                        if (md->params[j].name == a.name) { idx = j; break; }
+                }
+                if (idx >= md->params.size() || ordered[idx]) return nullptr;
+                ordered[idx] = v;
+            }
+            for (std::size_t j = 0; j < md->params.size(); ++j) {
+                if (!ordered[j]) {
+                    const ast::Expr* dv = md->params[j].defaultValue.get();
+                    if (!dv) return nullptr;  // required parameter omitted
+                    ordered[j] = lowerExpr(*dv);
+                    if (!ordered[j]) return nullptr;
+                }
+                args.push_back(ordered[j]);
+            }
+        } else {
+            for (const auto& a : call.args) {
+                if (!a.value) return nullptr;
+                llvm::Value* v = lowerExpr(*a.value);
                 if (!v) return nullptr;
                 args.push_back(v);
             }
