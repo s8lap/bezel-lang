@@ -120,3 +120,16 @@ BEZEL_TEST(codegen_cg33b, expression_body_property_implicit_this) {
         "  end Main; "
         "end C;"), 14);
 }
+
+// CG33c: an accessor-block getter with an expression body
+// (`property P: T get => …; end;`) is a computed read-only property too.
+BEZEL_TEST(codegen_cg33b, accessor_block_getter) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public _x: int := 41; "
+        "  public property Next: int get => _x + 1; end; "
+        "  public static method Main(): int "
+        "    var c := new C(); return c.Next; "
+        "  end Main; "
+        "end C;"), 42);
+}
