@@ -1076,6 +1076,17 @@ private:
             }
         }
         Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
+        // §5.4: an enum cast `E(i)` — the callee is an enum type name; the
+        // call's type is that enum.
+        if (auto* ts = dynamic_cast<TypeSymbol*>(calleeSym)) {
+            if (ts->kind == ast::TypeDeclKind::Enum) {
+                TypeRef* et = ctx_.makeTypeRef();
+                et->kind = TypeRef::Kind::Named;
+                et->declaration = ts;
+                ctx_.setExprType(&ce, et);
+                return;
+            }
+        }
         if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
             auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
             if (md && md->returnType) {

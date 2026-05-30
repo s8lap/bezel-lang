@@ -2600,6 +2600,19 @@ private:
         return src;  // same width, differing signedness (e.g. int ↔ uint)
     }
 
+    // CG44: lower an enum cast `E(i)` (§5.4). The enum's underlying type is
+    // i32, so width-adjust the integer argument to i32. (Out-of-range
+    // checks for the checked cast forms are deferred.)
+    llvm::Value* lowerEnumCast(const ast::CallExpr& call) {
+        if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+        llvm::Value* src = lowerExpr(*call.args[0].value);
+        if (!src || !src->getType()->isIntegerTy()) return nullptr;
+        unsigned sb = src->getType()->getIntegerBitWidth();
+        if (sb < 32) return builder_.CreateSExt(src, i32());
+        if (sb > 32) return builder_.CreateTrunc(src, i32());
+        return src;
+    }
+
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
         // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
@@ -2613,6 +2626,13 @@ private:
             }
         }
         sema::Symbol* calleeSym = ctx_.exprSymbol(*call.callee);
+        // CG44: an enum cast `E(i)` (§5.4) — the callee is an enum type
+        // name. An enum is represented by its underlying integer (i32), so
+        // the argument, width-adjusted to i32, is the enum value.
+        if (auto* ets = dynamic_cast<sema::TypeSymbol*>(calleeSym)) {
+            if (ets->kind == ast::TypeDeclKind::Enum)
+                return lowerEnumCast(call);
+        }
         // CG26: a call to an extern (FFI) function — direct C-ABI call to
         // the external declaration. (Native functions don't set the
         // exception global, so no post-call unwind check is needed.)
