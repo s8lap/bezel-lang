@@ -86,3 +86,21 @@ BEZEL_TEST(codegen_cg24, float_double_mixed_arithmetic) {
     BEZEL_EXPECT_EQ(run("var f := float(2.5); var d := 1.0; "
                         "return (1 if f + d = 3.5 else 0);"), 1);
 }
+
+// §6.3 (IEEE 754): `<>` is the negation of `=`, so `NaN <> NaN` is true
+// (an unordered not-equal), while `NaN = NaN` is false. Non-NaN operands
+// are unaffected.
+BEZEL_TEST(codegen_cg24, nan_inequality_is_true) {
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; "
+                        "return (1 if nan <> nan else 0);"), 1);
+}
+
+BEZEL_TEST(codegen_cg24, nan_equality_is_false) {
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; "
+                        "return (1 if nan = nan else 0);"), 0);
+}
+
+BEZEL_TEST(codegen_cg24, non_nan_inequality_unchanged) {
+    BEZEL_EXPECT_EQ(run("var a := 3.0; var b := 4.0; "
+                        "return (1 if a <> b else 0);"), 1);
+}
