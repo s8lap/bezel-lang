@@ -1793,6 +1793,11 @@ private:
     // Bitwise/shift ops are not overflow-checked, so they are exact now.
     llvm::Value* lowerBinary(const ast::BinaryExpr& bin) {
         if (!bin.left || !bin.right) return nullptr;
+        // CG: short-circuit `and`/`or` (§17) — the right operand is
+        // evaluated only when needed, so a side-effecting or throwing RHS
+        // is not run when the result is already determined.
+        if (bin.op == "and" || bin.op == "or")
+            return lowerShortCircuit(bin);
         llvm::Value* l = lowerExpr(*bin.left);
         llvm::Value* r = lowerExpr(*bin.right);
         if (!l || !r) return nullptr;
@@ -1886,9 +1891,35 @@ private:
         // evaluation; this eager form is observationally identical while
         // operands are side-effect-free (no calls lowered yet) — true
         // short-circuiting lands once call lowering exists.
-        if (op == "and") return builder_.CreateAnd(l, r);
-        if (op == "or") return builder_.CreateOr(l, r);
-        return nullptr;
+        return nullptr;  // `and`/`or` handled by lowerShortCircuit
+    }
+
+    // CG: short-circuit `and`/`or` via a branch + phi — the right operand
+    // runs only on the deciding path (§17 logical operators).
+    llvm::Value* lowerShortCircuit(const ast::BinaryExpr& bin) {
+        bool isAnd = (bin.op == "and");
+        llvm::Value* l = lowerExpr(*bin.left);
+        if (!l) return nullptr;
+        auto* entryBB = builder_.GetInsertBlock();
+        auto* rhsBB = llvm::BasicBlock::Create(llvm_, "sc.rhs", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "sc.end", currentFn_);
+        // and: evaluate RHS only when l is true; or: only when l is false.
+        if (isAnd) builder_.CreateCondBr(l, rhsBB, endBB);
+        else       builder_.CreateCondBr(l, endBB, rhsBB);
+
+        builder_.SetInsertPoint(rhsBB);
+        llvm::Value* r = lowerExpr(*bin.right);
+        if (!r) return nullptr;
+        auto* rhsEndBB = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2);
+        // Short-circuit value when RHS is skipped: false for `and`, true
+        // for `or`.
+        phi->addIncoming(builder_.getInt1(!isAnd), entryBB);
+        phi->addIncoming(r, rhsEndBB);
+        return phi;
     }
 
     llvm::Value* lowerUnary(const ast::UnaryExpr& un) {
