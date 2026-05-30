@@ -132,3 +132,37 @@ BEZEL_TEST(sema_ops, comparison_chain_in_logical) {
     auto* t = typeOf(r);
     BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Bool);
 }
+
+// §17.1 L12 null-coalescing: `a ?? b` has the *non-nullable* form of the
+// LHS as its result type (spec § null-coalescing: the RHS must be
+// compatible with the non-nullable form of the left).
+BEZEL_TEST(sema_ops, coalesce_yields_nonnull_lhs) {
+    auto r = parseSema(
+        "module M; class C public method M(a: int?) "
+        "  _ := a ?? 2; "
+        "end M; end C;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int && !t->nullable);
+}
+
+// Regression: the result stays typed even when the RHS is a postfix-`!`
+// expression (whose own type the checker does not record). Deriving the
+// `??` type from the LHS — not the RHS — keeps the whole expression typed.
+BEZEL_TEST(sema_ops, coalesce_typed_when_rhs_is_bang) {
+    auto r = parseSema(
+        "module M; class C public method M(a: int?, b: int?) "
+        "  _ := a ?? b!; "
+        "end M; end C;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int && !t->nullable);
+}
+
+// Reference-typed coalescing yields the non-nullable named type.
+BEZEL_TEST(sema_ops, coalesce_reference_type_nonnull) {
+    auto r = parseSema(
+        "module M; "
+        "class C public method M(a: T?) _ := a ?? new T(); end M; end C; "
+        "class T end T;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);
+}
