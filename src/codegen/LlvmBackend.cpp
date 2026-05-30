@@ -218,6 +218,13 @@ private:
     std::unordered_map<const sema::TypeSymbol*,
                        std::unordered_map<std::string_view, unsigned>>
         vtableNameSlot_;
+    // CG35: interface method dispatch. Every interface method gets a fixed
+    // vtable slot in [2, 2+G); each implementing class fills that slot with
+    // its implementation, so a call through an interface-typed value indexes
+    // the runtime object's vtable at the interface method's slot. Class
+    // virtual-method slots follow at [2+G, …).
+    std::unordered_map<const sema::MethodSymbol*, unsigned> ifaceMethodSlot_;
+    unsigned ifaceSlotCount_ = 0;
     // CG19: per-type runtime descriptor (class AND interface) — a
     // null-terminated array of pointers to the descriptor globals of this
     // type plus all its transitive base types. A type's identity is its
@@ -702,17 +709,19 @@ private:
             slots = vtableMethods_[base];
             nameSlot = vtableNameSlot_[base];
         }
+        // Vtable: [0]=descriptor, [1]=Dispose, [2..2+G)=interface-method
+        // slots, [2+G..]=virtual methods. So a virtual method's slot is its
+        // position in `slots` + (2 + G).
+        const unsigned base = 2 + ifaceSlotCount_;
         for (sema::Symbol* m : t->members) {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
             if (!ms || isStaticMethod(ms) || !isVirtual(ms)) continue;
-            // Vtable index 0 = type descriptor, 1 = Dispose, 2+ = methods,
-            // so a method's slot is its position in `slots` + 2.
             auto it = nameSlot.find(ms->name);
             if (it != nameSlot.end()) {       // override: reuse base slot
-                slots[it->second - 2] = ms;
+                slots[it->second - base] = ms;
                 vtableSlot_[ms] = it->second;
             } else {                          // new virtual: fresh slot
-                unsigned slot = static_cast<unsigned>(slots.size()) + 2;
+                unsigned slot = static_cast<unsigned>(slots.size()) + base;
                 slots.push_back(ms);
                 nameSlot[ms->name] = slot;
                 vtableSlot_[ms] = slot;
@@ -726,7 +735,34 @@ private:
     //   [0] type descriptor, [1] Dispose, [2+] virtual-method slots.
     // Also builds a runtime type descriptor for every class and interface
     // (CG19). Runs after declareFunctions so the function pointers exist.
+    // CG35: the class's (or its bases') method implementing interface
+    // method `name`, by name match (signatures match per §11.2).
+    sema::MethodSymbol* findMethodByName(const sema::TypeSymbol* cls,
+                                         std::string_view name) {
+        for (const sema::TypeSymbol* t = cls; t;) {
+            for (sema::Symbol* m : t->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && !isStaticMethod(ms) && ms->name == name &&
+                    methodFns_.count(ms))
+                    return ms;
+            }
+            t = baseClassOf(t);
+        }
+        return nullptr;
+    }
+
     void declareVtables() {
+        // Pass 0 (CG35): assign each interface method a fixed vtable slot in
+        // [2, 2+G), shared across all implementers.
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!ts || ts->kind != ast::TypeDeclKind::Interface) continue;
+            for (sema::Symbol* m : ts->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && !isStaticMethod(ms))
+                    ifaceMethodSlot_[ms] = 2 + ifaceSlotCount_++;
+            }
+        }
         // Pass A: assign vtable slots for all classes (base-first).
         for (const auto& sym : ctx_.symbols()) {
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
@@ -767,18 +803,36 @@ private:
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
             if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
             const auto& slots = vtableMethods_[ts];
-            std::vector<llvm::Constant*> elems;
-            elems.push_back(descArray_[ts]);  // [0] type descriptor
-            auto dit = disposerFns_.find(ts);  // [1] Dispose
-            elems.push_back(dit != disposerFns_.end()
-                                ? llvm::cast<llvm::Constant>(dit->second)
-                                : llvm::ConstantPointerNull::get(ptrTy()));
-            for (sema::MethodSymbol* ms : slots) {  // [2+] methods
-                auto mit = methodFns_.find(ms);
-                elems.push_back(
-                    mit != methodFns_.end()
-                        ? llvm::cast<llvm::Constant>(mit->second)
-                        : llvm::ConstantPointerNull::get(ptrTy()));
+            // [0] descriptor, [1] Dispose, [2..2+G) interface slots,
+            // [2+G..] virtual methods.
+            std::vector<llvm::Constant*> elems(2 + ifaceSlotCount_ +
+                                                   slots.size(),
+                                               llvm::ConstantPointerNull::get(
+                                                   ptrTy()));
+            elems[0] = descArray_[ts];
+            auto dit = disposerFns_.find(ts);
+            if (dit != disposerFns_.end())
+                elems[1] = llvm::cast<llvm::Constant>(dit->second);
+            // CG35: fill the interface-method slots this class implements.
+            std::vector<const sema::TypeSymbol*> supers;
+            collectTypeAndBases(ts, supers);
+            std::unordered_set<const sema::TypeSymbol*> superSet(supers.begin(),
+                                                                supers.end());
+            for (const auto& [im, slot] : ifaceMethodSlot_) {
+                if (!im->parent || !superSet.count(im->parent)) continue;
+                if (sema::MethodSymbol* impl =
+                        findMethodByName(ts, im->name)) {
+                    auto mit = methodFns_.find(impl);
+                    if (mit != methodFns_.end())
+                        elems[slot] = llvm::cast<llvm::Constant>(mit->second);
+                }
+            }
+            // Virtual methods at [2+G..].
+            for (std::size_t i = 0; i < slots.size(); ++i) {
+                auto mit = methodFns_.find(slots[i]);
+                if (mit != methodFns_.end())
+                    elems[2 + ifaceSlotCount_ + i] =
+                        llvm::cast<llvm::Constant>(mit->second);
             }
             auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
             auto* init = llvm::ConstantArray::get(arrTy, elems);
@@ -2345,20 +2399,32 @@ private:
             args.push_back(v);
         }
 
-        // CG17/CG18: virtual dispatch — load the receiver's vtable pointer
-        // (instance slot 0) and call through the method's slot. Works even
-        // when the statically-resolved method is `abstract` (no concrete
-        // function), since the slot is filled by the runtime override. A
-        // `base.M()` call bypasses dispatch (§12.3), as do non-virtual.
-        auto slotIt = vtableSlot_.find(ms);
-        if (!baseQualified && !isStaticMethod(ms) &&
-            slotIt != vtableSlot_.end()) {
+        // CG17/CG18/CG35: dynamic dispatch — load the receiver's vtable
+        // pointer (instance slot 0) and call through the method's slot.
+        // The slot is the interface-method slot when the static method is
+        // an interface method (CG35), else the virtual slot (CG17). Works
+        // for abstract/interface methods (no concrete function) since the
+        // slot is filled by the runtime class. A `base.M()` call bypasses
+        // dispatch (§12.3), as do non-virtual non-interface methods.
+        bool canDispatch = !baseQualified && !isStaticMethod(ms);
+        unsigned dispatchSlot = 0;
+        if (canDispatch) {
+            auto ifIt = ifaceMethodSlot_.find(ms);
+            if (ifIt != ifaceMethodSlot_.end()) {
+                dispatchSlot = ifIt->second;
+            } else {
+                auto slotIt = vtableSlot_.find(ms);
+                if (slotIt != vtableSlot_.end()) dispatchSlot = slotIt->second;
+                else canDispatch = false;
+            }
+        }
+        if (canDispatch) {
             llvm::FunctionType* fnTy = methodFnType(ms);
             if (!fnTy || args.size() != fnTy->getNumParams()) return nullptr;
             llvm::Value* recv = args[0];
             llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
             llvm::Value* slotPtr = builder_.CreateGEP(
-                ptrTy(), vptr, {builder_.getInt32(slotIt->second)});
+                ptrTy(), vptr, {builder_.getInt32(dispatchSlot)});
             llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
             llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
             emitPendingCheck();  // CG20: a callee may have thrown

@@ -162,6 +162,7 @@ set(BEZEL_TEST_SOURCES
     codegen/char_literal_test.cpp
     codegen/auto_property_test.cpp
     codegen/with_init_test.cpp
+    codegen/interface_dispatch_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
