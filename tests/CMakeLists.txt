@@ -171,6 +171,7 @@ set(BEZEL_TEST_SOURCES
     codegen/throw_expr_test.cpp
     codegen/null_cond_member_test.cpp
     codegen/null_cond_call_test.cpp
+    codegen/conditional_member_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp

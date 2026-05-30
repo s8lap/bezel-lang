@@ -933,6 +933,19 @@ private:
                 }
             }
         }
+        // §20: the `if` expression `x if c else y` has the common type of
+        // its two branches. Take the then-branch's type, falling back to
+        // the else-branch (e.g. when the then-branch is a bottom-typed
+        // `throw`). Without this the expression is untyped, so member
+        // access on its result (`(a if c else b).M`) fails to resolve.
+        if (auto* cnd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+            TypeRef* tt =
+                cnd->thenValue ? ctx_.exprType(*cnd->thenValue) : nullptr;
+            TypeRef* et =
+                cnd->elseValue ? ctx_.exprType(*cnd->elseValue) : nullptr;
+            if (tt) ctx_.setExprType(&e, tt);
+            else if (et) ctx_.setExprType(&e, et);
+        }
         // Slice 3d: MemberAccessExpr resolution. Runs after the target
         // is visited (so its TypeRef is available), looks the member up
         // on the target's TypeSymbol, and annotates the access with the
