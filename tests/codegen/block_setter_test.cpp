@@ -71,3 +71,41 @@ BEZEL_TEST(codegen_cg49, auto_property_unchanged) {
         "  end Main; "
         "end C;"), 99);
 }
+
+// §22.9 (issue #248): compound assignment on a block-form property is a
+// read-modify-write through the getter and setter, not a silent no-op.
+BEZEL_TEST(codegen_cg49, compound_assign_runs_getter_and_setter) {
+    // Doubling setter: `:= 10` stores _x=20; `+= 5` reads 20, +5 = 25, the
+    // setter doubles → _x = 50.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property P: int "
+        "    get => _x; set => do _x := value * 2; end; end; "
+        "  public static method Main(): int "
+        "    var c := new C(); c.P := 10; c.P += 5; return c.P; "
+        "  end Main; "
+        "end C;"), 50);
+}
+
+BEZEL_TEST(codegen_cg49, compound_assign_identity_setter) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property P: int get => _x; set => do _x := value; end; end; "
+        "  public static method Main(): int "
+        "    var c := new C(); c.P := 20; c.P -= 7; return c.P; "
+        "  end Main; "
+        "end C;"), 13);
+}
+
+BEZEL_TEST(codegen_cg49, compound_assign_times_equals) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public _x: int := 0; "
+        "  public property P: int get => _x; set => do _x := value; end; end; "
+        "  public static method Main(): int "
+        "    var c := new C(); c.P := 6; c.P *= 4; return c.P; "
+        "  end Main; "
+        "end C;"), 24);
+}
