@@ -2079,6 +2079,10 @@ private:
         // is not run when the result is already determined.
         if (bin.op == "and" || bin.op == "or")
             return lowerShortCircuit(bin);
+        // CG39: null-coalescing `??` (§17.1 L12) short-circuits — the right
+        // operand is evaluated only when the left is null.
+        if (bin.op == "??")
+            return lowerCoalesce(bin);
         llvm::Value* l = lowerExpr(*bin.left);
         llvm::Value* r = lowerExpr(*bin.right);
         if (!l || !r) return nullptr;
@@ -2215,6 +2219,37 @@ private:
         // Short-circuit value when RHS is skipped: false for `and`, true
         // for `or`.
         phi->addIncoming(builder_.getInt1(!isAnd), entryBB);
+        phi->addIncoming(r, rhsEndBB);
+        return phi;
+    }
+
+    // CG39: null-coalescing `a ?? b` (§17.1 L12). Evaluates `a`; if it is a
+    // non-null reference, that is the result; otherwise evaluates and yields
+    // `b`. The right operand is not evaluated when `a` is non-null. Operands
+    // are reference-typed here (a possibly-null heap pointer); `??` on
+    // nullable value types (`int?`, …) is deferred until those have a
+    // representation.
+    llvm::Value* lowerCoalesce(const ast::BinaryExpr& bin) {
+        llvm::Value* l = lowerExpr(*bin.left);
+        if (!l) return nullptr;
+        if (!l->getType()->isPointerTy())
+            return nullptr;  // nullable value-type `??` deferred
+        auto* entryBB = builder_.GetInsertBlock();
+        auto* rhsBB = llvm::BasicBlock::Create(llvm_, "coalesce.rhs", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "coalesce.end", currentFn_);
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            l, llvm::ConstantPointerNull::get(ptrTy()));
+        builder_.CreateCondBr(isNull, rhsBB, endBB);
+
+        builder_.SetInsertPoint(rhsBB);
+        llvm::Value* r = lowerExpr(*bin.right);
+        if (!r) return nullptr;
+        auto* rhsEndBB = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(ptrTy(), 2);
+        phi->addIncoming(l, entryBB);  // left was non-null
         phi->addIncoming(r, rhsEndBB);
         return phi;
     }
