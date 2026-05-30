@@ -94,7 +94,14 @@ struct MemberSymbol : Symbol {
     TypeSymbol* parent = nullptr;
 };
 
-struct FieldSymbol : MemberSymbol {};
+struct FieldSymbol : MemberSymbol {
+    // §9.1: a record's positional field. When non-null, this field was
+    // introduced by a record's positional parameter list rather than a body
+    // `FieldDecl`, and its type comes from `posParam->type` (the `decl` of
+    // such a symbol is the owning TypeDecl, not a FieldDecl). Null for
+    // ordinary body fields.
+    const ast::Param* posParam = nullptr;
+};
 
 struct MethodSymbol : MemberSymbol {
     std::vector<Symbol*> genericParams;
