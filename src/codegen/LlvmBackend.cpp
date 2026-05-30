@@ -449,10 +449,19 @@ private:
         auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
         if (!ps || ps->isIndexer) return nullptr;
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-        if (!pd || pd->isIndexer ||
-            pd->bodyKind != ast::PropertyBodyKind::Expression)
-            return nullptr;
-        return pd->exprBody.get();
+        if (!pd || pd->isIndexer) return nullptr;
+        // Property-level expression body: `property P: T => expr;`.
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+            return pd->exprBody.get();
+        // Accessor-block getter with an expression body: `{ get => expr; }`.
+        if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            for (const auto& acc : pd->accessors) {
+                if (!acc.isSet &&
+                    acc.bodyKind == ast::PropertyAccessorBodyKind::Expression)
+                    return acc.exprBody.get();
+            }
+        }
+        return nullptr;
     }
 
     // The LLVM type backing an instance-storage member (field or
