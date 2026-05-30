@@ -278,6 +278,18 @@ private:
                p == P::ULong || p == P::Char;
     }
 
+    // CG25b: does either operand of a binary expression have an unsigned
+    // integer type (drives unsigned op selection)?
+    bool isUnsignedBinOperand(const ast::BinaryExpr& bin) {
+        auto unsignedExpr = [&](const ast::Expr* e) {
+            if (!e) return false;
+            auto* rt = ctx_.exprType(*e);
+            return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                   isUnsignedPrim(rt->primitive);
+        };
+        return unsignedExpr(bin.left.get()) || unsignedExpr(bin.right.get());
+    }
+
     // Lower a Bezel type (AST node) to its LLVM representation.
     llvm::Type* lowerType(const ast::Type* t) {
         if (!t) return llvm::Type::getVoidTy(llvm_);
@@ -1826,17 +1838,22 @@ private:
             if (op == ">=") return builder_.CreateFCmpOGE(l, r);
             return nullptr;
         }
+        // CG25b: unsigned integer operands select unsigned operations
+        // (udiv/urem/lshr/unsigned compares, zext widening, uXXX overflow).
+        bool uns = isUnsignedBinOperand(bin);
         // CG25 (§6.2): mixed-width integer operands — widen the narrower to
-        // the wider (sign-extend; the signed types dominate the cases we
-        // lower) so the op and any overflow check run at one width.
+        // the wider (zero-extend for unsigned, sign-extend otherwise) so the
+        // op and any overflow check run at one width.
         if (l->getType()->isIntegerTy() && r->getType()->isIntegerTy() &&
             !l->getType()->isIntegerTy(1) && !r->getType()->isIntegerTy(1) &&
             l->getType() != r->getType()) {
             unsigned lw = l->getType()->getIntegerBitWidth();
             unsigned rw = r->getType()->getIntegerBitWidth();
             llvm::Type* wide = lw >= rw ? l->getType() : r->getType();
-            if (lw < rw) l = builder_.CreateSExt(l, wide);
-            if (rw < lw) r = builder_.CreateSExt(r, wide);
+            if (lw < rw) l = uns ? builder_.CreateZExt(l, wide)
+                                 : builder_.CreateSExt(l, wide);
+            if (rw < lw) r = uns ? builder_.CreateZExt(r, wide)
+                                 : builder_.CreateSExt(r, wide);
         }
         // CG22 (§6.1): integer + - * are overflow-checked; / and mod also
         // raise on a zero divisor and on INT_MIN / -1. Applies to integer
