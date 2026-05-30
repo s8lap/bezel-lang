@@ -1,6 +1,9 @@
 #include "sema/ExprTypecheck.hpp"
 
+#include <cerrno>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -12,6 +15,35 @@
 namespace bezel::sema {
 
 namespace {
+
+// §5: parse an integer literal's magnitude (ignoring base prefix,
+// underscores, and any type suffix). Returns true and the value via `out`
+// when it parses; saturates large hex/decimal in the rare overflow case
+// (which still exceeds int and is reported). Mirrors the codegen parser.
+bool intLiteralMagnitude(std::string_view text, unsigned long long& out) {
+    int base = 10;
+    std::size_t i = 0;
+    if (text.size() >= 2 && text[0] == '0') {
+        char b = text[1];
+        if (b == 'x' || b == 'X') { base = 16; i = 2; }
+        else if (b == 'b' || b == 'B') { base = 2; i = 2; }
+        else if (b == 'o' || b == 'O') { base = 8; i = 2; }
+    }
+    std::string digits;
+    for (; i < text.size(); ++i) {
+        char c = text[i];
+        if (c == '_') continue;
+        bool isDigit = (c >= '0' && c <= '9');
+        bool isHex =
+            isDigit || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (base == 16 ? !isHex : !isDigit) break;  // stop at suffix letters
+        digits.push_back(c);
+    }
+    if (digits.empty()) return false;
+    errno = 0;
+    out = std::strtoull(digits.c_str(), nullptr, base);
+    return true;
+}
 
 // Per-walker scope for identifier lookups inside method bodies (slice 3b).
 struct Scope {
@@ -870,6 +902,19 @@ private:
             if (hasL && hasU) pt = PrimitiveType::ULong;
             else if (hasL) pt = PrimitiveType::Long;
             else if (hasU) pt = PrimitiveType::UInt;
+            // §5: an unsuffixed integer literal must fit in `int`; if it does
+            // not, the literal requires a suffix (it is not silently widened).
+            if (pt == PrimitiveType::Int) {
+                unsigned long long mag = 0;
+                if (intLiteralMagnitude(il->text, mag) &&
+                    (errno == ERANGE || mag > 2147483647ull)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, il->span.begin,
+                        "integer literal does not fit in `int`; add a suffix "
+                        "(`L` for long, `U`/`UL` for unsigned) to widen it "
+                        "(§5)");
+                }
+            }
             ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
             return;
         }

@@ -165,3 +165,29 @@ BEZEL_TEST(sema_expr_lit, recursion_into_binary_subexprs) {
     auto* whole = r.ctx->exprType(*ds->value);
     BEZEL_EXPECT_TRUE(whole && whole->primitive == PrimitiveType::Int);
 }
+
+// §5: an unsuffixed integer literal must fit in `int`; a larger value
+// requires a suffix (it is not silently widened or wrapped).
+BEZEL_TEST(sema_literal, unsuffixed_int_in_range_ok) {
+    auto r = parseSemaAll(
+        "module M; class C public method M() _ := 2147483647; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_literal, unsuffixed_int_too_large_diagnosed) {
+    auto r = parseSemaAll(
+        "module M; class C public method M() _ := 2147483648; end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_literal, large_literal_with_long_suffix_ok) {
+    auto r = parseSemaAll(
+        "module M; class C public method M() _ := 5000000000L; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_literal, large_hex_literal_diagnosed) {
+    auto r = parseSemaAll(
+        "module M; class C public method M() _ := 0xFFFFFFFF; end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
