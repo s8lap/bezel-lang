@@ -916,6 +916,23 @@ private:
         if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             typeUnary(*ue);
         }
+        // §17.12 / §2553: the postfix `!` (null-forgiving) operator yields
+        // the non-nullable form of its operand's type. Recording it lets
+        // member access through `x!` (and any other consumer) resolve —
+        // without it, `x!.member` reads/writes silently fail (#206).
+        if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+            if (bg->operand) {
+                if (TypeRef* ot = ctx_.exprType(*bg->operand)) {
+                    if (ot->nullable) {
+                        TypeRef* nn = ctx_.makeTypeRef(*ot);
+                        nn->nullable = false;
+                        ctx_.setExprType(&e, nn);
+                    } else {
+                        ctx_.setExprType(&e, ot);  // already non-nullable
+                    }
+                }
+            }
+        }
         // Slice 3d: MemberAccessExpr resolution. Runs after the target
         // is visited (so its TypeRef is available), looks the member up
         // on the target's TypeSymbol, and annotates the access with the

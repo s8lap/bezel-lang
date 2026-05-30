@@ -166,3 +166,14 @@ BEZEL_TEST(sema_ops, coalesce_reference_type_nonnull) {
     auto* t = typeOf(r);
     BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);
 }
+
+// §17.12 / §2553: postfix `!` (null-forgiving) yields the non-nullable
+// form of the operand's type — so the result is typed and usable (#206).
+BEZEL_TEST(sema_ops, postfix_bang_yields_nonnull) {
+    auto r = parseSema(
+        "module M; "
+        "class C public method M(a: T?) _ := a!; end M; end C; "
+        "class T end T;");
+    auto* t = typeOf(r);
+    BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);
+}
