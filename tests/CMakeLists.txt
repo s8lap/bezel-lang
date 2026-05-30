@@ -160,6 +160,7 @@ set(BEZEL_TEST_SOURCES
     codegen/unsigned_int_test.cpp
     codegen/compound_assign_test.cpp
     codegen/char_literal_test.cpp
+    codegen/auto_property_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
