@@ -286,19 +286,30 @@ private:
             return;
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-            for (const auto& a : call->args) {
-                if (!a.value) continue;
-                // Slice O14: `owned x` argument modifier consumes x.
-                if (a.modifier == "owned") {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                            a.value.get())) {
-                        markMovedByName(id->name, id->span.begin);
-                        continue;
-                    }
-                }
-                recordMovesIn(*a.value);
-            }
+            recordMovesInArgs(call->args);
             return;
+        }
+        // A constructor call `new T(owned x)` / `new T(move x)` consumes its
+        // owned arguments exactly as a method call does — most commonly
+        // `using var b := new Box(move r);`.
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+            recordMovesInArgs(ne->args);
+            return;
+        }
+    }
+
+    void recordMovesInArgs(const std::vector<ast::CallArgument>& args) {
+        for (const auto& a : args) {
+            if (!a.value) continue;
+            // Slice O14: `owned x` argument modifier consumes x.
+            if (a.modifier == "owned") {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get())) {
+                    markMovedByName(id->name, id->span.begin);
+                    continue;
+                }
+            }
+            recordMovesIn(*a.value);
         }
     }
 

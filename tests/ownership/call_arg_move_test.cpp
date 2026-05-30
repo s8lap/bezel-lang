@@ -99,3 +99,48 @@ BEZEL_TEST(own_call_arg, plain_arg_does_not_consume) {
         "end C;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §28.3/§28.8: a constructor call `new T(move x)` / `new T(owned x)`
+// consumes its owned argument exactly as a method call does. (Previously
+// only CallExpr arguments were processed for the move, so a `new`-expr
+// argument left the source undischarged → a false "dropped" diagnostic.)
+namespace {
+std::string box(const std::string& methodBody) {
+    return std::string("module M; class T end T; "
+        "class Box "
+        "  public constructor(owned x: T) "
+        "    using var hold := move x; "
+        "  end constructor; "
+        "end Box; "
+        "class C ") + methodBody + " end C;";
+}
+} // namespace
+
+BEZEL_TEST(own_call_arg, new_move_arg_consumes_local) {
+    auto r = parseAndCheckOwnership(box(
+        "public method M() "
+        "  var t := new T(); "
+        "  using var b := new Box(move t); "
+        "end M;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(own_call_arg, new_owned_arg_consumes_local) {
+    auto r = parseAndCheckOwnership(box(
+        "public method M() "
+        "  var t := new T(); "
+        "  using var b := new Box(owned t); "
+        "end M;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(own_call_arg, read_after_new_move_arg_diagnosed) {
+    // After `new Box(move t)`, reading `t` again is a use-after-move.
+    auto r = parseAndCheckOwnership(box(
+        "public method M(s: Sink) "
+        "  var t := new T(); "
+        "  using var b := new Box(move t); "
+        "  s.Take(move t); "
+        "end M;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
