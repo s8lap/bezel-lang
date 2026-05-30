@@ -104,3 +104,18 @@ BEZEL_TEST(parser_conditional, missing_else_is_error) {
         "module M; class Foo public x: int := a if cond; end Foo;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §17.12 + §A.7 example: `throw` is valid in any expression position,
+// including the right operand of `??` — `config ?? throw new E()`. The
+// precedence climber must admit a `throw` expression as a binary RHS.
+BEZEL_TEST(parser_throw, throw_as_coalesce_rhs) {
+    BEZEL_EXPECT_EQ(
+        parseInitText("config ?? throw new InvalidOperationException()"),
+        std::string("(config ?? (throw new InvalidOperationException()))"));
+}
+
+BEZEL_TEST(parser_throw, throw_as_coalesce_rhs_chains) {
+    // `a ?? b ?? throw E` — right-associative; the throw is the deepest rhs.
+    BEZEL_EXPECT_EQ(parseInitText("a ?? b ?? throw err"),
+                    std::string("(a ?? (b ?? (throw err)))"));
+}
