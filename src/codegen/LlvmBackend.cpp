@@ -2430,6 +2430,9 @@ private:
         if (op == "~") return builder_.CreateNot(v);   // bitwise complement
         if (op == "+") return v;                       // identity
         if (op == "not") return builder_.CreateNot(v); // i1 logical negation
+        // §28.3: `move x` is a compile-time ownership transfer; at runtime
+        // it yields the operand value unchanged (the same reference).
+        if (op == "move") return v;
         return nullptr;
     }
 

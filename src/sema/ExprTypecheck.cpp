@@ -1510,13 +1510,16 @@ private:
             ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
             return;
         }
-        if (op == "+" || op == "-" || op == "~") {
+        // `move x` (§28.3) keeps the operand's type — the result is the
+        // same value with ownership transferred. Without the type, member
+        // access on a moved value (`var s := move r; s.M`) fails to resolve.
+        if (op == "+" || op == "-" || op == "~" || op == "move") {
             TypeRef* ot = ue.operand ? ctx_.exprType(*ue.operand) : nullptr;
             if (ot) ctx_.setExprType(&ue, ot);
             return;
         }
-        // `await`, `move` — result-type rules deeper (Task<T> -> T,
-        // move keeps the operand's type). Slice 3c doesn't type them.
+        // `await` — result-type rule is deeper (Task<T> -> T); not typed
+        // here.
     }
 
     void visitChildren(const ast::Expr& e) {
