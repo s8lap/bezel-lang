@@ -648,7 +648,11 @@ private:
     // CG12: the backing global of a bare identifier that resolves to a
     // static field, or null if `e` isn't such a reference.
     llvm::GlobalVariable* staticFieldGlobal(const ast::Expr& e) {
-        if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) return nullptr;
+        // A static field reached either bare (`Count`) or qualified
+        // (`Type.Count`, a member access) resolves to the same backing
+        // global. Match on the field symbol; only static fields are in
+        // staticGlobals_, so an instance field's FieldSymbol misses here
+        // (and is handled by fieldAddr instead).
         auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e));
         if (!fs) return nullptr;
         auto it = staticGlobals_.find(fs);
@@ -2088,6 +2092,12 @@ private:
             llvm::Type* elemTy = nullptr;
             if (llvm::Value* addr = fieldAddr(*ma, elemTy)) {
                 return builder_.CreateLoad(elemTy, addr);
+            }
+            // #213: a qualified static-field read `Type.Count` — static
+            // fields have no instance slot, so fieldAddr misses; read the
+            // backing global directly.
+            if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
+                return builder_.CreateLoad(gv->getValueType(), gv);
             }
         }
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
