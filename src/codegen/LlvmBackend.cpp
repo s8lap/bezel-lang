@@ -602,6 +602,56 @@ private:
             i32(), static_cast<std::uint64_t>(it->second), /*isSigned=*/true);
     }
 
+    // CG43: the enum TypeSymbol an expression's type denotes, or null. Uses
+    // the expression's resolved type when present, else falls back to a
+    // local/parameter's declared type (a scrutinee identifier often carries
+    // only an exprSymbol, not an exprType).
+    const sema::TypeSymbol* enumTypeOf(const ast::Expr& e) {
+        const sema::TypeRef* rt = ctx_.exprType(e);
+        if (!rt) {
+            sema::Symbol* sym = ctx_.exprSymbol(e);
+            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym))
+                rt = loc->declType;
+            else if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym))
+                rt = par->declType ? ctx_.resolvedType(*par->declType)
+                                   : nullptr;
+        }
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+        const sema::TypeSymbol* ts = rt->declaration;
+        if (ts && ts->kind == ast::TypeDeclKind::Enum) return ts;
+        return nullptr;
+    }
+
+    // CG43: resolve a `case`-pattern constant expression that names an enum
+    // constant (`E.Red` member access or a bare `Red`) against the
+    // scrutinee's enum, by name. Null if `e` is not such a name.
+    llvm::Value* enumConstantOfPatternExpr(const ast::Expr& e,
+                                           const sema::TypeSymbol* enumTy) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+            return enumConstantByName(enumTy, ma->member);
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+            return enumConstantByName(enumTy, id->name);
+        return nullptr;
+    }
+
+    // CG43: the value of the enum constant named `name` on `enumTy` (i32),
+    // resolved by name — used for `case` patterns, whose enum-constant
+    // names sema does not resolve to symbols. Null if no such constant.
+    llvm::Value* enumConstantByName(const sema::TypeSymbol* enumTy,
+                                    std::string_view name) {
+        if (!enumTy) return nullptr;
+        for (const sema::Symbol* m : enumTy->members) {
+            if (m->name != name) continue;
+            if (!dynamic_cast<const sema::EnumConstantSymbol*>(m)) continue;
+            auto it = enumValue_.find(m);
+            if (it == enumValue_.end()) return nullptr;
+            return llvm::ConstantInt::get(
+                i32(), static_cast<std::uint64_t>(it->second),
+                /*isSigned=*/true);
+        }
+        return nullptr;
+    }
+
     // CG36: a const member (`const X := …`) lowers to its initializer's
     // value (a compile-time constant). Covers bare `X` and `Type.X`.
     llvm::Value* constMemberValue(const ast::Expr& e) {
@@ -2692,10 +2742,11 @@ private:
         if (!cs.scrutinee) return false;  // scrutinee-less form deferred
         llvm::Value* scrut = lowerExpr(*cs.scrutinee);
         if (!scrut) return false;
+        const sema::TypeSymbol* enumTy = enumTypeOf(*cs.scrutinee);
         auto* endBB =
             llvm::BasicBlock::Create(llvm_, "casestmt.end", currentFn_);
         for (const auto& arm : cs.arms) {
-            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut);
+            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy);
             if (!pm) {  // deferred pattern kind — degrade to no-op
                 builder_.CreateBr(endBB);
                 builder_.SetInsertPoint(endBB);
@@ -2731,6 +2782,7 @@ private:
         if (!ce.scrutinee) return nullptr;  // scrutinee-less form deferred
         llvm::Value* scrut = lowerExpr(*ce.scrutinee);
         if (!scrut) return nullptr;
+        const sema::TypeSymbol* enumTy = enumTypeOf(*ce.scrutinee);
         llvm::Type* resultTy = i32();
         if (auto* rt = ctx_.exprType(ce)) resultTy = lowerTypeRef(rt);
 
@@ -2741,7 +2793,7 @@ private:
             if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
                 !arm.exprBody)
                 return nullptr;  // block-body arms deferred
-            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut);
+            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy);
             if (!pm) return nullptr;
             auto* bodyBB =
                 llvm::BasicBlock::Create(llvm_, "case.arm", currentFn_);
@@ -2777,14 +2829,31 @@ private:
     }
 
     // CG28: does `pattern` match `scrut`? Returns an i1.
-    llvm::Value* patternMatches(const ast::Pattern* pat, llvm::Value* scrut) {
+    llvm::Value* patternMatches(const ast::Pattern* pat, llvm::Value* scrut,
+                                const sema::TypeSymbol* enumTy = nullptr) {
         if (dynamic_cast<const ast::DiscardPattern*>(pat))
             return builder_.getInt1(true);
+        // CG43: a bare qualified name `E.Red` parses as a NamedPattern; when
+        // the scrutinee is an enum, resolve it to that enum's constant and
+        // test equality. (A name denoting a type — a type-test pattern — is
+        // still deferred.)
+        if (auto* np = dynamic_cast<const ast::NamedPattern*>(pat)) {
+            if (enumTy && np->name && !np->name->parts.empty()) {
+                if (llvm::Value* cv =
+                        enumConstantByName(enumTy, np->name->parts.back()))
+                    return emitEquals(scrut, cv);
+            }
+            return nullptr;  // type-test pattern deferred
+        }
         if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(pat)) {
             llvm::Value* any = builder_.getInt1(false);
             for (const auto& c : cp->constants) {
                 if (!c) continue;
                 llvm::Value* cv = lowerExpr(*c);
+                // CG43: an enum-constant alternative (`E.Red`, `E.Green`) has
+                // no resolved symbol on the pattern expression, so lowerExpr
+                // misses; resolve it by name against the scrutinee's enum.
+                if (!cv) cv = enumConstantOfPatternExpr(*c, enumTy);
                 if (!cv) return nullptr;
                 any = builder_.CreateOr(any, emitEquals(scrut, cv));
             }
