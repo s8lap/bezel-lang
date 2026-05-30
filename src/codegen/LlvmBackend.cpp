@@ -290,6 +290,79 @@ private:
         return unsignedExpr(bin.left.get()) || unsignedExpr(bin.right.get());
     }
 
+    // CG31: is the assignment/increment target an unsigned-typed lvalue?
+    bool isUnsignedTargetExpr(const ast::Expr& e) {
+        auto* rt = ctx_.exprType(e);
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               isUnsignedPrim(rt->primitive);
+    }
+
+    // CG31: the address (and element type) of an assignable target — a
+    // local/parameter slot, a static-field global, a `this.f`/`obj.f`
+    // field, or a bare implicit-`this` field. Null if not assignable.
+    llvm::Value* lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
+        if (llvm::AllocaInst* slot = localSlot(target)) {
+            elemTy = slot->getAllocatedType();
+            return slot;
+        }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+            if (llvm::Value* a = fieldAddr(*ma, elemTy)) return a;
+        }
+        if (llvm::GlobalVariable* gv = staticFieldGlobal(target)) {
+            elemTy = gv->getValueType();
+            return gv;
+        }
+        return implicitFieldAddr(target, elemTy);
+    }
+
+    // CG31: apply a compound-assignment/increment arithmetic or bitwise
+    // operator (op without the trailing `=`). Integer `+ - *` and `/ mod`
+    // are overflow/zero-checked exactly as in lowerBinary; bitwise/shift
+    // are exact; floats use IEEE ops.
+    llvm::Value* emitCompoundOp(const std::string& op, llvm::Value* l,
+                                llvm::Value* r, bool fp, bool uns) {
+        if (fp) {
+            if (op == "+") return builder_.CreateFAdd(l, r);
+            if (op == "-") return builder_.CreateFSub(l, r);
+            if (op == "*") return builder_.CreateFMul(l, r);
+            if (op == "/") return builder_.CreateFDiv(l, r);
+            return nullptr;
+        }
+        if (op == "+")
+            return emitCheckedArith(uns ? llvm::Intrinsic::uadd_with_overflow
+                                        : llvm::Intrinsic::sadd_with_overflow,
+                                    l, r);
+        if (op == "-")
+            return emitCheckedArith(uns ? llvm::Intrinsic::usub_with_overflow
+                                        : llvm::Intrinsic::ssub_with_overflow,
+                                    l, r);
+        if (op == "*")
+            return emitCheckedArith(uns ? llvm::Intrinsic::umul_with_overflow
+                                        : llvm::Intrinsic::smul_with_overflow,
+                                    l, r);
+        if (op == "/" || op == "mod") {
+            emitGuardThrow(builder_.CreateICmpEQ(r, zeroLike(r)),
+                           "DivideByZeroException");
+            if (uns)
+                return op == "/" ? builder_.CreateUDiv(l, r)
+                                 : builder_.CreateURem(l, r);
+            llvm::Value* negOne = llvm::ConstantInt::getSigned(r->getType(), -1);
+            emitGuardThrow(
+                builder_.CreateAnd(builder_.CreateICmpEQ(l, minIntLike(r)),
+                                   builder_.CreateICmpEQ(r, negOne)),
+                "OverflowException");
+            return op == "/" ? builder_.CreateSDiv(l, r)
+                             : builder_.CreateSRem(l, r);
+        }
+        if (op == "&") return builder_.CreateAnd(l, r);
+        if (op == "|") return builder_.CreateOr(l, r);
+        if (op == "^") return builder_.CreateXor(l, r);
+        if (op == "<<") return builder_.CreateShl(l, r);
+        if (op == ">>")
+            return uns ? builder_.CreateLShr(l, r) : builder_.CreateAShr(l, r);
+        return nullptr;
+    }
+
     // Lower a Bezel type (AST node) to its LLVM representation.
     llvm::Type* lowerType(const ast::Type* t) {
         if (!t) return llvm::Type::getVoidTy(llvm_);
@@ -1386,35 +1459,46 @@ private:
             return false;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-            if (as->op == ":=" && as->target && as->value) {
-                if (llvm::AllocaInst* slot = localSlot(*as->target)) {
-                    if (llvm::Value* v = lowerExpr(*as->value)) {
-                        builder_.CreateStore(v, slot);
-                    }
-                } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                               as->target.get())) {
-                    // CG8: field assignment `obj.f := v`.
-                    llvm::Type* elemTy = nullptr;
-                    if (llvm::Value* addr = fieldAddr(*ma, elemTy)) {
-                        if (llvm::Value* v = lowerExpr(*as->value)) {
-                            builder_.CreateStore(v, addr);
-                        }
-                    }
-                } else if (llvm::GlobalVariable* gv =
-                               staticFieldGlobal(*as->target)) {
-                    // CG12: static field assignment `_s := v`.
-                    if (llvm::Value* v = lowerExpr(*as->value)) {
-                        builder_.CreateStore(v, gv);
-                    }
+            if (as->target && as->value) {
+                llvm::Type* elemTy = nullptr;
+                llvm::Value* addr = lvalueAddr(*as->target, elemTy);
+                if (!addr) return false;
+                llvm::Value* rhs = lowerExpr(*as->value);
+                if (!rhs) return false;
+                if (as->op == ":=") {
+                    builder_.CreateStore(rhs, addr);
                 } else {
-                    // CG9: implicit-`this` field assignment `_f := v`.
-                    llvm::Type* elemTy = nullptr;
-                    if (llvm::Value* addr =
-                            implicitFieldAddr(*as->target, elemTy)) {
-                        if (llvm::Value* v = lowerExpr(*as->value)) {
-                            builder_.CreateStore(v, addr);
-                        }
-                    }
+                    // CG31: compound assignment `target OP= value` — read,
+                    // apply OP (overflow-checked like plain arithmetic),
+                    // write back.
+                    std::string op(as->op);
+                    if (!op.empty() && op.back() == '=') op.pop_back();
+                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    llvm::Value* res = emitCompoundOp(
+                        op, cur, rhs, elemTy->isFloatingPointTy(),
+                        isUnsignedTargetExpr(*as->target));
+                    if (res) builder_.CreateStore(res, addr);
+                }
+            }
+            return false;
+        }
+        // CG31: `x++` / `x--` — overflow-checked increment/decrement.
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+            if (inc->target) {
+                llvm::Type* elemTy = nullptr;
+                llvm::Value* addr = lvalueAddr(*inc->target, elemTy);
+                if (addr) {
+                    bool fp = elemTy->isFloatingPointTy();
+                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    llvm::Value* one =
+                        fp ? llvm::cast<llvm::Value>(
+                                 llvm::ConstantFP::get(elemTy, 1.0))
+                           : llvm::cast<llvm::Value>(
+                                 llvm::ConstantInt::get(elemTy, 1));
+                    llvm::Value* res = emitCompoundOp(
+                        inc->isIncrement ? "+" : "-", cur, one, fp,
+                        isUnsignedTargetExpr(*inc->target));
+                    if (res) builder_.CreateStore(res, addr);
                 }
             }
             return false;
