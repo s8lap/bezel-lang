@@ -1900,6 +1900,10 @@ private:
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
             return lowerNew(*ne);
         }
+        // CG34: object initializer `new C() with f := v, …`.
+        if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+            return lowerWith(*we);
+        }
         // CG19: `is` / `is not` / `as` type tests (§12.7).
         if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
             return lowerTypeTest(*te);
@@ -2165,6 +2169,36 @@ private:
     // its field initializers. (Explicit constructors, ownership-driven
     // disposal/free, and constructor args are later slices; trivial
     // instances currently leak — freed once disposal lowering lands.)
+    // CG34: `source with f := v, …` (§A.7 object initializer on a `new`
+    // expression). Construct the source, then store each named value into
+    // the corresponding instance-storage member (field or auto-property).
+    llvm::Value* lowerWith(const ast::WithExpr& we) {
+        if (!we.source) return nullptr;
+        llvm::Value* obj = lowerExpr(*we.source);
+        if (!obj) return nullptr;
+        auto* rt = ctx_.exprType(*we.source);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+            return obj;
+        const sema::TypeSymbol* t = rt->declaration;
+        llvm::StructType* st = classStruct(t);
+        std::vector<const sema::Symbol*> storage;
+        collectInstanceStorage(t, storage);
+        for (const auto& a : we.assigns) {
+            if (!a.value) continue;
+            const sema::Symbol* m = nullptr;
+            for (const sema::Symbol* s : storage)
+                if (s->name == a.name) { m = s; break; }
+            if (!m) continue;
+            auto idxIt = fieldIndex_.find(m);
+            if (idxIt == fieldIndex_.end()) continue;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) continue;
+            builder_.CreateStore(
+                v, builder_.CreateStructGEP(st, obj, idxIt->second));
+        }
+        return obj;
+    }
+
     llvm::Value* lowerNew(const ast::NewExpr& ne) {
         if (!ne.type) return nullptr;
         sema::TypeRef* rt = ctx_.resolvedType(*ne.type);
