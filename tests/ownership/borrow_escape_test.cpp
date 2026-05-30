@@ -61,3 +61,26 @@ BEZEL_TEST(own_escape, return_bare_local_not_borrow_escape) {
         "end Take;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// A *value-typed* projection of a `using var` (an int field or an
+// int-returning method) is a copy, not a borrow — returning it cannot
+// outlive the source, so it is not a borrow-escape (§28.3 governs
+// borrows). The reference-typed cases above remain diagnosed.
+BEZEL_TEST(own_escape, return_value_field_on_using_var_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class R public V: int := 0; end R; "
+        "class C public method Get(): int "
+        "  using var r := new R(); return r.V; "
+        "end Get; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(own_escape, return_value_method_on_using_var_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class R public V: int := 0; "
+        "  public method Size(): int => V; end R; "
+        "class C public method Get(): int "
+        "  using var r := new R(); return r.Size(); "
+        "end Get; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
