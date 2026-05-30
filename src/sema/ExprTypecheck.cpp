@@ -946,6 +946,38 @@ private:
             if (tt) ctx_.setExprType(&e, tt);
             else if (et) ctx_.setExprType(&e, et);
         }
+        // §17.4: `is` / `is not` yield bool; `as` yields the nullable form
+        // of the target type (a failed cast is null). Recording it lets
+        // `(x as T)` — and member access on its result — resolve.
+        if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+            if (te->op == "is" || te->op == "is not") {
+                ctx_.setExprType(&e,
+                                 ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            } else if (te->op == "as" && te->testType) {
+                if (TypeRef* tt = ctx_.resolvedType(*te->testType)) {
+                    if (tt->nullable) {
+                        ctx_.setExprType(&e, tt);
+                    } else {
+                        TypeRef* nn = ctx_.makeTypeRef(*tt);
+                        nn->nullable = true;
+                        ctx_.setExprType(&e, nn);
+                    }
+                }
+            }
+        }
+        // §19: a `case` expression's type is the common type of its arm
+        // bodies — take the first expression-bodied arm's type. Without it,
+        // member access on a case result (`(case … end).M`) fails to
+        // resolve.
+        if (auto* cse = dynamic_cast<const ast::CaseExpr*>(&e)) {
+            for (const auto& arm : cse->arms) {
+                if (!arm.exprBody) continue;
+                if (TypeRef* at = ctx_.exprType(*arm.exprBody)) {
+                    ctx_.setExprType(&e, at);
+                    break;
+                }
+            }
+        }
         // Slice 3d: MemberAccessExpr resolution. Runs after the target
         // is visited (so its TypeRef is available), looks the member up
         // on the target's TypeSymbol, and annotates the access with the
