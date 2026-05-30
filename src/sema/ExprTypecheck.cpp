@@ -851,8 +851,22 @@ private:
             return;
         }
         // Slice 3 main contract: every literal gets a type.
-        if (dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
-            ctx_.setExprType(&e, ctx_.primitiveTypeRef(PrimitiveType::Int));
+        if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
+            // §5: an integer literal's type comes from its suffix when
+            // present (`L` → long, `u` → uint, `uL`/`Lu` → ulong), else
+            // int. Context (target) typing of unsuffixed literals is a
+            // separate, broader change (tracked in the literal-typing
+            // issue); this covers the explicit-suffix forms.
+            bool hasL = false, hasU = false;
+            for (char c : il->text) {
+                if (c == 'l' || c == 'L') hasL = true;
+                if (c == 'u' || c == 'U') hasU = true;
+            }
+            PrimitiveType pt = PrimitiveType::Int;
+            if (hasL && hasU) pt = PrimitiveType::ULong;
+            else if (hasL) pt = PrimitiveType::Long;
+            else if (hasU) pt = PrimitiveType::UInt;
+            ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
             return;
         }
         if (dynamic_cast<const ast::FloatLiteralExpr*>(&e)) {

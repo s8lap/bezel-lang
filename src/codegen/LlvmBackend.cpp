@@ -256,12 +256,26 @@ private:
     // CG24: a primitive type's LLVM representation. Bool→i1, Float→f32,
     // Double→f64; the integer types are all i32 until CG25 widens them.
     llvm::Type* lowerPrimitive(sema::PrimitiveType p) {
+        using P = sema::PrimitiveType;
         switch (p) {
-            case sema::PrimitiveType::Bool:   return i1();
-            case sema::PrimitiveType::Float:  return llvm::Type::getFloatTy(llvm_);
-            case sema::PrimitiveType::Double: return llvm::Type::getDoubleTy(llvm_);
-            default:                          return i32();
+            case P::Bool:   return i1();
+            case P::Float:  return llvm::Type::getFloatTy(llvm_);
+            case P::Double: return llvm::Type::getDoubleTy(llvm_);
+            // CG25: integer widths (§5). Char is a 32-bit code point.
+            case P::Byte: case P::SByte:   return llvm::Type::getInt8Ty(llvm_);
+            case P::Short: case P::UShort: return llvm::Type::getInt16Ty(llvm_);
+            case P::Long: case P::ULong:   return i64();
+            case P::Int: case P::UInt: case P::Char:
+            default:                       return i32();
         }
+    }
+
+    // CG25: is a Bezel primitive an unsigned integer type? (Drives
+    // zext/udiv/lshr/unsigned-comparison choices.)
+    static bool isUnsignedPrim(sema::PrimitiveType p) {
+        using P = sema::PrimitiveType;
+        return p == P::Byte || p == P::UShort || p == P::UInt ||
+               p == P::ULong || p == P::Char;
     }
 
     // Lower a Bezel type (AST node) to its LLVM representation.
@@ -1656,9 +1670,14 @@ private:
         // CG30: an enum constant (`Color.Green`) is its integer value.
         if (llvm::Value* ev = enumConstant(e)) return ev;
         if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
+            // CG25: the literal's width comes from its resolved type
+            // (e.g. an `L`-suffixed literal is i64).
+            llvm::Type* ty = i32();
+            if (auto* rt = ctx_.exprType(e))
+                if (rt->kind == sema::TypeRef::Kind::Primitive)
+                    ty = lowerPrimitive(rt->primitive);
             return llvm::ConstantInt::get(
-                i32(),
-                static_cast<std::uint64_t>(parseIntLiteral(lit->text)),
+                ty, static_cast<std::uint64_t>(parseIntLiteral(lit->text)),
                 /*isSigned=*/true);
         }
         if (auto* boolLit = dynamic_cast<const ast::BoolLiteralExpr*>(&e)) {
@@ -1801,6 +1820,18 @@ private:
             if (op == "<=") return builder_.CreateFCmpOLE(l, r);
             if (op == ">=") return builder_.CreateFCmpOGE(l, r);
             return nullptr;
+        }
+        // CG25 (§6.2): mixed-width integer operands — widen the narrower to
+        // the wider (sign-extend; the signed types dominate the cases we
+        // lower) so the op and any overflow check run at one width.
+        if (l->getType()->isIntegerTy() && r->getType()->isIntegerTy() &&
+            !l->getType()->isIntegerTy(1) && !r->getType()->isIntegerTy(1) &&
+            l->getType() != r->getType()) {
+            unsigned lw = l->getType()->getIntegerBitWidth();
+            unsigned rw = r->getType()->getIntegerBitWidth();
+            llvm::Type* wide = lw >= rw ? l->getType() : r->getType();
+            if (lw < rw) l = builder_.CreateSExt(l, wide);
+            if (rw < lw) r = builder_.CreateSExt(r, wide);
         }
         // CG22 (§6.1): integer + - * are overflow-checked; / and mod also
         // raise on a zero divisor and on INT_MIN / -1. Applies to integer

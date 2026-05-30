@@ -154,6 +154,7 @@ set(BEZEL_TEST_SOURCES
     codegen/ffi_test.cpp
     codegen/case_expr_test.cpp
     codegen/finally_test.cpp
+    codegen/long_int_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
