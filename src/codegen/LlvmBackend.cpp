@@ -138,6 +138,12 @@ private:
     // CG6: parameter storage, keyed by ParameterSymbol* (params share
     // their owning method as `decl`, so the decl node can't disambiguate).
     std::unordered_map<const sema::Symbol*, llvm::AllocaInst*> paramSlots_;
+    // CG50: a `ref`/`out` parameter — the incoming argument is a pointer to
+    // the caller's storage (not a fresh by-value slot), so reads/writes of
+    // the parameter go through that pointer. Maps the ParameterSymbol to
+    // {address, element type}.
+    std::unordered_map<const sema::Symbol*, std::pair<llvm::Value*, llvm::Type*>>
+        refParams_;
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
@@ -268,6 +274,13 @@ private:
         llvm::BasicBlock& entry = currentFn_->getEntryBlock();
         llvm::IRBuilder<> tmp(&entry, entry.begin());
         return tmp.CreateAlloca(ty);
+    }
+
+    // CG50: a `ref` / `out` parameter is passed by reference (its LLVM type
+    // is a pointer to the value type, and the caller passes an address).
+    static bool isByRefMod(std::string_view m) {
+        return m == "ref" || m == "out" || m == "out var" ||
+               m == "out owned" || m == "out using var";
     }
 
     // Is this member symbol a static method with a lowerable body?
@@ -818,7 +831,9 @@ private:
             std::vector<llvm::Type*> paramTys;
             if (!isStaticMethod(ms)) paramTys.push_back(ptrTy());  // this
             for (const auto& p : *ci.params) {
-                paramTys.push_back(lowerType(p.type.get()));
+                paramTys.push_back(isByRefMod(p.modifier)
+                                       ? ptrTy()  // CG50: ref/out by reference
+                                       : lowerType(p.type.get()));
             }
             auto* fnType = llvm::FunctionType::get(retTy, paramTys,
                                                    /*isVarArg=*/false);
@@ -1288,6 +1303,7 @@ private:
         currentThis_ = &*fn->args().begin();
         locals_.clear();
         paramSlots_.clear();
+        refParams_.clear();
         disposeStack_.clear();
         loopStack_.clear();
         propagateBB_ = nullptr;
@@ -1457,6 +1473,7 @@ private:
         currentThis_ = nullptr;
         locals_.clear();
         paramSlots_.clear();
+        refParams_.clear();
         disposeStack_.clear();
         loopStack_.clear();
         propagateBB_ = nullptr;
@@ -1499,6 +1516,7 @@ private:
         currentThis_ = nullptr;
         locals_.clear();
         paramSlots_.clear();
+        refParams_.clear();
         disposeStack_.clear();
         loopStack_.clear();
         propagateBB_ = nullptr;
@@ -1516,6 +1534,7 @@ private:
         currentThis_ = nullptr;
         locals_.clear();
         paramSlots_.clear();
+        refParams_.clear();
         disposeStack_.clear();
         loopStack_.clear();
         propagateBB_ = nullptr;
@@ -1673,11 +1692,21 @@ private:
                 continue;
             }
             first = false;
-            llvm::AllocaInst* slot = entryAlloca(arg.getType());
-            builder_.CreateStore(&arg, slot);
-            if (paramSyms && paramIdx < paramSyms->size() &&
-                (*paramSyms)[paramIdx]) {
-                paramSlots_[(*paramSyms)[paramIdx]] = slot;
+            sema::Symbol* psym =
+                (paramSyms && paramIdx < paramSyms->size())
+                    ? (*paramSyms)[paramIdx]
+                    : nullptr;
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
+            if (ps && isByRefMod(ps->modifier)) {
+                // CG50: a ref/out parameter — the argument is the caller's
+                // storage address; reads/writes go through it.
+                llvm::Type* elemTy =
+                    ps->declType ? lowerType(ps->declType) : i32();
+                refParams_[psym] = {&arg, elemTy};
+            } else {
+                llvm::AllocaInst* slot = entryAlloca(arg.getType());
+                builder_.CreateStore(&arg, slot);
+                if (psym) paramSlots_[psym] = slot;
             }
             ++paramIdx;
         }
@@ -2140,6 +2169,18 @@ private:
     }
 
     // If `e` names a local or parameter, return its storage slot; else null.
+    // CG50: if `e` names a ref/out parameter, return its storage address
+    // (the incoming pointer) and set `elemTy` to the referent type.
+    llvm::Value* refParamAddr(const ast::Expr& e, llvm::Type*& elemTy) {
+        if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) return nullptr;
+        sema::Symbol* sym = ctx_.exprSymbol(e);
+        if (!sym) return nullptr;
+        auto it = refParams_.find(sym);
+        if (it == refParams_.end()) return nullptr;
+        elemTy = it->second.second;
+        return it->second.first;
+    }
+
     llvm::AllocaInst* localSlot(const ast::Expr& e) {
         if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) return nullptr;
         sema::Symbol* sym = ctx_.exprSymbol(e);
@@ -2348,6 +2389,11 @@ private:
             llvm::Type* elemTy = nullptr;
             if (llvm::Value* addr = implicitFieldAddr(e, elemTy)) {
                 return builder_.CreateLoad(elemTy, addr);
+            }
+            // CG50: a ref/out parameter — load through the incoming pointer.
+            llvm::Type* refElem = nullptr;
+            if (llvm::Value* a = refParamAddr(e, refElem)) {
+                return builder_.CreateLoad(refElem, a);
             }
             // CG3: a reference to a local variable loads from its slot.
             if (llvm::AllocaInst* slot = localSlot(e)) {
@@ -2886,8 +2932,6 @@ private:
         std::size_t pos = 0;
         for (const auto& a : args) {
             if (!a.value) return false;
-            llvm::Value* v = lowerExpr(*a.value);
-            if (!v) return false;
             std::size_t idx = params.size();
             if (a.name.empty()) {
                 idx = pos++;
@@ -2896,6 +2940,16 @@ private:
                     if (params[j].name == a.name) { idx = j; break; }
             }
             if (idx >= params.size() || ordered[idx]) return false;
+            // CG50: a ref/out parameter receives the address of its argument
+            // lvalue; an ordinary parameter receives the argument's value.
+            llvm::Value* v;
+            if (isByRefMod(params[idx].modifier)) {
+                llvm::Type* et = nullptr;
+                v = lvalueAddr(*a.value, et);
+            } else {
+                v = lowerExpr(*a.value);
+            }
+            if (!v) return false;
             ordered[idx] = v;
         }
         for (std::size_t j = 0; j < params.size(); ++j) {
@@ -3091,7 +3145,10 @@ private:
         std::vector<llvm::Type*> paramTys;
         if (!isStaticMethod(const_cast<sema::MethodSymbol*>(ms)))
             paramTys.push_back(ptrTy());
-        for (const auto& p : md->params) paramTys.push_back(lowerType(p.type.get()));
+        for (const auto& p : md->params)
+            paramTys.push_back(isByRefMod(p.modifier)
+                                   ? ptrTy()  // CG50: ref/out by reference
+                                   : lowerType(p.type.get()));
         return llvm::FunctionType::get(retTy, paramTys, /*isVarArg=*/false);
     }
 
