@@ -1519,7 +1519,14 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
         } else {
             const int nextMin =
                 isRightAssociative(opText) ? prec : prec + 1;
-            auto right = parseBinaryExpression(nextMin);
+            // §17.12: a `throw` expression has the bottom type and is valid
+            // in *any* expression position — including a binary right
+            // operand, most idiomatically `x ?? throw new E(...)` (spec
+            // §A.7 example). The precedence climber does not descend to the
+            // ThrowExpr level (A.7's grammar is informal; §17.12 governs),
+            // so parse a leading `throw` as a full expression here.
+            auto right = isKeyword("throw") ? parseExpressionImpl()
+                                            : parseBinaryExpression(nextMin);
             auto bin = std::make_unique<ast::BinaryExpr>();
             bin->op = opText;
             bin->left = std::move(left);
