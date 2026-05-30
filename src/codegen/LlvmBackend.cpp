@@ -541,16 +541,24 @@ private:
     // caller falls through to the normal store path) when `target` is not a
     // block-setter property.
     bool lowerPropertySet(const ast::Expr& target, const ast::Expr& value) {
+        if (!computedSetterOf(target)) return false;
+        llvm::Value* v = lowerExpr(value);
+        return v ? lowerPropertySetValue(target, v) : false;
+    }
+
+    // §22.9: run a block-form property setter with an already-lowered value
+    // `v` (the `value` parameter). Shared by the plain `obj.P := …` path and
+    // the compound-assignment read-modify-write path. Returns false when
+    // `target` is not a block-setter property.
+    bool lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
         const ast::PropertyAccessor* setter = computedSetterOf(target);
-        if (!setter) return false;
+        if (!setter || !v) return false;
         auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         llvm::Value* recv = currentThis_;
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target))
             recv = ma->target ? lowerExpr(*ma->target) : currentThis_;
         if (!recv) return false;
-        llvm::Value* v = lowerExpr(value);
-        if (!v) return false;
         // Bind `value` — sema anchored its symbol's decl on the PropertyDecl.
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
@@ -564,6 +572,27 @@ private:
             lowerScopedBlock(setter->stmts);
         currentThis_ = savedThis;
         return true;
+    }
+
+    // §22.9: compound assignment `obj.P OP= rhs` on a block-form property —
+    // a read-modify-write: read the current value through the getter, apply
+    // OP (overflow-checked, as for any compound assignment), then run the
+    // setter with the result. Returns false when `target` is not a
+    // block-setter property (so the caller uses the normal lvalue path).
+    // NOTE: the receiver is currently lowered once for the getter read and
+    // again for the setter write; this is observable only for receivers with
+    // side effects, which are not expressible as assignment targets here.
+    bool lowerPropertyCompound(const ast::AssignmentStmt& as) {
+        if (!computedSetterOf(*as.target)) return false;
+        llvm::Value* cur = lowerExpr(*as.target);   // getter read (CG33c)
+        llvm::Value* rhs = lowerExpr(*as.value);
+        if (!cur || !rhs) return false;
+        std::string op(as.op);
+        if (!op.empty() && op.back() == '=') op.pop_back();
+        llvm::Value* res = emitCompoundOp(
+            op, cur, rhs, cur->getType()->isFloatingPointTy(),
+            isUnsignedTargetExpr(*as.target));
+        return res ? lowerPropertySetValue(*as.target, res) : false;
     }
 
     // The LLVM type backing an instance-storage member (field or
@@ -1858,12 +1887,15 @@ private:
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
             if (as->target && as->value) {
-                // §22.9: `obj.P := v` where P is a block-form property runs
-                // its setter body (with `value` = v). Compound assignment on
-                // such a property is deferred.
-                if (as->op == ":=" &&
-                    lowerPropertySet(*as->target, *as->value))
+                // §22.9: `obj.P := v` / `obj.P OP= v` where P is a block-form
+                // property runs its setter body (with `value` = v); compound
+                // assignment is a read-modify-write through getter + setter.
+                if (as->op == ":=") {
+                    if (lowerPropertySet(*as->target, *as->value))
+                        return false;
+                } else if (lowerPropertyCompound(*as)) {
                     return false;
+                }
                 llvm::Type* elemTy = nullptr;
                 llvm::Value* addr = lvalueAddr(*as->target, elemTy);
                 if (!addr) return false;
