@@ -2784,30 +2784,38 @@ private:
     // expression). Construct the source, then store each named value into
     // the corresponding instance-storage member (field or auto-property).
     llvm::Value* lowerWith(const ast::WithExpr& we) {
+        // CG29c (§9.5): `r with name := v, ... end` — a non-destructive copy
+        // of the record value `r` with the named fields replaced. The source
+        // is left unchanged.
         if (!we.source) return nullptr;
-        llvm::Value* obj = lowerExpr(*we.source);
-        if (!obj) return nullptr;
+        llvm::Value* src = lowerExpr(*we.source);
+        if (!src) return nullptr;
         auto* rt = ctx_.exprType(*we.source);
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
-            return obj;
+            return src;
         const sema::TypeSymbol* t = rt->declaration;
-        llvm::StructType* st = classStruct(t);
+        llvm::StructType* st = recordStruct(t);
+        // Spill the source struct value to a fresh stack slot (the copy), so
+        // the field GEPs have a pointer to index and the original value is not
+        // mutated; overwrite the named fields, then reload the result by value.
+        llvm::Value* slot = entryAlloca(st);
+        builder_.CreateStore(src, slot);
         std::vector<const sema::Symbol*> storage;
         collectInstanceStorage(t, storage);
         for (const auto& a : we.assigns) {
             if (!a.value) continue;
             const sema::Symbol* m = nullptr;
-            for (const sema::Symbol* s : storage)
-                if (s->name == a.name) { m = s; break; }
+            for (const sema::Symbol* fs : storage)
+                if (fs->name == a.name) { m = fs; break; }
             if (!m) continue;
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) continue;
             builder_.CreateStore(
-                v, builder_.CreateStructGEP(st, obj, idxIt->second));
+                v, builder_.CreateStructGEP(st, slot, idxIt->second));
         }
-        return obj;
+        return builder_.CreateLoad(st, slot);
     }
 
     llvm::Value* lowerNew(const ast::NewExpr& ne) {
