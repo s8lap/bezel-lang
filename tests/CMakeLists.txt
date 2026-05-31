@@ -185,6 +185,7 @@ set(BEZEL_TEST_SOURCES
     codegen/block_setter_test.cpp
     codegen/ref_out_params_test.cpp
     codegen/record_basics_test.cpp
+    codegen/record_with_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp

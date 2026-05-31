@@ -2784,9 +2784,17 @@ private:
     // expression). Construct the source, then store each named value into
     // the corresponding instance-storage member (field or auto-property).
     llvm::Value* lowerWith(const ast::WithExpr& we) {
-        // CG29c (§9.5): `r with name := v, ... end` — a non-destructive copy
-        // of the record value `r` with the named fields replaced. The source
-        // is left unchanged.
+        // `expr with name := v, ... end` has two forms (§9.5 / §22.11),
+        // distinguished by the source type:
+        //  - Record (value type, §9.5): a *non-destructive copy* — the source
+        //    record is unchanged. The source is a first-class struct value, so
+        //    spill it to a fresh stack slot (the copy), overwrite the named
+        //    fields through that pointer, and reload the result by value. Using
+        //    the struct value directly as a GEP base is malformed (and hung the
+        //    compiler — #254).
+        //  - Class (object initializer block, §22.11): the source is a freshly
+        //    `new`-constructed instance (a pointer); the named members are
+        //    assigned in place and the same pointer is returned.
         if (!we.source) return nullptr;
         llvm::Value* src = lowerExpr(*we.source);
         if (!src) return nullptr;
@@ -2794,28 +2802,35 @@ private:
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
             return src;
         const sema::TypeSymbol* t = rt->declaration;
-        llvm::StructType* st = recordStruct(t);
-        // Spill the source struct value to a fresh stack slot (the copy), so
-        // the field GEPs have a pointer to index and the original value is not
-        // mutated; overwrite the named fields, then reload the result by value.
-        llvm::Value* slot = entryAlloca(st);
-        builder_.CreateStore(src, slot);
+        const bool isRecord = t->kind == ast::TypeDeclKind::Record;
+        // classStruct routes records to recordStruct (no vtable), so this is
+        // the right layout for both forms.
+        llvm::StructType* st = classStruct(t);
+        // The GEP base: a spilled copy for a record, the instance pointer for
+        // a class.
+        llvm::Value* base = src;
+        if (isRecord) {
+            base = entryAlloca(st);
+            builder_.CreateStore(src, base);
+        }
         std::vector<const sema::Symbol*> storage;
         collectInstanceStorage(t, storage);
         for (const auto& a : we.assigns) {
             if (!a.value) continue;
             const sema::Symbol* m = nullptr;
-            for (const sema::Symbol* fs : storage)
-                if (fs->name == a.name) { m = fs; break; }
+            for (const sema::Symbol* s : storage)
+                if (s->name == a.name) { m = s; break; }
             if (!m) continue;
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) continue;
             builder_.CreateStore(
-                v, builder_.CreateStructGEP(st, slot, idxIt->second));
+                v, builder_.CreateStructGEP(st, base, idxIt->second));
         }
-        return builder_.CreateLoad(st, slot);
+        // Record: return the modified copy by value. Class: return the mutated
+        // instance pointer.
+        return isRecord ? builder_.CreateLoad(st, base) : base;
     }
 
     llvm::Value* lowerNew(const ast::NewExpr& ne) {
