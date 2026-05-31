@@ -2817,6 +2817,14 @@ private:
             return nullptr;
         }
         const sema::TypeSymbol* t = rt->declaration;
+
+        // §9 / §9.5: `new Record(args)` builds a value-type struct directly —
+        // no heap allocation, vtable, constructor chain, or disposal. This is
+        // the spec's record construction form (records use `new`, like classes,
+        // but produce a value).
+        if (t->kind == ast::TypeDeclKind::Record)
+            return buildRecordValue(t, ne.args);
+
         llvm::StructType* st = classStruct(t);
 
         // sizeof(st) via the null-GEP / ptrtoint idiom (no DataLayout dep).
@@ -3067,13 +3075,14 @@ private:
         return true;
     }
 
-    // CG29 (§9.1): construct a record value `R(a, b, …)`. Positional
-    // arguments map to the record's fields in declaration order. The value is
-    // materialized in a stack slot and a pointer to it is returned — the
-    // value-as-pointer representation records share with the class machinery.
-    // (Named arguments and defaults for records are a later refinement.)
-    llvm::Value* lowerRecordConstruction(const sema::TypeSymbol* t,
-                                         const ast::CallExpr& call) {
+    // CG29 (§9): build a record value from positional arguments — used by
+    // `new Record(a, b, …)` (the spec construction form, §9.5). Positional
+    // arguments map to the record's fields in declaration order; the value is
+    // materialized in a stack slot and returned by value (records are value
+    // types, no heap allocation). Named arguments and defaults are a later
+    // refinement.
+    llvm::Value* buildRecordValue(const sema::TypeSymbol* t,
+                                  const std::vector<ast::CallArgument>& args) {
         llvm::StructType* st = recordStruct(t);
         llvm::Value* slot = entryAlloca(st);
         std::vector<const sema::Symbol*> fields;
@@ -3081,10 +3090,10 @@ private:
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (fs && !isStaticField(fs)) fields.push_back(fs);
         }
-        if (call.args.size() != fields.size()) return nullptr;
+        if (args.size() != fields.size()) return nullptr;
         for (std::size_t i = 0; i < fields.size(); ++i) {
-            if (!call.args[i].value) return nullptr;
-            llvm::Value* v = lowerExpr(*call.args[i].value);
+            if (!args[i].value) return nullptr;
+            llvm::Value* v = lowerExpr(*args[i].value);
             if (!v) return nullptr;
             auto idxIt = fieldIndex_.find(fields[i]);
             if (idxIt == fieldIndex_.end()) return nullptr;
@@ -3113,11 +3122,9 @@ private:
         if (auto* ets = dynamic_cast<sema::TypeSymbol*>(calleeSym)) {
             if (ets->kind == ast::TypeDeclKind::Enum)
                 return lowerEnumCast(call);
-            // CG29 (§9.1): record construction `Point(3, 4)` — the callee is
-            // a record type name. Build the value on the stack and return a
-            // pointer to it (the value-as-pointer representation).
-            if (ets->kind == ast::TypeDeclKind::Record)
-                return lowerRecordConstruction(ets, call);
+            // §9.5: records are constructed with `new Record(...)` (handled in
+            // lowerNew), not call-style `Record(...)`. A bare call on a record
+            // type name is not construction and is rejected in sema.
         }
         // CG26: a call to an extern (FFI) function — direct C-ABI call to
         // the external declaration. (Native functions don't set the
