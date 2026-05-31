@@ -1172,6 +1172,19 @@ private:
                 ctx_.setExprType(&ce, et);
                 return;
             }
+            // §9.5: records (like classes) are constructed with `new`, not by
+            // calling the type name. A bare `Record(...)` is not a valid
+            // expression — reject it with a fix-it rather than leaving the
+            // call untyped (which would silently miscompile downstream).
+            if (ts->kind == ast::TypeDeclKind::Record ||
+                ts->kind == ast::TypeDeclKind::Class) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "`" + std::string(ts->name) +
+                        "` is constructed with `new " + std::string(ts->name) +
+                        "(...)`, not by calling the type name (§9.5)");
+                return;
+            }
         }
         // §22.6: arity-based overload resolution. The callee resolved to one
         // method of its name; when that one's parameter count doesn't match
