@@ -197,8 +197,22 @@ private:
     // Categorize the initializer expression to determine the local's
     // initial ownership state (slice O1 producer table — minimal).
     OwnershipState producerState(const ast::Expr& e) {
-        // `new T(...)` is the canonical producer of Owned values.
-        if (dynamic_cast<const ast::NewExpr*>(&e)) {
+        // `new T(...)` is the canonical producer of Owned values — but only
+        // for reference types (classes). §9: a record is a value type with
+        // no disposal obligation (§9.7 forbids record destructors and owned
+        // fields), so `new Record(...)` yields a plain value, not an owned
+        // resource. (Enums and other value kinds likewise.)
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+            if (ne->type) {
+                if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                    if (rt->kind == sema::TypeRef::Kind::Named &&
+                        rt->declaration &&
+                        rt->declaration->kind != ast::TypeDeclKind::Class &&
+                        rt->declaration->kind != ast::TypeDeclKind::Interface) {
+                        return OwnershipState::Borrowed;  // value type: no obligation
+                    }
+                }
+            }
             return OwnershipState::Owned;
         }
         // `null` is the polymorphic-null state (§28.3 null-literal row).

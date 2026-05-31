@@ -27,7 +27,7 @@ BEZEL_TEST(codegen_cg29, construct_and_read_positional_field) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
-        "  var p := Point(3, 4); return p.x * 10 + p.y; "
+        "  var p := new Point(3, 4); return p.x * 10 + p.y;"
         "end Main; end C;"), 34);
 }
 
@@ -39,7 +39,7 @@ BEZEL_TEST(codegen_cg29, record_passed_to_method) {
         "class C "
         "  public static method Sum(p: Point): int => p.x + p.y; "
         "  public static method Main(): int "
-        "    var p := Point(5, 7); return Sum(p); "
+        "    var p := new Point(5, 7); return Sum(p);"
         "  end Main; "
         "end C;"), 12);
 }
@@ -49,7 +49,7 @@ BEZEL_TEST(codegen_cg29, record_returned_from_method) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Point(x: int, y: int); "
         "class C "
-        "  public static method Make(): Point => Point(2, 9); "
+        "  public static method Make(): Point => new Point(2, 9);"
         "  public static method Main(): int "
         "    var p := Make(); return p.x + p.y; "
         "  end Main; "
@@ -65,7 +65,7 @@ BEZEL_TEST(codegen_cg29, record_body_method_reads_field) {
         "  public method Len2(): int => dx * dx + dy * dy; "
         "end Vec; "
         "class C public static method Main(): int "
-        "  var v := Vec(3, 4); return v.Len2(); "
+        "  var v := new Vec(3, 4); return v.Len2();"
         "end Main; end C;"), 25);
 }
 
@@ -74,7 +74,7 @@ BEZEL_TEST(codegen_cg29, three_field_record) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Triple(a: int, b: int, c: int); "
         "class C public static method Main(): int "
-        "  var t := Triple(1, 2, 3); return t.a * 100 + t.b * 10 + t.c; "
+        "  var t := new Triple(1, 2, 3); return t.a * 100 + t.b * 10 + t.c;"
         "end Main; end C;"), 123);
 }
 
@@ -83,6 +83,6 @@ BEZEL_TEST(codegen_cg29, record_local_reassigned) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
-        "  var p := Point(1, 1); p := Point(8, 9); return p.x * 10 + p.y; "
+        "  var p := new Point(1, 1); p := new Point(8, 9); return p.x * 10 + p.y;"
         "end Main; end C;"), 89);
 }

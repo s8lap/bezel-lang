@@ -1159,13 +1159,13 @@ private:
             }
         }
         Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
-        // §5.4 / §9.1: a call whose callee is a type name. An enum cast
-        // `E(i)` and a record construction `R(a, b)` both produce a value of
-        // that named type. Typing the call lets `var x := E(i)` / `var p :=
-        // R(...)` infer the local's type so subsequent member access resolves.
+        // §5.4: an enum cast `E(i)` — the callee is an enum type name; the
+        // call produces a value of that enum type. (Records are NOT
+        // call-constructible: per §9.5 a record is built with `new Record(...)`
+        // like a class, so a bare `Record(...)` call is not construction and is
+        // left untyped here — it surfaces as an error at the use site.)
         if (auto* ts = dynamic_cast<TypeSymbol*>(calleeSym)) {
-            if (ts->kind == ast::TypeDeclKind::Enum ||
-                ts->kind == ast::TypeDeclKind::Record) {
+            if (ts->kind == ast::TypeDeclKind::Enum) {
                 TypeRef* et = ctx_.makeTypeRef();
                 et->kind = TypeRef::Kind::Named;
                 et->declaration = ts;
