@@ -1738,6 +1738,11 @@ private:
                 if (auto* rt = ctx_.resolvedType(*fd->type)) {
                     ctx_.setExprType(&ma, rt);
                 }
+            } else if (fs->posParam && fs->posParam->type) {
+                // §9: positional record field — type comes from the Param.
+                if (auto* rt = ctx_.resolvedType(*fs->posParam->type)) {
+                    ctx_.setExprType(&ma, rt);
+                }
             }
         } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);

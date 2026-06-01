@@ -3104,11 +3104,24 @@ private:
                     auto* rt = ctx_.exprType(*part.expr);
                     if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
                         pv = emitPrimitiveToString(ev, rt->primitive);
-                    } else {
-                        // For non-primitive types, defer to the string identity
-                        // or a future Object.ToString() slot. For now, if the
-                        // value is already ptr-typed (string), use as-is.
-                        pv = ev;  // best effort
+                    } else if (!rt || rt->kind != sema::TypeRef::Kind::Primitive) {
+                        // Type not set or not primitive — infer from LLVM type.
+                        using P = sema::PrimitiveType;
+                        auto* llvmTy = ev->getType();
+                        if (llvmTy->isIntegerTy(1))
+                            pv = emitPrimitiveToString(ev, P::Bool);
+                        else if (llvmTy->isIntegerTy(8) || llvmTy->isIntegerTy(16) ||
+                                 llvmTy->isIntegerTy(32))
+                            pv = emitPrimitiveToString(ev, P::Int);
+                        else if (llvmTy->isIntegerTy(64))
+                            pv = emitPrimitiveToString(ev, P::Long);
+                        else if (llvmTy->isDoubleTy())
+                            pv = emitPrimitiveToString(ev, P::Double);
+                        else if (llvmTy->isFloatTy())
+                            pv = emitPrimitiveToString(ev, P::Float);
+                        else if (llvmTy->isPointerTy())
+                            pv = ev;  // string or class — use as-is
+                        // else: struct (record value) etc. — skip
                     }
                 }
                 if (pv) acc = emitStringConcat(acc, pv);
