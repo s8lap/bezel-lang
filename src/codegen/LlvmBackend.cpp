@@ -6002,13 +6002,14 @@ private:
                     llvm::Value* isNegInf = builder_.CreateFCmpOEQ(arg, negInf);
                     return builder_.CreateOr(isPosInf, isNegInf, "isinf");
                 }
-                if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round") {
+                if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round" || m == "Truncate") {
                     // Use llvm intrinsics for common math ops.
                     llvm::Intrinsic::ID iid =
-                        m == "Sqrt"    ? llvm::Intrinsic::sqrt :
-                        m == "Floor"   ? llvm::Intrinsic::floor :
-                        m == "Ceiling" ? llvm::Intrinsic::ceil :
-                                         llvm::Intrinsic::round;
+                        m == "Sqrt"     ? llvm::Intrinsic::sqrt :
+                        m == "Floor"    ? llvm::Intrinsic::floor :
+                        m == "Ceiling"  ? llvm::Intrinsic::ceil :
+                        m == "Truncate" ? llvm::Intrinsic::trunc :
+                                          llvm::Intrinsic::round;
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
                     if (!arg->getType()->isDoubleTy())
                         arg = builder_.CreateSIToFP(arg, dbl);
