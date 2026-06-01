@@ -180,3 +180,41 @@ BEZEL_TEST(codegen_cg60, closure_in_loop) {
         "  end Main; "
         "end C;"), 18);
 }
+
+// ── Method references ────────────────────────────────────────────────────────
+// §17.14: A named method can be used as a function value by naming it
+// without calling it. The compiler creates a closure struct wrapping a
+// thunk function.
+
+BEZEL_TEST(codegen_cg60, static_method_reference) {
+    // Static method reference passed directly.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class H "
+        "  public static method Square(x: int): int => x * x; "
+        "end H; "
+        "class C "
+        "  public static method Apply(f: (int) -> int, n: int): int "
+        "    return f(n); "
+        "  end Apply; "
+        "  public static method Main(): int "
+        "    return Apply(H.Square, 5); "
+        "  end Main; "
+        "end C;"), 25);
+}
+
+BEZEL_TEST(codegen_cg60, method_reference_stored_in_local) {
+    // Method reference stored in a local, then called.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class H "
+        "  public static method Negate(x: int): int => -x; "
+        "end H; "
+        "class C "
+        "  public static method Apply(f: (int) -> int, n: int): int "
+        "    return f(n); "
+        "  end Apply; "
+        "  public static method Main(): int "
+        "    var neg := H.Negate; "
+        "    return Apply(neg, 7); "
+        "  end Main; "
+        "end C;"), -7);
+}

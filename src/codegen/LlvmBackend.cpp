@@ -4780,8 +4780,121 @@ private:
             if (llvm::AllocaInst* slot = localSlot(e)) {
                 return builder_.CreateLoad(slot->getAllocatedType(), slot);
             }
+            // CG60: a bare identifier resolving to a static method —
+            // produce a closure struct { thunk_ptr, null_env } so it can
+            // be passed as a function-typed value (§A.7 / §17.14).
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
+                if (isStaticMethod(ms)) return makeMethodThunk(ms, nullptr);
+            }
+        }
+        // CG60: `Class.StaticMethod` or `obj.InstanceMethod` used as a
+        // value (not called). Produce a closure struct for it.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
+                llvm::Value* recv = nullptr;
+                if (!isStaticMethod(ms) && ma->target)
+                    recv = lowerExpr(*ma->target);
+                return makeMethodThunk(ms, recv);
+            }
         }
         return nullptr;
+    }
+
+    // CG60: produce a closure struct { thunk_fn, env } for a method
+    // reference. For static methods: env = null, thunk ignores env.
+    // For instance methods: env = heap-copy of receiver ptr, thunk
+    // loads receiver from env.
+    // The thunk has calling convention (ptr env, params...) -> ret.
+    llvm::Value* makeMethodThunk(sema::MethodSymbol* ms,
+                                 llvm::Value* receiverVal) {
+        auto it = methodFns_.find(ms);
+        if (it == methodFns_.end()) return nullptr;
+        llvm::Function* origFn = it->second;
+
+        // Build the thunk's parameter types: (ptr env, user_params...).
+        std::vector<llvm::Type*> thunkParamTys;
+        thunkParamTys.push_back(ptrTy());  // env_ptr
+        // Skip the leading `this` arg for instance methods
+        // (it comes from env instead).
+        bool instMethod = !isStaticMethod(ms);
+        for (std::size_t i = (instMethod ? 1 : 0);
+             i < origFn->arg_size(); ++i)
+            thunkParamTys.push_back(origFn->getArg(i)->getType());
+        llvm::Type* retTy = origFn->getReturnType();
+        auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
+
+        // Create thunk function.
+        static std::atomic<unsigned> thunkCtr{0};
+        std::string thunkName = "thunk$" + std::to_string(thunkCtr.fetch_add(1));
+        auto* thunk = llvm::Function::Create(
+            thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
+
+        // Save emitter state.
+        llvm::Function* savedFn = currentFn_;
+        llvm::Value* savedThis = currentThis_;
+        llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+        auto savedLocals = locals_;
+        auto savedParams = paramSlots_;
+        auto savedRefParams = refParams_;
+        auto savedDisposeStack = disposeStack_;
+        auto savedLoopStack = loopStack_;
+        llvm::BasicBlock* savedUnwind = unwindTarget_;
+        llvm::BasicBlock* savedProp = propagateBB_;
+        llvm::Value* savedCaught = currentCaughtExc_;
+        std::size_t savedUnwindDepth = unwindScopeDepth_;
+        bool savedDiverged = diverged_;
+
+        currentFn_ = thunk;
+        currentThis_ = nullptr;
+        locals_.clear(); paramSlots_.clear(); refParams_.clear();
+        disposeStack_.clear(); loopStack_.clear();
+        unwindTarget_ = nullptr; propagateBB_ = nullptr;
+        currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
+        builder_.SetInsertPoint(
+            llvm::BasicBlock::Create(llvm_, "entry", thunk));
+
+        // Build call args to the original function.
+        std::vector<llvm::Value*> callArgs;
+        auto argIt = thunk->args().begin();
+        llvm::Value* envPtrArg = &*argIt++;  // env_ptr (arg 0)
+        if (instMethod) {
+            // Load receiver from env: env_ptr → load ptr.
+            callArgs.push_back(builder_.CreateLoad(ptrTy(), envPtrArg));
+        }
+        for (; argIt != thunk->args().end(); ++argIt)
+            callArgs.push_back(&*argIt);
+
+        llvm::Value* result = builder_.CreateCall(origFn, callArgs);
+        if (retTy->isVoidTy()) builder_.CreateRetVoid();
+        else builder_.CreateRet(result);
+
+        // Restore emitter state.
+        currentFn_ = savedFn;
+        currentThis_ = savedThis;
+        locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
+        refParams_ = std::move(savedRefParams);
+        disposeStack_ = std::move(savedDisposeStack);
+        loopStack_ = std::move(savedLoopStack);
+        unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
+        currentCaughtExc_ = savedCaught; unwindScopeDepth_ = savedUnwindDepth;
+        diverged_ = savedDiverged;
+        if (savedBB) builder_.SetInsertPoint(savedBB);
+
+        // Build closure struct { thunk_ptr, env_ptr }.
+        llvm::Value* closureObj = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
+        builder_.CreateStore(thunk, closureObj);
+        // For instance methods: store a copy of the receiver in env.
+        llvm::Value* envObj = llvm::ConstantPointerNull::get(ptrTy());
+        if (instMethod && receiverVal) {
+            envObj = builder_.CreateCall(
+                callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+            builder_.CreateStore(receiverVal, envObj);
+        }
+        builder_.CreateStore(
+            envObj,
+            builder_.CreateGEP(ptrTy(), closureObj, {builder_.getInt32(1)}));
+        return closureObj;
     }
 
     // CG9: address of an implicitly-`this`-qualified instance field
