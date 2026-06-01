@@ -606,9 +606,9 @@ private:
                 fmt = "%d"; break;
             case P::Float:
                 printVal = builder_.CreateFPExt(val, llvm::Type::getDoubleTy(llvm_));
-                fmt = "%g"; break;
+                fmt = "%.7g"; break;  // 7 significant digits for float (f32)
             case P::Double:
-                fmt = "%g"; break;
+                fmt = "%.15g"; break;  // 15 significant digits for double (f64)
             case P::Char:
                 // Char is i32 code point → print as character
                 fmt = "%lc"; break;
