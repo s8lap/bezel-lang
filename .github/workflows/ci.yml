@@ -10,14 +10,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install toolchain
-        # clang/LLVM per CLAUDE.md's "Build toolchain" section. (The reference
-        # toolchain is Fedora's; this runner installs the equivalent clang via
-        # apt. Revisit when codegen starts linking LLVM and version parity with
-        # Fedora's LLVM matters.)
-        run: sudo apt-get update && sudo apt-get install -y cmake clang llvm ninja-build
+      - name: Install LLVM 21 toolchain
+        # Per CLAUDE.md, the reference toolchain is clang++ + LLVM 21
+        # (Fedora's system package). Ubuntu's default `llvm` package is
+        # LLVM 18, which lacks API renames the codegen depends on
+        # (`Intrinsic::getOrInsertDeclaration` and the `Triple`-typed
+        # `setTargetTriple` / `createTargetMachine` overloads). We install
+        # LLVM 21 from apt.llvm.org so CI matches the reference version.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build wget
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBEZEL_WERROR=ON -DCMAKE_BUILD_TYPE=Debug
+        # `-DLLVM_DIR=...` is the documented override in the root
+        # CMakeLists.txt for selecting a specific LLVM install — required
+        # here because the unversioned `llvm-config` on this runner still
+        # resolves to LLVM 18.
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=clang-21 \
+            -DCMAKE_CXX_COMPILER=clang++-21 \
+            -DLLVM_DIR="$(llvm-config-21 --cmakedir)" \
+            -DBEZEL_WERROR=ON \
+            -DCMAKE_BUILD_TYPE=Debug
       - name: Build
         run: cmake --build build
       - name: Test
