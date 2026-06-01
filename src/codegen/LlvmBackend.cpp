@@ -5608,7 +5608,16 @@ private:
             if (isStr(bin.left.get()) && !eitherNull) {
                 if (op == "=") return emitStringEq(l, r);
                 if (op == "<>") return builder_.CreateNot(emitStringEq(l, r));
-                if (op == "+") return emitStringConcat(l, r);
+                if (op == "+") {
+                    // §4.6: string + T — if the right operand is not a string
+                    // (e.g. char), convert it via emitPrimitiveToString first.
+                    llvm::Value* rStr = r;
+                    auto* rt = ctx_.exprType(*bin.right);
+                    if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                        rt->primitive != sema::PrimitiveType::String)
+                        rStr = emitPrimitiveToString(r, rt->primitive);
+                    return emitStringConcat(l, rStr);
+                }
                 // CG27b (§4.6): ordinal comparison operators.
                 if (op == "<" || op == ">" || op == "<=" || op == ">=") {
                     llvm::Value* cmp = emitStringOrdCmp(l, r);
