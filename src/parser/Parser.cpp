@@ -3091,8 +3091,22 @@ std::vector<ast::Param> Parser::parseParamList() {
             p.modifier = "owned";
         }
         if (current_.kind != TokenKind::Identifier) {
-            diagnostics_.report(Severity::Error, current_.location,
-                                "expected parameter name");
+            // Recovery: if a keyword was used as a parameter name, accept
+            // it (with a diagnostic) and advance. This prevents an infinite
+            // loop in error recovery. Note: `base`, `this`, and other
+            // keywords are not legal parameter names per Appendix B.1.
+            if (current_.kind == TokenKind::Keyword) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    std::string("reserved keyword `") +
+                    std::string(current_.text) +
+                    "` cannot be used as a parameter name");
+                p.name = current_.text;
+                advance();
+            } else {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected parameter name");
+            }
         } else {
             p.name = current_.text;
             advance();
