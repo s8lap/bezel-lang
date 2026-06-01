@@ -155,3 +155,20 @@ BEZEL_TEST(codegen_generic, generic_size_after_layout_change) {
         "  return s.Size(); "   // 3
         "end Main; end C;"), 3);
 }
+
+// ── Array assignment with side effects ───────────────────────────────────
+
+BEZEL_TEST(codegen_generic, array_elem_assign_rhs_evaluated_once) {
+    // §22.10: `arr[i] := expr` must evaluate `expr` exactly once.
+    // Bug: the RHS was evaluated twice — once in the failed indexerSet
+    // attempt and again in the plain lvalue path.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  private static _n: int := 0; "
+        "  private static method Next(): int _n := _n + 1; return _n; end Next; "
+        "  public static method Main(): int "
+        "    var arr: [5]int; "
+        "    for var i in 0..4 do arr[i] := Next(); end; "
+        "    return _n; "   // should be 5, not 10
+        "end Main; end C;"), 5);
+}
