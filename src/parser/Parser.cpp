@@ -536,6 +536,18 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                 "end label does not match the declared type name");
         }
         advance();
+        // §14: `end TypeName<T>;` — skip generic params in the end label so
+        // that generic class declarations can label their end consistently.
+        if (isPunctuator("<")) {
+            advance();  // skip `<`
+            int depth = 1;
+            while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
+                if (isPunctuator("<")) depth++;
+                else if (isPunctuator(">")) { depth--; if (depth == 0) break; }
+                advance();
+            }
+            if (isPunctuator(">")) advance();  // consume final `>`
+        }
     }
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
