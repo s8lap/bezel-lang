@@ -254,3 +254,28 @@ BEZEL_TEST(codegen_cg60, block_body_lambda_with_for_and_capture) {
         "    return result; "
         "  end Main; end C;"), 2);
 }
+
+// ── Curried functions and nested lambdas ─────────────────────────────────
+BEZEL_TEST(codegen_cg60, curried_add) {
+    // `(a) => (b) => a + b` — outer returns inner closure.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var adder := (x: int) => (y: int) => x + y; "
+        "    var add5 := adder(5); "
+        "    return add5(3); "
+        "  end Main; end C;"), 8);
+}
+
+BEZEL_TEST(codegen_cg60, array_element_call) {
+    // Calling a closure stored in an inline array element: `handlers[i]()`.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var fns: [3](int) -> int; "
+        "    fns[0] := (x: int) => x + 1; "
+        "    fns[1] := (x: int) => x * 2; "
+        "    fns[2] := (x: int) => x - 1; "
+        "    return fns[0](3) + fns[1](4) + fns[2](5); "
+        "  end Main; end C;"), 16);
+}
