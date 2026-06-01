@@ -102,6 +102,7 @@ set(BEZEL_TEST_SOURCES
     sema/record_restrictions_test.cpp
     sema/builtin_types_test.cpp
     sema/builtin_exceptions_test.cpp
+    sema/string_member_diagnostic_test.cpp
     sema/break_continue_test.cpp
     sema/bare_throw_test.cpp
     sema/primitive_assignability_test.cpp
