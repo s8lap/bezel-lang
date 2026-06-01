@@ -7268,6 +7268,18 @@ private:
                     llvm::Value* isNegInf = builder_.CreateFCmpOEQ(arg, negInf);
                     return builder_.CreateOr(isPosInf, isNegInf, "isinf");
                 }
+                if (m == "Cbrt") {
+                    // Math.Cbrt(x): double — cube root via libc cbrt().
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!arg->getType()->isDoubleTy())
+                        arg = builder_.CreateSIToFP(arg, dbl);
+                    auto* cbrtFn = module_->getFunction("cbrt");
+                    if (!cbrtFn) {
+                        auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
+                        cbrtFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "cbrt", module_.get());
+                    }
+                    return builder_.CreateCall(cbrtFn, {arg}, "cbrt.result");
+                }
                 if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round" || m == "Truncate") {
                     // Use llvm intrinsics for common math ops.
                     llvm::Intrinsic::ID iid =
