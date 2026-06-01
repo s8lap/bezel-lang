@@ -1668,7 +1668,8 @@ private:
                             ma.member == "TrimEnd" || ma.member == "ToLower" ||
                             ma.member == "ToUpper" || ma.member == "Replace" ||
                             ma.member == "PadLeft" || ma.member == "PadRight" ||
-                            ma.member == "Repeat") {
+                            ma.member == "Repeat" ||
+                            ma.member == "GetField") {
                             ctx_.setExprType(
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                             return;
