@@ -2286,13 +2286,14 @@ private:
                     std::string_view lastName = dp->typeName->parts.empty()
                         ? std::string_view{}
                         : dp->typeName->parts.back();
-                    if (ctx_.module()) {
-                        for (Symbol* child : ctx_.module()->children) {
-                            if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
-                                if (ts->name == lastName &&
-                                    ts->kind == ast::TypeDeclKind::Record) {
-                                    recTy = ts; break;
-                                }
+                    // Search ctx_.symbols() for the record TypeSymbol by name.
+                    // This is more robust than searching only module children
+                    // since symbols may be nested or added during synthesis.
+                    for (const auto& sym : ctx_.symbols()) {
+                        if (auto* ts = dynamic_cast<TypeSymbol*>(sym.get())) {
+                            if (ts->name == lastName &&
+                                ts->kind == ast::TypeDeclKind::Record) {
+                                recTy = ts; break;
                             }
                         }
                     }

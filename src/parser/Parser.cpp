@@ -2086,7 +2086,7 @@ ast::Param Parser::parseLambdaParam() {
 
 // ===== Slice 38: patterns and case expressions (§A.7) =====================
 
-std::unique_ptr<ast::Pattern> Parser::parsePattern() {
+std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
     // `_` discard. `_` is an Identifier per the lexer.
     if (current_.kind == TokenKind::Identifier && current_.text == "_") {
         advance();
@@ -2193,9 +2193,15 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern() {
     }
     auto cp = std::make_unique<ast::ConstantPattern>();
     cp->constants.push_back(std::move(e));
-    while (isPunctuator(",") && isConstantStart(peekAt(1))) {
-        advance(); // past `,`
-        cp->constants.push_back(parseConstantExpr());
+    // §A.7: ConstantPattern alternatives (`,` list) are only valid at the
+    // case-arm level, NOT inside DestructuringPattern sub-patterns — the `,`
+    // there is the sub-pattern separator. Suppress the alternatives loop when
+    // parsing a positional sub-pattern (inPositional=true).
+    if (!inPositional) {
+        while (isPunctuator(",") && isConstantStart(peekAt(1))) {
+            advance(); // past `,`
+            cp->constants.push_back(parseConstantExpr());
+        }
     }
     return std::unique_ptr<ast::Pattern>(cp.release());
 }
@@ -2217,7 +2223,7 @@ ast::PositionalPattern Parser::parsePositionalPattern() {
             return pp;
         }
     }
-    pp.pattern = parsePattern();
+    pp.pattern = parsePattern(/*inPositional=*/true);
     return pp;
 }
 

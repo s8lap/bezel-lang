@@ -106,7 +106,9 @@ private:
     // Slice 37: parse one Accessor within a PropertyBody block form.
     ast::PropertyAccessor parsePropertyAccessor();
     // Slice 38: patterns and case expressions (§A.7).
-    std::unique_ptr<ast::Pattern> parsePattern();
+    // inPositional=true suppresses the ConstantPattern `,` alternatives loop
+    // to avoid consuming the sub-pattern separator in DestructuringPatterns.
+    std::unique_ptr<ast::Pattern> parsePattern(bool inPositional = false);
     ast::CaseArm parseCaseArm();
     std::unique_ptr<ast::Expr> parseCaseExpr();
     // The positional sub-pattern of `Name(p1, p2)` destructuring. Mostly
