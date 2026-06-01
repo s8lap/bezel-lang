@@ -2282,6 +2282,13 @@ private:
                     if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(arrSlotTy)) {
                         llvm::Value* idx = lowerExpr(*ix->indices[0].value);
                         if (idx) {
+                            // Bounds check (§15.1): IndexOutOfRangeException.
+                            uint64_t sz = arrTy->getNumElements();
+                            llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
+                                ? idx : builder_.CreateSExt(idx, i64());
+                            llvm::Value* oor = builder_.CreateICmpUGE(
+                                idx64, builder_.getInt64(sz), "arr.wr.oor");
+                            emitGuardThrow(oor, "IndexOutOfRangeException");
                             elemTy = arrTy->getElementType();
                             return builder_.CreateGEP(
                                 arrTy, arrAddr, {builder_.getInt64(0), idx});
@@ -5032,6 +5039,18 @@ private:
             if (!arrTy) return nullptr;
             llvm::Value* idx = lowerExpr(*ix->indices[0].value);
             if (!idx) return nullptr;
+            // §15.1 / §31.2: bounds-check idx against the array's compile-time
+            // size; out-of-range raises IndexOutOfRangeException.
+            {
+                uint64_t sz = arrTy->getNumElements();
+                llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
+                    ? idx : builder_.CreateSExt(idx, i64());
+                llvm::Value* szV = builder_.getInt64(sz);
+                // Raise if idx < 0 (i.e., (uint64)idx >= sz when sign-extended)
+                // OR idx >= sz — use an unsigned comparison covering both.
+                llvm::Value* oor = builder_.CreateICmpUGE(idx64, szV, "arr.oor");
+                emitGuardThrow(oor, "IndexOutOfRangeException");
+            }
             llvm::Value* elemAddr = builder_.CreateGEP(
                 arrTy, addr, {builder_.getInt64(0), idx});
             return builder_.CreateLoad(arrTy->getElementType(), elemAddr);
