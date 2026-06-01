@@ -829,8 +829,41 @@ private:
                                     const std::string& spec,
                                     const sema::TypeRef* rt) {
         if (spec.empty() || !val) return nullptr;
-        // §18.5 alignment specifier `,WIDTH` — deferred; use PadLeft/PadRight.
-        if (spec[0] == ',') return nullptr;
+        // §18.5 alignment specifier `,WIDTH`:
+        // Positive width = right-align, negative = left-align.
+        // First convert value to its default string, then pad with snprintf.
+        if (spec[0] == ',') {
+            int alignWidth = std::atoi(spec.c_str() + 1);
+            bool leftAlign = alignWidth < 0;
+            int w = leftAlign ? -alignWidth : alignWidth;
+            if (w == 0) return nullptr;
+            std::string snpFmt = leftAlign
+                ? ("%-" + std::to_string(w) + "s")
+                : ("%" + std::to_string(w) + "s");
+            // Get the default string repr: convert val to string first.
+            llvm::Value* strVal = nullptr;
+            using P = sema::PrimitiveType;
+            bool isFloat = val->getType()->isDoubleTy() || val->getType()->isFloatTy();
+            bool isInt = val->getType()->isIntegerTy();
+            bool isStr = rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                         rt->primitive == P::String;
+            if (isStr) {
+                strVal = val;  // already a bz_string
+            } else if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
+                strVal = emitPrimitiveToString(val, rt->primitive);
+            } else if (isFloat) {
+                strVal = emitPrimitiveToString(val, P::Double);
+            } else if (isInt) {
+                llvm::Value* iv = val->getType()->isIntegerTy(64) ? val
+                    : builder_.CreateSExt(val, i64());
+                strVal = emitPrimitiveToString(iv, P::Long);
+            }
+            if (!strVal || !strVal->getType()->isPointerTy()) return nullptr;
+            // Extract C string data from bz_string and format with padding.
+            llvm::Value* datPtr = builder_.CreateLoad(
+                ptrTy(), builder_.CreateStructGEP(stringType(), strVal, 0));
+            return emitSnprintfToString(snpFmt, datPtr);
+        }
         char kind = std::toupper(spec[0]);
         int width = (spec.size() > 1) ? std::atoi(spec.c_str() + 1) : -1;
         std::string snprintfFmt;
