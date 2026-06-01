@@ -4344,6 +4344,82 @@ private:
         const auto cls = id->name;
         const auto& m = ma->member;
 
+        // §2.3 Environment class methods.
+        if (cls == "Environment") {
+            // Environment.Exit(code: int) — terminate the process.
+            if (m == "Exit" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* code = lowerExpr(*call.args[0].value);
+                if (!code) return nullptr;
+                // Declare exit(3): void exit(int)
+                auto* exitFn = module_->getFunction("exit");
+                if (!exitFn) {
+                    auto* ft = llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(llvm_), {i32()}, false);
+                    exitFn = llvm::Function::Create(
+                        ft, llvm::Function::ExternalLinkage, "exit", module_.get());
+                    exitFn->addFnAttr(llvm::Attribute::NoReturn);
+                }
+                // Truncate to i32 if needed.
+                if (!code->getType()->isIntegerTy(32))
+                    code = builder_.CreateTrunc(code, i32());
+                builder_.CreateCall(exitFn, {code});
+                // Create an unreachable block after the noreturn call.
+                builder_.CreateUnreachable();
+                auto* deadBB = llvm::BasicBlock::Create(llvm_, "exit.dead", currentFn_);
+                builder_.SetInsertPoint(deadBB);
+                return llvm::ConstantInt::get(i32(), 0);  // nominal value, never reached
+            }
+            // Environment.GetEnvironmentVariable(name): string? — getenv
+            if (m == "GetEnvironmentVariable" && call.args.size() == 1 &&
+                call.args[0].value) {
+                llvm::Value* nameStr = lowerExpr(*call.args[0].value);
+                if (!nameStr) return nullptr;
+                llvm::Value* nameData = loadStringData(nameStr);
+                auto* getenvFn = module_->getFunction("getenv");
+                if (!getenvFn) {
+                    auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+                    getenvFn = llvm::Function::Create(
+                        ft, llvm::Function::ExternalLinkage, "getenv", module_.get());
+                }
+                llvm::Value* rawPtr = builder_.CreateCall(getenvFn, {nameData}, "getenv.ret");
+                // null → return null (string?). Non-null: wrap in bz_string.
+                auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+                llvm::Value* isNull = builder_.CreateICmpEQ(rawPtr, nullPtr);
+                auto* nullBB = llvm::BasicBlock::Create(llvm_, "env.null", currentFn_);
+                auto* okBB   = llvm::BasicBlock::Create(llvm_, "env.ok",   currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "env.end",  currentFn_);
+                auto* entBB  = builder_.GetInsertBlock();
+                builder_.CreateCondBr(isNull, endBB, okBB);
+                builder_.SetInsertPoint(okBB);
+                // strlen of the result.
+                auto* strlenFn = module_->getFunction("strlen");
+                if (!strlenFn) {
+                    auto* ft2 = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                    strlenFn = llvm::Function::Create(ft2, llvm::Function::ExternalLinkage, "strlen", module_.get());
+                }
+                llvm::Value* rawLen = builder_.CreateCall(strlenFn, {rawPtr});
+                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* dataSz = builder_.CreateAdd(rawLen, builder_.getInt64(1));
+                llvm::Value* dataCopy = builder_.CreateCall(mallocFn, {dataSz});
+                builder_.CreateCall(memcpyFn, {dataCopy, rawPtr, rawLen});
+                llvm::Value* end = builder_.CreateGEP(i8Ty, dataCopy, rawLen);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), end);
+                uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+                llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)});
+                builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
+                builder_.CreateStore(rawLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+                auto* okEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+                auto* phi = builder_.CreatePHI(ptrTy(), 2, "env.result");
+                phi->addIncoming(nullPtr, entBB);
+                phi->addIncoming(strObj, okEnd);
+                return phi;
+            }
+        }
+
         if (cls == "Convert") {
             if (call.args.size() == 1 && call.args[0].value) {
                 // Convert.ToInt32(s: string): int — atoi / strtol
