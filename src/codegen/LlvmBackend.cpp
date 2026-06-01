@@ -3588,6 +3588,25 @@ private:
                             return llvm::ConstantFP::getInfinity(ft, true);
                         }
                     }
+                    // §2.3: built-in class constant properties (Math.PI, Math.E, etc.)
+                    // These are MemberAccess on a CLASS name (not a primitive type).
+                    if (pt == sema::PrimitiveType::None) {
+                        // Not a primitive keyword — check for built-in class names.
+                    }
+                } else {
+                    // Not a primitive keyword identifier — check for built-in class names.
+                }
+            }
+        }
+        // §2.3: Math.PI / Math.E as constant properties (not function calls).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (id->name == "Math") {
+                        if (ma->member == "PI") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
+                        if (ma->member == "E")  return llvm::ConstantFP::get(dbl, 2.71828182845904523536);
+                    }
                 }
             }
         }
