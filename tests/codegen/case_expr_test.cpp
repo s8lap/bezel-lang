@@ -102,3 +102,44 @@ BEZEL_TEST(codegen_cg28, range_pattern_combined_with_constant) {
         "var x := 0; "
         "var r := case x 0 => 10, 1..5 => 20, _ => 30 end; return r;"), 10);
 }
+
+// CG28b / CG38b: binding patterns (`var n`) in case expressions / statements.
+// §19.2: the bound name is in scope for the arm guard and body; the binding
+// is a borrow of the scrutinee value (same type, always matches).
+
+BEZEL_TEST(codegen_cg28b, binding_pattern_basic) {
+    // `var n` always matches; `n` should equal the scrutinee (5).
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; "
+        "var r := case x var n => n end; return r;"), 5);
+}
+
+BEZEL_TEST(codegen_cg28b, binding_pattern_with_arithmetic) {
+    // Body can compute with the bound name.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 7; "
+        "var r := case x var n => n + 1 end; return r;"), 8);
+}
+
+BEZEL_TEST(codegen_cg28b, binding_pattern_after_non_match) {
+    // A binding pattern following unmatched constant arms catches the value.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 9; "
+        "var r := case x 1 => 0, 2 => 0, var n => n * 2 end; return r;"), 18);
+}
+
+BEZEL_TEST(codegen_cg28b, binding_pattern_with_guard_true) {
+    // A `when` guard can reference the bound name; guard passes.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 4; "
+        "var r := case x var n when n > 2 => n + 10, _ => 0 end; return r;"),
+        14);
+}
+
+BEZEL_TEST(codegen_cg28b, binding_pattern_with_guard_false) {
+    // Guard fails → fall through to wildcard.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 1; "
+        "var r := case x var n when n > 2 => n + 10, _ => 99 end; return r;"),
+        99);
+}

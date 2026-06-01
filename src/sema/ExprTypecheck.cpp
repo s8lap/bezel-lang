@@ -898,10 +898,35 @@ private:
             if (is->target) visitExpr(*is->target);
         } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
             if (cs->scrutinee) visitExpr(*cs->scrutinee);
+            TypeRef* scrutTy =
+                cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
             for (const auto& arm : cs->arms) {
-                if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) visitExpr(*arm.exprBody);
-                for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                // §19: a BindingPattern arm introduces a new scope with the
+                // bound name visible inside the guard and body (per §19.2).
+                auto* bp =
+                    dynamic_cast<const ast::BindingPattern*>(arm.pattern.get());
+                if (bp && currentScope_) {
+                    Scope armScope;
+                    armScope.parent = currentScope_;
+                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                    lsym->name = bp->name;
+                    lsym->decl = bp;
+                    // Explicit type annotation wins; otherwise inherit scrutinee
+                    // type (the binding is a borrow of the matched value).
+                    lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
+                                              : scrutTy;
+                    armScope.names[bp->name] = lsym;
+                    Scope* saveScope = currentScope_;
+                    currentScope_ = &armScope;
+                    if (arm.guard) visitExpr(*arm.guard);
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                    currentScope_ = saveScope;
+                } else {
+                    if (arm.guard) visitExpr(*arm.guard);
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                }
             }
         }
         // Break, Continue have no expressions.
@@ -2051,10 +2076,33 @@ private:
             catchDepth_ = saveCatch;
         } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
             if (ce->scrutinee) visitExpr(*ce->scrutinee);
+            TypeRef* scrutTy =
+                ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
             for (const auto& arm : ce->arms) {
-                if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) visitExpr(*arm.exprBody);
-                for (const auto& s : arm.stmts) if (s) visitStmt(*s);
+                // §19: a BindingPattern arm introduces a new scope with the
+                // bound name visible inside the guard and body (per §19.2).
+                auto* bp =
+                    dynamic_cast<const ast::BindingPattern*>(arm.pattern.get());
+                if (bp && currentScope_) {
+                    Scope armScope;
+                    armScope.parent = currentScope_;
+                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                    lsym->name = bp->name;
+                    lsym->decl = bp;
+                    lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
+                                              : scrutTy;
+                    armScope.names[bp->name] = lsym;
+                    Scope* saveScope = currentScope_;
+                    currentScope_ = &armScope;
+                    if (arm.guard) visitExpr(*arm.guard);
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& s : arm.stmts) if (s) visitStmt(*s);
+                    currentScope_ = saveScope;
+                } else {
+                    if (arm.guard) visitExpr(*arm.guard);
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& s : arm.stmts) if (s) visitStmt(*s);
+                }
             }
         } else if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
             if (we->source) visitExpr(*we->source);

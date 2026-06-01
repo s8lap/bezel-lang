@@ -6201,6 +6201,19 @@ private:
                 llvm::BasicBlock::Create(llvm_, "casestmt.arm", currentFn_);
             auto* nextBB =
                 llvm::BasicBlock::Create(llvm_, "casestmt.next", currentFn_);
+            // CG38b: a BindingPattern arm exposes the scrutinee value via a
+            // local slot keyed on the BindingPattern AST node — the same node
+            // sema used as lsym->decl, so localSlot() resolves the identifier.
+            // The slot must be filled before the guard (which may reference the
+            // bound name) and before the arm body. The alloca goes in the
+            // function entry block; the store is emitted in the current
+            // (pattern-test) block, before we branch to the guard or body.
+            if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
+                               arm.pattern.get())) {
+                llvm::AllocaInst* slot = entryAlloca(scrut->getType());
+                builder_.CreateStore(scrut, slot);
+                locals_[bp] = slot;
+            }
             if (arm.guard) {
                 auto* guardBB = llvm::BasicBlock::Create(
                     llvm_, "casestmt.guard", currentFn_);
@@ -6246,6 +6259,19 @@ private:
                 llvm::BasicBlock::Create(llvm_, "case.arm", currentFn_);
             auto* nextBB =
                 llvm::BasicBlock::Create(llvm_, "case.next", currentFn_);
+            // CG28b: a BindingPattern arm exposes the scrutinee value via a
+            // local slot keyed on the BindingPattern AST node — matches the
+            // sema decl anchor so localSlot() resolves the bound identifier.
+            // The slot must be filled before the guard (which may reference the
+            // bound name) and before the arm body. The alloca goes in the
+            // function entry block; the store is emitted in the current
+            // (pattern-test) block, before we branch to the guard or body.
+            if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
+                               arm.pattern.get())) {
+                llvm::AllocaInst* slot = entryAlloca(scrut->getType());
+                builder_.CreateStore(scrut, slot);
+                locals_[bp] = slot;
+            }
             if (arm.guard) {
                 auto* guardBB =
                     llvm::BasicBlock::Create(llvm_, "case.guard", currentFn_);
@@ -6280,6 +6306,11 @@ private:
                                 const sema::TypeSymbol* enumTy = nullptr,
                                 bool isStr = false) {
         if (dynamic_cast<const ast::DiscardPattern*>(pat))
+            return builder_.getInt1(true);
+        // CG38b: a BindingPattern always matches (it binds the scrutinee
+        // value unconditionally); the slot registration happens in the
+        // arm-body preamble after this function returns true.
+        if (dynamic_cast<const ast::BindingPattern*>(pat))
             return builder_.getInt1(true);
         // CG43: a bare qualified name `E.Red` parses as a NamedPattern; when
         // the scrutinee is an enum, resolve it to that enum's constant and
