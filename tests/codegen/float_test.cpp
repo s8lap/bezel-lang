@@ -136,3 +136,13 @@ BEZEL_TEST(codegen_cg24, float_record_inequality) {
         "end Main; end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// §3.4: static properties on primitive type names.
+BEZEL_TEST(codegen_cg24, double_nan_is_not_equal_to_itself) {
+    // IEEE 754: NaN != NaN.
+    BEZEL_EXPECT_EQ(run("var x := double.NaN; return (1 if x = x else 0);"), 0);
+}
+
+BEZEL_TEST(codegen_cg24, double_positive_infinity_greater_than_zero) {
+    BEZEL_EXPECT_EQ(run("var x := double.PositiveInfinity; return (1 if x > 0.0 else 0);"), 1);
+}

@@ -1534,6 +1534,40 @@ private:
                 }
             }
         }
+        // §3.4: `int.MaxValue`, `double.NaN`, `char.MaxValue`, etc. — static
+        // properties on primitive keyword aliases. The target is an identifier
+        // that names a primitive type; there's no TypeSymbol in scope for it.
+        if (!targetType && ma.target) {
+            if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+                PrimitiveType pt = primitiveFromName(id2->name);
+                if (pt != PrimitiveType::None) {
+                    const auto& mbr = ma.member;
+                    // Numeric properties: MaxValue/MinValue → same type.
+                    if (mbr == "MaxValue" || mbr == "MinValue" ||
+                        mbr == "Zero" || mbr == "One") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
+                        return;
+                    }
+                    // double/float properties.
+                    if (pt == PrimitiveType::Double || pt == PrimitiveType::Float) {
+                        if (mbr == "NaN" || mbr == "PositiveInfinity" ||
+                            mbr == "NegativeInfinity" || mbr == "Epsilon") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
+                            return;
+                        }
+                        if (mbr == "IsNaN" || mbr == "IsInfinity") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                            return;
+                        }
+                    }
+                    // int.Parse(s) → int.
+                    if (mbr == "Parse") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
+                        return;
+                    }
+                }
+            }
+        }
         if (!targetType && ma.target) {
             auto* tt = ctx_.exprType(*ma.target);
             if (tt && tt->kind == TypeRef::Kind::Named) {
