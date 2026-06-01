@@ -4151,7 +4151,36 @@ private:
                                 pv = ev;  // string or unknown ptr — use as-is
                             }
                         }
-                        // else: struct (record value) etc. — skip
+                        // For struct (record value): spill to alloca, call ToString.
+                        if (!pv && ev->getType()->isStructTy() && rt &&
+                            rt->kind == sema::TypeRef::Kind::Named &&
+                            rt->declaration) {
+                            auto* ts = rt->declaration;
+                            sema::MethodSymbol* toStr = nullptr;
+                            for (auto* cur = ts; cur && !toStr;) {
+                                for (auto* sym : cur->members) {
+                                    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                                    if (ms && ms->name == "ToString" && ms->params.empty()) {
+                                        toStr = ms; break;
+                                    }
+                                }
+                                sema::TypeSymbol* nxt = nullptr;
+                                for (auto* b : cur->baseTypes)
+                                    if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+                                cur = nxt;
+                            }
+                            if (toStr) {
+                                // Spill the record value to an alloca so we have a ptr.
+                                llvm::AllocaInst* spill = entryAlloca(ev->getType());
+                                builder_.CreateStore(ev, spill);
+                                std::vector<llvm::Value*> args{spill};
+                                pv = emitMethodCall(toStr, args, false);
+                            } else {
+                                // No ToString — use type name.
+                                pv = lowerStringLiteral(
+                                    std::string("\"") + std::string(ts->name) + "\"", false);
+                            }
+                        }
                     }
                 }
                 if (pv) acc = emitStringConcat(acc, pv);
