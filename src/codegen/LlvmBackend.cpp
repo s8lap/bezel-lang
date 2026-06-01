@@ -3660,24 +3660,72 @@ private:
                                     return emitPrimitiveToString(recv, tt->primitive);
                             }
                             // §9.x: ToString(format) — formatted numeric string.
-                            // Bezel format specifiers: "Fn" (n decimal places for float/double),
-                            // "D" (integer, decimal), "X" (hex). Fallback to default.
                             if (call->args.size() == 1 && call->args[0].value &&
                                 ma->member == "ToString") {
                                 llvm::Value* recv = lowerExpr(*ma->target);
-                                llvm::Value* fmtArg = lowerExpr(*call->args[0].value);
-                                if (recv && fmtArg) {
-                                    // Build a snprintf format from the Bezel format spec.
-                                    // For now: parse the format string literal if constant.
-                                    using P = sema::PrimitiveType;
-                                    // Simple heuristic: if the format string's content
-                                    // starts with 'F' or 'f' followed by digits, use
-                                    // "%.Nf" format. Otherwise use default.
-                                    // Since format strings are usually literals, we can
-                                    // inspect the string data at runtime via snprintf+toupper.
-                                    // Simplest: just call emitPrimitiveToString as fallback.
-                                    return emitPrimitiveToString(recv, tt->primitive);
+                                if (!recv) return nullptr;
+                                // Try to extract the format specifier from a literal arg.
+                                std::string bezelFmt;
+                                if (auto* sl = dynamic_cast<const ast::StringLiteralExpr*>(
+                                        call->args[0].value.get())) {
+                                    bezelFmt = processStringText(sl->text, false);
                                 }
+                                if (!bezelFmt.empty()) {
+                                    // Translate Bezel format spec to printf format.
+                                    // "Fn" / "fn" → "%.Nf" (fixed decimal)
+                                    // "En" / "en" → "%.Ne" (scientific)
+                                    // "Gn" / "gn" → "%.Ng" (general)
+                                    // "X" / "x" → "%X" / "%x" (hex integer)
+                                    // "D" / "d" → "%d" (decimal integer)
+                                    std::string printfFmt;
+                                    char spec = std::toupper(bezelFmt[0]);
+                                    std::string digits = bezelFmt.size() > 1 ? bezelFmt.substr(1) : "";
+                                    using P = sema::PrimitiveType;
+                                    bool isFP = tt->primitive == P::Double || tt->primitive == P::Float;
+                                    if ((spec == 'F' || spec == 'G' || spec == 'E') && isFP) {
+                                        char pfspec = spec == 'F' ? 'f' : (spec == 'E' ? 'e' : 'g');
+                                        printfFmt = "%." + (digits.empty() ? "2" : digits) + pfspec;
+                                        // Widen float to double for snprintf.
+                                        if (tt->primitive == P::Float)
+                                            recv = builder_.CreateFPExt(recv, llvm::Type::getDoubleTy(llvm_));
+                                    } else if (spec == 'X' || spec == 'D') {
+                                        printfFmt = spec == 'X' ? "%x" : "%d";
+                                        if (!recv->getType()->isIntegerTy(32))
+                                            recv = builder_.CreateFPToSI(recv, i32());
+                                    } else {
+                                        return emitPrimitiveToString(recv, tt->primitive);
+                                    }
+                                    // Emit snprintf with the translated format.
+                                    llvm::Constant* fmtData = llvm::ConstantDataArray::getString(
+                                        llvm_, printfFmt, true);
+                                    unsigned fid = stringLiteralIdx_++;
+                                    auto* fmtGV = new llvm::GlobalVariable(*module_, fmtData->getType(), true,
+                                        llvm::GlobalValue::PrivateLinkage, fmtData, ".bz.ts.fmt." + std::to_string(fid));
+                                    fmtGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                                    auto* snpFn = module_->getFunction("snprintf");
+                                    if (!snpFn) {
+                                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), i64(), ptrTy()}, true);
+                                        snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
+                                    }
+                                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                                    llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, 64));
+                                    llvm::Value* bufPtr = builder_.CreateGEP(llvm::ArrayType::get(i8Ty, 64), buf, {builder_.getInt64(0), builder_.getInt64(0)});
+                                    llvm::Value* wr = builder_.CreateCall(snpFn, {bufPtr, builder_.getInt64(64), fmtGV, recv}, "ts.wr");
+                                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                                    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                                    llvm::Value* l64 = builder_.CreateSExt(wr, i64());
+                                    llvm::Value* dSz = builder_.CreateAdd(l64, builder_.getInt64(1));
+                                    llvm::Value* dc = builder_.CreateCall(mallocFn, {dSz}, "ts.data");
+                                    builder_.CreateCall(memcpyFn, {dc, bufPtr, l64});
+                                    llvm::Value* np = builder_.CreateGEP(i8Ty, dc, l64);
+                                    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np);
+                                    uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+                                    llvm::Value* so = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "ts.obj");
+                                    builder_.CreateStore(dc, builder_.CreateStructGEP(stringType(), so, 0));
+                                    builder_.CreateStore(l64, builder_.CreateStructGEP(stringType(), so, 1));
+                                    return so;
+                                }
+                                return emitPrimitiveToString(recv, tt->primitive);
                             }
                         }
                     }
