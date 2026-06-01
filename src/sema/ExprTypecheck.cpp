@@ -1634,13 +1634,28 @@ private:
         // ambiguity resolution between base interfaces yet).
         Symbol* member = lookupMember(targetType, ma.member);
         if (!member) {
-            // Slice 3d intentionally does NOT diagnose unknown members
-            // — base-type/inherited-member lookup and extension-method
-            // dispatch are later slices. A user-typed `obj.Dispose()`
-            // against `Stream` would otherwise mis-flag a method that
-            // really lives on the IDisposable interface. The lookup
-            // failure is non-fatal: the expression simply lacks an
-            // exprSymbol/exprType, and later passes can still proceed.
+            // §2.3: built-in class TypeSymbols (Console, Math, Convert, …)
+            // have null `decl` and empty members. Assign return types for
+            // their known methods so callers can infer the call result type.
+            if (!targetType->decl) {
+                std::string_view cls = targetType->name;
+                const auto& m = ma.member;
+                // Convert methods (§9 stdlib).
+                if (cls == "Convert" || cls == "Math") {
+                    auto setInt = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int)); };
+                    auto setLong = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long)); };
+                    auto setDbl = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double)); };
+                    auto setBool = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool)); };
+                    auto setStr = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String)); };
+                    if (m=="ToInt32"||m=="Abs"||m=="Min"||m=="Max"||m=="Sign") setInt();
+                    else if (m=="ToInt64") setLong();
+                    else if (m=="ToDouble"||m=="Sqrt"||m=="Pow"||m=="Log"||m=="Ceiling"||m=="Floor"||m=="Round") setDbl();
+                    else if (m=="ToBoolean") setBool();
+                    else if (m=="ToString") setStr();
+                }
+                // Console methods always return unit — leave untyped (unit).
+            }
+            // Slice 3d intentionally does NOT diagnose unknown members.
             return;
         }
         // Slice S8: visibility check. A `private` member is accessible
