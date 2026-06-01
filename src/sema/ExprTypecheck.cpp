@@ -1749,9 +1749,25 @@ private:
                         if (ma.member == "CompareTo" ||
                             ma.member == "IndexOf" ||
                             ma.member == "LastIndexOf" ||
-                            ma.member == "CountOf") {
+                            ma.member == "CountOf" ||
+                            ma.member == "ToInt32" || ma.member == "ToUInt32") {
                             ctx_.setExprType(
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                            return;
+                        }
+                        if (ma.member == "ToInt64") {
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
+                            return;
+                        }
+                        if (ma.member == "ToDouble" || ma.member == "ToFloat") {
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
+                            return;
+                        }
+                        if (ma.member == "ToBoolean") {
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                             return;
                         }
                         if (ma.member == "Substring" ||
