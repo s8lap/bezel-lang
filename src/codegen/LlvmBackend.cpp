@@ -2533,7 +2533,9 @@ private:
             if (lowerRangeFor(*fors)) return false;
             // §15.1: `for var x in a` over an inline array.
             if (lowerArrayFor(*fors)) return false;
-            // Non-range, non-array iterables are not yet lowered.
+            // §4.6: `for var c in s` over a string — iterates chars.
+            if (lowerStringFor(*fors)) return false;
+            // Non-range, non-array, non-string iterables are not yet lowered.
             ctx_.diagnostics().report(
                 Severity::Error, s.span.begin,
                 "not yet implemented: codegen for this for statement");
@@ -2920,6 +2922,61 @@ private:
         llvm::Value* v = builder_.CreateLoad(i32(), idxSlot);
         builder_.CreateStore(
             builder_.CreateAdd(v, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(endBB);
+        return true;
+    }
+
+    // §4.6 / §29.2: `for var c in s do … end` over a string — iterates
+    // each char (i32 code point) in order. For ASCII/UTF-8 strings this
+    // iterates bytes; full Unicode code-point iteration deferred.
+    bool lowerStringFor(const ast::ForStmt& fs) {
+        if (!fs.iterable) return false;
+        auto* tt = ctx_.exprType(*fs.iterable);
+        if (!tt || tt->kind != sema::TypeRef::Kind::Primitive ||
+            tt->primitive != sema::PrimitiveType::String)
+            return false;
+
+        llvm::Value* strPtr = lowerExpr(*fs.iterable);
+        if (!strPtr) return false;
+        llvm::Value* len = loadStringLen(strPtr);          // i64 length
+        llvm::Value* data = loadStringData(strPtr);        // ptr to chars
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+
+        // Index counter (i64).
+        auto* idxSlot = entryAlloca(i64());
+        builder_.CreateStore(builder_.getInt64(0), idxSlot);
+
+        // Loop variable slot — the body sees `c` as the current char (i32).
+        auto* varSlot = entryAlloca(i32());
+        locals_[&fs] = varSlot;
+
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "sfor.cond", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sfor.body", currentFn_);
+        auto* incBB  = llvm::BasicBlock::Create(llvm_, "sfor.inc",  currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "sfor.end",  currentFn_);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+        llvm::Value* cond = builder_.CreateICmpSLT(idx, len, "sfor.cond");
+        builder_.CreateCondBr(cond, bodyBB, endBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* idxBod = builder_.CreateLoad(i64(), idxSlot);
+        llvm::Value* bytePtr = builder_.CreateGEP(i8Ty, data, idxBod, "sfor.ptr");
+        llvm::Value* byte = builder_.CreateLoad(i8Ty, bytePtr, "sfor.byte");
+        builder_.CreateStore(builder_.CreateZExt(byte, i32()), varSlot);
+        loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+        lowerScopedBlock(fs.body);
+        loopStack_.pop_back();
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(incBB);
+
+        builder_.SetInsertPoint(incBB);
+        llvm::Value* idxInc = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateStore(builder_.CreateAdd(idxInc, builder_.getInt64(1)), idxSlot);
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(endBB);
