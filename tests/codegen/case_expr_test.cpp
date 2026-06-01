@@ -225,7 +225,7 @@ BEZEL_TEST(codegen_cg28_destructure, record_case_expr_fallthrough_discard) {
 BEZEL_TEST(codegen_cg28_destructure, const_then_binding) {
     // Point(0, y) — first sub-pattern is constant (must match 0),
     // second is binding. Only matches when first field == 0.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runFull(
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(0, 7); "
@@ -238,7 +238,7 @@ BEZEL_TEST(codegen_cg28_destructure, const_then_binding) {
 
 BEZEL_TEST(codegen_cg28_destructure, const_then_binding_no_match) {
     // Point(0, y) should NOT match when first field != 0.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runFull(
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(5, 7); "
@@ -251,7 +251,7 @@ BEZEL_TEST(codegen_cg28_destructure, const_then_binding_no_match) {
 
 BEZEL_TEST(codegen_cg28_destructure, binding_then_const) {
     // Point(x, 0) — matches when second field == 0.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runFull(
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(3, 0); "
@@ -264,7 +264,7 @@ BEZEL_TEST(codegen_cg28_destructure, binding_then_const) {
 
 BEZEL_TEST(codegen_cg28_destructure, both_const_no_match) {
     // Point(0, 0) should not match Point(3, 4).
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runFull(
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(3, 4); "
