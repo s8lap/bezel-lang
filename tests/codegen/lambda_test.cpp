@@ -341,3 +341,19 @@ BEZEL_TEST(codegen_cg60, function_typed_field_call) {
         "  return r1 + r2; "
         "end Main; end C;"), 25);
 }
+
+// ── Function-typed array elements — return type propagation ───────────────
+BEZEL_TEST(codegen_cg60, array_element_string_return) {
+    // Verify that calling a `(int)->string` through an array element correctly
+    // types the result as string (enabling .Length etc.).
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var fns: [2](int) -> string; "
+        "    fns[0] := (n: int) => (\"abc\" if n > 0 else \"xy\"); "
+        "    fns[1] := (n: int) => \"hello\"; "
+        "    var r0 := fns[0](5); "   // = "abc", length 3
+        "    var r1 := fns[1](0); "   // = "hello", length 5
+        "    return r0.Length + r1.Length; "  // 3+5=8
+        "  end Main; end C;"), 8);
+}
