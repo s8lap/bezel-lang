@@ -227,6 +227,16 @@ private:
                        std::vector<llvm::Type*>>,
              llvm::Function*>
         specializedMethods_;
+    // localGenericSubst_[decl] = concrete subst when local was created.
+    // Populated when a local is assigned from a generic expression. Used
+    // to recover the concrete type args when calling methods on that local.
+    std::unordered_map<const ast::Node*,
+                       std::unordered_map<std::string_view, llvm::Type*>>
+        localGenericSubst_;
+    // lastCallGenericSubst_: the most recently active genericSubst_ during a
+    // method call. Set by lowerCallImpl before restoring; read by lowerLocalDecl
+    // to associate a local with the concrete types of its initializer.
+    std::unordered_map<std::string_view, llvm::Type*> lastCallGenericSubst_;
 
     // CG26: external (FFI) function declared by an extern block (§32).
     std::unordered_map<const sema::ExternDeclSymbol*, llvm::Function*>
@@ -3936,6 +3946,19 @@ private:
             v ? v->getType() : (declType ? lowerType(declType) : i32());
         llvm::AllocaInst* slot = entryAlloca(slotTy);
         locals_[declNode] = slot;
+        // CG-generic: record the concrete substitution for this local so that
+        // method calls on it (e.g. sp2.GetFirst()) can recover the concrete type
+        // args even when the sema type is still generic. Prefer the active
+        // genericSubst_ (set during field access), but fall back to
+        // lastCallGenericSubst_ (set during method calls that return generic types).
+        if (slotTy->isPointerTy()) {
+            if (!genericSubst_.empty())
+                localGenericSubst_[declNode] = genericSubst_;
+            else if (!lastCallGenericSubst_.empty()) {
+                localGenericSubst_[declNode] = lastCallGenericSubst_;
+                lastCallGenericSubst_.clear();
+            }
+        }
         if (v) {
             builder_.CreateStore(v, slot);
         } else if (llvm::dyn_cast<llvm::ArrayType>(slotTy)) {
@@ -6095,11 +6118,15 @@ private:
         if (!rt->genericArgs.empty() && t->decl) {
             auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
             if (td && td->genericParams.size() == rt->genericArgs.size()) {
-                genericSubst_.clear();
+                // Resolve generic args WITH the outer substitution active so
+                // that `new Pair<T>` inside a `Pair<string>` method correctly
+                // maps T → ptr (string) rather than the i32 fallback.
+                std::unordered_map<std::string_view, llvm::Type*> newSubst;
                 for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
                     llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
-                    genericSubst_[td->genericParams[gi].name] = concrTy;
+                    newSubst[td->genericParams[gi].name] = concrTy;
                 }
+                genericSubst_ = std::move(newSubst);
             }
         }
 
@@ -6230,12 +6257,29 @@ private:
                     ms->parent->decl);
                 if (td && td->genericParams.size() ==
                           targetTy->genericArgs.size()) {
-                    genericSubst_.clear();
+                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
                     for (std::size_t gi = 0;
                          gi < td->genericParams.size(); ++gi) {
-                        genericSubst_[td->genericParams[gi].name] =
+                        newSubst[td->genericParams[gi].name] =
                             lowerTypeRef(targetTy->genericArgs[gi]);
                     }
+                    // If any resolved type is i32 (unresolved generic fallback),
+                    // try looking up the local's stored concrete substitution.
+                    bool hasUnresolved = false;
+                    for (auto& [n, ty] : newSubst)
+                        if (ty == i32()) { hasUnresolved = true; break; }
+                    if (hasUnresolved) {
+                        sema::Symbol* sym = ctx_.exprSymbol(*ma.target);
+                        const ast::Node* decl = nullptr;
+                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym))
+                            decl = loc->decl;
+                        if (decl) {
+                            auto lit = localGenericSubst_.find(decl);
+                            if (lit != localGenericSubst_.end())
+                                newSubst = lit->second;
+                        }
+                    }
+                    genericSubst_ = std::move(newSubst);
                 }
             }
         }
@@ -7607,17 +7651,41 @@ private:
                         ms->parent->decl);
                     if (td && td->genericParams.size() ==
                               recvTy->genericArgs.size()) {
-                        genericSubst_.clear();
+                        // Resolve generic args using the OUTER substitution so
+                        // that `Pair<T>` in `Pair<string>` context resolves T→ptr.
+                        std::unordered_map<std::string_view, llvm::Type*> newSubst;
                         for (std::size_t gi = 0;
                              gi < td->genericParams.size(); ++gi) {
-                            genericSubst_[td->genericParams[gi].name] =
-                                lowerTypeRef(recvTy->genericArgs[gi]);
+                            llvm::Type* concrTy = lowerTypeRef(recvTy->genericArgs[gi]);
+                            newSubst[td->genericParams[gi].name] = concrTy;
                         }
+                        // Check if any resolved arg is still i32 (unresolved generic
+                        // fallback). If so, try the localGenericSubst_ for the receiver.
+                        bool hasUnresolved = false;
+                        for (auto& [name, ty] : newSubst)
+                            if (ty == i32()) { hasUnresolved = true; break; }
+                        if (hasUnresolved) {
+                            // Try looking up the local's stored substitution.
+                            sema::Symbol* recvSym = ctx_.exprSymbol(*recvExpr);
+                            const ast::Node* recvDecl = nullptr;
+                            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(recvSym))
+                                recvDecl = loc->decl;
+                            if (recvDecl) {
+                                auto lit = localGenericSubst_.find(recvDecl);
+                                if (lit != localGenericSubst_.end())
+                                    newSubst = lit->second;  // use stored concrete subst
+                            }
+                        }
+                        genericSubst_ = std::move(newSubst);
                     }
                 }
             }
         }
         llvm::Value* result = emitMethodCall(ms, args, baseQualified);
+        // Record the concrete subst that was active during this call so that
+        // lowerLocalDecl can associate it with the result's local variable.
+        if (!genericSubst_.empty())
+            lastCallGenericSubst_ = genericSubst_;
         genericSubst_ = std::move(savedSubst);
         return result;
     }
