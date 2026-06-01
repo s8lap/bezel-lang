@@ -318,3 +318,26 @@ BEZEL_TEST(codegen_cg60, partial_application) {
         "  end Main; "
         "end C;"), 28);  // 15 + 13 = 28
 }
+
+// ── Function-typed field calls ────────────────────────────────────────────
+// Previously `obj._callback()` where `_callback: () -> int` silently
+// dropped the call. Now dispatches through emitClosureCall.
+
+BEZEL_TEST(codegen_cg60, function_typed_field_call) {
+    // Class with a function-typed field; calling it should invoke the closure.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Acc public _v: int := 0; destructor end destructor; end Acc; "
+        "class T "
+        "  public _cb: (int) -> int; "
+        "  public constructor(f: (int) -> int) _cb := f; end constructor; "
+        "  destructor end destructor; "
+        "end T; "
+        "class C public static method Main(): int "
+        "  using var acc := new Acc(); "
+        "  using var t := new T((x: int) => do acc._v := acc._v + x; return acc._v; end); "
+        "  var r1 := t._cb(10); "
+        "  var r2 := t._cb(5); "
+        "  return r1 + r2; "
+        "end Main; end C;"), 25);
+}
