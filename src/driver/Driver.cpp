@@ -44,7 +44,8 @@ bool readFile(const std::string& path, std::string& out) {
 // toolchain). Returns true on success.
 bool linkExecutable(const std::string& objectPath,
                     const std::string& exePath) {
-    std::string cmd = "clang " + objectPath + " -o " + exePath;
+    // Link with libc and libm (for math functions like pow, log, etc.)
+    std::string cmd = "clang " + objectPath + " -o " + exePath + " -lm";
     return std::system(cmd.c_str()) == 0;
 }
 

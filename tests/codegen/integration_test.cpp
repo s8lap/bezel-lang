@@ -325,3 +325,22 @@ BEZEL_TEST(integration, string_isnotempty_branch) {
         "  return s.Length; "
         "end Main; end C;"), 5);
 }
+
+BEZEL_TEST(integration, string_replace_and_case) {
+    // Replace + ToUpper chain.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello world\"; "
+        "  var t := s.Replace(\"world\", \"bezel\").ToUpper(); "
+        "  return (1 if t = \"HELLO BEZEL\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(integration, math_pow_and_sqrt) {
+    // Math.Pow and Math.Sqrt integration.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var area := Math.PI * Math.Pow(5.0, 2.0); "
+        "  return (1 if area > 78.0 else 0); "
+        "end Main; end C;"), 1);
+}
