@@ -5218,6 +5218,17 @@ private:
                     // any unknown member already.
                     return nullptr;
                 }
+                // Fallback for cases where sema type is unknown (e.g. e.Message
+                // on a built-in exception — sema doesn't know Message returns
+                // string). Lower the target and check if it's a string struct ptr.
+                if (ma->member == "Length" && (!tt || tt->kind != sema::TypeRef::Kind::Primitive)) {
+                    llvm::Value* strPtr = lowerExpr(*ma->target);
+                    if (strPtr && strPtr->getType()->isPointerTy()) {
+                        // If the value is a bz_string struct pointer, load Length.
+                        llvm::Value* len64 = loadStringLen(strPtr);
+                        return builder_.CreateTrunc(len64, i32(), "str.len.i32");
+                    }
+                }
             }
         }
         // CG22+: Exception.Message — built-in exceptions store a message
