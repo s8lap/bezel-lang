@@ -4128,10 +4128,21 @@ private:
                     if (lowerPropertySet(*as->target, *as->value))
                         return false;
                     // §22.10: indexer setter for `obj[i] := v`.
+                    // Evaluate RHS ONCE to avoid double side-effects if
+                    // lowerIndexerSet fails and we fall through to the
+                    // plain lvalue path below.
                     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
                             as->target.get())) {
-                        llvm::Value* rhs = lowerExpr(*as->value);
-                        if (rhs && lowerIndexerSet(*ix, rhs)) return false;
+                        llvm::Value* rhsOnce = lowerExpr(*as->value);
+                        if (!rhsOnce) return false;
+                        if (lowerIndexerSet(*ix, rhsOnce)) return false;
+                        // Not an indexer property — fall through to plain array
+                        // assignment using the already-computed RHS.
+                        llvm::Type* elemTy2 = nullptr;
+                        llvm::Value* addr2 = lvalueAddr(*as->target, elemTy2);
+                        if (!addr2) return false;
+                        builder_.CreateStore(rhsOnce, addr2);
+                        return false;
                     }
                 } else if (lowerPropertyCompound(*as)) {
                     return false;
