@@ -550,6 +550,30 @@ private:
         return newStr;
     }
 
+    // CG27b (§4.6): ordinal comparison of two bz_string pointers → i32.
+    // Returns negative / 0 / positive (same sign contract as memcmp/strcmp).
+    // Ordinal = code-point-by-code-point; shorter string is "less" when it
+    // is a prefix of the longer one (per §4.6 length-aware comparison).
+    llvm::Value* emitStringOrdCmp(llvm::Value* l, llvm::Value* r) {
+        // Compare min(lenL,lenR) bytes with memcmp; if equal, compare lengths.
+        llvm::Value* lenL = loadStringLen(l);
+        llvm::Value* lenR = loadStringLen(r);
+        llvm::Value* minLen = builder_.CreateSelect(
+            builder_.CreateICmpSLT(lenL, lenR), lenL, lenR, "str.minlen");
+        llvm::Value* dataL = loadStringData(l);
+        llvm::Value* dataR = loadStringData(r);
+        auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
+        llvm::Value* cmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, minLen},
+                                                  "str.cmp");
+        // If memcmp returned 0, fall back to comparing lengths.
+        auto* cmpZero = builder_.CreateICmpEQ(
+            cmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
+        llvm::Value* lenDiff = builder_.CreateSub(
+            builder_.CreateTrunc(lenL, i32()),
+            builder_.CreateTrunc(lenR, i32()), "str.lendiff");
+        return builder_.CreateSelect(cmpZero, lenDiff, cmpRes, "str.ord");
+    }
+
     // CG25: is a Bezel primitive an unsigned integer type? (Drives
     // zext/udiv/lshr/unsigned-comparison choices.)
     static bool isUnsignedPrim(sema::PrimitiveType p) {
@@ -3090,7 +3114,15 @@ private:
                 if (op == "=") return emitStringEq(l, r);
                 if (op == "<>") return builder_.CreateNot(emitStringEq(l, r));
                 if (op == "+") return emitStringConcat(l, r);
-                // <, >, <=, >= → ordinal (deferred); fall through.
+                // CG27b (§4.6): ordinal comparison operators.
+                if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+                    llvm::Value* cmp = emitStringOrdCmp(l, r);
+                    llvm::Value* zero = llvm::ConstantInt::get(i32(), 0);
+                    if (op == "<") return builder_.CreateICmpSLT(cmp, zero);
+                    if (op == ">") return builder_.CreateICmpSGT(cmp, zero);
+                    if (op == "<=") return builder_.CreateICmpSLE(cmp, zero);
+                    /* >= */ return builder_.CreateICmpSGE(cmp, zero);
+                }
             }
         }
         // CG22 (§6.1): integer + - * are overflow-checked; / and mod also
@@ -3845,15 +3877,24 @@ private:
     // value falls through with no action (§19.6) — unlike the expression
     // form, no MatchFailureException. Returns false: the fall-through edge
     // keeps the post-case block reachable.
+    // CG27b: is an expression's sema type a string (Primitive::String)?
+    bool isStringExprType(const ast::Expr& e) {
+        auto* rt = ctx_.exprType(e);
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
+
     bool lowerCaseStmt(const ast::CaseStmt& cs) {
         if (!cs.scrutinee) return false;  // scrutinee-less form deferred
         llvm::Value* scrut = lowerExpr(*cs.scrutinee);
         if (!scrut) return false;
         const sema::TypeSymbol* enumTy = enumTypeOf(*cs.scrutinee);
+        bool isStr = isStringExprType(*cs.scrutinee);
         auto* endBB =
             llvm::BasicBlock::Create(llvm_, "casestmt.end", currentFn_);
         for (const auto& arm : cs.arms) {
-            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy);
+            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy,
+                                             isStr);
             if (!pm) {  // deferred pattern kind — degrade to no-op
                 builder_.CreateBr(endBB);
                 builder_.SetInsertPoint(endBB);
@@ -3890,6 +3931,7 @@ private:
         llvm::Value* scrut = lowerExpr(*ce.scrutinee);
         if (!scrut) return nullptr;
         const sema::TypeSymbol* enumTy = enumTypeOf(*ce.scrutinee);
+        bool isStr = isStringExprType(*ce.scrutinee);
         llvm::Type* resultTy = i32();
         if (auto* rt = ctx_.exprType(ce)) resultTy = lowerTypeRef(rt);
 
@@ -3900,7 +3942,8 @@ private:
             if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
                 !arm.exprBody)
                 return nullptr;  // block-body arms deferred
-            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy);
+            llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy,
+                                             isStr);
             if (!pm) return nullptr;
             auto* bodyBB =
                 llvm::BasicBlock::Create(llvm_, "case.arm", currentFn_);
@@ -3937,7 +3980,8 @@ private:
 
     // CG28: does `pattern` match `scrut`? Returns an i1.
     llvm::Value* patternMatches(const ast::Pattern* pat, llvm::Value* scrut,
-                                const sema::TypeSymbol* enumTy = nullptr) {
+                                const sema::TypeSymbol* enumTy = nullptr,
+                                bool isStr = false) {
         if (dynamic_cast<const ast::DiscardPattern*>(pat))
             return builder_.getInt1(true);
         // CG43: a bare qualified name `E.Red` parses as a NamedPattern; when
@@ -3948,7 +3992,7 @@ private:
             if (enumTy && np->name && !np->name->parts.empty()) {
                 if (llvm::Value* cv =
                         enumConstantByName(enumTy, np->name->parts.back()))
-                    return emitEquals(scrut, cv);
+                    return emitEquals(scrut, cv, isStr);
             }
             return nullptr;  // type-test pattern deferred
         }
@@ -3962,7 +4006,8 @@ private:
                 // misses; resolve it by name against the scrutinee's enum.
                 if (!cv) cv = enumConstantOfPatternExpr(*c, enumTy);
                 if (!cv) return nullptr;
-                any = builder_.CreateOr(any, emitEquals(scrut, cv));
+                // CG27b: string scrutinee → content comparison (not ptr cmp).
+                any = builder_.CreateOr(any, emitEquals(scrut, cv, isStr));
             }
             return any;
         }
@@ -4004,7 +4049,9 @@ private:
     }
 
     // CG28: equality of two same-typed scalars (int or FP).
-    llvm::Value* emitEquals(llvm::Value* a, llvm::Value* b) {
+    llvm::Value* emitEquals(llvm::Value* a, llvm::Value* b,
+                            bool isStr = false) {
+        if (isStr) return emitStringEq(a, b);
         return a->getType()->isFloatingPointTy()
                    ? builder_.CreateFCmpOEQ(a, b)
                    : builder_.CreateICmpEQ(a, b);
