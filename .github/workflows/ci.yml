@@ -1,24 +1,34 @@
+# CI is currently disabled.
+#
+# The project's reference toolchain is clang++ + LLVM 21 (Fedora, per
+# CLAUDE.md). GitHub-hosted Ubuntu runners ship LLVM 18 by default; the
+# codegen has come to depend on post-LLVM-18 APIs
+# (`Intrinsic::getOrInsertDeclaration`, the `Triple`-typed
+# `setTargetTriple` / `createTargetMachine` overloads), so the previous
+# build-and-test job has been red since 2026-05-30 and has been validating
+# a toolchain the project does not support anyway.
+#
+# Local validation uses `scripts/run-tests.sh` (relink-guarded test
+# runner) against the reference Fedora LLVM 21.
+#
+# To re-enable: install LLVM 21 on the runner (e.g. via apt.llvm.org or a
+# docker image with LLVM 21 preinstalled), then restore the previous job.
+# Tracked at https://github.com/s8lap/bezel-lang/pull/260 (the LLVM 21
+# install approach was prototyped there and closed in favor of disabling
+# CI for now).
+
 name: CI
 
+# No triggers — workflow is effectively disabled until the toolchain
+# story stabilizes. Use `workflow_dispatch` to run on demand if needed.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
-  build-and-test:
+  noop:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install toolchain
-        # clang/LLVM per CLAUDE.md's "Build toolchain" section. (The reference
-        # toolchain is Fedora's; this runner installs the equivalent clang via
-        # apt. Revisit when codegen starts linking LLVM and version parity with
-        # Fedora's LLVM matters.)
-        run: sudo apt-get update && sudo apt-get install -y cmake clang llvm ninja-build
-      - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBEZEL_WERROR=ON -DCMAKE_BUILD_TYPE=Debug
-      - name: Build
-        run: cmake --build build
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+      - name: CI disabled
+        run: |
+          echo "CI is disabled — see the comment in .github/workflows/ci.yml."
+          echo "Run scripts/run-tests.sh locally for validation."
