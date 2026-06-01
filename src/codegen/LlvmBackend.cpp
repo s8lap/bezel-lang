@@ -5372,6 +5372,29 @@ private:
                 if (m == "E")  return llvm::ConstantFP::get(dbl, 2.71828182845904523536);
             }
             // Math.Log(x), Math.Log2(x), Math.Log10(x)
+            // Math.Clamp(value, min, max): clamp value to [min, max].
+            if (m == "Clamp" && call.args.size() == 3 &&
+                call.args[0].value && call.args[1].value && call.args[2].value) {
+                llvm::Value* val = lowerExpr(*call.args[0].value);
+                llvm::Value* lo  = lowerExpr(*call.args[1].value);
+                llvm::Value* hi  = lowerExpr(*call.args[2].value);
+                if (!val || !lo || !hi) return nullptr;
+                if (val->getType()->isIntegerTy()) {
+                    llvm::Value* clamped = builder_.CreateSelect(
+                        builder_.CreateICmpSLT(val, lo), lo, val);
+                    return builder_.CreateSelect(
+                        builder_.CreateICmpSGT(clamped, hi), hi, clamped, "clamp.result");
+                } else {
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!val->getType()->isDoubleTy()) val = builder_.CreateSIToFP(val, dbl);
+                    if (!lo->getType()->isDoubleTy())  lo  = builder_.CreateSIToFP(lo, dbl);
+                    if (!hi->getType()->isDoubleTy())  hi  = builder_.CreateSIToFP(hi, dbl);
+                    llvm::Value* clamped = builder_.CreateSelect(
+                        builder_.CreateFCmpOLT(val, lo), lo, val);
+                    return builder_.CreateSelect(
+                        builder_.CreateFCmpOGT(clamped, hi), hi, clamped, "clamp.f.result");
+                }
+            }
             if (call.args.size() == 1 && call.args[0].value && (m == "Log" || m == "Log2" || m == "Log10")) {
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
                 if (!arg) return nullptr;
