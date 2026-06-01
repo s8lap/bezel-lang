@@ -1565,6 +1565,17 @@ private:
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                         return;
                     }
+                    // string static methods → bool or string.
+                    if (pt == PrimitiveType::String) {
+                        if (mbr == "IsNullOrEmpty" || mbr == "IsNullOrWhiteSpace") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                            return;
+                        }
+                        if (mbr == "Concat" || mbr == "Join" || mbr == "Empty") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                            return;
+                        }
+                    }
                 }
             }
         }
