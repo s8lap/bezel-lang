@@ -1469,6 +1469,18 @@ private:
                 ctx_.setExprType(&ce, unit);
             }
         }
+        // CG60: call through a function-typed local/parameter — propagate the
+        // function's declared return type to the CallExpr so that downstream
+        // expressions (e.g. `var x := f(n)`) are typed correctly.
+        if (auto* loc = dynamic_cast<LocalSymbol*>(calleeSym)) {
+            if (loc->declType && loc->declType->kind == TypeRef::Kind::Function &&
+                loc->declType->funcReturn)
+                ctx_.setExprType(&ce, loc->declType->funcReturn);
+        } else if (auto* par = dynamic_cast<ParameterSymbol*>(calleeSym)) {
+            TypeRef* prt = par->declType ? ctx_.resolvedType(*par->declType) : nullptr;
+            if (prt && prt->kind == TypeRef::Kind::Function && prt->funcReturn)
+                ctx_.setExprType(&ce, prt->funcReturn);
+        }
         // CG27c: if the callee is an intrinsic member (no symbol, but has a
         // type set by the MemberAccessExpr handler), propagate that type to
         // the CallExpr — e.g. `n.ToString()` callee has type `string`.
