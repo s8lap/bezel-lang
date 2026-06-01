@@ -5401,10 +5401,49 @@ private:
                 if (!ma->target) return nullptr;
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (!obj) return nullptr;
+                // CG-generic: set up genericSubst_ for the receiver's type so
+                // that fields accessed inside the getter use the right struct.
+                auto savedSubst = genericSubst_;
+                if (auto* sym = ctx_.exprSymbol(*ma)) {
+                    if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+                        if (ps->parent && ps->parent->decl) {
+                            sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                            if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                                recvTy->declaration == ps->parent &&
+                                !recvTy->genericArgs.empty()) {
+                                auto* td = dynamic_cast<const ast::TypeDecl*>(ps->parent->decl);
+                                if (td && td->genericParams.size() == recvTy->genericArgs.size()) {
+                                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                                    for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
+                                        llvm::Type* concrTy = lowerTypeRef(recvTy->genericArgs[gi]);
+                                        newSubst[td->genericParams[gi].name] = concrTy;
+                                    }
+                                    // Check unresolved (i32 fallback) → use localGenericSubst_
+                                    bool hasUnresolved = false;
+                                    for (auto& [n, ty] : newSubst)
+                                        if (ty == i32()) { hasUnresolved = true; break; }
+                                    if (hasUnresolved) {
+                                        sema::Symbol* recvSym = ctx_.exprSymbol(*ma->target);
+                                        const ast::Node* decl = nullptr;
+                                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(recvSym))
+                                            decl = loc->decl;
+                                        if (decl) {
+                                            auto lit = localGenericSubst_.find(decl);
+                                            if (lit != localGenericSubst_.end())
+                                                newSubst = lit->second;
+                                        }
+                                    }
+                                    genericSubst_ = std::move(newSubst);
+                                }
+                            }
+                        }
+                    }
+                }
                 llvm::Value* saved = currentThis_;
                 currentThis_ = obj;
                 llvm::Value* v = lowerExpr(*getter);
                 currentThis_ = saved;
+                genericSubst_ = std::move(savedSubst);
                 return v;
             }
         }
