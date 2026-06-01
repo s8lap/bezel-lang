@@ -4095,6 +4095,52 @@ private:
                                 if (recv)
                                     return emitPrimitiveToString(recv, tt->primitive);
                             }
+                            // §6.3: FP predicates as instance methods (x.IsNaN(), x.IsFinite()).
+                            if (call->args.empty()) {
+                                using P = sema::PrimitiveType;
+                                bool isFP = tt->primitive == P::Double || tt->primitive == P::Float;
+                                if (ma->member == "IsNaN" && isFP) {
+                                    llvm::Value* recv = lowerExpr(*ma->target);
+                                    if (!recv) return nullptr;
+                                    return builder_.CreateFCmpUNO(recv, recv, "isnan");
+                                }
+                                if (ma->member == "IsInfinity" && isFP) {
+                                    llvm::Value* recv = lowerExpr(*ma->target);
+                                    if (!recv) return nullptr;
+                                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                                    if (!recv->getType()->isDoubleTy())
+                                        recv = builder_.CreateFPExt(recv, dbl);
+                                    return builder_.CreateOr(
+                                        builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(dbl, false)),
+                                        builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(dbl, true)));
+                                }
+                                if (ma->member == "IsFinite" && isFP) {
+                                    llvm::Value* recv = lowerExpr(*ma->target);
+                                    if (!recv) return nullptr;
+                                    // IsFinite = !IsNaN && !IsInfinity
+                                    llvm::Value* isNaN = builder_.CreateFCmpUNO(recv, recv);
+                                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                                    if (!recv->getType()->isDoubleTy())
+                                        recv = builder_.CreateFPExt(recv, dbl);
+                                    llvm::Value* isInf = builder_.CreateOr(
+                                        builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(dbl, false)),
+                                        builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(dbl, true)));
+                                    return builder_.CreateNot(builder_.CreateOr(isNaN, isInf), "isfinite");
+                                }
+                                if (ma->member == "Abs") {
+                                    llvm::Value* recv = lowerExpr(*ma->target);
+                                    if (!recv) return nullptr;
+                                    if (recv->getType()->isFloatingPointTy()) {
+                                        auto* fn = llvm::Intrinsic::getDeclaration(
+                                            module_.get(), llvm::Intrinsic::fabs, {recv->getType()});
+                                        return builder_.CreateCall(fn, {recv}, "fabs");
+                                    } else {
+                                        llvm::Value* isNeg = builder_.CreateICmpSLT(
+                                            recv, llvm::ConstantInt::get(recv->getType(), 0));
+                                        return builder_.CreateSelect(isNeg, builder_.CreateNeg(recv), recv, "abs");
+                                    }
+                                }
+                            }
                             // §9.x: ToString(format) — formatted numeric string.
                             if (call->args.size() == 1 && call->args[0].value &&
                                 ma->member == "ToString") {
