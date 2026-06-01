@@ -4296,14 +4296,25 @@ private:
                 // dispatch if the type has a ToString method, else fall back
                 // to a type-name placeholder string.
                 auto* ts = argTy->declaration;
-                // Find a 'ToString' method symbol by walking members.
+                // Find a 'ToString()' method walking the inheritance chain.
+                // ToString() may be declared on a base class (e.g. Shape)
+                // and inherited by the concrete type (Circle).
                 sema::MethodSymbol* toStr = nullptr;
-                for (auto* sym : ts->members) {
-                    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
-                    if (ms && ms->name == "ToString" && ms->params.empty()) {
-                        toStr = ms;
-                        break;
+                for (auto* cur = ts; cur && !toStr;) {
+                    for (auto* sym : cur->members) {
+                        auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                        if (ms && ms->name == "ToString" && ms->params.empty()) {
+                            toStr = ms;
+                            break;
+                        }
                     }
+                    // Walk to first base class.
+                    sema::TypeSymbol* next = nullptr;
+                    for (auto* b : cur->baseTypes)
+                        if (b && b->kind == ast::TypeDeclKind::Class) {
+                            next = b; break;
+                        }
+                    cur = next;
                 }
                 if (toStr) {
                     // Emit the method call (virtual if overriding, static otherwise).
