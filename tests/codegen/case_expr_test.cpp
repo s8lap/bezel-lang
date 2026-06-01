@@ -69,3 +69,36 @@ BEZEL_TEST(codegen_cg28, no_match_raises_match_failure) {
         "try var r := case x 1 => 10, 2 => 20 end; return r; "
         "catch MatchFailureException => return 77; end;"), 77);
 }
+
+// §19.3: range patterns in case arms — `lo..hi` and `lo..<hi`.
+BEZEL_TEST(codegen_cg28, range_pattern_hit) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; "
+        "var r := case x 1..3 => 1, 4..6 => 2, _ => 3 end; return r;"), 2);
+}
+
+BEZEL_TEST(codegen_cg28, range_pattern_low_arm) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 2; "
+        "var r := case x 1..3 => 1, 4..6 => 2, _ => 3 end; return r;"), 1);
+}
+
+BEZEL_TEST(codegen_cg28, range_pattern_wildcard_fallthrough) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 9; "
+        "var r := case x 1..3 => 1, 4..6 => 2, _ => 3 end; return r;"), 3);
+}
+
+BEZEL_TEST(codegen_cg28, range_pattern_half_open) {
+    // `..<` excludes the upper bound.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 6; "
+        "var r := case x 1..<6 => 1, 6..10 => 2, _ => 0 end; return r;"), 2);
+}
+
+BEZEL_TEST(codegen_cg28, range_pattern_combined_with_constant) {
+    // A range pattern and a constant pattern in the same case.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 0; "
+        "var r := case x 0 => 10, 1..5 => 20, _ => 30 end; return r;"), 10);
+}
