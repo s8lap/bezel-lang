@@ -5299,12 +5299,23 @@ private:
         if (!call.callee) return nullptr;
         // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
         if (tryLowerConsoleCall(call)) return nullptr;  // unit result
-        // Console.ReadLine() → string? (returns a value, not unit)
+        // Console.ReadLine() → string? / Console.ReadKey() → char
         if (call.args.empty() && call.callee) {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
-                if (ma->member == "ReadLine" && ma->target) {
+                if (ma->target) {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
-                        if (id->name == "Console") return emitConsoleReadLine();
+                        if (id->name == "Console") {
+                            if (ma->member == "ReadLine") return emitConsoleReadLine();
+                            if (ma->member == "ReadKey") {
+                                // getchar() → char (i32)
+                                auto* gcFn = module_->getFunction("getchar");
+                                if (!gcFn) {
+                                    auto* ft = llvm::FunctionType::get(i32(), {}, false);
+                                    gcFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "getchar", module_.get());
+                                }
+                                return builder_.CreateCall(gcFn, {}, "readkey");
+                            }
+                        }
                     }
                 }
             }

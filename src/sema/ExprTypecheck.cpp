@@ -1717,13 +1717,15 @@ private:
                     else if (m=="ToBoolean") setBool();
                     else if (m=="ToString") setStr();
                 }
-                // Console.ReadLine() → string? (null at EOF).
+                // Console input methods.
                 if (cls == "Console") {
                     if (m == "ReadLine")
                         ctx_.setExprType(
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::String,
                                                        /*nullable=*/true));
-                    // Write/WriteLine/ReadKey → unit (leave untyped).
+                    else if (m == "ReadKey")
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Char));
+                    // Write/WriteLine → unit (leave untyped).
                 }
             }
             // Slice 3d intentionally does NOT diagnose unknown members.
