@@ -7524,6 +7524,10 @@ private:
                 }
                 return builder_.CreateCall(fn, {arg}, "tolower.result");
             }
+            // char.ToString(c): string — convert char code point to string.
+            if (m == "ToString") {
+                return emitPrimitiveToString(arg, sema::PrimitiveType::Char);
+            }
         }
 
         // string.IsNullOrEmpty(s): bool — true if s is null or length 0.
