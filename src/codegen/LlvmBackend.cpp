@@ -5628,6 +5628,15 @@ private:
                     /* >= */ return builder_.CreateICmpSGE(cmp, zero);
                 }
             }
+            // §4.6: primitive + string — convert lhs to string first.
+            if (isStr(bin.right.get()) && op == "+" && !eitherNull) {
+                auto* lt = ctx_.exprType(*bin.left);
+                if (lt && lt->kind == sema::TypeRef::Kind::Primitive &&
+                    lt->primitive != sema::PrimitiveType::String) {
+                    llvm::Value* lStr = emitPrimitiveToString(l, lt->primitive);
+                    return emitStringConcat(lStr, r);
+                }
+            }
         }
         // CG22 (§6.1): integer + - * are overflow-checked; / and mod also
         // raise on a zero divisor and on INT_MIN / -1. Applies to integer
