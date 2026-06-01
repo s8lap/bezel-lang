@@ -1565,6 +1565,20 @@ private:
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                         return;
                     }
+                    // char static classification methods → bool.
+                    if (pt == PrimitiveType::Char) {
+                        if (mbr == "IsDigit" || mbr == "IsLetter" ||
+                            mbr == "IsLetterOrDigit" || mbr == "IsWhiteSpace" ||
+                            mbr == "IsUpper" || mbr == "IsLower" ||
+                            mbr == "IsPunctuation" || mbr == "IsSymbol") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                            return;
+                        }
+                        if (mbr == "ToUpper" || mbr == "ToLower") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Char));
+                            return;
+                        }
+                    }
                     // string static methods → bool or string.
                     if (pt == PrimitiveType::String) {
                         if (mbr == "IsNullOrEmpty" || mbr == "IsNullOrWhiteSpace") {
