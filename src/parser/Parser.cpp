@@ -1567,9 +1567,22 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
 
         // §17.4: `is` / `is not` / `as` take a Type on the right. `in` takes
         // an expression (it's a regular binary op).
+        // §17.4 special: `is null` / `is not null` compare to the null
+        // literal rather than naming a type — lower to an equality test.
         const bool isTypeTest =
             (opText == "is" || opText == "is not" || opText == "as");
-        if (isTypeTest) {
+        if (isTypeTest && isKeyword("null") &&
+            (opText == "is" || opText == "is not")) {
+            advance();  // past `null`
+            auto bin = std::make_unique<ast::BinaryExpr>();
+            bin->op = (opText == "is") ? "=" : "<>";
+            bin->left = std::move(left);
+            bin->right = [&]() {
+                auto nl = std::make_unique<ast::NullLiteralExpr>();
+                return std::unique_ptr<ast::Expr>(nl.release());
+            }();
+            left = std::unique_ptr<ast::Expr>(bin.release());
+        } else if (isTypeTest) {
             auto tt = std::make_unique<ast::TypeTestExpr>();
             tt->operand = std::move(left);
             tt->op = opText;
