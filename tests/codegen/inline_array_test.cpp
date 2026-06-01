@@ -123,3 +123,46 @@ BEZEL_TEST(codegen_array, array_of_records_equality) {
         "  return (1 if ps[0] = ps[1] else 0); "
         "end Main; end C;"), 1);
 }
+
+// Array passed by ref — element modifications visible to caller.
+BEZEL_TEST(codegen_array, fill_via_ref_parameter) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Fill(ref a: [5]int, v: int) "
+        "    for var i in 0..4 do a[i] := v; end; "
+        "  end Fill; "
+        "  public static method Main(): int "
+        "    var b: [5]int; Fill(ref b, 7); return b[2]; "
+        "  end Main; "
+        "end C;"), 7);
+}
+
+// Inline array as a field of a class instance.
+BEZEL_TEST(codegen_array, array_as_class_field) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Container public data: [3]int; "
+        "  public static method Main(): int "
+        "    var c := new Container(); "
+        "    c.data[0] := 10; c.data[1] := 20; c.data[2] := 30; "
+        "    return c.data[0] + c.data[1] + c.data[2]; "
+        "  end Main; "
+        "end Container;"), 60);
+}
+
+// Binary search over a sorted inline array.
+BEZEL_TEST(codegen_array, binary_search) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var a: [8]int; "
+        "  a[0]:=1; a[1]:=3; a[2]:=5; a[3]:=7; "
+        "  a[4]:=9; a[5]:=11; a[6]:=13; a[7]:=15; "
+        "  var target := 9; var lo := 0; var hi := 7; var found := -1; "
+        "  while lo <= hi do "
+        "    var mid := (lo + hi) / 2; "
+        "    if a[mid] = target then found := mid; lo := hi + 1; "
+        "    elif a[mid] < target then lo := mid + 1; "
+        "    else hi := mid - 1; end; "
+        "  end; "
+        "  return found; "
+        "end Main; end C;"), 4);
+}
