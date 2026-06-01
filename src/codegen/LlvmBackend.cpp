@@ -5686,6 +5686,43 @@ private:
                 }
                 return builder_.CreateCall(logFn, {arg}, std::string(m) + ".result");
             }
+            // §6.1/§6.3: Trig functions — 1-arg via libc.
+            if (call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!arg->getType()->isDoubleTy()) arg = builder_.CreateSIToFP(arg, dbl);
+                const char* fn1 = m == "Sin" ? "sin" : m == "Cos" ? "cos" :
+                    m == "Tan" ? "tan" : m == "Asin" ? "asin" : m == "Acos" ? "acos" :
+                    m == "Atan" ? "atan" : m == "Exp" ? "exp" :
+                    m == "Sinh" ? "sinh" : m == "Cosh" ? "cosh" : m == "Tanh" ? "tanh" : nullptr;
+                if (fn1) {
+                    auto* fn = module_->getFunction(fn1);
+                    if (!fn) {
+                        auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
+                        fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fn1, module_.get());
+                    }
+                    return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
+                }
+            }
+            // §6.1: Math.Fmod, IEEERemainder, Atan2, Hypot — 2-arg via libc.
+            if (call.args.size() == 2 && call.args[0].value && call.args[1].value &&
+                (m == "Fmod" || m == "IEEERemainder" || m == "Atan2" || m == "Hypot")) {
+                llvm::Value* a = lowerExpr(*call.args[0].value);
+                llvm::Value* b = lowerExpr(*call.args[1].value);
+                if (!a || !b) return nullptr;
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                const char* fn2 = m == "Fmod" ? "fmod" : m == "IEEERemainder" ? "remainder" :
+                                   m == "Atan2" ? "atan2" : "hypot";
+                auto* fn = module_->getFunction(fn2);
+                if (!fn) {
+                    auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
+                    fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fn2, module_.get());
+                }
+                return builder_.CreateCall(fn, {a, b}, std::string(m) + ".result");
+            }
         }
 
         // §2.x: Random class — pseudorandom numbers via libc rand()/srand().
