@@ -430,3 +430,50 @@ BEZEL_TEST(integration, resource_disposal_order) {
         "  return R._log; "
         "end Main; end C;"), 65);  // 321 mod 256 = 65 (8-bit exit code)
 }
+
+BEZEL_TEST(integration, record_operators_and_pattern_matching) {
+    // Record operators + destructuring pattern.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "record Pair(x: int, y: int); "
+        "class C "
+        "  public static method Sum(p: Pair): int "
+        "    return case p Pair(a, b) => a + b, _ => 0 end; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    var p := new Pair(10, 20); "
+        "    return Sum(p); "
+        "  end Main; "
+        "end C;"), 30);
+}
+
+BEZEL_TEST(integration, binding_pattern_with_guard) {
+    // Binding pattern with guard in case expression.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var n := 42; "
+        "  return case n "
+        "    var x when x > 100 => 1, "
+        "    var x when x > 10  => 2, "
+        "    _ => 3 end; "
+        "end Main; end C;"), 2);
+}
+
+BEZEL_TEST(integration, string_operations_chain) {
+    // Chained string operations.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := \"  Hello, World!  \"; "
+        "  var t := s.Trim().ToLower().Replace(\",\", \"\"); "
+        "  return (1 if t.StartsWith(\"hello\") else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(integration, math_truncate) {
+    // Math.Truncate truncates toward zero (not floor).
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var x := 0.0 - 2.7; "
+        "  return int(Math.Truncate(x)); "  // -2, not -3
+        "end Main; end C;"), -2 & 255);  // -2 mod 256 = 254
+}
