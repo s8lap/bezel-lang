@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -211,6 +212,17 @@ private:
 
     // CG30: computed integer value of each enum constant (§10).
     std::unordered_map<const sema::Symbol*, std::int64_t> enumValue_;
+
+    // CG-generic: generic type substitution — maps type-parameter names to
+    // their concrete LLVM types during the lowering of a specific instantiation
+    // (e.g. Box<int>: {"T" → i32}). Set by classStructInst before calling
+    // classStruct; cleared after. Also caches specialized struct types so
+    // Box<int> and Box<string> get distinct LLVM structs.
+    std::unordered_map<std::string_view, llvm::Type*> genericSubst_;
+    // specializedStructs_[ts][signature_key] = cached StructType
+    std::map<const sema::TypeSymbol*,
+             std::map<std::vector<llvm::Type*>, llvm::StructType*>>
+        specializedStructs_;
 
     // CG26: external (FFI) function declared by an extern block (§32).
     std::unordered_map<const sema::ExternDeclSymbol*, llvm::Function*>
@@ -2090,19 +2102,26 @@ private:
             case sema::TypeRef::Kind::Primitive:
                 return lowerPrimitive(rt->primitive);
             case sema::TypeRef::Kind::Named:
+                // CG-generic: a Named type with null declaration is a generic
+                // type parameter (e.g. T in Box<T>). If there's an active
+                // substitution, resolve via the param's name in the ast::Type.
+                if (!rt->declaration && !genericSubst_.empty()) {
+                    if (rt->astNode && rt->astNode->name &&
+                        rt->astNode->name->parts.size() == 1) {
+                        auto sit = genericSubst_.find(
+                            rt->astNode->name->parts[0]);
+                        if (sit != genericSubst_.end())
+                            return sit->second;
+                    }
+                    return i32();  // unresolved generic param → i32 fallback
+                }
                 if (rt->declaration &&
                     (rt->declaration->kind == ast::TypeDeclKind::Class ||
                      rt->declaration->kind == ast::TypeDeclKind::Interface)) {
                     return ptrTy();  // reference types are heap pointers
                 }
                 // §9.4: a record is a value type, lowered to a first-class
-                // LLVM struct value. Locals/params/returns hold the struct by
-                // value, so copy-on-assignment and copy-on-return are
-                // automatic and frame-safe (a returned record travels in
-                // registers, not as a pointer into the callee's dead frame).
-                // Field access spills the value to a stack slot to take a
-                // field address; records are immutable (§9.2) so the spill
-                // never loses a write.
+                // LLVM struct value.
                 if (rt->declaration &&
                     rt->declaration->kind == ast::TypeDeclKind::Record) {
                     return recordStruct(rt->declaration);
@@ -2286,10 +2305,43 @@ private:
     // property means an inherited field has the same index in the base
     // struct and every derived struct, so member access through
     // fs->parent's struct is correct on a derived instance.
+    //
+    // CG-generic: when genericSubst_ is non-empty (during lowering of a
+    // generic instantiation like Box<int>), the struct is built with the
+    // substituted field types. Specializations are cached separately so
+    // Box<int> and Box<string> get distinct LLVM struct types.
     llvm::StructType* classStruct(const sema::TypeSymbol* t) {
         // CG29: a record has no vtable header; route to recordStruct so every
         // classStruct caller (field access, etc.) gets the right layout.
         if (t->kind == ast::TypeDeclKind::Record) return recordStruct(t);
+
+        // CG-generic: if we have an active substitution, compute the concrete
+        // field types first and look them up in the specialization cache.
+        if (!genericSubst_.empty()) {
+            // Peek at what field types we'd get with the substitution.
+            std::vector<const sema::Symbol*> storage;
+            collectInstanceStorage(t, storage);
+            std::vector<llvm::Type*> specFieldTys;
+            specFieldTys.push_back(ptrTy());
+            for (const sema::Symbol* m : storage)
+                specFieldTys.push_back(storageType(m));
+            // Cache lookup: specializedStructs_[t][specFieldTys] → existing
+            auto& specMap = specializedStructs_[t];
+            auto sit = specMap.find(specFieldTys);
+            if (sit != specMap.end()) return sit->second;
+            // Create new specialized struct.
+            std::string specName = std::string("class.") + std::string(t->name)
+                + "$spec" + std::to_string(specMap.size());
+            auto* specSt = llvm::StructType::create(llvm_, specName);
+            specSt->setBody(specFieldTys);
+            specMap[specFieldTys] = specSt;
+            // Register field indices for this specialization.
+            unsigned sidx = 1;
+            for (const sema::Symbol* m : storage)
+                fieldIndex_[m] = sidx++;
+            return specSt;
+        }
+
         auto it = structs_.find(t);
         if (it != structs_.end()) return it->second;
         auto* st = llvm::StructType::create(
@@ -5615,7 +5667,25 @@ private:
         if (t->kind == ast::TypeDeclKind::Record)
             return buildRecordValue(t, ne.args);
 
+        // CG-generic: if this is a generic instantiation (e.g. Box<int>),
+        // set up the type-parameter substitution before classStruct so that
+        // field types are computed with the concrete type arguments.
+        auto savedSubst = genericSubst_;  // save outer subst (nested generics)
+        if (!rt->genericArgs.empty() && t->decl) {
+            auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+            if (td && td->genericParams.size() == rt->genericArgs.size()) {
+                genericSubst_.clear();
+                for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
+                    llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
+                    genericSubst_[td->genericParams[gi].name] = concrTy;
+                }
+            }
+        }
+
         llvm::StructType* st = classStruct(t);
+        // Note: genericSubst_ stays active until after the constructor runs,
+        // so that inline constructor bodies (for generic types) use concrete
+        // types. It is restored at the end of lowerNew.
 
         // sizeof(st) via the null-GEP / ptrtoint idiom (no DataLayout dep).
         llvm::Value* sizeofSt = builder_.CreatePtrToInt(
@@ -5661,17 +5731,50 @@ private:
         // CG16: select the ctor by arity (covers single-ctor and
         // arity-distinct overloads; full type-based overload resolution
         // is deferred). The chosen ctor runs its own base/this chain.
+        //
+        // CG-generic: when the type has an active generic substitution, the
+        // constructor function was compiled for the generic template (T→i32)
+        // but the actual arguments use concrete types. Emit the constructor
+        // body INLINE with the substitution active so that parameter types
+        // and field stores use the correct concrete types. This avoids the
+        // ABI mismatch that results from calling a T→i32 ctor with f64 args.
         if (sema::ConstructorSymbol* cs = ctorForArgs(t, ne.args)) {
             auto it = ctorFns_.find(cs);
             auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
             if (it != ctorFns_.end() && cd) {
                 std::vector<llvm::Value*> args;
                 args.push_back(obj);
-                // §22.4/§22.7: named arguments and default values, as for a
-                // method call.
                 if (buildOrderedArgs(cd->params, ne.args, args) &&
                     args.size() == it->second->arg_size()) {
-                    builder_.CreateCall(it->second, args);
+                    // Check for type mismatch (generic substitution active).
+                    bool typesMismatch = false;
+                    auto* callFnTy = it->second->getFunctionType();
+                    for (std::size_t ai = 0; ai < args.size(); ++ai)
+                        if (args[ai]->getType() != callFnTy->getParamType(ai))
+                            { typesMismatch = true; break; }
+
+                    if (!typesMismatch || genericSubst_.empty()) {
+                        builder_.CreateCall(it->second, args);
+                    } else {
+                        // Inline the constructor body with the generic
+                        // substitution so field stores use concrete types.
+                        llvm::Value* savedThis = currentThis_;
+                        auto savedLocals = locals_;
+                        auto savedParams = paramSlots_;
+                        currentThis_ = obj;
+                        locals_.clear();
+                        paramSlots_.clear();
+                        // Bind constructor params to the concrete arg values.
+                        for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
+                            auto* slot = entryAlloca(args[pi + 1]->getType());
+                            builder_.CreateStore(args[pi + 1], slot);
+                            paramSlots_[cs->params[pi]] = slot;
+                        }
+                        lowerScopedBlock(cd->body);
+                        currentThis_ = savedThis;
+                        locals_ = std::move(savedLocals);
+                        paramSlots_ = std::move(savedParams);
+                    }
                     emitPendingCheck();  // CG20: a constructor may throw
                 }
             }
@@ -5681,6 +5784,8 @@ private:
             emitImplicitBase(t, obj);
             emitPendingCheck();  // CG20: the base constructor may throw
         }
+        // CG-generic: restore the outer generic substitution.
+        genericSubst_ = std::move(savedSubst);
         return obj;
     }
 
@@ -5692,8 +5797,34 @@ private:
         auto* ms = storageMemberOf(ctx_.exprSymbol(ma));
         if (!ms || !ms->parent || !ma.target) return nullptr;
         auto idxIt = fieldIndex_.find(ms);
-        if (idxIt == fieldIndex_.end()) return nullptr;
+        // CG-generic: for generic class field access (e.g. bd.value where
+        // bd: Box<double>), set up the substitution from the target's exprType
+        // so classStruct uses the correct concrete field types.
+        auto savedSubst = genericSubst_;
+        if (sema::TypeRef* targetTy = ctx_.exprType(*ma.target)) {
+            if (targetTy->kind == sema::TypeRef::Kind::Named &&
+                targetTy->declaration == ms->parent &&
+                !targetTy->genericArgs.empty()) {
+                auto* td = dynamic_cast<const ast::TypeDecl*>(
+                    ms->parent->decl);
+                if (td && td->genericParams.size() ==
+                          targetTy->genericArgs.size()) {
+                    genericSubst_.clear();
+                    for (std::size_t gi = 0;
+                         gi < td->genericParams.size(); ++gi) {
+                        genericSubst_[td->genericParams[gi].name] =
+                            lowerTypeRef(targetTy->genericArgs[gi]);
+                    }
+                }
+            }
+        }
+        if (idxIt == fieldIndex_.end()) {
+            // Re-run classStruct to populate fieldIndex_ under the substitution.
+            classStruct(ms->parent);
+            idxIt = fieldIndex_.find(ms);
+        }
         llvm::StructType* st = classStruct(ms->parent);
+        genericSubst_ = std::move(savedSubst);
         // CG29: a record is a first-class struct value, not a pointer. To take
         // the address of one of its fields, GEP the record's storage:
         //  - an addressable target (a record local/parameter) → GEP its slot
