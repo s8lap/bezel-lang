@@ -1444,6 +1444,44 @@ private:
         }
 
         // §9.6: LastIndexOf(sub: string): int — last occurrence, -1 if not found.
+        // §9.6: LastIndexOf(char) overload — scan backward, return last match index.
+        if (method == "LastIndexOf" && call.args.size() == 1 && call.args[0].value) {
+            auto* argTy = ctx_.exprType(*call.args[0].value);
+            if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+                argTy->primitive == sema::PrimitiveType::Char) {
+                llvm::Value* needle = lowerExpr(*call.args[0].value);
+                if (!needle) return nullptr;
+                llvm::Value* len = loadStringLen(self);
+                // Scan from len-1 down to 0.
+                auto* lastS = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt32(-1), lastS);
+                auto* cBB = llvm::BasicBlock::Create(llvm_, "lioc.c", currentFn_);
+                auto* bBB = llvm::BasicBlock::Create(llvm_, "lioc.b", currentFn_);
+                auto* eBB = llvm::BasicBlock::Create(llvm_, "lioc.e", currentFn_);
+                auto* idxS = entryAlloca(i64());
+                llvm::Value* startIdx = builder_.CreateSub(len, builder_.getInt64(1));
+                builder_.CreateStore(startIdx, idxS);
+                builder_.CreateBr(cBB);
+                builder_.SetInsertPoint(cBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
+                builder_.CreateCondBr(builder_.CreateICmpSGE(idx, builder_.getInt64(0)), bBB, eBB);
+                builder_.SetInsertPoint(bBB);
+                llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
+                llvm::Value* cp = loadCodePoint(self, idxB);
+                llvm::Value* found = builder_.CreateICmpEQ(cp, needle);
+                auto* storeB = llvm::BasicBlock::Create(llvm_, "lioc.st", currentFn_);
+                auto* decBB = llvm::BasicBlock::Create(llvm_, "lioc.dec", currentFn_);
+                builder_.CreateCondBr(found, storeB, decBB);
+                builder_.SetInsertPoint(storeB);
+                builder_.CreateStore(builder_.CreateTrunc(idxB, i32()), lastS);
+                builder_.CreateBr(eBB);  // stop at first match from the end
+                builder_.SetInsertPoint(decBB);
+                builder_.CreateStore(builder_.CreateSub(idxB, builder_.getInt64(1)), idxS);
+                builder_.CreateBr(cBB);
+                builder_.SetInsertPoint(eBB);
+                return builder_.CreateLoad(i32(), lastS, "lioc.result");
+            }
+        }
         // Implemented by scanning from the end using reverse memmem search loop.
         if (method == "LastIndexOf") {
             llvm::Value* sub = getStrArg(0);
