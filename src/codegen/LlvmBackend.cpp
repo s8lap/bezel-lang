@@ -5010,6 +5010,49 @@ private:
         const auto& m = ma->member;
         using P = sema::PrimitiveType;
 
+        // §5: char static classification methods — char.IsDigit(c), etc.
+        if (pt == P::Char && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            // Widen to i32 for libc functions if needed.
+            if (!arg->getType()->isIntegerTy(32))
+                arg = builder_.CreateSExt(arg, i32());
+            // Map Bezel method names to libc functions.
+            const char* fnName = nullptr;
+            if (m == "IsDigit") fnName = "isdigit";
+            else if (m == "IsLetter") fnName = "isalpha";
+            else if (m == "IsLetterOrDigit") fnName = "isalnum";
+            else if (m == "IsWhiteSpace") fnName = "isspace";
+            else if (m == "IsUpper") fnName = "isupper";
+            else if (m == "IsLower") fnName = "islower";
+            else if (m == "IsPunctuation") fnName = "ispunct";
+            if (fnName) {
+                auto* fn = module_->getFunction(fnName);
+                if (!fn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                    fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fnName, module_.get());
+                }
+                llvm::Value* res = builder_.CreateCall(fn, {arg}, std::string(fnName) + ".res");
+                return builder_.CreateICmpNE(res, builder_.getInt32(0), std::string(fnName) + ".bool");
+            }
+            if (m == "ToUpper") {
+                auto* fn = module_->getFunction("toupper");
+                if (!fn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                    fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "toupper", module_.get());
+                }
+                return builder_.CreateCall(fn, {arg}, "toupper.result");
+            }
+            if (m == "ToLower") {
+                auto* fn = module_->getFunction("tolower");
+                if (!fn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                    fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "tolower", module_.get());
+                }
+                return builder_.CreateCall(fn, {arg}, "tolower.result");
+            }
+        }
+
         // string.IsNullOrEmpty(s): bool — true if s is null or length 0.
         if (pt == P::String && m == "IsNullOrEmpty" &&
             call.args.size() == 1 && call.args[0].value) {
