@@ -1801,6 +1801,59 @@ private:
             return builder_.CreateLoad(i32(), cntSlot, "countof.result");
         }
 
+        // §9.6: Remove(start): string — remove from start to end.
+        // §9.6: Remove(start, count): string — remove count code points.
+        if (method == "Remove" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* startV = getIntArg(0);
+            if (!startV) return nullptr;
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* selfLen  = loadStringLen(self);
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* start64 = builder_.CreateSExt(startV, i64(), "rm.start");
+            // end = start + count (if given), else = selfLen
+            llvm::Value* end64;
+            if (call.args.size() >= 2 && call.args[1].value) {
+                llvm::Value* cntV = lowerExpr(*call.args[1].value);
+                if (!cntV) return nullptr;
+                llvm::Value* cnt64 = builder_.CreateSExt(cntV, i64(), "rm.cnt");
+                end64 = builder_.CreateAdd(start64, cnt64, "rm.end");
+                // Clamp to selfLen
+                llvm::Value* pastEnd = builder_.CreateICmpSGT(end64, selfLen);
+                end64 = builder_.CreateSelect(pastEnd, selfLen, end64);
+            } else {
+                end64 = selfLen;  // remove from start to end of string
+            }
+            // Result length = start + (selfLen - end)
+            llvm::Value* tailLen = builder_.CreateSub(selfLen, end64, "rm.tail");
+            llvm::Value* resultLen = builder_.CreateAdd(start64, tailLen, "rm.reslen");
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            // Byte sizes (width=1 for now — simple byte operations).
+            llvm::Value* dataSz = builder_.CreateAdd(resultLen, builder_.getInt64(1));
+            llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "rm.data");
+            // Copy prefix (0..start).
+            llvm::Value* wid = builder_.CreateZExt(loadStringWidth(self), i64());
+            llvm::Value* prefBytes = builder_.CreateMul(start64, wid);
+            builder_.CreateCall(memcpyFn, {newData, selfData, prefBytes});
+            // Copy suffix (end..selfLen).
+            llvm::Value* tailSrcOff = builder_.CreateMul(end64, wid);
+            llvm::Value* tailSrc = builder_.CreateGEP(i8Ty, selfData, tailSrcOff);
+            llvm::Value* tailDst = builder_.CreateGEP(i8Ty, newData, prefBytes);
+            llvm::Value* tailBytes = builder_.CreateMul(tailLen, wid);
+            builder_.CreateCall(memcpyFn, {tailDst, tailSrc, tailBytes});
+            // Null-terminate.
+            llvm::Value* resultBytes = builder_.CreateMul(resultLen, wid);
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, resultBytes);
+            llvm::Value* maxW8 = builder_.CreateTrunc(loadStringWidth(self), llvm::Type::getInt8Ty(llvm_));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0), nulPtr);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rm.obj");
+            builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
+            builder_.CreateStore(resultLen, builder_.CreateStructGEP(stringType(), newStr, 1));
+            builder_.CreateStore(maxW8, builder_.CreateStructGEP(stringType(), newStr, 2));
+            return newStr;
+        }
+
         return nullptr;  // method not recognised
     }
 
