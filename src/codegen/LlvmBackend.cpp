@@ -7273,6 +7273,19 @@ private:
                     llvm::Value* isNegInf = builder_.CreateFCmpOEQ(arg, negInf);
                     return builder_.CreateOr(isPosInf, isNegInf, "isinf");
                 }
+                // Math.IsFinite(x): bool — not NaN and not infinity.
+                if (m == "IsFinite") {
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!arg->getType()->isDoubleTy())
+                        arg = builder_.CreateSIToFP(arg, dbl);
+                    llvm::Value* isNaN = builder_.CreateFCmpUNO(arg, arg);
+                    auto* posInf = llvm::ConstantFP::getInfinity(dbl, false);
+                    auto* negInf = llvm::ConstantFP::getInfinity(dbl, true);
+                    llvm::Value* isInf = builder_.CreateOr(
+                        builder_.CreateFCmpOEQ(arg, posInf),
+                        builder_.CreateFCmpOEQ(arg, negInf));
+                    return builder_.CreateNot(builder_.CreateOr(isNaN, isInf), "isfinite");
+                }
                 if (m == "Cbrt") {
                     // Math.Cbrt(x): double — cube root via libc cbrt().
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
