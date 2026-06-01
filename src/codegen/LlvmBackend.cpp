@@ -966,6 +966,57 @@ private:
             return lowerExpr(*call.args[idx].value);
         };
 
+        // §9.6: String parse methods — convenience wrappers over Convert.ToXxx.
+        if (call.args.empty()) {
+            llvm::Value* data = loadStringData(self);
+            if (method == "ToInt32") {
+                auto* atoiFn = module_->getFunction("atoi");
+                if (!atoiFn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+                    atoiFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atoi", module_.get());
+                }
+                return builder_.CreateCall(atoiFn, {data}, "atoi.ret");
+            }
+            if (method == "ToInt64") {
+                auto* atollFn = module_->getFunction("atoll");
+                if (!atollFn) {
+                    auto* ft = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                    atollFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atoll", module_.get());
+                }
+                return builder_.CreateCall(atollFn, {data}, "atoll.ret");
+            }
+            if (method == "ToDouble" || method == "ToFloat") {
+                auto* atofFn = module_->getFunction("atof");
+                if (!atofFn) {
+                    auto* ft = llvm::FunctionType::get(llvm::Type::getDoubleTy(llvm_), {ptrTy()}, false);
+                    atofFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atof", module_.get());
+                }
+                return builder_.CreateCall(atofFn, {data}, "atof.ret");
+            }
+            if (method == "ToBoolean") {
+                // "true" → true, "1" → true, anything else → false
+                auto* strcmpFn = module_->getFunction("strcasecmp");
+                if (!strcmpFn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    strcmpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "strcasecmp", module_.get());
+                }
+                llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
+                unsigned tid = stringLiteralIdx_++;
+                auto* trueGV = new llvm::GlobalVariable(*module_, trueStr->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, trueStr, ".bz.bool.true." + std::to_string(tid));
+                llvm::Value* cmpTrue = builder_.CreateICmpEQ(
+                    builder_.CreateCall(strcmpFn, {data, trueGV}),
+                    llvm::ConstantInt::get(i32(), 0));
+                llvm::Constant* oneStr = llvm::ConstantDataArray::getString(llvm_, "1", true);
+                auto* oneGV = new llvm::GlobalVariable(*module_, oneStr->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, oneStr, ".bz.bool.one." + std::to_string(tid));
+                llvm::Value* cmpOne = builder_.CreateICmpEQ(
+                    builder_.CreateCall(strcmpFn, {data, oneGV}),
+                    llvm::ConstantInt::get(i32(), 0));
+                return builder_.CreateOr(cmpTrue, cmpOne, "tobool");
+            }
+        }
+
         // §9.6: Equals(other: string): bool — content equality (same as `=`).
         // Equals(other, ignoreCase: bool): bool — optional case-insensitive.
         if (method == "Equals" && !call.args.empty() && call.args[0].value) {
