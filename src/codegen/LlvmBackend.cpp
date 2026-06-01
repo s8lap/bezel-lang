@@ -398,6 +398,23 @@ private:
             elemTy = gv->getValueType();
             return gv;
         }
+        // §15.1: inline array element lvalue `a[i]`.
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&target)) {
+            if (ix->target && !ix->indices.empty() && ix->indices[0].value) {
+                llvm::Type* arrSlotTy = nullptr;
+                llvm::Value* arrAddr = lvalueAddr(*ix->target, arrSlotTy);
+                if (arrAddr && arrSlotTy) {
+                    if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(arrSlotTy)) {
+                        llvm::Value* idx = lowerExpr(*ix->indices[0].value);
+                        if (idx) {
+                            elemTy = arrTy->getElementType();
+                            return builder_.CreateGEP(
+                                arrTy, arrAddr, {builder_.getInt64(0), idx});
+                        }
+                    }
+                }
+            }
+        }
         return implicitFieldAddr(target, elemTy);
     }
 
@@ -484,6 +501,17 @@ private:
                     return recordStruct(rt->declaration);
                 }
                 return i32();  // other value-kind named (enum) — int
+            case sema::TypeRef::Kind::InlineArray: {
+                // §15.1: [N]T is an LLVM fixed-size array [N x elemType].
+                // N is stored as an IntLiteralExpr; element type recurses.
+                if (!rt->arrayElement || !rt->arraySize) return i32();
+                llvm::Type* elem = lowerTypeRef(rt->arrayElement);
+                auto* lit =
+                    dynamic_cast<const ast::IntLiteralExpr*>(rt->arraySize);
+                if (!lit) return i32();
+                uint64_t n = std::stoull(std::string(lit->text));
+                return llvm::ArrayType::get(elem, n);
+            }
             default:
                 return i32();
         }
@@ -1826,7 +1854,14 @@ private:
             v ? v->getType() : (declType ? lowerType(declType) : i32());
         llvm::AllocaInst* slot = entryAlloca(slotTy);
         locals_[declNode] = slot;
-        if (v) builder_.CreateStore(v, slot);
+        if (v) {
+            builder_.CreateStore(v, slot);
+        } else if (llvm::dyn_cast<llvm::ArrayType>(slotTy)) {
+            // §15.1: inline arrays are zero-initialized when declared
+            // without an initializer (like all locals with explicit type).
+            builder_.CreateStore(llvm::ConstantAggregateZero::get(slotTy),
+                                 slot);
+        }
     }
 
     // CG13: register a `using var`'s scope-based disposal (§28.3). The
@@ -2454,6 +2489,21 @@ private:
         }
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
             return lowerNew(*ne);
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            // §15.1: inline array `a[i]` — GEP the array slot and load.
+            if (!ix->target || ix->indices.empty() || !ix->indices[0].value)
+                return nullptr;
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = lvalueAddr(*ix->target, ety);
+            if (!addr || !ety) return nullptr;
+            auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(ety);
+            if (!arrTy) return nullptr;
+            llvm::Value* idx = lowerExpr(*ix->indices[0].value);
+            if (!idx) return nullptr;
+            llvm::Value* elemAddr = builder_.CreateGEP(
+                arrTy, addr, {builder_.getInt64(0), idx});
+            return builder_.CreateLoad(arrTy->getElementType(), elemAddr);
         }
         // CG34: object initializer `new C() with f := v, …`.
         if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
