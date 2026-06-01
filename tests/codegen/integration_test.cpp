@@ -248,3 +248,46 @@ BEZEL_TEST(integration, range_case_pattern_classification) {
         "  return s; "
         "end Main; end C;"), 10);  // 4+3+2+1+0 = 10 (fits in exit code)
 }
+
+BEZEL_TEST(integration, console_writeline_sum) {
+    // Console.WriteLine with int — prints the sum and returns it.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; "
+        "  for var i in 1..10 do s := s + i; end; "
+        "  Console.WriteLine(s); "
+        "  return s; "
+        "end Main; end C;"), 55);
+}
+
+BEZEL_TEST(integration, string_interpolation_result) {
+    // Interpolated string: construct and measure length.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var x := 42; var s := $\"x={x}\"; "
+        "  return s.Length; "
+        "end Main; end C;"), 4);  // "x=42" = 4 chars
+}
+
+BEZEL_TEST(integration, string_for_in_and_count) {
+    // for-in over string counting a specific char (native path).
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := \"mississippi\"; var cnt := 0; "
+        "  for var c in s do if c = 's' then cnt := cnt + 1; end; end; "
+        "  return cnt; "
+        "end Main; end C;"), 4);  // 's' appears 4 times
+}
+
+BEZEL_TEST(integration, string_methods_chain) {
+    // StartsWith + Substring chain — verify start and extract.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello World\"; "
+        "  if s.StartsWith(\"Hello\") then "
+        "    var rest := s.Substring(6); "
+        "    return rest.Length; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 5);  // "World" has length 5
+}
