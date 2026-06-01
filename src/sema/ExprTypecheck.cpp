@@ -2182,6 +2182,24 @@ private:
             currentReturnType_ = saveRetTy;
             loopDepth_ = saveLoop;
             catchDepth_ = saveCatch;
+            // §A.7: set the lambda's exprType to a Function TypeRef so
+            // that `var f := lam; f(...)` calls type-check correctly and
+            // lowerCall can detect it as a function-typed local.
+            {
+                auto* lamTy = ctx_.makeTypeRef();
+                lamTy->kind = TypeRef::Kind::Function;
+                for (const auto& p : lam->params) {
+                    TypeRef::FuncParam fp;
+                    fp.modifier = p.modifier;
+                    fp.name = p.name;
+                    if (p.type) fp.type = ctx_.resolvedType(*p.type);
+                    lamTy->funcParams.push_back(std::move(fp));
+                }
+                lamTy->funcReturn = lam->exprBody
+                                        ? ctx_.exprType(*lam->exprBody)
+                                        : nullptr;
+                ctx_.setExprType(lam, lamTy);
+            }
         } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
             if (ce->scrutinee) visitExpr(*ce->scrutinee);
             TypeRef* scrutTy =

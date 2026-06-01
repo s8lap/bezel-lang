@@ -149,3 +149,34 @@ BEZEL_TEST(codegen_cg60, closure_independent_captured_value) {
         "  end Main; "
         "end C;"), 32);
 }
+
+BEZEL_TEST(codegen_cg60, closure_call_through_local) {
+    // §A.7: a lambda stored in a local can be called via the local.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var n := 7; "
+        "    var f := (x: int) => x + n; "
+        "    return f(3); "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+BEZEL_TEST(codegen_cg60, closure_in_loop) {
+    // Closures created inside a loop each capture the current value.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Apply(f: (int) -> int, v: int): int "
+        "    return f(v); "
+        "  end Apply; "
+        "  public static method Main(): int "
+        "    var k := 3; "
+        "    var total := 0; "
+        "    for var i in 1..3 do "
+        "      var fi := (x: int) => x * k; "
+        "      total := total + fi(i); "
+        "    end; "
+        "    return total; "
+        "  end Main; "
+        "end C;"), 18);
+}
