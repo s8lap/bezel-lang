@@ -828,11 +828,17 @@ private:
                         lsym->declType = ctx_.exprType(*range->hi);
                 } else if (fs->iterable) {
                     // §15.1: `for var x in a` over an inline array — the
-                    // element type is the array's element TypeRef.
                     if (auto* tt = ctx_.exprType(*fs->iterable)) {
+                        // §15.1: `for var x in a` over an inline array.
                         if (tt->kind == TypeRef::Kind::InlineArray &&
-                            tt->arrayElement)
+                            tt->arrayElement) {
                             lsym->declType = tt->arrayElement;
+                        // §4.6: `for var c in s` over a string → char.
+                        } else if (tt->kind == TypeRef::Kind::Primitive &&
+                                   tt->primitive == PrimitiveType::String) {
+                            lsym->declType =
+                                ctx_.primitiveTypeRef(PrimitiveType::Char);
+                        }
                     }
                 }
                 forScope.names[fs->varName] = lsym;
