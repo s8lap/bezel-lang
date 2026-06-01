@@ -580,9 +580,12 @@ struct VerbatimStringExpr  : Expr { std::string_view text; };
 // substring (after escape-processing) or an embedded expression whose
 // value is converted to string and concatenated into the result.
 struct InterpPart {
-    std::string literal;                // non-empty iff this is a literal part
-    std::unique_ptr<Expr> expr;         // non-null iff this is an expression part
-    // alignment / format-spec fields deferred (§18.5)
+    std::string literal;                    // non-empty iff this is a literal part
+    std::unique_ptr<Expr> expr;             // non-null iff this is an expression part
+    std::string formatSpec;                 // §18.5 format specifier (e.g. "F2", "X")
+    std::unique_ptr<std::string> exprSource; // heap-allocated source for sub-parsed
+                                            // expressions; string_views in the expr
+                                            // AST remain valid through vector moves.
 };
 
 // §18.5 / §18.7: interpolated string. `parts` holds the alternating literal

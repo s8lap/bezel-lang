@@ -87,14 +87,51 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                 e.parts.push_back(std::move(lp));
                 literal.clear();
             }
-            // Sub-parse the expression.
-            if (!exprText.empty()) {
-                Lexer subLex(exprText, diagnostics_);
+            // Sub-parse the expression. Check for a format specifier
+            // `{expr:FORMAT}` (§18.5): a `:` not inside balanced
+            // delimiters splits expression from the format spec.
+            // The format spec is stored in InterpPart::formatSpec and
+            // applied at codegen time (avoids dangling-string_view bug
+            // that would result from modifying the expression text).
+            std::string_view actualExpr = exprText;
+            std::string fmtSpec;
+            {
+                int d = 0; // paren/bracket depth
+                for (size_t k = 0; k < exprText.size(); ++k) {
+                    char ek = exprText[k];
+                    if (ek == '(' || ek == '[') ++d;
+                    else if (ek == ')' || ek == ']') --d;
+                    else if (ek == ':' && d == 0 && k + 1 < exprText.size()) {
+                        // Looks like a format specifier — check that
+                        // the tail is purely alphanumeric.
+                        bool looksLikeFmt = true;
+                        for (size_t f = k + 1; f < exprText.size(); ++f) {
+                            char fc = exprText[f];
+                            if (!std::isalnum(fc) && fc != '-' && fc != '+')
+                                { looksLikeFmt = false; break; }
+                        }
+                        if (looksLikeFmt) {
+                            actualExpr = exprText.substr(0, k);
+                            fmtSpec = std::string(exprText.substr(k + 1));
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!actualExpr.empty()) {
+                // Heap-allocate the source string so string_views inside the
+                // sub-parsed expression AST remain valid through vector moves
+                // (avoids SSO invalidation when the InterpPart is moved).
+                auto srcOwned =
+                    std::make_unique<std::string>(std::string(actualExpr));
+                Lexer subLex(*srcOwned, diagnostics_);
                 Parser subPar(subLex, diagnostics_);
                 auto expr = subPar.parseExpression();
                 if (expr) {
                     ast::InterpPart ep;
                     ep.expr = std::move(expr);
+                    ep.formatSpec = std::move(fmtSpec);
+                    ep.exprSource = std::move(srcOwned);
                     e.parts.push_back(std::move(ep));
                 }
             }

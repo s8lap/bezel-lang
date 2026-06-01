@@ -822,6 +822,94 @@ private:
     }
 
     // CG27c (§5): emit `.ToString()` for a Bezel primitive value.
+    // §18.5: emit a formatted conversion using a Bezel format specifier
+    // (e.g. "F2" → "%.2f", "X" → "%X", "D5" → "%5d"). Returns the bz_string,
+    // or null if the format spec is unrecognized.
+    llvm::Value* emitWithFormatSpec(llvm::Value* val,
+                                    const std::string& spec,
+                                    const sema::TypeRef* rt) {
+        if (spec.empty() || !val) return nullptr;
+        char kind = std::toupper(spec[0]);
+        int width = (spec.size() > 1) ? std::atoi(spec.c_str() + 1) : -1;
+        std::string snprintfFmt;
+        bool isFloat = val->getType()->isDoubleTy() ||
+                       val->getType()->isFloatTy() ||
+                       (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                        (rt->primitive == sema::PrimitiveType::Double ||
+                         rt->primitive == sema::PrimitiveType::Float));
+        bool isInt = val->getType()->isIntegerTy() ||
+                     (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                      !isFloat);
+        if (kind == 'F' && isFloat) {
+            snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + "f";
+        } else if (kind == 'E' && isFloat) {
+            snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + "e";
+        } else if ((kind == 'G') && isFloat) {
+            snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + "g";
+        } else if (kind == 'X' && isInt) {
+            snprintfFmt = (spec[0] == 'x') ? "%x" : "%X";
+        } else if (kind == 'D' && isInt) {
+            snprintfFmt = width >= 0
+                ? ("%" + std::to_string(width) + "d")
+                : "%d";
+        } else {
+            return nullptr;  // unknown format spec
+        }
+        // Emit snprintf call.
+        if (isFloat) {
+            llvm::Value* dv = val->getType()->isFloatTy()
+                ? builder_.CreateFPExt(val, llvm::Type::getDoubleTy(llvm_))
+                : val;
+            return emitSnprintfToString(snprintfFmt, dv);
+        } else {
+            llvm::Value* iv = val->getType()->isIntegerTy(64) ? val
+                : builder_.CreateSExt(val, i64());
+            return emitSnprintfToString(snprintfFmt, iv);
+        }
+    }
+
+    // Helper: emit snprintf(buf, 64, fmt, val) → bz_string.
+    llvm::Value* emitSnprintfToString(const std::string& fmt,
+                                      llvm::Value* val) {
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+        auto* snpFn = module_->getFunction("snprintf");
+        if (!snpFn) {
+            auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), i64(), ptrTy()}, true);
+            snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
+                                           "snprintf", module_.get());
+        }
+        const unsigned BUF = 64;
+        llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
+        llvm::Value* bufPtr = builder_.CreateGEP(
+            llvm::ArrayType::get(i8Ty, BUF), buf,
+            {builder_.getInt64(0), builder_.getInt64(0)});
+        // Build format string global.
+        auto* fmtData = llvm::ConstantDataArray::getString(llvm_, fmt, true);
+        unsigned fid = stringLiteralIdx_++;
+        auto* fmtGV = new llvm::GlobalVariable(
+            *module_, fmtData->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, fmtData,
+            ".bz.fmtspec." + std::to_string(fid));
+        llvm::Value* wr = builder_.CreateCall(
+            snpFn, {bufPtr, builder_.getInt64(BUF), fmtGV, val});
+        llvm::Value* l64 = builder_.CreateSExt(wr, i64());
+        // Build heap-backed bz_string.
+        llvm::Value* dSz = builder_.CreateAdd(l64, builder_.getInt64(1));
+        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+        llvm::Value* dc = builder_.CreateCall(mallocFn, {dSz});
+        builder_.CreateCall(memcpyFn, {dc, bufPtr, l64});
+        llvm::Value* np = builder_.CreateGEP(i8Ty, dc, l64);
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np);
+        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+        llvm::Value* so = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)});
+        builder_.CreateStore(dc, builder_.CreateStructGEP(stringType(), so, 0));
+        builder_.CreateStore(l64, builder_.CreateStructGEP(stringType(), so, 1));
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                             builder_.CreateStructGEP(stringType(), so, 2));
+        return so;
+    }
+
     // Uses snprintf to format into a stack buffer, then malloc a bz_string.
     // The format specifier depends on the primitive type.
     llvm::Value* emitPrimitiveToString(llvm::Value* val,
@@ -4319,9 +4407,18 @@ private:
                     pv = strGV;
                 } else if (part.expr) {
                     // Expression part: lower the expression, then convert to
-                    // string.
+                    // string. If a format spec is present (§18.5), apply it.
                     llvm::Value* ev = lowerExpr(*part.expr);
                     if (!ev) continue;
+                    // §18.5: format spec → translate to snprintf format.
+                    if (!part.formatSpec.empty()) {
+                        pv = emitWithFormatSpec(ev, part.formatSpec,
+                                                ctx_.exprType(*part.expr));
+                        if (pv) {
+                            acc = emitStringConcat(acc, pv);
+                            continue;
+                        }
+                    }
                     auto* rt = ctx_.exprType(*part.expr);
                     if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
                         pv = emitPrimitiveToString(ev, rt->primitive);
