@@ -291,3 +291,37 @@ BEZEL_TEST(integration, string_methods_chain) {
         "  return 0; "
         "end Main; end C;"), 5);  // "World" has length 5
 }
+
+BEZEL_TEST(integration, fizzbuzz_via_console) {
+    // FizzBuzz 1..15 — tests Console.WriteLine(int), string, + conditional logic.
+    // Check exit code (must be 0 = success).
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  for var i in 1..15 do "
+        "    if i mod 15 = 0 then Console.WriteLine(\"FizzBuzz\"); "
+        "    elif i mod 3 = 0 then Console.WriteLine(\"Fizz\"); "
+        "    elif i mod 5 = 0 then Console.WriteLine(\"Buzz\"); "
+        "    else Console.WriteLine(i); end; "
+        "  end; return 0; "
+        "end Main; end C;"), 0);
+}
+
+BEZEL_TEST(integration, for_in_string_char_count) {
+    // Count occurrences of 's' in "mississippi" via for-in-string.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := \"mississippi\"; var cnt := 0; "
+        "  for var c in s do if c = 's' then cnt := cnt + 1; end; end; "
+        "  return cnt; "
+        "end Main; end C;"), 4);
+}
+
+BEZEL_TEST(integration, string_isnotempty_branch) {
+    // string.IsNullOrEmpty gate (non-empty path).
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  if string.IsNullOrEmpty(s) then return 0; end; "
+        "  return s.Length; "
+        "end Main; end C;"), 5);
+}
