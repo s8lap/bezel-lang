@@ -2044,7 +2044,9 @@ private:
         }
         if (auto* fors = dynamic_cast<const ast::ForStmt*>(&s)) {
             if (lowerRangeFor(*fors)) return false;
-            // Non-range or open-ended iterables are not yet lowered.
+            // §15.1: `for var x in a` over an inline array.
+            if (lowerArrayFor(*fors)) return false;
+            // Non-range, non-array iterables are not yet lowered.
             ctx_.diagnostics().report(
                 Severity::Error, s.span.begin,
                 "not yet implemented: codegen for this for statement");
@@ -2355,6 +2357,66 @@ private:
         llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
         llvm::Value* next = builder_.CreateAdd(v, stepVal);
         builder_.CreateStore(next, slot);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(endBB);
+        return true;
+    }
+
+    // §15.1: `for var x in a do … end` over an inline [N]T array.
+    // Emits an indexed counted loop; the element value `a[i]` is stored in
+    // the loop variable slot (same anchor `locals_[&fs]`) at the start of
+    // each body iteration so `x` in the body resolves to the current element.
+    bool lowerArrayFor(const ast::ForStmt& fs) {
+        if (!fs.iterable) return false;
+        llvm::Type* arrSlotTy = nullptr;
+        llvm::Value* arrAddr = lvalueAddr(*fs.iterable, arrSlotTy);
+        if (!arrAddr || !arrSlotTy) return false;
+        auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(arrSlotTy);
+        if (!arrTy) return false;
+        uint64_t N = arrTy->getNumElements();
+        if (N == 0) return true;  // empty array — no iterations
+        llvm::Type* elemTy = arrTy->getElementType();
+
+        // Index counter (i32).
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+
+        // Element value slot — what the body sees as `x`.
+        auto* varSlot = entryAlloca(elemTy);
+        locals_[&fs] = varSlot;
+
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "far.cond", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "far.body", currentFn_);
+        auto* incBB  = llvm::BasicBlock::Create(llvm_, "far.inc",  currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "far.end",  currentFn_);
+        builder_.CreateBr(condBB);
+
+        // cond: i < N.
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx = builder_.CreateLoad(i32(), idxSlot);
+        llvm::Value* cond = builder_.CreateICmpSLT(
+            idx, builder_.getInt32(static_cast<uint32_t>(N)));
+        builder_.CreateCondBr(cond, bodyBB, endBB);
+
+        // body: load a[i] into varSlot so the body sees x = a[i].
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* cur = builder_.CreateLoad(i32(), idxSlot);
+        llvm::Value* elemAddr = builder_.CreateGEP(
+            arrTy, arrAddr, {builder_.getInt64(0), cur});
+        llvm::Value* elem = builder_.CreateLoad(elemTy, elemAddr);
+        builder_.CreateStore(elem, varSlot);
+
+        loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+        bool term = lowerScopedBlock(fs.body);
+        loopStack_.pop_back();
+        if (!term) builder_.CreateBr(incBB);
+
+        // inc: i := i + 1.
+        builder_.SetInsertPoint(incBB);
+        llvm::Value* v = builder_.CreateLoad(i32(), idxSlot);
+        builder_.CreateStore(
+            builder_.CreateAdd(v, builder_.getInt32(1)), idxSlot);
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(endBB);

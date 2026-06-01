@@ -809,6 +809,14 @@ private:
                         lsym->declType = ctx_.exprType(*range->lo);
                     else if (range->hi)
                         lsym->declType = ctx_.exprType(*range->hi);
+                } else if (fs->iterable) {
+                    // §15.1: `for var x in a` over an inline array — the
+                    // element type is the array's element TypeRef.
+                    if (auto* tt = ctx_.exprType(*fs->iterable)) {
+                        if (tt->kind == TypeRef::Kind::InlineArray &&
+                            tt->arrayElement)
+                            lsym->declType = tt->arrayElement;
+                    }
                 }
                 forScope.names[fs->varName] = lsym;
             }
