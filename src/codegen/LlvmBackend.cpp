@@ -4816,7 +4816,8 @@ private:
     // write(1, "\n", 1) for WriteLine. This provides observable stdout.
     // `value` must be a ptr to a bz_string; if it's an integer or other
     // primitive, the caller converts via emitPrimitiveToString first.
-    llvm::Value* emitConsoleWrite(llvm::Value* strPtr, bool newline) {
+    llvm::Value* emitConsoleWrite(llvm::Value* strPtr, bool newline,
+                                   int fd = 1) {
         // Declare POSIX write(2): ssize_t write(int, const void*, size_t)
         auto* writeFn = module_->getFunction("write");
         if (!writeFn) {
@@ -4828,7 +4829,7 @@ private:
         llvm::Value* data = loadStringData(strPtr);
         llvm::Value* len  = loadStringLen(strPtr);
         builder_.CreateCall(writeFn,
-                            {builder_.getInt32(1), data, len});  // fd=1 (stdout)
+                            {builder_.getInt32(fd), data, len});
         if (newline) {
             // Write a newline byte.
             llvm::Constant* nlData = llvm::ConstantDataArray::getString(
@@ -4837,7 +4838,7 @@ private:
                 *module_, nlData->getType(), true,
                 llvm::GlobalValue::PrivateLinkage, nlData, ".bz.nl");
             builder_.CreateCall(writeFn,
-                                {builder_.getInt32(1), nlGV,
+                                {builder_.getInt32(fd), nlGV,
                                  builder_.getInt64(1)});
         }
         return nullptr;  // unit (void)
@@ -4932,8 +4933,21 @@ private:
         if (!call.callee) return false;
         auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
         if (!ma || !ma->target) return false;
+
+        // Detect Console.Error.Write/WriteLine — stderr output (fd=2).
+        int stdfd = 1;  // default: stdout
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-        if (!id || id->name != "Console") return false;
+        if (!id) {
+            // Try Console.Error.Write/WriteLine: target is MemberAccess "Console.Error"
+            auto* innerMA = dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get());
+            if (!innerMA || !innerMA->target) return false;
+            auto* innerID = dynamic_cast<const ast::IdentifierExpr*>(innerMA->target.get());
+            if (!innerID || innerID->name != "Console") return false;
+            if (innerMA->member == "Error" || innerMA->member == "Out") {
+                stdfd = (innerMA->member == "Error") ? 2 : 1;
+                id = nullptr;  // mark as Error/Out path
+            } else return false;
+        } else if (id->name != "Console") return false;
 
         bool isWriteLine = (ma->member == "WriteLine");
         bool isWrite = (ma->member == "Write");
@@ -4954,7 +4968,7 @@ private:
                 *module_, nlData->getType(), true,
                 llvm::GlobalValue::PrivateLinkage, nlData,
                 ".bz.console.nl." + std::to_string(id2));
-            builder_.CreateCall(writeFn, {builder_.getInt32(1), nlGV, builder_.getInt64(1)});
+            builder_.CreateCall(writeFn, {builder_.getInt32(stdfd), nlGV, builder_.getInt64(1)});
             return true;
         }
         if (call.args.size() != 1 || !call.args[0].value) return false;
@@ -5008,7 +5022,7 @@ private:
             }
         }
         if (!strPtr) return false;
-        emitConsoleWrite(strPtr, isWriteLine);
+        emitConsoleWrite(strPtr, isWriteLine, stdfd);
         return true;
     }
 
