@@ -2974,9 +2974,27 @@ private:
             return lowerNew(*ne);
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
-            // §15.1: inline array `a[i]` — GEP the array slot and load.
             if (!ix->target || ix->indices.empty() || !ix->indices[0].value)
                 return nullptr;
+            // CG27e (§4.6): string indexer `s[i]` → char (i32 code point).
+            // For ASCII/UTF-8 strings, this is the byte at position i widened
+            // to i32. Full code-point-by-position for non-ASCII deferred.
+            {
+                auto* tt = ctx_.exprType(*ix->target);
+                if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
+                    tt->primitive == sema::PrimitiveType::String) {
+                    llvm::Value* strPtr = lowerExpr(*ix->target);
+                    llvm::Value* idx = lowerExpr(*ix->indices[0].value);
+                    if (!strPtr || !idx) return nullptr;
+                    llvm::Value* data = loadStringData(strPtr);
+                    llvm::Value* idx64 = builder_.CreateSExt(idx, i64(), "str.idx64");
+                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                    llvm::Value* cp = builder_.CreateGEP(i8Ty, data, idx64, "str.cp.ptr");
+                    llvm::Value* byte = builder_.CreateLoad(i8Ty, cp, "str.byte");
+                    return builder_.CreateZExt(byte, i32(), "str.char");
+                }
+            }
+            // §15.1: inline array `a[i]` — GEP the array slot and load.
             llvm::Type* ety = nullptr;
             llvm::Value* addr = lvalueAddr(*ix->target, ety);
             if (!addr || !ety) return nullptr;

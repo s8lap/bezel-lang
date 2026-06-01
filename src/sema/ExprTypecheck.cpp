@@ -1121,11 +1121,15 @@ private:
         // element type, so member access on array elements (`a[i].field`)
         // can resolve. The element type comes from the target's InlineArray
         // TypeRef, or from an indexer-property return type (deferred).
+        // §4.6: string indexer `s[i]` → char (code point).
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
             if (ix->target) {
                 if (auto* tt = ctx_.exprType(*ix->target)) {
                     if (tt->kind == TypeRef::Kind::InlineArray && tt->arrayElement)
                         ctx_.setExprType(&e, tt->arrayElement);
+                    else if (tt->kind == TypeRef::Kind::Primitive &&
+                             tt->primitive == PrimitiveType::String)
+                        ctx_.setExprType(&e, ctx_.primitiveTypeRef(PrimitiveType::Char));
                 }
             }
         }
