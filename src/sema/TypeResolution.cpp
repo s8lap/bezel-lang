@@ -1765,6 +1765,15 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         }
         return;
     }
+    // §18.5: InterpolatedStringExpr — each expression part may contain type
+    // nodes (e.g. `{x is IAnimal}` has a testType; `{new T(...)}`has a new-type).
+    // Resolve them so that lowerTypeTest / lowerNew find the resolved TypeRef.
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : is->parts) {
+            if (part.expr) resolveTypesInExpr(*part.expr, scope);
+        }
+        return;
+    }
     // Literals + Identifier + ThisBaseTypeOf — no nested Types/Exprs.
 }
 
