@@ -702,9 +702,31 @@ private:
                     // Slice T1: when an explicit ascription and an
                     // initializer are both present and both primitive,
                     // check primitive assignability (§5.1).
+                    // §5.1 special: an integer literal assigns to any
+                    // integer type that can represent its value without
+                    // loss — re-type the literal as the target type so
+                    // the assignability check passes.
                     if (ld->initializer) {
+                        TypeRef* fromTy = ctx_.exprType(*ld->initializer);
+                        if (fromTy && lsym->declType &&
+                            fromTy->kind == TypeRef::Kind::Primitive &&
+                            lsym->declType->kind == TypeRef::Kind::Primitive &&
+                            fromTy->primitive == PrimitiveType::Int) {
+                            PrimitiveType tgt = lsym->declType->primitive;
+                            if (tgt == PrimitiveType::Byte ||
+                                tgt == PrimitiveType::SByte ||
+                                tgt == PrimitiveType::Short ||
+                                tgt == PrimitiveType::UShort ||
+                                tgt == PrimitiveType::UInt ||
+                                tgt == PrimitiveType::ULong) {
+                                // Retype the literal as the narrower type.
+                                ctx_.setExprType(ld->initializer.get(),
+                                                 lsym->declType);
+                                fromTy = lsym->declType;
+                            }
+                        }
                         checkAssignable(
-                            ctx_.exprType(*ld->initializer),
+                            fromTy,
                             lsym->declType, ld->initializer->span.begin,
                             std::string("initializer for `") +
                             std::string(ld->name) + "`");

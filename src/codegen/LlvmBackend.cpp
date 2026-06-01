@@ -853,9 +853,9 @@ private:
                 fmt = "%u"; break;
             case P::Byte: case P::SByte:
             case P::Short: case P::UShort:
-                // Widen to i32 for snprintf
-                printVal = (prim == P::Byte || prim == P::UShort ||
-                            prim == P::Short)
+                // Widen to i32: signed types (SByte, Short) use SExt;
+                // unsigned types (Byte, UShort) use ZExt.
+                printVal = (prim == P::SByte || prim == P::Short)
                     ? builder_.CreateSExt(val, i32())
                     : builder_.CreateZExt(val, i32());
                 fmt = "%d"; break;
