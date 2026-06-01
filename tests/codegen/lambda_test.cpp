@@ -218,3 +218,39 @@ BEZEL_TEST(codegen_cg60, method_reference_stored_in_local) {
         "  end Main; "
         "end C;"), -7);
 }
+
+// ── Block-body lambda with for loop and captured array ────────────────────
+// The previous bug: block-body lambdas had funcReturn=null in their
+// Function TypeRef, causing emitClosureCall to use void return type.
+// This produced invalid IR (ud2 opcode) when the result was stored in
+// a local variable.
+
+BEZEL_TEST(codegen_cg60, block_body_result_in_local) {
+    // Block-body lambda's return value stored in a `var result :=` local.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var f := (n: int) => do "
+        "      var r := n * 2; return r; "
+        "    end; "
+        "    var result := f(5); "
+        "    return result; "
+        "  end Main; end C;"), 10);
+}
+
+BEZEL_TEST(codegen_cg60, block_body_lambda_with_for_and_capture) {
+    // Block-body lambda capturing an array and looping over it.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var f := (threshold: int) => do "
+        "      var c := 0; "
+        "      for var i in 0..4 do "
+        "        if i > threshold then c := c + 1; end; "
+        "      end; "
+        "      return c; "
+        "    end; "
+        "    var result := f(2); "
+        "    return result; "
+        "  end Main; end C;"), 2);
+}
