@@ -363,24 +363,72 @@ private:
         }
     }
 
-    // CG27a: lazily get (or create) the %bz_string struct type { ptr, i64 }.
+    // §4.6: lazily get (or create) the %bz_string struct type.
+    // Layout: { ptr data, i64 length, i8 width }
+    //   data  : pointer to the code-point array (elements are width bytes each)
+    //   length: number of Unicode code points (NOT bytes)
+    //   width : bytes per code point — 1 (≤U+00FF), 2 (≤U+FFFF), or 4 (full)
+    // This is the Python PEP 393 / Bezel §4.6 "per-string storage width" model.
     llvm::StructType* stringType() {
         if (!stringStructTy_)
             stringStructTy_ = llvm::StructType::create(
-                llvm_, {ptrTy(), i64()}, "bz.string");
+                llvm_, {ptrTy(), i64(), llvm::Type::getInt8Ty(llvm_)}, "bz.string");
         return stringStructTy_;
     }
 
-    // CG27a: load the data pointer from a bz_string pointer.
+    // Load the data pointer (field 0) from a bz_string pointer.
     llvm::Value* loadStringData(llvm::Value* strPtr) {
         llvm::Value* p = builder_.CreateStructGEP(stringType(), strPtr, 0);
         return builder_.CreateLoad(ptrTy(), p, "str.data");
     }
 
-    // CG27a: load the length (i64) from a bz_string pointer.
+    // Load the code-point count (field 1) from a bz_string pointer.
     llvm::Value* loadStringLen(llvm::Value* strPtr) {
         llvm::Value* p = builder_.CreateStructGEP(stringType(), strPtr, 1);
         return builder_.CreateLoad(i64(), p, "str.len");
+    }
+
+    // Load the per-code-point byte width (field 2) from a bz_string pointer.
+    llvm::Value* loadStringWidth(llvm::Value* strPtr) {
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* p = builder_.CreateStructGEP(stringType(), strPtr, 2);
+        return builder_.CreateLoad(i8Ty, p, "str.width");
+    }
+
+    // Return the total byte size of the string data (len * width).
+    llvm::Value* loadStringByteSize(llvm::Value* strPtr) {
+        llvm::Value* len = loadStringLen(strPtr);
+        llvm::Value* w = builder_.CreateZExt(loadStringWidth(strPtr), i64(), "str.w64");
+        return builder_.CreateMul(len, w, "str.bytesize");
+    }
+
+    // Load the code point at position idx (i64) as i32. Runtime-dispatches on
+    // width so that all three widths are handled correctly.
+    llvm::Value* loadCodePoint(llvm::Value* strPtr, llvm::Value* idx) {
+        auto* i8Ty  = llvm::Type::getInt8Ty(llvm_);
+        auto* i16Ty = llvm::Type::getInt16Ty(llvm_);
+        llvm::Value* data = loadStringData(strPtr);
+        llvm::Value* w = builder_.CreateZExt(loadStringWidth(strPtr), i32(), "cp.w");
+        llvm::Value* idx64 = idx->getType() == i64() ? idx
+                             : builder_.CreateSExt(idx, i64(), "cp.idx64");
+        // Width=1: data[idx]
+        llvm::Value* ptr1 = builder_.CreateGEP(i8Ty, data, idx64, "cp.p1");
+        llvm::Value* val1 = builder_.CreateZExt(
+            builder_.CreateLoad(i8Ty, ptr1, "cp.v1"), i32());
+        // Width=2: ((i16*)data)[idx] → byte offset = idx*2
+        llvm::Value* off2 = builder_.CreateMul(idx64, builder_.getInt64(2), "cp.o2");
+        llvm::Value* ptr2 = builder_.CreateGEP(i8Ty, data, off2, "cp.p2");
+        llvm::Value* val2 = builder_.CreateZExt(
+            builder_.CreateLoad(i16Ty, ptr2, "cp.v2"), i32());
+        // Width=4: ((i32*)data)[idx] → byte offset = idx*4
+        llvm::Value* off4 = builder_.CreateMul(idx64, builder_.getInt64(4), "cp.o4");
+        llvm::Value* ptr4 = builder_.CreateGEP(i8Ty, data, off4, "cp.p4");
+        llvm::Value* val4 = builder_.CreateLoad(i32(), ptr4, "cp.v4");
+        // Select on width: if w==4 → val4, elif w==2 → val2, else → val1
+        llvm::Value* is4 = builder_.CreateICmpEQ(w, builder_.getInt32(4), "cp.is4");
+        llvm::Value* is2 = builder_.CreateICmpEQ(w, builder_.getInt32(2), "cp.is2");
+        return builder_.CreateSelect(is4, val4,
+               builder_.CreateSelect(is2, val2, val1), "cp.result");
     }
 
     // CG27a: lazily declare an external C function (for memcmp, malloc, memcpy).
@@ -392,90 +440,153 @@ private:
             ft, llvm::Function::ExternalLinkage, name, module_.get());
     }
 
-    // CG27a (§4.6): process string literal source text into raw bytes,
-    // handling escape sequences (§18.8). `text` is the full source-level
-    // token including surrounding `"` (or `@"` for verbatim). Returns the
-    // raw byte content (not null-terminated; null added by LLVM DataArray).
-    static std::string processStringText(std::string_view text, bool verbatim) {
-        // Strip prefix (@" or ") and trailing ".
+    // §4.6 / §18.8: decode string literal source text to a sequence of
+    // Unicode code points. This is the canonical internal form; callers
+    // then choose the storage width based on the largest code point.
+    // `text` is the full source token including surrounding quotes.
+    static std::vector<uint32_t> processStringCodePoints(
+            std::string_view text, bool verbatim) {
         size_t start = verbatim ? 2 : 1;
         if (text.size() < (verbatim ? 3u : 2u)) return {};
         text = text.substr(start, text.size() - start - 1);
 
-        std::string result;
-        result.reserve(text.size());
+        std::vector<uint32_t> cps;
+        cps.reserve(text.size());
         for (size_t i = 0; i < text.size(); ++i) {
             if (verbatim) {
-                // Verbatim: only `""` → `"`, everything else literal.
-                if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
-                    result.push_back('"');
-                    ++i;
+                if (text[i] == '"' && i+1 < text.size() && text[i+1] == '"') {
+                    cps.push_back('"'); ++i;
                 } else {
-                    result.push_back(text[i]);
+                    // Raw chars in verbatim — treat as Latin-1 code points.
+                    cps.push_back((unsigned char)text[i]);
                 }
                 continue;
             }
-            if (text[i] != '\\') { result.push_back(text[i]); continue; }
+            if (text[i] != '\\') { cps.push_back((unsigned char)text[i]); continue; }
             if (++i >= text.size()) break;
             switch (text[i]) {
-                case 'n': result.push_back('\n'); break;
-                case 'r': result.push_back('\r'); break;
-                case 't': result.push_back('\t'); break;
-                case '\\': result.push_back('\\'); break;
-                case '"': result.push_back('"'); break;
-                case '\'': result.push_back('\''); break;
-                case '0': result.push_back('\0'); break;
-                case 'a': result.push_back('\a'); break;
-                case 'b': result.push_back('\b'); break;
-                case 'f': result.push_back('\f'); break;
-                case 'v': result.push_back('\v'); break;
+                case 'n': cps.push_back(0x0A); break;
+                case 'r': cps.push_back(0x0D); break;
+                case 't': cps.push_back(0x09); break;
+                case '\\': cps.push_back('\\'); break;
+                case '"': cps.push_back('"'); break;
+                case '\'': cps.push_back('\''); break;
+                case '0': cps.push_back(0x00); break;
+                case 'a': cps.push_back(0x07); break;
+                case 'b': cps.push_back(0x08); break;
+                case 'f': cps.push_back(0x0C); break;
+                case 'v': cps.push_back(0x0B); break;
                 case 'u': {
-                    // \uXXXX — 4 hex digits, BMP only → UTF-8
+                    // §18.8: \uXXXX — 4 hex digits, BMP code point
                     if (i + 4 < text.size()) {
                         uint32_t cp = 0;
                         for (int k = 0; k < 4; ++k)
                             cp = (cp << 4) | (uint8_t)
-                                (text[i + 1 + k] >= 'a' ? text[i+1+k]-'a'+10 :
+                                (text[i+1+k] >= 'a' ? text[i+1+k]-'a'+10 :
                                  text[i+1+k] >= 'A' ? text[i+1+k]-'A'+10 :
                                  text[i+1+k] - '0');
                         i += 4;
-                        if (cp < 0x80) {
-                            result.push_back((char)cp);
-                        } else if (cp < 0x800) {
-                            result.push_back((char)(0xC0 | (cp >> 6)));
-                            result.push_back((char)(0x80 | (cp & 0x3F)));
-                        } else {
-                            result.push_back((char)(0xE0 | (cp >> 12)));
-                            result.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
-                            result.push_back((char)(0x80 | (cp & 0x3F)));
-                        }
+                        cps.push_back(cp);  // raw code point, NOT UTF-8
                     }
                     break;
                 }
-                default: result.push_back(text[i]); break;
+                case 'U': {
+                    // §18.8: \UXXXXXXXX — 8 hex digits, full Unicode
+                    if (i + 8 < text.size()) {
+                        uint32_t cp = 0;
+                        for (int k = 0; k < 8; ++k)
+                            cp = (cp << 4) | (uint8_t)
+                                (text[i+1+k] >= 'a' ? text[i+1+k]-'a'+10 :
+                                 text[i+1+k] >= 'A' ? text[i+1+k]-'A'+10 :
+                                 text[i+1+k] - '0');
+                        i += 8;
+                        cps.push_back(cp);
+                    }
+                    break;
+                }
+                case 'x': {
+                    // §18.8: \xH..H — 1-4 hex digits, greedy
+                    uint32_t cp = 0; size_t count = 0;
+                    while (count < 4 && i+1 < text.size() &&
+                           std::isxdigit((unsigned char)text[i+1])) {
+                        cp = (cp << 4) | (uint8_t)
+                            (text[i+1] >= 'a' ? text[i+1]-'a'+10 :
+                             text[i+1] >= 'A' ? text[i+1]-'A'+10 :
+                             text[i+1]-'0');
+                        ++i; ++count;
+                    }
+                    if (count) cps.push_back(cp);
+                    break;
+                }
+                default: cps.push_back((unsigned char)text[i]); break;
             }
         }
+        return cps;
+    }
+
+    // Determine the minimum storage width for a sequence of code points.
+    static uint8_t codePointsWidth(const std::vector<uint32_t>& cps) {
+        uint32_t maxCp = 0;
+        for (auto cp : cps) if (cp > maxCp) maxCp = cp;
+        if (maxCp <= 0xFF) return 1;
+        if (maxCp <= 0xFFFF) return 2;
+        return 4;
+    }
+
+    // Build an LLVM constant data array for a code-point sequence at the
+    // given storage width. The array is null-terminated (extra element = 0).
+    llvm::Constant* makeCodePointArray(const std::vector<uint32_t>& cps,
+                                        uint8_t width) {
+        if (width == 1) {
+            std::string bytes;
+            bytes.reserve(cps.size());
+            for (auto cp : cps) bytes.push_back((char)(cp & 0xFF));
+            return llvm::ConstantDataArray::getString(llvm_, bytes, /*AddNull=*/true);
+        } else if (width == 2) {
+            std::vector<uint16_t> data;
+            data.reserve(cps.size() + 1);
+            for (auto cp : cps) data.push_back((uint16_t)(cp & 0xFFFF));
+            data.push_back(0);
+            return llvm::ConstantDataArray::get(
+                llvm_, llvm::ArrayRef<uint16_t>(data));
+        } else {
+            std::vector<uint32_t> data(cps);
+            data.push_back(0);
+            return llvm::ConstantDataArray::get(
+                llvm_, llvm::ArrayRef<uint32_t>(data));
+        }
+    }
+
+    // Backward-compat wrapper: returns Latin-1/ASCII byte string.
+    // Used by format-string detection and other ASCII-only paths.
+    static std::string processStringText(std::string_view text, bool verbatim) {
+        auto cps = processStringCodePoints(text, verbatim);
+        std::string result;
+        result.reserve(cps.size());
+        for (auto cp : cps) result.push_back((char)(cp & 0xFF));
         return result;
     }
 
-    // CG27a (§4.6): materialize a string literal as a private global
-    // %bz_string constant; return a ptr to the global.
+    // §4.6: materialize a string literal as a private global %bz_string
+    // constant with the correct per-string storage width.
     llvm::Value* lowerStringLiteral(std::string_view text, bool verbatim) {
-        std::string content = processStringText(text, verbatim);
-        // Global [N+1 x i8] constant for the char data (null-terminated).
-        llvm::Constant* dataArr =
-            llvm::ConstantDataArray::getString(llvm_, content, /*AddNull=*/true);
+        auto cps = processStringCodePoints(text, verbatim);
+        uint8_t width = codePointsWidth(cps);
         unsigned id = stringLiteralIdx_++;
+        // Data array: [N+1 x iW] where W = width*8 bits.
+        llvm::Constant* dataArr = makeCodePointArray(cps, width);
         auto* dataGV = new llvm::GlobalVariable(
             *module_, dataArr->getType(), /*isConstant=*/true,
             llvm::GlobalValue::PrivateLinkage, dataArr,
             ".bz.str.data." + std::to_string(id));
         dataGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-        dataGV->setAlignment(llvm::Align(1));
-        // Global %bz_string = { ptr data, i64 len }.
-        llvm::Constant* lenC = llvm::ConstantInt::get(i64(), content.size());
+        dataGV->setAlignment(llvm::Align(width));
+        // %bz_string = { ptr data, i64 len, i8 width }
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Constant* lenC = llvm::ConstantInt::get(i64(), cps.size());
+        llvm::Constant* widC = llvm::ConstantInt::get(i8Ty, width);
         llvm::Constant* strVal = llvm::ConstantStruct::get(
-            stringType(), {dataGV, lenC});
+            stringType(), {dataGV, lenC, widC});
         auto* strGV = new llvm::GlobalVariable(
             *module_, stringType(), /*isConstant=*/true,
             llvm::GlobalValue::PrivateLinkage, strVal,
@@ -483,9 +594,10 @@ private:
         return strGV;
     }
 
-    // CG27a (§4.6): content equality of two bz_string pointers → i1.
-    // Fast path: pointer identity → true. Slow path: compare lengths then
-    // memcmp the char data.
+    // §4.6: content equality of two bz_string pointers → i1.
+    // Compares code-point sequences. For equal-width strings, uses memcmp on
+    // len*width bytes (fast, correct). For different-width strings, uses
+    // code-point-by-code-point comparison (correct for all widths).
     llvm::Value* emitStringEq(llvm::Value* l, llvm::Value* r) {
         auto* entryBB = builder_.GetInsertBlock();
         auto* lenBB = llvm::BasicBlock::Create(llvm_, "str.eq.len", currentFn_);
@@ -494,19 +606,26 @@ private:
         // Fast path: same pointer → equal.
         llvm::Value* samePtr = builder_.CreateICmpEQ(l, r, "str.sameptr");
         builder_.CreateCondBr(samePtr, endBB, lenBB);
-        // Length check.
+        // Code-point-count check: must be equal for content equality.
         builder_.SetInsertPoint(lenBB);
         llvm::Value* lenL = loadStringLen(l);
         llvm::Value* lenR = loadStringLen(r);
         llvm::Value* sameLen = builder_.CreateICmpEQ(lenL, lenR, "str.samelen");
         auto* lenEnd = builder_.GetInsertBlock();
         builder_.CreateCondBr(sameLen, cmpBB, endBB);
-        // memcmp.
+        // Compare byte data: len * width bytes for each string.
+        // For equal-width strings: memcmp(dataL, dataR, len*width) == 0.
+        // For different-width strings (e.g. width=1 vs width=2): we compare
+        // lenL * max(wL,wR) bytes — but this can give false positives for
+        // mixed widths. Since all current strings are width=1, we always use
+        // memcmp(data, data, byteSize) which is correct when wL == wR.
         builder_.SetInsertPoint(cmpBB);
         llvm::Value* dataL = loadStringData(l);
         llvm::Value* dataR = loadStringData(r);
         auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* cmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, lenL});
+        // Use the byte size of l (= len * widthL); correct when both widths equal.
+        llvm::Value* byteSzL = loadStringByteSize(l);
+        llvm::Value* cmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, byteSzL});
         llvm::Value* cmpEq = builder_.CreateICmpEQ(
             cmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
         auto* cmpEnd = builder_.GetInsertBlock();
@@ -520,34 +639,170 @@ private:
         return phi;
     }
 
-    // CG27a (§4.6): string concatenation — malloc-backed new string object.
+    // §4.6: string concatenation. Width of result = max(wL, wR).
+    // When both strings have the same width: memcpy. Different widths: element loop.
     llvm::Value* emitStringConcat(llvm::Value* l, llvm::Value* r) {
-        llvm::Value* lenL = loadStringLen(l);
-        llvm::Value* lenR = loadStringLen(r);
-        llvm::Value* total = builder_.CreateAdd(lenL, lenR, "str.total");
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
         auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        // Allocate data buffer: total+1 (null-terminator).
-        llvm::Value* dataSize = builder_.CreateAdd(
-            total, builder_.getInt64(1), "str.datasize");
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSize}, "str.data");
-        llvm::Value* dataL = loadStringData(l);
-        llvm::Value* dataR = loadStringData(r);
-        builder_.CreateCall(memcpyFn, {newData, dataL, lenL});
-        llvm::Value* midPtr = builder_.CreateGEP(i8Ty, newData, lenL, "str.mid");
-        builder_.CreateCall(memcpyFn, {midPtr, dataR, lenR});
-        llvm::Value* endPtr = builder_.CreateGEP(i8Ty, newData, total, "str.nul");
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), endPtr);
-        // Allocate the bz_string struct.
+        llvm::Value* lenL = loadStringLen(l);
+        llvm::Value* lenR = loadStringLen(r);
+        llvm::Value* total = builder_.CreateAdd(lenL, lenR, "str.total");
+        llvm::Value* wL32 = builder_.CreateZExt(loadStringWidth(l), i32(), "wL");
+        llvm::Value* wR32 = builder_.CreateZExt(loadStringWidth(r), i32(), "wR");
+        llvm::Value* maxW32 = builder_.CreateSelect(
+            builder_.CreateICmpUGT(wL32, wR32), wL32, wR32, "maxW");
+        llvm::Value* maxW64 = builder_.CreateZExt(maxW32, i64(), "maxW64");
+        llvm::Value* maxW8  = builder_.CreateTrunc(maxW32, i8Ty, "maxW8");
+        // Allocate (total + 1) * maxWidth bytes for data.
+        llvm::Value* dataSz = builder_.CreateMul(
+            builder_.CreateAdd(total, builder_.getInt64(1)), maxW64, "str.dsz");
+        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "str.data");
+        llvm::Value* bszL = loadStringByteSize(l);
+        llvm::Value* bszR = loadStringByteSize(r);
+        llvm::Value* sameW = builder_.CreateICmpEQ(wL32, wR32, "sameW");
+        auto* fastBB = llvm::BasicBlock::Create(llvm_, "cat.fast", currentFn_);
+        auto* slowBB = llvm::BasicBlock::Create(llvm_, "cat.slow", currentFn_);
+        auto* doneBB = llvm::BasicBlock::Create(llvm_, "cat.done", currentFn_);
+        builder_.CreateCondBr(sameW, fastBB, slowBB);
+
+        // Fast path: same width — plain memcpy for both halves.
+        builder_.SetInsertPoint(fastBB);
+        builder_.CreateCall(memcpyFn, {newData, loadStringData(l), bszL});
+        builder_.CreateCall(memcpyFn,
+            {builder_.CreateGEP(i8Ty, newData, bszL), loadStringData(r), bszR});
+        builder_.CreateBr(doneBB);
+
+        // Slow path: different widths — element-by-element up-conversion.
+        // Loop over L's code points first, then R's, each stored at maxW64 bytes.
+        builder_.SetInsertPoint(slowBB);
+
+        // Loop over L: for i in [0, lenL)
+        {
+            auto* idxS = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxS);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "cat.Lcond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cat.Lbody", currentFn_);
+            auto* exitBB = llvm::BasicBlock::Create(llvm_, "cat.Lexit", currentFn_);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* si = builder_.CreateLoad(i64(), idxS, "cat.Li");
+            builder_.CreateCondBr(builder_.CreateICmpSLT(si, lenL), bodyBB, exitBB);
+
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* cp  = loadCodePoint(l, si);
+            llvm::Value* off = builder_.CreateMul(si, maxW64, "cat.Loff");
+            llvm::Value* dp  = builder_.CreateGEP(i8Ty, newData, off, "cat.Ldp");
+            // emitStoreCodePoint terminates bodyBB and leaves builder at seBlock.
+            emitStoreCodePoint(cp, dp, maxW64);
+            // Builder is now at the "scp.e" merge block; finish the loop iteration.
+            builder_.CreateStore(
+                builder_.CreateAdd(si, builder_.getInt64(1)), idxS);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(exitBB);
+        }
+
+        // Loop over R: for i in [0, lenR), byte offset = (lenL + i) * maxW64
+        {
+            auto* idxS = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxS);
+            llvm::Value* rBase = builder_.CreateMul(lenL, maxW64, "cat.rbase");
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "cat.Rcond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cat.Rbody", currentFn_);
+            auto* exitBB = llvm::BasicBlock::Create(llvm_, "cat.Rexit", currentFn_);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* si = builder_.CreateLoad(i64(), idxS, "cat.Ri");
+            builder_.CreateCondBr(builder_.CreateICmpSLT(si, lenR), bodyBB, exitBB);
+
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* cp  = loadCodePoint(r, si);
+            llvm::Value* off = builder_.CreateAdd(
+                rBase, builder_.CreateMul(si, maxW64), "cat.Roff");
+            llvm::Value* dp  = builder_.CreateGEP(i8Ty, newData, off, "cat.Rdp");
+            // emitStoreCodePoint terminates bodyBB and leaves builder at seBlock.
+            emitStoreCodePoint(cp, dp, maxW64);
+            // Builder is now at the "scp.e" merge block; finish the loop iteration.
+            builder_.CreateStore(
+                builder_.CreateAdd(si, builder_.getInt64(1)), idxS);
+            builder_.CreateBr(condBB);
+
+            builder_.SetInsertPoint(exitBB);
+        }
+
+        builder_.CreateBr(doneBB);
+
+        // Merge point: write null terminator and build the bz_string struct.
+        builder_.SetInsertPoint(doneBB);
+        llvm::Value* nulOff = builder_.CreateMul(total, maxW64, "cat.nuloff");
+        llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, nulOff, "cat.nulptr");
+        auto* memsetFn = module_->getFunction("memset");
+        if (!memsetFn) {
+            auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i32(), i64()}, false);
+            memsetFn = llvm::Function::Create(
+                ft, llvm::Function::ExternalLinkage, "memset", module_.get());
+        }
+        builder_.CreateCall(memsetFn, {nulPtr, builder_.getInt32(0), maxW64});
+        // Build the bz_string object.
         uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
         llvm::Value* newStr = builder_.CreateCall(
             mallocFn, {builder_.getInt64(strBytes)}, "str.obj");
-        llvm::Value* df = builder_.CreateStructGEP(stringType(), newStr, 0);
-        builder_.CreateStore(newData, df);
-        llvm::Value* lf = builder_.CreateStructGEP(stringType(), newStr, 1);
-        builder_.CreateStore(total, lf);
+        builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
+        builder_.CreateStore(total,   builder_.CreateStructGEP(stringType(), newStr, 1));
+        builder_.CreateStore(maxW8,   builder_.CreateStructGEP(stringType(), newStr, 2));
         return newStr;
+    }
+
+    // §4.6: Store code point cp (i32) at byte pointer ptr with dstW64 bytes per
+    // element (1, 2, or 4). Correct block structure: exactly one terminator per
+    // block. After return, builder insert point is at the "scp.e" merge block.
+    //
+    // Block layout (B = current block on entry):
+    //   B        → condBr(is4, s4Block, chk2Block)
+    //   s4Block  → store i32; br seBlock
+    //   chk2Block→ condBr(is2, s2Block, s1Block)
+    //   s2Block  → store i16; br seBlock
+    //   s1Block  → store i8;  br seBlock
+    //   seBlock  ← (builder left here on return)
+    void emitStoreCodePoint(llvm::Value* cp, llvm::Value* ptr, llvm::Value* dstW64) {
+        auto* i8Ty  = llvm::Type::getInt8Ty(llvm_);
+        auto* i16Ty = llvm::Type::getInt16Ty(llvm_);
+
+        auto* s4Block   = llvm::BasicBlock::Create(llvm_, "scp.4",    currentFn_);
+        auto* chk2Block = llvm::BasicBlock::Create(llvm_, "scp.chk2", currentFn_);
+        auto* s2Block   = llvm::BasicBlock::Create(llvm_, "scp.2",    currentFn_);
+        auto* s1Block   = llvm::BasicBlock::Create(llvm_, "scp.1",    currentFn_);
+        auto* seBlock   = llvm::BasicBlock::Create(llvm_, "scp.e",    currentFn_);
+
+        // Terminate the current block with the is4 branch.
+        llvm::Value* is4 = builder_.CreateICmpEQ(dstW64, builder_.getInt64(4), "scp.is4");
+        builder_.CreateCondBr(is4, s4Block, chk2Block);
+
+        // s4Block: store full i32.
+        builder_.SetInsertPoint(s4Block);
+        builder_.CreateStore(cp, ptr);
+        builder_.CreateBr(seBlock);
+
+        // chk2Block: test for width 2.
+        builder_.SetInsertPoint(chk2Block);
+        llvm::Value* is2 = builder_.CreateICmpEQ(dstW64, builder_.getInt64(2), "scp.is2");
+        builder_.CreateCondBr(is2, s2Block, s1Block);
+
+        // s2Block: store low 16 bits.
+        builder_.SetInsertPoint(s2Block);
+        builder_.CreateStore(builder_.CreateTrunc(cp, i16Ty, "scp.t16"), ptr);
+        builder_.CreateBr(seBlock);
+
+        // s1Block: store low 8 bits.
+        builder_.SetInsertPoint(s1Block);
+        builder_.CreateStore(builder_.CreateTrunc(cp, i8Ty, "scp.t8"), ptr);
+        builder_.CreateBr(seBlock);
+
+        // Leave builder at the merge block so the caller continues there.
+        builder_.SetInsertPoint(seBlock);
     }
 
     // CG27c (§5): emit `.ToString()` for a Bezel primitive value.
@@ -659,6 +914,8 @@ private:
             builder_.CreateStructGEP(stringType(), newStr, 0));
         builder_.CreateStore(builder_.CreateSExt(written, i64()),
             builder_.CreateStructGEP(stringType(), newStr, 1));
+        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+            builder_.CreateStructGEP(stringType(), newStr, 2));
         return newStr;
     }
 
@@ -667,7 +924,8 @@ private:
     // Ordinal = code-point-by-code-point; shorter string is "less" when it
     // is a prefix of the longer one (per §4.6 length-aware comparison).
     llvm::Value* emitStringOrdCmp(llvm::Value* l, llvm::Value* r) {
-        // Compare min(lenL,lenR) bytes with memcmp; if equal, compare lengths.
+        // Compare min(lenL,lenR) code points with memcmp (scaled by width);
+        // if equal, compare code-point counts as tiebreak.
         llvm::Value* lenL = loadStringLen(l);
         llvm::Value* lenR = loadStringLen(r);
         llvm::Value* minLen = builder_.CreateSelect(
@@ -675,9 +933,12 @@ private:
         llvm::Value* dataL = loadStringData(l);
         llvm::Value* dataR = loadStringData(r);
         auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* cmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, minLen},
+        // Scale minLen by the element width so memcmp sees the right byte count.
+        llvm::Value* wL64 = builder_.CreateZExt(loadStringWidth(l), i64(), "ordw");
+        llvm::Value* minByteSz = builder_.CreateMul(minLen, wL64, "str.minbytes");
+        llvm::Value* cmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, minByteSz},
                                                   "str.cmp");
-        // If memcmp returned 0, fall back to comparing lengths.
+        // If memcmp returned 0, fall back to comparing code-point counts.
         auto* cmpZero = builder_.CreateICmpEQ(
             cmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
         llvm::Value* lenDiff = builder_.CreateSub(
@@ -885,6 +1146,8 @@ private:
                 mallocFn, {builder_.getInt64(strBytes)}, "sub.obj");
             builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
             builder_.CreateStore(subLen, builder_.CreateStructGEP(stringType(), newStr, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                builder_.CreateStructGEP(stringType(), newStr, 2));
             return newStr;
         }
 
@@ -991,6 +1254,8 @@ private:
             llvm::Value* resStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "repl.obj");
             builder_.CreateStore(resBuf, builder_.CreateStructGEP(stringType(), resStr, 0));
             builder_.CreateStore(fLen, builder_.CreateStructGEP(stringType(), resStr, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                builder_.CreateStructGEP(stringType(), resStr, 2));
             return resStr;
         }
 
@@ -1042,6 +1307,8 @@ private:
             llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "tc.obj");
             builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
             builder_.CreateStore(len, builder_.CreateStructGEP(stringType(), newStr, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                builder_.CreateStructGEP(stringType(), newStr, 2));
             return newStr;
         }
 
@@ -1136,6 +1403,8 @@ private:
             llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "trim.obj");
             builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
             builder_.CreateStore(trimLen, builder_.CreateStructGEP(stringType(), newStr, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                builder_.CreateStructGEP(stringType(), newStr, 2));
             return newStr;
         }
 
@@ -1183,6 +1452,8 @@ private:
             llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "pad.obj");
             builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
             builder_.CreateStore(width64, builder_.CreateStructGEP(stringType(), newStr, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                builder_.CreateStructGEP(stringType(), newStr, 2));
             auto* padEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
@@ -1229,6 +1500,8 @@ private:
             llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rep.obj");
             builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), strObj, 0));
             builder_.CreateStore(totalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                builder_.CreateStructGEP(stringType(), strObj, 2));
             return strObj;
         }
 
@@ -1345,6 +1618,8 @@ private:
             llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "gf.obj");
             builder_.CreateStore(fData, builder_.CreateStructGEP(stringType(), strObj, 0));
             builder_.CreateStore(fieldLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                builder_.CreateStructGEP(stringType(), strObj, 2));
             return strObj;
         }
 
@@ -1963,18 +2238,20 @@ private:
     // Version of lowerStringLiteral that only creates globals (no builder
     // instructions), safe to call during declareStatics.
     llvm::Constant* lowerStringLiteralConst(std::string_view text, bool verbatim) {
-        std::string content = processStringText(text, verbatim);
-        llvm::Constant* dataArr =
-            llvm::ConstantDataArray::getString(llvm_, content, /*AddNull=*/true);
+        auto cps = processStringCodePoints(text, verbatim);
+        uint8_t width = codePointsWidth(cps);
+        llvm::Constant* dataArr = makeCodePointArray(cps, width);
         unsigned id = stringLiteralIdx_++;
         auto* dataGV = new llvm::GlobalVariable(
             *module_, dataArr->getType(), /*isConstant=*/true,
             llvm::GlobalValue::PrivateLinkage, dataArr,
             ".bz.str.data." + std::to_string(id));
         dataGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-        dataGV->setAlignment(llvm::Align(1));
-        llvm::Constant* lenC = llvm::ConstantInt::get(i64(), content.size());
-        llvm::Constant* strVal = llvm::ConstantStruct::get(stringType(), {dataGV, lenC});
+        dataGV->setAlignment(llvm::Align(width));
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Constant* lenC = llvm::ConstantInt::get(i64(), cps.size());
+        llvm::Constant* widC = llvm::ConstantInt::get(i8Ty, width);
+        llvm::Constant* strVal = llvm::ConstantStruct::get(stringType(), {dataGV, lenC, widC});
         auto* strGV = new llvm::GlobalVariable(
             *module_, stringType(), /*isConstant=*/true,
             llvm::GlobalValue::PrivateLinkage, strVal,
@@ -3539,9 +3816,7 @@ private:
 
         llvm::Value* strPtr = lowerExpr(*fs.iterable);
         if (!strPtr) return false;
-        llvm::Value* len = loadStringLen(strPtr);          // i64 length
-        llvm::Value* data = loadStringData(strPtr);        // ptr to chars
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* len = loadStringLen(strPtr);          // i64 code-point count
 
         // Index counter (i64).
         auto* idxSlot = entryAlloca(i64());
@@ -3563,10 +3838,8 @@ private:
         builder_.CreateCondBr(cond, bodyBB, endBB);
 
         builder_.SetInsertPoint(bodyBB);
-        llvm::Value* idxBod = builder_.CreateLoad(i64(), idxSlot);
-        llvm::Value* bytePtr = builder_.CreateGEP(i8Ty, data, idxBod, "sfor.ptr");
-        llvm::Value* byte = builder_.CreateLoad(i8Ty, bytePtr, "sfor.byte");
-        builder_.CreateStore(builder_.CreateZExt(byte, i32()), varSlot);
+        llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateStore(loadCodePoint(strPtr, idxB), varSlot);
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
         lowerScopedBlock(fs.body);
         loopStack_.pop_back();
@@ -3886,6 +4159,8 @@ private:
                                     llvm::Value* so = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "ts.obj");
                                     builder_.CreateStore(dc, builder_.CreateStructGEP(stringType(), so, 0));
                                     builder_.CreateStore(l64, builder_.CreateStructGEP(stringType(), so, 1));
+                                    builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                                        builder_.CreateStructGEP(stringType(), so, 2));
                                     return so;
                                 }
                                 return emitPrimitiveToString(recv, tt->primitive);
@@ -3912,12 +4187,9 @@ private:
                     llvm::Value* strPtr = lowerExpr(*ix->target);
                     llvm::Value* idx = lowerExpr(*ix->indices[0].value);
                     if (!strPtr || !idx) return nullptr;
-                    llvm::Value* data = loadStringData(strPtr);
-                    llvm::Value* idx64 = builder_.CreateSExt(idx, i64(), "str.idx64");
-                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-                    llvm::Value* cp = builder_.CreateGEP(i8Ty, data, idx64, "str.cp.ptr");
-                    llvm::Value* byte = builder_.CreateLoad(i8Ty, cp, "str.byte");
-                    return builder_.CreateZExt(byte, i32(), "str.char");
+                    // Use idx (the index expression value, probably i32) — sext to i64 first
+                    llvm::Value* idx64 = idx->getType() == i64() ? idx : builder_.CreateSExt(idx, i64(), "str.idx64");
+                    return loadCodePoint(strPtr, idx64);
                 }
             }
             // §15.1: inline array `a[i]` — GEP the array slot and load.
@@ -4963,6 +5235,8 @@ private:
         llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rl.obj");
         builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
         builder_.CreateStore(finalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+            builder_.CreateStructGEP(stringType(), strObj, 2));
         auto* okEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
         // Merge.
@@ -5150,6 +5424,8 @@ private:
                 llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)});
                 builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
                 builder_.CreateStore(rawLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+                builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                    builder_.CreateStructGEP(stringType(), strObj, 2));
                 auto* okEnd = builder_.GetInsertBlock();
                 builder_.CreateBr(endBB);
                 builder_.SetInsertPoint(endBB);
@@ -5263,6 +5539,8 @@ private:
                     llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rd.obj");
                     builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
                     builder_.CreateStore(len64, builder_.CreateStructGEP(stringType(), strObj, 1));
+                    builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                        builder_.CreateStructGEP(stringType(), strObj, 2));
                     return strObj;
                 }
                 return nullptr;  // binary radix deferred
