@@ -114,3 +114,60 @@ BEZEL_TEST(codegen_cg51, loop_variable_value) {
         "  return last; "
         "end Main; end C;"), 13);
 }
+
+// CG51b (§16.4): stride — `for var i in lo..hi step k do … end`.
+// A positive step ascends; a negative step descends. A non-constant or
+// zero step is deferred (falls back to the not-yet-implemented path).
+
+// Ascending step 2: 0, 2, 4, 6, 8, 10 → sum = 30.
+BEZEL_TEST(codegen_cg51b, ascending_step_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; for var i in 0..10 step 2 do s := s + i; end; return s; "
+        "end Main; end C;"), 30);
+}
+
+// Half-open with step 2: 0, 2, 4, 6, 8 (10 excluded) → sum = 20.
+BEZEL_TEST(codegen_cg51b, half_open_step_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; for var i in 0..<10 step 2 do s := s + i; end; return s; "
+        "end Main; end C;"), 20);
+}
+
+// Descending step -1: 5, 4, 3, 2, 1 → sum = 15.
+BEZEL_TEST(codegen_cg51b, descending_step_neg1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; for var i in 5..1 step -1 do s := s + i; end; return s; "
+        "end Main; end C;"), 15);
+}
+
+// Descending, count only: 10, 8, 6, 4, 2 → 5 iterations.
+BEZEL_TEST(codegen_cg51b, descending_count) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var n := 0; for var i in 10..2 step -2 do n := n + 1; end; return n; "
+        "end Main; end C;"), 5);
+}
+
+// Step 3: 0, 3, 6, 9 → sum = 18.
+BEZEL_TEST(codegen_cg51b, step_3_sum) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; for var i in 0..10 step 3 do s := s + i; end; return s; "
+        "end Main; end C;"), 18);
+}
+
+// Step with break: ascend by 3 until i > 6, sum 0+3+6 = 9.
+BEZEL_TEST(codegen_cg51b, step_with_break) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; "
+        "  for var i in 0..100 step 3 do "
+        "    if i > 6 then break; end; "
+        "    s := s + i; "
+        "  end; "
+        "  return s; "
+        "end Main; end C;"), 9);
+}
