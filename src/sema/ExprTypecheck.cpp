@@ -1760,6 +1760,7 @@ private:
                             ma.member == "ToUpper" || ma.member == "Replace" ||
                             ma.member == "PadLeft" || ma.member == "PadRight" ||
                             ma.member == "Repeat" || ma.member == "Remove" ||
+                            ma.member == "Insert" ||
                             ma.member == "GetField") {
                             ctx_.setExprType(
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::String));

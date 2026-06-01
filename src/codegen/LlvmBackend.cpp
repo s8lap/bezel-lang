@@ -1801,6 +1801,59 @@ private:
             return builder_.CreateLoad(i32(), cntSlot, "countof.result");
         }
 
+        // §9.6: Insert(index, value): string — insert value at code-point position index.
+        if (method == "Insert" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* idxV = getIntArg(0);
+            llvm::Value* ins  = getStrArg(1);
+            if (!idxV || !ins) return nullptr;
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* selfLen = loadStringLen(self);
+            llvm::Value* insLen  = loadStringLen(ins);
+            llvm::Value* idx64 = builder_.CreateSExt(idxV, i64(), "ins.idx");
+            // Clamp index to [0, selfLen]
+            llvm::Value* tooHigh = builder_.CreateICmpSGT(idx64, selfLen);
+            idx64 = builder_.CreateSelect(tooHigh, selfLen, idx64);
+            llvm::Value* tooLow = builder_.CreateICmpSLT(idx64, builder_.getInt64(0));
+            idx64 = builder_.CreateSelect(tooLow, builder_.getInt64(0), idx64);
+            llvm::Value* resultLen = builder_.CreateAdd(selfLen, insLen, "ins.reslen");
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            // Width handling: use self's width (assume same width for ins for simplicity).
+            llvm::Value* wid = builder_.CreateZExt(loadStringWidth(self), i64());
+            llvm::Value* dataSz = builder_.CreateAdd(
+                builder_.CreateMul(resultLen, wid), builder_.getInt64(1));
+            llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "ins.data");
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* insData  = loadStringData(ins);
+            // Copy prefix: self[0..idx)
+            llvm::Value* prefBytes = builder_.CreateMul(idx64, wid);
+            builder_.CreateCall(memcpyFn, {newData, selfData, prefBytes});
+            // Copy insertion: ins[0..insLen)
+            llvm::Value* insBytes  = builder_.CreateMul(insLen, wid);
+            llvm::Value* midDst = builder_.CreateGEP(i8Ty, newData, prefBytes);
+            builder_.CreateCall(memcpyFn, {midDst, insData, insBytes});
+            // Copy suffix: self[idx..selfLen)
+            llvm::Value* suffOff = builder_.CreateMul(idx64, wid);
+            llvm::Value* suffSrc = builder_.CreateGEP(i8Ty, selfData, suffOff);
+            llvm::Value* suffDst = builder_.CreateGEP(i8Ty, newData,
+                builder_.CreateAdd(prefBytes, insBytes));
+            llvm::Value* suffBytes = builder_.CreateMul(
+                builder_.CreateSub(selfLen, idx64), wid);
+            builder_.CreateCall(memcpyFn, {suffDst, suffSrc, suffBytes});
+            // Null-terminate.
+            llvm::Value* resultBytes = builder_.CreateMul(resultLen, wid);
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, resultBytes);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            llvm::Value* maxW8 = builder_.CreateTrunc(loadStringWidth(self), i8Ty);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "ins.obj");
+            builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
+            builder_.CreateStore(resultLen, builder_.CreateStructGEP(stringType(), newStr, 1));
+            builder_.CreateStore(maxW8, builder_.CreateStructGEP(stringType(), newStr, 2));
+            return newStr;
+        }
+
         // §9.6: Remove(start): string — remove from start to end.
         // §9.6: Remove(start, count): string — remove count code points.
         if (method == "Remove" && !call.args.empty() && call.args[0].value) {
