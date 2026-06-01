@@ -3859,8 +3859,91 @@ private:
         return builder_.CreateLoad(st, slot);  // the record value (by value)
     }
 
+    // CG-console: emit a Console.Write/Console.WriteLine call as an
+    // intrinsic. Uses libc write(1, data, len) for Write and additionally
+    // write(1, "\n", 1) for WriteLine. This provides observable stdout.
+    // `value` must be a ptr to a bz_string; if it's an integer or other
+    // primitive, the caller converts via emitPrimitiveToString first.
+    llvm::Value* emitConsoleWrite(llvm::Value* strPtr, bool newline) {
+        // Declare POSIX write(2): ssize_t write(int, const void*, size_t)
+        auto* writeFn = module_->getFunction("write");
+        if (!writeFn) {
+            auto* ft = llvm::FunctionType::get(i64(), {i32(), ptrTy(), i64()},
+                                               false);
+            writeFn = llvm::Function::Create(
+                ft, llvm::Function::ExternalLinkage, "write", module_.get());
+        }
+        llvm::Value* data = loadStringData(strPtr);
+        llvm::Value* len  = loadStringLen(strPtr);
+        builder_.CreateCall(writeFn,
+                            {builder_.getInt32(1), data, len});  // fd=1 (stdout)
+        if (newline) {
+            // Write a newline byte.
+            llvm::Constant* nlData = llvm::ConstantDataArray::getString(
+                llvm_, "\n", /*AddNull=*/false);
+            auto* nlGV = new llvm::GlobalVariable(
+                *module_, nlData->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, nlData, ".bz.nl");
+            builder_.CreateCall(writeFn,
+                                {builder_.getInt32(1), nlGV,
+                                 builder_.getInt64(1)});
+        }
+        return nullptr;  // unit (void)
+    }
+
+    // Detect `Console.Write(...)` / `Console.WriteLine(...)` /
+    // `Console.WriteLine()` (no-arg) as intrinsic call patterns.
+    // Returns true and emits code if the pattern matches; false otherwise.
+    bool tryLowerConsoleCall(const ast::CallExpr& call) {
+        if (!call.callee) return false;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+        if (!ma || !ma->target) return false;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!id || id->name != "Console") return false;
+
+        bool isWriteLine = (ma->member == "WriteLine");
+        bool isWrite = (ma->member == "Write");
+        if (!isWrite && !isWriteLine) return false;
+
+        // Console.WriteLine() with no args → just print a newline.
+        if (call.args.empty() && isWriteLine) {
+            auto* writeFn = module_->getFunction("write");
+            if (!writeFn) {
+                auto* ft = llvm::FunctionType::get(i64(), {i32(), ptrTy(), i64()}, false);
+                writeFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "write", module_.get());
+            }
+            llvm::Constant* nlData = llvm::ConstantDataArray::getString(
+                llvm_, "\n", false);
+            unsigned id2 = stringLiteralIdx_++;
+            auto* nlGV = new llvm::GlobalVariable(
+                *module_, nlData->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, nlData,
+                ".bz.console.nl." + std::to_string(id2));
+            builder_.CreateCall(writeFn, {builder_.getInt32(1), nlGV, builder_.getInt64(1)});
+            return true;
+        }
+        if (call.args.size() != 1 || !call.args[0].value) return false;
+
+        // Evaluate the argument. If it's a string, use directly; if it's a
+        // primitive, convert via emitPrimitiveToString first.
+        llvm::Value* arg = lowerExpr(*call.args[0].value);
+        if (!arg) return false;
+        auto* argTy = ctx_.exprType(*call.args[0].value);
+        llvm::Value* strPtr = arg;
+        if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+            argTy->primitive != sema::PrimitiveType::String) {
+            strPtr = emitPrimitiveToString(arg, argTy->primitive);
+        }
+        if (!strPtr) return false;
+        emitConsoleWrite(strPtr, isWriteLine);
+        return true;
+    }
+
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
+        // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
+        if (tryLowerConsoleCall(call)) return nullptr;  // unit result
         // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
         // primitive type name (no resolved symbol) converts its argument.
         if (auto* cid =

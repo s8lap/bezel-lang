@@ -112,6 +112,23 @@ private:
     // state (`this`, `base`, instance members).
     bool inFieldInitializer_ = false;
 
+    // §2.3: cache of synthetic TypeSymbol objects for always-available
+    // built-in classes (Console, Math, Convert, Environment).
+    std::unordered_map<std::string, TypeSymbol*> builtinClassCache_;
+
+    // Return (or lazily create) a synthetic TypeSymbol for a built-in class.
+    TypeSymbol* builtinClassSym(std::string_view name) {
+        auto key = std::string(name);
+        auto it = builtinClassCache_.find(key);
+        if (it != builtinClassCache_.end()) return it->second;
+        auto* ts = ctx_.makeSymbol<TypeSymbol>();
+        ts->kind = ast::TypeDeclKind::Class;
+        ts->name = name;
+        ts->decl = nullptr;
+        builtinClassCache_[key] = ts;
+        return ts;
+    }
+
     // Slice S29: report when a bare identifier inside a field
     // initializer resolves to a non-static member of the current type
     // (an implicit-`this` reference, forbidden by §22.8). Static
@@ -951,6 +968,15 @@ private:
                 // §5.2: a primitive type name used in expression position is
                 // a conversion callee (`int(x)`). It has no value symbol;
                 // the enclosing call resolves the conversion (typeCall).
+            } else if (id->name == "Console" || id->name == "Math" ||
+                       id->name == "Convert" || id->name == "Environment") {
+                // §2.3: these System classes are auto-imported and always
+                // available without an explicit import. Give them a synthetic
+                // TypeSymbol (null decl) so member access can proceed; the
+                // codegen handles known methods (Write/WriteLine, etc.)
+                // as intrinsics.
+                auto* ts = builtinClassSym(id->name);
+                ctx_.setExprSymbol(&e, ts);
             } else if (currentScope_) {
                 ctx_.diagnostics().report(
                     Severity::Error, id->span.begin,

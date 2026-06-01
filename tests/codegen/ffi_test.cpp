@@ -80,3 +80,48 @@ BEZEL_TEST(codegen_cg26, putchar_writes_stdout) {
         "end Main; end C;");
     BEZEL_EXPECT_EQ(out, std::string("Hi\n"));
 }
+
+// §2.3: Console is always available; Write/WriteLine are intrinsics lowered
+// via POSIX write(2). These tests use compileAndCapture to observe stdout.
+
+BEZEL_TEST(codegen_console, write_string) {
+    BEZEL_EXPECT_EQ(compileAndCapture(
+        "module M; class C public static method Main(): int "
+        "  Console.Write(\"Hello\"); return 0; "
+        "end Main; end C;"), std::string("Hello"));
+}
+
+BEZEL_TEST(codegen_console, writeline_string) {
+    BEZEL_EXPECT_EQ(compileAndCapture(
+        "module M; class C public static method Main(): int "
+        "  Console.WriteLine(\"World\"); return 0; "
+        "end Main; end C;"), std::string("World\n"));
+}
+
+BEZEL_TEST(codegen_console, writeline_int) {
+    BEZEL_EXPECT_EQ(compileAndCapture(
+        "module M; class C public static method Main(): int "
+        "  Console.WriteLine(42); return 0; "
+        "end Main; end C;"), std::string("42\n"));
+}
+
+BEZEL_TEST(codegen_console, writeline_no_args) {
+    BEZEL_EXPECT_EQ(compileAndCapture(
+        "module M; class C public static method Main(): int "
+        "  Console.WriteLine(); return 0; "
+        "end Main; end C;"), std::string("\n"));
+}
+
+BEZEL_TEST(codegen_console, writeline_interpolated) {
+    BEZEL_EXPECT_EQ(compileAndCapture(
+        "module M; class C public static method Main(): int "
+        "  var x := 7; Console.WriteLine($\"x={x}\"); return 0; "
+        "end Main; end C;"), std::string("x=7\n"));
+}
+
+BEZEL_TEST(codegen_console, write_bool) {
+    BEZEL_EXPECT_EQ(compileAndCapture(
+        "module M; class C public static method Main(): int "
+        "  Console.Write(true); return 0; "
+        "end Main; end C;"), std::string("true"));
+}
