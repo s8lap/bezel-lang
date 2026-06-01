@@ -8,6 +8,7 @@
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
+#include "sema/TypeRef.hpp"
 
 namespace bezel::sema {
 
@@ -51,7 +52,17 @@ private:
             if (ld->initializer) visitExpr(*ld->initializer);
             if (!ld->name.empty()) {
                 declared_.insert(ld->name);
-                if (ld->initializer) assigned_.insert(ld->name);
+                if (ld->initializer) {
+                    assigned_.insert(ld->name);
+                } else if (ld->type) {
+                    // §15.1: inline arrays are zero-initialized when declared
+                    // without an initializer (the declaration is the init);
+                    // treat them as definitely assigned.
+                    if (auto* rt = ctx_.resolvedType(*ld->type)) {
+                        if (rt->kind == sema::TypeRef::Kind::InlineArray)
+                            assigned_.insert(ld->name);
+                    }
+                }
             }
             return;
         }
