@@ -6903,6 +6903,29 @@ private:
                     }
                     return builder_.CreateCall(atofFn, {data}, "atof.ret");
                 }
+                // Convert.ToBoolean(s: string): bool — "true"/"1" → true
+                if (m == "ToBoolean") {
+                    llvm::Value* arg = lowerExpr(*call.args[0].value);
+                    if (!arg) return nullptr;
+                    llvm::Value* data = loadStringData(arg);
+                    auto* strcmpFn = module_->getFunction("strcasecmp");
+                    if (!strcmpFn) {
+                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                        strcmpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "strcasecmp", module_.get());
+                    }
+                    llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
+                    unsigned tid = stringLiteralIdx_++;
+                    auto* trueGV = new llvm::GlobalVariable(*module_, trueStr->getType(), true,
+                        llvm::GlobalValue::PrivateLinkage, trueStr, ".bz.bool.true." + std::to_string(tid));
+                    llvm::Value* cmpTrue = builder_.CreateICmpEQ(
+                        builder_.CreateCall(strcmpFn, {data, trueGV}), builder_.getInt32(0));
+                    llvm::Constant* oneStr = llvm::ConstantDataArray::getString(llvm_, "1", true);
+                    auto* oneGV = new llvm::GlobalVariable(*module_, oneStr->getType(), true,
+                        llvm::GlobalValue::PrivateLinkage, oneStr, ".bz.bool.one." + std::to_string(tid));
+                    llvm::Value* cmpOne = builder_.CreateICmpEQ(
+                        builder_.CreateCall(strcmpFn, {data, oneGV}), builder_.getInt32(0));
+                    return builder_.CreateOr(cmpTrue, cmpOne, "tobool");
+                }
                 // Convert.ToString(n: int): string — alias for n.ToString()
                 if (m == "ToString") {
                     llvm::Value* arg = lowerExpr(*call.args[0].value);
