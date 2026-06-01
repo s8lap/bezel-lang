@@ -3370,8 +3370,35 @@ private:
                             pv = emitPrimitiveToString(ev, P::Double);
                         else if (llvmTy->isFloatTy())
                             pv = emitPrimitiveToString(ev, P::Float);
-                        else if (llvmTy->isPointerTy())
-                            pv = ev;  // string or class — use as-is
+                        else if (llvmTy->isPointerTy()) {
+                            // Could be string (use as-is) or class (call ToString).
+                            if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                                rt->declaration) {
+                                // Class/interface: call ToString() if available.
+                                auto* ts = rt->declaration;
+                                sema::MethodSymbol* toStr = nullptr;
+                                for (auto* cur = ts; cur && !toStr;) {
+                                    for (auto* sym : cur->members) {
+                                        auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                                        if (ms && ms->name == "ToString" && ms->params.empty()) {
+                                            toStr = ms; break;
+                                        }
+                                    }
+                                    sema::TypeSymbol* nxt = nullptr;
+                                    for (auto* b : cur->baseTypes)
+                                        if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+                                    cur = nxt;
+                                }
+                                if (toStr) {
+                                    std::vector<llvm::Value*> args{ev};
+                                    pv = emitMethodCall(toStr, args, false);
+                                } else {
+                                    pv = ev;  // string — use as-is
+                                }
+                            } else {
+                                pv = ev;  // string or unknown ptr — use as-is
+                            }
+                        }
                         // else: struct (record value) etc. — skip
                     }
                 }
