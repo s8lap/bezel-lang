@@ -7646,6 +7646,37 @@ private:
             }
         }
         if (canDispatch) {
+            // CG-generic: if there is an active type-parameter substitution
+            // and this method has generic params/return, use inline emission
+            // rather than vtable dispatch — the vtable function was compiled
+            // with i32-placeholder types and calling it with concrete types
+            // (e.g. ptr for string) will mis-type the call or crash.
+            if (!genericSubst_.empty()) {
+                llvm::FunctionType* fnTy = methodFnType(ms);
+                if (fnTy) {
+                    bool needsInline = false;
+                    // Check return type for generic placeholder (i32 from lowerType fallback).
+                    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                    if (md && md->returnType) {
+                        sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+                        if (retTy && lowerTypeRef(retTy) != fnTy->getReturnType())
+                            needsInline = true;
+                    }
+                    // Check param types.
+                    if (!needsInline) {
+                        for (std::size_t ai = 0; ai < args.size(); ++ai)
+                            if (args[ai]->getType() != fnTy->getParamType(ai))
+                                { needsInline = true; break; }
+                    }
+                    if (needsInline) {
+                        llvm::Value* r = emitInlineGenericMethod(ms, args);
+                        if (r != nullptr || diverged_) {
+                            emitPendingCheck();
+                            return r;
+                        }
+                    }
+                }
+            }
             llvm::FunctionType* fnTy = methodFnType(ms);
             if (!fnTy || args.size() != fnTy->getNumParams()) return nullptr;
             llvm::Value* recv = args[0];
@@ -7664,31 +7695,49 @@ private:
         llvm::Function* callee = it->second;
         if (args.size() != callee->arg_size()) return nullptr;
         // CG-generic: if the generic substitution is active and the method
+        // is on a class that has generic parameters, we must specialize the
+        // call — even for methods with non-generic param/return types (like
+        // `Size(): int`), because the struct layout changes when generic field
+        // types (e.g. [5]T) are substituted with concrete types (e.g. [5]ptr).
+        if (!genericSubst_.empty() && !isStaticMethod(ms)) {
+            // Check if the method's parent class has generic params (i.e., is a
+            // generic class that has been instantiated with the current subst).
+            bool parentIsGeneric = false;
+            if (ms->parent && ms->parent->decl) {
+                auto* td = dynamic_cast<const ast::TypeDecl*>(ms->parent->decl);
+                if (td && !td->genericParams.empty()) parentIsGeneric = true;
+            }
+            if (parentIsGeneric) {
+                llvm::Value* r = emitInlineGenericMethod(ms, args);
+                if (r != nullptr || diverged_) {
+                    emitPendingCheck();
+                    return r;
+                }
+            }
+        }
+        // CG-generic: if the generic substitution is active and the method
         // function has type-mismatched args (generic T→i32 vs concrete f64),
         // emit a specialized inline wrapper rather than calling the compiled
         // generic function. This handles generic methods like `Get(): T`.
-        {
+        if (!genericSubst_.empty()) {
             bool typesMismatch = false;
             auto* callFnTy = callee->getFunctionType();
             for (std::size_t ai = 0; ai < args.size(); ++ai)
                 if (args[ai]->getType() != callFnTy->getParamType(ai))
                     { typesMismatch = true; break; }
-            if (!typesMismatch) {
+            if (!typesMismatch && ms->decl) {
                 // Also check return type — if the method returns a generic
                 // param (i32 fallback) but we need a concrete type.
                 llvm::Type* declRetTy = callFnTy->getReturnType();
-                // Look at the sema return type for the method.
-                if (ms->decl && !genericSubst_.empty()) {
-                    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-                    if (md && md->returnType) {
-                        sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
-                        llvm::Type* concrRetTy = retTy
-                            ? lowerTypeRef(retTy) : declRetTy;
-                        if (concrRetTy != declRetTy) typesMismatch = true;
-                    }
+                auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                if (md && md->returnType) {
+                    sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+                    llvm::Type* concrRetTy = retTy
+                        ? lowerTypeRef(retTy) : declRetTy;
+                    if (concrRetTy != declRetTy) typesMismatch = true;
                 }
             }
-            if (typesMismatch && !genericSubst_.empty()) {
+            if (typesMismatch) {
                 // Inline the method body with the current generic substitution.
                 llvm::Value* r = emitInlineGenericMethod(ms, args);
                 if (r != nullptr || diverged_) {
@@ -7699,6 +7748,113 @@ private:
         }
         llvm::Value* r = builder_.CreateCall(callee, args);
         emitPendingCheck();  // CG20: a callee may have thrown
+        return r;
+    }
+
+    // CG-generic: compile a specialized version of a block-body method with
+    // the current genericSubst_ applied to all types.  The specialized
+    // function is cached in specializedMethods_ so each (ms, subst) pair is
+    // compiled at most once.  The result is a call to the specialized fn.
+    llvm::Value* emitGenericSpecialization(sema::MethodSymbol* ms,
+                                           std::vector<llvm::Value*>& args,
+                                           const CallableInfo& ci) {
+        // Build the substitution key for caching.
+        std::vector<llvm::Type*> substKey;
+        for (auto& [name, ty] : genericSubst_) substKey.push_back(ty);
+
+        auto cacheKey = std::make_pair(ms, substKey);
+        auto cit = specializedMethods_.find(cacheKey);
+        if (cit != specializedMethods_.end()) {
+            // Already compiled — just call it.
+            llvm::Function* fn = cit->second;
+            if (args.size() != fn->arg_size()) return nullptr;
+            llvm::Value* r = builder_.CreateCall(fn, args);
+            emitPendingCheck();
+            return r;
+        }
+
+        // Build the function type with concrete arg/ret types.
+        std::vector<llvm::Type*> paramTys;
+        for (auto* a : args) paramTys.push_back(a->getType());
+        // Return type: apply genericSubst_ to the declared return type.
+        llvm::Type* retTy = llvm::Type::getVoidTy(llvm_);
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (md && md->returnType) {
+            sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+            if (rt) retTy = lowerTypeRef(rt);
+        }
+        auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+
+        // Create the specialized function.
+        std::string fname = std::string(ms->parent ? ms->parent->name : "")
+                            + "$" + std::string(ms->name) + "$spec";
+        llvm::Function* specFn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage, fname, module_.get());
+        specializedMethods_[cacheKey] = specFn;
+
+        // Emit the body into the specialized function.
+        llvm::BasicBlock* savedInsert = builder_.GetInsertBlock();
+        llvm::Value* savedThis = currentThis_;
+        auto savedLocals = locals_;
+        auto savedParams = paramSlots_;
+        llvm::BasicBlock* savedProp = propagateBB_;
+        llvm::BasicBlock* savedUnwind = unwindTarget_;
+        llvm::Value* savedCaught = currentCaughtExc_;
+        std::size_t savedUnwindDepth = unwindScopeDepth_;
+        bool savedDiverged = diverged_;
+        auto savedLoop = loopStack_;
+        auto savedDispose = disposeStack_;
+        llvm::Function* savedFn = currentFn_;
+
+        currentFn_ = specFn;
+        auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", specFn);
+        builder_.SetInsertPoint(entryBB);
+        locals_.clear();
+        paramSlots_.clear();
+        propagateBB_ = nullptr;
+        unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr;
+        unwindScopeDepth_ = 0;
+        diverged_ = false;
+        loopStack_.clear();
+        disposeStack_.clear();
+
+        // Bind `this` and params.
+        auto argIt = specFn->arg_begin();
+        std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
+        if (!isStaticMethod(ms)) {
+            currentThis_ = &*argIt++;
+        } else {
+            currentThis_ = nullptr;
+        }
+        for (std::size_t pi = 0; pi < ms->params.size(); ++pi, ++argIt) {
+            auto* slot = entryAlloca(argIt->getType());
+            builder_.CreateStore(&*argIt, slot);
+            paramSlots_[ms->params[pi]] = slot;
+        }
+
+        // Emit block body.
+        if (ci.stmts) lowerScopedBlock(*ci.stmts);
+        if (!diverged_) emitImplicitReturn(specFn);
+
+        // Restore outer state.
+        builder_.SetInsertPoint(savedInsert);
+        currentFn_ = savedFn;
+        currentThis_ = savedThis;
+        locals_ = std::move(savedLocals);
+        paramSlots_ = std::move(savedParams);
+        propagateBB_ = savedProp;
+        unwindTarget_ = savedUnwind;
+        currentCaughtExc_ = savedCaught;
+        unwindScopeDepth_ = savedUnwindDepth;
+        diverged_ = savedDiverged;
+        loopStack_ = std::move(savedLoop);
+        disposeStack_ = std::move(savedDispose);
+
+        // Call the specialized function.
+        if (args.size() != specFn->arg_size()) return nullptr;
+        llvm::Value* r = builder_.CreateCall(specFn, args);
+        emitPendingCheck();
         return r;
     }
 
@@ -7746,8 +7902,11 @@ private:
         if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
             result = lowerExpr(*ci.exprBody);
         } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
-            // Block body inline: just emit statements; return via ret value.
-            lowerScopedBlock(*ci.stmts);
+            // Block body: compile a specialized function and call it.
+            // Inlining block bodies is problematic because `return` generates
+            // `ret` in the outer function. Instead, monomorphize: compile a
+            // concrete version of the function with the active substitution.
+            result = emitGenericSpecialization(ms, args, ci);
         }
 
         // Restore state.
