@@ -172,3 +172,24 @@ BEZEL_TEST(codegen_generic, array_elem_assign_rhs_evaluated_once) {
         "    return _n; "   // should be 5, not 10
         "end Main; end C;"), 5);
 }
+
+// ── Computed property named "Length" ─────────────────────────────────────
+
+BEZEL_TEST(codegen_generic, computed_property_named_length) {
+    // §22.4/§33: A user-defined computed property named "Length" must return
+    // its own getter expression, not be intercepted by the string Length
+    // fallback. The fallback was too broad: it matched any Named type with
+    // a "Length" member, treating the class pointer as a bz_string.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class V "
+        "  private _n: int := 0; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public property Length: int => _n * 2; "  // user-defined Length
+        "  destructor end destructor; "
+        "end V; "
+        "class C public static method Main(): int "
+        "  using var v := new V(5); "
+        "  return v.Length; "   // should be 10 (5*2), not garbage
+        "end Main; end C;"), 10);
+}
