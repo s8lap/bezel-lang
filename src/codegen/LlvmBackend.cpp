@@ -3263,14 +3263,20 @@ private:
         return nullptr;
     }
 
+    // Returns true if `tt` is a Named type with no user declaration, i.e.,
+    // one of the built-in exception types (Exception, ArgumentException, …).
+    bool isBuiltinExceptionType(const sema::TypeRef* tt) const {
+        if (!tt || tt->kind != sema::TypeRef::Kind::Named) return false;
+        return tt->declaration == nullptr;  // built-ins have no TypeSymbol
+    }
+
     // CG22: construct + throw a built-in exception by name, then unwind.
     void emitThrowBuiltin(const char* name) {
         auto vit = builtinVtable_.find(name);
         if (vit == builtinVtable_.end()) return;
-        // Minimal object: one pointer (the vtable) — built-ins have no
-        // fields. 8 bytes covers the pointer on the host.
+        // 16-byte object: slot0=vtable, slot1=empty message ptr (calloc zeros it).
         llvm::Value* obj = builder_.CreateCall(
-            callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+            callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
         builder_.CreateStore(vit->second, obj);
         builder_.CreateStore(obj, excGlobal());
         emitUnwindDisposals();
@@ -5090,6 +5096,28 @@ private:
                 }
             }
         }
+        // CG22+: Exception.Message — built-in exceptions store a message
+        // string pointer at byte offset 8 (slot 1) of the exception object.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target && ma->member == "Message") {
+                auto* tt = ctx_.exprType(*ma->target);
+                if (tt && isBuiltinExceptionType(tt)) {
+                    llvm::Value* excObj = lowerExpr(*ma->target);
+                    if (!excObj) return nullptr;
+                    // slot 1 = message string ptr (at byte offset 8)
+                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                    llvm::Value* msgSlot = builder_.CreateGEP(
+                        i8Ty, excObj, builder_.getInt64(8));
+                    llvm::Value* msgPtr = builder_.CreateLoad(ptrTy(), msgSlot);
+                    // If null (no message given), return empty string constant.
+                    auto* isNull = builder_.CreateICmpEQ(
+                        msgPtr,
+                        llvm::ConstantPointerNull::get(ptrTy()));
+                    llvm::Value* emptyStr = lowerStringLiteral("\"\"", false);
+                    return builder_.CreateSelect(isNull, emptyStr, msgPtr);
+                }
+            }
+        }
         // CG33b: a computed (arrow-getter) property read `obj.P` evaluates
         // the getter with `this` = obj.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
@@ -5955,16 +5983,26 @@ private:
         if (!rt->declaration) {
             // CG22: built-in exception types (Exception, ArgumentException, …)
             // have no user TypeSymbol (rt->declaration == null) but do have a
-            // built-in vtable from setupBuiltinExceptions. Construct a minimal
-            // heap object — 8 bytes to hold the vtable pointer — and store its
-            // vtable so emitIsA can match a catch arm.
+            // built-in vtable from setupBuiltinExceptions. Construct a 16-byte
+            // object — [vtable_ptr, message_ptr] — so that e.Message works.
             if (ne.type->name && !ne.type->name->parts.empty()) {
                 std::string n(ne.type->name->parts.back());
                 auto vit = builtinVtable_.find(n);
                 if (vit != builtinVtable_.end()) {
+                    // 16 bytes: slot0=vtable, slot1=message string ptr
                     llvm::Value* obj = builder_.CreateCall(
-                        callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+                        callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
                     builder_.CreateStore(vit->second, obj);
+                    // Store message string if a first argument was provided.
+                    if (!ne.args.empty() && ne.args[0].value) {
+                        llvm::Value* msgStr = lowerExpr(*ne.args[0].value);
+                        if (msgStr) {
+                            auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+                            llvm::Value* msgSlot = builder_.CreateGEP(
+                                i8Ty2, obj, builder_.getInt64(8));
+                            builder_.CreateStore(msgStr, msgSlot);
+                        }
+                    }
                     return obj;
                 }
             }
