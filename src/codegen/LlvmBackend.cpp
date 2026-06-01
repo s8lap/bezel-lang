@@ -4549,12 +4549,11 @@ private:
             for (const auto& part : is->parts) {
                 llvm::Value* pv = nullptr;
                 if (!part.literal.empty()) {
-                    // Literal part: create a temporary source-like string and
-                    // use processStringText (the literal chars already went
-                    // through escape processing in splitInterpolation; wrap in
-                    // quotes so lowerStringLiteral's strip-quotes logic works).
-                    // Simpler: use the content directly.
-                    std::string content = part.literal;
+                    // Literal part: process escape sequences (e.g. \n → newline,
+                    // \t → tab) that were stored as raw chars by splitInterpolation.
+                    // Wrap in quotes so processStringText's strip-quotes logic works.
+                    std::string content = processStringText(
+                        "\"" + part.literal + "\"", false);
                     llvm::Constant* dataArr = llvm::ConstantDataArray::getString(
                         llvm_, content, /*AddNull=*/true);
                     unsigned id = stringLiteralIdx_++;
