@@ -215,3 +215,62 @@ BEZEL_TEST(codegen_cg28_destructure, record_case_expr_fallthrough_discard) {
         "  end; "
         "end Main; end C;"), 30);
 }
+
+// ── DestructuringPattern with mixed constant/binding sub-patterns ─────────
+// Previously, `Point(0, y)` was mis-parsed: the ConstantPattern alternatives
+// loop consumed `,y` treating `y` as a second constant alternative, leaving
+// only one sub-pattern. Fixed by suppressing `,` alternatives inside
+// positional-pattern context.
+
+BEZEL_TEST(codegen_cg28_destructure, const_then_binding) {
+    // Point(0, y) — first sub-pattern is constant (must match 0),
+    // second is binding. Only matches when first field == 0.
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pair(a: int, b: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(0, 7); "
+        "  return case p "
+        "    Pair(0, b) => b, "
+        "    _ => -1 "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(codegen_cg28_destructure, const_then_binding_no_match) {
+    // Point(0, y) should NOT match when first field != 0.
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pair(a: int, b: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(5, 7); "
+        "  return case p "
+        "    Pair(0, b) => b, "
+        "    _ => -1 "
+        "  end; "
+        "end Main; end C;"), -1);
+}
+
+BEZEL_TEST(codegen_cg28_destructure, binding_then_const) {
+    // Point(x, 0) — matches when second field == 0.
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pair(a: int, b: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(3, 0); "
+        "  return case p "
+        "    Pair(a, 0) => a, "
+        "    _ => -1 "
+        "  end; "
+        "end Main; end C;"), 3);
+}
+
+BEZEL_TEST(codegen_cg28_destructure, both_const_no_match) {
+    // Point(0, 0) should not match Point(3, 4).
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pair(a: int, b: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(3, 4); "
+        "  return case p "
+        "    Pair(0, 0) => 99, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 0);
+}
