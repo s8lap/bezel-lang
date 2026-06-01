@@ -7021,6 +7021,13 @@ private:
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
                 if (!arg) return nullptr;
                 if (m == "Abs") {
+                    if (arg->getType()->isFloatingPointTy()) {
+                        // Abs for float/double — use fabs intrinsic.
+                        auto* fabsFn = llvm::Intrinsic::getOrInsertDeclaration(
+                            module_.get(), llvm::Intrinsic::fabs,
+                            {arg->getType()});
+                        return builder_.CreateCall(fabsFn, {arg}, "abs.result");
+                    }
                     // Abs for int — select(n<0, -n, n)
                     llvm::Value* neg = builder_.CreateNeg(arg, "abs.neg");
                     llvm::Value* isNeg = builder_.CreateICmpSLT(
