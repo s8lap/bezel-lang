@@ -7834,8 +7834,8 @@ private:
         }
 
         // Emit block body.
-        if (ci.stmts) lowerScopedBlock(*ci.stmts);
-        if (!diverged_) emitImplicitReturn(specFn);
+        bool terminated = ci.stmts && lowerScopedBlock(*ci.stmts);
+        if (!terminated) emitImplicitReturn(specFn);
 
         // Restore outer state.
         builder_.SetInsertPoint(savedInsert);
