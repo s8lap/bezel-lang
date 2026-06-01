@@ -4408,6 +4408,65 @@ private:
         return nullptr;
     }
 
+    // §3.4: static methods on primitive type names — `int.Parse(s)`,
+    // `double.Parse(s)`, etc. The target is a primitive keyword identifier.
+    llvm::Value* tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
+        if (!call.callee) return nullptr;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+        if (!ma || !ma->target) return nullptr;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!id) return nullptr;
+        sema::PrimitiveType pt = sema::primitiveFromName(id->name);
+        if (pt == sema::PrimitiveType::None) return nullptr;
+        const auto& m = ma->member;
+        using P = sema::PrimitiveType;
+
+        // int.Parse(s) / long.Parse(s) / double.Parse(s) etc.
+        if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            // If the argument is a string, use atoi/atoll/atof.
+            auto* argTy = ctx_.exprType(*call.args[0].value);
+            if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+                argTy->primitive == P::String) {
+                llvm::Value* data = loadStringData(arg);
+                if (pt == P::Int || pt == P::UInt || pt == P::Short ||
+                    pt == P::UShort || pt == P::Byte || pt == P::SByte) {
+                    auto* atoiFn = module_->getFunction("atoi");
+                    if (!atoiFn) {
+                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+                        atoiFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atoi", module_.get());
+                    }
+                    llvm::Value* r = builder_.CreateCall(atoiFn, {data});
+                    // Narrow if needed.
+                    if (pt != P::Int && pt != P::UInt) r = builder_.CreateTrunc(r, lowerPrimitive(pt));
+                    return r;
+                }
+                if (pt == P::Long || pt == P::ULong) {
+                    auto* atollFn = module_->getFunction("atoll");
+                    if (!atollFn) {
+                        auto* ft = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                        atollFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atoll", module_.get());
+                    }
+                    return builder_.CreateCall(atollFn, {data});
+                }
+                if (pt == P::Double || pt == P::Float) {
+                    auto* atofFn = module_->getFunction("atof");
+                    if (!atofFn) {
+                        auto* ft = llvm::FunctionType::get(llvm::Type::getDoubleTy(llvm_), {ptrTy()}, false);
+                        atofFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atof", module_.get());
+                    }
+                    llvm::Value* d = builder_.CreateCall(atofFn, {data});
+                    if (pt == P::Float) d = builder_.CreateFPTrunc(d, llvm::Type::getFloatTy(llvm_));
+                    return d;
+                }
+            }
+            // If already the right type, just return it.
+            return arg;
+        }
+        return nullptr;
+    }
+
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
         // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
@@ -4422,6 +4481,8 @@ private:
                 }
             }
         }
+        // §3.4: primitive type static methods: int.Parse(s), double.Parse(s), etc.
+        if (auto* v = tryLowerPrimitiveStaticCall(call)) return v;
         // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
         if (auto* v = tryLowerBuiltinClassCall(call)) return v;
         // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
