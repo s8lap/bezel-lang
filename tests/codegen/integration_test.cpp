@@ -97,3 +97,54 @@ BEZEL_TEST(integration, case_expression) {
         "  return r; "
         "end Main; end C;"), 22);
 }
+
+BEZEL_TEST(integration, for_in_range_sum) {
+    // for var i in lo..hi counted loop (§16.5) in a real native binary.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; for var i in 1..10 do s := s + i; end; return s; "
+        "end Main; end C;"), 55);
+}
+
+BEZEL_TEST(integration, for_in_range_step) {
+    // for with step clause (§16.4): ascending by 2, sum = 0+2+4+6+8+10 = 30.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; for var i in 0..10 step 2 do s := s + i; end; return s; "
+        "end Main; end C;"), 30);
+}
+
+BEZEL_TEST(integration, record_structural_equality) {
+    // Record = / <> (§8.3) — two identical records are equal; modified is not.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var a := new Point(3, 4); "
+        "  var b := new Point(3, 4); "
+        "  var c := a with x := 9 end; "
+        "  return (1 if a = b else 0) + (1 if a <> c else 0); "
+        "end Main; end C;"), 2);
+}
+
+BEZEL_TEST(integration, for_with_break_and_sum) {
+    // break inside for-in exits early; values before the break are counted.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := 0; "
+        "  for var i in 1..100 do "
+        "    if i > 5 then break; end; "
+        "    s := s + i; "
+        "  end; "
+        "  return s; "
+        "end Main; end C;"), 15);
+}
+
+BEZEL_TEST(integration, fibonacci_via_for_in) {
+    // Fibonacci using for-in — integration test for combined control flow.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var a := 0; var b := 1; "
+        "  for var i in 0..9 do var c := a + b; a := b; b := c; end; "
+        "  return a; "
+        "end Main; end C;"), 55);
+}
