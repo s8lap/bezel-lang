@@ -101,20 +101,39 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                     char ek = exprText[k];
                     if (ek == '(' || ek == '[') ++d;
                     else if (ek == ')' || ek == ']') --d;
-                    else if (ek == ':' && d == 0 && k + 1 < exprText.size()) {
-                        // Looks like a format specifier — check that
-                        // the tail is purely alphanumeric.
-                        bool looksLikeFmt = true;
-                        for (size_t f = k + 1; f < exprText.size(); ++f) {
-                            char fc = exprText[f];
-                            if (!std::isalnum(fc) && fc != '-' && fc != '+')
-                                { looksLikeFmt = false; break; }
+                    else if (d == 0 && k + 1 < exprText.size()) {
+                        // `:FORMAT` — standard format specifier.
+                        if (ek == ':') {
+                            bool looksLikeFmt = true;
+                            for (size_t f = k + 1; f < exprText.size(); ++f) {
+                                char fc = exprText[f];
+                                if (!std::isalnum(fc) && fc != '-' && fc != '+')
+                                    { looksLikeFmt = false; break; }
+                            }
+                            if (looksLikeFmt) {
+                                actualExpr = exprText.substr(0, k);
+                                fmtSpec = std::string(exprText.substr(k + 1));
+                            }
+                            break;
                         }
-                        if (looksLikeFmt) {
-                            actualExpr = exprText.substr(0, k);
-                            fmtSpec = std::string(exprText.substr(k + 1));
+                        // `,WIDTH` — alignment specifier (negative = left-align).
+                        // e.g. `{x,-15}` or `{x,10}`.
+                        if (ek == ',') {
+                            auto tail = exprText.substr(k + 1);
+                            bool looksLikeWidth = !tail.empty();
+                            size_t start = 0;
+                            if (!tail.empty() && (tail[0] == '-' || tail[0] == '+'))
+                                start = 1;
+                            for (size_t f = start; f < tail.size(); ++f)
+                                if (!std::isdigit(tail[f]))
+                                    { looksLikeWidth = false; break; }
+                            if (looksLikeWidth && start < tail.size()) {
+                                actualExpr = exprText.substr(0, k);
+                                // Encode alignment as "," + WIDTH.
+                                fmtSpec = "," + std::string(tail);
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }

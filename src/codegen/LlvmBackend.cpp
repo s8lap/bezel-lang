@@ -829,6 +829,8 @@ private:
                                     const std::string& spec,
                                     const sema::TypeRef* rt) {
         if (spec.empty() || !val) return nullptr;
+        // §18.5 alignment specifier `,WIDTH` — deferred; use PadLeft/PadRight.
+        if (spec[0] == ',') return nullptr;
         char kind = std::toupper(spec[0]);
         int width = (spec.size() > 1) ? std::atoi(spec.c_str() + 1) : -1;
         std::string snprintfFmt;
