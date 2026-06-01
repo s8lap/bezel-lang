@@ -1092,6 +1092,18 @@ private:
                 }
             }
         }
+        // §15.1: IndexExpr `a[i]` — the expression type is the array's
+        // element type, so member access on array elements (`a[i].field`)
+        // can resolve. The element type comes from the target's InlineArray
+        // TypeRef, or from an indexer-property return type (deferred).
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            if (ix->target) {
+                if (auto* tt = ctx_.exprType(*ix->target)) {
+                    if (tt->kind == TypeRef::Kind::InlineArray && tt->arrayElement)
+                        ctx_.setExprType(&e, tt->arrayElement);
+                }
+            }
+        }
         // Slice 3d: MemberAccessExpr resolution. Runs after the target
         // is visited (so its TypeRef is available), looks the member up
         // on the target's TypeSymbol, and annotates the access with the

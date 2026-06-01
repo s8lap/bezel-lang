@@ -88,3 +88,38 @@ BEZEL_TEST(codegen_array, findmax_via_array) {
         "  return m; "
         "end Main; end C;"), 9);
 }
+
+// §15.1 + §9: array of records — element exprType is set via IndexExpr
+// typing in sema so that member access on array elements (a[i].field)
+// resolves correctly.
+BEZEL_TEST(codegen_array, array_of_records_element_access) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var ps: [3]P; "
+        "  ps[0] := new P(1, 2); ps[1] := new P(3, 4); ps[2] := new P(5, 6); "
+        "  return ps[0].x + ps[1].y + ps[2].x; "
+        "end Main; end C;"), 10);
+}
+
+BEZEL_TEST(codegen_array, array_of_records_sum_via_loop) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var ps: [3]P; "
+        "  ps[0] := new P(1, 2); ps[1] := new P(3, 4); ps[2] := new P(5, 6); "
+        "  var s := 0; "
+        "  for var i in 0..2 do s := s + ps[i].x + ps[i].y; end; "
+        "  return s; "
+        "end Main; end C;"), 21);  // (1+2)+(3+4)+(5+6) = 21
+}
+
+BEZEL_TEST(codegen_array, array_of_records_equality) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var ps: [2]P; "
+        "  ps[0] := new P(1, 2); ps[1] := new P(1, 2); "
+        "  return (1 if ps[0] = ps[1] else 0); "
+        "end Main; end C;"), 1);
+}
