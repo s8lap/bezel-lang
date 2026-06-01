@@ -686,6 +686,161 @@ private:
         return builder_.CreateSelect(cmpZero, lenDiff, cmpRes, "str.ord");
     }
 
+    // CG27f (stdlib §9.6): intercept stdlib string method calls.
+    // Returns the lowered value, or null if the method is not recognised.
+    llvm::Value* tryLowerStringMethod(const ast::CallExpr& call,
+                                       const ast::MemberAccessExpr& ma) {
+        const auto& method = ma.member;
+        if (!ma.target) return nullptr;
+        llvm::Value* self = lowerExpr(*ma.target);
+        if (!self) return nullptr;
+
+        // Helpers for extracting the first string argument.
+        auto getStrArg = [&](size_t idx) -> llvm::Value* {
+            if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
+            return lowerExpr(*call.args[idx].value);
+        };
+        auto getIntArg = [&](size_t idx) -> llvm::Value* {
+            if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
+            return lowerExpr(*call.args[idx].value);
+        };
+
+        // §9.6: StartsWith(prefix: string): bool
+        // prefix.len <= self.len AND memcmp(self.data, prefix.data, prefix.len)==0
+        if (method == "StartsWith") {
+            llvm::Value* prefix = getStrArg(0);
+            if (!prefix) return nullptr;
+            llvm::Value* selfLen = loadStringLen(self);
+            llvm::Value* prefLen = loadStringLen(prefix);
+            // if prefLen > selfLen → false
+            llvm::Value* tooLong = builder_.CreateICmpUGT(prefLen, selfLen, "sw.toolong");
+            auto* cmpBB = llvm::BasicBlock::Create(llvm_, "sw.cmp", currentFn_);
+            auto* endBB = llvm::BasicBlock::Create(llvm_, "sw.end", currentFn_);
+            auto* entryBB = builder_.GetInsertBlock();
+            builder_.CreateCondBr(tooLong, endBB, cmpBB);
+            builder_.SetInsertPoint(cmpBB);
+            auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
+            llvm::Value* cmpRes = builder_.CreateCall(
+                memcmpFn, {loadStringData(self), loadStringData(prefix), prefLen});
+            llvm::Value* eqZ = builder_.CreateICmpEQ(cmpRes, llvm::ConstantInt::get(i32(),0));
+            auto* cmpEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "sw.result");
+            phi->addIncoming(builder_.getFalse(), entryBB);
+            phi->addIncoming(eqZ, cmpEnd);
+            return phi;
+        }
+
+        // §9.6: EndsWith(suffix: string): bool
+        if (method == "EndsWith") {
+            llvm::Value* suffix = getStrArg(0);
+            if (!suffix) return nullptr;
+            llvm::Value* selfLen = loadStringLen(self);
+            llvm::Value* sufLen = loadStringLen(suffix);
+            llvm::Value* tooLong = builder_.CreateICmpUGT(sufLen, selfLen, "ew.toolong");
+            auto* cmpBB = llvm::BasicBlock::Create(llvm_, "ew.cmp", currentFn_);
+            auto* endBB = llvm::BasicBlock::Create(llvm_, "ew.end", currentFn_);
+            auto* entryBB = builder_.GetInsertBlock();
+            builder_.CreateCondBr(tooLong, endBB, cmpBB);
+            builder_.SetInsertPoint(cmpBB);
+            // offset = selfLen - sufLen; compare self.data+offset with suffix.data
+            llvm::Value* offset = builder_.CreateSub(selfLen, sufLen, "ew.off");
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* selfOff = builder_.CreateGEP(i8Ty, loadStringData(self), offset);
+            auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
+            llvm::Value* cmpRes = builder_.CreateCall(
+                memcmpFn, {selfOff, loadStringData(suffix), sufLen});
+            llvm::Value* eqZ = builder_.CreateICmpEQ(cmpRes, llvm::ConstantInt::get(i32(),0));
+            auto* cmpEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "ew.result");
+            phi->addIncoming(builder_.getFalse(), entryBB);
+            phi->addIncoming(eqZ, cmpEnd);
+            return phi;
+        }
+
+        // §9.6: Contains(sub: string): bool — uses libc memmem (POSIX).
+        if (method == "Contains") {
+            llvm::Value* sub = getStrArg(0);
+            if (!sub) return nullptr;
+            // Declare memmem: void* memmem(void*, size_t, void*, size_t)
+            auto* memmemFn = module_->getFunction("memmem");
+            if (!memmemFn) {
+                auto* ft = llvm::FunctionType::get(
+                    ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
+                memmemFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
+            }
+            llvm::Value* found = builder_.CreateCall(memmemFn, {
+                loadStringData(self), loadStringLen(self),
+                loadStringData(sub),  loadStringLen(sub)});
+            return builder_.CreateICmpNE(
+                found, llvm::ConstantPointerNull::get(ptrTy()), "contains");
+        }
+
+        // §9.6: IndexOf(sub: string): int — first occurrence, -1 if not found.
+        if (method == "IndexOf") {
+            llvm::Value* sub = getStrArg(0);
+            if (!sub) return nullptr;
+            auto* memmemFn = module_->getFunction("memmem");
+            if (!memmemFn) {
+                auto* ft = llvm::FunctionType::get(
+                    ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
+                memmemFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
+            }
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* found = builder_.CreateCall(memmemFn, {
+                selfData, loadStringLen(self),
+                loadStringData(sub), loadStringLen(sub)});
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                found, llvm::ConstantPointerNull::get(ptrTy()), "iof.null");
+            // If found: index = (found ptr) - (selfData ptr), cast to i32.
+            llvm::Value* diff = builder_.CreatePtrDiff(
+                llvm::Type::getInt8Ty(llvm_), found, selfData, "iof.diff");
+            llvm::Value* idx = builder_.CreateTrunc(diff, i32(), "iof.idx");
+            return builder_.CreateSelect(isNull,
+                llvm::ConstantInt::getSigned(i32(), -1), idx, "iof.result");
+        }
+
+        // §9.6: Substring(start) → new string from start to end.
+        // §9.6: Substring(start, length) → new string of given length.
+        if (method == "Substring") {
+            llvm::Value* startV = getIntArg(0);
+            if (!startV) return nullptr;
+            llvm::Value* selfLen = loadStringLen(self);
+            llvm::Value* start64 = builder_.CreateSExt(startV, i64(), "sub.start");
+            llvm::Value* subLen = (call.args.size() >= 2 && call.args[1].value)
+                ? builder_.CreateSExt(lowerExpr(*call.args[1].value), i64(), "sub.len")
+                : builder_.CreateSub(selfLen, start64, "sub.len");
+            // Clamp to avoid over-reading.
+            llvm::Value* maxLen = builder_.CreateSub(selfLen, start64, "sub.maxlen");
+            llvm::Value* tooLong = builder_.CreateICmpSGT(subLen, maxLen, "sub.toolong");
+            subLen = builder_.CreateSelect(tooLong, maxLen, subLen, "sub.clamped");
+            // Allocate new string data + object.
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            llvm::Value* dataSize = builder_.CreateAdd(subLen, builder_.getInt64(1));
+            llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSize}, "sub.data");
+            llvm::Value* srcPtr = builder_.CreateGEP(
+                i8Ty, loadStringData(self), start64, "sub.src");
+            builder_.CreateCall(memcpyFn, {newData, srcPtr, subLen});
+            llvm::Value* endPtr = builder_.CreateGEP(i8Ty, newData, subLen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), endPtr);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* newStr = builder_.CreateCall(
+                mallocFn, {builder_.getInt64(strBytes)}, "sub.obj");
+            builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
+            builder_.CreateStore(subLen, builder_.CreateStructGEP(stringType(), newStr, 1));
+            return newStr;
+        }
+
+        return nullptr;  // method not recognised
+    }
+
     // CG25: is a Bezel primitive an unsigned integer type? (Drives
     // zext/udiv/lshr/unsigned-comparison choices.)
     static bool isUnsignedPrim(sema::PrimitiveType p) {
@@ -2953,17 +3108,24 @@ private:
                         call->callee.get()))
                     return lowerNullCondCall(*call, *nm);
             }
-            // CG27c (§5): `.ToString()` on a primitive-typed receiver is a
-            // compiler intrinsic — emit snprintf-based conversion to string.
-            if (call->args.empty() && call->callee) {
+            // CG27c/27f: intrinsic methods on string/primitive receivers.
+            if (call->callee) {
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         call->callee.get())) {
-                    if (ma->member == "ToString" && ma->target) {
+                    if (ma->target) {
                         auto* tt = ctx_.exprType(*ma->target);
                         if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
-                            llvm::Value* recv = lowerExpr(*ma->target);
-                            if (recv)
-                                return emitPrimitiveToString(recv, tt->primitive);
+                            if (tt->primitive == sema::PrimitiveType::String) {
+                                // CG27f: stdlib §9.6 string methods.
+                                if (auto* v = tryLowerStringMethod(*call, *ma))
+                                    return v;
+                            }
+                            // CG27c: ToString() on any primitive.
+                            if (call->args.empty() && ma->member == "ToString") {
+                                llvm::Value* recv = lowerExpr(*ma->target);
+                                if (recv)
+                                    return emitPrimitiveToString(recv, tt->primitive);
+                            }
                         }
                     }
                 }
