@@ -2249,9 +2249,41 @@ private:
                     if (p.type) fp.type = ctx_.resolvedType(*p.type);
                     lamTy->funcParams.push_back(std::move(fp));
                 }
-                lamTy->funcReturn = lam->exprBody
-                                        ? ctx_.exprType(*lam->exprBody)
-                                        : nullptr;
+                // Infer the return type: from exprBody for expression lambdas,
+                // or by scanning block-body stmts for the first `return expr`.
+                TypeRef* inferredReturn = nullptr;
+                if (lam->exprBody) {
+                    inferredReturn = ctx_.exprType(*lam->exprBody);
+                } else {
+                    // Scan stmts (flat, not recursive) for a `return EXPR`.
+                    for (const auto& s : lam->stmts) {
+                        if (!s) continue;
+                        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get())) {
+                            if (rs->value) { inferredReturn = ctx_.exprType(*rs->value); break; }
+                        }
+                        // Check common wrappers: DoEndBlock, IfStmt body.
+                        auto scanInner = [&](const std::vector<std::unique_ptr<ast::Stmt>>& inner) {
+                            for (const auto& ss : inner) {
+                                if (!ss) continue;
+                                if (auto* rs2 = dynamic_cast<const ast::ReturnStmt*>(ss.get()))
+                                    if (rs2->value && !inferredReturn)
+                                        inferredReturn = ctx_.exprType(*rs2->value);
+                            }
+                        };
+                        if (auto* bs = dynamic_cast<const ast::DoEndBlock*>(s.get()))
+                            scanInner(bs->body);
+                        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+                            scanInner(ifs->ifBranch.body);
+                            for (auto& el : ifs->elifBranches) scanInner(el.body);
+                            scanInner(ifs->elseBody);
+                        }
+                        if (inferredReturn) break;
+                    }
+                    // Fallback: use int (i32) for lambdas with no visible return.
+                    if (!inferredReturn)
+                        inferredReturn = ctx_.primitiveTypeRef(PrimitiveType::Int);
+                }
+                lamTy->funcReturn = inferredReturn;
                 ctx_.setExprType(lam, lamTy);
             }
         } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
