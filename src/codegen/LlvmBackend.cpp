@@ -1089,6 +1089,59 @@ private:
             return newStr;
         }
 
+        // §9.6: PadLeft(totalWidth)/PadRight(totalWidth): string
+        // Pads with spaces on the left/right to reach totalWidth.
+        if ((method == "PadLeft" || method == "PadRight") &&
+            call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* widthArg = lowerExpr(*call.args[0].value);
+            if (!widthArg) return nullptr;
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* selfLen = loadStringLen(self);
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* width64 = builder_.CreateSExt(widthArg, i64(), "pad.width");
+            // If selfLen >= totalWidth, return self unchanged.
+            llvm::Value* needPad = builder_.CreateICmpSGT(width64, selfLen, "pad.need");
+            auto* padBB = llvm::BasicBlock::Create(llvm_, "pad.do",  currentFn_);
+            auto* endBB = llvm::BasicBlock::Create(llvm_, "pad.end", currentFn_);
+            auto* entBB = builder_.GetInsertBlock();
+            builder_.CreateCondBr(needPad, padBB, endBB);
+            builder_.SetInsertPoint(padBB);
+            llvm::Value* padLen = builder_.CreateSub(width64, selfLen, "pad.len");
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            auto* memsetFn = module_->getFunction("memset");
+            if (!memsetFn) {
+                auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i32(), i64()}, false);
+                memsetFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "memset", module_.get());
+            }
+            llvm::Value* dataSz = builder_.CreateAdd(width64, builder_.getInt64(1));
+            llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "pad.data");
+            // Fill with spaces.
+            builder_.CreateCall(memsetFn, {newData, builder_.getInt32(' '), width64});
+            if (method == "PadLeft") {
+                // Self goes after the spaces.
+                llvm::Value* dst = builder_.CreateGEP(i8Ty, newData, padLen);
+                builder_.CreateCall(memcpyFn, {dst, selfData, selfLen});
+            } else {
+                // Self goes at the start.
+                builder_.CreateCall(memcpyFn, {newData, selfData, selfLen});
+            }
+            // Null-terminate.
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, width64);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "pad.obj");
+            builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
+            builder_.CreateStore(width64, builder_.CreateStructGEP(stringType(), newStr, 1));
+            auto* padEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(ptrTy(), 2, "pad.result");
+            phi->addIncoming(self, entBB);    // no padding needed
+            phi->addIncoming(newStr, padEnd); // padded result
+            return phi;
+        }
+
         return nullptr;  // method not recognised
     }
 
