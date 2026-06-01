@@ -215,14 +215,18 @@ private:
 
     // CG-generic: generic type substitution — maps type-parameter names to
     // their concrete LLVM types during the lowering of a specific instantiation
-    // (e.g. Box<int>: {"T" → i32}). Set by classStructInst before calling
-    // classStruct; cleared after. Also caches specialized struct types so
-    // Box<int> and Box<string> get distinct LLVM structs.
+    // (e.g. Box<int>: {"T" → i32}). Set by lowerNew before calling classStruct
+    // and kept active through the constructor; also set during field access.
     std::unordered_map<std::string_view, llvm::Type*> genericSubst_;
-    // specializedStructs_[ts][signature_key] = cached StructType
+    // specializedStructs_[ts][field_types] = cached specialized StructType
     std::map<const sema::TypeSymbol*,
              std::map<std::vector<llvm::Type*>, llvm::StructType*>>
         specializedStructs_;
+    // specializedMethods_[(ms, subst_key)] = specialized LLVM function
+    std::map<std::pair<const sema::MethodSymbol*,
+                       std::vector<llvm::Type*>>,
+             llvm::Function*>
+        specializedMethods_;
 
     // CG26: external (FFI) function declared by an extern block (§32).
     std::unordered_map<const sema::ExternDeclSymbol*, llvm::Function*>
@@ -7133,7 +7137,38 @@ private:
             }
         }
 
-        return emitMethodCall(ms, args, baseQualified);
+        // CG-generic: before calling the method, if the receiver's exprType
+        // has generic args and the parent TypeSymbol has genericParams,
+        // set up the substitution for the method body specialization.
+        auto savedSubst = genericSubst_;
+        if (!isStaticMethod(ms) && ms->parent && !args.empty()) {
+            // Find the receiver expression to get its type.
+            const ast::Expr* recvExpr = nullptr;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get()))
+                recvExpr = ma->target.get();
+            if (recvExpr) {
+                sema::TypeRef* recvTy = ctx_.exprType(*recvExpr);
+                if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    recvTy->declaration == ms->parent &&
+                    !recvTy->genericArgs.empty()) {
+                    auto* td = dynamic_cast<const ast::TypeDecl*>(
+                        ms->parent->decl);
+                    if (td && td->genericParams.size() ==
+                              recvTy->genericArgs.size()) {
+                        genericSubst_.clear();
+                        for (std::size_t gi = 0;
+                             gi < td->genericParams.size(); ++gi) {
+                            genericSubst_[td->genericParams[gi].name] =
+                                lowerTypeRef(recvTy->genericArgs[gi]);
+                        }
+                    }
+                }
+            }
+        }
+        llvm::Value* result = emitMethodCall(ms, args, baseQualified);
+        genericSubst_ = std::move(savedSubst);
+        return result;
     }
 
     // CG17/CG18/CG35: emit a call to `ms` with fully-built `args` (receiver
@@ -7177,9 +7212,104 @@ private:
         if (it == methodFns_.end()) return nullptr;
         llvm::Function* callee = it->second;
         if (args.size() != callee->arg_size()) return nullptr;
+        // CG-generic: if the generic substitution is active and the method
+        // function has type-mismatched args (generic T→i32 vs concrete f64),
+        // emit a specialized inline wrapper rather than calling the compiled
+        // generic function. This handles generic methods like `Get(): T`.
+        {
+            bool typesMismatch = false;
+            auto* callFnTy = callee->getFunctionType();
+            for (std::size_t ai = 0; ai < args.size(); ++ai)
+                if (args[ai]->getType() != callFnTy->getParamType(ai))
+                    { typesMismatch = true; break; }
+            if (!typesMismatch) {
+                // Also check return type — if the method returns a generic
+                // param (i32 fallback) but we need a concrete type.
+                llvm::Type* declRetTy = callFnTy->getReturnType();
+                // Look at the sema return type for the method.
+                if (ms->decl && !genericSubst_.empty()) {
+                    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                    if (md && md->returnType) {
+                        sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+                        llvm::Type* concrRetTy = retTy
+                            ? lowerTypeRef(retTy) : declRetTy;
+                        if (concrRetTy != declRetTy) typesMismatch = true;
+                    }
+                }
+            }
+            if (typesMismatch && !genericSubst_.empty()) {
+                // Inline the method body with the current generic substitution.
+                llvm::Value* r = emitInlineGenericMethod(ms, args);
+                if (r != nullptr || diverged_) {
+                    emitPendingCheck();
+                    return r;
+                }
+            }
+        }
         llvm::Value* r = builder_.CreateCall(callee, args);
         emitPendingCheck();  // CG20: a callee may have thrown
         return r;
+    }
+
+    // CG-generic: emit a method body inline with the current genericSubst_
+    // active, binding `this` and the parameters to the actual arguments.
+    // Used when the method function was compiled for a generic template (T→i32)
+    // but the actual call uses concrete types (e.g. double for Box<double>).
+    llvm::Value* emitInlineGenericMethod(sema::MethodSymbol* ms,
+                                          std::vector<llvm::Value*>& args) {
+        CallableInfo ci;
+        if (!callableInfo(ms, ci)) return nullptr;
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md) return nullptr;
+
+        // Save state.
+        llvm::Value* savedThis = currentThis_;
+        auto savedLocals = locals_;
+        auto savedParams = paramSlots_;
+        llvm::BasicBlock* savedProp = propagateBB_;
+        llvm::BasicBlock* savedUnwind = unwindTarget_;
+        llvm::Value* savedCaught = currentCaughtExc_;
+        std::size_t savedUnwindDepth = unwindScopeDepth_;
+        bool savedDiverged = diverged_;
+
+        // Bind this and params.
+        currentThis_ = (!args.empty() && !isStaticMethod(ms))
+                        ? args[0] : nullptr;
+        locals_.clear();
+        paramSlots_.clear();
+        propagateBB_ = nullptr;
+        currentCaughtExc_ = nullptr;
+        unwindScopeDepth_ = 0;
+        diverged_ = false;
+        // Bind user params (skip leading `this`).
+        std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
+        for (std::size_t pi = 0; pi < ms->params.size() &&
+             pi + paramStart < args.size(); ++pi) {
+            auto* slot = entryAlloca(args[pi + paramStart]->getType());
+            builder_.CreateStore(args[pi + paramStart], slot);
+            paramSlots_[ms->params[pi]] = slot;
+        }
+
+        // Emit the body.
+        llvm::Value* result = nullptr;
+        if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
+            result = lowerExpr(*ci.exprBody);
+        } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
+            // Block body inline: just emit statements; return via ret value.
+            lowerScopedBlock(*ci.stmts);
+        }
+
+        // Restore state.
+        currentThis_ = savedThis;
+        locals_ = std::move(savedLocals);
+        paramSlots_ = std::move(savedParams);
+        propagateBB_ = savedProp;
+        unwindTarget_ = savedUnwind;
+        currentCaughtExc_ = savedCaught;
+        unwindScopeDepth_ = savedUnwindDepth;
+        diverged_ = savedDiverged;
+
+        return result;
     }
 
     // CG42: null-conditional call `x?.M(args)` (§7.5) — the callee is a
