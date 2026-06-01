@@ -550,6 +550,118 @@ private:
         return newStr;
     }
 
+    // CG27c (§5): emit `.ToString()` for a Bezel primitive value.
+    // Uses snprintf to format into a stack buffer, then malloc a bz_string.
+    // The format specifier depends on the primitive type.
+    llvm::Value* emitPrimitiveToString(llvm::Value* val,
+                                       sema::PrimitiveType prim) {
+        using P = sema::PrimitiveType;
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+
+        // Special case: bool → "true" or "false"
+        if (prim == P::Bool) {
+            // lowerStringLiteral materializes constant globals.
+            auto* trueStr  = lowerStringLiteral("\"true\"", false);
+            auto* falseStr = lowerStringLiteral("\"false\"", false);
+            return builder_.CreateSelect(
+                builder_.CreateTrunc(val, i1()), trueStr, falseStr,
+                "bool.str");
+        }
+
+        // Special case: string.ToString() → identity (return itself).
+        if (prim == P::String) return val;
+
+        // Numeric types: snprintf into a stack buffer, then heap-copy.
+        // Buffer of 64 bytes is ample for any numeric type.
+        const unsigned BUF = 64;
+        llvm::Value* buf = entryAlloca(
+            llvm::ArrayType::get(i8Ty, BUF));
+
+        // Declare snprintf: int snprintf(char*, size_t, const char*, ...)
+        auto* snprintfFn = module_->getFunction("snprintf");
+        if (!snprintfFn) {
+            auto* ft = llvm::FunctionType::get(
+                i32(), {ptrTy(), i64(), ptrTy()}, /*variadic=*/true);
+            snprintfFn = llvm::Function::Create(
+                ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
+        }
+
+        // Pick format string and possibly widen/convert val.
+        const char* fmt = "%d";
+        llvm::Value* printVal = val;
+        switch (prim) {
+            case P::Long: case P::ULong:
+                fmt = prim == P::ULong ? "%llu" : "%lld";
+                break;
+            case P::UInt:
+                fmt = "%u"; break;
+            case P::Byte: case P::SByte:
+            case P::Short: case P::UShort:
+                // Widen to i32 for snprintf
+                printVal = (prim == P::Byte || prim == P::UShort ||
+                            prim == P::Short)
+                    ? builder_.CreateSExt(val, i32())
+                    : builder_.CreateZExt(val, i32());
+                fmt = "%d"; break;
+            case P::Float:
+                printVal = builder_.CreateFPExt(val, llvm::Type::getDoubleTy(llvm_));
+                fmt = "%g"; break;
+            case P::Double:
+                fmt = "%g"; break;
+            case P::Char:
+                // Char is i32 code point → print as character
+                fmt = "%lc"; break;
+            default:
+                fmt = "%d"; break;
+        }
+
+        // Create a global constant for the format string.
+        llvm::Constant* fmtData = llvm::ConstantDataArray::getString(
+            llvm_, fmt, /*AddNull=*/true);
+        unsigned fmtId = stringLiteralIdx_++;
+        auto* fmtGV = new llvm::GlobalVariable(
+            *module_, fmtData->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, fmtData,
+            ".bz.fmt." + std::to_string(fmtId));
+        fmtGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+
+        llvm::Value* bufPtr = builder_.CreateBitCast(
+            builder_.CreateGEP(
+                llvm::ArrayType::get(i8Ty, BUF), buf,
+                {builder_.getInt64(0), builder_.getInt64(0)}),
+            ptrTy());
+
+        // snprintf(bufPtr, BUF, fmt, printVal)
+        llvm::Value* written = builder_.CreateCall(
+            snprintfFn,
+            {bufPtr, builder_.getInt64(BUF), fmtGV, printVal},
+            "snprintf.ret");
+
+        // Allocate heap storage for the data: written+1 bytes.
+        llvm::Value* dataSize = builder_.CreateAdd(
+            builder_.CreateSExt(written, i64()), builder_.getInt64(1),
+            "str.ts.datasize");
+        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+        llvm::Value* dataCopy = builder_.CreateCall(mallocFn, {dataSize}, "str.ts.data");
+        builder_.CreateCall(memcpyFn, {dataCopy, bufPtr,
+                                       builder_.CreateSExt(written, i64())});
+        // Null-terminate.
+        llvm::Value* endPtr = builder_.CreateGEP(
+            i8Ty, dataCopy, builder_.CreateSExt(written, i64()));
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), endPtr);
+
+        // Build the bz_string object.
+        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+        llvm::Value* newStr = builder_.CreateCall(
+            mallocFn, {builder_.getInt64(strBytes)}, "str.ts.obj");
+        builder_.CreateStore(dataCopy,
+            builder_.CreateStructGEP(stringType(), newStr, 0));
+        builder_.CreateStore(builder_.CreateSExt(written, i64()),
+            builder_.CreateStructGEP(stringType(), newStr, 1));
+        return newStr;
+    }
+
     // CG27b (§4.6): ordinal comparison of two bz_string pointers → i32.
     // Returns negative / 0 / positive (same sign contract as memcmp/strcmp).
     // Ordinal = code-point-by-code-point; shorter string is "less" when it
@@ -2787,6 +2899,21 @@ private:
                 if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(
                         call->callee.get()))
                     return lowerNullCondCall(*call, *nm);
+            }
+            // CG27c (§5): `.ToString()` on a primitive-typed receiver is a
+            // compiler intrinsic — emit snprintf-based conversion to string.
+            if (call->args.empty() && call->callee) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        call->callee.get())) {
+                    if (ma->member == "ToString" && ma->target) {
+                        auto* tt = ctx_.exprType(*ma->target);
+                        if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
+                            llvm::Value* recv = lowerExpr(*ma->target);
+                            if (recv)
+                                return emitPrimitiveToString(recv, tt->primitive);
+                        }
+                    }
+                }
             }
             return lowerCall(*call);
         }
