@@ -148,3 +148,63 @@ BEZEL_TEST(integration, fibonacci_via_for_in) {
         "  return a; "
         "end Main; end C;"), 55);
 }
+
+BEZEL_TEST(integration, sieve_of_eratosthenes) {
+    // Sieve of Eratosthenes using an inline [50]int array.
+    // Counts primes < 50 (2,3,5,7,11,13,17,19,23,29,31,37,41,43,47 = 15).
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var sieve: [50]int; "
+        "  for var i in 0..49 do sieve[i] := 1; end; "
+        "  sieve[0] := 0; sieve[1] := 0; "
+        "  for var i in 2..49 do "
+        "    if sieve[i] = 1 then "
+        "      var j := i * 2; "
+        "      while j <= 49 do sieve[j] := 0; j := j + i; end; "
+        "    end; "
+        "  end; "
+        "  var count := 0; "
+        "  for var i in 0..49 do if sieve[i] = 1 then count := count + 1; end; end; "
+        "  return count; "
+        "end Main; end C;"), 15);
+}
+
+BEZEL_TEST(integration, bubble_sort) {
+    // Bubble sort a 5-element inline array — tests array element swaps.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var a: [5]int; "
+        "  a[0] := 3; a[1] := 1; a[2] := 4; a[3] := 1; a[4] := 5; "
+        "  for var i in 0..3 do "
+        "    for var j in 0..3 do "
+        "      if a[j] > a[j+1] then "
+        "        var t := a[j]; a[j] := a[j+1]; a[j+1] := t; "
+        "      end; "
+        "    end; "
+        "  end; "
+        "  var s := 0; for var i in 0..4 do s := s + a[i]; end; return s; "
+        "end Main; end C;"), 14);  // [3,1,4,1,5] sorted = [1,1,3,4,5], sum=14
+}
+
+BEZEL_TEST(integration, grade_classifier_with_range_patterns) {
+    // Records + range patterns in case + for-in + inline arrays.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; record Score(value: int); "
+        "class C "
+        "  public static method Grade(s: Score): int "
+        "    return case s.value "
+        "      90..100 => 4, 80..89 => 3, 70..79 => 2, "
+        "      60..69 => 1, _ => 0 end; "
+        "  end Grade; "
+        "  public static method Main(): int "
+        "    var scores: [5]int; "
+        "    scores[0] := 95; scores[1] := 85; scores[2] := 75; "
+        "    scores[3] := 65; scores[4] := 55; "
+        "    var s := 0; "
+        "    for var i in 0..4 do "
+        "      s := s + Grade(new Score(scores[i])); "
+        "    end; "
+        "    return s; "
+        "  end Main; "
+        "end C;"), 10);
+}
