@@ -1584,6 +1584,28 @@ private:
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                             return;
                         }
+                        // CG27f: stdlib §9.6 string methods — result types.
+                        if (ma.member == "Contains" ||
+                            ma.member == "StartsWith" ||
+                            ma.member == "EndsWith") {
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                            return;
+                        }
+                        if (ma.member == "IndexOf" ||
+                            ma.member == "LastIndexOf") {
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                            return;
+                        }
+                        if (ma.member == "Substring" ||
+                            ma.member == "Trim" || ma.member == "TrimStart" ||
+                            ma.member == "TrimEnd" || ma.member == "ToLower" ||
+                            ma.member == "ToUpper" || ma.member == "Replace") {
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                            return;
+                        }
                         // Emit a diagnostic for unrecognized string members.
                         ctx_.diagnostics().report(
                             Severity::Error, ma.span.begin,
