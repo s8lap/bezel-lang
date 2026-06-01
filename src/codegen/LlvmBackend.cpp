@@ -4993,6 +4993,55 @@ private:
                         return emitPrimitiveToString(arg, argTy->primitive);
                 }
             }
+            // Convert.ToString(n, radix: int): string — radix-based conversion.
+            if (m == "ToString" && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                llvm::Value* radix = lowerExpr(*call.args[1].value);
+                if (!arg || !radix) return nullptr;
+                // Widen to i32.
+                if (!arg->getType()->isIntegerTy(32))
+                    arg = builder_.CreateSExt(arg, i32());
+                // Select format based on radix (constant check).
+                const char* fmt = "%d";
+                if (auto* cr = llvm::dyn_cast<llvm::ConstantInt>(radix)) {
+                    uint64_t r = cr->getZExtValue();
+                    if (r == 16) fmt = "%x";
+                    else if (r == 8) fmt = "%o";
+                    else if (r == 2) fmt = nullptr;  // handle below
+                }
+                if (fmt) {
+                    // Use snprintf with the chosen format.
+                    llvm::Constant* fmtData = llvm::ConstantDataArray::getString(llvm_, fmt, true);
+                    unsigned fid = stringLiteralIdx_++;
+                    auto* fmtGV = new llvm::GlobalVariable(*module_, fmtData->getType(), true,
+                        llvm::GlobalValue::PrivateLinkage, fmtData, ".bz.rfmt." + std::to_string(fid));
+                    fmtGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                    auto* snpFn = module_->getFunction("snprintf");
+                    if (!snpFn) {
+                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), i64(), ptrTy()}, true);
+                        snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
+                    }
+                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                    llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, 64));
+                    llvm::Value* bufPtr = builder_.CreateGEP(llvm::ArrayType::get(i8Ty, 64), buf, {builder_.getInt64(0), builder_.getInt64(0)});
+                    llvm::Value* written = builder_.CreateCall(snpFn, {bufPtr, builder_.getInt64(64), fmtGV, arg}, "snp.ret");
+                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                    llvm::Value* len64 = builder_.CreateSExt(written, i64());
+                    llvm::Value* dataSz = builder_.CreateAdd(len64, builder_.getInt64(1));
+                    llvm::Value* dataCopy = builder_.CreateCall(mallocFn, {dataSz}, "rd.data");
+                    builder_.CreateCall(memcpyFn, {dataCopy, bufPtr, len64});
+                    llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCopy, len64);
+                    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+                    uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+                    llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rd.obj");
+                    builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
+                    builder_.CreateStore(len64, builder_.CreateStructGEP(stringType(), strObj, 1));
+                    return strObj;
+                }
+                return nullptr;  // binary radix deferred
+            }
         }
 
         if (cls == "Math") {
