@@ -5959,7 +5959,108 @@ private:
                         builder_.CreateStructGEP(stringType(), strObj, 2));
                     return strObj;
                 }
-                return nullptr;  // binary radix deferred
+                // Binary (radix=2): emit a runtime bit-scan loop.
+                // Builds digits MSB-first into a 33-byte stack buffer.
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                auto* buf2 = entryAlloca(llvm::ArrayType::get(i8Ty, 33));
+                llvm::Value* b2Ptr = builder_.CreateGEP(
+                    llvm::ArrayType::get(i8Ty, 33), buf2,
+                    {builder_.getInt64(0), builder_.getInt64(0)});
+                // For n=0: just write "0"
+                llvm::Value* isZero = builder_.CreateICmpEQ(arg, builder_.getInt32(0));
+                auto* zeroBB = llvm::BasicBlock::Create(llvm_, "bn.zero", currentFn_);
+                auto* nonBB  = llvm::BasicBlock::Create(llvm_, "bn.nonz", currentFn_);
+                auto* binBB  = llvm::BasicBlock::Create(llvm_, "bn.end",  currentFn_);
+                auto* entBN  = builder_.GetInsertBlock();
+                builder_.CreateCondBr(isZero, zeroBB, nonBB);
+                // Zero: write "0\0"
+                builder_.SetInsertPoint(zeroBB);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, '0'), b2Ptr);
+                llvm::Value* z1 = builder_.CreateGEP(i8Ty, b2Ptr, builder_.getInt64(1));
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), z1);
+                llvm::Value* zlen = builder_.getInt64(1);
+                auto* zeroBBEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(binBB);
+                // Non-zero: find highest set bit, then emit each bit MSB-first.
+                builder_.SetInsertPoint(nonBB);
+                auto* posS = entryAlloca(i32());
+                auto* lenS = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt32(0), lenS);
+                // Find bit width: highest set bit position.
+                // Use while loop: find highest bit.
+                auto* tmp = entryAlloca(i32());
+                builder_.CreateStore(arg, tmp);
+                auto* bitPos = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt32(31), bitPos);
+                // Scan from MSB to find the first 1 bit.
+                auto* fhBB = llvm::BasicBlock::Create(llvm_, "bn.fh", currentFn_);
+                auto* fhBodyBB = llvm::BasicBlock::Create(llvm_, "bn.fhb", currentFn_);
+                auto* fhEndBB  = llvm::BasicBlock::Create(llvm_, "bn.fhe", currentFn_);
+                builder_.CreateBr(fhBB);
+                builder_.SetInsertPoint(fhBB);
+                llvm::Value* bp = builder_.CreateLoad(i32(), bitPos);
+                llvm::Value* bv = builder_.CreateLoad(i32(), tmp);
+                llvm::Value* bit = builder_.CreateLShr(bv, bp);
+                llvm::Value* isOne = builder_.CreateICmpEQ(
+                    builder_.CreateAnd(bit, builder_.getInt32(1)), builder_.getInt32(1));
+                llvm::Value* bpGe0 = builder_.CreateICmpSGT(bp, builder_.getInt32(0));
+                builder_.CreateCondBr(builder_.CreateAnd(bpGe0, builder_.CreateNot(isOne)),
+                    fhBodyBB, fhEndBB);
+                builder_.SetInsertPoint(fhBodyBB);
+                builder_.CreateStore(builder_.CreateSub(bp, builder_.getInt32(1)), bitPos);
+                builder_.CreateBr(fhBB);
+                builder_.SetInsertPoint(fhEndBB);
+                // Now emit bits from bitPos down to 0.
+                auto* emBP = entryAlloca(i32());
+                auto* emLen = entryAlloca(i64());
+                llvm::Value* startBP = builder_.CreateLoad(i32(), bitPos);
+                builder_.CreateStore(startBP, emBP);
+                builder_.CreateStore(builder_.getInt64(0), emLen);
+                auto* emCBB = llvm::BasicBlock::Create(llvm_, "bn.ec", currentFn_);
+                auto* emBBB = llvm::BasicBlock::Create(llvm_, "bn.eb", currentFn_);
+                auto* emEBB = llvm::BasicBlock::Create(llvm_, "bn.ee", currentFn_);
+                builder_.CreateBr(emCBB);
+                builder_.SetInsertPoint(emCBB);
+                llvm::Value* ep = builder_.CreateLoad(i32(), emBP);
+                builder_.CreateCondBr(builder_.CreateICmpSGE(ep, builder_.getInt32(0)), emBBB, emEBB);
+                builder_.SetInsertPoint(emBBB);
+                llvm::Value* epB = builder_.CreateLoad(i32(), emBP);
+                llvm::Value* lenV = builder_.CreateLoad(i64(), emLen);
+                llvm::Value* bArg = builder_.CreateLoad(i32(), tmp);
+                llvm::Value* d = builder_.CreateAnd(builder_.CreateLShr(bArg, epB), builder_.getInt32(1));
+                llvm::Value* ch = builder_.CreateAdd(builder_.CreateTrunc(d, i8Ty),
+                    llvm::ConstantInt::get(i8Ty, '0'));
+                llvm::Value* dp = builder_.CreateGEP(i8Ty, b2Ptr, lenV);
+                builder_.CreateStore(ch, dp);
+                builder_.CreateStore(builder_.CreateAdd(lenV, builder_.getInt64(1)), emLen);
+                builder_.CreateStore(builder_.CreateSub(epB, builder_.getInt32(1)), emBP);
+                builder_.CreateBr(emCBB);
+                builder_.SetInsertPoint(emEBB);
+                llvm::Value* nlen = builder_.CreateLoad(i64(), emLen);
+                // Null-terminate.
+                llvm::Value* np2 = builder_.CreateGEP(i8Ty, b2Ptr, nlen);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np2);
+                auto* nonBBEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(binBB);
+                // Merge and create bz_string.
+                builder_.SetInsertPoint(binBB);
+                auto* phiLen = builder_.CreatePHI(i64(), 2, "bn.len");
+                phiLen->addIncoming(zlen, zeroBBEnd);
+                phiLen->addIncoming(nlen, nonBBEnd);
+                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                llvm::Value* dataSz2 = builder_.CreateAdd(phiLen, builder_.getInt64(1));
+                llvm::Value* dataCopy2 = builder_.CreateCall(mallocFn, {dataSz2}, "bn.data");
+                builder_.CreateCall(memcpyFn, {dataCopy2, b2Ptr, phiLen});
+                llvm::Value* nulPtr2 = builder_.CreateGEP(i8Ty, dataCopy2, phiLen);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr2);
+                uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+                llvm::Value* strObj2 = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "bn.obj");
+                builder_.CreateStore(dataCopy2, builder_.CreateStructGEP(stringType(), strObj2, 0));
+                builder_.CreateStore(phiLen, builder_.CreateStructGEP(stringType(), strObj2, 1));
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                    builder_.CreateStructGEP(stringType(), strObj2, 2));
+                return strObj2;
             }
         }
 
