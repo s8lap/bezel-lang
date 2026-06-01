@@ -6564,9 +6564,14 @@ private:
                            "OverflowException");
             return trunc;
         }
-        if (db > sb)
+        if (db > sb) {
+            // §5.1: bool (i1) widening to any integer always zero-extends
+            // (true=1, false=0). Sign-extending i1 would give -1 for true.
+            if (srcTy->isIntegerTy(1))
+                return builder_.CreateZExt(src, dstTy);
             return srcUns ? builder_.CreateZExt(src, dstTy)
                           : builder_.CreateSExt(src, dstTy);
+        }
         return src;  // same width, differing signedness (e.g. int ↔ uint)
     }
 
