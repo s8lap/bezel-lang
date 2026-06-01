@@ -1481,12 +1481,20 @@ private:
             if (prt && prt->kind == TypeRef::Kind::Function && prt->funcReturn)
                 ctx_.setExprType(&ce, prt->funcReturn);
         }
-        // CG27c: if the callee is an intrinsic member (no symbol, but has a
-        // type set by the MemberAccessExpr handler), propagate that type to
-        // the CallExpr — e.g. `n.ToString()` callee has type `string`.
+        // CG27c / CG60: if the callee has no resolved symbol but has a type,
+        // propagate the appropriate type to the CallExpr:
+        // - If the callee has a Function TypeRef (e.g. indexed array element
+        //   `handlers[i]`), use funcReturn as the call's return type.
+        // - Otherwise (intrinsic member like `n.ToString()`), use the callee
+        //   type directly.
         if (!calleeSym) {
-            if (auto* rt = ctx_.exprType(*ce.callee))
-                ctx_.setExprType(&ce, rt);
+            if (auto* rt = ctx_.exprType(*ce.callee)) {
+                if (rt->kind == TypeRef::Kind::Function && rt->funcReturn)
+                    ctx_.setExprType(&ce, rt->funcReturn);
+                else if (rt->kind != TypeRef::Kind::Function)
+                    ctx_.setExprType(&ce, rt);
+                // If Function with null funcReturn: leave untyped (void/unknown)
+            }
         }
         // CallExpr where the callee is a constructor reference (e.g.
         // `T(args)` form — rare in Bezel since `new T(args)` is the
