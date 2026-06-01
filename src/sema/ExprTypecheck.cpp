@@ -1713,6 +1713,16 @@ private:
                         ctx_.setExprType(
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
+                    } else if (ma.member == "IsNaN" || ma.member == "IsInfinity" ||
+                               ma.member == "IsFinite") {
+                        // §6.3: FP predicates — bool result.
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    } else if (ma.member == "Abs") {
+                        // §5: Abs on numeric primitive — same type.
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(tt->primitive));
+                        return;
                     }
                 }
             }
