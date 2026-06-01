@@ -166,3 +166,45 @@ BEZEL_TEST(codegen_array, binary_search) {
         "  return found; "
         "end Main; end C;"), 4);
 }
+
+// §15.1: `for var x in a do … end` — iterating over inline array elements.
+// The compiler emits a direct counted loop (0..N-1) loading a[i] into the
+// loop variable at the start of each iteration. No IEnumerable protocol.
+
+BEZEL_TEST(codegen_array, for_in_array_sum) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var a: [5]int; a[0]:=1; a[1]:=2; a[2]:=3; a[3]:=4; a[4]:=5; "
+        "  var s := 0; for var x in a do s := s + x; end; return s; "
+        "end Main; end C;"), 15);
+}
+
+BEZEL_TEST(codegen_array, for_in_array_max) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var a: [5]int; a[0]:=3; a[1]:=7; a[2]:=1; a[3]:=9; a[4]:=4; "
+        "  var m := 0; for var x in a do if x > m then m := x; end; end; "
+        "  return m; "
+        "end Main; end C;"), 9);
+}
+
+BEZEL_TEST(codegen_array, for_in_array_count_in_range) {
+    // Count elements of the array that fall in a range.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var a: [6]int; a[0]:=1; a[1]:=5; a[2]:=3; a[3]:=8; a[4]:=2; a[5]:=7; "
+        "  var cnt := 0; for var x in a do if x in 3..7 then cnt := cnt + 1; end; end; "
+        "  return cnt; "
+        "end Main; end C;"), 3);  // 5, 3, 7 are in 3..7
+}
+
+BEZEL_TEST(codegen_array, for_in_array_with_break) {
+    // Find the first element above a threshold and exit.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var a: [5]int; a[0]:=2; a[1]:=4; a[2]:=7; a[3]:=1; a[4]:=9; "
+        "  var found := -1; "
+        "  for var x in a do if x > 5 then found := x; break; end; end; "
+        "  return found; "
+        "end Main; end C;"), 7);
+}
