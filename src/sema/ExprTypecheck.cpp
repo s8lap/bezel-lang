@@ -905,6 +905,8 @@ private:
                 // bound name visible inside the guard and body (per §19.2).
                 auto* bp =
                     dynamic_cast<const ast::BindingPattern*>(arm.pattern.get());
+                auto* dp =
+                    dynamic_cast<const ast::DestructuringPattern*>(arm.pattern.get());
                 if (bp && currentScope_) {
                     Scope armScope;
                     armScope.parent = currentScope_;
@@ -916,6 +918,66 @@ private:
                     lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                               : scrutTy;
                     armScope.names[bp->name] = lsym;
+                    Scope* saveScope = currentScope_;
+                    currentScope_ = &armScope;
+                    if (arm.guard) visitExpr(*arm.guard);
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                    currentScope_ = saveScope;
+                } else if (dp && currentScope_ && dp->typeName) {
+                    // §19: a DestructuringPattern arm introduces a scope with
+                    // one LocalSymbol per naked binding, typed as the
+                    // corresponding positional field of the record (§9.4).
+                    // Look up the record TypeSymbol by the pattern's type name.
+                    TypeSymbol* recTy = nullptr;
+                    std::string_view lastName = dp->typeName->parts.empty()
+                        ? std::string_view{}
+                        : dp->typeName->parts.back();
+                    if (ctx_.module()) {
+                        for (Symbol* child : ctx_.module()->children) {
+                            if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                                if (ts->name == lastName &&
+                                    ts->kind == ast::TypeDeclKind::Record) {
+                                    recTy = ts; break;
+                                }
+                            }
+                        }
+                    }
+                    // Collect the record's positional (non-static) fields.
+                    std::vector<FieldSymbol*> fields;
+                    if (recTy) {
+                        for (Symbol* m : recTy->members) {
+                            if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                                if (!fs->modifiers.empty()) {
+                                    // skip static fields
+                                    bool isStatic = false;
+                                    for (auto& mod : fs->modifiers)
+                                        if (mod == "static") { isStatic = true; break; }
+                                    if (isStatic) continue;
+                                }
+                                fields.push_back(fs);
+                            }
+                        }
+                    }
+                    Scope armScope;
+                    armScope.parent = currentScope_;
+                    for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
+                        const auto& sp = dp->subPatterns[i];
+                        if (sp.nakedBinding.empty()) continue;
+                        TypeRef* fieldTy = nullptr;
+                        if (i < fields.size() && fields[i]->posParam &&
+                            fields[i]->posParam->type) {
+                            fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
+                        }
+                        auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                        lsym->name = sp.nakedBinding;
+                        // Use the PositionalPattern's address (stable since
+                        // AST is immutable) as the unique decl anchor so
+                        // codegen can key locals_[] on the same pointer.
+                        lsym->decl = reinterpret_cast<const ast::Node*>(&sp);
+                        lsym->declType = fieldTy;
+                        armScope.names[sp.nakedBinding] = lsym;
+                    }
                     Scope* saveScope = currentScope_;
                     currentScope_ = &armScope;
                     if (arm.guard) visitExpr(*arm.guard);
@@ -2097,6 +2159,8 @@ private:
                 // bound name visible inside the guard and body (per §19.2).
                 auto* bp =
                     dynamic_cast<const ast::BindingPattern*>(arm.pattern.get());
+                auto* dp =
+                    dynamic_cast<const ast::DestructuringPattern*>(arm.pattern.get());
                 if (bp && currentScope_) {
                     Scope armScope;
                     armScope.parent = currentScope_;
@@ -2106,6 +2170,55 @@ private:
                     lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                               : scrutTy;
                     armScope.names[bp->name] = lsym;
+                    Scope* saveScope = currentScope_;
+                    currentScope_ = &armScope;
+                    if (arm.guard) visitExpr(*arm.guard);
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& s : arm.stmts) if (s) visitStmt(*s);
+                    currentScope_ = saveScope;
+                } else if (dp && currentScope_ && dp->typeName) {
+                    // §19: DestructuringPattern — same logic as in CaseStmt.
+                    TypeSymbol* recTy = nullptr;
+                    std::string_view lastName = dp->typeName->parts.empty()
+                        ? std::string_view{}
+                        : dp->typeName->parts.back();
+                    if (ctx_.module()) {
+                        for (Symbol* child : ctx_.module()->children) {
+                            if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                                if (ts->name == lastName &&
+                                    ts->kind == ast::TypeDeclKind::Record) {
+                                    recTy = ts; break;
+                                }
+                            }
+                        }
+                    }
+                    std::vector<FieldSymbol*> fields;
+                    if (recTy) {
+                        for (Symbol* m : recTy->members) {
+                            if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                                bool isStatic = false;
+                                for (auto& mod : fs->modifiers)
+                                    if (mod == "static") { isStatic = true; break; }
+                                if (!isStatic) fields.push_back(fs);
+                            }
+                        }
+                    }
+                    Scope armScope;
+                    armScope.parent = currentScope_;
+                    for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
+                        const auto& sp = dp->subPatterns[i];
+                        if (sp.nakedBinding.empty()) continue;
+                        TypeRef* fieldTy = nullptr;
+                        if (i < fields.size() && fields[i]->posParam &&
+                            fields[i]->posParam->type) {
+                            fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
+                        }
+                        auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                        lsym->name = sp.nakedBinding;
+                        lsym->decl = reinterpret_cast<const ast::Node*>(&sp);
+                        lsym->declType = fieldTy;
+                        armScope.names[sp.nakedBinding] = lsym;
+                    }
                     Scope* saveScope = currentScope_;
                     currentScope_ = &armScope;
                     if (arm.guard) visitExpr(*arm.guard);

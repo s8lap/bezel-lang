@@ -6708,7 +6708,58 @@ private:
             return builder_.CreateICmpEQ(
                 scrut, llvm::ConstantPointerNull::get(ptrTy()), "null.match");
         }
-        return nullptr;  // destructure/positional — deferred
+        // §19 / §9.4: DestructuringPattern `TypeName(x, y, ...)` — for record
+        // value types the type test is satisfied statically (the scrutinee's
+        // static type already determines which record it is). Extract each
+        // positional field from the struct value and store it in a local alloca
+        // so the arm body (and guard) can read the bound names.  The alloca is
+        // keyed on the PositionalPattern's address, mirroring the sema anchor
+        // (`lsym->decl = reinterpret_cast<const ast::Node*>(&sp)`) so that
+        // `localSlot()` resolves the identifier to the right slot.
+        if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(pat)) {
+            if (!dp->typeName) return nullptr;
+            // Find the record TypeSymbol by the pattern's last name part.
+            std::string_view lastName = dp->typeName->parts.empty()
+                ? std::string_view{} : dp->typeName->parts.back();
+            const sema::TypeSymbol* recTy = nullptr;
+            for (const auto& sym : ctx_.symbols()) {
+                if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get())) {
+                    if (ts->name == lastName &&
+                        ts->kind == ast::TypeDeclKind::Record) {
+                        recTy = ts; break;
+                    }
+                }
+            }
+            if (!recTy) return nullptr;
+            // Ensure the record struct (and fieldIndex_) is populated.
+            recordStruct(recTy);
+            // Collect positional (non-static) fields in declaration order.
+            std::vector<const sema::FieldSymbol*> fields;
+            for (const sema::Symbol* m : recTy->members) {
+                if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m)) {
+                    if (!isStaticField(fs)) fields.push_back(fs);
+                }
+            }
+            // Extract each field value from the struct and register the slot.
+            for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
+                const auto& sp = dp->subPatterns[i];
+                if (sp.nakedBinding.empty()) continue;  // sub-pattern, not binding
+                if (i >= fields.size()) return nullptr;  // arity mismatch
+                auto idxIt = fieldIndex_.find(fields[i]);
+                if (idxIt == fieldIndex_.end()) return nullptr;
+                llvm::Value* fieldVal =
+                    builder_.CreateExtractValue(scrut, {idxIt->second});
+                llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
+                builder_.CreateStore(fieldVal, slot);
+                // Key on the PositionalPattern's stable address (same anchor
+                // that sema stored in lsym->decl) so localSlot() resolves it.
+                const auto* key = reinterpret_cast<const ast::Node*>(&sp);
+                locals_[key] = slot;
+            }
+            // For a record scrutinee the type test is statically satisfied.
+            return builder_.getInt1(true);
+        }
+        return nullptr;  // positional — deferred
     }
 
     // CG28: equality of two same-typed scalars (int or FP).

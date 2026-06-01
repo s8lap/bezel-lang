@@ -143,3 +143,75 @@ BEZEL_TEST(codegen_cg28b, binding_pattern_with_guard_false) {
         "var r := case x var n when n > 2 => n + 10, _ => 99 end; return r;"),
         99);
 }
+
+// §19 / §9.4: DestructuringPattern in case expressions — a `TypeName(x, y)`
+// pattern on a record value type extracts the positional fields into the arm
+// body's scope. The type test is statically satisfied (the scrutinee's static
+// type already determines which record it is); field values are extracted via
+// llvm::ExtractValue on the struct value.
+
+namespace {
+int runFull(const std::string& program) {
+    auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+} // namespace
+
+BEZEL_TEST(codegen_cg28_destructure, record_case_expr_sum_fields) {
+    // §19 / §9.4: Point(x, y) extracts both fields; body computes x + y.
+    // Expected: 3 + 4 = 7.
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(3, 4); "
+        "  return case p "
+        "    Point(x, y) => x + y, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(codegen_cg28_destructure, record_case_expr_first_field) {
+    // §19 / §9.4: destructuring exposes each field independently; use only x.
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(10, 20); "
+        "  return case p "
+        "    Point(x, y) => x, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 10);
+}
+
+BEZEL_TEST(codegen_cg28_destructure, record_case_expr_second_field) {
+    // §19 / §9.4: use only the second bound name (y).
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(10, 20); "
+        "  return case p "
+        "    Point(x, y) => y, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 20);
+}
+
+BEZEL_TEST(codegen_cg28_destructure, record_case_expr_fallthrough_discard) {
+    // §19 / §9.4: a _ arm after a destructuring arm is reachable only when
+    // no prior arm matched. Here Point(x, y) always matches a Point scrutinee,
+    // so the _ arm is dead; confirm the destructuring arm fires.
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(5, 6); "
+        "  return case p "
+        "    Point(x, y) => x * y, "
+        "    _ => -1 "
+        "  end; "
+        "end Main; end C;"), 30);
+}
