@@ -5830,6 +5830,56 @@ private:
             phi->addIncoming(empty, chkEnd);
             return phi;
         }
+        // string.IsNullOrWhiteSpace(s): bool — null, empty, or all whitespace.
+        if (pt == P::String && m == "IsNullOrWhiteSpace" &&
+            call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            auto* isspaceFn = module_->getFunction("isspace");
+            if (!isspaceFn) {
+                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                isspaceFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "isspace", module_.get());
+            }
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                arg, llvm::ConstantPointerNull::get(ptrTy()), "inws.null");
+            auto* entBB = builder_.GetInsertBlock();
+            auto* chkBB = llvm::BasicBlock::Create(llvm_, "inws.chk", currentFn_);
+            auto* loopBB = llvm::BasicBlock::Create(llvm_, "inws.loop", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "inws.body", currentFn_);
+            auto* nonwsBB = llvm::BasicBlock::Create(llvm_, "inws.nonws", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "inws.end",  currentFn_);
+            builder_.CreateCondBr(isNull, endBB, chkBB);
+            builder_.SetInsertPoint(chkBB);
+            llvm::Value* len = loadStringLen(arg);
+            llvm::Value* data = loadStringData(arg);
+            auto* idxS = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxS);
+            builder_.CreateBr(loopBB);
+            builder_.SetInsertPoint(loopBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            // For now: only check width=1 chars (ASCII whitespace check).
+            llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
+            llvm::Value* cp = loadCodePoint(arg, idxB);
+            llvm::Value* isSp = builder_.CreateCall(isspaceFn, {cp});
+            llvm::Value* isSpBool = builder_.CreateICmpNE(isSp, builder_.getInt32(0));
+            auto* incBB = llvm::BasicBlock::Create(llvm_, "inws.inc", currentFn_);
+            builder_.CreateCondBr(isSpBool, incBB, nonwsBB);
+            builder_.SetInsertPoint(incBB);
+            builder_.CreateStore(builder_.CreateAdd(idxB, builder_.getInt64(1)), idxS);
+            builder_.CreateBr(loopBB);
+            builder_.SetInsertPoint(nonwsBB);
+            builder_.CreateBr(endBB);
+            auto* nonwsEnd = builder_.GetInsertBlock();
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 3, "inws.result");
+            phi->addIncoming(builder_.getTrue(), entBB);   // null → true
+            phi->addIncoming(builder_.getTrue(), loopBB);  // all whitespace → true
+            phi->addIncoming(builder_.getFalse(), nonwsEnd);// found non-WS → false
+            return phi;
+        }
         // string.Empty → empty string literal.
         if (pt == P::String && m == "Empty" && call.args.empty()) {
             return lowerStringLiteral("\"\"", false);
