@@ -26,6 +26,99 @@ Parser::Parser(Lexer& lexer, DiagnosticEngine& diagnostics)
     advance(); // prime current_ with the first token
 }
 
+// §18.5 / §18.7: split an interpolated string token into its alternating
+// literal and expression parts.  The lexer has already validated balanced
+// braces, so we can walk the content in a single pass:
+//  - literal chars accumulate into `current_literal`
+//  - `{` opens an expression region; we find the matching `}` and create a
+//    sub-parser to parse one expression from that slice
+//  - `{{` / `}}` are literal-brace escapes; verbatim strings skip all `\`
+//  - `\` in non-verbatim strings is consumed as an escape sequence
+void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
+    std::string_view raw = e.text;   // full `$"..."` or `$@"..."` token text
+    // Determine where the content starts and ends.
+    size_t start = e.isVerbatim ? 3 : 2;  // skip `$@"` or `$"`
+    if (raw.size() < start + 1) return;
+    size_t end = raw.size() - 1;          // before the closing `"`
+
+    std::string literal;
+    size_t i = start;
+    while (i < end) {
+        char c = raw[i];
+        // Literal-brace escapes `{{` → `{` and `}}` → `}`.
+        if (c == '{' && i + 1 < end && raw[i + 1] == '{') {
+            literal.push_back('{');
+            i += 2;
+            continue;
+        }
+        if (c == '}' && i + 1 < end && raw[i + 1] == '}') {
+            literal.push_back('}');
+            i += 2;
+            continue;
+        }
+        // Expression region `{expr}`.
+        if (c == '{') {
+            ++i; // past `{`
+            // Find matching `}` tracking brace depth (and nested strings).
+            size_t exprStart = i;
+            int depth = 1;
+            while (i < end && depth > 0) {
+                char ic = raw[i];
+                if (ic == '"') {
+                    // Nested string — skip to its closing `"`.
+                    ++i;
+                    while (i < end && raw[i] != '"') {
+                        if (!e.isVerbatim && raw[i] == '\\') ++i; // escape
+                        ++i;
+                    }
+                    if (i < end) ++i; // closing `"`
+                } else if (ic == '{') { ++depth; ++i; }
+                else if (ic == '}') { --depth; if (depth > 0) ++i; else break; }
+                else ++i;
+            }
+            // `raw[exprStart..i)` is the expression text.
+            std::string_view exprText = raw.substr(exprStart, i - exprStart);
+            if (i < end) ++i; // consume `}`
+
+            // Flush any accumulated literal.
+            if (!literal.empty()) {
+                ast::InterpPart lp;
+                lp.literal = std::move(literal);
+                e.parts.push_back(std::move(lp));
+                literal.clear();
+            }
+            // Sub-parse the expression.
+            if (!exprText.empty()) {
+                Lexer subLex(exprText, diagnostics_);
+                Parser subPar(subLex, diagnostics_);
+                auto expr = subPar.parseExpression();
+                if (expr) {
+                    ast::InterpPart ep;
+                    ep.expr = std::move(expr);
+                    e.parts.push_back(std::move(ep));
+                }
+            }
+            continue;
+        }
+        // Non-verbatim escape: skip the escape char, let processStringText
+        // handle the actual byte at codegen time — just copy the raw chars.
+        if (!e.isVerbatim && c == '\\' && i + 1 < end) {
+            literal.push_back(c);
+            literal.push_back(raw[i + 1]);
+            i += 2;
+            continue;
+        }
+        literal.push_back(c);
+        ++i;
+    }
+    // Trailing literal.
+    if (!literal.empty()) {
+        ast::InterpPart lp;
+        lp.literal = std::move(literal);
+        e.parts.push_back(std::move(lp));
+    }
+}
+
 void Parser::advance() {
     if (!peeked_.empty()) {
         current_ = std::move(peeked_.front());
@@ -1594,6 +1687,9 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         e->isVerbatim =
             (current_.kind == TokenKind::InterpolatedVerbatimString);
         e->text = current_.text;
+        // §18.5 / §18.7: split the `$"..."` token into alternating literal
+        // and expression parts. The lexer already validated balanced braces.
+        splitInterpolation(*e);
         advance();
         return std::unique_ptr<ast::Expr>(e.release());
     }

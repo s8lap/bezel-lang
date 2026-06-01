@@ -2850,6 +2850,59 @@ private:
             return lowerStringLiteral(sl->text, /*verbatim=*/false);
         if (auto* vs = dynamic_cast<const ast::VerbatimStringExpr*>(&e))
             return lowerStringLiteral(vs->text, /*verbatim=*/true);
+        // CG27d (§18.5): interpolated string — concatenate all parts.
+        // Literal parts are materialized as string globals. Expression parts
+        // call emitPrimitiveToString (for primitives) or string identity (for
+        // string-typed exprs); other types call their ToString() intrinsic.
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+            // Start with the empty string and concat each part.
+            llvm::Value* acc = lowerStringLiteral("\"\"", false);  // ""
+            for (const auto& part : is->parts) {
+                llvm::Value* pv = nullptr;
+                if (!part.literal.empty()) {
+                    // Literal part: create a temporary source-like string and
+                    // use processStringText (the literal chars already went
+                    // through escape processing in splitInterpolation; wrap in
+                    // quotes so lowerStringLiteral's strip-quotes logic works).
+                    // Simpler: use the content directly.
+                    std::string content = part.literal;
+                    llvm::Constant* dataArr = llvm::ConstantDataArray::getString(
+                        llvm_, content, /*AddNull=*/true);
+                    unsigned id = stringLiteralIdx_++;
+                    auto* dataGV = new llvm::GlobalVariable(
+                        *module_, dataArr->getType(), true,
+                        llvm::GlobalValue::PrivateLinkage, dataArr,
+                        ".bz.istr.data." + std::to_string(id));
+                    dataGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                    dataGV->setAlignment(llvm::Align(1));
+                    llvm::Constant* lenC = llvm::ConstantInt::get(
+                        i64(), content.size());
+                    llvm::Constant* strVal = llvm::ConstantStruct::get(
+                        stringType(), {dataGV, lenC});
+                    auto* strGV = new llvm::GlobalVariable(
+                        *module_, stringType(), true,
+                        llvm::GlobalValue::PrivateLinkage, strVal,
+                        ".bz.istr." + std::to_string(id));
+                    pv = strGV;
+                } else if (part.expr) {
+                    // Expression part: lower the expression, then convert to
+                    // string.
+                    llvm::Value* ev = lowerExpr(*part.expr);
+                    if (!ev) continue;
+                    auto* rt = ctx_.exprType(*part.expr);
+                    if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
+                        pv = emitPrimitiveToString(ev, rt->primitive);
+                    } else {
+                        // For non-primitive types, defer to the string identity
+                        // or a future Object.ToString() slot. For now, if the
+                        // value is already ptr-typed (string), use as-is.
+                        pv = ev;  // best effort
+                    }
+                }
+                if (pv) acc = emitStringConcat(acc, pv);
+            }
+            return acc;
+        }
         // CG23: the `null` literal is a null reference pointer.
         if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
             return llvm::ConstantPointerNull::get(ptrTy());

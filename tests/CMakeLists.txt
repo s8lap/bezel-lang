@@ -191,6 +191,7 @@ set(BEZEL_TEST_SOURCES
     codegen/string_test.cpp
     codegen/string_compare_test.cpp
     codegen/string_tostring_test.cpp
+    codegen/interpolated_string_test.cpp
     codegen/range_for_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
