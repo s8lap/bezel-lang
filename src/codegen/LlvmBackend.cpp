@@ -5342,6 +5342,28 @@ private:
                 }
             }
         }
+        // §15.1: inline array `a.Length` — compile-time constant equal to N.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target && ma->member == "Length") {
+                auto* tt = ctx_.exprType(*ma->target);
+                if (tt && tt->kind == sema::TypeRef::Kind::InlineArray) {
+                    // The array size is encoded in tt->arraySize (IntLiteralExpr).
+                    // Evaluate it as a compile-time constant.
+                    if (auto* slit = dynamic_cast<const ast::IntLiteralExpr*>(tt->arraySize)) {
+                        int64_t sz = (int64_t)parseIntLiteral(slit->text);
+                        return llvm::ConstantInt::get(i32(), sz, true);
+                    }
+                }
+                // Also handle the case where the target is an inline-array lvalue
+                // and we can get the array type from the LLVM type.
+                llvm::Type* elemTy = nullptr;
+                if (llvm::Value* addr = lvalueAddr(*ma->target, elemTy)) {
+                    if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(elemTy)) {
+                        return llvm::ConstantInt::get(i32(), arrTy->getNumElements(), true);
+                    }
+                }
+            }
+        }
         // CG22+: Exception.Message — built-in exceptions store a message
         // string pointer at byte offset 8 (slot 1) of the exception object.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
