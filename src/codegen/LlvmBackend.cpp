@@ -3273,6 +3273,60 @@ private:
             phi->addIncoming(val, accessEnd);
             return phi;
         }
+        // §3.4: static properties on primitive type names (`int.MaxValue`,
+        // `double.NaN`, etc.) — the target is a primitive-name identifier.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get())) {
+                    sema::PrimitiveType pt = sema::primitiveFromName(id->name);
+                    if (pt != sema::PrimitiveType::None) {
+                        const auto& mbr = ma->member;
+                        using P = sema::PrimitiveType;
+                        if (mbr == "MaxValue") {
+                            switch (pt) {
+                                case P::Int:  return llvm::ConstantInt::get(i32(), 0x7FFFFFFF, true);
+                                case P::UInt: return llvm::ConstantInt::get(i32(), 0xFFFFFFFFu, false);
+                                case P::Long: return llvm::ConstantInt::get(i64(), 0x7FFFFFFFFFFFFFFFll, true);
+                                case P::ULong:return llvm::ConstantInt::get(i64(), 0xFFFFFFFFFFFFFFFFull, false);
+                                case P::Short:return llvm::ConstantInt::get(llvm::Type::getInt16Ty(llvm_), 32767, true);
+                                case P::UShort:return llvm::ConstantInt::get(llvm::Type::getInt16Ty(llvm_), 65535, false);
+                                case P::Byte: return llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 255, false);
+                                case P::SByte:return llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 127, true);
+                                case P::Double:return llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), std::numeric_limits<double>::max());
+                                case P::Float: return llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_), std::numeric_limits<float>::max());
+                                default: break;
+                            }
+                        }
+                        if (mbr == "MinValue") {
+                            switch (pt) {
+                                case P::Int:  return llvm::ConstantInt::get(i32(), int32_t(-2147483648ll), true);
+                                case P::Long: return llvm::ConstantInt::get(i64(), int64_t(-9223372036854775808ll), true);
+                                case P::Short:return llvm::ConstantInt::get(llvm::Type::getInt16Ty(llvm_), int16_t(-32768), true);
+                                case P::SByte:return llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), int8_t(-128), true);
+                                case P::UInt: case P::ULong: case P::UShort: case P::Byte:
+                                    return llvm::ConstantInt::get(lowerPrimitive(pt), 0, false);
+                                case P::Double: return llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), std::numeric_limits<double>::lowest());
+                                case P::Float:  return llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_), std::numeric_limits<float>::lowest());
+                                default: break;
+                            }
+                        }
+                        if (mbr == "NaN" && (pt == P::Double || pt == P::Float)) {
+                            llvm::Type* ft = pt == P::Double ? llvm::Type::getDoubleTy(llvm_) : llvm::Type::getFloatTy(llvm_);
+                            return llvm::ConstantFP::getNaN(ft);
+                        }
+                        if (mbr == "PositiveInfinity" && (pt == P::Double || pt == P::Float)) {
+                            llvm::Type* ft = pt == P::Double ? llvm::Type::getDoubleTy(llvm_) : llvm::Type::getFloatTy(llvm_);
+                            return llvm::ConstantFP::getInfinity(ft, false);
+                        }
+                        if (mbr == "NegativeInfinity" && (pt == P::Double || pt == P::Float)) {
+                            llvm::Type* ft = pt == P::Double ? llvm::Type::getDoubleTy(llvm_) : llvm::Type::getFloatTy(llvm_);
+                            return llvm::ConstantFP::getInfinity(ft, true);
+                        }
+                    }
+                }
+            }
+        }
         // CG27a (§4.6): intrinsic string member access (Length, etc.).
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
             if (ma->target) {

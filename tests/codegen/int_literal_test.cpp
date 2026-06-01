@@ -51,3 +51,22 @@ BEZEL_TEST(codegen_cg1, binary_literal) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
+
+// §3.4: static properties on primitive type names (int.MaxValue, int.MinValue).
+BEZEL_TEST(codegen_cg1, int_max_value) {
+    // int.MaxValue = 2^31 - 1; return 1 to fit in exit code.
+    auto r = runJit(
+        "module M; class C public static method Main(): int "
+        "  return (1 if int.MaxValue > 0 else 0); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+BEZEL_TEST(codegen_cg1, int_min_value) {
+    // int.MinValue = -2^31; must be negative.
+    auto r = runJit(
+        "module M; class C public static method Main(): int "
+        "  return (1 if int.MinValue < 0 else 0); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
