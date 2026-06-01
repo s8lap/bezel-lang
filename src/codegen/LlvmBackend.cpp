@@ -7932,23 +7932,33 @@ private:
                 }
             }
             // Extract each field value from the struct and register the slot.
+            // Build up a cumulative match condition for constant sub-patterns.
+            llvm::Value* matched = builder_.getInt1(true);
             for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
                 const auto& sp = dp->subPatterns[i];
-                if (sp.nakedBinding.empty()) continue;  // sub-pattern, not binding
                 if (i >= fields.size()) return nullptr;  // arity mismatch
                 auto idxIt = fieldIndex_.find(fields[i]);
                 if (idxIt == fieldIndex_.end()) return nullptr;
                 llvm::Value* fieldVal =
                     builder_.CreateExtractValue(scrut, {idxIt->second});
-                llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
-                builder_.CreateStore(fieldVal, slot);
-                // Key on the PositionalPattern's stable address (same anchor
-                // that sema stored in lsym->decl) so localSlot() resolves it.
-                const auto* key = reinterpret_cast<const ast::Node*>(&sp);
-                locals_[key] = slot;
+                if (!sp.nakedBinding.empty()) {
+                    // Binding: store field value into a slot for `sp.nakedBinding`.
+                    llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
+                    builder_.CreateStore(fieldVal, slot);
+                    const auto* key = reinterpret_cast<const ast::Node*>(&sp);
+                    locals_[key] = slot;
+                } else if (sp.pattern) {
+                    // Non-binding sub-pattern: check it against the field value.
+                    // For constant patterns (e.g. `0`), emit an equality check.
+                    llvm::Value* subMatch =
+                        patternMatches(sp.pattern.get(), fieldVal);
+                    if (subMatch)
+                        matched = builder_.CreateAnd(matched, subMatch);
+                }
             }
-            // For a record scrutinee the type test is statically satisfied.
-            return builder_.getInt1(true);
+            // For a record scrutinee, the type test is satisfied if all
+            // non-binding sub-pattern checks pass.
+            return matched;
         }
         return nullptr;  // positional — deferred
     }
