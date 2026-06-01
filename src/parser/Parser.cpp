@@ -2794,58 +2794,85 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                 advance();
             }
         }
-        while (consumeKeyword("catch")) {
-            // A.6 CatchPattern: `Type ("," Type)*` OR
-            //   `"var" Identifier ":" Type ("," Type)*`.
-            // Also accept `Identifier ":" Type` (no `var`) as an alias for
-            // the binding form — a common C#/Java idiom — with a recovery
-            // diagnostic. This prevents an infinite-loop parse hang if the
-            // user forgets `var`.
-            ast::CatchArm arm;
-            if (consumeKeyword("var")) {
-                arm.hasBinding = true;
-                if (current_.kind != TokenKind::Identifier) {
-                    diagnostics_.report(
-                        Severity::Error, current_.location,
-                        "expected exception-binding name");
-                } else {
+        // §A.6: CatchBlock ::= "catch" CatchArm ("," CatchArm)* ","?
+        // One "catch" keyword followed by one or more comma-separated arms.
+        // Also support multiple "catch" keywords (one per arm) as alias.
+        if (consumeKeyword("catch")) {
+            // Parse one arm: CatchPattern ("when" Guard)? "=>" ArmBody
+            auto parseCatchArm = [&]() {
+                ast::CatchArm arm;
+                if (consumeKeyword("var")) {
+                    arm.hasBinding = true;
+                    if (current_.kind != TokenKind::Identifier) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected exception-binding name");
+                    } else {
+                        arm.varName = current_.text;
+                        advance();
+                    }
+                    if (!consumePunctuator(":")) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected ':' after catch binding name");
+                    }
+                } else if (current_.kind == TokenKind::Identifier &&
+                           peekAt(1).kind == TokenKind::Punctuator &&
+                           peekAt(1).text == ":") {
+                    // `catch name: Type` without `var` — accepted silently.
+                    arm.hasBinding = true;
                     arm.varName = current_.text;
-                    advance();
+                    advance(); // past name
+                    advance(); // past ":"
                 }
-                if (!consumePunctuator(":")) {
+                arm.types.push_back(parseType());
+                // Within the pattern, "," joins additional exception types.
+                // Stop if the next token starts an arm (is `var`/`when`/`=>`).
+                // Peek ahead: `,` followed by `var` → arm separator, not type.
+                while (isPunctuator(",") && !isKeyword("when")) {
+                    // Peek past the comma.
+                    const auto& afterComma = peekAt(1);
+                    // If comma is followed by `var`, another binding pattern starts.
+                    if (afterComma.kind == TokenKind::Keyword &&
+                        afterComma.text == "var") break;
+                    // If comma is followed by end/finally, it's a trailing comma.
+                    if (afterComma.kind == TokenKind::Keyword &&
+                        (afterComma.text == "end" || afterComma.text == "finally")) break;
+                    advance(); // consume ","
+                    arm.types.push_back(parseType());
+                }
+                if (consumeKeyword("when")) {
+                    arm.guard = parseExpression();
+                }
+                if (!consumePunctuator("=>")) {
                     diagnostics_.report(
                         Severity::Error, current_.location,
-                        "expected ':' after catch binding name");
+                        "expected '=>' after catch pattern");
                 }
-            } else if (current_.kind == TokenKind::Identifier &&
-                       peekAt(1).kind == TokenKind::Punctuator &&
-                       peekAt(1).text == ":") {
-                // `catch name: Type` — silently treat as `catch var name: Type`
-                arm.hasBinding = true;
-                arm.varName = current_.text;
-                advance(); // past name
-                advance(); // past ":"
+                arm.body = parseStatement();
+                stmt->catches.push_back(std::move(arm));
+            };
+            parseCatchArm();
+            // Additional arms: comma-separated inline OR repeated `catch`
+            // keywords (possibly after a comma). Handle both styles:
+            //   Style A (spec): `catch Arm1, Arm2 end;`
+            //   Style B (alias): `catch Arm1;, catch Arm2; end;`
+            while (true) {
+                bool hadComma = consumePunctuator(",");
+                if (isKeyword("end") || isKeyword("finally") ||
+                    current_.kind == TokenKind::EndOfFile) break;
+                if (consumeKeyword("catch")) {
+                    // Style B: next arm starts with `catch` keyword.
+                    parseCatchArm();
+                } else if (hadComma && (isKeyword("var") ||
+                           current_.kind == TokenKind::Identifier)) {
+                    // Style A: inline next arm (no `catch` keyword).
+                    parseCatchArm();
+                } else {
+                    // No more arms.
+                    break;
+                }
             }
-            arm.types.push_back(parseType());
-            while (consumePunctuator(",")) {
-                // `,` here joins additional Types in the catch pattern. The
-                // top-level CatchBlock arm-separator `,` only appears AFTER
-                // the body — at this point we're still inside the pattern.
-                arm.types.push_back(parseType());
-            }
-            if (consumeKeyword("when")) {
-                arm.guard = parseExpression();
-            }
-            if (!consumePunctuator("=>")) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected '=>' after catch pattern");
-            }
-            arm.body = parseStatement();
-            stmt->catches.push_back(std::move(arm));
-            // Optional trailing comma between arms; consumed here so the
-            // next catch keyword (or `finally`/`end`) is current.
-            (void)consumePunctuator(",");
         }
         if (consumeKeyword("finally")) {
             stmt->hasFinally = true;
