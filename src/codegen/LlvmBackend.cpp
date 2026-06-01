@@ -5256,7 +5256,23 @@ private:
     llvm::Value* lowerNew(const ast::NewExpr& ne) {
         if (!ne.type) return nullptr;
         sema::TypeRef* rt = ctx_.resolvedType(*ne.type);
-        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+        if (!rt->declaration) {
+            // CG22: built-in exception types (Exception, ArgumentException, …)
+            // have no user TypeSymbol (rt->declaration == null) but do have a
+            // built-in vtable from setupBuiltinExceptions. Construct a minimal
+            // heap object — 8 bytes to hold the vtable pointer — and store its
+            // vtable so emitIsA can match a catch arm.
+            if (ne.type->name && !ne.type->name->parts.empty()) {
+                std::string n(ne.type->name->parts.back());
+                auto vit = builtinVtable_.find(n);
+                if (vit != builtinVtable_.end()) {
+                    llvm::Value* obj = builder_.CreateCall(
+                        callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+                    builder_.CreateStore(vit->second, obj);
+                    return obj;
+                }
+            }
             return nullptr;
         }
         const sema::TypeSymbol* t = rt->declaration;

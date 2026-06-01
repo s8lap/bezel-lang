@@ -6,9 +6,10 @@
 // runtime type (reusing the CG19 type descriptors), first match wins.
 // Observable via the int exit code.
 //
-// User-defined exception classes are used: the built-in exception types
-// (§31.4) have no runtime descriptor yet (deferred). Catch-arm variable
-// binding (`catch var e: T`) and `when` guards are exercised below.
+// Both user-defined exception classes and the built-in exception types
+// (§31.4: Exception, ArgumentException, OverflowException, …) are tested.
+// Catch-arm variable binding (`catch var e: T` or `catch e: T`) and
+// `when` guards are exercised below.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -220,4 +221,71 @@ BEZEL_TEST(codegen_cg20, exception_from_implicit_base_constructor) {
         "class C public static method Main(): int "
         "  try var d := new D(); return 0; catch E => return 4; end; "
         "end Main; end C;"), 4);
+}
+
+// ── Built-in exception types (§31.4) ──────────────────────────────────────
+// Prior to this fix, `new Exception()` produced a null pointer (the type
+// had no user TypeSymbol), so the catch-dispatch emitIsA always failed.
+// These tests confirm that built-in exception objects are properly
+// heap-allocated with the correct vtable so the hierarchy check works.
+
+BEZEL_TEST(codegen_cg20, builtin_exception_throw_catch) {
+    // §31.4: throw a built-in Exception; catch by the same type.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var r := 0; "
+        "  try throw new Exception(); "
+        "  catch var e: Exception => r := 42; end; "
+        "  return r; "
+        "end Main; end C;"), 42);
+}
+
+BEZEL_TEST(codegen_cg20, builtin_exception_catch_base) {
+    // §31.4: throw ArgumentException; catch by its base Exception.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var r := 0; "
+        "  try throw new ArgumentException(); "
+        "  catch var e: Exception => r := 7; end; "
+        "  return r; "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(codegen_cg20, builtin_exception_hierarchy_match) {
+    // §31.4: OverflowException → ArithmeticException → Exception chain.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var r := 0; "
+        "  try throw new OverflowException(); "
+        "  catch var e: ArithmeticException => r := 5; end; "
+        "  return r; "
+        "end Main; end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg20, builtin_exception_no_match_falls_through) {
+    // §31.4: throw ArgumentException; a DivideByZeroException arm doesn't
+    // match; the exception propagates to the outer try that does match.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var r := 0; "
+        "  try "
+        "    try throw new ArgumentException(); "
+        "    catch var e: DivideByZeroException => r := 99; end; "
+        "  catch var e: Exception => r := 3; end; "
+        "  return r; "
+        "end Main; end C;"), 3);
+}
+
+// ── catch without var (parser recovery — `catch e: T` = `catch var e: T`) ─
+
+BEZEL_TEST(codegen_cg20, catch_binding_without_var) {
+    // `catch e: Exception` is accepted as a binding pattern even without
+    // the `var` keyword (parser tolerates the common C#/Java idiom).
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var r := 0; "
+        "  try throw new Exception(); "
+        "  catch e: Exception => r := 11; end; "
+        "  return r; "
+        "end Main; end C;"), 11);
 }

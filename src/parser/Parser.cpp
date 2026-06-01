@@ -2710,6 +2710,10 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         while (consumeKeyword("catch")) {
             // A.6 CatchPattern: `Type ("," Type)*` OR
             //   `"var" Identifier ":" Type ("," Type)*`.
+            // Also accept `Identifier ":" Type` (no `var`) as an alias for
+            // the binding form — a common C#/Java idiom — with a recovery
+            // diagnostic. This prevents an infinite-loop parse hang if the
+            // user forgets `var`.
             ast::CatchArm arm;
             if (consumeKeyword("var")) {
                 arm.hasBinding = true;
@@ -2726,6 +2730,14 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                         Severity::Error, current_.location,
                         "expected ':' after catch binding name");
                 }
+            } else if (current_.kind == TokenKind::Identifier &&
+                       peekAt(1).kind == TokenKind::Punctuator &&
+                       peekAt(1).text == ":") {
+                // `catch name: Type` — silently treat as `catch var name: Type`
+                arm.hasBinding = true;
+                arm.varName = current_.text;
+                advance(); // past name
+                advance(); // past ":"
             }
             arm.types.push_back(parseType());
             while (consumePunctuator(",")) {
