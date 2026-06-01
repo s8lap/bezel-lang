@@ -4159,10 +4159,125 @@ private:
         return true;
     }
 
+    // Detect Convert.ToInt32(s) / Convert.ToInt64(s) / Math.Abs(n) etc.
+    // as intrinsic static class method calls. Returns a lowered value or null.
+    llvm::Value* tryLowerBuiltinClassCall(const ast::CallExpr& call) {
+        if (!call.callee) return nullptr;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+        if (!ma || !ma->target) return nullptr;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!id) return nullptr;
+        const auto cls = id->name;
+        const auto& m = ma->member;
+
+        if (cls == "Convert") {
+            if (call.args.size() == 1 && call.args[0].value) {
+                // Convert.ToInt32(s: string): int — atoi / strtol
+                if (m == "ToInt32") {
+                    llvm::Value* arg = lowerExpr(*call.args[0].value);
+                    if (!arg) return nullptr;
+                    auto* argTy = ctx_.exprType(*call.args[0].value);
+                    // If it's already an int, return as-is.
+                    if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+                        argTy->primitive == sema::PrimitiveType::Int)
+                        return arg;
+                    // For string: call atoi(data_ptr)
+                    llvm::Value* strPtr = arg;
+                    llvm::Value* data = loadStringData(strPtr);
+                    auto* atoiFn = module_->getFunction("atoi");
+                    if (!atoiFn) {
+                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+                        atoiFn = llvm::Function::Create(
+                            ft, llvm::Function::ExternalLinkage, "atoi", module_.get());
+                    }
+                    return builder_.CreateCall(atoiFn, {data}, "atoi.ret");
+                }
+                // Convert.ToInt64(s: string): long — atoll
+                if (m == "ToInt64") {
+                    llvm::Value* arg = lowerExpr(*call.args[0].value);
+                    if (!arg) return nullptr;
+                    llvm::Value* data = loadStringData(arg);
+                    auto* atolFn = module_->getFunction("atoll");
+                    if (!atolFn) {
+                        auto* ft = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                        atolFn = llvm::Function::Create(
+                            ft, llvm::Function::ExternalLinkage, "atoll", module_.get());
+                    }
+                    return builder_.CreateCall(atolFn, {data}, "atoll.ret");
+                }
+                // Convert.ToDouble(s: string): double — atof
+                if (m == "ToDouble") {
+                    llvm::Value* arg = lowerExpr(*call.args[0].value);
+                    if (!arg) return nullptr;
+                    llvm::Value* data = loadStringData(arg);
+                    auto* atofFn = module_->getFunction("atof");
+                    if (!atofFn) {
+                        auto* ft = llvm::FunctionType::get(
+                            llvm::Type::getDoubleTy(llvm_), {ptrTy()}, false);
+                        atofFn = llvm::Function::Create(
+                            ft, llvm::Function::ExternalLinkage, "atof", module_.get());
+                    }
+                    return builder_.CreateCall(atofFn, {data}, "atof.ret");
+                }
+                // Convert.ToString(n: int): string — alias for n.ToString()
+                if (m == "ToString") {
+                    llvm::Value* arg = lowerExpr(*call.args[0].value);
+                    if (!arg) return nullptr;
+                    auto* argTy = ctx_.exprType(*call.args[0].value);
+                    if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive)
+                        return emitPrimitiveToString(arg, argTy->primitive);
+                }
+            }
+        }
+
+        if (cls == "Math") {
+            if (call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                if (m == "Abs") {
+                    // Abs for int — select(n<0, -n, n)
+                    llvm::Value* neg = builder_.CreateNeg(arg, "abs.neg");
+                    llvm::Value* isNeg = builder_.CreateICmpSLT(
+                        arg, llvm::ConstantInt::get(arg->getType(), 0));
+                    return builder_.CreateSelect(isNeg, neg, arg, "abs.result");
+                }
+                if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round") {
+                    // Use llvm intrinsics for common math ops.
+                    llvm::Intrinsic::ID iid =
+                        m == "Sqrt"    ? llvm::Intrinsic::sqrt :
+                        m == "Floor"   ? llvm::Intrinsic::floor :
+                        m == "Ceiling" ? llvm::Intrinsic::ceil :
+                                         llvm::Intrinsic::round;
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!arg->getType()->isDoubleTy())
+                        arg = builder_.CreateSIToFP(arg, dbl);
+                    auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), iid, {dbl});
+                    return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
+                }
+            }
+            if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+                llvm::Value* a = lowerExpr(*call.args[0].value);
+                llvm::Value* b = lowerExpr(*call.args[1].value);
+                if (!a || !b) return nullptr;
+                if (m == "Min") {
+                    llvm::Value* cmp = builder_.CreateICmpSLT(a, b);
+                    return builder_.CreateSelect(cmp, a, b, "min.result");
+                }
+                if (m == "Max") {
+                    llvm::Value* cmp = builder_.CreateICmpSGT(a, b);
+                    return builder_.CreateSelect(cmp, a, b, "max.result");
+                }
+            }
+        }
+        return nullptr;
+    }
+
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
         // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
         if (tryLowerConsoleCall(call)) return nullptr;  // unit result
+        // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
+        if (auto* v = tryLowerBuiltinClassCall(call)) return v;
         // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
         // primitive type name (no resolved symbol) converts its argument.
         if (auto* cid =

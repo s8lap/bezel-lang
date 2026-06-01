@@ -125,3 +125,32 @@ BEZEL_TEST(codegen_console, write_bool) {
         "  Console.Write(true); return 0; "
         "end Main; end C;"), std::string("true"));
 }
+
+// §2.3 / stdlib §9: Convert.ToInt32 / Math.Abs / Math.Min / Math.Max
+// as always-available built-in class method intrinsics.
+
+BEZEL_TEST(codegen_convert, to_int32_from_string) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"42\"; return Convert.ToInt32(s); "
+        "end Main; end C;"), 42);
+}
+
+BEZEL_TEST(codegen_math, abs_positive) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int return Math.Abs(5); "
+        "end Main; end C;"), 5);
+}
+
+BEZEL_TEST(codegen_math, abs_negative) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int return Math.Abs(0 - 7); "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(codegen_math, min_max) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  return Math.Min(3, 7) + Math.Max(3, 7); "
+        "end Main; end C;"), 10);
+}
