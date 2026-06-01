@@ -95,3 +95,47 @@ BEZEL_TEST(codegen_cg38, arm_with_return) {
         "end; "
         "return 0;"), 11);
 }
+
+// CG38b: binding patterns (`var n`) in statement-position case arms.
+// §19.2: the bound name is in scope for the arm guard and body.
+
+BEZEL_TEST(codegen_cg38b, binding_pattern_stores_scrutinee) {
+    // `var n` always matches; body stores scrutinee into `r` via `n`.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; var r := 0; "
+        "case x "
+        "  var n => do r := n; end, "
+        "end; "
+        "return r;"), 5);
+}
+
+BEZEL_TEST(codegen_cg38b, binding_pattern_arithmetic_in_body) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 6; var r := 0; "
+        "case x "
+        "  var n => do r := n * 3; end, "
+        "end; "
+        "return r;"), 18);
+}
+
+BEZEL_TEST(codegen_cg38b, binding_pattern_after_constant_arms) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 8; var r := 0; "
+        "case x "
+        "  1 => do r := 1; end, "
+        "  2 => do r := 2; end, "
+        "  var n => do r := n + 100; end, "
+        "end; "
+        "return r;"), 108);
+}
+
+BEZEL_TEST(codegen_cg38b, binding_pattern_with_guard) {
+    // Guard references `n`; when it holds the arm runs.
+    BEZEL_EXPECT_EQ(run(
+        "var x := 10; var r := 0; "
+        "case x "
+        "  var n when n > 5 => do r := n + 1; end, "
+        "  _ => do r := 99; end, "
+        "end; "
+        "return r;"), 11);
+}
