@@ -391,3 +391,42 @@ BEZEL_TEST(integration, string_interpolation_with_class) {
         "  end Main; "
         "end C;"), 12);  // "Point: (3,4)" = 12 chars
 }
+
+BEZEL_TEST(integration, sieve_of_eratosthenes_with_output) {
+    // Sieve producing sum and count of primes ≤ 50.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var sieve: [51]int; "
+        "  for var i in 0..50 do sieve[i] := 1; end; "
+        "  sieve[0] := 0; sieve[1] := 0; "
+        "  for var i in 2..50 do "
+        "    if sieve[i] = 1 then "
+        "      var j := i * 2; "
+        "      while j <= 50 do sieve[j] := 0; j := j + i; end; "
+        "    end; "
+        "  end; "
+        "  var count := 0; "
+        "  for var i in 2..50 do if sieve[i] = 1 then count := count + 1; end; end; "
+        "  return count; "
+        "end Main; end C;"), 15);  // primes ≤ 50: 15 total
+}
+
+BEZEL_TEST(integration, resource_disposal_order) {
+    // RAII using-var disposal runs in reverse declaration order.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class R "
+        "  public static _log: int := 0; "
+        "  public _id: int := 0; "
+        "  public constructor(id: int) _id := id; end constructor; "
+        "  destructor R._log := R._log * 10 + _id; end destructor; "
+        "end R; "
+        "class C public static method Main(): int "
+        "  do "
+        "    using var a := new R(1); "
+        "    using var b := new R(2); "
+        "    using var c := new R(3); "
+        "  end; "
+        "  return R._log; "
+        "end Main; end C;"), 65);  // 321 mod 256 = 65 (8-bit exit code)
+}
