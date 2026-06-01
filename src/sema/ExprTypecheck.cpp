@@ -1516,20 +1516,30 @@ private:
             }
         }
         if (!targetType) {
-            // Guard: string member access compiles but silently returns 0
-            // because the string runtime is not yet implemented. Emit a
-            // clean diagnostic so programmers get a clear error rather
-            // than a misleading 0. (Issue #251.)
+            // CG27a (§4.6): handle known intrinsic string members directly —
+            // string has no user TypeSymbol in the symbol table.
             if (ma.target) {
                 auto* tt = ctx_.exprType(*ma.target);
                 if (tt && tt->kind == TypeRef::Kind::Primitive &&
                     tt->primitive == PrimitiveType::String) {
+                    if (ma.member == "Length") {
+                        // stdlib §9.6: Length: int
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                        return;
+                    }
+                    if (ma.member == "IsAscii") {
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    }
+                    // Emit a diagnostic for unrecognized string members so the
+                    // user gets a clear error rather than a silent codegen null.
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
-                        std::string("member access on `string` (`.") +
+                        std::string("string member `.") +
                         std::string(ma.member) +
-                        "`) is not yet supported in codegen — the string "
-                        "runtime is a future milestone");
+                        "` is not yet supported in codegen");
                 }
             }
             return;

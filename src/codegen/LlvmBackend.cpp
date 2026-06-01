@@ -216,6 +216,12 @@ private:
     std::unordered_map<const sema::ExternDeclSymbol*, llvm::Function*>
         externFns_;
 
+    // CG27a: string runtime — %bz_string = { ptr, i64 } (data, length).
+    // Literals are materialized as private global constants; concatenation
+    // allocates via malloc/memcpy. All string variables are ptr-typed (§4.6).
+    llvm::StructType* stringStructTy_ = nullptr;
+    unsigned stringLiteralIdx_ = 0;
+
     // CG8: per-class instance layout (struct of instance fields) and each
     // field's index within it.
     std::unordered_map<const sema::TypeSymbol*, llvm::StructType*> structs_;
@@ -350,8 +356,198 @@ private:
             case P::Short: case P::UShort: return llvm::Type::getInt16Ty(llvm_);
             case P::Long: case P::ULong:   return i64();
             case P::Int: case P::UInt: case P::Char:
+                                           return i32();
+            // CG27a (§4.6): string is a reference type — pointer to bz_string.
+            case P::String:                return ptrTy();
             default:                       return i32();
         }
+    }
+
+    // CG27a: lazily get (or create) the %bz_string struct type { ptr, i64 }.
+    llvm::StructType* stringType() {
+        if (!stringStructTy_)
+            stringStructTy_ = llvm::StructType::create(
+                llvm_, {ptrTy(), i64()}, "bz.string");
+        return stringStructTy_;
+    }
+
+    // CG27a: load the data pointer from a bz_string pointer.
+    llvm::Value* loadStringData(llvm::Value* strPtr) {
+        llvm::Value* p = builder_.CreateStructGEP(stringType(), strPtr, 0);
+        return builder_.CreateLoad(ptrTy(), p, "str.data");
+    }
+
+    // CG27a: load the length (i64) from a bz_string pointer.
+    llvm::Value* loadStringLen(llvm::Value* strPtr) {
+        llvm::Value* p = builder_.CreateStructGEP(stringType(), strPtr, 1);
+        return builder_.CreateLoad(i64(), p, "str.len");
+    }
+
+    // CG27a: lazily declare an external C function (for memcmp, malloc, memcpy).
+    llvm::Function* declareC(const char* name, llvm::Type* ret,
+                             std::vector<llvm::Type*> args) {
+        if (auto* f = module_->getFunction(name)) return f;
+        auto* ft = llvm::FunctionType::get(ret, args, /*variadic=*/false);
+        return llvm::Function::Create(
+            ft, llvm::Function::ExternalLinkage, name, module_.get());
+    }
+
+    // CG27a (§4.6): process string literal source text into raw bytes,
+    // handling escape sequences (§18.8). `text` is the full source-level
+    // token including surrounding `"` (or `@"` for verbatim). Returns the
+    // raw byte content (not null-terminated; null added by LLVM DataArray).
+    static std::string processStringText(std::string_view text, bool verbatim) {
+        // Strip prefix (@" or ") and trailing ".
+        size_t start = verbatim ? 2 : 1;
+        if (text.size() < (verbatim ? 3u : 2u)) return {};
+        text = text.substr(start, text.size() - start - 1);
+
+        std::string result;
+        result.reserve(text.size());
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (verbatim) {
+                // Verbatim: only `""` → `"`, everything else literal.
+                if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
+                    result.push_back('"');
+                    ++i;
+                } else {
+                    result.push_back(text[i]);
+                }
+                continue;
+            }
+            if (text[i] != '\\') { result.push_back(text[i]); continue; }
+            if (++i >= text.size()) break;
+            switch (text[i]) {
+                case 'n': result.push_back('\n'); break;
+                case 'r': result.push_back('\r'); break;
+                case 't': result.push_back('\t'); break;
+                case '\\': result.push_back('\\'); break;
+                case '"': result.push_back('"'); break;
+                case '\'': result.push_back('\''); break;
+                case '0': result.push_back('\0'); break;
+                case 'a': result.push_back('\a'); break;
+                case 'b': result.push_back('\b'); break;
+                case 'f': result.push_back('\f'); break;
+                case 'v': result.push_back('\v'); break;
+                case 'u': {
+                    // \uXXXX — 4 hex digits, BMP only → UTF-8
+                    if (i + 4 < text.size()) {
+                        uint32_t cp = 0;
+                        for (int k = 0; k < 4; ++k)
+                            cp = (cp << 4) | (uint8_t)
+                                (text[i + 1 + k] >= 'a' ? text[i+1+k]-'a'+10 :
+                                 text[i+1+k] >= 'A' ? text[i+1+k]-'A'+10 :
+                                 text[i+1+k] - '0');
+                        i += 4;
+                        if (cp < 0x80) {
+                            result.push_back((char)cp);
+                        } else if (cp < 0x800) {
+                            result.push_back((char)(0xC0 | (cp >> 6)));
+                            result.push_back((char)(0x80 | (cp & 0x3F)));
+                        } else {
+                            result.push_back((char)(0xE0 | (cp >> 12)));
+                            result.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+                            result.push_back((char)(0x80 | (cp & 0x3F)));
+                        }
+                    }
+                    break;
+                }
+                default: result.push_back(text[i]); break;
+            }
+        }
+        return result;
+    }
+
+    // CG27a (§4.6): materialize a string literal as a private global
+    // %bz_string constant; return a ptr to the global.
+    llvm::Value* lowerStringLiteral(std::string_view text, bool verbatim) {
+        std::string content = processStringText(text, verbatim);
+        // Global [N+1 x i8] constant for the char data (null-terminated).
+        llvm::Constant* dataArr =
+            llvm::ConstantDataArray::getString(llvm_, content, /*AddNull=*/true);
+        unsigned id = stringLiteralIdx_++;
+        auto* dataGV = new llvm::GlobalVariable(
+            *module_, dataArr->getType(), /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, dataArr,
+            ".bz.str.data." + std::to_string(id));
+        dataGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        dataGV->setAlignment(llvm::Align(1));
+        // Global %bz_string = { ptr data, i64 len }.
+        llvm::Constant* lenC = llvm::ConstantInt::get(i64(), content.size());
+        llvm::Constant* strVal = llvm::ConstantStruct::get(
+            stringType(), {dataGV, lenC});
+        auto* strGV = new llvm::GlobalVariable(
+            *module_, stringType(), /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, strVal,
+            ".bz.str." + std::to_string(id));
+        return strGV;
+    }
+
+    // CG27a (§4.6): content equality of two bz_string pointers → i1.
+    // Fast path: pointer identity → true. Slow path: compare lengths then
+    // memcmp the char data.
+    llvm::Value* emitStringEq(llvm::Value* l, llvm::Value* r) {
+        auto* entryBB = builder_.GetInsertBlock();
+        auto* lenBB = llvm::BasicBlock::Create(llvm_, "str.eq.len", currentFn_);
+        auto* cmpBB = llvm::BasicBlock::Create(llvm_, "str.eq.cmp", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "str.eq.end", currentFn_);
+        // Fast path: same pointer → equal.
+        llvm::Value* samePtr = builder_.CreateICmpEQ(l, r, "str.sameptr");
+        builder_.CreateCondBr(samePtr, endBB, lenBB);
+        // Length check.
+        builder_.SetInsertPoint(lenBB);
+        llvm::Value* lenL = loadStringLen(l);
+        llvm::Value* lenR = loadStringLen(r);
+        llvm::Value* sameLen = builder_.CreateICmpEQ(lenL, lenR, "str.samelen");
+        auto* lenEnd = builder_.GetInsertBlock();
+        builder_.CreateCondBr(sameLen, cmpBB, endBB);
+        // memcmp.
+        builder_.SetInsertPoint(cmpBB);
+        llvm::Value* dataL = loadStringData(l);
+        llvm::Value* dataR = loadStringData(r);
+        auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
+        llvm::Value* cmpRes = builder_.CreateCall(memcmpFn, {dataL, dataR, lenL});
+        llvm::Value* cmpEq = builder_.CreateICmpEQ(
+            cmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
+        auto* cmpEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        // Merge.
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "str.eq");
+        phi->addIncoming(builder_.getTrue(), entryBB);
+        phi->addIncoming(builder_.getFalse(), lenEnd);
+        phi->addIncoming(cmpEq, cmpEnd);
+        return phi;
+    }
+
+    // CG27a (§4.6): string concatenation — malloc-backed new string object.
+    llvm::Value* emitStringConcat(llvm::Value* l, llvm::Value* r) {
+        llvm::Value* lenL = loadStringLen(l);
+        llvm::Value* lenR = loadStringLen(r);
+        llvm::Value* total = builder_.CreateAdd(lenL, lenR, "str.total");
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+        // Allocate data buffer: total+1 (null-terminator).
+        llvm::Value* dataSize = builder_.CreateAdd(
+            total, builder_.getInt64(1), "str.datasize");
+        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSize}, "str.data");
+        llvm::Value* dataL = loadStringData(l);
+        llvm::Value* dataR = loadStringData(r);
+        builder_.CreateCall(memcpyFn, {newData, dataL, lenL});
+        llvm::Value* midPtr = builder_.CreateGEP(i8Ty, newData, lenL, "str.mid");
+        builder_.CreateCall(memcpyFn, {midPtr, dataR, lenR});
+        llvm::Value* endPtr = builder_.CreateGEP(i8Ty, newData, total, "str.nul");
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), endPtr);
+        // Allocate the bz_string struct.
+        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+        llvm::Value* newStr = builder_.CreateCall(
+            mallocFn, {builder_.getInt64(strBytes)}, "str.obj");
+        llvm::Value* df = builder_.CreateStructGEP(stringType(), newStr, 0);
+        builder_.CreateStore(newData, df);
+        llvm::Value* lf = builder_.CreateStructGEP(stringType(), newStr, 1);
+        builder_.CreateStore(total, lf);
+        return newStr;
     }
 
     // CG25: is a Bezel primitive an unsigned integer type? (Drives
@@ -2513,6 +2709,11 @@ private:
                                                           nullptr);
             return llvm::ConstantFP::get(ty, v);
         }
+        // CG27a (§4.6): string and verbatim-string literals → global bz_string.
+        if (auto* sl = dynamic_cast<const ast::StringLiteralExpr*>(&e))
+            return lowerStringLiteral(sl->text, /*verbatim=*/false);
+        if (auto* vs = dynamic_cast<const ast::VerbatimStringExpr*>(&e))
+            return lowerStringLiteral(vs->text, /*verbatim=*/true);
         // CG23: the `null` literal is a null reference pointer.
         if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
             return llvm::ConstantPointerNull::get(ptrTy());
@@ -2630,6 +2831,25 @@ private:
             phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), entryBB);
             phi->addIncoming(val, accessEnd);
             return phi;
+        }
+        // CG27a (§4.6): intrinsic string member access (Length, etc.).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target) {
+                auto* tt = ctx_.exprType(*ma->target);
+                if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
+                    tt->primitive == sema::PrimitiveType::String) {
+                    llvm::Value* strPtr = lowerExpr(*ma->target);
+                    if (!strPtr) return nullptr;
+                    if (ma->member == "Length") {
+                        // stdlib §9.6: Length: int — number of char code points.
+                        llvm::Value* len64 = loadStringLen(strPtr);
+                        return builder_.CreateTrunc(len64, i32(), "str.len.i32");
+                    }
+                    // Other string members deferred — sema would have flagged
+                    // any unknown member already.
+                    return nullptr;
+                }
+            }
         }
         // CG33b: a computed (arrow-getter) property read `obj.P` evaluates
         // the getter with `this` = obj.
@@ -2849,6 +3069,29 @@ private:
                                  : builder_.CreateSExt(l, wide);
             if (rw < lw) r = uns ? builder_.CreateZExt(r, wide)
                                  : builder_.CreateSExt(r, wide);
+        }
+        // CG27a (§4.6): string binary operations — intercept before the
+        // integer arithmetic path (string variables are ptr-typed, not int).
+        // When either operand is a null literal, fall through to pointer
+        // comparison (`s = null` / `s <> null` is a reference/null check).
+        {
+            auto isStr = [&](const ast::Expr* e) {
+                if (!e) return false;
+                auto* rt = ctx_.exprType(*e);
+                return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                       rt->primitive == sema::PrimitiveType::String;
+            };
+            bool eitherNull =
+                (bin.left && dynamic_cast<const ast::NullLiteralExpr*>(
+                                  bin.left.get())) ||
+                (bin.right && dynamic_cast<const ast::NullLiteralExpr*>(
+                                   bin.right.get()));
+            if (isStr(bin.left.get()) && !eitherNull) {
+                if (op == "=") return emitStringEq(l, r);
+                if (op == "<>") return builder_.CreateNot(emitStringEq(l, r));
+                if (op == "+") return emitStringConcat(l, r);
+                // <, >, <=, >= → ordinal (deferred); fall through.
+            }
         }
         // CG22 (§6.1): integer + - * are overflow-checked; / and mod also
         // raise on a zero divisor and on INT_MIN / -1. Applies to integer
