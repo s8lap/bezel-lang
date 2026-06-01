@@ -350,3 +350,41 @@ BEZEL_TEST(codegen_cg20, array_bounds_oor_write_throws) {
         "end Main; end C;"),
         77);
 }
+
+// ── Multiple catch arms ────────────────────────────────────────────────────
+
+BEZEL_TEST(codegen_cg20, multiple_catch_arms_comma_separated) {
+    // §31.2: Multiple catch arms under a single `catch` keyword,
+    // comma-separated. First matching arm runs.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var caught := 0; "
+        "  try "
+        "    throw new IndexOutOfRangeException(); "
+        "  catch "
+        "    var e: ArgumentException => caught := 1;, "
+        "    var e: IndexOutOfRangeException => caught := 2;, "
+        "    var e: Exception => caught := 3; "
+        "  end; "
+        "  return caught; "
+        "end Main; end C;"),
+        2);
+}
+
+BEZEL_TEST(codegen_cg20, type_test_in_interpolated_string) {
+    // §18.5 + §12.7: `{x is T}` inside an interpolated string must resolve
+    // the type node; it was previously skipped by TypeResolution.
+    // Returns 1 if all three type tests format correctly, 0 otherwise.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IA end IA; "
+        "class A : IA destructor end destructor; end A; "
+        "class B : IA destructor end destructor; end B; "
+        "class C public static method Main(): int "
+        "  using var a := new A(); "
+        "  using var b := new B(); "
+        "  var s := $\"{a is IA},{b is IA},{a is B}\"; "
+        "  if s = \"true,true,false\" then return 1; else return 0; end; "
+        "end Main; end C;"),
+        1);
+}
