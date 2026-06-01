@@ -116,20 +116,26 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                             }
                             break;
                         }
-                        // `,WIDTH` — alignment specifier (negative = left-align).
-                        // e.g. `{x,-15}` or `{x,10}`.
+                        // `,WIDTH` or `,WIDTH:FORMAT` — alignment specifier.
+                        // Negative WIDTH = left-align.
+                        // e.g. `{x,-15}`, `{x,10}`, `{x,10:F2}`.
                         if (ek == ',') {
                             auto tail = exprText.substr(k + 1);
                             bool looksLikeWidth = !tail.empty();
                             size_t start = 0;
                             if (!tail.empty() && (tail[0] == '-' || tail[0] == '+'))
                                 start = 1;
-                            for (size_t f = start; f < tail.size(); ++f)
-                                if (!std::isdigit(tail[f]))
-                                    { looksLikeWidth = false; break; }
-                            if (looksLikeWidth && start < tail.size()) {
+                            size_t digitEnd = start;
+                            while (digitEnd < tail.size() && std::isdigit(tail[digitEnd]))
+                                ++digitEnd;
+                            if (digitEnd == start) looksLikeWidth = false; // no digits
+                            // After the digits, only `}` (end) or `:FORMAT` is valid.
+                            if (looksLikeWidth && digitEnd < tail.size() &&
+                                tail[digitEnd] != ':')
+                                looksLikeWidth = false;
+                            if (looksLikeWidth) {
                                 actualExpr = exprText.substr(0, k);
-                                // Encode alignment as "," + WIDTH.
+                                // Encode as "," + WIDTH (+ optional ":FORMAT").
                                 fmtSpec = "," + std::string(tail);
                             }
                             break;

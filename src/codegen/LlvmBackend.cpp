@@ -829,37 +829,47 @@ private:
                                     const std::string& spec,
                                     const sema::TypeRef* rt) {
         if (spec.empty() || !val) return nullptr;
-        // §18.5 alignment specifier `,WIDTH`:
+        // §18.5 alignment specifier `,WIDTH` or `,WIDTH:FORMAT`:
         // Positive width = right-align, negative = left-align.
-        // First convert value to its default string, then pad with snprintf.
+        // First apply FORMAT (if any) to get the value string, then pad.
         if (spec[0] == ',') {
-            int alignWidth = std::atoi(spec.c_str() + 1);
+            // Split ",WIDTH" and optional ":FORMAT".
+            size_t colonPos = spec.find(':', 1);
+            std::string widthPart = (colonPos == std::string::npos)
+                ? spec.substr(1) : spec.substr(1, colonPos - 1);
+            std::string innerFmt = (colonPos == std::string::npos)
+                ? "" : spec.substr(colonPos + 1);
+            int alignWidth = std::atoi(widthPart.c_str());
             bool leftAlign = alignWidth < 0;
             int w = leftAlign ? -alignWidth : alignWidth;
             if (w == 0) return nullptr;
             std::string snpFmt = leftAlign
                 ? ("%-" + std::to_string(w) + "s")
                 : ("%" + std::to_string(w) + "s");
-            // Get the default string repr: convert val to string first.
+            // If an inner format spec exists, apply it first.
             llvm::Value* strVal = nullptr;
+            if (!innerFmt.empty()) {
+                llvm::Value* formatted = emitWithFormatSpec(val, innerFmt, rt);
+                if (formatted) strVal = formatted;
+            }
             using P = sema::PrimitiveType;
-            bool isFloat = val->getType()->isDoubleTy() || val->getType()->isFloatTy();
-            bool isInt = val->getType()->isIntegerTy();
-            bool isStr = rt && rt->kind == sema::TypeRef::Kind::Primitive &&
-                         rt->primitive == P::String;
-            if (isStr) {
-                strVal = val;  // already a bz_string
-            } else if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
-                strVal = emitPrimitiveToString(val, rt->primitive);
-            } else if (isFloat) {
-                strVal = emitPrimitiveToString(val, P::Double);
-            } else if (isInt) {
-                llvm::Value* iv = val->getType()->isIntegerTy(64) ? val
-                    : builder_.CreateSExt(val, i64());
-                strVal = emitPrimitiveToString(iv, P::Long);
+            if (!strVal) {
+                // Default string conversion.
+                bool isStr = rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                             rt->primitive == P::String;
+                if (isStr) {
+                    strVal = val;
+                } else if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
+                    strVal = emitPrimitiveToString(val, rt->primitive);
+                } else if (val->getType()->isDoubleTy() || val->getType()->isFloatTy()) {
+                    strVal = emitPrimitiveToString(val, P::Double);
+                } else if (val->getType()->isIntegerTy()) {
+                    llvm::Value* iv = val->getType()->isIntegerTy(64) ? val
+                        : builder_.CreateSExt(val, i64());
+                    strVal = emitPrimitiveToString(iv, P::Long);
+                }
             }
             if (!strVal || !strVal->getType()->isPointerTy()) return nullptr;
-            // Extract C string data from bz_string and format with padding.
             llvm::Value* datPtr = builder_.CreateLoad(
                 ptrTy(), builder_.CreateStructGEP(stringType(), strVal, 0));
             return emitSnprintfToString(snpFmt, datPtr);
