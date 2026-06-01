@@ -7358,6 +7358,17 @@ private:
                 return emitClosureCall(closurePtr, rt);
             }
         }
+        // CG60: call through an indexed array element of function type —
+        // `handlers[i]()` where handlers: [N](T) -> R. The IndexExpr has
+        // no resolved symbol (calleeSym = null), so we lower the IndexExpr
+        // directly and use its exprType to drive emitClosureCall.
+        if (!calleeSym) {
+            sema::TypeRef* calleeTy = ctx_.exprType(*call.callee);
+            if (calleeTy && calleeTy->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* closurePtr = lowerExpr(*call.callee);
+                return emitClosureCall(closurePtr, calleeTy);
+            }
+        }
         auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
         if (!ms) return nullptr;
 
