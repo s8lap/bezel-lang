@@ -3081,6 +3081,12 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         return std::unique_ptr<ast::Stmt>(a.release());
     }
 
+    // If the expression is null (e.g. a keyword token where an expression
+    // was expected) and no `;` follows, return nullptr to allow the body-
+    // parsing loop to advance past the problematic token. Returning a non-
+    // null ExpressionStmt with null expr and no progress causes an infinite
+    // loop in statement-list parsers.
+    if (!lhs && !isPunctuator(";")) return nullptr;
     auto es = std::make_unique<ast::ExpressionStmt>();
     es->expr = std::move(lhs);
     if (!consumePunctuator(";")) {
