@@ -2512,6 +2512,31 @@ private:
     // emits the value computation only (correct for the non-overflowing,
     // non-zero-divisor case). The checks land with exceptions codegen.
     // Bitwise/shift ops are not overflow-checked, so they are exact now.
+
+    // CG29b (§8.3 / §17.3): structural equality for record values.
+    // A record lowers to a first-class LLVM struct — the only Bezel value
+    // that does — so a struct-typed operand uniquely identifies the record
+    // case. We AND per-field equality, recursing into nested record structs.
+    llvm::Value* emitStructEquality(llvm::Value* l, llvm::Value* r,
+                                    llvm::StructType* st) {
+        llvm::Value* acc = builder_.getInt1(true);
+        for (unsigned i = 0; i < st->getNumElements(); ++i) {
+            llvm::Value* li = builder_.CreateExtractValue(l, {i});
+            llvm::Value* ri = builder_.CreateExtractValue(r, {i});
+            llvm::Type* ft = st->getElementType(i);
+            llvm::Value* fieldEq;
+            if (auto* nested = llvm::dyn_cast<llvm::StructType>(ft)) {
+                fieldEq = emitStructEquality(li, ri, nested);
+            } else if (ft->isFloatingPointTy()) {
+                fieldEq = builder_.CreateFCmpOEQ(li, ri);
+            } else {
+                fieldEq = builder_.CreateICmpEQ(li, ri);
+            }
+            acc = builder_.CreateAnd(acc, fieldEq);
+        }
+        return acc;
+    }
+
     llvm::Value* lowerBinary(const ast::BinaryExpr& bin) {
         if (!bin.left || !bin.right) return nullptr;
         // CG: short-circuit `and`/`or` (§17) — the right operand is
@@ -2646,6 +2671,13 @@ private:
         if (op == "<<") return builder_.CreateShl(l, r);
         if (op == ">>") return uns ? builder_.CreateLShr(l, r)
                                    : builder_.CreateAShr(l, r);
+        // CG29b (§8.3): records compare structurally — dispatch before the
+        // scalar integer path (ICmp doesn't accept struct operands).
+        if ((op == "=" || op == "<>") && l->getType()->isStructTy()) {
+            llvm::Value* eq = emitStructEquality(
+                l, r, llvm::cast<llvm::StructType>(l->getType()));
+            return op == "=" ? eq : builder_.CreateNot(eq);
+        }
         // CG4: integer comparisons → i1.
         if (op == "=") return builder_.CreateICmpEQ(l, r);
         if (op == "<>") return builder_.CreateICmpNE(l, r);
