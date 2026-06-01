@@ -279,3 +279,42 @@ BEZEL_TEST(codegen_cg60, array_element_call) {
         "    return fns[0](3) + fns[1](4) + fns[2](5); "
         "  end Main; end C;"), 16);
 }
+
+// ── Advanced closure patterns ─────────────────────────────────────────────
+BEZEL_TEST(codegen_cg60, once_pattern) {
+    // A `once` function: call compute only on first invocation.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Cache public _v: int := 0; public _done: bool := false; destructor end destructor; end Cache; "
+        "class Acc public _c: int := 0; destructor end destructor; end Acc; "
+        "class C "
+        "  public static method Once(f: () -> int, ca: Cache): () -> int "
+        "    return () => do "
+        "      if ca._done then return ca._v; end; "
+        "      ca._v := f(); ca._done := true; return ca._v; "
+        "    end; "
+        "  end Once; "
+        "  public static method Main(): int "
+        "    using var ca := new Cache(); "
+        "    using var acc := new Acc(); "
+        "    var f := Once(() => do acc._c := acc._c + 1; return 99; end, ca); "
+        "    var r1 := f(); var r2 := f(); var r3 := f(); "
+        "    return r1 + r2 + r3 - acc._c; "
+        "  end Main; "
+        "end C;"), 296);  // 99+99+99-1=296
+}
+
+BEZEL_TEST(codegen_cg60, partial_application) {
+    // Partial application: bind first arg of (int,int)->int.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Partial(f: (int, int) -> int, a: int): (int) -> int "
+        "    return (b: int) => f(a, b); "
+        "  end Partial; "
+        "  public static method Main(): int "
+        "    var add := (x: int, y: int) => x + y; "
+        "    var add10 := Partial(add, 10); "
+        "    return add10(5) + add10(3); "
+        "  end Main; "
+        "end C;"), 28);  // 15 + 13 = 28
+}
