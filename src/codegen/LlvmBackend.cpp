@@ -1348,6 +1348,53 @@ private:
             return strObj;
         }
 
+        // §9.6-ext: CountOf(sub: string): int — count non-overlapping occurrences.
+        if (method == "CountOf" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* sub = getStrArg(0);
+            if (!sub) return nullptr;
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* selfLen = loadStringLen(self);
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* subLen = loadStringLen(sub);
+            llvm::Value* subData = loadStringData(sub);
+            auto* memmemFn = module_->getFunction("memmem");
+            if (!memmemFn) {
+                auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
+                memmemFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
+            }
+            auto* cntSlot = entryAlloca(i32());
+            auto* posSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(builder_.getInt32(0), cntSlot);
+            builder_.CreateStore(selfData, posSlot);
+            llvm::Value* endPtr = builder_.CreateGEP(i8Ty, selfData, selfLen);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "cnt.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cnt.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "cnt.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* pos = builder_.CreateLoad(ptrTy(), posSlot);
+            llvm::Value* rem = builder_.CreatePtrDiff(i8Ty, endPtr, pos);
+            llvm::Value* canSearch = builder_.CreateICmpSGE(rem, subLen);
+            builder_.CreateCondBr(canSearch, bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* posB = builder_.CreateLoad(ptrTy(), posSlot);
+            llvm::Value* remB = builder_.CreatePtrDiff(i8Ty, endPtr, posB);
+            llvm::Value* found = builder_.CreateCall(memmemFn, {posB, remB, subData, subLen});
+            auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+            llvm::Value* notFound = builder_.CreateICmpEQ(found, nullPtr);
+            auto* incBB = llvm::BasicBlock::Create(llvm_, "cnt.inc", currentFn_);
+            builder_.CreateCondBr(notFound, endBB, incBB);
+            builder_.SetInsertPoint(incBB);
+            // Increment count, advance past found occurrence.
+            llvm::Value* cnt = builder_.CreateLoad(i32(), cntSlot);
+            builder_.CreateStore(builder_.CreateAdd(cnt, builder_.getInt32(1)), cntSlot);
+            llvm::Value* afterFound = builder_.CreateGEP(i8Ty, found, subLen);
+            builder_.CreateStore(afterFound, posSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return builder_.CreateLoad(i32(), cntSlot, "countof.result");
+        }
+
         return nullptr;  // method not recognised
     }
 

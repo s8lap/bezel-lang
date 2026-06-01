@@ -1658,7 +1658,8 @@ private:
                             return;
                         }
                         if (ma.member == "IndexOf" ||
-                            ma.member == "LastIndexOf") {
+                            ma.member == "LastIndexOf" ||
+                            ma.member == "CountOf") {
                             ctx_.setExprType(
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                             return;
