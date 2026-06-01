@@ -171,3 +171,63 @@ BEZEL_TEST(codegen_cg51b, step_with_break) {
         "  return s; "
         "end Main; end C;"), 9);
 }
+
+// §17.5: `x in lo..hi` — range membership test.
+// The `in` operator with a range literal is true when x is within the range.
+// For inclusive `..`: lo <= x <= hi. For half-open `..<`: lo <= x < hi.
+
+BEZEL_TEST(codegen_in_range, in_inclusive_hit) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x := 5; return (1 if x in 1..10 else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_in_range, in_inclusive_miss) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x := 15; return (1 if x in 1..10 else 0); "
+        "end Main; end C;"), 0);
+}
+
+BEZEL_TEST(codegen_in_range, in_inclusive_boundary_lo) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x := 1; return (1 if x in 1..10 else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_in_range, in_inclusive_boundary_hi) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x := 10; return (1 if x in 1..10 else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_in_range, in_half_open_excludes_hi) {
+    // `..<` excludes the upper bound.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x := 10; return (1 if x in 1..<10 else 0); "
+        "end Main; end C;"), 0);
+}
+
+BEZEL_TEST(codegen_in_range, in_with_variable_bounds) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var x := 5; var lo := 1; var hi := 10; "
+        "  return (1 if x in lo..hi else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_in_range, in_used_as_filter_in_for) {
+    // Count values in 1..20 that are in the range 5..15 (inclusive).
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var count := 0; "
+        "  for var i in 1..20 do "
+        "    if i in 5..15 then count := count + 1; end; "
+        "  end; "
+        "  return count; "
+        "end Main; end C;"), 11);
+}

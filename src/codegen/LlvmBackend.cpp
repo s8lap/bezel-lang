@@ -2691,6 +2691,26 @@ private:
                 return emitMethodCall(opm, args, /*baseQualified=*/false);
             }
         }
+        // §17.5: `x in lo..hi` — true if lo <= x <= hi (inclusive) or
+        // lo <= x < hi (half-open). The right operand is a RangeExpr, not a
+        // value, so we intercept before the general lowerExpr path.
+        if (bin.op == "in") {
+            if (!bin.left || !bin.right) return nullptr;
+            auto* range = dynamic_cast<const ast::RangeExpr*>(bin.right.get());
+            if (range && range->lo && range->hi && !range->step) {
+                llvm::Value* x = lowerExpr(*bin.left);
+                llvm::Value* lo = lowerExpr(*range->lo);
+                llvm::Value* hi = lowerExpr(*range->hi);
+                if (!x || !lo || !hi) return nullptr;
+                // x >= lo AND (x <= hi for inclusive, x < hi for half-open).
+                llvm::Value* geL = builder_.CreateICmpSGE(x, lo);
+                llvm::Value* leH = range->inclusive
+                                       ? builder_.CreateICmpSLE(x, hi)
+                                       : builder_.CreateICmpSLT(x, hi);
+                return builder_.CreateAnd(geL, leH);
+            }
+            return nullptr;  // non-range `in` (collection) not yet implemented
+        }
         llvm::Value* l = lowerExpr(*bin.left);
         llvm::Value* r = lowerExpr(*bin.right);
         if (!l || !r) return nullptr;
