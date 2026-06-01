@@ -6366,10 +6366,15 @@ private:
                 llvm::Value* lo = lowerExpr(*range->lo);
                 llvm::Value* hi = lowerExpr(*range->hi);
                 if (!lo || !hi) return nullptr;
-                llvm::Value* geL = builder_.CreateICmpSGE(scrut, lo);
-                llvm::Value* leH = range->inclusive
-                                       ? builder_.CreateICmpSLE(scrut, hi)
-                                       : builder_.CreateICmpSLT(scrut, hi);
+                bool fp = scrut->getType()->isFloatingPointTy();
+                // §19.3: range patterns — use FP comparisons for float scrutinees.
+                llvm::Value* geL = fp ? builder_.CreateFCmpOGE(scrut, lo)
+                                      : builder_.CreateICmpSGE(scrut, lo);
+                llvm::Value* leH = fp
+                    ? (range->inclusive ? builder_.CreateFCmpOLE(scrut, hi)
+                                        : builder_.CreateFCmpOLT(scrut, hi))
+                    : (range->inclusive ? builder_.CreateICmpSLE(scrut, hi)
+                                        : builder_.CreateICmpSLT(scrut, hi));
                 return builder_.CreateAnd(geL, leH);
             }
         }
