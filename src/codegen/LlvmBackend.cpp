@@ -4546,7 +4546,52 @@ private:
                                        : builder_.CreateICmpSLT(x, hi);
                 return builder_.CreateAnd(geL, leH);
             }
-            return nullptr;  // non-range `in` (collection) not yet implemented
+            // §17.5: `c in s` — char membership test in a string.
+            // True when the char c appears at any position in s.
+            if (bin.right) {
+                auto* rTy = ctx_.exprType(*bin.right);
+                if (rTy && rTy->kind == sema::TypeRef::Kind::Primitive &&
+                    rTy->primitive == sema::PrimitiveType::String) {
+                    auto* lTy = ctx_.exprType(*bin.left);
+                    if (lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
+                        lTy->primitive == sema::PrimitiveType::Char) {
+                        // Implement as: scan through string code points for a match.
+                        llvm::Value* needle = lowerExpr(*bin.left);
+                        llvm::Value* haystack = lowerExpr(*bin.right);
+                        if (!needle || !haystack) return nullptr;
+                        llvm::Value* len = loadStringLen(haystack);
+                        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                        auto* idxS = entryAlloca(i64());
+                        builder_.CreateStore(builder_.getInt64(0), idxS);
+                        auto* cBB = llvm::BasicBlock::Create(llvm_, "cin.c", currentFn_);
+                        auto* bBB = llvm::BasicBlock::Create(llvm_, "cin.b", currentFn_);
+                        auto* sBB = llvm::BasicBlock::Create(llvm_, "cin.s", currentFn_);  // success
+                        auto* eBB = llvm::BasicBlock::Create(llvm_, "cin.e", currentFn_);  // end
+                        builder_.CreateBr(cBB);
+                        builder_.SetInsertPoint(cBB);
+                        llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
+                        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bBB, eBB);
+                        builder_.SetInsertPoint(bBB);
+                        llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
+                        llvm::Value* cp = loadCodePoint(haystack, idxB);
+                        llvm::Value* found = builder_.CreateICmpEQ(cp, needle, "cin.found");
+                        auto* incBB = llvm::BasicBlock::Create(llvm_, "cin.inc", currentFn_);
+                        builder_.CreateCondBr(found, sBB, incBB);
+                        builder_.SetInsertPoint(incBB);
+                        builder_.CreateStore(builder_.CreateAdd(idxB, builder_.getInt64(1)), idxS);
+                        builder_.CreateBr(cBB);
+                        builder_.SetInsertPoint(sBB);
+                        auto* sBBEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(eBB);
+                        builder_.SetInsertPoint(eBB);
+                        auto* phi = builder_.CreatePHI(i1(), 2, "cin.result");
+                        phi->addIncoming(builder_.getFalse(), cBB);  // loop exhausted
+                        phi->addIncoming(builder_.getTrue(), sBBEnd); // found match
+                        return phi;
+                    }
+                }
+            }
+            return nullptr;  // other `in` forms (collection) not yet implemented
         }
         llvm::Value* l = lowerExpr(*bin.left);
         llvm::Value* r = lowerExpr(*bin.right);
