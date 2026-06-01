@@ -116,20 +116,23 @@ BEZEL_TEST(codegen_cg24, float_suffix_typing) {
 
 BEZEL_TEST(codegen_cg24, float_record_equality) {
     // Record with float fields: equality uses FCmpOEQ on f32 values.
-    BEZEL_EXPECT_EQ(run(
+    // Use runJit directly so we can define a record at module scope.
+    auto r = runJit(
         "module M; record F(x: float, y: float); "
         "class C public static method Main(): int "
         "  var a := new F(1.0f, 2.0f); var b := new F(1.0f, 2.0f); "
         "  return (1 if a = b else 0); "
-        "end Main; end C;"), 1);
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
 
 BEZEL_TEST(codegen_cg24, float_record_inequality) {
     // Two float records with different y field compare unequal.
-    BEZEL_EXPECT_EQ(run(
+    auto r = runJit(
         "module M; record F(x: float, y: float); "
         "class C public static method Main(): int "
         "  var a := new F(1.0f, 2.0f); var b := new F(1.0f, 2.5f); "
         "  return (1 if a <> b else 0); "
-        "end Main; end C;"), 1);
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }

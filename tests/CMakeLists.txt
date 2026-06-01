@@ -188,6 +188,7 @@ set(BEZEL_TEST_SOURCES
     codegen/record_basics_test.cpp
     codegen/record_equality_test.cpp
     codegen/inline_array_test.cpp
+    codegen/string_test.cpp
     codegen/range_for_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
