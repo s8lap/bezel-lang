@@ -4479,6 +4479,14 @@ private:
                             llvm::Type* ft = pt == P::Double ? llvm::Type::getDoubleTy(llvm_) : llvm::Type::getFloatTy(llvm_);
                             return llvm::ConstantFP::getInfinity(ft, true);
                         }
+                        if (mbr == "Epsilon" && (pt == P::Double || pt == P::Float)) {
+                            // Smallest positive value: 5e-324 for double, ~1.4e-45 for float.
+                            return pt == P::Double
+                                ? llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_),
+                                    std::numeric_limits<double>::denorm_min())
+                                : llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_),
+                                    std::numeric_limits<float>::denorm_min());
+                        }
                     }
                     // §2.3: built-in class constant properties (Math.PI, Math.E, etc.)
                     // These are MemberAccess on a CLASS name (not a primitive type).
