@@ -5207,15 +5207,26 @@ private:
         return module_->getOrInsertFunction("calloc", fnTy);
     }
 
-    // CG60: lower a lambda expression to a nested LLVM function and return
-    // its function pointer (non-capturing; captures deferred per §A.7).
-    // Param types come from explicit type annotations; the return type is
-    // inferred from the sema-resolved type of the expression body.
+    // CG60: lower a lambda expression. Lambdas are represented as a
+    // heap-allocated two-pointer closure struct { fn_ptr, env_ptr }.
+    //
+    // For non-capturing lambdas: env_ptr = null; the function ignores it.
+    // For capturing lambdas: env_ptr points to a heap struct of captured
+    // variable values (captured by copy at creation time — per Bezel's
+    // value-type capture model).
+    //
+    // All lambda functions use the calling convention:
+    //   (env_ptr: ptr, param1, param2, …) → ret
+    // The env_ptr is always the first argument, ensuring a uniform
+    // calling convention regardless of capture status.
+    //
+    // A closure struct is stored as { ptr fn, ptr env } allocated on the
+    // heap; its address (an opaque ptr) is the lambda value.
     llvm::Value* lowerLambda(const ast::LambdaExpr& lam) {
         const std::vector<sema::Symbol*>* paramSyms = ctx_.lambdaParams(&lam);
 
-        // Build the LLVM parameter type list.
-        std::vector<llvm::Type*> paramTys;
+        // Build user-visible parameter type list.
+        std::vector<llvm::Type*> userParamTys;
         if (paramSyms) {
             for (sema::Symbol* ps : *paramSyms) {
                 auto* par = dynamic_cast<sema::ParameterSymbol*>(ps);
@@ -5224,27 +5235,30 @@ private:
                     if (sema::TypeRef* rt = ctx_.resolvedType(*par->declType))
                         ty = lowerTypeRef(rt);
                 }
-                paramTys.push_back(ty);
+                userParamTys.push_back(ty);
             }
         }
 
         // Pre-determine return type from sema's exprType of the body.
-        llvm::Type* retTy = llvm::Type::getVoidTy(llvm_);
+        llvm::Type* retTy = i32();
         if (lam.exprBody) {
             if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody))
                 retTy = lowerTypeRef(rt);
-            else
-                retTy = i32();  // fallback
         }
 
-        // Create the function.
-        static std::atomic<unsigned> lamCounter{0};
-        std::string lamName = "lam$" + std::to_string(lamCounter.fetch_add(1));
-        auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
-        auto* fn = llvm::Function::Create(
-            fnTy, llvm::Function::InternalLinkage, lamName, module_.get());
+        // Collect outer captured variables (everything in the outer frame
+        // that may be referenced in the body). We include all outer params
+        // and locals conservatively; unused captures are harmless.
+        // Entries: { llvm::Type*, outer_slot_ptr }
+        struct CaptureEntry {
+            llvm::Type*            ty;
+            llvm::AllocaInst*      outerSlot;
+            const sema::Symbol*    sym;   // non-null for param captures
+            const ast::Node*       decl;  // non-null for local captures
+        };
+        std::vector<CaptureEntry> captures;
 
-        // Save/reset emitter state for the nested function body.
+        // Save state (needed for capture slot access and restoration).
         llvm::Function* savedFn = currentFn_;
         llvm::Value* savedThis = currentThis_;
         llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
@@ -5259,6 +5273,42 @@ private:
         std::size_t savedUnwindDepth = unwindScopeDepth_;
         bool savedDiverged = diverged_;
 
+        // Collect outer params as potential captures.
+        for (auto& [sym, slot] : paramSlots_) {
+            CaptureEntry ce;
+            ce.ty = slot->getAllocatedType();
+            ce.outerSlot = slot;
+            ce.sym = sym;
+            ce.decl = nullptr;
+            captures.push_back(ce);
+        }
+        // Collect outer locals as potential captures.
+        for (auto& [decl, slot] : locals_) {
+            CaptureEntry ce;
+            ce.ty = slot->getAllocatedType();
+            ce.outerSlot = slot;
+            ce.sym = nullptr;
+            ce.decl = decl;
+            captures.push_back(ce);
+        }
+
+        // Build env struct type (one slot per capture).
+        std::vector<llvm::Type*> envFieldTys;
+        for (const auto& ce : captures) envFieldTys.push_back(ce.ty);
+
+        // Build the LLVM function type: (ptr env, user_params...) -> ret.
+        std::vector<llvm::Type*> allParamTys;
+        allParamTys.push_back(ptrTy());  // env_ptr (slot 0)
+        for (llvm::Type* t : userParamTys) allParamTys.push_back(t);
+
+        static std::atomic<unsigned> lamCounter{0};
+        unsigned lamId = lamCounter.fetch_add(1);
+        std::string lamName = "lam$" + std::to_string(lamId);
+        auto* fnTy = llvm::FunctionType::get(retTy, allParamTys, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage, lamName, module_.get());
+
+        // --- Emit the lambda function body ---
         currentFn_ = fn;
         currentThis_ = nullptr;
         locals_.clear();
@@ -5274,14 +5324,32 @@ private:
         builder_.SetInsertPoint(
             llvm::BasicBlock::Create(llvm_, "entry", fn));
 
-        // Bind lambda params.
+        // Arg 0 is env_ptr; extract captured vars from it.
+        llvm::Value* envPtr = &*fn->args().begin();
+        // Re-create alloca slots for captured vars, loading from env.
+        if (!captures.empty() && !envFieldTys.empty()) {
+            auto* envTy = llvm::StructType::get(llvm_, envFieldTys);
+            for (std::size_t i = 0; i < captures.size(); ++i) {
+                const CaptureEntry& ce = captures[i];
+                llvm::Value* fieldPtr = builder_.CreateStructGEP(
+                    envTy, envPtr, static_cast<unsigned>(i));
+                llvm::Value* val = builder_.CreateLoad(ce.ty, fieldPtr);
+                auto* slot = entryAlloca(ce.ty);
+                builder_.CreateStore(val, slot);
+                if (ce.sym) paramSlots_[ce.sym] = slot;
+                if (ce.decl) locals_[ce.decl] = slot;
+            }
+        }
+
+        // Bind user lambda params (args 1..N).
         if (paramSyms) {
             std::size_t idx = 0;
-            for (auto& arg : fn->args()) {
+            for (auto it = std::next(fn->args().begin()); it != fn->args().end();
+                 ++it, ++idx) {
                 if (idx >= paramSyms->size()) break;
-                auto* slot = entryAlloca(arg.getType());
-                builder_.CreateStore(&arg, slot);
-                paramSlots_[(*paramSyms)[idx++]] = slot;
+                auto* slot = entryAlloca(it->getType());
+                builder_.CreateStore(&*it, slot);
+                paramSlots_[(*paramSyms)[idx]] = slot;
             }
         }
 
@@ -5298,7 +5366,7 @@ private:
                 builder_.CreateRetVoid();
         }
 
-        // Restore emitter state.
+        // --- Restore emitter state ---
         currentFn_ = savedFn;
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
@@ -5313,7 +5381,37 @@ private:
         diverged_ = savedDiverged;
         if (savedBB) builder_.SetInsertPoint(savedBB);
 
-        return fn;  // function pointer as the lambda value
+        // --- Build the closure struct { fn_ptr, env_ptr } ---
+        // Allocate a heap closure object: { ptr fn, ptr env }.
+        // Size = 2 pointers = 2 * sizeof(ptr).
+        llvm::Value* closureObj = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
+        // Store fn_ptr at offset 0.
+        builder_.CreateStore(fn, closureObj);
+        // Allocate and fill the env struct (if there are captures).
+        llvm::Value* envAlloc = llvm::ConstantPointerNull::get(ptrTy());
+        if (!captures.empty()) {
+            auto* envTy = llvm::StructType::get(llvm_, envFieldTys);
+            llvm::Value* envSize = builder_.CreatePtrToInt(
+                builder_.CreateGEP(envTy, llvm::ConstantPointerNull::get(ptrTy()),
+                                   {builder_.getInt32(1)}),
+                i64());
+            envAlloc = builder_.CreateCall(callocFn(),
+                                           {builder_.getInt64(1), envSize});
+            for (std::size_t i = 0; i < captures.size(); ++i) {
+                const CaptureEntry& ce = captures[i];
+                // Load current value from outer slot.
+                llvm::Value* val = builder_.CreateLoad(ce.ty, ce.outerSlot);
+                llvm::Value* dst = builder_.CreateStructGEP(
+                    envTy, envAlloc, static_cast<unsigned>(i));
+                builder_.CreateStore(val, dst);
+            }
+        }
+        // Store env_ptr at offset sizeof(ptr).
+        llvm::Value* envSlot = builder_.CreateGEP(
+            ptrTy(), closureObj, {builder_.getInt32(1)});
+        builder_.CreateStore(envAlloc, envSlot);
+        return closureObj;
     }
 
     // CG8: `new T(...)` — heap-allocate (zeroed) an instance of T and run
@@ -6689,67 +6787,63 @@ private:
             return builder_.CreateCall(it->second, args);
         }
         // CG60: call through a function-typed parameter or local (lambda
-        // value). The callee expression resolves to a ParameterSymbol or
-        // LocalSymbol whose declType is a function type (Kind::Function).
-        // Lower it by loading the function pointer and calling it indirectly.
+        // value). Lambda values are heap-allocated closure structs
+        // { ptr fn, ptr env }. The function's actual type includes an env_ptr
+        // as first arg: (ptr env, user_params...) -> ret.
+        auto emitClosureCall = [&](llvm::Value* closurePtr,
+                                   const sema::TypeRef* rt) -> llvm::Value* {
+            if (!closurePtr || !rt ||
+                rt->kind != sema::TypeRef::Kind::Function)
+                return nullptr;
+            // Load fn_ptr from closure[0].
+            llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
+            // Load env_ptr from closure[1].
+            llvm::Value* envSlot = builder_.CreateGEP(
+                ptrTy(), closurePtr, {builder_.getInt32(1)});
+            llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot);
+            // Build function type: (ptr env, user_params...) -> ret.
+            llvm::Type* retTy = rt->funcReturn
+                                    ? lowerTypeRef(rt->funcReturn)
+                                    : llvm::Type::getVoidTy(llvm_);
+            std::vector<llvm::Type*> allArgTys;
+            allArgTys.push_back(ptrTy());  // env
+            for (const auto& fp : rt->funcParams)
+                allArgTys.push_back(fp.type ? lowerTypeRef(fp.type) : i32());
+            auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
+            // Build call args.
+            std::vector<llvm::Value*> args;
+            args.push_back(envPtr);  // env_ptr first
+            for (const auto& a : call.args) {
+                if (!a.value) return nullptr;
+                llvm::Value* v = lowerExpr(*a.value);
+                if (!v) return nullptr;
+                args.push_back(v);
+            }
+            if (args.size() != allArgTys.size()) return nullptr;
+            return builder_.CreateCall(fnTy, fnPtr, args);
+        };
         if (auto* par = dynamic_cast<sema::ParameterSymbol*>(calleeSym)) {
             sema::TypeRef* rt = par->declType
                                     ? ctx_.resolvedType(*par->declType)
                                     : nullptr;
             if (rt && rt->kind == sema::TypeRef::Kind::Function) {
-                // Build LLVM function type from the TypeRef.
-                llvm::Type* retTy = rt->funcReturn
-                                        ? lowerTypeRef(rt->funcReturn)
-                                        : llvm::Type::getVoidTy(llvm_);
-                std::vector<llvm::Type*> argTys;
-                for (const auto& fp : rt->funcParams) {
-                    argTys.push_back(fp.type ? lowerTypeRef(fp.type) : i32());
-                }
-                auto* fnTy = llvm::FunctionType::get(retTy, argTys, false);
-                // Load the function pointer from the param slot.
-                llvm::Value* fnPtr = nullptr;
+                llvm::Value* closurePtr = nullptr;
                 auto pit = paramSlots_.find(par);
                 if (pit != paramSlots_.end())
-                    fnPtr = builder_.CreateLoad(ptrTy(), pit->second);
-                if (!fnPtr) return nullptr;
-                // Lower arguments.
-                std::vector<llvm::Value*> args;
-                for (const auto& a : call.args) {
-                    if (!a.value) return nullptr;
-                    llvm::Value* v = lowerExpr(*a.value);
-                    if (!v) return nullptr;
-                    args.push_back(v);
-                }
-                if (args.size() != argTys.size()) return nullptr;
-                return builder_.CreateCall(fnTy, fnPtr, args);
+                    closurePtr = builder_.CreateLoad(ptrTy(), pit->second);
+                return emitClosureCall(closurePtr, rt);
             }
         }
         if (auto* loc = dynamic_cast<sema::LocalSymbol*>(calleeSym)) {
             sema::TypeRef* rt = loc->declType;
             if (rt && rt->kind == sema::TypeRef::Kind::Function) {
-                llvm::Type* retTy = rt->funcReturn
-                                        ? lowerTypeRef(rt->funcReturn)
-                                        : llvm::Type::getVoidTy(llvm_);
-                std::vector<llvm::Type*> argTys;
-                for (const auto& fp : rt->funcParams)
-                    argTys.push_back(fp.type ? lowerTypeRef(fp.type) : i32());
-                auto* fnTy = llvm::FunctionType::get(retTy, argTys, false);
-                llvm::Value* fnPtr = nullptr;
+                llvm::Value* closurePtr = nullptr;
                 if (loc->decl) {
                     auto lit = locals_.find(loc->decl);
                     if (lit != locals_.end())
-                        fnPtr = builder_.CreateLoad(ptrTy(), lit->second);
+                        closurePtr = builder_.CreateLoad(ptrTy(), lit->second);
                 }
-                if (!fnPtr) return nullptr;
-                std::vector<llvm::Value*> args;
-                for (const auto& a : call.args) {
-                    if (!a.value) return nullptr;
-                    llvm::Value* v = lowerExpr(*a.value);
-                    if (!v) return nullptr;
-                    args.push_back(v);
-                }
-                if (args.size() != argTys.size()) return nullptr;
-                return builder_.CreateCall(fnTy, fnPtr, args);
+                return emitClosureCall(closurePtr, rt);
             }
         }
         auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);

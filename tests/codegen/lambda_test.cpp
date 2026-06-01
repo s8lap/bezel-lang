@@ -98,3 +98,54 @@ BEZEL_TEST(codegen_cg60, lambda_passed_twice) {
         "  end Main; "
         "end C;"), 14);
 }
+
+// ── Closures: lambdas that capture outer variables by value ─────────────────
+// Each lambda is stored as a heap-allocated { fn_ptr, env_ptr } struct.
+// The env contains a copy of any outer variables referenced in the body.
+
+BEZEL_TEST(codegen_cg60, closure_captures_param) {
+    // §A.7: lambda captures a method parameter by value.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method MakeAdder(n: int): (int) -> int "
+        "    return (x: int) => x + n; "
+        "  end MakeAdder; "
+        "  public static method Main(): int "
+        "    var add5 := MakeAdder(5); "
+        "    return add5(3); "
+        "  end Main; "
+        "end C;"), 8);
+}
+
+BEZEL_TEST(codegen_cg60, closure_captures_local) {
+    // Capture a local variable by value.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Apply(f: (int) -> int): int "
+        "    return f(10); "
+        "  end Apply; "
+        "  public static method Main(): int "
+        "    var offset := 7; "
+        "    return Apply((x: int) => x + offset); "
+        "  end Main; "
+        "end C;"), 17);
+}
+
+BEZEL_TEST(codegen_cg60, closure_independent_captured_value) {
+    // Two closures from the same factory share the captured value
+    // independently (each closure has its own copy).
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method MakeMul(n: int): (int) -> int "
+        "    return (x: int) => x * n; "
+        "  end MakeMul; "
+        "  public static method Apply(f: (int) -> int, v: int): int "
+        "    return f(v); "
+        "  end Apply; "
+        "  public static method Main(): int "
+        "    var mul3 := MakeMul(3); "
+        "    var mul5 := MakeMul(5); "
+        "    return Apply(mul3, 4) + Apply(mul5, 4); "
+        "  end Main; "
+        "end C;"), 32);
+}
