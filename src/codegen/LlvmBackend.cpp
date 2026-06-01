@@ -1232,6 +1232,122 @@ private:
             return strObj;
         }
 
+        // §9.6-ext: GetField(delim: char, n: int): string
+        // Returns the n-th 0-indexed field when splitting self by delim.
+        // Returns empty string if n is out of range.
+        if (method == "GetField" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* delimArg = lowerExpr(*call.args[0].value);
+            llvm::Value* nArg = lowerExpr(*call.args[1].value);
+            if (!delimArg || !nArg) return nullptr;
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* selfLen = loadStringLen(self);
+            llvm::Value* selfData = loadStringData(self);
+            // Convert delim (char = i32) to i8.
+            llvm::Value* delimByte = builder_.CreateTrunc(delimArg, i8Ty, "gf.delim");
+            // Walk the string counting fields.
+            auto* idxSlot = entryAlloca(i64());  // current scan position
+            auto* fldSlot = entryAlloca(i32());  // current field count
+            auto* staSlot = entryAlloca(i64());  // start of current field
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            builder_.CreateStore(builder_.getInt32(0), fldSlot);
+            builder_.CreateStore(builder_.getInt64(0), staSlot);
+            // Loop: find the n-th field.
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "gf.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "gf.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "gf.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* fld = builder_.CreateLoad(i32(), fldSlot);
+            llvm::Value* inRange = builder_.CreateICmpSLE(idx, selfLen);
+            llvm::Value* notDone = builder_.CreateICmpSLT(fld, nArg);
+            builder_.CreateCondBr(builder_.CreateAnd(inRange, notDone), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+            // Check if we've reached the end OR found the delimiter.
+            llvm::Value* atEnd = builder_.CreateICmpSGE(idxB, selfLen);
+            auto* delimBB  = llvm::BasicBlock::Create(llvm_, "gf.delim", currentFn_);
+            auto* scanBB   = llvm::BasicBlock::Create(llvm_, "gf.scan",  currentFn_);
+            builder_.CreateCondBr(atEnd, delimBB, scanBB);
+            builder_.SetInsertPoint(scanBB);
+            llvm::Value* bp  = builder_.CreateGEP(i8Ty, selfData, idxB);
+            llvm::Value* by  = builder_.CreateLoad(i8Ty, bp);
+            llvm::Value* isDlm = builder_.CreateICmpEQ(by, delimByte);
+            builder_.CreateCondBr(isDlm, delimBB, delimBB);  // always → delimBB
+            // Merged: either we're at end or found delimiter (or just scanning).
+            // Actually, let's restructure: scan forward to next delimiter.
+            // Simpler: use a while-char-loop, exit when delimiter or end.
+            builder_.SetInsertPoint(delimBB);
+            // If at delimiter: advance field count, update start, advance pos.
+            llvm::Value* idxC = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* byC = builder_.CreateSelect(
+                builder_.CreateICmpSGE(idxC, selfLen),
+                llvm::ConstantInt::get(i8Ty, 0),
+                builder_.CreateLoad(i8Ty, builder_.CreateGEP(i8Ty, selfData, idxC)));
+            llvm::Value* atDlm = builder_.CreateICmpEQ(byC, delimByte);
+            llvm::Value* atEnd2 = builder_.CreateICmpSGE(idxC, selfLen);
+            llvm::Value* shouldNext = builder_.CreateOr(atDlm, atEnd2);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "gf.next", currentFn_);
+            auto* stepBB = llvm::BasicBlock::Create(llvm_, "gf.step", currentFn_);
+            builder_.CreateCondBr(shouldNext, nextBB, stepBB);
+            builder_.SetInsertPoint(stepBB);
+            // Just advance position.
+            builder_.CreateStore(builder_.CreateAdd(idxC, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(nextBB);
+            // Advance to next field.
+            llvm::Value* fldC = builder_.CreateLoad(i32(), fldSlot);
+            builder_.CreateStore(builder_.CreateAdd(fldC, builder_.getInt32(1)), fldSlot);
+            // New start = pos+1 (after delimiter). If at end, start stays.
+            llvm::Value* newStart = builder_.CreateSelect(
+                atDlm, builder_.CreateAdd(idxC, builder_.getInt64(1)), idxC);
+            builder_.CreateStore(newStart, staSlot);
+            builder_.CreateStore(newStart, idxSlot);
+            builder_.CreateBr(condBB);
+            // After loop: extract from staSlot to either next delimiter or end.
+            builder_.SetInsertPoint(endBB);
+            llvm::Value* sta = builder_.CreateLoad(i64(), staSlot);
+            // Find end of this field: scan from sta forward to delimiter or end.
+            auto* es = entryAlloca(i64());
+            builder_.CreateStore(sta, es);
+            auto* ecBB = llvm::BasicBlock::Create(llvm_, "gf.ec", currentFn_);
+            auto* ebBB = llvm::BasicBlock::Create(llvm_, "gf.eb", currentFn_);
+            auto* eBB  = llvm::BasicBlock::Create(llvm_, "gf.e",  currentFn_);
+            builder_.CreateBr(ecBB);
+            builder_.SetInsertPoint(ecBB);
+            llvm::Value* ei = builder_.CreateLoad(i64(), es);
+            llvm::Value* eiLt = builder_.CreateICmpSLT(ei, selfLen);
+            builder_.CreateCondBr(eiLt, ebBB, eBB);
+            builder_.SetInsertPoint(ebBB);
+            llvm::Value* eip = builder_.CreateGEP(i8Ty, selfData, ei);
+            llvm::Value* eib = builder_.CreateLoad(i8Ty, eip);
+            llvm::Value* eiDlm = builder_.CreateICmpEQ(eib, delimByte);
+            auto* eincBB = llvm::BasicBlock::Create(llvm_, "gf.einc", currentFn_);
+            builder_.CreateCondBr(eiDlm, eBB, eincBB);
+            builder_.SetInsertPoint(eincBB);
+            llvm::Value* eiL = builder_.CreateLoad(i64(), es);
+            builder_.CreateStore(builder_.CreateAdd(eiL, builder_.getInt64(1)), es);
+            builder_.CreateBr(ecBB);
+            builder_.SetInsertPoint(eBB);
+            llvm::Value* fieldEnd = builder_.CreateLoad(i64(), es);
+            llvm::Value* fieldLen = builder_.CreateSub(fieldEnd, sta);
+            // Create string for the field.
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            llvm::Value* dataSz = builder_.CreateAdd(fieldLen, builder_.getInt64(1));
+            llvm::Value* fData = builder_.CreateCall(mallocFn, {dataSz}, "gf.data");
+            llvm::Value* srcPtr = builder_.CreateGEP(i8Ty, selfData, sta, "gf.src");
+            builder_.CreateCall(memcpyFn, {fData, srcPtr, fieldLen});
+            llvm::Value* nul = builder_.CreateGEP(i8Ty, fData, fieldLen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nul);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "gf.obj");
+            builder_.CreateStore(fData, builder_.CreateStructGEP(stringType(), strObj, 0));
+            builder_.CreateStore(fieldLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+            return strObj;
+        }
+
         return nullptr;  // method not recognised
     }
 
