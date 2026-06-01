@@ -1630,8 +1630,50 @@ private:
             if (auto* b = dynamic_cast<const ast::BoolLiteralExpr*>(e)) {
                 return llvm::ConstantInt::get(ty, b->value ? 1 : 0);
             }
+            // CG27a: string literal initializer for static string fields.
+            if (auto* sl = dynamic_cast<const ast::StringLiteralExpr*>(e)) {
+                // lowerStringLiteral creates globals and returns a GV*.
+                // Since we're in declareStatics (before emitMethod bodies),
+                // the builder's insert point is not set — set it temporarily
+                // to avoid assertion errors in CreateStore etc. The string
+                // literal only creates globals (no instruction emission needed).
+                if (!currentFn_) {
+                    // Create a temporary function context so lowerStringLiteral
+                    // can use builder_ safely (though it doesn't emit instructions).
+                    auto* strGV = lowerStringLiteralConst(sl->text, false);
+                    return strGV;
+                }
+                auto* strGV = lowerStringLiteralConst(sl->text, false);
+                return strGV;
+            }
+            if (auto* vs = dynamic_cast<const ast::VerbatimStringExpr*>(e)) {
+                auto* strGV = lowerStringLiteralConst(vs->text, true);
+                return strGV;
+            }
         }
         return llvm::Constant::getNullValue(ty);
+    }
+
+    // Version of lowerStringLiteral that only creates globals (no builder
+    // instructions), safe to call during declareStatics.
+    llvm::Constant* lowerStringLiteralConst(std::string_view text, bool verbatim) {
+        std::string content = processStringText(text, verbatim);
+        llvm::Constant* dataArr =
+            llvm::ConstantDataArray::getString(llvm_, content, /*AddNull=*/true);
+        unsigned id = stringLiteralIdx_++;
+        auto* dataGV = new llvm::GlobalVariable(
+            *module_, dataArr->getType(), /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, dataArr,
+            ".bz.str.data." + std::to_string(id));
+        dataGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        dataGV->setAlignment(llvm::Align(1));
+        llvm::Constant* lenC = llvm::ConstantInt::get(i64(), content.size());
+        llvm::Constant* strVal = llvm::ConstantStruct::get(stringType(), {dataGV, lenC});
+        auto* strGV = new llvm::GlobalVariable(
+            *module_, stringType(), /*isConstant=*/true,
+            llvm::GlobalValue::PrivateLinkage, strVal,
+            ".bz.str." + std::to_string(id));
+        return strGV;  // Constant pointer to the bz_string struct
     }
 
     // CG12: the backing global of a bare identifier that resolves to a
