@@ -991,9 +991,18 @@ private:
             ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
             return;
         }
-        if (dynamic_cast<const ast::FloatLiteralExpr*>(&e)) {
-            ctx_.setExprType(
-                &e, ctx_.primitiveTypeRef(PrimitiveType::Double));
+        if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(&e)) {
+            // §18.1: the `f`/`F` suffix gives type `float` (f32); `d`/`D`,
+            // `m`/`M`, or no suffix gives `double` (f64) / decimal. Currently
+            // only float and double are codegen-backed.
+            PrimitiveType pt = PrimitiveType::Double;
+            if (!fl->text.empty()) {
+                char last = fl->text.back();
+                if (last == 'f' || last == 'F') pt = PrimitiveType::Float;
+                // `d`/`D` → double (already default); `m`/`M` → decimal
+                // (not yet implemented, leave as double for now).
+            }
+            ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
             return;
         }
         if (dynamic_cast<const ast::CharLiteralExpr*>(&e)) {

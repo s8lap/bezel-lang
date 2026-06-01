@@ -104,3 +104,32 @@ BEZEL_TEST(codegen_cg24, non_nan_inequality_unchanged) {
     BEZEL_EXPECT_EQ(run("var a := 3.0; var b := 4.0; "
                         "return (1 if a <> b else 0);"), 1);
 }
+
+// §18.1: the `f`/`F` suffix gives type `float` (f32); no suffix or `d`/`D`
+// gives `double` (f64). After this fix, float literals with `f` suffix are
+// correctly typed as float (not double) in sema, so they lower to f32 values.
+
+BEZEL_TEST(codegen_cg24, float_suffix_typing) {
+    // 1.5f is f32, not f64.
+    BEZEL_EXPECT_EQ(run("var x := 1.5f; return (1 if x = 1.5f else 0);"), 1);
+}
+
+BEZEL_TEST(codegen_cg24, float_record_equality) {
+    // Record with float fields: equality uses FCmpOEQ on f32 values.
+    BEZEL_EXPECT_EQ(run(
+        "module M; record F(x: float, y: float); "
+        "class C public static method Main(): int "
+        "  var a := new F(1.0f, 2.0f); var b := new F(1.0f, 2.0f); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_cg24, float_record_inequality) {
+    // Two float records with different y field compare unequal.
+    BEZEL_EXPECT_EQ(run(
+        "module M; record F(x: float, y: float); "
+        "class C public static method Main(): int "
+        "  var a := new F(1.0f, 2.0f); var b := new F(1.0f, 2.5f); "
+        "  return (1 if a <> b else 0); "
+        "end Main; end C;"), 1);
+}
