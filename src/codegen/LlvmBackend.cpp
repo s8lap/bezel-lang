@@ -805,6 +805,56 @@ private:
                 llvm::ConstantInt::getSigned(i32(), -1), idx, "iof.result");
         }
 
+        // §9.6: LastIndexOf(sub: string): int — last occurrence, -1 if not found.
+        // Implemented by scanning from the end using reverse memmem search loop.
+        if (method == "LastIndexOf") {
+            llvm::Value* sub = getStrArg(0);
+            if (!sub) return nullptr;
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* selfLen  = loadStringLen(self);
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* subLen   = loadStringLen(sub);
+            llvm::Value* subData  = loadStringData(sub);
+            auto* memmemFn = module_->getFunction("memmem");
+            if (!memmemFn) {
+                auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
+                memmemFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
+            }
+            // Scan from offset 0..selfLen-subLen, track last match.
+            auto* lastSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(-1), lastSlot);
+            auto* posSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), posSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "liof.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "liof.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "liof.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* pos = builder_.CreateLoad(i64(), posSlot);
+            llvm::Value* rem = builder_.CreateSub(selfLen, pos, "liof.rem");
+            llvm::Value* hasSub = builder_.CreateICmpSGE(rem, subLen, "liof.hasub");
+            builder_.CreateCondBr(hasSub, bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* posB = builder_.CreateLoad(i64(), posSlot);
+            llvm::Value* remB = builder_.CreateSub(selfLen, posB, "liof.remb");
+            llvm::Value* dataOff = builder_.CreateGEP(i8Ty, selfData, posB, "liof.off");
+            llvm::Value* found = builder_.CreateCall(memmemFn, {dataOff, remB, subData, subLen}, "liof.found");
+            auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+            llvm::Value* notFound = builder_.CreateICmpEQ(found, nullPtr);
+            auto* updateBB = llvm::BasicBlock::Create(llvm_, "liof.upd", currentFn_);
+            builder_.CreateCondBr(notFound, endBB, updateBB);
+            builder_.SetInsertPoint(updateBB);
+            llvm::Value* matchOff = builder_.CreatePtrDiff(i8Ty, found, selfData, "liof.moff");
+            builder_.CreateStore(matchOff, lastSlot);
+            // Advance past this match.
+            llvm::Value* newPos = builder_.CreateAdd(matchOff, subLen, "liof.npos");
+            builder_.CreateStore(newPos, posSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            llvm::Value* lastI64 = builder_.CreateLoad(i64(), lastSlot);
+            return builder_.CreateTrunc(lastI64, i32(), "liof.result");
+        }
+
         // §9.6: Substring(start) → new string from start to end.
         // §9.6: Substring(start, length) → new string of given length.
         if (method == "Substring") {
