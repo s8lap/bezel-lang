@@ -208,3 +208,43 @@ BEZEL_TEST(integration, grade_classifier_with_range_patterns) {
         "  end Main; "
         "end C;"), 10);
 }
+
+BEZEL_TEST(integration, for_in_array_with_records) {
+    // for-in over array of records — iterates element values.
+    // [P(1,2), P(3,4), P(5,6)] sums to (1+2)+(3+4)+(5+6) = 21.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var a: [3]P; "
+        "  a[0] := new P(1, 2); a[1] := new P(3, 4); a[2] := new P(5, 6); "
+        "  var s := 0; for var p in a do s := s + p.x + p.y; end; "
+        "  return s; "
+        "end Main; end C;"), 21);
+}
+
+BEZEL_TEST(integration, in_range_operator_filter) {
+    // `x in lo..hi` as a filter in a for-in-array loop.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var a: [10]int; "
+        "  for var i in 0..9 do a[i] := i * 10; end; "
+        "  var cnt := 0; "
+        "  for var x in a do if x in 20..60 then cnt := cnt + 1; end; end; "
+        "  return cnt; "
+        "end Main; end C;"), 5);  // 20,30,40,50,60 = 5 elements
+}
+
+BEZEL_TEST(integration, range_case_pattern_classification) {
+    // Range patterns in case expression over values computed in for loop.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var a: [5]int; "
+        "  a[0] := 95; a[1] := 85; a[2] := 75; a[3] := 65; a[4] := 55; "
+        "  var s := 0; "
+        "  for var x in a do "
+        "    var g := case x 90..100 => 4, 80..89 => 3, 70..79 => 2, 60..69 => 1, _ => 0 end; "
+        "    s := s + g; "
+        "  end; "
+        "  return s; "
+        "end Main; end C;"), 10);  // 4+3+2+1+0 = 10 (fits in exit code)
+}
