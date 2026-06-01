@@ -6342,7 +6342,41 @@ private:
                 return builder_.CreateAnd(geL, leH);
             }
         }
-        return nullptr;  // binding/type/null/destructure — deferred
+        // §19: BindingPattern `var x` or `var x: T` (§3016).
+        // Unconstrained `var x` always matches and binds the scrutinee's value
+        // to `x` within the arm body. The binding is a borrow (non-destructive).
+        // `var x: T` with a type annotation is a type-test + binding.
+        if (auto* bp = dynamic_cast<const ast::BindingPattern*>(pat)) {
+            // Look up the LocalSymbol for this binding from sema.
+            // Sema symbolizes binding-pattern names in the arm scope.
+            // We need to make the scrutinee value available as `bp->name`.
+            // For now, store into the arm's local symbol slot if we can find it.
+            // The alloca for the binding variable is created in lowerCaseExpr/Stmt
+            // by looking up the arm's symbols — but currently we don't thread that
+            // context here. Simplest: always match (true) and let the arm body
+            // resolve the name directly through the scrutinee slot.
+            // TODO: wire binding symbol → alloca and store scrut into it.
+            // For the type-constrained form (`var x: T`), emit a type test:
+            if (bp->type) {
+                // Type-test pattern: matches if scrutinee is-a T.
+                if (auto* rt = ctx_.resolvedType(*bp->type)) {
+                    if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
+                        auto dit = descArray_.find(rt->declaration);
+                        if (dit != descArray_.end())
+                            return emitIsA(scrut, dit->second);
+                    }
+                }
+                return nullptr;  // type not found — deferred
+            }
+            // Unconstrained `var x`: always matches.
+            return builder_.getInt1(true);
+        }
+        // §19: NullPattern — matches null.
+        if (dynamic_cast<const ast::NullPattern*>(pat)) {
+            return builder_.CreateICmpEQ(
+                scrut, llvm::ConstantPointerNull::get(ptrTy()), "null.match");
+        }
+        return nullptr;  // destructure/positional — deferred
     }
 
     // CG28: equality of two same-typed scalars (int or FP).
