@@ -1652,7 +1652,8 @@ private:
                         if (ma.member == "Substring" ||
                             ma.member == "Trim" || ma.member == "TrimStart" ||
                             ma.member == "TrimEnd" || ma.member == "ToLower" ||
-                            ma.member == "ToUpper" || ma.member == "Replace") {
+                            ma.member == "ToUpper" || ma.member == "Replace" ||
+                            ma.member == "PadLeft" || ma.member == "PadRight") {
                             ctx_.setExprType(
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                             return;
