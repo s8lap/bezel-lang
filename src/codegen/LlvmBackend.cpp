@@ -1264,6 +1264,44 @@ private:
 
         // §9.6: Contains(sub: string): bool — uses libc memmem (POSIX).
         if (method == "Contains") {
+            // §9.6: Contains(char) overload — scan code-point by code-point.
+            if (call.args.size() == 1 && call.args[0].value) {
+                auto* argTy = ctx_.exprType(*call.args[0].value);
+                if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+                    argTy->primitive == sema::PrimitiveType::Char) {
+                    llvm::Value* needle = lowerExpr(*call.args[0].value);
+                    if (!needle) return nullptr;
+                    llvm::Value* len = loadStringLen(self);
+                    auto* idxS = entryAlloca(i64());
+                    builder_.CreateStore(builder_.getInt64(0), idxS);
+                    auto* loopBB = llvm::BasicBlock::Create(llvm_, "cic.loop", currentFn_);
+                    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cic.body", currentFn_);
+                    auto* foundBB = llvm::BasicBlock::Create(llvm_, "cic.found", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "cic.end",  currentFn_);
+                    auto* entBB  = builder_.GetInsertBlock();
+                    builder_.CreateBr(loopBB);
+                    builder_.SetInsertPoint(loopBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
+                    builder_.CreateCondBr(
+                        builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* cp = loadCodePoint(self, idx);
+                    auto* incBB = llvm::BasicBlock::Create(llvm_, "cic.inc", currentFn_);
+                    builder_.CreateCondBr(
+                        builder_.CreateICmpEQ(cp, needle), foundBB, incBB);
+                    builder_.SetInsertPoint(incBB);
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idx, builder_.getInt64(1)), idxS);
+                    builder_.CreateBr(loopBB);
+                    builder_.SetInsertPoint(foundBB);
+                    builder_.CreateBr(endBB);
+                    builder_.SetInsertPoint(endBB);
+                    auto* phi = builder_.CreatePHI(i1(), 3);
+                    phi->addIncoming(builder_.getFalse(), loopBB);
+                    phi->addIncoming(builder_.getTrue(), foundBB);
+                    return phi;
+                }
+            }
             llvm::Value* sub = getStrArg(0);
             if (!sub) return nullptr;
             // Declare memmem: void* memmem(void*, size_t, void*, size_t)
