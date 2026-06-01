@@ -1486,7 +1486,25 @@ private:
                 }
             }
         }
-        if (!targetType) return;
+        if (!targetType) {
+            // Guard: string member access compiles but silently returns 0
+            // because the string runtime is not yet implemented. Emit a
+            // clean diagnostic so programmers get a clear error rather
+            // than a misleading 0. (Issue #251.)
+            if (ma.target) {
+                auto* tt = ctx_.exprType(*ma.target);
+                if (tt && tt->kind == TypeRef::Kind::Primitive &&
+                    tt->primitive == PrimitiveType::String) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("member access on `string` (`.") +
+                        std::string(ma.member) +
+                        "`) is not yet supported in codegen — the string "
+                        "runtime is a future milestone");
+                }
+            }
+            return;
+        }
         // Lookup member by name. Slice S5: walks own members first,
         // then transitively each base type — first match wins (no
         // ambiguity resolution between base interfaces yet).
