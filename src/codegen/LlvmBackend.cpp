@@ -1043,6 +1043,45 @@ private:
 
         // §9.6: IndexOf(sub: string): int — first occurrence, -1 if not found.
         if (method == "IndexOf") {
+            // Check if arg is a char (not a string) — linear scan for code point.
+            if (call.args.size() == 1 && call.args[0].value) {
+                auto* argTy = ctx_.exprType(*call.args[0].value);
+                if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+                    argTy->primitive == sema::PrimitiveType::Char) {
+                    llvm::Value* needle = lowerExpr(*call.args[0].value);
+                    if (!needle) return nullptr;
+                    llvm::Value* len = loadStringLen(self);
+                    auto* idxS = entryAlloca(i64());
+                    builder_.CreateStore(builder_.getInt64(0), idxS);
+                    auto* cBB = llvm::BasicBlock::Create(llvm_, "ioc.c", currentFn_);
+                    auto* bBB = llvm::BasicBlock::Create(llvm_, "ioc.b", currentFn_);
+                    auto* sBB = llvm::BasicBlock::Create(llvm_, "ioc.s", currentFn_);
+                    auto* eBB = llvm::BasicBlock::Create(llvm_, "ioc.e", currentFn_);
+                    builder_.CreateBr(cBB);
+                    builder_.SetInsertPoint(cBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bBB, sBB);
+                    builder_.SetInsertPoint(bBB);
+                    llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
+                    llvm::Value* cp = loadCodePoint(self, idxB);
+                    llvm::Value* found = builder_.CreateICmpEQ(cp, needle);
+                    auto* incBB = llvm::BasicBlock::Create(llvm_, "ioc.inc", currentFn_);
+                    builder_.CreateCondBr(found, eBB, incBB);
+                    builder_.SetInsertPoint(incBB);
+                    builder_.CreateStore(builder_.CreateAdd(idxB, builder_.getInt64(1)), idxS);
+                    builder_.CreateBr(cBB);
+                    builder_.SetInsertPoint(sBB);  // not found
+                    builder_.CreateBr(eBB);
+                    builder_.SetInsertPoint(eBB);
+                    llvm::Value* fi = builder_.CreateLoad(i64(), idxS);
+                    // If we exited because idx >= len (sBB), result = -1
+                    llvm::Value* exhausted = builder_.CreateICmpSGE(fi, len, "ioc.exhausted");
+                    llvm::Value* result = builder_.CreateSelect(exhausted,
+                        llvm::ConstantInt::getSigned(i32(), -1),
+                        builder_.CreateTrunc(fi, i32()), "ioc.result");
+                    return result;
+                }
+            }
             llvm::Value* sub = getStrArg(0);
             if (!sub) return nullptr;
             auto* memmemFn = module_->getFunction("memmem");
