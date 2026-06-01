@@ -1532,10 +1532,10 @@ private:
             return newStr;
         }
 
-        // §9.6: PadLeft(totalWidth)/PadRight(totalWidth): string
-        // Pads with spaces on the left/right to reach totalWidth.
+        // §9.6: PadLeft(totalWidth[, padChar])/PadRight(totalWidth[, padChar]): string
+        // Pads with the given character (default: space) to reach totalWidth.
         if ((method == "PadLeft" || method == "PadRight") &&
-            call.args.size() == 1 && call.args[0].value) {
+            !call.args.empty() && call.args[0].value) {
             llvm::Value* widthArg = lowerExpr(*call.args[0].value);
             if (!widthArg) return nullptr;
             auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
@@ -1559,8 +1559,15 @@ private:
             }
             llvm::Value* dataSz = builder_.CreateAdd(width64, builder_.getInt64(1));
             llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "pad.data");
-            // Fill with spaces.
-            builder_.CreateCall(memsetFn, {newData, builder_.getInt32(' '), width64});
+            // Get the pad character (default: space, or 2nd arg if provided).
+            llvm::Value* padCharI32 = builder_.getInt32(' ');
+            if (call.args.size() >= 2 && call.args[1].value) {
+                llvm::Value* pc = lowerExpr(*call.args[1].value);
+                if (pc && pc->getType()->isIntegerTy(32)) padCharI32 = pc;
+                else if (pc) padCharI32 = builder_.CreateSExt(pc, i32());
+            }
+            // Fill with pad character.
+            builder_.CreateCall(memsetFn, {newData, padCharI32, width64});
             if (method == "PadLeft") {
                 // Self goes after the spaces.
                 llvm::Value* dst = builder_.CreateGEP(i8Ty, newData, padLen);
