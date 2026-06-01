@@ -966,6 +966,83 @@ private:
             return lowerExpr(*call.args[idx].value);
         };
 
+        // §9.6: Equals(other: string): bool — content equality (same as `=`).
+        // Equals(other, ignoreCase: bool): bool — optional case-insensitive.
+        if (method == "Equals" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* other = getStrArg(0);
+            if (!other) return nullptr;
+            if (call.args.size() == 1) {
+                return emitStringEq(self, other);
+            }
+            // 2-arg form: Equals(other, ignoreCase).
+            // For ignoreCase=true: compare ToLower versions.
+            llvm::Value* ignoreCase = lowerExpr(*call.args[1].value);
+            if (!ignoreCase) return emitStringEq(self, other);
+            // Fast path: ignoreCase=false → plain equality.
+            auto* icBB = llvm::BasicBlock::Create(llvm_, "eq.ic", currentFn_);
+            auto* planBB = llvm::BasicBlock::Create(llvm_, "eq.pl", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "eq.end", currentFn_);
+            auto* entBB  = builder_.GetInsertBlock();
+            builder_.CreateCondBr(ignoreCase, icBB, planBB);
+            builder_.SetInsertPoint(planBB);
+            llvm::Value* plainEq = emitStringEq(self, other);
+            auto* planEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(icBB);
+            // ToLower both, then compare.
+            auto emitToLower = [&](llvm::Value* s) -> llvm::Value* {
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                auto* tolowerFn = module_->getFunction("tolower");
+                if (!tolowerFn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                    tolowerFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "tolower", module_.get());
+                }
+                llvm::Value* slen = loadStringLen(s);
+                llvm::Value* sdata = loadStringData(s);
+                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                llvm::Value* dsz = builder_.CreateAdd(slen, builder_.getInt64(1));
+                llvm::Value* nd = builder_.CreateCall(mallocFn, {dsz});
+                auto* idxS = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxS);
+                auto* cBB2 = llvm::BasicBlock::Create(llvm_, "eq.lc", currentFn_);
+                auto* bBB2 = llvm::BasicBlock::Create(llvm_, "eq.lb", currentFn_);
+                auto* eBB2 = llvm::BasicBlock::Create(llvm_, "eq.le", currentFn_);
+                builder_.CreateBr(cBB2);
+                builder_.SetInsertPoint(cBB2);
+                llvm::Value* si = builder_.CreateLoad(i64(), idxS);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(si, slen), bBB2, eBB2);
+                builder_.SetInsertPoint(bBB2);
+                llvm::Value* siB = builder_.CreateLoad(i64(), idxS);
+                llvm::Value* cp = loadCodePoint(s, siB);
+                llvm::Value* lc = builder_.CreateCall(tolowerFn, {cp});
+                llvm::Value* off = builder_.CreateMul(siB, builder_.getInt64(1));  // width=1
+                llvm::Value* dp = builder_.CreateGEP(i8Ty, nd, off);
+                builder_.CreateStore(builder_.CreateTrunc(lc, i8Ty), dp);
+                builder_.CreateStore(builder_.CreateAdd(siB, builder_.getInt64(1)), idxS);
+                builder_.CreateBr(cBB2);
+                builder_.SetInsertPoint(eBB2);
+                llvm::Value* np = builder_.CreateGEP(i8Ty, nd, slen);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np);
+                uint64_t sb = module_->getDataLayout().getTypeAllocSize(stringType());
+                llvm::Value* so = builder_.CreateCall(mallocFn, {builder_.getInt64(sb)});
+                builder_.CreateStore(nd, builder_.CreateStructGEP(stringType(), so, 0));
+                builder_.CreateStore(slen, builder_.CreateStructGEP(stringType(), so, 1));
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                    builder_.CreateStructGEP(stringType(), so, 2));
+                return so;
+            };
+            llvm::Value* selfLc  = emitToLower(self);
+            llvm::Value* otherLc = emitToLower(other);
+            llvm::Value* icEq = emitStringEq(selfLc, otherLc);
+            auto* icEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "eq.result");
+            phi->addIncoming(plainEq, planEnd);
+            phi->addIncoming(icEq, icEnd);
+            return phi;
+        }
+
         // §9.6: CompareTo(other: string): int — ordinal lexicographic comparison.
         // Returns negative / 0 / positive (same as emitStringOrdCmp).
         if (method == "CompareTo" && call.args.size() == 1 && call.args[0].value) {

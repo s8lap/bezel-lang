@@ -1678,7 +1678,8 @@ private:
                         // CG27f: stdlib §9.6 string methods — result types.
                         if (ma.member == "Contains" ||
                             ma.member == "StartsWith" ||
-                            ma.member == "EndsWith") {
+                            ma.member == "EndsWith" ||
+                            ma.member == "Equals") {
                             ctx_.setExprType(
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                             return;
