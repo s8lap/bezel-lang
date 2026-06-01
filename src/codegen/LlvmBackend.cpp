@@ -2254,16 +2254,31 @@ private:
         return false;  // control may always exit the loop
     }
 
-    // CG51 (§16.5): lower `for var i in lo..hi do … end` over a closed,
-    // step-less range literal to a counted loop. Returns false when the
-    // iterable is not a closed range literal (open-ended / with step /
-    // non-range iterables are deferred).
+    // CG51 (§16.5) + CG51b (§16.4): lower `for var i in lo..hi [step k] do … end`
+    // over a closed range literal to a counted loop. Returns false when the
+    // iterable is not a closed range literal (open-ended / non-range deferred).
+    // §16.4: `step k` supports positive (ascending) and constant negative
+    // (descending) strides. A non-constant or zero step falls back to the
+    // not-yet-implemented diagnostic.
     bool lowerRangeFor(const ast::ForStmt& fs) {
         auto* range = dynamic_cast<const ast::RangeExpr*>(fs.iterable.get());
-        if (!range || !range->lo || !range->hi || range->step) return false;
+        if (!range || !range->lo || !range->hi) return false;
         llvm::Value* lo = lowerExpr(*range->lo);
         llvm::Value* hi = lowerExpr(*range->hi);
         if (!lo || !hi) return false;
+
+        // §16.4: resolve the step (default = 1; negative steps descend).
+        llvm::Value* stepVal = llvm::ConstantInt::get(lo->getType(), 1);
+        bool descending = false;
+        if (range->step) {
+            llvm::Value* s = lowerExpr(*range->step);
+            if (!s) return false;
+            auto* cs = llvm::dyn_cast<llvm::ConstantInt>(s);
+            if (!cs || cs->isZero()) return false;  // non-const / zero: defer
+            stepVal = cs;
+            descending = cs->getValue().isNegative();
+        }
+
         llvm::AllocaInst* slot = entryAlloca(lo->getType());
         builder_.CreateStore(lo, slot);
         // Anchor on the ForStmt node — sema gave `lsym->decl = fs` so that
@@ -2276,12 +2291,21 @@ private:
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "for.end",  currentFn_);
         builder_.CreateBr(condBB);
 
-        // cond: `..` (inclusive) tests i <= hi; `..<` (half-open) tests i < hi.
+        // cond: direction-aware bound check.
+        // Ascending: i <= hi (inclusive `..`) or i < hi (half-open `..<`).
+        // Descending: i >= hi (inclusive `..`) or i > hi (half-open `..<`).
         builder_.SetInsertPoint(condBB);
         llvm::Value* cur = builder_.CreateLoad(slot->getAllocatedType(), slot);
-        llvm::Value* cond = range->inclusive
-                                ? builder_.CreateICmpSLE(cur, hi)
-                                : builder_.CreateICmpSLT(cur, hi);
+        llvm::Value* cond;
+        if (descending) {
+            cond = range->inclusive
+                       ? builder_.CreateICmpSGE(cur, hi)
+                       : builder_.CreateICmpSGT(cur, hi);
+        } else {
+            cond = range->inclusive
+                       ? builder_.CreateICmpSLE(cur, hi)
+                       : builder_.CreateICmpSLT(cur, hi);
+        }
         builder_.CreateCondBr(cond, bodyBB, endBB);
 
         // body: `continue` targets incBB, `break` targets endBB.
@@ -2291,11 +2315,10 @@ private:
         loopStack_.pop_back();
         if (!term) builder_.CreateBr(incBB);
 
-        // inc: i := i + 1.
+        // inc: i := i + step.
         builder_.SetInsertPoint(incBB);
         llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
-        llvm::Value* next = builder_.CreateAdd(
-            v, llvm::ConstantInt::get(v->getType(), 1));
+        llvm::Value* next = builder_.CreateAdd(v, stepVal);
         builder_.CreateStore(next, slot);
         builder_.CreateBr(condBB);
 
