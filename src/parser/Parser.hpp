@@ -159,6 +159,9 @@ private:
     std::unique_ptr<ast::Expr> parsePrimaryExpressionImpl();
     std::unique_ptr<ast::Expr> parsePostfix(std::unique_ptr<ast::Expr> head);
     std::unique_ptr<ast::QualifiedName> parseQualifiedName();
+    // §18.5: split an interpolated string token into alternating literal
+    // and expression parts. Fills `e.parts` in place.
+    void splitInterpolation(ast::InterpolatedStringExpr& e);
 
     Lexer& lexer_;
     DiagnosticEngine& diagnostics_;

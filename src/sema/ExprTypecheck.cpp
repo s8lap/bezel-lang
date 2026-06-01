@@ -1010,8 +1010,16 @@ private:
             return;
         }
         if (dynamic_cast<const ast::StringLiteralExpr*>(&e) ||
-            dynamic_cast<const ast::VerbatimStringExpr*>(&e) ||
-            dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+            dynamic_cast<const ast::VerbatimStringExpr*>(&e)) {
+            ctx_.setExprType(
+                &e, ctx_.primitiveTypeRef(PrimitiveType::String));
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+            // §18.5: visit embedded expression parts BEFORE returning, so
+            // their identifiers resolve and their types are set for codegen.
+            for (const auto& part : is->parts)
+                if (part.expr) visitExpr(*part.expr);
             ctx_.setExprType(
                 &e, ctx_.primitiveTypeRef(PrimitiveType::String));
             return;
