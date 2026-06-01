@@ -1827,10 +1827,11 @@ private:
                     auto setDbl = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double)); };
                     auto setBool = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool)); };
                     auto setStr = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String)); };
-                    if (m=="ToInt32"||m=="Abs"||m=="Sign"||m=="Truncate") setInt();
+                    if (m=="ToInt32"||m=="Abs"||m=="Sign") setInt();
                     else if (m=="ToInt64") setLong();
                     else if (m=="ToDouble"||m=="Sqrt"||m=="Pow"||m=="Log"||m=="Log2"||m=="Log10"||
-                             m=="Ceiling"||m=="Floor"||m=="Round"||m=="PI"||m=="E"||
+                             m=="Ceiling"||m=="Floor"||m=="Round"||m=="Truncate"||
+                             m=="PI"||m=="E"||
                              m=="Fmod"||m=="IEEERemainder"||m=="Sin"||m=="Cos"||m=="Tan"||
                              m=="Asin"||m=="Acos"||m=="Atan"||m=="Atan2"||m=="Exp"||m=="Hypot"||
                              m=="Sinh"||m=="Cosh"||m=="Tanh") setDbl();
