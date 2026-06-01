@@ -7359,6 +7359,20 @@ private:
                 return emitClosureCall(closurePtr, rt);
             }
         }
+        // CG60: call through a function-typed field or auto-property —
+        // `obj._callback()` where `_callback: () -> int`. The FieldSymbol has
+        // a declared type (from the FieldDecl); if it's a Function TypeRef,
+        // lower the field access as a closure pointer and dispatch.
+        if (auto* fs = dynamic_cast<sema::FieldSymbol*>(calleeSym)) {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (fd && fd->type) {
+                sema::TypeRef* rt = ctx_.resolvedType(*fd->type);
+                if (rt && rt->kind == sema::TypeRef::Kind::Function) {
+                    llvm::Value* closurePtr = lowerExpr(*call.callee);
+                    return emitClosureCall(closurePtr, rt);
+                }
+            }
+        }
         // CG60: call through an indexed array element of function type —
         // `handlers[i]()` where handlers: [N](T) -> R. The IndexExpr has
         // no resolved symbol (calleeSym = null), so we lower the IndexExpr
