@@ -838,6 +838,151 @@ private:
             return newStr;
         }
 
+        // §9.6: ToUpper/ToLower — ASCII-only case conversion via toupper/tolower.
+        if (method == "ToUpper" || method == "ToLower") {
+            if (!call.args.empty()) return nullptr;  // no extra args
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* len = loadStringLen(self);
+            llvm::Value* data = loadStringData(self);
+            // Declare toupper / tolower: int fn(int)
+            const char* fnName = method == "ToUpper" ? "toupper" : "tolower";
+            auto* caseFn = module_->getFunction(fnName);
+            if (!caseFn) {
+                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                caseFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fnName, module_.get());
+            }
+            // Allocate new buffer.
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            llvm::Value* bufSz = builder_.CreateAdd(len, builder_.getInt64(1));
+            llvm::Value* newData = builder_.CreateCall(mallocFn, {bufSz}, "tc.data");
+            // Loop: for i in 0..len, newData[i] = fn(data[i])
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "tc.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "tc.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "tc.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* bytePtr = builder_.CreateGEP(i8Ty, data, idxB);
+            llvm::Value* byte = builder_.CreateLoad(i8Ty, bytePtr);
+            llvm::Value* asI32 = builder_.CreateZExt(byte, i32());
+            llvm::Value* converted = builder_.CreateCall(caseFn, {asI32});
+            llvm::Value* asByte = builder_.CreateTrunc(converted, i8Ty);
+            llvm::Value* dstPtr = builder_.CreateGEP(i8Ty, newData, idxB);
+            builder_.CreateStore(asByte, dstPtr);
+            llvm::Value* next = builder_.CreateAdd(idxB, builder_.getInt64(1));
+            builder_.CreateStore(next, idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            // Null-terminate.
+            llvm::Value* nullPtr = builder_.CreateGEP(i8Ty, newData, len);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nullPtr);
+            // Build result string.
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "tc.obj");
+            builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
+            builder_.CreateStore(len, builder_.CreateStructGEP(stringType(), newStr, 1));
+            return newStr;
+        }
+
+        // §9.6: Trim/TrimStart/TrimEnd — remove leading/trailing ASCII whitespace.
+        if (method == "Trim" || method == "TrimStart" || method == "TrimEnd") {
+            if (!call.args.empty()) return nullptr;
+            // Implement via stripping bytes that match isspace.
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* len = loadStringLen(self);
+            llvm::Value* data = loadStringData(self);
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            // Declare isspace: int isspace(int)
+            auto* isspaceFn = module_->getFunction("isspace");
+            if (!isspaceFn) {
+                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                isspaceFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "isspace", module_.get());
+            }
+            // Find start and end indices.
+            auto startSlot = entryAlloca(i64());
+            auto endSlot   = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), startSlot);
+            builder_.CreateStore(len, endSlot);
+            // Simple approach: use memmove-based trimming with loop.
+            // For brevity, reuse Substring logic after computing new bounds.
+            llvm::Value* startV = builder_.getInt64(0);
+            llvm::Value* endV   = len;
+            // Skip leading whitespace (for Trim and TrimStart).
+            if (method == "Trim" || method == "TrimStart") {
+                auto* stBB  = llvm::BasicBlock::Create(llvm_, "trim.s.cond", currentFn_);
+                auto* stBdy = llvm::BasicBlock::Create(llvm_, "trim.s.body", currentFn_);
+                auto* stEnd = llvm::BasicBlock::Create(llvm_, "trim.s.end",  currentFn_);
+                builder_.CreateStore(startV, startSlot);
+                builder_.CreateBr(stBB);
+                builder_.SetInsertPoint(stBB);
+                llvm::Value* si = builder_.CreateLoad(i64(), startSlot);
+                llvm::Value* sLt = builder_.CreateICmpSLT(si, endV);
+                builder_.CreateCondBr(sLt, stBdy, stEnd);
+                builder_.SetInsertPoint(stBdy);
+                llvm::Value* siB = builder_.CreateLoad(i64(), startSlot);
+                llvm::Value* bp  = builder_.CreateGEP(i8Ty, data, siB);
+                llvm::Value* by  = builder_.CreateLoad(i8Ty, bp);
+                llvm::Value* byI = builder_.CreateZExt(by, i32());
+                llvm::Value* isSp = builder_.CreateCall(isspaceFn, {byI});
+                llvm::Value* isSpBool = builder_.CreateICmpNE(isSp, builder_.getInt32(0));
+                auto* nextSBB = llvm::BasicBlock::Create(llvm_, "trim.s.next", currentFn_);
+                builder_.CreateCondBr(isSpBool, nextSBB, stEnd);
+                builder_.SetInsertPoint(nextSBB);
+                llvm::Value* siN = builder_.CreateLoad(i64(), startSlot);
+                builder_.CreateStore(builder_.CreateAdd(siN, builder_.getInt64(1)), startSlot);
+                builder_.CreateBr(stBB);
+                builder_.SetInsertPoint(stEnd);
+                startV = builder_.CreateLoad(i64(), startSlot);
+            }
+            // Skip trailing whitespace (for Trim and TrimEnd).
+            if (method == "Trim" || method == "TrimEnd") {
+                builder_.CreateStore(len, endSlot);
+                auto* etBB  = llvm::BasicBlock::Create(llvm_, "trim.e.cond", currentFn_);
+                auto* etBdy = llvm::BasicBlock::Create(llvm_, "trim.e.body", currentFn_);
+                auto* etEnd = llvm::BasicBlock::Create(llvm_, "trim.e.end",  currentFn_);
+                builder_.CreateBr(etBB);
+                builder_.SetInsertPoint(etBB);
+                llvm::Value* ei = builder_.CreateLoad(i64(), endSlot);
+                llvm::Value* eGt = builder_.CreateICmpSGT(ei, startV);
+                builder_.CreateCondBr(eGt, etBdy, etEnd);
+                builder_.SetInsertPoint(etBdy);
+                llvm::Value* eiB = builder_.CreateLoad(i64(), endSlot);
+                llvm::Value* prev = builder_.CreateSub(eiB, builder_.getInt64(1));
+                llvm::Value* bp  = builder_.CreateGEP(i8Ty, data, prev);
+                llvm::Value* by  = builder_.CreateLoad(i8Ty, bp);
+                llvm::Value* byI = builder_.CreateZExt(by, i32());
+                llvm::Value* isSp = builder_.CreateCall(isspaceFn, {byI});
+                llvm::Value* isSpBool = builder_.CreateICmpNE(isSp, builder_.getInt32(0));
+                auto* nextEBB = llvm::BasicBlock::Create(llvm_, "trim.e.next", currentFn_);
+                builder_.CreateCondBr(isSpBool, nextEBB, etEnd);
+                builder_.SetInsertPoint(nextEBB);
+                llvm::Value* eiN = builder_.CreateLoad(i64(), endSlot);
+                builder_.CreateStore(builder_.CreateSub(eiN, builder_.getInt64(1)), endSlot);
+                builder_.CreateBr(etBB);
+                builder_.SetInsertPoint(etEnd);
+                endV = builder_.CreateLoad(i64(), endSlot);
+            }
+            // Build trimmed string.
+            llvm::Value* trimLen = builder_.CreateSub(endV, startV);
+            llvm::Value* dataSz = builder_.CreateAdd(trimLen, builder_.getInt64(1));
+            llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "trim.data");
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            llvm::Value* srcPtr = builder_.CreateGEP(i8Ty, data, startV);
+            builder_.CreateCall(memcpyFn, {newData, srcPtr, trimLen});
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, trimLen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "trim.obj");
+            builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
+            builder_.CreateStore(trimLen, builder_.CreateStructGEP(stringType(), newStr, 1));
+            return newStr;
+        }
+
         return nullptr;  // method not recognised
     }
 
