@@ -2007,6 +2007,14 @@ private:
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
             return lowerWhile(*ws);
         }
+        if (auto* fors = dynamic_cast<const ast::ForStmt*>(&s)) {
+            if (lowerRangeFor(*fors)) return false;
+            // Non-range or open-ended iterables are not yet lowered.
+            ctx_.diagnostics().report(
+                Severity::Error, s.span.begin,
+                "not yet implemented: codegen for this for statement");
+            return false;
+        }
         // CG11: break / continue jump to the innermost loop's exit /
         // condition block. CG13: they first dispose the loop body's (and
         // any nested) `using var`s. Both terminate the current block.
@@ -2244,6 +2252,55 @@ private:
 
         builder_.SetInsertPoint(endBB);
         return false;  // control may always exit the loop
+    }
+
+    // CG51 (§16.5): lower `for var i in lo..hi do … end` over a closed,
+    // step-less range literal to a counted loop. Returns false when the
+    // iterable is not a closed range literal (open-ended / with step /
+    // non-range iterables are deferred).
+    bool lowerRangeFor(const ast::ForStmt& fs) {
+        auto* range = dynamic_cast<const ast::RangeExpr*>(fs.iterable.get());
+        if (!range || !range->lo || !range->hi || range->step) return false;
+        llvm::Value* lo = lowerExpr(*range->lo);
+        llvm::Value* hi = lowerExpr(*range->hi);
+        if (!lo || !hi) return false;
+        llvm::AllocaInst* slot = entryAlloca(lo->getType());
+        builder_.CreateStore(lo, slot);
+        // Anchor on the ForStmt node — sema gave `lsym->decl = fs` so that
+        // identifier `i` in the body resolves through `locals_[fs]`.
+        locals_[&fs] = slot;
+
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "for.cond", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "for.body", currentFn_);
+        auto* incBB  = llvm::BasicBlock::Create(llvm_, "for.inc",  currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "for.end",  currentFn_);
+        builder_.CreateBr(condBB);
+
+        // cond: `..` (inclusive) tests i <= hi; `..<` (half-open) tests i < hi.
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* cur = builder_.CreateLoad(slot->getAllocatedType(), slot);
+        llvm::Value* cond = range->inclusive
+                                ? builder_.CreateICmpSLE(cur, hi)
+                                : builder_.CreateICmpSLT(cur, hi);
+        builder_.CreateCondBr(cond, bodyBB, endBB);
+
+        // body: `continue` targets incBB, `break` targets endBB.
+        builder_.SetInsertPoint(bodyBB);
+        loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+        bool term = lowerScopedBlock(fs.body);
+        loopStack_.pop_back();
+        if (!term) builder_.CreateBr(incBB);
+
+        // inc: i := i + 1.
+        builder_.SetInsertPoint(incBB);
+        llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
+        llvm::Value* next = builder_.CreateAdd(
+            v, llvm::ConstantInt::get(v->getType(), 1));
+        builder_.CreateStore(next, slot);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(endBB);
+        return true;
     }
 
     // If `e` names a local or parameter, return its storage slot; else null.
