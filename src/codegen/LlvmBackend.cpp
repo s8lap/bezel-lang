@@ -4523,13 +4523,63 @@ private:
                 llvm::Value* b = lowerExpr(*call.args[1].value);
                 if (!a || !b) return nullptr;
                 if (m == "Min") {
-                    llvm::Value* cmp = builder_.CreateICmpSLT(a, b);
-                    return builder_.CreateSelect(cmp, a, b, "min.result");
+                    // Handle int or double operands.
+                    if (a->getType()->isIntegerTy()) {
+                        llvm::Value* cmp = builder_.CreateICmpSLT(a, b);
+                        return builder_.CreateSelect(cmp, a, b, "min.result");
+                    } else {
+                        // float/double: use llvm.minnum intrinsic
+                        auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                        if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                        if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                        auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::minnum, {dbl});
+                        return builder_.CreateCall(fn, {a, b}, "fmin.result");
+                    }
                 }
                 if (m == "Max") {
-                    llvm::Value* cmp = builder_.CreateICmpSGT(a, b);
-                    return builder_.CreateSelect(cmp, a, b, "max.result");
+                    if (a->getType()->isIntegerTy()) {
+                        llvm::Value* cmp = builder_.CreateICmpSGT(a, b);
+                        return builder_.CreateSelect(cmp, a, b, "max.result");
+                    } else {
+                        auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                        if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                        if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                        auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::maxnum, {dbl});
+                        return builder_.CreateCall(fn, {a, b}, "fmax.result");
+                    }
                 }
+                // Math.Pow(b, e): double — libc pow()
+                if (m == "Pow") {
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                    if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                    auto* powFn = module_->getFunction("pow");
+                    if (!powFn) {
+                        auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
+                        powFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "pow", module_.get());
+                    }
+                    return builder_.CreateCall(powFn, {a, b}, "pow.result");
+                }
+            }
+            // Math.PI, Math.E — named constants.
+            if (call.args.empty()) {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (m == "PI") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
+                if (m == "E")  return llvm::ConstantFP::get(dbl, 2.71828182845904523536);
+            }
+            // Math.Log(x), Math.Log2(x), Math.Log10(x)
+            if (call.args.size() == 1 && call.args[0].value && (m == "Log" || m == "Log2" || m == "Log10")) {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!arg->getType()->isDoubleTy()) arg = builder_.CreateSIToFP(arg, dbl);
+                const char* cname = m == "Log2" ? "log2" : m == "Log10" ? "log10" : "log";
+                auto* logFn = module_->getFunction(cname);
+                if (!logFn) {
+                    auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
+                    logFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, cname, module_.get());
+                }
+                return builder_.CreateCall(logFn, {arg}, std::string(m) + ".result");
             }
         }
         return nullptr;

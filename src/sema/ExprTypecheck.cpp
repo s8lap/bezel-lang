@@ -1692,9 +1692,12 @@ private:
                     auto setDbl = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double)); };
                     auto setBool = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool)); };
                     auto setStr = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String)); };
-                    if (m=="ToInt32"||m=="Abs"||m=="Min"||m=="Max"||m=="Sign") setInt();
+                    if (m=="ToInt32"||m=="Abs"||m=="Sign") setInt();
                     else if (m=="ToInt64") setLong();
-                    else if (m=="ToDouble"||m=="Sqrt"||m=="Pow"||m=="Log"||m=="Ceiling"||m=="Floor"||m=="Round") setDbl();
+                    else if (m=="ToDouble"||m=="Sqrt"||m=="Pow"||m=="Log"||m=="Log2"||m=="Log10"||
+                             m=="Ceiling"||m=="Floor"||m=="Round"||m=="PI"||m=="E") setDbl();
+                    // Min/Max are overloaded (int or double) — leave untyped so
+                    // typeCall can propagate via callee exprType (null → no set).
                     else if (m=="ToBoolean") setBool();
                     else if (m=="ToString") setStr();
                 }
