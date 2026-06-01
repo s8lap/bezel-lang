@@ -1513,6 +1513,77 @@ private:
             return newStr;
         }
 
+        // §9.6: Replace(oldChar, newChar): string — replaces all char occurrences.
+        // Detected by arg type being char (Char primitive).
+        if (method == "Replace" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            auto* at0 = ctx_.exprType(*call.args[0].value);
+            if (at0 && at0->kind == sema::TypeRef::Kind::Primitive &&
+                at0->primitive == sema::PrimitiveType::Char) {
+                llvm::Value* oldCh = lowerExpr(*call.args[0].value);
+                llvm::Value* newCh = lowerExpr(*call.args[1].value);
+                if (!oldCh || !newCh) return nullptr;
+                auto* i8Ty  = llvm::Type::getInt8Ty(llvm_);
+                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                // Only handle ASCII (width=1) strings for now.
+                llvm::Value* len  = loadStringLen(self);   // i64
+                llvm::Value* data = loadStringData(self);  // ptr
+                // Alloc new buffer: same length.
+                llvm::Value* bufLen = builder_.CreateAdd(len, builder_.getInt64(1));
+                llvm::Value* newBuf = builder_.CreateCall(mallocFn, {bufLen});
+                builder_.CreateCall(memcpyFn, {newBuf, data, len});
+                // Store NUL terminator.
+                builder_.CreateStore(
+                    llvm::ConstantInt::get(i8Ty, 0),
+                    builder_.CreateGEP(i8Ty, newBuf, len));
+                // Loop: for i in 0..len, if newBuf[i]==oldCh, newBuf[i]=newCh.
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "rcc.cond", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rcc.body", currentFn_);
+                auto* contBB = llvm::BasicBlock::Create(llvm_, "rcc.cont", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "rcc.end",  currentFn_);
+                auto* iSlot  = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), iSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* i = builder_.CreateLoad(i64(), iSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(i, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                llvm::Value* i2  = builder_.CreateLoad(i64(), iSlot);
+                llvm::Value* ptr = builder_.CreateGEP(i8Ty, newBuf, i2);
+                llvm::Value* ch  = builder_.CreateLoad(i8Ty, ptr);
+                llvm::Value* ch32 = builder_.CreateZExt(ch, i32());
+                llvm::Value* isOld = builder_.CreateICmpEQ(ch32, oldCh);
+                builder_.CreateCondBr(isOld, contBB, contBB);  // body always falls to cont
+                builder_.SetInsertPoint(contBB);
+                // Re-load i since we're in a new block.
+                llvm::Value* i3  = builder_.CreateLoad(i64(), iSlot);
+                llvm::Value* ptr3 = builder_.CreateGEP(i8Ty, newBuf, i3);
+                llvm::Value* ch3  = builder_.CreateLoad(i8Ty, ptr3);
+                llvm::Value* ch33 = builder_.CreateZExt(ch3, i32());
+                llvm::Value* isOld3 = builder_.CreateICmpEQ(ch33, oldCh);
+                // newCh to i8 (truncate — ASCII only)
+                llvm::Value* newChI8 = builder_.CreateTrunc(newCh, i8Ty);
+                llvm::Value* ch8 = builder_.CreateLoad(i8Ty, ptr3);
+                llvm::Value* selected = builder_.CreateSelect(isOld3, newChI8, ch8);
+                builder_.CreateStore(selected, ptr3);
+                builder_.CreateStore(
+                    builder_.CreateAdd(i3, builder_.getInt64(1)), iSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                // Wrap in bz_string struct.
+                uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+                llvm::Value* newStr2 = builder_.CreateCall(
+                    mallocFn, {builder_.getInt64(strBytes)}, "rcc.obj");
+                builder_.CreateStore(newBuf, builder_.CreateStructGEP(stringType(), newStr2, 0));
+                builder_.CreateStore(len, builder_.CreateStructGEP(stringType(), newStr2, 1));
+                builder_.CreateStore(
+                    llvm::ConstantInt::get(i8Ty, 1),
+                    builder_.CreateStructGEP(stringType(), newStr2, 2));
+                return newStr2;
+            }
+        }
+
         // §9.6: Replace(oldStr, newStr): string — replaces all occurrences of
         // `oldStr` with `newStr` in `self`. Uses memmem for finding occurrences;
         // builds the result via repeated concatenation in a loop.
@@ -7266,6 +7337,15 @@ private:
         // string.Empty → empty string literal.
         if (pt == P::String && m == "Empty" && call.args.empty()) {
             return lowerStringLiteral("\"\"", false);
+        }
+        // §9.6: string.Compare(a, b): int — ordinal comparison; returns
+        // negative/0/positive like memcmp.
+        if (pt == P::String && m == "Compare" &&
+            call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            llvm::Value* a = lowerExpr(*call.args[0].value);
+            llvm::Value* b = lowerExpr(*call.args[1].value);
+            if (!a || !b) return nullptr;
+            return emitStringOrdCmp(a, b);
         }
 
         // int.Parse(s) / long.Parse(s) / double.Parse(s) etc.
