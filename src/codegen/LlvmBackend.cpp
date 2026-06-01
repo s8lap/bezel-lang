@@ -5227,7 +5227,7 @@ private:
                 }
             }
         }
-        // §2.3: Math.PI / Math.E as constant properties (not function calls).
+        // §2.3: Math.PI / Math.E + Environment.NewLine / TickCount etc.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
             if (ma->target) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
@@ -5235,6 +5235,68 @@ private:
                     if (id->name == "Math") {
                         if (ma->member == "PI") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
                         if (ma->member == "E")  return llvm::ConstantFP::get(dbl, 2.71828182845904523536);
+                    }
+                    if (id->name == "Environment") {
+                        // §2.3: Environment static properties.
+                        if (ma->member == "NewLine") {
+                            // Platform newline: "\n" on Unix, "\r\n" on Windows.
+                            // Emit a global string constant for "\n" (Unix default).
+                            return lowerStringLiteral("\"\\n\"", false);
+                        }
+                        if (ma->member == "TickCount") {
+                            // Milliseconds since process start (via clock_gettime).
+                            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                            auto* clockFn = module_->getFunction("clock");
+                            if (!clockFn) {
+                                auto* ft = llvm::FunctionType::get(i64(), {}, false);
+                                clockFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "clock", module_.get());
+                            }
+                            llvm::Value* clk = builder_.CreateCall(clockFn, {}, "clock.ret");
+                            // CLOCKS_PER_SEC ≈ 1000000 on Linux; scale to ms.
+                            llvm::Value* ms = builder_.CreateSDiv(
+                                clk, builder_.getInt64(1000), "tick.ms");
+                            return builder_.CreateTrunc(ms, i32(), "tick.i32");
+                        }
+                        if (ma->member == "OSVersion") {
+                            return lowerStringLiteral("\"Linux\"", false);
+                        }
+                        if (ma->member == "MachineName") {
+                            return lowerStringLiteral("\"localhost\"", false);
+                        }
+                        if (ma->member == "ProcessId") {
+                            auto* getpidFn = module_->getFunction("getpid");
+                            if (!getpidFn) {
+                                auto* ft = llvm::FunctionType::get(i32(), {}, false);
+                                getpidFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "getpid", module_.get());
+                            }
+                            return builder_.CreateCall(getpidFn, {}, "pid.ret");
+                        }
+                    }
+                    if (id->name == "int") {
+                        if (ma->member == "MaxValue")
+                            return llvm::ConstantInt::getSigned(i32(), 2147483647);
+                        if (ma->member == "MinValue")
+                            return llvm::ConstantInt::getSigned(i32(), -2147483648LL);
+                    }
+                    if (id->name == "long") {
+                        if (ma->member == "MaxValue")
+                            return llvm::ConstantInt::getSigned(i64(), 9223372036854775807LL);
+                        if (ma->member == "MinValue")
+                            return llvm::ConstantInt::getSigned(i64(), (int64_t)(-9223372036854775807LL - 1));
+                    }
+                    if (id->name == "double") {
+                        if (ma->member == "MaxValue")
+                            return llvm::ConstantFP::get(dbl, 1.7976931348623157e308);
+                        if (ma->member == "MinValue")
+                            return llvm::ConstantFP::get(dbl, 2.2250738585072014e-308);
+                        if (ma->member == "Epsilon")
+                            return llvm::ConstantFP::get(dbl, 5e-324);
+                        if (ma->member == "PositiveInfinity")
+                            return llvm::ConstantFP::getInfinity(dbl, false);
+                        if (ma->member == "NegativeInfinity")
+                            return llvm::ConstantFP::getInfinity(dbl, true);
+                        if (ma->member == "NaN")
+                            return llvm::ConstantFP::getNaN(dbl);
                     }
                 }
             }
