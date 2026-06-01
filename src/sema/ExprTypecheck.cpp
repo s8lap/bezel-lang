@@ -975,7 +975,8 @@ private:
                 // a conversion callee (`int(x)`). It has no value symbol;
                 // the enclosing call resolves the conversion (typeCall).
             } else if (id->name == "Console" || id->name == "Math" ||
-                       id->name == "Convert" || id->name == "Environment") {
+                       id->name == "Convert" || id->name == "Environment" ||
+                       id->name == "Random") {
                 // §2.3: these System classes are auto-imported and always
                 // available without an explicit import. Give them a synthetic
                 // TypeSymbol (null decl) so member access can proceed; the
@@ -1728,6 +1729,14 @@ private:
                     else if (m == "ReadKey")
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Char));
                     // Write/WriteLine → unit (leave untyped).
+                }
+                // Random class methods.
+                if (cls == "Random") {
+                    if (m == "Next" || m == "NextInt")
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    else if (m == "NextDouble" || m == "NextFloat")
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
+                    // Seed → unit (leave untyped)
                 }
             }
             // Slice 3d intentionally does NOT diagnose unknown members.

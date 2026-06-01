@@ -5687,6 +5687,66 @@ private:
                 return builder_.CreateCall(logFn, {arg}, std::string(m) + ".result");
             }
         }
+
+        // §2.x: Random class — pseudorandom numbers via libc rand()/srand().
+        if (cls == "Random") {
+            auto* randFn = module_->getFunction("rand");
+            if (!randFn) {
+                auto* ft = llvm::FunctionType::get(i32(), {}, false);
+                randFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "rand", module_.get());
+            }
+            // Helper: make non-negative.
+            auto absRand = [&](llvm::Value* v) -> llvm::Value* {
+                llvm::Value* isNeg = builder_.CreateICmpSLT(
+                    v, llvm::ConstantInt::get(i32(), 0));
+                return builder_.CreateSelect(isNeg, builder_.CreateNeg(v), v);
+            };
+            if (m == "Next" && call.args.empty())
+                return builder_.CreateCall(randFn, {}, "rand.ret");
+            if (m == "Next" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* maxV = lowerExpr(*call.args[0].value);
+                if (!maxV) return nullptr;
+                return builder_.CreateSRem(
+                    absRand(builder_.CreateCall(randFn, {}, "rand.r")),
+                    maxV, "rand.mod");
+            }
+            if (m == "Next" && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* minV = lowerExpr(*call.args[0].value);
+                llvm::Value* maxV = lowerExpr(*call.args[1].value);
+                if (!minV || !maxV) return nullptr;
+                llvm::Value* range = builder_.CreateSub(maxV, minV);
+                return builder_.CreateAdd(
+                    builder_.CreateSRem(
+                        absRand(builder_.CreateCall(randFn, {}, "rand.r")),
+                        range),
+                    minV, "rand.result");
+            }
+            if (m == "NextDouble" && call.args.empty()) {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                llvm::Value* r = absRand(builder_.CreateCall(randFn, {}, "rand.r"));
+                return builder_.CreateFDiv(
+                    builder_.CreateSIToFP(r, dbl),
+                    llvm::ConstantFP::get(dbl, 2147483648.0), "rand.dbl");
+            }
+            if (m == "Seed" && call.args.size() == 1 && call.args[0].value) {
+                auto* srandFn = module_->getFunction("srand");
+                if (!srandFn) {
+                    auto* ft = llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(llvm_), {i32()}, false);
+                    srandFn = llvm::Function::Create(
+                        ft, llvm::Function::ExternalLinkage, "srand", module_.get());
+                }
+                llvm::Value* seed = lowerExpr(*call.args[0].value);
+                if (!seed) return nullptr;
+                if (!seed->getType()->isIntegerTy(32))
+                    seed = builder_.CreateTrunc(seed, i32());
+                builder_.CreateCall(srandFn, {seed});
+                return nullptr;  // unit
+            }
+        }
+
         return nullptr;
     }
 
