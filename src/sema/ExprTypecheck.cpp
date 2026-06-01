@@ -788,9 +788,36 @@ private:
         } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
             if (fs->iterable) visitExpr(*fs->iterable);
             if (fs->withExpr) visitExpr(*fs->withExpr);
+            // §16.5: symbolize the loop variable so the body can refer to it.
+            // The variable's type is the explicit annotation if given; for a
+            // range literal iterable (`1..3`) it is the element type inferred
+            // from the lo/hi expression type. `lsym->decl = fs` anchors the
+            // symbol on the ForStmt — codegen maps `locals_[fs]` to the
+            // counter alloca so identifier `i` resolves to the slot.
+            Scope forScope;
+            forScope.parent = currentScope_;
+            if (currentScope_ && !fs->varName.empty()) {
+                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                lsym->name = fs->varName;
+                lsym->decl = fs;
+                if (fs->varType) {
+                    lsym->declType = ctx_.resolvedType(*fs->varType);
+                } else if (auto* range =
+                               dynamic_cast<const ast::RangeExpr*>(
+                                   fs->iterable.get())) {
+                    if (range->lo)
+                        lsym->declType = ctx_.exprType(*range->lo);
+                    else if (range->hi)
+                        lsym->declType = ctx_.exprType(*range->hi);
+                }
+                forScope.names[fs->varName] = lsym;
+            }
+            Scope* saveScope = currentScope_;
+            currentScope_ = &forScope;
             ++loopDepth_;
             for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
             --loopDepth_;
+            currentScope_ = saveScope;
         } else if (dynamic_cast<const ast::BreakStmt*>(&s)) {
             // Slice S26 (§21.5): `break` is legal only inside a loop.
             if (loopDepth_ == 0) {
@@ -1798,6 +1825,12 @@ private:
                        dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
             for (const auto& k : cl->keys) if (k) visitExpr(*k);
             for (const auto& v : cl->elements) if (v) visitExpr(*v);
+        } else if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            // §16: visit lo, hi, and step so that identifiers inside range
+            // bounds (e.g. `1..n`) get their symbols resolved.
+            if (re->lo) visitExpr(*re->lo);
+            if (re->hi) visitExpr(*re->hi);
+            if (re->step) visitExpr(*re->step);
         }
         // Identifier / This / Base / TypeOf / NameOf / Default —
         // no expression children to recurse into.
