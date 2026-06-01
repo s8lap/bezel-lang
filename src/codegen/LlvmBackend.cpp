@@ -838,6 +838,112 @@ private:
             return newStr;
         }
 
+        // §9.6: Replace(oldStr, newStr): string — replaces all occurrences of
+        // `oldStr` with `newStr` in `self`. Uses memmem for finding occurrences;
+        // builds the result via repeated concatenation in a loop.
+        if (method == "Replace" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* oldStr = lowerExpr(*call.args[0].value);
+            llvm::Value* newStr = lowerExpr(*call.args[1].value);
+            if (!oldStr || !newStr) return nullptr;
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            // Declare memmem.
+            auto* memmemFn = module_->getFunction("memmem");
+            if (!memmemFn) {
+                auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
+                memmemFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
+            }
+            // Walk the input, collecting prefix+new segments.
+            // For simplicity emit a result built from:
+            //   acc = "" ; pos = self.data ; end = self.data + self.len
+            //   while (found = memmem(pos, end-pos, old.data, old.len)):
+            //     acc = acc + str(pos..found) + newStr
+            //     pos = found + old.len
+            //   acc = acc + str(pos..end)
+            // All in LLVM IR using a loop.
+            llvm::Value* selfLen  = loadStringLen(self);
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* oldData  = loadStringData(oldStr);
+            llvm::Value* oldLen   = loadStringLen(oldStr);
+            llvm::Value* newData2 = loadStringData(newStr);
+            llvm::Value* newLen   = loadStringLen(newStr);
+            // Allocate result buffer: worst case self.len * (newLen / oldLen + 1)
+            // For simplicity allocate 4x self.len + newLen as initial buffer.
+            // Actually: build result as linked list of segments, then concat.
+            // Simpler approach: use realloc-based appending.
+            // Simplest for now: pre-allocate 4x self.len + 4*newLen bytes.
+            llvm::Value* bound = builder_.CreateAdd(
+                builder_.CreateMul(selfLen, builder_.getInt64(4)),
+                builder_.CreateMul(newLen, builder_.getInt64(4)));
+            bound = builder_.CreateAdd(bound, builder_.getInt64(1));
+            llvm::Value* resBuf = builder_.CreateCall(mallocFn, {bound}, "repl.buf");
+            auto* resLenSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), resLenSlot);
+            auto* posSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(selfData, posSlot);
+            llvm::Value* endPtr = builder_.CreateGEP(i8Ty, selfData, selfLen, "repl.end");
+            // Loop.
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "repl.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "repl.body", currentFn_);
+            auto* dumpBB = llvm::BasicBlock::Create(llvm_, "repl.dump", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "repl.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* pos    = builder_.CreateLoad(ptrTy(), posSlot);
+            llvm::Value* remain = builder_.CreatePtrDiff(i8Ty, endPtr, pos, "repl.rem");
+            llvm::Value* hasOld = builder_.CreateICmpSGT(oldLen, builder_.getInt64(0));
+            llvm::Value* remGe  = builder_.CreateICmpSGE(remain, oldLen);
+            llvm::Value* canSearch = builder_.CreateAnd(hasOld, remGe);
+            builder_.CreateCondBr(canSearch, bodyBB, dumpBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* pos2    = builder_.CreateLoad(ptrTy(), posSlot);
+            llvm::Value* remain2 = builder_.CreatePtrDiff(i8Ty, endPtr, pos2, "repl.rem2");
+            llvm::Value* found   = builder_.CreateCall(memmemFn, {pos2, remain2, oldData, oldLen}, "repl.found");
+            auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+            llvm::Value* notFound = builder_.CreateICmpEQ(found, nullPtr);
+            auto* copyBB = llvm::BasicBlock::Create(llvm_, "repl.copy", currentFn_);
+            builder_.CreateCondBr(notFound, dumpBB, copyBB);
+            builder_.SetInsertPoint(copyBB);
+            // Copy prefix: found - pos2 bytes.
+            llvm::Value* prefLen = builder_.CreatePtrDiff(i8Ty, found, pos2, "repl.pref");
+            llvm::Value* resLen  = builder_.CreateLoad(i64(), resLenSlot);
+            llvm::Value* dst1    = builder_.CreateGEP(i8Ty, resBuf, resLen);
+            builder_.CreateCall(memcpyFn, {dst1, pos2, prefLen});
+            llvm::Value* resLen2 = builder_.CreateAdd(resLen, prefLen);
+            // Copy newStr.
+            llvm::Value* dst2    = builder_.CreateGEP(i8Ty, resBuf, resLen2);
+            builder_.CreateCall(memcpyFn, {dst2, newData2, newLen});
+            llvm::Value* resLen3 = builder_.CreateAdd(resLen2, newLen);
+            builder_.CreateStore(resLen3, resLenSlot);
+            // Advance pos past the old occurrence.
+            llvm::Value* afterOld = builder_.CreateGEP(i8Ty, found, oldLen, "repl.after");
+            builder_.CreateStore(afterOld, posSlot);
+            builder_.CreateBr(condBB);
+            // Dump remaining.
+            builder_.SetInsertPoint(dumpBB);
+            llvm::Value* pos3     = builder_.CreateLoad(ptrTy(), posSlot);
+            llvm::Value* tailLen  = builder_.CreatePtrDiff(i8Ty, endPtr, pos3, "repl.tail");
+            llvm::Value* resLen4  = builder_.CreateLoad(i64(), resLenSlot);
+            llvm::Value* dst3     = builder_.CreateGEP(i8Ty, resBuf, resLen4);
+            builder_.CreateCall(memcpyFn, {dst3, pos3, tailLen});
+            llvm::Value* finalLen = builder_.CreateAdd(resLen4, tailLen);
+            builder_.CreateStore(finalLen, resLenSlot);
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            // Null-terminate.
+            llvm::Value* fLen     = builder_.CreateLoad(i64(), resLenSlot);
+            llvm::Value* nulPtr2  = builder_.CreateGEP(i8Ty, resBuf, fLen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr2);
+            // Build result string object.
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* resStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "repl.obj");
+            builder_.CreateStore(resBuf, builder_.CreateStructGEP(stringType(), resStr, 0));
+            builder_.CreateStore(fLen, builder_.CreateStructGEP(stringType(), resStr, 1));
+            return resStr;
+        }
+
         // §9.6: ToUpper/ToLower — ASCII-only case conversion via toupper/tolower.
         if (method == "ToUpper" || method == "ToLower") {
             if (!call.args.empty()) return nullptr;  // no extra args
