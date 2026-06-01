@@ -1283,6 +1283,13 @@ private:
                 ctx_.setExprType(&ce, unit);
             }
         }
+        // CG27c: if the callee is an intrinsic member (no symbol, but has a
+        // type set by the MemberAccessExpr handler), propagate that type to
+        // the CallExpr — e.g. `n.ToString()` callee has type `string`.
+        if (!calleeSym) {
+            if (auto* rt = ctx_.exprType(*ce.callee))
+                ctx_.setExprType(&ce, rt);
+        }
         // CallExpr where the callee is a constructor reference (e.g.
         // `T(args)` form — rare in Bezel since `new T(args)` is the
         // canonical form), or the callee is a type symbol, are not yet
@@ -1520,26 +1527,38 @@ private:
             // string has no user TypeSymbol in the symbol table.
             if (ma.target) {
                 auto* tt = ctx_.exprType(*ma.target);
-                if (tt && tt->kind == TypeRef::Kind::Primitive &&
-                    tt->primitive == PrimitiveType::String) {
-                    if (ma.member == "Length") {
-                        // stdlib §9.6: Length: int
+                if (tt && tt->kind == TypeRef::Kind::Primitive) {
+                    if (tt->primitive == PrimitiveType::String) {
+                        if (ma.member == "Length") {
+                            // stdlib §9.6: Length: int
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                            return;
+                        }
+                        if (ma.member == "IsAscii") {
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                            return;
+                        }
+                        if (ma.member == "ToString") {
+                            // string.ToString() returns itself (§9.6)
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                            return;
+                        }
+                        // Emit a diagnostic for unrecognized string members.
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("string member `.") +
+                            std::string(ma.member) +
+                            "` is not yet supported in codegen");
+                    } else if (ma.member == "ToString") {
+                        // CG27c: ToString() is an intrinsic on all primitive
+                        // types (§5) — returns the string representation.
                         ctx_.setExprType(
-                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
                     }
-                    if (ma.member == "IsAscii") {
-                        ctx_.setExprType(
-                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
-                        return;
-                    }
-                    // Emit a diagnostic for unrecognized string members so the
-                    // user gets a clear error rather than a silent codegen null.
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        std::string("string member `.") +
-                        std::string(ma.member) +
-                        "` is not yet supported in codegen");
                 }
             }
             return;
