@@ -2278,6 +2278,128 @@ private:
         }
     }
 
+    // §22.10: find the indexer PropertySymbol on a TypeSymbol, if any.
+    const sema::PropertySymbol* findIndexer(
+        const sema::TypeSymbol* ts) const {
+        for (const sema::Symbol* m : ts->members) {
+            if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(m))
+                if (ps->isIndexer) return ps;
+        }
+        return nullptr;
+    }
+
+    // §22.10: emit the getter of an indexer property via inline body.
+    // Returns the loaded value, or null if no indexer applies.
+    llvm::Value* lowerIndexerGet(const ast::IndexExpr& ix) {
+        if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
+            return nullptr;
+        auto* targetTy = ctx_.exprType(*ix.target);
+        if (!targetTy || targetTy->kind != sema::TypeRef::Kind::Named ||
+            !targetTy->declaration)
+            return nullptr;
+        auto* ps = findIndexer(targetTy->declaration);
+        if (!ps) return nullptr;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd) return nullptr;
+        // Find a getter accessor body.
+        const ast::Expr* getterExpr = nullptr;
+        const std::vector<std::unique_ptr<ast::Stmt>>* getterStmts = nullptr;
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression && pd->exprBody)
+            getterExpr = pd->exprBody.get();
+        for (const auto& a : pd->accessors) {
+            if (!a.isSet) {
+                if (a.exprBody) getterExpr = a.exprBody.get();
+                else if (!a.stmts.empty()) getterStmts = &a.stmts;
+                break;
+            }
+        }
+        if (!getterExpr && !getterStmts) return nullptr;
+        // Bind `this` to the target object and indexer params to the args.
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj) return nullptr;
+        llvm::Value* savedThis = currentThis_;
+        auto savedLocals = locals_;
+        auto savedParams = paramSlots_;
+        currentThis_ = obj;
+        locals_.clear();
+        paramSlots_.clear();
+        // Bind each indexer parameter to its argument.
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix.indices.size(); ++k) {
+            if (!ix.indices[k].value) continue;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) continue;
+            auto* slot = entryAlloca(argVal->getType());
+            builder_.CreateStore(argVal, slot);
+            paramSlots_[ps->indexerParams[k]] = slot;
+        }
+        llvm::Value* result = nullptr;
+        if (getterExpr) result = lowerExpr(*getterExpr);
+        else { lowerScopedBlock(*getterStmts); }
+        currentThis_ = savedThis;
+        locals_ = std::move(savedLocals);
+        paramSlots_ = std::move(savedParams);
+        return result;
+    }
+
+    // §22.10: emit the setter of an indexer property via inline body.
+    // Returns true if the setter was handled.
+    bool lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
+        if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
+            return false;
+        auto* targetTy = ctx_.exprType(*ix.target);
+        if (!targetTy || targetTy->kind != sema::TypeRef::Kind::Named ||
+            !targetTy->declaration)
+            return false;
+        auto* ps = findIndexer(targetTy->declaration);
+        if (!ps) return false;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd) return false;
+        // Find a setter accessor body.
+        const ast::Expr* setterExpr = nullptr;
+        const std::vector<std::unique_ptr<ast::Stmt>>* setterStmts = nullptr;
+        for (const auto& a : pd->accessors) {
+            if (a.isSet) {
+                if (a.exprBody) setterExpr = a.exprBody.get();
+                else if (!a.stmts.empty()) setterStmts = &a.stmts;
+                break;
+            }
+        }
+        if (!setterExpr && !setterStmts) return false;
+        // Bind `this`, indexer params, and implicit `value` param.
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj) return false;
+        llvm::Value* savedThis = currentThis_;
+        auto savedLocals = locals_;
+        auto savedParams = paramSlots_;
+        currentThis_ = obj;
+        locals_.clear();
+        paramSlots_.clear();
+        // Indexer params.
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix.indices.size(); ++k) {
+            if (!ix.indices[k].value) continue;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) continue;
+            auto* slot = entryAlloca(argVal->getType());
+            builder_.CreateStore(argVal, slot);
+            paramSlots_[ps->indexerParams[k]] = slot;
+        }
+        // `value` param: look for the LocalSymbol anchored on pd.
+        // The codegen's `lowerPropertySet` uses locals_[pd] for `value`.
+        if (val) {
+            auto* slot = entryAlloca(val->getType());
+            builder_.CreateStore(val, slot);
+            locals_[pd] = slot;
+        }
+        if (setterExpr) lowerExpr(*setterExpr);
+        else if (setterStmts) lowerScopedBlock(*setterStmts);
+        currentThis_ = savedThis;
+        locals_ = std::move(savedLocals);
+        paramSlots_ = std::move(savedParams);
+        return true;
+    }
+
     // CG15: collect a class's instance fields in layout order —
     // base-class fields FIRST (prefix layout: a `Derived*` aliases a
     // `Base*`), then own fields. Recurses the single base class
@@ -3810,6 +3932,12 @@ private:
                 if (as->op == ":=") {
                     if (lowerPropertySet(*as->target, *as->value))
                         return false;
+                    // §22.10: indexer setter for `obj[i] := v`.
+                    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
+                            as->target.get())) {
+                        llvm::Value* rhs = lowerExpr(*as->value);
+                        if (rhs && lowerIndexerSet(*ix, rhs)) return false;
+                    }
                 } else if (lowerPropertyCompound(*as)) {
                     return false;
                 }
@@ -4737,8 +4865,6 @@ private:
             if (!ix->target || ix->indices.empty() || !ix->indices[0].value)
                 return nullptr;
             // CG27e (§4.6): string indexer `s[i]` → char (i32 code point).
-            // For ASCII/UTF-8 strings, this is the byte at position i widened
-            // to i32. Full code-point-by-position for non-ASCII deferred.
             {
                 auto* tt = ctx_.exprType(*ix->target);
                 if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
@@ -4746,11 +4872,14 @@ private:
                     llvm::Value* strPtr = lowerExpr(*ix->target);
                     llvm::Value* idx = lowerExpr(*ix->indices[0].value);
                     if (!strPtr || !idx) return nullptr;
-                    // Use idx (the index expression value, probably i32) — sext to i64 first
-                    llvm::Value* idx64 = idx->getType() == i64() ? idx : builder_.CreateSExt(idx, i64(), "str.idx64");
+                    llvm::Value* idx64 = idx->getType() == i64() ? idx
+                        : builder_.CreateSExt(idx, i64(), "str.idx64");
                     return loadCodePoint(strPtr, idx64);
                 }
             }
+            // §22.10: class/record indexer property getter.
+            if (auto* idxGetVal = lowerIndexerGet(*ix))
+                return idxGetVal;
             // §15.1: inline array `a[i]` — GEP the array slot and load.
             llvm::Type* ety = nullptr;
             llvm::Value* addr = lvalueAddr(*ix->target, ety);

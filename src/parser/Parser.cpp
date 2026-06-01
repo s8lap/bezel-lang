@@ -902,7 +902,13 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         auto pd = std::make_unique<ast::PropertyDecl>();
         pd->visibility = visibility;
         pd->modifiers = std::move(modifiers);
-        // A.4 IndexerDecl: `[ParamList]` in place of the Identifier name.
+        // A.4 IndexerDecl: `[ParamList]` or `this [ParamList]` in place of
+        // the Identifier name. The `this` form is the spec's canonical
+        // indexer syntax (§22.10): `property this[params]: T`.
+        if (isKeyword("this") && peekAt(1).kind == TokenKind::Punctuator &&
+            peekAt(1).text == "[") {
+            advance();  // past `this`
+        }
         if (consumePunctuator("[")) {
             pd->isIndexer = true;
             pd->indexerParams = parseParamList();

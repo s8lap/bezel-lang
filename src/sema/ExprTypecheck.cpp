@@ -622,41 +622,73 @@ private:
             returnCtx_ = saveRet;
         } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
             std::vector<ast::Param> none;
+            // §22.10: for an indexer property, find the PropertySymbol's
+            // indexerParams so they're visible inside accessor bodies.
+            const std::vector<Symbol*>* idxSymsPtr = nullptr;
+            std::vector<Symbol*> idxSyms;
+            if (pd->isIndexer && currentType_) {
+                for (Symbol* mem : currentType_->members) {
+                    if (auto* ps = dynamic_cast<PropertySymbol*>(mem)) {
+                        if (ps->isIndexer && ps->decl == pd) {
+                            idxSyms = ps->indexerParams;
+                            idxSymsPtr = &idxSyms;
+                            break;
+                        }
+                    }
+                }
+            }
+            // Use pd->indexerParams as the param reference (move-only but
+            // we only need its .name field in runMethodBody).
+            const auto& pdParams = pd->isIndexer ? pd->indexerParams : none;
             if (pd->exprBody)
-                runMethodBody(none, nullptr, pd->exprBody.get(), nullptr);
+                runMethodBody(pdParams, nullptr, pd->exprBody.get(),
+                              idxSymsPtr);
             if (pd->autoInitializer) {
                 // §22.8 applies to auto-property initializers too.
                 bool save = inFieldInitializer_;
                 inFieldInitializer_ = true;
                 visitExpr(*pd->autoInitializer);
+                inFieldInitializer_ = false;
                 inFieldInitializer_ = save;
             }
             for (const auto& a : pd->accessors) {
                 // §22.9: a setter accessor has an implicit `value` parameter
                 // (renamable via a SetterParamSpec) of the property's type.
                 // Its decl anchors on the PropertyDecl so codegen can map it
-                // to the assigned value.
+                // to the assigned value. For indexers, include indexer params.
                 if (a.isSet) {
                     std::string_view vname = a.setterParamName.empty()
                         ? std::string_view("value")
                         : a.setterParamName;
-                    std::vector<ast::Param> sp(1);
-                    sp[0].name = vname;
                     auto* vsym = ctx_.makeSymbol<LocalSymbol>();
                     vsym->name = vname;
                     vsym->decl = pd;
                     if (pd->type) vsym->declType = ctx_.resolvedType(*pd->type);
-                    std::vector<Symbol*> ssyms{vsym};
+                    // Build extended symbol list: indexer params + value.
+                    std::vector<Symbol*> ssyms;
+                    for (auto* s : idxSyms) ssyms.push_back(s);
+                    ssyms.push_back(vsym);
+                    // Build synthetic param list for the combined set.
+                    // runMethodBody just reads param[i].name to populate scope.
+                    std::vector<ast::Param> sp;
+                    for (const auto& p : pd->indexerParams) {
+                        ast::Param dummy; dummy.name = p.name;
+                        sp.push_back(std::move(dummy));
+                    }
+                    ast::Param vp; vp.name = vname;
+                    sp.push_back(std::move(vp));
                     if (a.exprBody)
                         runMethodBody(sp, nullptr, a.exprBody.get(), &ssyms);
                     if (!a.stmts.empty())
                         runMethodBody(sp, &a.stmts, nullptr, &ssyms);
                     continue;
                 }
+                // Getter: include indexer params.
                 if (a.exprBody)
-                    runMethodBody(none, nullptr, a.exprBody.get(), nullptr);
+                    runMethodBody(pdParams, nullptr, a.exprBody.get(),
+                                  idxSymsPtr);
                 if (!a.stmts.empty())
-                    runMethodBody(none, &a.stmts, nullptr, nullptr);
+                    runMethodBody(pdParams, &a.stmts, nullptr, idxSymsPtr);
             }
         } else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(&m)) {
             if (cd->value) visitExpr(*cd->value);
