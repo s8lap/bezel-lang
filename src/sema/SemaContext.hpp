@@ -111,6 +111,19 @@ public:
     // request.
     TypeRef* primitiveTypeRef(PrimitiveType p, bool nullable = false);
 
+    // §A.7 Lambda expressions — per-lambda parameter symbol list. Sema
+    // populates this during expression type-checking; codegen uses it to
+    // bind each lambda parameter to its LLVM argument.
+    void setLambdaParams(const ast::LambdaExpr* lam,
+                         std::vector<Symbol*> syms) {
+        lambdaParams_[lam] = std::move(syms);
+    }
+    const std::vector<Symbol*>* lambdaParams(
+        const ast::LambdaExpr* lam) const {
+        auto it = lambdaParams_.find(lam);
+        return it == lambdaParams_.end() ? nullptr : &it->second;
+    }
+
 private:
     DiagnosticEngine& diagnostics_;
     std::vector<std::unique_ptr<Symbol>> symbols_;
@@ -118,6 +131,7 @@ private:
     std::unordered_map<const ast::Type*, TypeRef*> resolvedTypes_;
     std::unordered_map<const ast::Expr*, TypeRef*> exprTypes_;
     std::unordered_map<const ast::Expr*, Symbol*> exprSymbols_;
+    std::unordered_map<const ast::LambdaExpr*, std::vector<Symbol*>> lambdaParams_;
     // Cache for the common primitive TypeRefs. Key is `(p << 1) | nullable`.
     std::unordered_map<std::uint32_t, TypeRef*> primitiveCache_;
     ModuleSymbol* module_ = nullptr;

@@ -2147,23 +2147,37 @@ private:
                     "catch arm body (§31.5)");
             }
         } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
-            // §21.7: a `return` inside a lambda exits the lambda and
-            // follows the lambda's own return type — which slice S21
-            // does not yet infer. Suppress the enclosing callable's
-            // return-form context while walking the lambda body.
-            // §21.5: a loop in the enclosing scope does not make
-            // `break`/`continue` legal inside the lambda, so reset the
-            // loop depth across the lambda boundary too.
+            // §A.7 / §21.7: lambdas create their own scope with parameter
+            // symbols. Each parameter becomes a ParameterSymbol whose
+            // declType is inferred from the explicit type annotation (untyped
+            // lambda params remain null — callers must supply context).
+            Scope lamScope;
+            lamScope.parent = currentScope_;
+            std::vector<sema::Symbol*> lamParamSyms;
+            for (const auto& p : lam->params) {
+                auto* ps = ctx_.makeSymbol<ParameterSymbol>();
+                ps->name = p.name;
+                ps->modifier = p.modifier;
+                if (p.type) ps->declType = p.type.get();
+                lamParamSyms.push_back(ps);
+                if (!p.name.empty()) lamScope.names[p.name] = ps;
+            }
+            ctx_.setLambdaParams(lam, std::move(lamParamSyms));
+            // §21.7: suppress enclosing callable's return context;
+            // §21.5: reset loop/catch depth across the lambda boundary.
+            Scope* saveScope = currentScope_;
             ReturnCtx saveRet = returnCtx_;
             TypeRef* saveRetTy = currentReturnType_;
             int saveLoop = loopDepth_;
             int saveCatch = catchDepth_;
+            currentScope_ = &lamScope;
             returnCtx_ = ReturnCtx::None;
             currentReturnType_ = nullptr;
             loopDepth_ = 0;
             catchDepth_ = 0;
             if (lam->exprBody) visitExpr(*lam->exprBody);
             for (const auto& s : lam->stmts) if (s) visitStmt(*s);
+            currentScope_ = saveScope;
             returnCtx_ = saveRet;
             currentReturnType_ = saveRetTy;
             loopDepth_ = saveLoop;

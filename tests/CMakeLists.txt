@@ -196,6 +196,7 @@ set(BEZEL_TEST_SOURCES
     codegen/string_methods_test.cpp
     codegen/string_for_in_test.cpp
     codegen/range_for_test.cpp
+    codegen/lambda_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
