@@ -4286,9 +4286,36 @@ private:
         if (!arg) return false;
         auto* argTy = ctx_.exprType(*call.args[0].value);
         llvm::Value* strPtr = arg;
-        if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
-            argTy->primitive != sema::PrimitiveType::String) {
-            strPtr = emitPrimitiveToString(arg, argTy->primitive);
+        if (argTy) {
+            if (argTy->kind == sema::TypeRef::Kind::Primitive &&
+                argTy->primitive != sema::PrimitiveType::String) {
+                strPtr = emitPrimitiveToString(arg, argTy->primitive);
+            } else if (argTy->kind == sema::TypeRef::Kind::Named &&
+                       argTy->declaration) {
+                // Named type (class/record) — call ToString() via virtual
+                // dispatch if the type has a ToString method, else fall back
+                // to a type-name placeholder string.
+                auto* ts = argTy->declaration;
+                // Find a 'ToString' method symbol by walking members.
+                sema::MethodSymbol* toStr = nullptr;
+                for (auto* sym : ts->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                    if (ms && ms->name == "ToString" && ms->params.empty()) {
+                        toStr = ms;
+                        break;
+                    }
+                }
+                if (toStr) {
+                    // Emit the method call (virtual if overriding, static otherwise).
+                    std::vector<llvm::Value*> args{arg};
+                    strPtr = emitMethodCall(toStr, args, false);
+                } else {
+                    // No ToString override — use type name as placeholder string.
+                    strPtr = lowerStringLiteral(
+                        std::string("\"") + std::string(ts->name) + "\"",
+                        false);
+                }
+            }
         }
         if (!strPtr) return false;
         emitConsoleWrite(strPtr, isWriteLine);
