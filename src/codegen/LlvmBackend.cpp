@@ -5055,6 +5055,16 @@ private:
                         arg, llvm::ConstantInt::get(arg->getType(), 0));
                     return builder_.CreateSelect(isNeg, neg, arg, "abs.result");
                 }
+                if (m == "Sign") {
+                    // Sign: -1 if n<0, 0 if n==0, 1 if n>0.
+                    auto* zero = llvm::ConstantInt::get(arg->getType(), 0);
+                    llvm::Value* isNeg = builder_.CreateICmpSLT(arg, zero, "sgn.neg");
+                    llvm::Value* isPos = builder_.CreateICmpSGT(arg, zero, "sgn.pos");
+                    llvm::Value* one = llvm::ConstantInt::get(arg->getType(), 1);
+                    llvm::Value* negOne = llvm::ConstantInt::getSigned(arg->getType(), -1);
+                    llvm::Value* s1 = builder_.CreateSelect(isPos, one, zero, "sgn.1");
+                    return builder_.CreateSelect(isNeg, negOne, s1, "sgn.result");
+                }
                 if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round") {
                     // Use llvm intrinsics for common math ops.
                     llvm::Intrinsic::ID iid =
