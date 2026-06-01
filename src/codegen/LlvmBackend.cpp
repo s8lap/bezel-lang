@@ -4448,6 +4448,35 @@ private:
         const auto& m = ma->member;
         using P = sema::PrimitiveType;
 
+        // string.IsNullOrEmpty(s): bool — true if s is null or length 0.
+        if (pt == P::String && m == "IsNullOrEmpty" &&
+            call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            // null → true
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                arg, llvm::ConstantPointerNull::get(ptrTy()), "ine.null");
+            auto* nullBB = llvm::BasicBlock::Create(llvm_, "ine.null", currentFn_);
+            auto* checkBB= llvm::BasicBlock::Create(llvm_, "ine.check", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ine.end",   currentFn_);
+            auto* entBB  = builder_.GetInsertBlock();
+            builder_.CreateCondBr(isNull, endBB, checkBB);
+            builder_.SetInsertPoint(checkBB);
+            llvm::Value* len = loadStringLen(arg);
+            llvm::Value* empty = builder_.CreateICmpEQ(len, builder_.getInt64(0), "ine.empty");
+            auto* chkEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "ine.result");
+            phi->addIncoming(builder_.getTrue(), entBB);
+            phi->addIncoming(empty, chkEnd);
+            return phi;
+        }
+        // string.Empty → empty string literal.
+        if (pt == P::String && m == "Empty" && call.args.empty()) {
+            return lowerStringLiteral("\"\"", false);
+        }
+
         // int.Parse(s) / long.Parse(s) / double.Parse(s) etc.
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* arg = lowerExpr(*call.args[0].value);
