@@ -5687,6 +5687,66 @@ private:
                 return builder_.CreateCall(logFn, {arg}, std::string(m) + ".result");
             }
         }
+
+        // §2.x: Random class — pseudorandom numbers via libc rand()/srand().
+        if (cls == "Random") {
+            auto* randFn = module_->getFunction("rand");
+            if (!randFn) {
+                auto* ft = llvm::FunctionType::get(i32(), {}, false);
+                randFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "rand", module_.get());
+            }
+            // Helper: make non-negative.
+            auto absRand = [&](llvm::Value* v) -> llvm::Value* {
+                llvm::Value* isNeg = builder_.CreateICmpSLT(
+                    v, llvm::ConstantInt::get(i32(), 0));
+                return builder_.CreateSelect(isNeg, builder_.CreateNeg(v), v);
+            };
+            if (m == "Next" && call.args.empty())
+                return builder_.CreateCall(randFn, {}, "rand.ret");
+            if (m == "Next" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* maxV = lowerExpr(*call.args[0].value);
+                if (!maxV) return nullptr;
+                return builder_.CreateSRem(
+                    absRand(builder_.CreateCall(randFn, {}, "rand.r")),
+                    maxV, "rand.mod");
+            }
+            if (m == "Next" && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* minV = lowerExpr(*call.args[0].value);
+                llvm::Value* maxV = lowerExpr(*call.args[1].value);
+                if (!minV || !maxV) return nullptr;
+                llvm::Value* range = builder_.CreateSub(maxV, minV);
+                return builder_.CreateAdd(
+                    builder_.CreateSRem(
+                        absRand(builder_.CreateCall(randFn, {}, "rand.r")),
+                        range),
+                    minV, "rand.result");
+            }
+            if (m == "NextDouble" && call.args.empty()) {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                llvm::Value* r = absRand(builder_.CreateCall(randFn, {}, "rand.r"));
+                return builder_.CreateFDiv(
+                    builder_.CreateSIToFP(r, dbl),
+                    llvm::ConstantFP::get(dbl, 2147483648.0), "rand.dbl");
+            }
+            if (m == "Seed" && call.args.size() == 1 && call.args[0].value) {
+                auto* srandFn = module_->getFunction("srand");
+                if (!srandFn) {
+                    auto* ft = llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(llvm_), {i32()}, false);
+                    srandFn = llvm::Function::Create(
+                        ft, llvm::Function::ExternalLinkage, "srand", module_.get());
+                }
+                llvm::Value* seed = lowerExpr(*call.args[0].value);
+                if (!seed) return nullptr;
+                if (!seed->getType()->isIntegerTy(32))
+                    seed = builder_.CreateTrunc(seed, i32());
+                builder_.CreateCall(srandFn, {seed});
+                return nullptr;  // unit
+            }
+        }
+
         return nullptr;
     }
 
@@ -5768,6 +5828,56 @@ private:
             auto* phi = builder_.CreatePHI(i1(), 2, "ine.result");
             phi->addIncoming(builder_.getTrue(), entBB);
             phi->addIncoming(empty, chkEnd);
+            return phi;
+        }
+        // string.IsNullOrWhiteSpace(s): bool — null, empty, or all whitespace.
+        if (pt == P::String && m == "IsNullOrWhiteSpace" &&
+            call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            auto* isspaceFn = module_->getFunction("isspace");
+            if (!isspaceFn) {
+                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                isspaceFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "isspace", module_.get());
+            }
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                arg, llvm::ConstantPointerNull::get(ptrTy()), "inws.null");
+            auto* entBB = builder_.GetInsertBlock();
+            auto* chkBB = llvm::BasicBlock::Create(llvm_, "inws.chk", currentFn_);
+            auto* loopBB = llvm::BasicBlock::Create(llvm_, "inws.loop", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "inws.body", currentFn_);
+            auto* nonwsBB = llvm::BasicBlock::Create(llvm_, "inws.nonws", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "inws.end",  currentFn_);
+            builder_.CreateCondBr(isNull, endBB, chkBB);
+            builder_.SetInsertPoint(chkBB);
+            llvm::Value* len = loadStringLen(arg);
+            llvm::Value* data = loadStringData(arg);
+            auto* idxS = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxS);
+            builder_.CreateBr(loopBB);
+            builder_.SetInsertPoint(loopBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            // For now: only check width=1 chars (ASCII whitespace check).
+            llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
+            llvm::Value* cp = loadCodePoint(arg, idxB);
+            llvm::Value* isSp = builder_.CreateCall(isspaceFn, {cp});
+            llvm::Value* isSpBool = builder_.CreateICmpNE(isSp, builder_.getInt32(0));
+            auto* incBB = llvm::BasicBlock::Create(llvm_, "inws.inc", currentFn_);
+            builder_.CreateCondBr(isSpBool, incBB, nonwsBB);
+            builder_.SetInsertPoint(incBB);
+            builder_.CreateStore(builder_.CreateAdd(idxB, builder_.getInt64(1)), idxS);
+            builder_.CreateBr(loopBB);
+            builder_.SetInsertPoint(nonwsBB);
+            builder_.CreateBr(endBB);
+            auto* nonwsEnd = builder_.GetInsertBlock();
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 3, "inws.result");
+            phi->addIncoming(builder_.getTrue(), entBB);   // null → true
+            phi->addIncoming(builder_.getTrue(), loopBB);  // all whitespace → true
+            phi->addIncoming(builder_.getFalse(), nonwsEnd);// found non-WS → false
             return phi;
         }
         // string.Empty → empty string literal.
@@ -6232,7 +6342,41 @@ private:
                 return builder_.CreateAnd(geL, leH);
             }
         }
-        return nullptr;  // binding/type/null/destructure — deferred
+        // §19: BindingPattern `var x` or `var x: T` (§3016).
+        // Unconstrained `var x` always matches and binds the scrutinee's value
+        // to `x` within the arm body. The binding is a borrow (non-destructive).
+        // `var x: T` with a type annotation is a type-test + binding.
+        if (auto* bp = dynamic_cast<const ast::BindingPattern*>(pat)) {
+            // Look up the LocalSymbol for this binding from sema.
+            // Sema symbolizes binding-pattern names in the arm scope.
+            // We need to make the scrutinee value available as `bp->name`.
+            // For now, store into the arm's local symbol slot if we can find it.
+            // The alloca for the binding variable is created in lowerCaseExpr/Stmt
+            // by looking up the arm's symbols — but currently we don't thread that
+            // context here. Simplest: always match (true) and let the arm body
+            // resolve the name directly through the scrutinee slot.
+            // TODO: wire binding symbol → alloca and store scrut into it.
+            // For the type-constrained form (`var x: T`), emit a type test:
+            if (bp->type) {
+                // Type-test pattern: matches if scrutinee is-a T.
+                if (auto* rt = ctx_.resolvedType(*bp->type)) {
+                    if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
+                        auto dit = descArray_.find(rt->declaration);
+                        if (dit != descArray_.end())
+                            return emitIsA(scrut, dit->second);
+                    }
+                }
+                return nullptr;  // type not found — deferred
+            }
+            // Unconstrained `var x`: always matches.
+            return builder_.getInt1(true);
+        }
+        // §19: NullPattern — matches null.
+        if (dynamic_cast<const ast::NullPattern*>(pat)) {
+            return builder_.CreateICmpEQ(
+                scrut, llvm::ConstantPointerNull::get(ptrTy()), "null.match");
+        }
+        return nullptr;  // destructure/positional — deferred
     }
 
     // CG28: equality of two same-typed scalars (int or FP).
