@@ -5065,6 +5065,24 @@ private:
                     llvm::Value* s1 = builder_.CreateSelect(isPos, one, zero, "sgn.1");
                     return builder_.CreateSelect(isNeg, negOne, s1, "sgn.result");
                 }
+                // Math.IsNaN(x): bool — NaN is not equal to itself.
+                if (m == "IsNaN") {
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!arg->getType()->isDoubleTy())
+                        arg = builder_.CreateSIToFP(arg, dbl);
+                    return builder_.CreateFCmpUNO(arg, arg, "isnan");
+                }
+                // Math.IsInfinity(x): bool — compare with +/-infinity.
+                if (m == "IsInfinity") {
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!arg->getType()->isDoubleTy())
+                        arg = builder_.CreateSIToFP(arg, dbl);
+                    auto* posInf = llvm::ConstantFP::getInfinity(dbl, false);
+                    auto* negInf = llvm::ConstantFP::getInfinity(dbl, true);
+                    llvm::Value* isPosInf = builder_.CreateFCmpOEQ(arg, posInf);
+                    llvm::Value* isNegInf = builder_.CreateFCmpOEQ(arg, negInf);
+                    return builder_.CreateOr(isPosInf, isNegInf, "isinf");
+                }
                 if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round") {
                     // Use llvm intrinsics for common math ops.
                     llvm::Intrinsic::ID iid =
