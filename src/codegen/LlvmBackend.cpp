@@ -966,6 +966,14 @@ private:
             return lowerExpr(*call.args[idx].value);
         };
 
+        // §9.6: CompareTo(other: string): int — ordinal lexicographic comparison.
+        // Returns negative / 0 / positive (same as emitStringOrdCmp).
+        if (method == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* other = getStrArg(0);
+            if (!other) return nullptr;
+            return builder_.CreateTrunc(emitStringOrdCmp(self, other), i32(), "cmp.result");
+        }
+
         // §9.6: StartsWith(prefix: string): bool
         // prefix.len <= self.len AND memcmp(self.data, prefix.data, prefix.len)==0
         if (method == "StartsWith") {
