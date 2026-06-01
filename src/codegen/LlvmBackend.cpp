@@ -902,10 +902,15 @@ private:
         } else if ((kind == 'G') && isFloat) {
             snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + "g";
         } else if (kind == 'X' && isInt) {
-            snprintfFmt = (spec[0] == 'x') ? "%x" : "%X";
-        } else if (kind == 'D' && isInt) {
+            // §18.5 X[n]: zero-padded hex to n digits minimum.
+            char xch = (spec[0] == 'x') ? 'x' : 'X';
             snprintfFmt = width >= 0
-                ? ("%" + std::to_string(width) + "d")
+                ? ("%0" + std::to_string(width) + xch)
+                : (std::string("%") + xch);
+        } else if (kind == 'D' && isInt) {
+            // §18.5 D[n]: zero-padded decimal to n digits minimum.
+            snprintfFmt = width >= 0
+                ? ("%0" + std::to_string(width) + "d")
                 : "%d";
         } else {
             return nullptr;  // unknown format spec
@@ -4963,7 +4968,13 @@ private:
                                         if (tt->primitive == P::Float)
                                             recv = builder_.CreateFPExt(recv, llvm::Type::getDoubleTy(llvm_));
                                     } else if (spec == 'X' || spec == 'D') {
-                                        printfFmt = spec == 'X' ? "%x" : "%d";
+                                        // §18.5: D/X with digits = min width, zero-padded.
+                                        // D5 → %05d, X4 → %04X.
+                                        char pfspec2 = spec == 'X' ? 'X' : 'd';
+                                        if (!digits.empty())
+                                            printfFmt = std::string("%0") + digits + pfspec2;
+                                        else
+                                            printfFmt = spec == 'X' ? "%X" : "%d";
                                         if (!recv->getType()->isIntegerTy(32))
                                             recv = builder_.CreateFPToSI(recv, i32());
                                     } else {
