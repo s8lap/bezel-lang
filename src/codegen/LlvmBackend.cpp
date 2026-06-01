@@ -1192,6 +1192,46 @@ private:
             return phi;
         }
 
+        // §9.6: Repeat(n: int): string — repeat self n times.
+        if (method == "Repeat" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* nArg = lowerExpr(*call.args[0].value);
+            if (!nArg) return nullptr;
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* selfLen = loadStringLen(self);
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* n64 = builder_.CreateSExt(nArg, i64(), "rep.n");
+            llvm::Value* totalLen = builder_.CreateMul(selfLen, n64, "rep.total");
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            llvm::Value* dataSz = builder_.CreateAdd(totalLen, builder_.getInt64(1));
+            llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "rep.data");
+            // Loop: copy self n times.
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "rep.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rep.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "rep.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, n64), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* off = builder_.CreateMul(idxB, selfLen, "rep.off");
+            llvm::Value* dst = builder_.CreateGEP(i8Ty, newData, off, "rep.dst");
+            builder_.CreateCall(memcpyFn, {dst, selfData, selfLen});
+            builder_.CreateStore(builder_.CreateAdd(idxB, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, totalLen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rep.obj");
+            builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), strObj, 0));
+            builder_.CreateStore(totalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+            return strObj;
+        }
+
         return nullptr;  // method not recognised
     }
 

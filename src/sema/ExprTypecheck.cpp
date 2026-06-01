@@ -1667,7 +1667,8 @@ private:
                             ma.member == "Trim" || ma.member == "TrimStart" ||
                             ma.member == "TrimEnd" || ma.member == "ToLower" ||
                             ma.member == "ToUpper" || ma.member == "Replace" ||
-                            ma.member == "PadLeft" || ma.member == "PadRight") {
+                            ma.member == "PadLeft" || ma.member == "PadRight" ||
+                            ma.member == "Repeat") {
                             ctx_.setExprType(
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                             return;
