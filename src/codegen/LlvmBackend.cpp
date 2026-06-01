@@ -3662,7 +3662,24 @@ private:
                 return fp ? builder_.CreateFCmpOGE(scrut, rv)
                           : builder_.CreateICmpSGE(scrut, rv);
         }
-        return nullptr;  // binding/type/range/null/destructure — deferred
+        // §19: range patterns `lo..hi` and `lo..<hi` — same semantics as
+        // the `in` operator but in a case arm. The pattern matches when
+        // lo <= scrut <= hi (inclusive) or lo <= scrut < hi (half-open).
+        if (auto* rp = dynamic_cast<const ast::RangePattern*>(pat)) {
+            auto* range = dynamic_cast<const ast::RangeExpr*>(
+                rp->rangeExpr.get());
+            if (range && range->lo && range->hi && !range->step) {
+                llvm::Value* lo = lowerExpr(*range->lo);
+                llvm::Value* hi = lowerExpr(*range->hi);
+                if (!lo || !hi) return nullptr;
+                llvm::Value* geL = builder_.CreateICmpSGE(scrut, lo);
+                llvm::Value* leH = range->inclusive
+                                       ? builder_.CreateICmpSLE(scrut, hi)
+                                       : builder_.CreateICmpSLT(scrut, hi);
+                return builder_.CreateAnd(geL, leH);
+            }
+        }
+        return nullptr;  // binding/type/null/destructure — deferred
     }
 
     // CG28: equality of two same-typed scalars (int or FP).
