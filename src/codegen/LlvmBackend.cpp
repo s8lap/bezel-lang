@@ -4110,6 +4110,88 @@ private:
         return nullptr;  // unit (void)
     }
 
+    // CG-console: Console.ReadLine() → string? (null at EOF).
+    // Uses fgets(buf, 4096, stdin), strips trailing newline, copies to heap.
+    llvm::Value* emitConsoleReadLine() {
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        const unsigned BUFSZ = 4096;
+        llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, BUFSZ));
+        llvm::Value* bufPtr = builder_.CreateGEP(
+            llvm::ArrayType::get(i8Ty, BUFSZ), buf,
+            {builder_.getInt64(0), builder_.getInt64(0)});
+        // fgets(bufPtr, BUFSZ, stdin)
+        auto* fgetsFn = module_->getFunction("fgets");
+        if (!fgetsFn) {
+            auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i32(), ptrTy()}, false);
+            fgetsFn = llvm::Function::Create(
+                ft, llvm::Function::ExternalLinkage, "fgets", module_.get());
+        }
+        // stdin global (FILE*)
+        auto* stdinGV = module_->getGlobalVariable("stdin");
+        if (!stdinGV) {
+            stdinGV = new llvm::GlobalVariable(
+                *module_, ptrTy(), false,
+                llvm::GlobalValue::ExternalLinkage, nullptr, "stdin");
+        }
+        llvm::Value* stdinVal = builder_.CreateLoad(ptrTy(), stdinGV, "stdin");
+        llvm::Value* fgRet = builder_.CreateCall(
+            fgetsFn, {bufPtr, builder_.getInt32(BUFSZ), stdinVal}, "fgets.ret");
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* isEOF = builder_.CreateICmpEQ(fgRet, nullPtr, "rl.eof");
+        auto* eofBB = llvm::BasicBlock::Create(llvm_, "rl.eof",  currentFn_);
+        auto* okBB  = llvm::BasicBlock::Create(llvm_, "rl.ok",   currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "rl.end",  currentFn_);
+        builder_.CreateCondBr(isEOF, eofBB, okBB);
+        builder_.SetInsertPoint(eofBB);
+        builder_.CreateBr(endBB);
+        // OK: compute length, strip trailing '\n'.
+        builder_.SetInsertPoint(okBB);
+        auto* strlenFn = module_->getFunction("strlen");
+        if (!strlenFn) {
+            auto* ft2 = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+            strlenFn = llvm::Function::Create(
+                ft2, llvm::Function::ExternalLinkage, "strlen", module_.get());
+        }
+        llvm::Value* rawLen = builder_.CreateCall(strlenFn, {bufPtr}, "rawlen");
+        llvm::Value* hasBytes = builder_.CreateICmpSGT(rawLen, builder_.getInt64(0));
+        auto* stripBB = llvm::BasicBlock::Create(llvm_, "rl.strip", currentFn_);
+        auto* afterBB = llvm::BasicBlock::Create(llvm_, "rl.after", currentFn_);
+        builder_.CreateCondBr(hasBytes, stripBB, afterBB);
+        builder_.SetInsertPoint(stripBB);
+        llvm::Value* lastIdx = builder_.CreateSub(rawLen, builder_.getInt64(1));
+        llvm::Value* lastPtr = builder_.CreateGEP(i8Ty, bufPtr, lastIdx);
+        llvm::Value* lastByte = builder_.CreateLoad(i8Ty, lastPtr);
+        llvm::Value* isNL = builder_.CreateICmpEQ(lastByte, llvm::ConstantInt::get(i8Ty, '\n'));
+        auto* nlBB = llvm::BasicBlock::Create(llvm_, "rl.nl", currentFn_);
+        builder_.CreateCondBr(isNL, nlBB, afterBB);
+        builder_.SetInsertPoint(nlBB);
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), lastPtr);
+        builder_.CreateBr(afterBB);
+        builder_.SetInsertPoint(afterBB);
+        // Final length after stripping.
+        llvm::Value* finalLen = builder_.CreateCall(strlenFn, {bufPtr}, "finalLen");
+        // Heap-copy the data.
+        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+        llvm::Value* dataSz = builder_.CreateAdd(finalLen, builder_.getInt64(1));
+        llvm::Value* dataCopy = builder_.CreateCall(mallocFn, {dataSz}, "rl.data");
+        builder_.CreateCall(memcpyFn, {dataCopy, bufPtr, finalLen});
+        llvm::Value* endData = builder_.CreateGEP(i8Ty, dataCopy, finalLen);
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), endData);
+        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+        llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rl.obj");
+        builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
+        builder_.CreateStore(finalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+        auto* okEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        // Merge.
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(ptrTy(), 2, "rl.result");
+        phi->addIncoming(nullPtr, eofBB);
+        phi->addIncoming(strObj, okEnd);
+        return phi;
+    }
+
     // Detect `Console.Write(...)` / `Console.WriteLine(...)` /
     // `Console.WriteLine()` (no-arg) as intrinsic call patterns.
     // Returns true and emits code if the pattern matches; false otherwise.
@@ -4276,6 +4358,16 @@ private:
         if (!call.callee) return nullptr;
         // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
         if (tryLowerConsoleCall(call)) return nullptr;  // unit result
+        // Console.ReadLine() → string? (returns a value, not unit)
+        if (call.args.empty() && call.callee) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+                if (ma->member == "ReadLine" && ma->target) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+                        if (id->name == "Console") return emitConsoleReadLine();
+                    }
+                }
+            }
+        }
         // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
         if (auto* v = tryLowerBuiltinClassCall(call)) return v;
         // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a

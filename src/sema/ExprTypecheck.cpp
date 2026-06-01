@@ -1653,7 +1653,14 @@ private:
                     else if (m=="ToBoolean") setBool();
                     else if (m=="ToString") setStr();
                 }
-                // Console methods always return unit — leave untyped (unit).
+                // Console.ReadLine() → string? (null at EOF).
+                if (cls == "Console") {
+                    if (m == "ReadLine")
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::String,
+                                                       /*nullable=*/true));
+                    // Write/WriteLine/ReadKey → unit (leave untyped).
+                }
             }
             // Slice 3d intentionally does NOT diagnose unknown members.
             return;
