@@ -344,3 +344,50 @@ BEZEL_TEST(integration, math_pow_and_sqrt) {
         "  return (1 if area > 78.0 else 0); "
         "end Main; end C;"), 1);
 }
+
+BEZEL_TEST(integration, recursive_fibonacci) {
+    // Fibonacci via recursive method call.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static method Fib(n: int): int "
+        "    if n <= 1 then return n; end; "
+        "    return Fib(n - 1) + Fib(n - 2); "
+        "  end Fib; "
+        "  public static method Main(): int return Fib(10); "
+        "  end Main; "
+        "end C;"), 55);
+}
+
+BEZEL_TEST(integration, exception_catch_app_error) {
+    // User-defined exception type caught by its exact type.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class AppError end AppError; "
+        "class C "
+        "  public static method Main(): int "
+        "    try throw new AppError(); "
+        "    catch AppError => return 7; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 7);
+}
+
+BEZEL_TEST(integration, string_interpolation_with_class) {
+    // Interpolated string with class {obj} calls ToString().
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class Point "
+        "  public _x: int := 0; public _y: int := 0; "
+        "  public override method ToString(): string "
+        "    return $\"({_x},{_y})\"; "
+        "  end ToString; "
+        "end Point; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var p := new Point(); "
+        "    p._x := 3; p._y := 4; "
+        "    var s := $\"Point: {p}\"; "
+        "    return s.Length; "
+        "  end Main; "
+        "end C;"), 12);  // "Point: (3,4)" = 12 chars
+}
