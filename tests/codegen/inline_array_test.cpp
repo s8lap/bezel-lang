@@ -208,3 +208,17 @@ BEZEL_TEST(codegen_array, for_in_array_with_break) {
         "  return found; "
         "end Main; end C;"), 7);
 }
+
+// for-in over an inline array expression (not just a variable).
+// The result is spilled to a temp alloca so GEP has an address.
+BEZEL_TEST(codegen_array, for_in_array_expression) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method GetArr(): [3]int "
+        "    var a: [3]int; a[0]:=10; a[1]:=20; a[2]:=30; return a; "
+        "  end GetArr; "
+        "  public static method Main(): int "
+        "    var s := 0; for var x in GetArr() do s := s + x; end; return s; "
+        "  end Main; "
+        "end C;"), 60);
+}

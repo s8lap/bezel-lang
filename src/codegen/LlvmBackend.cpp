@@ -2369,9 +2369,25 @@ private:
     // each body iteration so `x` in the body resolves to the current element.
     bool lowerArrayFor(const ast::ForStmt& fs) {
         if (!fs.iterable) return false;
+        // Try the lvalue path first (local/field/parameter — no spill needed).
         llvm::Type* arrSlotTy = nullptr;
         llvm::Value* arrAddr = lvalueAddr(*fs.iterable, arrSlotTy);
-        if (!arrAddr || !arrSlotTy) return false;
+        // If the iterable is an expression (e.g. a method call returning [N]T),
+        // evaluate it and spill the array value to a temp alloca so we have an
+        // address to GEP through.
+        if (!arrAddr || !arrSlotTy) {
+            // Check exprType to see if the iterable is an InlineArray.
+            auto* tt = ctx_.exprType(*fs.iterable);
+            if (!tt || tt->kind != sema::TypeRef::Kind::InlineArray) return false;
+            llvm::Value* v = lowerExpr(*fs.iterable);
+            if (!v) return false;
+            auto* at = llvm::dyn_cast<llvm::ArrayType>(v->getType());
+            if (!at) return false;
+            llvm::AllocaInst* tmp = entryAlloca(at);
+            builder_.CreateStore(v, tmp);
+            arrAddr = tmp;
+            arrSlotTy = at;
+        }
         auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(arrSlotTy);
         if (!arrTy) return false;
         uint64_t N = arrTy->getNumElements();
