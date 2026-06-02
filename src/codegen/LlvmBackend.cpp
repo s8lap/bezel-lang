@@ -6488,7 +6488,12 @@ private:
             emitImplicitBase(t, obj);
             emitPendingCheck();  // CG20: the base constructor may throw
         }
-        // CG-generic: restore the outer generic substitution.
+        // CG-generic: record the substitution for this new object so that
+        // lowerLocalDecl can associate it correctly even when the outer
+        // savedSubst would override the lastCallGenericSubst_ from a prior call.
+        if (!genericSubst_.empty())
+            lastCallGenericSubst_ = genericSubst_;
+        // Restore the outer generic substitution.
         genericSubst_ = std::move(savedSubst);
         return obj;
     }
