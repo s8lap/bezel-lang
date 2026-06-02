@@ -4350,6 +4350,21 @@ private:
                 if (!rhs) return false;
                 if (as->op == ":=") {
                     builder_.CreateStore(rhs, addr);
+                } else if (as->op == "??=") {
+                    // §4.7: null-coalescing assignment `x ??= e` — store e
+                    // into x only when x is currently null.
+                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    if (cur->getType()->isPointerTy()) {
+                        auto* isNull = builder_.CreateICmpEQ(
+                            cur, llvm::ConstantPointerNull::get(ptrTy()));
+                        auto* assignBB = llvm::BasicBlock::Create(llvm_, "coaleq.do", currentFn_);
+                        auto* endBB = llvm::BasicBlock::Create(llvm_, "coaleq.end", currentFn_);
+                        builder_.CreateCondBr(isNull, assignBB, endBB);
+                        builder_.SetInsertPoint(assignBB);
+                        builder_.CreateStore(rhs, addr);
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(endBB);
+                    }
                 } else {
                     // CG31: compound assignment `target OP= value` — read,
                     // apply OP (overflow-checked like plain arithmetic),
