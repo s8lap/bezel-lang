@@ -4013,11 +4013,74 @@ private:
     // §22.4/§22.7: select the constructor of `cls` whose parameters the
     // given arguments can fill (named/positional + defaults). Prefers an
     // exact-arity match, else the first that argsCanFill accepts.
+    // Count constructors with exactly n params (excluding `exclude`).
+    int ctorArityCount(const sema::TypeSymbol* cls, std::size_t n,
+                       const sema::ConstructorSymbol* exclude) {
+        int cnt = 0;
+        for (sema::Symbol* m : cls->members) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+            if (!cs || cs->isStatic || cs == exclude) continue;
+            if (cs->params.size() == n) cnt++;
+        }
+        return cnt;
+    }
+
     sema::ConstructorSymbol* ctorForArgs(
         const sema::TypeSymbol* cls,
         const std::vector<ast::CallArgument>& args) {
         if (!cls) return nullptr;
-        if (auto* exact = ctorByArity(cls, args.size(), nullptr)) return exact;
+        // If exactly one constructor matches by arity, use it directly.
+        if (ctorArityCount(cls, args.size(), nullptr) == 1) {
+            if (auto* exact = ctorByArity(cls, args.size(), nullptr)) return exact;
+        }
+        // Multiple constructors with same arity: resolve by LLVM type
+        // matching. Lower each arg, check if the lowered type matches
+        // the constructor's parameter type. Use the sema type of each
+        // arg (ptr for class/string, i32 for int, etc.) to discriminate.
+        if (ctorArityCount(cls, args.size(), nullptr) > 1) {
+            // Collect candidate ctors with matching arity.
+            std::vector<sema::ConstructorSymbol*> candidates;
+            for (sema::Symbol* m : cls->members) {
+                auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+                if (!cs || cs->isStatic) continue;
+                if (cs->params.size() == args.size()) candidates.push_back(cs);
+            }
+            // For each candidate, check if positional arg sema types are
+            // compatible with param sema types.
+            for (auto* cs : candidates) {
+                auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                if (!cd || cd->params.size() != args.size()) continue;
+                bool match = true;
+                for (std::size_t pi = 0; pi < args.size() && match; ++pi) {
+                    if (!args[pi].value || !cd->params[pi].type) continue;
+                    // Check if arg's sema type is "pointer-typed" (class/string)
+                    // vs "int-typed" — use this to discriminate class vs int params.
+                    auto* argTy = ctx_.exprType(*args[pi].value);
+                    bool argIsPtr = argTy && (
+                        (argTy->kind == sema::TypeRef::Kind::Named) ||
+                        (argTy->kind == sema::TypeRef::Kind::Primitive &&
+                         (argTy->primitive == sema::PrimitiveType::String ||
+                          argTy->primitive == sema::PrimitiveType::Char)));
+                    bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
+                        args[pi].value.get()) != nullptr;
+                    argIsPtr = argIsPtr || argIsNull;
+
+                    auto* paramTy = ctx_.resolvedType(*cd->params[pi].type);
+                    bool paramIsPtr = paramTy && (
+                        (paramTy->kind == sema::TypeRef::Kind::Named) ||
+                        (paramTy->kind == sema::TypeRef::Kind::Primitive &&
+                         (paramTy->primitive == sema::PrimitiveType::String ||
+                          paramTy->primitive == sema::PrimitiveType::Char)) ||
+                        paramTy->nullable);
+
+                    // If one is ptr and other is not, no match.
+                    if (argIsPtr != paramIsPtr) match = false;
+                }
+                if (match) return cs;
+            }
+            // No perfect type match — fall back to first by arity.
+            return candidates.empty() ? nullptr : candidates[0];
+        }
         for (sema::Symbol* m : cls->members) {
             auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
             if (!cs || cs->isStatic) continue;
