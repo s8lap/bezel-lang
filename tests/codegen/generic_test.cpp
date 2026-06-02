@@ -365,3 +365,28 @@ BEZEL_TEST(codegen_generic, two_param_string_key_map) {
         "  end Main; "
         "end Program;"), 1);
 }
+
+// Test: ref params in generic method specialization (§14/CG50)
+BEZEL_TEST(codegen_generic, ref_param_in_spec_inorder) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Coll<K> "
+        "  private _d: [10]K; private _n: int := 0; "
+        "  public constructor() end constructor; "
+        "  public method Add(v: K) _d[_n] := v; _n := _n + 1; end Add; "
+        "  public method Copy(ref r: [20]K, ref n: int) "
+        "    for var i in 0.._n-1 do r[n] := _d[i]; n := n + 1; end; "
+        "  end Copy; "
+        "  destructor end destructor; "
+        "end Coll; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var c := new Coll<int>(); "
+        "    c.Add(10); c.Add(20); c.Add(30); "
+        "    var arr: [20]int; var n := 0; "
+        "    c.Copy(ref arr, ref n); "
+        "    if n = 3 and arr[0] = 10 and arr[2] = 30 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
