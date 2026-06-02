@@ -2509,6 +2509,21 @@ private:
                     }
                     return i32();  // unresolved generic param → i32 fallback
                 }
+                // §3 stdlib: collection and IO built-in classes (no user TypeDecl).
+                // All are heap-allocated opaque pointers to runtime structs.
+                if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty()) {
+                    auto n = rt->astNode->name->parts[0];
+                    if (n == "Array" || n == "OwnedArray" ||
+                        n == "Dictionary" || n == "OwnedDictionary" ||
+                        n == "Stack" || n == "OwnedStack" ||
+                        n == "Queue" || n == "OwnedQueue" ||
+                        n == "Set" || n == "OwnedSet" ||
+                        n == "LinkedList" || n == "OwnedLinkedList" ||
+                        n == "StringBuilder" || n == "Random" ||
+                        n == "DateTime" || n == "TimeSpan")
+                        return ptrTy();
+                }
                 if (rt->declaration &&
                     (rt->declaration->kind == ast::TypeDeclKind::Class ||
                      rt->declaration->kind == ast::TypeDeclKind::Interface)) {
@@ -5142,6 +5157,50 @@ private:
                 return true;
             }
         }
+        // §3: for var x in array (runtime Array<T> object).
+        {
+            auto* iterTy = ctx_.exprType(*fs.iterable);
+            if (isCollectionTypeName(iterTy)) {
+                llvm::Value* arrObj = lowerExpr(*fs.iterable);
+                if (!arrObj) return false;
+                // Determine element type from generic arg.
+                llvm::Type* elemTy = i32();
+                int64_t esz = 8;
+                if (iterTy && !iterTy->genericArgs.empty() && iterTy->genericArgs[0]) {
+                    elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+                    esz = collectionElemSize(iterTy);
+                }
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {arrObj});
+                auto* idxSlotR = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlotR);
+                auto* varSlotR = entryAlloca(elemTy);
+                locals_[&fs] = varSlotR;
+                auto* condBBR = llvm::BasicBlock::Create(llvm_, "rt.cond", currentFn_);
+                auto* bodyBBR = llvm::BasicBlock::Create(llvm_, "rt.body", currentFn_);
+                auto* incBBR  = llvm::BasicBlock::Create(llvm_, "rt.inc",  currentFn_);
+                auto* endBBR  = llvm::BasicBlock::Create(llvm_, "rt.end",  currentFn_);
+                builder_.CreateBr(condBBR);
+                builder_.SetInsertPoint(condBBR);
+                llvm::Value* idxR = builder_.CreateLoad(i64(), idxSlotR);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idxR, len), bodyBBR, endBBR);
+                builder_.SetInsertPoint(bodyBBR);
+                llvm::Value* idxR2 = builder_.CreateLoad(i64(), idxSlotR);
+                llvm::Value* ep = builder_.CreateCall(ptrAtFn,
+                    {arrObj, idxR2, builder_.getInt64(esz)});
+                llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
+                builder_.CreateStore(elem, varSlotR);
+                loopStack_.push_back({incBBR, endBBR, disposeStack_.size()});
+                lowerScopedBlock(fs.body);
+                loopStack_.pop_back();
+                llvm::Value* idxR3 = builder_.CreateLoad(i64(), idxSlotR);
+                builder_.CreateStore(builder_.CreateAdd(idxR3, builder_.getInt64(1)), idxSlotR);
+                builder_.CreateBr(condBBR);
+                builder_.SetInsertPoint(endBBR);
+                return true;
+            }
+        }
         // Try the lvalue path first (local/field/parameter — no spill needed).
         llvm::Type* arrSlotTy = nullptr;
         llvm::Value* arrAddr = lvalueAddr(*fs.iterable, arrSlotTy);
@@ -6006,6 +6065,29 @@ private:
                 if (llvm::Value* addr = lvalueAddr(*ma->target, elemTy)) {
                     if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(elemTy)) {
                         return llvm::ConstantInt::get(i32(), arrTy->getNumElements(), true);
+                    }
+                }
+            }
+        }
+        // §3: Array<T>.Length / .Count — runtime bz_array_len.
+        // Dictionary<K,V>.Count — runtime bz_dict_count.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target && (ma->member == "Length" || ma->member == "Count")) {
+                auto* tt = ctx_.exprType(*ma->target);
+                if (isCollectionTypeName(tt)) {
+                    llvm::Value* obj = lowerExpr(*ma->target);
+                    if (obj) {
+                        auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
+                        llvm::Value* len64 = builder_.CreateCall(fn, {obj});
+                        return builder_.CreateTrunc(len64, i32(), "col.len");
+                    }
+                }
+                if (isDictTypeName(tt)) {
+                    llvm::Value* obj = lowerExpr(*ma->target);
+                    if (obj) {
+                        auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
+                        llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
+                        return builder_.CreateTrunc(cnt64, i32(), "dict.cnt");
                     }
                 }
             }
@@ -7203,6 +7285,56 @@ private:
                     return obj;
                 }
             }
+            // §3: stdlib collection types — allocate via runtime.
+            if (ne.type->name && !ne.type->name->parts.empty()) {
+                std::string_view colName = ne.type->name->parts[0];
+                // Determine element size from the first generic arg (if present).
+                // For pointer-typed elements (class, string) → sizeof(ptr) = 8.
+                // For int → 4, long → 8, double → 8, bool → 1, etc.
+                int64_t elemSize = 8;  // default: pointer
+                if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
+                    llvm::Type* et = lowerTypeRef(rt->genericArgs[0]);
+                    if (et) {
+                        if (et->isIntegerTy(32) || et->isFloatTy()) elemSize = 4;
+                        else if (et->isIntegerTy(1) || et->isIntegerTy(8)) elemSize = 1;
+                        else if (et->isIntegerTy(16)) elemSize = 2;
+                        else elemSize = 8;  // ptr, i64, double, struct
+                    }
+                }
+                if (colName == "Array" || colName == "OwnedArray" ||
+                    colName == "Stack" || colName == "OwnedStack" ||
+                    colName == "Queue" || colName == "OwnedQueue" ||
+                    colName == "Set" || colName == "OwnedSet" ||
+                    colName == "LinkedList" || colName == "OwnedLinkedList") {
+                    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                    return builder_.CreateCall(allocFn,
+                        {builder_.getInt64(elemSize), builder_.getInt64(16)});
+                }
+                if (colName == "Dictionary" || colName == "OwnedDictionary") {
+                    auto* allocFn = declareC("bz_dict_alloc", ptrTy(), {});
+                    return builder_.CreateCall(allocFn, {});
+                }
+                if (colName == "StringBuilder") {
+                    // StringBuilder is a bz_array_t of chars (elem_size=1 or 2).
+                    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                    return builder_.CreateCall(allocFn,
+                        {builder_.getInt64(2), builder_.getInt64(64)});
+                }
+                if (colName == "Random") {
+                    int64_t seed = 0;
+                    if (!ne.args.empty() && ne.args[0].value) {
+                        llvm::Value* sv = lowerExpr(*ne.args[0].value);
+                        if (sv && sv->getType()->isIntegerTy(64))
+                            seed = 0;  // pass dynamic seed below
+                        auto* allocFn = declareC("bz_random_alloc", ptrTy(), {i64()});
+                        return builder_.CreateCall(allocFn, {sv ? sv : builder_.getInt64(0)});
+                    }
+                    auto* timeFn = declareC("bz_datetime_now_ticks", i64(), {});
+                    llvm::Value* ts = builder_.CreateCall(timeFn, {});
+                    auto* allocFn = declareC("bz_random_alloc", ptrTy(), {i64()});
+                    return builder_.CreateCall(allocFn, {ts});
+                }
+            }
             return nullptr;
         }
         const sema::TypeSymbol* t = rt->declaration;
@@ -7933,6 +8065,249 @@ private:
         if (!strPtr) return false;
         emitConsoleWrite(strPtr, isWriteLine, stdfd);
         return true;
+    }
+
+    // Helper: get the element size (bytes) of the element type of a collection.
+    int64_t collectionElemSize(const sema::TypeRef* collTy) {
+        if (!collTy || collTy->genericArgs.empty() || !collTy->genericArgs[0])
+            return 8;
+        llvm::Type* et = lowerTypeRef(collTy->genericArgs[0]);
+        if (!et) return 8;
+        if (et->isIntegerTy(32) || et->isFloatTy()) return 4;
+        if (et->isIntegerTy(1) || et->isIntegerTy(8)) return 1;
+        if (et->isIntegerTy(16)) return 2;
+        return 8;  // ptr, i64, double
+    }
+
+    // Check if the named type (TypeRef with null declaration) is a collection.
+    static bool isCollectionTypeName(const sema::TypeRef* rt) {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+            return false;
+        auto n = rt->astNode->name->parts[0];
+        return n == "Array" || n == "OwnedArray" ||
+               n == "Stack" || n == "OwnedStack" ||
+               n == "Queue" || n == "OwnedQueue" ||
+               n == "Set" || n == "OwnedSet" ||
+               n == "LinkedList" || n == "OwnedLinkedList";
+    }
+
+    static bool isDictTypeName(const sema::TypeRef* rt) {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+            return false;
+        auto n = rt->astNode->name->parts[0];
+        return n == "Dictionary" || n == "OwnedDictionary";
+    }
+
+    // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
+    // Called from lowerCall before the normal method-symbol dispatch.
+    llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call) {
+        if (!call.callee) return nullptr;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+        if (!ma || !ma->target) return nullptr;
+        const auto& m = ma->member;
+
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isArr  = isCollectionTypeName(recvTy);
+        bool isDict = isDictTypeName(recvTy);
+        if (!isArr && !isDict) return nullptr;
+
+        llvm::Value* recv = lowerExpr(*ma->target);
+        if (!recv) return nullptr;
+
+        // -----------------------------------------------------------------------
+        // Array / Stack / Queue / Set / LinkedList methods
+        // -----------------------------------------------------------------------
+        if (isArr) {
+            int64_t esz = collectionElemSize(recvTy);
+
+            // .Length: int / .Count: int
+            if ((m == "Length" || m == "Count") && call.args.empty()) {
+                auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len64 = builder_.CreateCall(fn, {recv});
+                return builder_.CreateTrunc(len64, i32(), "arr.len");
+            }
+            // .Add(v) / .Push(v) / .Enqueue(v)
+            if ((m == "Add" || m == "Push" || m == "Enqueue") &&
+                call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                // Store elem to stack alloca, pass pointer to runtime
+                llvm::AllocaInst* slot = entryAlloca(v->getType());
+                builder_.CreateStore(v, slot);
+                auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)});
+                return llvm::ConstantInt::get(i32(), 0);  // unit/void result
+            }
+            // .Get(i): T / .Peek(): T (top/front element)
+            if ((m == "Get" || m == "Peek") &&
+                (call.args.size() == 1 || call.args.empty())) {
+                llvm::Value* idx = call.args.empty()
+                    ? nullptr : lowerExpr(*call.args[0].value);
+                if (!call.args.empty() && !idx) return nullptr;
+                if (call.args.empty()) {
+                    // Peek: last element (Stack) or first (Queue)
+                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                    idx = builder_.CreateSub(len, builder_.getInt64(1));
+                } else {
+                    idx = builder_.CreateSExt(idx, i64());
+                }
+                // Determine return type from generic arg
+                llvm::Type* retTy = i32();
+                if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                    retTy = lowerTypeRef(recvTy->genericArgs[0]);
+                llvm::AllocaInst* out = entryAlloca(retTy);
+                auto* fn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), i64(), ptrTy(), i64()});
+                builder_.CreateCall(fn, {recv, idx, out, builder_.getInt64(esz)});
+                return builder_.CreateLoad(retTy, out, "arr.elem");
+            }
+            // .Set(i, v)
+            if (m == "Set" && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* idx = lowerExpr(*call.args[0].value);
+                llvm::Value* v   = lowerExpr(*call.args[1].value);
+                if (!idx || !v) return nullptr;
+                idx = builder_.CreateSExt(idx, i64());
+                llvm::AllocaInst* slot = entryAlloca(v->getType());
+                builder_.CreateStore(v, slot);
+                auto* fn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), i64(), ptrTy(), i64()});
+                builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz)});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+            // .RemoveAt(i) / .Pop(): T / .Dequeue(): T
+            if (m == "RemoveAt" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* idx = lowerExpr(*call.args[0].value);
+                if (!idx) return nullptr;
+                idx = builder_.CreateSExt(idx, i64());
+                auto* fn = declareC("bz_array_remove_at", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), i64(), i64()});
+                builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz)});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+            if ((m == "Pop" || m == "Dequeue") && call.args.empty()) {
+                // Get last (Pop) or first (Dequeue) element, then remove it
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                llvm::Value* idx = m == "Pop"
+                    ? builder_.CreateSub(len, builder_.getInt64(1))
+                    : builder_.getInt64(0);
+                llvm::Type* retTy = i32();
+                if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                    retTy = lowerTypeRef(recvTy->genericArgs[0]);
+                llvm::AllocaInst* out = entryAlloca(retTy);
+                auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), i64(), ptrTy(), i64()});
+                builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
+                auto* remFn = declareC("bz_array_remove_at", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), i64(), i64()});
+                builder_.CreateCall(remFn, {recv, idx, builder_.getInt64(esz)});
+                return builder_.CreateLoad(retTy, out, "arr.pop");
+            }
+            // .Clear()
+            if (m == "Clear" && call.args.empty()) {
+                auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy()});
+                builder_.CreateCall(fn, {recv});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+            // .IsEmpty(): bool
+            if (m == "IsEmpty" && call.args.empty()) {
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                return builder_.CreateICmpEQ(len, builder_.getInt64(0), "arr.empty");
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Dictionary<string, V> methods (string-key variant)
+        // -----------------------------------------------------------------------
+        if (isDict) {
+            // Helper: extract string data/len from bz.string ptr
+            auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
+                llvm::Value* data = loadStringData(s);
+                llvm::Value* len  = loadStringLen(s);
+                return {data, len};
+            };
+
+            // .Count: int
+            if (m == "Count" && call.args.empty()) {
+                auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
+                llvm::Value* c = builder_.CreateCall(fn, {recv});
+                return builder_.CreateTrunc(c, i32());
+            }
+            // .ContainsKey(k): bool
+            if (m == "ContainsKey" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* k = lowerExpr(*call.args[0].value);
+                if (!k) return nullptr;
+                auto [kd, kl] = strDataLen(k);
+                auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
+                return builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
+            }
+            // .Add(k, v) / .Set(k, v)
+            if ((m == "Add" || m == "Set") && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* k = lowerExpr(*call.args[0].value);
+                llvm::Value* v = lowerExpr(*call.args[1].value);
+                if (!k || !v) return nullptr;
+                auto [kd, kl] = strDataLen(k);
+                // v must be passed as ptr; if it's a plain value, box it
+                llvm::Value* vPtr = v;
+                if (!v->getType()->isPointerTy()) {
+                    llvm::AllocaInst* slot = entryAlloca(v->getType());
+                    builder_.CreateStore(v, slot);
+                    vPtr = slot;
+                }
+                auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+            // .Remove(k): bool
+            if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* k = lowerExpr(*call.args[0].value);
+                if (!k) return nullptr;
+                auto [kd, kl] = strDataLen(k);
+                auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
+                return builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
+            }
+            // .TryGetValue(k, out v): bool
+            // (Note: the out-var slot is pre-created by ensureOutVarSlots)
+            if (m == "TryGetValue" && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* k = lowerExpr(*call.args[0].value);
+                if (!k) return nullptr;
+                auto [kd, kl] = strDataLen(k);
+                // Get the address of the out parameter
+                llvm::Type* outTy = nullptr;
+                llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
+                if (!outAddr) return nullptr;
+                // bz_dict_try_get_str writes a void* to *outPtrSlot
+                // We need a temp void* slot, then copy the value
+                auto* tmpSlot = entryAlloca(ptrTy());
+                auto* fn = declareC("bz_dict_try_get_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                llvm::Value* found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+                // If found, load the value pointer and store through out slot
+                llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
+                if (outTy && !outTy->isPointerTy()) {
+                    // Value type: load the pointed-to value
+                    llvm::Value* loaded = builder_.CreateLoad(outTy, valPtr);
+                    builder_.CreateStore(loaded, outAddr);
+                } else {
+                    builder_.CreateStore(valPtr, outAddr);
+                }
+                return found;
+            }
+        }
+
+        return nullptr;  // not a collection call
     }
 
     // Detect Convert.ToInt32(s) / Convert.ToInt64(s) / Math.Abs(n) etc.
@@ -8899,6 +9274,8 @@ private:
         }
         // §3.4: primitive type static methods: int.Parse(s), double.Parse(s), etc.
         if (auto* v = tryLowerPrimitiveStaticCall(call)) return v;
+        // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
+        if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
         // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
         if (auto* v = tryLowerBuiltinClassCall(call)) return v;
         // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
@@ -9157,7 +9534,21 @@ private:
                 if (ma->member == "Dispose" && ma->target) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
-                        emitDynamicDispose(recv);
+                        // §3: collection types use bz_array_free / bz_dict_free.
+                        auto* recvTy = ctx_.exprType(*ma->target);
+                        if (isCollectionTypeName(recvTy)) {
+                            auto* fn = declareC("bz_array_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {recv,
+                                llvm::ConstantPointerNull::get(ptrTy())});
+                        } else if (isDictTypeName(recvTy)) {
+                            auto* fn = declareC("bz_dict_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {recv,
+                                llvm::ConstantPointerNull::get(ptrTy())});
+                        } else {
+                            emitDynamicDispose(recv);
+                        }
                         return nullptr;
                     }
                 }

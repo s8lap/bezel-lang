@@ -108,7 +108,9 @@ add_executable(bezelc src/main.cpp)
 target_link_libraries(bezelc PRIVATE bezel_core bezel_runtime bezel_warnings)
 # Teach the driver the path to libbezel_runtime.a so it can pass it to clang
 # when compiling standalone Bezel programs (generator expression → literal path).
-target_compile_definitions(bezelc PRIVATE
+# NOTE: Driver.cpp is compiled as part of bezel_core, so the definition must
+# be added to bezel_core (not bezelc which only compiles main.cpp).
+target_compile_definitions(bezel_core PRIVATE
     BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>")
 
 # --- Tests ------------------------------------------------------------------

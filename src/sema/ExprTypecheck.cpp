@@ -1149,7 +1149,21 @@ private:
                 // the enclosing call resolves the conversion (typeCall).
             } else if (id->name == "Console" || id->name == "Math" ||
                        id->name == "Convert" || id->name == "Environment" ||
-                       id->name == "Random") {
+                       id->name == "Random" ||
+                       // §3 stdlib collection and helper classes:
+                       id->name == "Array" || id->name == "OwnedArray" ||
+                       id->name == "Dictionary" || id->name == "OwnedDictionary" ||
+                       id->name == "Stack" || id->name == "OwnedStack" ||
+                       id->name == "Queue" || id->name == "OwnedQueue" ||
+                       id->name == "Set" || id->name == "OwnedSet" ||
+                       id->name == "LinkedList" || id->name == "OwnedLinkedList" ||
+                       id->name == "StringBuilder" || id->name == "Encoding" ||
+                       id->name == "DateTime" || id->name == "TimeSpan" ||
+                       // §7 System.IO:
+                       id->name == "File" || id->name == "Directory" ||
+                       id->name == "Path" ||
+                       // §4 Linq:
+                       id->name == "Linq") {
                 // §2.3: these System classes are auto-imported and always
                 // available without an explicit import. Give them a synthetic
                 // TypeSymbol (null decl) so member access can proceed; the
