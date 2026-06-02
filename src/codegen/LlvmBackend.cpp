@@ -2989,6 +2989,19 @@ private:
             if (auto* b = dynamic_cast<const ast::BoolLiteralExpr*>(e)) {
                 return llvm::ConstantInt::get(ty, b->value ? 1 : 0);
             }
+            // CG24: float/double literal initializer for static float fields.
+            if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(e)) {
+                std::string digits;
+                for (char c : fl->text) {
+                    if (c == '_' || c == 'f' || c == 'F' || c == 'd' ||
+                        c == 'D') continue;
+                    digits.push_back(c);
+                }
+                double v = digits.empty() ? 0.0 : std::strtod(digits.c_str(), nullptr);
+                if (ty->isFloatTy())
+                    return llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_), (float)v);
+                return llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), v);
+            }
             // CG27a: string literal initializer for static string fields.
             if (auto* sl = dynamic_cast<const ast::StringLiteralExpr*>(e)) {
                 // lowerStringLiteral creates globals and returns a GV*.
