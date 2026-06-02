@@ -214,6 +214,6 @@ add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(bezel_tests PRIVATE bezel_core bezel_warnings)
+target_link_libraries(bezel_tests PRIVATE bezel_core bezel_runtime bezel_warnings)
 
 add_test(NAME bezel_tests COMMAND bezel_tests)

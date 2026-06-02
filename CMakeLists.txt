@@ -70,6 +70,17 @@ separate_arguments(BEZEL_LLVM_DEFS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 # directories (and namespaces), not separate packages; see CLAUDE.md and the
 # "phase-aligned skeleton" decision. Sources are listed explicitly (no globs)
 # so that adding a file is always a reviewable diff.
+# --- Bezel runtime library -------------------------------------------------
+# A static C++ library that implements the Bezel standard library's native
+# layer: Array<T>, Dictionary<K,V>, File I/O, DateTime, Random, Task scheduler.
+# Linked into the compiler driver (for standalone executables) and available
+# to the JIT test harness via DynamicLibrarySearchGenerator.
+add_library(bezel_runtime STATIC src/runtime/bezel_runtime.cpp)
+target_include_directories(bezel_runtime PUBLIC src/runtime)
+# bezel_runtime uses POSIX threads; suppress LLVM-specific warnings.
+target_compile_options(bezel_runtime PRIVATE -std=c++20 -pthread)
+target_link_libraries(bezel_runtime PRIVATE pthread)
+
 add_library(bezel_core STATIC
     src/support/Diagnostic.cpp
     src/lexer/Lexer.cpp
@@ -94,7 +105,11 @@ target_link_libraries(bezel_core PUBLIC ${BEZEL_LLVM_LIBS})
 
 # --- Compiler driver executable --------------------------------------------
 add_executable(bezelc src/main.cpp)
-target_link_libraries(bezelc PRIVATE bezel_core bezel_warnings)
+target_link_libraries(bezelc PRIVATE bezel_core bezel_runtime bezel_warnings)
+# Teach the driver the path to libbezel_runtime.a so it can pass it to clang
+# when compiling standalone Bezel programs (generator expression → literal path).
+target_compile_definitions(bezelc PRIVATE
+    BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>")
 
 # --- Tests ------------------------------------------------------------------
 enable_testing()

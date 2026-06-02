@@ -44,8 +44,14 @@ bool readFile(const std::string& path, std::string& out) {
 // toolchain). Returns true on success.
 bool linkExecutable(const std::string& objectPath,
                     const std::string& exePath) {
-    // Link with libc and libm (for math functions like pow, log, etc.)
-    std::string cmd = "clang " + objectPath + " -o " + exePath + " -lm";
+    // Link with libc, libm, libpthread, and the Bezel runtime library.
+    std::string cmd = "clang " + objectPath + " -o " + exePath + " -lm -lpthread";
+#ifdef BEZEL_RUNTIME_LIB_PATH
+    // Static-link the Bezel runtime (path injected at compile time by CMake).
+    cmd += " ";
+    cmd += BEZEL_RUNTIME_LIB_PATH;
+#endif
+    cmd += " -lstdc++";  // runtime uses C++ std (std::mutex, std::thread, etc.)
     return std::system(cmd.c_str()) == 0;
 }
 
