@@ -1,0 +1,160 @@
+// Codegen tests for IEnumerable iteration and iterator methods (§29.2, §29.3).
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+}  // namespace
+
+// --- Part A: user-defined IEnumerable<T> for-loop ---
+
+// A user class implementing IEnumerable<int> via GetEnumerator/MoveNext/Current.
+static const char* kIntRangeBase = R"(
+  class IntRangeEnum: IEnumerator<int>
+    private lo: int; private hi: int; private cur: int;
+    public constructor(lo: int, hi: int) this.lo:=lo; this.hi:=hi; cur:=lo-1; end constructor;
+    public method MoveNext(): bool cur:=cur+1; return cur<=hi; end MoveNext;
+    public readonly property Current: int get => cur; end Current;
+    public method Dispose() end Dispose;
+  end IntRangeEnum;
+  class IntRange: IEnumerable<int>
+    private lo: int; private hi: int;
+    public constructor(lo: int, hi: int) this.lo:=lo; this.hi:=hi; end constructor;
+    public method GetEnumerator(): IEnumerator<int> return new IntRangeEnum(lo, hi); end GetEnumerator;
+  end IntRange;
+)";
+
+BEZEL_TEST(iter_a, user_ienumerable_sum) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M;") + kIntRangeBase +
+        "class C public static method Main(): int "
+        "  using var r := new IntRange(1, 5); var s := 0; "
+        "  for var x in r do s := s + x; end; return s; "
+        "end Main; end C;"), 15);
+}
+
+BEZEL_TEST(iter_a, user_ienumerable_break) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M;") + kIntRangeBase +
+        "class C public static method Main(): int "
+        "  using var r := new IntRange(1, 100); var s := 0; "
+        "  for var x in r do s:=s+x; if x>=5 then break; end; end; return s; "
+        "end Main; end C;"), 15);
+}
+
+// --- Part B1: Array<T> as IEnumerable<T> parameter ---
+
+BEZEL_TEST(iter_b1, array_as_ienumerable_param) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Sum(items: IEnumerable<int>): int "
+        "    var s := 0; for var x in items do s:=s+x; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); "
+        "    a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
+        "    return Sum(a); "
+        "  end Main; end C;"), 15);
+}
+
+BEZEL_TEST(iter_b1, string_array_as_ienumerable) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Count(items: IEnumerable<string>): int "
+        "    var n := 0; for var x in items do n:=n+1; end; return n; "
+        "  end Count; "
+        "  public static method Main(): int "
+        "    using var a := new Array<string>(); "
+        "    a.Add(\"hi\"); a.Add(\"hello\"); a.Add(\"world\"); "
+        "    return Count(a); "
+        "  end Main; end C;"), 3);
+}
+
+// --- Part C: yield return / iterator methods ---
+
+BEZEL_TEST(iter_c, simple_sequence) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method OneTwoThree(): IEnumerable<int> "
+        "    yield return 1; yield return 2; yield return 3; "
+        "  end OneTwoThree; "
+        "  public static method Main(): int "
+        "    var s := 0; for var x in OneTwoThree() do s:=s+x; end; return s; "
+        "  end Main; end C;"), 6);
+}
+
+BEZEL_TEST(iter_c, range_for_yield) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Squares(n: int): IEnumerable<int> "
+        "    for var i in 1..n do yield return i*i; end; "
+        "  end Squares; "
+        "  public static method Main(): int "
+        "    var s := 0; for var x in Squares(4) do s:=s+x; end; return s; "
+        "  end Main; end C;"), 30);  // 1+4+9+16=30
+}
+
+BEZEL_TEST(iter_c, while_yield_with_condition) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Odds(max: int): IEnumerable<int> "
+        "    var i := 1; while i <= max do "
+        "      if i mod 2 = 1 then yield return i; end; "
+        "      i := i + 1; end; "
+        "  end Odds; "
+        "  public static method Main(): int "
+        "    var s := 0; for var x in Odds(10) do s:=s+x; end; return s; "
+        "  end Main; end C;"), 25);  // 1+3+5+7+9=25
+}
+
+BEZEL_TEST(iter_c, fibonacci_iterator) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Fibonacci(n: int): IEnumerable<int> "
+        "    var a := 0; var b := 1; var count := 0; "
+        "    while count < n do "
+        "      yield return a; "
+        "      var t := a + b; a := b; b := t; "
+        "      count := count + 1; "
+        "    end; "
+        "  end Fibonacci; "
+        "  public static method Main(): int "
+        "    var last := 0; "
+        "    for var x in Fibonacci(8) do last := x; end; "
+        "    return last; "  // 8th fib = 13 (0,1,1,2,3,5,8,13)
+        "  end Main; end C;"), 13);
+}
+
+BEZEL_TEST(iter_c, yield_break) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Limited(n: int): IEnumerable<int> "
+        "    for var i in 1..100 do "
+        "      if i > n then yield break; end; "
+        "      yield return i; "
+        "    end; "
+        "  end Limited; "
+        "  public static method Main(): int "
+        "    var s := 0; for var x in Limited(5) do s:=s+x; end; return s; "
+        "  end Main; end C;"), 15);  // 1+2+3+4+5=15
+}
+
+BEZEL_TEST(iter_c, iterator_as_ienumerable_param) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Range(lo: int, hi: int): IEnumerable<int> "
+        "    var i := lo; while i <= hi do yield return i; i:=i+1; end; "
+        "  end Range; "
+        "  public static method Sum(items: IEnumerable<int>): int "
+        "    var s := 0; for var x in items do s:=s+x; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    return Sum(Range(1, 10)); "
+        "  end Main; end C;"), 55);
+}
