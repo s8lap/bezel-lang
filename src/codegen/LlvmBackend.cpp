@@ -8478,23 +8478,40 @@ private:
                 }
             }
             // Similarly fix up the return type if it's an unresolved generic.
-            // ONLY upgrade if funcReturn is an unresolved generic (Named with no decl);
-            // do NOT upgrade for concrete primitives like Int (would make (string)->int
-            // call return ptr instead of i32, causing ICmpInst type mismatches).
+            // ONLY upgrade if funcReturn is an unresolved generic (Named with no decl)
+            // AND its type parameter name matches at least one of the param type
+            // parameter names — this ensures '(T)->T' upgrades but '(S)->A' does not
+            // (different type params mean S=string doesn't imply A=string).
             if (retTy == i32() && !args.empty() &&
                 rt->funcReturn &&
                 rt->funcReturn->kind == sema::TypeRef::Kind::Named &&
-                !rt->funcReturn->declaration) {
-                // If the last param type was resolved to ptr, the return is likely ptr too.
-                bool anyPtr = false;
-                for (std::size_t ai = 1; ai < args.size(); ++ai)
-                    if (args[ai]->getType()->isPointerTy()) { anyPtr = true; break; }
-                // Only upgrade if all non-env params are ptr (same-type function).
-                if (anyPtr && allArgTys.size() > 1) {
-                    bool allPtrs = true;
-                    for (std::size_t ti = 1; ti < allArgTys.size(); ++ti)
-                        if (!allArgTys[ti]->isPointerTy()) { allPtrs = false; break; }
-                    if (allPtrs) retTy = ptrTy();
+                !rt->funcReturn->declaration &&
+                rt->funcReturn->astNode && rt->funcReturn->astNode->name &&
+                rt->funcReturn->astNode->name->parts.size() == 1) {
+                std::string_view retParamName = rt->funcReturn->astNode->name->parts[0];
+                // Check if any param has the same type parameter name.
+                bool retMatchesParam = false;
+                for (const auto& fp : rt->funcParams) {
+                    if (!fp.type) continue;
+                    if (fp.type->kind == sema::TypeRef::Kind::Named &&
+                        !fp.type->declaration && fp.type->astNode &&
+                        fp.type->astNode->name &&
+                        fp.type->astNode->name->parts.size() == 1 &&
+                        fp.type->astNode->name->parts[0] == retParamName) {
+                        retMatchesParam = true; break;
+                    }
+                }
+                if (retMatchesParam) {
+                    // If all non-env params are ptr, the return is also ptr.
+                    bool anyPtr = false;
+                    for (std::size_t ai = 1; ai < args.size(); ++ai)
+                        if (args[ai]->getType()->isPointerTy()) { anyPtr = true; break; }
+                    if (anyPtr && allArgTys.size() > 1) {
+                        bool allPtrs = true;
+                        for (std::size_t ti = 1; ti < allArgTys.size(); ++ti)
+                            if (!allArgTys[ti]->isPointerTy()) { allPtrs = false; break; }
+                        if (allPtrs) retTy = ptrTy();
+                    }
                 }
             }
             auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
