@@ -526,9 +526,13 @@ private:
 
     // A returned value is only a *borrow* of its local root when it has
     // reference type; a value-typed projection (e.g. `r.V` where V is an
-    // int, or `r.Size()` returning int) is a copy and cannot dangle. Be
-    // conservative: an unknown/generic type is treated as a possible
-    // borrow so the escape check still fires.
+    // int, or `r.Size()` returning int) is a copy and cannot dangle.
+    // Generic type parameters (Named with no declaration) are treated as
+    // non-borrowable: the ownership checker runs on generic code without
+    // knowing the concrete instantiation (e.g. Box<int>.Value has sema type
+    // T which looks like an unresolved Named), and conservatively treating T
+    // as borrowable produces false positives for value-type instantiations.
+    // A missed borrow for T=class is acceptable at this stage (§14).
     static bool isBorrowableType(const sema::TypeRef* rt) {
         if (!rt) return true;            // unknown → conservative
         if (rt->nullable) return true;   // nullable reference
@@ -539,7 +543,7 @@ private:
             case sema::TypeRef::Kind::Function:
                 return true;
             case sema::TypeRef::Kind::Named:
-                if (!rt->declaration) return true;  // generic/unknown
+                if (!rt->declaration) return false;  // generic param → not conservative
                 return rt->declaration->kind == ast::TypeDeclKind::Class ||
                        rt->declaration->kind == ast::TypeDeclKind::Interface;
             case sema::TypeRef::Kind::Error:
