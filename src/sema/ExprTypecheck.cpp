@@ -171,6 +171,29 @@ private:
         return false;
     }
 
+    // §29.3: check if a statement list contains any yield return/break
+    // (making it an iterator method body that is exempt from DR1).
+    static bool stmtsContainYield(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        for (const auto& s : body) {
+            if (!s) continue;
+            if (dynamic_cast<const ast::YieldStmt*>(s.get())) return true;
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get()))
+                if (stmtsContainYield(fs->body)) return true;
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get()))
+                if (stmtsContainYield(ws->body)) return true;
+            if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+                if (stmtsContainYield(ifs->ifBranch.body)) return true;
+                for (const auto& el : ifs->elifBranches)
+                    if (stmtsContainYield(el.body)) return true;
+                if (ifs->hasElse && stmtsContainYield(ifs->elseBody)) return true;
+            }
+            if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get()))
+                if (stmtsContainYield(db->body)) return true;
+        }
+        return false;
+    }
+
     bool stmtAlwaysExits(const ast::Stmt& s) {
         if (dynamic_cast<const ast::ReturnStmt*>(&s)) return true;
         if (dynamic_cast<const ast::ThrowStmt*>(&s)) return true;
@@ -577,7 +600,11 @@ private:
             // Slice DR1 (§21.7): a value-returning method with a block
             // body must return (or otherwise abruptly exit) on every
             // path. Abstract / expression bodies are exempt.
+            // §29.3: iterator methods (containing yield return/break) are
+            // exempt — the compiler synthesizes the return mechanism.
+            bool isIteratorMethod = stmts && stmtsContainYield(*stmts);
             if (stmts && returnCtx_ == ReturnCtx::ValueMethod &&
+                !isIteratorMethod &&
                 !bodyAlwaysExits(*stmts)) {
                 ctx_.diagnostics().report(
                     Severity::Error, md->span.begin,

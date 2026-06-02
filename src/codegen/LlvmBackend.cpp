@@ -3964,10 +3964,366 @@ private:
         return k == ast::TypeDeclKind::Class || k == ast::TypeDeclKind::Interface;
     }
 
+    // §29.3: Pre-scan iterator body to collect all LocalDecl/ForStmt nodes and
+    // their types. Returns {node, llvmType} pairs for all locals that need
+    // to survive across yield points (i.e., all locals in the body).
+    void collectIterLocals(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
+        for (const auto& s : body) {
+            if (!s) continue;
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
+                llvm::Type* ty = i32();
+                if (ld->type) {
+                    if (auto* rt = ctx_.resolvedType(*ld->type)) ty = lowerTypeRef(rt);
+                } else if (ld->initializer) {
+                    if (auto* rt = ctx_.exprType(*ld->initializer)) ty = lowerTypeRef(rt);
+                }
+                out.push_back({ld, ty});
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
+                // The loop variable is anchored on the ForStmt node.
+                if (!fs->varName.empty()) {
+                    llvm::Type* ty = i32();  // range/int loop var default
+                    if (fs->varType) {
+                        if (auto* rt = ctx_.resolvedType(*fs->varType)) ty = lowerTypeRef(rt);
+                    }
+                    out.push_back({fs, ty});
+                }
+                collectIterLocals(fs->body, out);
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
+                collectIterLocals(ws->body, out);
+            } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+                collectIterLocals(ifs->ifBranch.body, out);
+                for (const auto& el : ifs->elifBranches)
+                    collectIterLocals(el.body, out);
+                if (ifs->hasElse) collectIterLocals(ifs->elseBody, out);
+            } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+                collectIterLocals(db->body, out);
+            }
+        }
+    }
+
+    // §29.3: Detect if a block of statements contains any yield return / yield break.
+    static bool containsYield(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+        for (const auto& s : stmts) {
+            if (!s) continue;
+            if (dynamic_cast<const ast::YieldStmt*>(s.get())) return true;
+            // Recurse into compound statements.
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get()))
+                if (containsYield(fs->body)) return true;
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get()))
+                if (containsYield(ws->body)) return true;
+            if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+                if (containsYield(ifs->ifBranch.body)) return true;
+                for (const auto& el : ifs->elifBranches)
+                    if (containsYield(el.body)) return true;
+                if (ifs->hasElse && containsYield(ifs->elseBody)) return true;
+            }
+            if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get()))
+                if (containsYield(db->body)) return true;
+        }
+        return false;
+    }
+
+    // §29.3: Collect all YieldStmt pointers in order from a statement list.
+    static void collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+                               std::vector<const ast::YieldStmt*>& out) {
+        for (const auto& s : stmts) {
+            if (!s) continue;
+            if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s.get()))
+                { out.push_back(ys); continue; }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get()))
+                collectYields(fs->body, out);
+            else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get()))
+                collectYields(ws->body, out);
+            else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+                collectYields(ifs->ifBranch.body, out);
+                for (const auto& el : ifs->elifBranches)
+                    collectYields(el.body, out);
+                if (ifs->hasElse) collectYields(ifs->elseBody, out);
+            } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+                collectYields(db->body, out);
+            }
+        }
+    }
+
+    // §29.3: Emit an iterator method (one containing `yield return`).
+    // Creates:
+    //   - State struct: { ptr vtable, i32 state, param0..N, T current_val }
+    //   - MoveNext(ptr self): bool  — state machine body
+    //   - Current getter(ptr self): T
+    //   - Dispose(ptr self): void   — no-op
+    //   - Module-level vtable for the anonymous IEnumerator<T> class
+    //   - The original function becomes GetEnumerator: allocs + fills struct, returns it
+    void emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
+                             const CallableInfo& ci) {
+        if (!ci.stmts) return;
+        // Determine element type T from the return type's generic arg.
+        llvm::Type* elemTy = i32();  // default
+        if (ci.returnType) {
+            auto* retRef = ctx_.resolvedType(*ci.returnType);
+            if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0])
+                elemTy = lowerTypeRef(retRef->genericArgs[0]);
+        }
+
+        // Collect all parameters to capture.
+        std::vector<std::pair<sema::Symbol*, llvm::Type*>> captures;
+        bool isInstance = !isStaticMethod(ms);
+        if (isInstance)
+            captures.push_back({nullptr, ptrTy()});  // 'this' capture
+        for (auto* param : ms->params) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(param);
+            if (!ps) continue;
+            llvm::Type* pty = ptrTy();  // default ptr for class params
+            if (ps->declType) {
+                if (auto* rt = ctx_.resolvedType(*ps->declType))
+                    pty = lowerTypeRef(rt);
+            }
+            captures.push_back({ps, pty});
+        }
+
+        // Pre-scan body to find all locals that need to live across yield points.
+        std::vector<std::pair<const ast::Node*, llvm::Type*>> bodyLocals;
+        if (ci.stmts) collectIterLocals(*ci.stmts, bodyLocals);
+
+        // Build state struct type:
+        // { ptr vtable, i32 state, captures..., locals..., T current_val }
+        std::vector<llvm::Type*> fields;
+        fields.push_back(ptrTy());   // vtable  → field 0
+        fields.push_back(i32());     // state   → field 1
+        for (auto& [sym, ty] : captures) fields.push_back(ty);  // params → fields 2..N
+        // Body locals → fields N+1..M
+        const unsigned LOCAL_START = (unsigned)(2 + captures.size());
+        for (auto& [node, ty] : bodyLocals) fields.push_back(ty);
+        fields.push_back(elemTy);    // current_val → last field
+        auto* stateStructTy = llvm::StructType::create(llvm_, fields,
+            std::string("iter.") + std::string(ms->name));
+
+        const unsigned VTABLE_FIELD = 0;
+        const unsigned STATE_FIELD = 1;
+        const unsigned CAPTURE_START = 2;
+        const unsigned CURRENT_VAL_FIELD = (unsigned)(2 + captures.size() + bodyLocals.size());
+
+        // Build mapping from AST nodes to struct field indices.
+        std::unordered_map<const ast::Node*, unsigned> localFields;
+        for (unsigned li = 0; li < bodyLocals.size(); ++li)
+            localFields[bodyLocals[li].first] = LOCAL_START + li;
+
+        std::string prefix = std::string("bz$iter$") + std::string(ms->name) + "$";
+
+        // --- MoveNext(ptr self) -> i1 ---
+        auto* moveNextTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
+        auto* moveNextFn = llvm::Function::Create(
+            moveNextTy, llvm::Function::InternalLinkage,
+            prefix + "MoveNext", module_.get());
+
+        // --- get$Current(ptr self) -> T ---
+        auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+        auto* currentFn = llvm::Function::Create(
+            currentTy, llvm::Function::InternalLinkage,
+            prefix + "Current", module_.get());
+
+        // --- Dispose(ptr self) -> void ---
+        auto* disposeFn = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
+        {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", disposeFn);
+            llvm::IRBuilder<> db(bb);
+            db.CreateRetVoid();
+        }
+
+        // --- Vtable global for this iterator's IEnumerator<T> impl ---
+        // Layout: [ptr vtable (self-ptr for td), ptr Dispose, ptr MoveNext, ptr get$Current]
+        // We reuse the td format with a synthetic descriptor.
+        // For simplicity, just make a constant array with 4 pointers.
+        const unsigned VT_SIZE = 4;
+        std::vector<llvm::Constant*> vtElems(VT_SIZE, llvm::ConstantPointerNull::get(ptrTy()));
+        // Slot 0: type descriptor (point to itself as a sentinel)
+        auto* vtGVType = llvm::ArrayType::get(ptrTy(), VT_SIZE);
+        auto* vtGV = new llvm::GlobalVariable(*module_, vtGVType, true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtGVType, vtElems),
+            prefix + "vtable");
+        // Fill: [0]=self-ptr, [1]=Dispose, [2]=MoveNext, [3]=Current
+        vtElems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtElems[1] = disposeFn;
+        vtElems[2] = moveNextFn;
+        vtElems[3] = currentFn;
+        vtGV->setInitializer(llvm::ConstantArray::get(vtGVType, vtElems));
+
+        // --- GetEnumerator (= the original method body): alloc + fill struct ---
+        // fn is the already-declared function for this method.
+        // We reuse its parameter list but change its body.
+        {
+            currentFn_ = fn;
+            currentThis_ = nullptr;
+            locals_.clear(); paramSlots_.clear(); refParams_.clear();
+            disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+            propagateBB_ = nullptr; unwindTarget_ = nullptr;
+            currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            builder_.SetInsertPoint(entry);
+            bindParameters(fn, isInstance, &ms->params);
+
+            // Allocate state struct
+            uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stateStructTy);
+            auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+            llvm::Value* st = builder_.CreateCall(callocFn2,
+                {builder_.getInt64(1), builder_.getInt64(stSz)}, "iter.state");
+            // Store vtable at field 0
+            llvm::Value* vtField = builder_.CreateStructGEP(stateStructTy, st, VTABLE_FIELD);
+            builder_.CreateStore(vtGV, vtField);
+            // Store state = 0
+            llvm::Value* stateField = builder_.CreateStructGEP(stateStructTy, st, STATE_FIELD);
+            builder_.CreateStore(builder_.getInt32(0), stateField);
+            // Store each capture
+            unsigned ci_idx = CAPTURE_START;
+            for (auto& [sym, ty] : captures) {
+                llvm::Value* capField = builder_.CreateStructGEP(stateStructTy, st, ci_idx++);
+                llvm::Value* val = nullptr;
+                if (!sym) {
+                    // 'this' capture
+                    val = currentThis_ ? currentThis_ : fn->arg_begin();
+                } else {
+                    auto it = paramSlots_.find(sym);
+                    if (it != paramSlots_.end())
+                        val = builder_.CreateLoad(ty, it->second);
+                }
+                if (val) builder_.CreateStore(val, capField);
+            }
+            // Return the state struct (as ptr)
+            builder_.CreateRet(st);
+        }
+
+        // --- Current: load current_val from struct ---
+        {
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", currentFn);
+            llvm::IRBuilder<> cb(entry);
+            llvm::Value* self = &*currentFn->arg_begin();
+            llvm::Value* cvField = cb.CreateStructGEP(stateStructTy, self, CURRENT_VAL_FIELD);
+            cb.CreateRet(cb.CreateLoad(elemTy, cvField));
+        }
+
+        // --- MoveNext: the state machine body ---
+        // We emit MoveNext by re-running the method body in a special "iterator" mode.
+        // This re-uses lowerScopedBlock but with yield points turned into
+        // state transitions.
+        {
+            currentFn_ = moveNextFn;
+            currentThis_ = nullptr;
+            locals_.clear(); paramSlots_.clear(); refParams_.clear();
+            disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+            propagateBB_ = nullptr; unwindTarget_ = nullptr;
+            currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
+            builder_.SetInsertPoint(entry);
+
+            llvm::Value* self = &*moveNextFn->arg_begin();
+
+            // Restore captured params from struct.
+            unsigned ci_idx2 = CAPTURE_START;
+            for (auto& [sym, ty] : captures) {
+                llvm::Value* capField = builder_.CreateStructGEP(stateStructTy, self, ci_idx2++);
+                llvm::Value* val = builder_.CreateLoad(ty, capField);
+                if (!sym) {
+                    // 'this' — set currentThis_
+                    currentThis_ = val;
+                } else {
+                    // param — create a slot and store it
+                    auto* slot = entryAlloca(ty);
+                    builder_.CreateStore(val, slot);
+                    paramSlots_[sym] = slot;
+                }
+            }
+
+            // Read state field.
+            llvm::Value* stateGEP = builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
+            llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP);
+
+            // Collect all yield stmts and assign state numbers.
+            std::vector<const ast::YieldStmt*> yields;
+            collectYields(*ci.stmts, yields);
+            unsigned numYields = (unsigned)yields.size();
+
+            // Create basic blocks for each state.
+            // State 0: beginning, State 1..N: after each yield, State -1: done
+            auto* doneBB = llvm::BasicBlock::Create(llvm_, "mn.done", currentFn_);
+            std::vector<llvm::BasicBlock*> stateBBs;
+            for (unsigned s = 0; s <= numYields; ++s) {
+                stateBBs.push_back(
+                    llvm::BasicBlock::Create(llvm_, "mn.s" + std::to_string(s), currentFn_));
+            }
+
+            // Switch dispatch on state.
+            auto* sw = builder_.CreateSwitch(curState, doneBB, numYields + 1);
+            for (unsigned s = 0; s <= numYields; ++s)
+                sw->addCase(builder_.getInt32((int)s), stateBBs[s]);
+
+            // doneBB: exhausted → return false
+            builder_.SetInsertPoint(doneBB);
+            builder_.CreateRet(builder_.getFalse());
+
+            // Set up the yield callback so lowerStmt knows what to do.
+            // We use iterYields_ and iterStateGEP_ members.
+            iterStateStruct_ = stateStructTy;
+            iterSelf_ = self;
+            iterStateGEP_ = stateGEP;
+            iterStateBBs_ = stateBBs;
+            iterDoneBB_ = doneBB;
+            iterCurrentValField_ = CURRENT_VAL_FIELD;
+            iterNextYieldState_ = 0;  // incremented as yields are processed
+            iterElemTy_ = elemTy;
+            iterLocalFields_ = localFields;
+
+            // Emit MoveNext body starting from state 0.
+            // The body is emitted linearly; YieldStmt handlers interrupt it to
+            // emit the yield transition and jump to the next state block.
+            builder_.SetInsertPoint(stateBBs[0]);
+            disposeStack_.emplace_back();
+            bool term = lowerBody(*ci.stmts);
+            disposeStack_.pop_back();
+            // If body didn't terminate, fall through to done.
+            if (!term && !builder_.GetInsertBlock()->getTerminator()) {
+                builder_.CreateStore(builder_.getInt32(-1), iterStateGEP_);
+                builder_.CreateRet(builder_.getFalse());
+            }
+
+            // Clear iterator state.
+            iterStateStruct_ = nullptr;
+            iterSelf_ = nullptr;
+            iterLocalFields_.clear();
+            iterAllocaToField_.clear();
+        }
+    }
+
+    // Iterator state for the currently-emitting iterator MoveNext function.
+    llvm::StructType* iterStateStruct_ = nullptr;
+    llvm::Value* iterSelf_ = nullptr;
+    llvm::Value* iterStateGEP_ = nullptr;
+    std::vector<llvm::BasicBlock*> iterStateBBs_;
+    llvm::BasicBlock* iterDoneBB_ = nullptr;
+    unsigned iterCurrentValField_ = 0;
+    unsigned iterNextYieldState_ = 0;
+    llvm::Type* iterElemTy_ = nullptr;
+    // Maps LocalDecl/ForStmt AST node → struct field index for iterator locals.
+    std::unordered_map<const ast::Node*, unsigned> iterLocalFields_;
+    // Maps alloca slot → struct field index (for save at yield, restore at state entry).
+    std::unordered_map<llvm::AllocaInst*, unsigned> iterAllocaToField_;
+
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         CallableInfo ci;
         if (!callableInfo(ms, ci)) return;
+
+        // §29.3: detect iterator methods BEFORE creating the entry block.
+        // emitIteratorMethod handles its own entry block creation + bindParameters.
+        if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts &&
+            containsYield(*ci.stmts)) {
+            emitIteratorMethod(ms, fn, ci);
+            return;
+        }
+
         currentFn_ = fn;
         currentThis_ = nullptr;
         locals_.clear();
@@ -4421,7 +4777,38 @@ private:
                 }
             }
         }
-        llvm::AllocaInst* slot = entryAlloca(slotTy);
+        // §29.3: in an iterator MoveNext body, map locals to state-struct fields
+        // so they persist across yield returns.
+        llvm::AllocaInst* slot = nullptr;
+        if (iterStateStruct_ && iterSelf_) {
+            auto fit = iterLocalFields_.find(declNode);
+            if (fit != iterLocalFields_.end()) {
+                // Use the struct field as the "slot" — it's a GEP result.
+                // We can't store a GEP as an AllocaInst, so we must use a
+                // different path: store the GEP in a separate alloca-of-ptr
+                // that points to the struct field. Or simply: create an alloca
+                // that shadows the struct field (load/store to it), and at each
+                // yield point save/restore all locals from the struct.
+                // SIMPLEST CORRECT APPROACH: create an alloca AND store it in
+                // the struct field by GEP. At each yield, save the alloca to struct.
+                // For now: use entryAlloca but track it for save/restore.
+                slot = entryAlloca(slotTy);
+                // Record this slot → field mapping for yield save/restore.
+                iterAllocaToField_[slot] = fit->second;
+                locals_[declNode] = slot;
+                // Restore from struct at this point (in case we're in state > 0).
+                llvm::Value* fptr = builder_.CreateStructGEP(
+                    iterStateStruct_, iterSelf_, fit->second);
+                llvm::Value* saved = builder_.CreateLoad(slotTy, fptr);
+                // Only restore if state != 0 (first entry); use v if state=0.
+                // For simplicity: always load from struct, then overwrite with init below.
+                // (State 0: struct field is 0-initialized; override with init is correct.)
+                // Actually: just DON'T restore — let the init below set the value.
+                // The struct field will be set by the yield handler when saving.
+                (void)saved;  // will be overwritten by init
+            }
+        }
+        if (!slot) slot = entryAlloca(slotTy);
         locals_[declNode] = slot;
         // CG-generic: record the concrete substitution for this local so that
         // method calls on it (e.g. sp2.GetFirst()) can recover the concrete type
@@ -4794,6 +5181,57 @@ private:
         if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
             return lowerCaseStmt(*cs);
         }
+        // §29.3: yield return / yield break inside an iterator method.
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+            if (iterStateStruct_ && iterSelf_) {
+                // Save all iterator locals to the state struct before yielding.
+                for (auto& [allocaSlot, fieldIdx] : iterAllocaToField_) {
+                    llvm::Value* fptr = builder_.CreateStructGEP(
+                        iterStateStruct_, iterSelf_, fieldIdx);
+                    llvm::Value* curVal = builder_.CreateLoad(
+                        allocaSlot->getAllocatedType(), allocaSlot);
+                    builder_.CreateStore(curVal, fptr);
+                }
+
+                if (ys->isBreak) {
+                    // yield break: set state=-1, return false.
+                    builder_.CreateStore(builder_.getInt32(-1), iterStateGEP_);
+                    builder_.CreateRet(builder_.getFalse());
+                    return true;
+                }
+                // yield return expr: store to current_val, set next state, return true.
+                if (ys->value) {
+                    llvm::Value* v = lowerExpr(*ys->value);
+                    if (v) {
+                        if (v->getType() != iterElemTy_ &&
+                            v->getType()->isIntegerTy() && iterElemTy_->isIntegerTy())
+                            v = builder_.CreateTrunc(v, iterElemTy_);
+                        if (v->getType() == iterElemTy_) {
+                            llvm::Value* cvField = builder_.CreateStructGEP(
+                                iterStateStruct_, iterSelf_, iterCurrentValField_);
+                            builder_.CreateStore(v, cvField);
+                        }
+                    }
+                }
+                unsigned nextState = ++iterNextYieldState_;
+                builder_.CreateStore(builder_.getInt32((int)nextState), iterStateGEP_);
+                builder_.CreateRet(builder_.getTrue());
+                // Continue emitting code after this yield in the next state block.
+                if (nextState < iterStateBBs_.size()) {
+                    builder_.SetInsertPoint(iterStateBBs_[nextState]);
+                    // Restore all iterator locals from the state struct.
+                    for (auto& [allocaSlot, fieldIdx] : iterAllocaToField_) {
+                        llvm::Value* fptr = builder_.CreateStructGEP(
+                            iterStateStruct_, iterSelf_, fieldIdx);
+                        llvm::Value* savedVal = builder_.CreateLoad(
+                            allocaSlot->getAllocatedType(), fptr);
+                        builder_.CreateStore(savedVal, allocaSlot);
+                    }
+                }
+                return false;  // not terminated (we continue in next state BB)
+            }
+            return false;
+        }
         return false;  // unhandled statement kinds land in later slices
     }
 
@@ -5091,10 +5529,61 @@ private:
         }
 
         llvm::AllocaInst* slot = entryAlloca(lo->getType());
+        // §29.3: in an iterator method, map the loop variable to a struct field.
+        if (iterStateStruct_ && iterSelf_) {
+            auto fit = iterLocalFields_.find(&fs);
+            if (fit != iterLocalFields_.end())
+                iterAllocaToField_[slot] = fit->second;
+        }
         builder_.CreateStore(lo, slot);
         // Anchor on the ForStmt node — sema gave `lsym->decl = fs` so that
         // identifier `i` in the body resolves through `locals_[fs]`.
         locals_[&fs] = slot;
+
+        // §29.3: in an iterator method, store `hi` in an alloca so it is
+        // accessible from all state blocks (not just the initial state path).
+        // Without this, resumed states skip the `hi = lowerExpr(range->hi)`
+        // instruction and use garbage for the upper bound.
+        llvm::Value* hiToUse = hi;
+        if (iterStateStruct_) {
+            auto* hiSlot = entryAlloca(hi->getType());
+            builder_.CreateStore(hi, hiSlot);
+            // hiToUse will be loaded in condBB below.
+            hiToUse = nullptr;  // signal to load from hiSlot in condBB
+            // Store hiSlot as a special local; we handle it per-cond.
+            // For now, just always load in condBB.
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "for.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "for.body", currentFn_);
+            auto* incBB  = llvm::BasicBlock::Create(llvm_, "for.inc",  currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "for.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* cur = builder_.CreateLoad(slot->getAllocatedType(), slot);
+            llvm::Value* hiVal = builder_.CreateLoad(hi->getType(), hiSlot);
+            llvm::Value* cond;
+            if (descending) {
+                cond = range->inclusive
+                           ? builder_.CreateICmpSGE(cur, hiVal)
+                           : builder_.CreateICmpSGT(cur, hiVal);
+            } else {
+                cond = range->inclusive
+                           ? builder_.CreateICmpSLE(cur, hiVal)
+                           : builder_.CreateICmpSLT(cur, hiVal);
+            }
+            builder_.CreateCondBr(cond, bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+            bool term = lowerScopedBlock(fs.body);
+            loopStack_.pop_back();
+            if (!term) builder_.CreateBr(incBB);
+            builder_.SetInsertPoint(incBB);
+            llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
+            llvm::Value* next = builder_.CreateAdd(v, stepVal);
+            builder_.CreateStore(next, slot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return true;
+        }
 
         auto* condBB = llvm::BasicBlock::Create(llvm_, "for.cond", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "for.body", currentFn_);
@@ -5370,8 +5859,9 @@ private:
     //   __enum.Dispose();   ← via disposeStack_ at scope exit
     // §29.2 (B1): `for var x in items` where items is typed as IEnumerable<T> /
     // IReadOnlyCollection<T> etc. with null declaration (builtin interface).
-    // Since Array<T> is the only IEnumerable<T> implementation at this point,
-    // we treat the value as a bz_array_t* and emit a direct indexed loop.
+    // Uses the vtable protocol (MoveNext at slot 2, Current at slot 3) which
+    // works for BOTH iterator state machines AND Array<T> (via its vtable).
+    // If the actual runtime object is a bz_array_t, falls back to direct loop.
     bool lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         if (!fs.iterable) return false;
         auto* iterTy = ctx_.exprType(*fs.iterable);
@@ -5388,45 +5878,107 @@ private:
         // Must have a generic arg to determine element type.
         if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
 
-        llvm::Value* arrObj = lowerExpr(*fs.iterable);
-        if (!arrObj) return false;
+        llvm::Value* enumObj = lowerExpr(*fs.iterable);
+        if (!enumObj) return false;
 
         llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
-        int64_t esz = 8;  // default pointer size
-        {
-            llvm::Type* et = elemTy;
-            if (et && (et->isIntegerTy(32) || et->isFloatTy())) esz = 4;
-            else if (et && (et->isIntegerTy(1) || et->isIntegerTy(8))) esz = 1;
-            else if (et && et->isIntegerTy(16)) esz = 2;
+
+        // Determine if the value is a bz_array_t (from a variable or parameter
+        // typed Array<T>) or an iterator state machine (from a call to an
+        // iterator method). Iterator values have a vtable pointer at offset 0.
+        // We detect this by checking if the original expression was a function call —
+        // iterator methods return IEnumerable<T>, so a call result is an iterator.
+        // For a variable/parameter typed IEnumerable<T> backed by Array<T>,
+        // use the direct array protocol.
+        bool isArrayBacked = false;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            // Check if the original parameter/local was typed as a collection.
+            if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                if (par->declType) {
+                    auto* rt = ctx_.resolvedType(*par->declType);
+                    if (rt && isCollectionTypeName(rt)) isArrayBacked = true;
+                }
+            } else if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                if (loc->declType && isCollectionTypeName(loc->declType))
+                    isArrayBacked = true;
+            }
         }
 
-        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-        llvm::Value* len = builder_.CreateCall(lenFn, {arrObj});
-        auto* idxSlot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), idxSlot);
+        if (isArrayBacked) {
+            // Use direct bz_array_t protocol.
+            int64_t esz = 8;
+            if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
+            else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
+            else if (elemTy->isIntegerTy(16)) esz = 2;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {enumObj});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* varSlot = entryAlloca(elemTy);
+            locals_[&fs] = varSlot;
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ib.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ib.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* ep = builder_.CreateCall(ptrAtFn, {enumObj, idx2, builder_.getInt64(esz)});
+            llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
+            builder_.CreateStore(elem, varSlot);
+            loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+            lowerScopedBlock(fs.body);
+            loopStack_.pop_back();
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return true;
+        }
+
+        // Store the enumerator in a slot.
+        auto* enumSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(enumObj, enumSlot);
+
+        // Use vtable-based MoveNext (slot 2) and Current (slot 3).
+        // Layout: [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current
+        auto* moveNextTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
+        auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+
         auto* varSlot = entryAlloca(elemTy);
         locals_[&fs] = varSlot;
 
         auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ib.body", currentFn_);
-        auto* incBB  = llvm::BasicBlock::Create(llvm_, "ib.inc",  currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "ib.end",  currentFn_);
         builder_.CreateBr(condBB);
+
+        // cond: call vtable slot 2 (MoveNext)
         builder_.SetInsertPoint(condBB);
-        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+        llvm::Value* obj = builder_.CreateLoad(ptrTy(), enumSlot);
+        llvm::Value* vtable = builder_.CreateLoad(ptrTy(), obj);
+        llvm::Value* mnSlotPtr = builder_.CreateGEP(ptrTy(), vtable, {builder_.getInt32(2)});
+        llvm::Value* mnFnPtr = builder_.CreateLoad(ptrTy(), mnSlotPtr);
+        llvm::Value* moved = builder_.CreateCall(moveNextTy, mnFnPtr, {obj}, "ib.moved");
+        builder_.CreateCondBr(moved, bodyBB, endBB);
+
+        // body: call vtable slot 3 (Current)
         builder_.SetInsertPoint(bodyBB);
-        llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot);
-        llvm::Value* ep = builder_.CreateCall(ptrAtFn, {arrObj, idx2, builder_.getInt64(esz)});
-        llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
-        builder_.CreateStore(elem, varSlot);
-        loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+        llvm::Value* obj2 = builder_.CreateLoad(ptrTy(), enumSlot);
+        llvm::Value* vtable2 = builder_.CreateLoad(ptrTy(), obj2);
+        llvm::Value* curSlotPtr = builder_.CreateGEP(ptrTy(), vtable2, {builder_.getInt32(3)});
+        llvm::Value* curFnPtr = builder_.CreateLoad(ptrTy(), curSlotPtr);
+        llvm::Value* curVal = builder_.CreateCall(currentTy, curFnPtr, {obj2}, "ib.cur");
+        builder_.CreateStore(curVal, varSlot);
+
+        loopStack_.push_back({condBB, endBB, disposeStack_.size()});
         lowerScopedBlock(fs.body);
         loopStack_.pop_back();
-        llvm::Value* idx3 = builder_.CreateLoad(i64(), idxSlot);
-        builder_.CreateStore(builder_.CreateAdd(idx3, builder_.getInt64(1)), idxSlot);
-        builder_.CreateBr(condBB);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(condBB);
         builder_.SetInsertPoint(endBB);
         return true;
     }
