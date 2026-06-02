@@ -205,6 +205,11 @@ void  bz_task_then(void* task, void (*cont)(void* task, void* state), void* stat
 void  bz_task_free(void* task);
 
 // ---------------------------------------------------------------------------
+// Split a string by a delimiter: returns bz_array_t* of bz.string* (heap alloc'd).
+// Caller disposes result array. All pointers point into separately malloc'd strings.
+void* bz_string_split(const char* s, int64_t s_len,
+                       const char* delim, int64_t delim_len);
+
 // StringBuilder helper — concatenates an array of bz.string pointers.
 // Caller must free *out_data with free() after use.
 // ---------------------------------------------------------------------------

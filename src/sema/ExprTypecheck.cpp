@@ -2099,6 +2099,9 @@ private:
                                 &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                             return;
                         }
+                        // §9.6: Split returns Array<string> — no simple TypeRef,
+                        // but suppress the diagnostic; codegen handles it.
+                        if (ma.member == "Split") return;
                         // Emit a diagnostic for unrecognized string members.
                         ctx_.diagnostics().report(
                             Severity::Error, ma.span.begin,

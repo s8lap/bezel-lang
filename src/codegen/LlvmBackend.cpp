@@ -2310,6 +2310,22 @@ private:
             return newStr;
         }
 
+        // §9.6: Split(delimiter: string): Array<string> — splits self on delimiter.
+        // Returns an Array<string> of parts. Width=1 (ASCII/UTF-8 byte mode).
+        if (method == "Split" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* delim = lowerExpr(*call.args[0].value);
+            if (!delim) return nullptr;
+            // Emit via a runtime helper to keep IR compact.
+            auto* fn = declareC("bz_string_split", ptrTy(),
+                                {ptrTy(), ptrTy(), i64(), ptrTy(), i64()});
+            llvm::Value* selfData = loadStringData(self);
+            llvm::Value* selfLen  = loadStringLen(self);
+            llvm::Value* delimData = loadStringData(delim);
+            llvm::Value* delimLen  = loadStringLen(delim);
+            return builder_.CreateCall(fn, {selfData, selfLen, delimData, delimLen},
+                                       "split.result");
+        }
+
         return nullptr;  // method not recognised
     }
 

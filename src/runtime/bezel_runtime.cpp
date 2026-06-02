@@ -795,6 +795,52 @@ struct bz_string_struct {
     int8_t  width;
 };
 
+void* bz_string_split(const char* s, int64_t s_len,
+                       const char* delim, int64_t delim_len) {
+    void* arr = bz_array_alloc(8, 8);
+    if (delim_len <= 0) {
+        // Empty delimiter: return array with one element (the whole string)
+        char* copy = (char*)malloc((size_t)(s_len + 1));
+        memcpy(copy, s, (size_t)s_len);
+        copy[s_len] = '\0';
+        uint8_t* strObj = (uint8_t*)calloc(1, 24);
+        memcpy(strObj, &copy, sizeof(void*));
+        memcpy(strObj + 8, &s_len, sizeof(int64_t));
+        strObj[16] = 1;
+        bz_array_add(arr, &strObj, 8);
+        return arr;
+    }
+    int64_t start = 0;
+    for (int64_t i = 0; i <= s_len - delim_len; ) {
+        if (memcmp(s + i, delim, (size_t)delim_len) == 0) {
+            int64_t partLen = i - start;
+            char* part = (char*)malloc((size_t)(partLen + 1));
+            memcpy(part, s + start, (size_t)partLen);
+            part[partLen] = '\0';
+            uint8_t* strObj = (uint8_t*)calloc(1, 24);
+            memcpy(strObj, &part, sizeof(void*));
+            memcpy(strObj + 8, &partLen, sizeof(int64_t));
+            strObj[16] = 1;
+            bz_array_add(arr, &strObj, 8);
+            i += delim_len;
+            start = i;
+        } else {
+            i++;
+        }
+    }
+    // Last segment
+    int64_t partLen = s_len - start;
+    char* part = (char*)malloc((size_t)(partLen + 1));
+    memcpy(part, s + start, (size_t)partLen);
+    part[partLen] = '\0';
+    uint8_t* strObj = (uint8_t*)calloc(1, 24);
+    memcpy(strObj, &part, sizeof(void*));
+    memcpy(strObj + 8, &partLen, sizeof(int64_t));
+    strObj[16] = 1;
+    bz_array_add(arr, &strObj, 8);
+    return arr;
+}
+
 void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || arr->count == 0) {
