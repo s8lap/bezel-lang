@@ -917,9 +917,10 @@ public:
         for (Symbol* child : ctx_.module()->children) {
             auto* t = dynamic_cast<TypeSymbol*>(child);
             if (!t) continue;
-            std::unordered_set<TypeSymbol*> visited;
+            std::unordered_set<TypeSymbol*> onStack;
+            std::unordered_set<TypeSymbol*> done;
             std::vector<TypeSymbol*> path;
-            checkCycleFrom(t, visited, path, reported);
+            checkCycleFrom(t, onStack, done, path, reported);
         }
         return !reported.empty();
     }
@@ -1151,13 +1152,21 @@ public:
         }
     }
 
+    // Per §12: inheritance must be well-founded (no cycles).  Diamond
+    // inheritance (shared base through multiple paths) is legal for interfaces
+    // — each base is visited once per DFS path, not globally, so a shared
+    // ancestor is not a cycle.  `onStack` = nodes currently being explored
+    // (detecting true back-edges); `done` = fully-explored nodes that need
+    // not be re-entered.
     bool checkCycleFrom(
         TypeSymbol* t,
-        std::unordered_set<TypeSymbol*>& visited,
+        std::unordered_set<TypeSymbol*>& onStack,
+        std::unordered_set<TypeSymbol*>& done,
         std::vector<TypeSymbol*>& path,
         std::unordered_set<TypeSymbol*>& reported) {
-        if (visited.count(t)) {
-            // We're seeing t again on this DFS path → cycle.
+        if (done.count(t)) return false;  // already fully explored, no cycle
+        if (onStack.count(t)) {
+            // Back-edge → actual cycle.
             if (!reported.count(t)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
@@ -1170,12 +1179,14 @@ public:
             }
             return true;
         }
-        visited.insert(t);
+        onStack.insert(t);
         path.push_back(t);
         for (TypeSymbol* b : t->baseTypes) {
-            if (b) checkCycleFrom(b, visited, path, reported);
+            if (b) checkCycleFrom(b, onStack, done, path, reported);
         }
         path.pop_back();
+        onStack.erase(t);
+        done.insert(t);
         return false;
     }
 
