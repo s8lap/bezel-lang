@@ -8682,8 +8682,37 @@ private:
         llvm::Value* result = emitMethodCall(ms, args, baseQualified);
         // Record the concrete subst that was active during this call so that
         // lowerLocalDecl can associate it with the result's local variable.
-        if (!genericSubst_.empty())
+        if (!genericSubst_.empty()) {
             lastCallGenericSubst_ = genericSubst_;
+        } else {
+            // Even if genericSubst_ is empty (non-generic caller), try to
+            // derive the subst from the method's return type so that
+            // 'var primes := CreatePrimes(...)' correctly associates
+            // the Gen<int> substitution rather than inheriting stale
+            // lastCallGenericSubst_ from prior generic method calls.
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                if (md->returnType) {
+                    sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+                    if (retTy && retTy->kind == sema::TypeRef::Kind::Named &&
+                        retTy->declaration && !retTy->genericArgs.empty()) {
+                        auto* td = dynamic_cast<const ast::TypeDecl*>(
+                            retTy->declaration->decl);
+                        if (td && td->genericParams.size() ==
+                                  retTy->genericArgs.size()) {
+                            std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                            for (std::size_t gi = 0;
+                                 gi < td->genericParams.size(); ++gi) {
+                                llvm::Type* concrTy =
+                                    lowerTypeRef(retTy->genericArgs[gi]);
+                                newSubst[td->genericParams[gi].name] = concrTy;
+                            }
+                            if (!newSubst.empty())
+                                lastCallGenericSubst_ = std::move(newSubst);
+                        }
+                    }
+                }
+            }
+        }
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         return result;
