@@ -3200,11 +3200,16 @@ std::unique_ptr<ast::Member> Parser::parseOperatorDeclBody(
                                 "expected 'end' to close operator body");
         }
         // §1.6 keyword-labelled construct: `end operator OpToken?`.
-        if (isKeyword("operator")) {
+        // `operator` is a contextual keyword (App. B.2) — lexed as Identifier.
+        if ((isKeyword("operator") ||
+             (current_.kind == TokenKind::Identifier &&
+              current_.text == "operator"))) {
             advance();
             // The OpToken itself may also follow.
             if (current_.kind == TokenKind::Punctuator) {
                 advance();
+            } else if (current_.kind == TokenKind::Identifier) {
+                advance();  // keyword-spelled operator (e.g. `mod`)
             }
         }
         if (!consumePunctuator(";")) {
