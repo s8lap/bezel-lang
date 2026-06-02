@@ -893,6 +893,15 @@ private:
                             lsym->declType =
                                 ctx_.primitiveTypeRef(PrimitiveType::Char);
                         }
+                    } else if (auto* cl =
+                                   dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                       fs->iterable.get())) {
+                        // §16: `for var x in [e1, e2, ...]` — infer element
+                        // type from first element.
+                        if (!cl->isDict && !cl->elements.empty() &&
+                            cl->elements[0]) {
+                            lsym->declType = ctx_.exprType(*cl->elements[0]);
+                        }
                     }
                 }
                 forScope.names[fs->varName] = lsym;

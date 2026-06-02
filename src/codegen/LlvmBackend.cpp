@@ -4776,6 +4776,56 @@ private:
     // each body iteration so `x` in the body resolves to the current element.
     bool lowerArrayFor(const ast::ForStmt& fs) {
         if (!fs.iterable) return false;
+        // Handle collection literal `for var x in [e1, e2, ...] do`:
+        // Lower each element into a temp alloca and iterate.
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                fs.iterable.get())) {
+            if (!cl->isDict && !cl->elements.empty()) {
+                // Determine element type from first element.
+                llvm::Value* first = lowerExpr(*cl->elements[0]);
+                if (!first) return false;
+                llvm::Type* elemTy = first->getType();
+                std::size_t N = cl->elements.size();
+                auto* at = llvm::ArrayType::get(elemTy, N);
+                auto* tmp = entryAlloca(at);
+                // Fill the temp array.
+                builder_.CreateStore(first,
+                    builder_.CreateGEP(at, tmp, {builder_.getInt32(0), builder_.getInt32(0)}));
+                for (std::size_t i = 1; i < N; ++i) {
+                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                    if (!ev) continue;
+                    builder_.CreateStore(ev,
+                        builder_.CreateGEP(at, tmp, {builder_.getInt32(0), builder_.getInt32(i)}));
+                }
+                // Now iterate as a normal array.
+                uint64_t n = N;
+                auto* idxSlot2 = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt32(0), idxSlot2);
+                auto* varSlot2 = entryAlloca(elemTy);
+                locals_[&fs] = varSlot2;
+                auto* condBB2 = llvm::BasicBlock::Create(llvm_, "clit.cond", currentFn_);
+                auto* bodyBB2 = llvm::BasicBlock::Create(llvm_, "clit.body", currentFn_);
+                auto* endBB2 = llvm::BasicBlock::Create(llvm_, "clit.end", currentFn_);
+                builder_.CreateBr(condBB2);
+                builder_.SetInsertPoint(condBB2);
+                llvm::Value* idx2 = builder_.CreateLoad(i32(), idxSlot2);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(idx2, builder_.getInt32((uint32_t)n)),
+                    bodyBB2, endBB2);
+                builder_.SetInsertPoint(bodyBB2);
+                llvm::Value* elem2 = builder_.CreateLoad(elemTy,
+                    builder_.CreateGEP(at, tmp,
+                        {builder_.getInt32(0), idx2}));
+                builder_.CreateStore(elem2, varSlot2);
+                lowerScopedBlock(fs.body);
+                llvm::Value* inc2 = builder_.CreateAdd(
+                    builder_.CreateLoad(i32(), idxSlot2), builder_.getInt32(1));
+                builder_.CreateStore(inc2, idxSlot2);
+                builder_.CreateBr(condBB2);
+                builder_.SetInsertPoint(endBB2);
+                return true;
+            }
+        }
         // Try the lvalue path first (local/field/parameter — no spill needed).
         llvm::Type* arrSlotTy = nullptr;
         llvm::Value* arrAddr = lvalueAddr(*fs.iterable, arrSlotTy);
