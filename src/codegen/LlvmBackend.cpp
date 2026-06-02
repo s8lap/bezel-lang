@@ -8811,6 +8811,119 @@ private:
                 builder_.SetInsertPoint(endBB);
                 return llvm::ConstantInt::get(i32(), 0);
             }
+            // per §3: .IndexOf(item): int — index of first match, -1 if not found
+            if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* target = lowerExpr(*call.args[0].value);
+                if (!target) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB  = llvm::BasicBlock::Create(llvm_, "iof.c", currentFn_);
+                auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iof.b", currentFn_);
+                auto* foundBB = llvm::BasicBlock::Create(llvm_, "iof.f", currentFn_);
+                auto* nextBB  = llvm::BasicBlock::Create(llvm_, "iof.n", currentFn_);
+                auto* endBB   = llvm::BasicBlock::Create(llvm_, "iof.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* eq;
+                if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
+                    eq = emitStringEq(el, target);
+                else {
+                    llvm::Value* elN = el, *tN = target;
+                    if (el->getType() != target->getType() &&
+                        el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
+                        unsigned ew = el->getType()->getIntegerBitWidth();
+                        unsigned tw = target->getType()->getIntegerBitWidth();
+                        llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
+                        elN = builder_.CreateSExt(el, wide);
+                        tN = builder_.CreateSExt(target, wide);
+                    }
+                    eq = builder_.CreateICmpEQ(elN, tN);
+                }
+                builder_.CreateCondBr(eq, foundBB, nextBB);
+                builder_.SetInsertPoint(foundBB);
+                llvm::Value* result64 = idx;
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                auto* phiIdx = builder_.CreatePHI(i64(), 2, "iof.r");
+                phiIdx->addIncoming(result64, foundBB);
+                phiIdx->addIncoming(builder_.getInt64(-1), condBB);
+                return builder_.CreateTrunc(phiIdx, i32(), "iof.i32");
+            }
+            // per §5 LINQ: .Distinct(): Array<T> — remove duplicates (order preserved)
+            if (m == "Distinct" && call.args.empty()) {
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                llvm::Value* result = builder_.CreateCall(allocFn2,
+                    {builder_.getInt64(esz), builder_.getInt64(16)});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "dst.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dst.b", currentFn_);
+                auto* addBB  = llvm::BasicBlock::Create(llvm_, "dst.a", currentFn_);
+                auto* nextBB = llvm::BasicBlock::Create(llvm_, "dst.n", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "dst.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                // Check if el already in result — use Contains logic inline
+                auto* resLenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* resLen = builder_.CreateCall(resLenFn, {result});
+                auto* idxSlot2 = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot2);
+                auto* chkCond = llvm::BasicBlock::Create(llvm_, "dst.cc", currentFn_);
+                auto* chkBody = llvm::BasicBlock::Create(llvm_, "dst.cb", currentFn_);
+                auto* chkEnd  = llvm::BasicBlock::Create(llvm_, "dst.ce", currentFn_);
+                builder_.CreateBr(chkCond);
+                builder_.SetInsertPoint(chkCond);
+                llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot2);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx2, resLen), chkBody, chkEnd);
+                builder_.SetInsertPoint(chkBody);
+                llvm::Value* ep2 = builder_.CreateCall(ptrFn, {result, idx2, builder_.getInt64(esz)});
+                llvm::Value* el2 = builder_.CreateLoad(elemTy, ep2);
+                llvm::Value* eq;
+                if (el->getType()->isPointerTy() && el2->getType()->isPointerTy())
+                    eq = emitStringEq(el, el2);
+                else
+                    eq = builder_.CreateICmpEQ(el, el2);
+                builder_.CreateCondBr(eq, chkEnd, [&]{ // found dup → exit check
+                    builder_.CreateStore(builder_.CreateAdd(idx2, builder_.getInt64(1)), idxSlot2);
+                    return chkCond;
+                }());
+                builder_.SetInsertPoint(chkEnd);
+                // If idx2 == resLen → not found → add; else → dup → skip
+                llvm::Value* idx2End = builder_.CreateLoad(i64(), idxSlot2);
+                llvm::Value* notDup = builder_.CreateICmpEQ(idx2End, resLen);
+                builder_.CreateCondBr(notDup, addBB, nextBB);
+                builder_.SetInsertPoint(addBB);
+                auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+                builder_.CreateBr(nextBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return result;
+            }
             // .Add(v) / .Push(v) / .Enqueue(v)
             if ((m == "Add" || m == "Push" || m == "Enqueue") &&
                 call.args.size() == 1 && call.args[0].value) {

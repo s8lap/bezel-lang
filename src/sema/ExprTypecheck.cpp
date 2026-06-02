@@ -1594,9 +1594,13 @@ private:
                                 if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                     ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                             }
-                            // per §3: Contains → bool
+                            // per §3: Contains → bool, IndexOf → int, Distinct → Array<T>
                             else if (m == "Contains")
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                            else if (m == "IndexOf")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                            else if (m == "Distinct")
+                                ctx_.setExprType(&ce, recvTy);
                             // per §5 LINQ: Any/All → bool, Count → int, Where/Select → Array<T>
                             else if (m == "Any" || m == "All")
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
