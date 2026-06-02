@@ -1,0 +1,199 @@
+// Codegen slice §3 stdlib — Array<T>, Dictionary<K,V>, Stack<T>, Queue<T>,
+// LINQ basics (Any/All/Where/Count/ForEach/Sum/Min/Max/First/Select).
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+}  // namespace
+
+// --- Array<T> ---
+
+BEZEL_TEST(collection_array, add_get_length) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  return int(a.Length = 3 and a.Get(0) = 10 and a.Get(2) = 30); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(collection_array, set_and_remove) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  a.Set(1, 99); "
+        "  a.RemoveAt(0); "
+        "  return int(a.Length = 2 and a.Get(0) = 99 and a.Get(1) = 3); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(collection_array, string_elements) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<string>(); "
+        "  a.Add(\"hello\"); a.Add(\"world\"); "
+        "  return int(a.Length = 2 and a.Get(0) = \"hello\"); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(collection_array, for_in) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var s := 0; "
+        "  for var x in a do s := s + x; end; "
+        "  return s; "
+        "end Main; end C;"), 6);
+}
+
+// --- Stack<T> and Queue<T> ---
+
+BEZEL_TEST(collection_stack, push_peek_pop) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var s := new Stack<int>(); "
+        "  s.Push(1); s.Push(2); s.Push(3); "
+        "  var top := s.Peek(); "
+        "  var popped := s.Pop(); "
+        "  return int(top = 3 and popped = 3 and s.Length = 2); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(collection_queue, enqueue_dequeue) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var q := new Queue<int>(); "
+        "  q.Enqueue(10); q.Enqueue(20); q.Enqueue(30); "
+        "  var front := q.Dequeue(); "
+        "  return int(front = 10 and q.Length = 2 and q.Get(0) = 20); "
+        "end Main; end C;"), 1);
+}
+
+// --- Dictionary<K,V> ---
+
+BEZEL_TEST(collection_dict, add_get_contains) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d.Add(\"a\", 1); d.Add(\"b\", 2); "
+        "  var v := 0; "
+        "  d.TryGetValue(\"a\", out v); "
+        "  return int(d.Count = 2 and v = 1 and d.ContainsKey(\"b\") and not d.ContainsKey(\"c\")); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(collection_dict, set_and_remove) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d.Add(\"x\", 10); "
+        "  d.Set(\"x\", 99); "
+        "  var v := 0; "
+        "  d.TryGetValue(\"x\", out v); "
+        "  d.Remove(\"x\"); "
+        "  return int(v = 99 and d.Count = 0); "
+        "end Main; end C;"), 1);
+}
+
+// --- LINQ on Array<int> ---
+
+BEZEL_TEST(linq_int, any) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return int(a.Any((x) => x > 2) and not a.Any((x) => x > 10)); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(linq_int, all) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return int(a.All((x) => x > 0) and not a.All((x) => x > 2)); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(linq_int, count) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  return a.Count((x) => x mod 2 = 0); "
+        "end Main; end C;"), 2);
+}
+
+BEZEL_TEST(linq_int, where) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
+        "  using var evens := a.Where((x) => x mod 2 = 0); "
+        "  return int(evens.Length = 2 and evens.Get(0) = 2 and evens.Get(1) = 4); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(linq_int, sum_min_max) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(3); a.Add(1); a.Add(4); a.Add(1); a.Add(5); "
+        "  return int(a.Sum() = 14 and a.Min() = 1 and a.Max() = 5); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(linq_int, first) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var f := a.First((x) => x > 2); "
+        "  return f; "
+        "end Main; end C;"), 3);
+}
+
+BEZEL_TEST(linq_int, foreach_and_select) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Sum2(ref acc: int, x: int) acc := acc + x; end Sum2; "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); "
+        "    a.Add(1); a.Add(2); a.Add(3); "
+        "    using var doubled: Array<int> := a.Select((x: int) => x * 2); "
+        "    return int(doubled.Length = 3 and doubled.Get(0) = 2 and doubled.Get(2) = 6); "
+        "  end Main; end C;"), 1);
+}
+
+// --- LINQ on Array<string> ---
+
+BEZEL_TEST(linq_string, any_all_count) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<string>(); "
+        "  a.Add(\"apple\"); a.Add(\"banana\"); a.Add(\"avocado\"); "
+        "  var hasA := a.Any((s) => s[0] = 'a'); "
+        "  var allNE := a.All((s) => s.Length > 0); "
+        "  var aCount := a.Count((s) => s[0] = 'a'); "
+        "  return int(hasA and allNE and aCount = 2); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(linq_string, where) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<string>(); "
+        "  a.Add(\"hi\"); a.Add(\"hello\"); a.Add(\"hey\"); "
+        "  using var long2 := a.Where((s) => s.Length > 2); "
+        "  return int(long2.Length = 2 and long2.Get(0) = \"hello\"); "
+        "end Main; end C;"), 1);
+}

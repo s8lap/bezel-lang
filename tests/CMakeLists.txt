@@ -198,6 +198,7 @@ set(BEZEL_TEST_SOURCES
     codegen/range_for_test.cpp
     codegen/lambda_test.cpp
     codegen/generic_test.cpp
+    codegen/collection_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
@@ -214,6 +215,12 @@ add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(bezel_tests PRIVATE bezel_core bezel_runtime bezel_warnings)
+target_link_libraries(bezel_tests PRIVATE bezel_core bezel_warnings)
+# Force all bezel_runtime object files into bezel_tests, then export-dynamic
+# so the JIT (DynamicLibrarySearchGenerator::GetForCurrentProcess) can resolve
+# bz_array_*, bz_dict_*, etc. from the process symbol table at JIT run time.
+target_link_options(bezel_tests PRIVATE
+    -Wl,--whole-archive $<TARGET_FILE:bezel_runtime> -Wl,--no-whole-archive
+    -Wl,--export-dynamic)
 
 add_test(NAME bezel_tests COMMAND bezel_tests)
