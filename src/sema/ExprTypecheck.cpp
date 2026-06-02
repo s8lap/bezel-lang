@@ -1602,7 +1602,7 @@ private:
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                             else if (m == "Count" && !ce.args.empty())
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
-                            else if (m == "Where" || m == "Select")
+                            else if (m == "Where" || m == "Select" || m == "Skip" || m == "Take")
                                 ctx_.setExprType(&ce, recvTy);  // same Array<T> type
                             else if (m == "Sum" || m == "Min" || m == "Max")
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));

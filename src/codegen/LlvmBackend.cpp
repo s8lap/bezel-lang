@@ -8686,6 +8686,77 @@ private:
                 builder_.SetInsertPoint(endBB);
                 return builder_.CreateLoad(elemTy, resultSlot, "fst.r");
             }
+            // per §5 LINQ: .Skip(n: int): Array<T> — return elements from index n onward
+            if (m == "Skip" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* nV = lowerExpr(*call.args[0].value);
+                if (!nV) return nullptr;
+                llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
+                    : builder_.CreateSExt(nV, i64(), "sk.n");
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                // startIdx = max(0, min(n, len))
+                llvm::Value* clampedN = builder_.CreateSelect(
+                    builder_.CreateICmpSLT(n64, builder_.getInt64(0)), builder_.getInt64(0),
+                    builder_.CreateSelect(builder_.CreateICmpSGT(n64, len), len, n64));
+                auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                llvm::Value* result = builder_.CreateCall(allocFn2,
+                    {builder_.getInt64(esz), builder_.getInt64(16)});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(clampedN, idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "sk.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sk.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "sk.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return result;
+            }
+            // per §5 LINQ: .Take(n: int): Array<T> — return first n elements
+            if (m == "Take" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* nV = lowerExpr(*call.args[0].value);
+                if (!nV) return nullptr;
+                llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
+                    : builder_.CreateSExt(nV, i64(), "tk.n");
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                llvm::Value* endIdx = builder_.CreateSelect(
+                    builder_.CreateICmpSLT(n64, builder_.getInt64(0)), builder_.getInt64(0),
+                    builder_.CreateSelect(builder_.CreateICmpSGT(n64, len), len, n64));
+                auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                llvm::Value* result = builder_.CreateCall(allocFn2,
+                    {builder_.getInt64(esz), builder_.getInt64(16)});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "tk.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "tk.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "tk.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, endIdx), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return result;
+            }
             // per §3: .Sort() — in-place ascending sort for int arrays.
             // Uses bz_array_sort with a built-in i32 comparator thunk.
             if (m == "Sort" && call.args.empty()) {
