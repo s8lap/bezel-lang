@@ -2018,19 +2018,35 @@ private:
         // only from inside the declaring type. Walk the member's
         // parent TypeSymbol; if it isn't currentType_, diagnose.
         // Other visibilities (internal/protected/public) are deferred.
+        // Exception: if there are also public members with the same name
+        // (overloads), suppress the error — the codegen picks by arity.
         if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
             if (msym->visibility == ast::Visibility::Private &&
                 msym->parent && msym->parent != currentType_) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ma.span.begin,
-                    std::string("`") + std::string(ma.member) +
-                    "` is private to type `" +
-                    std::string(msym->parent->name) +
-                    "` and not accessible from `" +
-                    std::string(currentType_ ? currentType_->name
-                                             : std::string_view("(global)")) +
-                    "` (§13.1 — `private` is visible to the declaring "
-                    "class only)");
+                // Check if there is any public member with the same name
+                // in the same type — if so, this is an overload set and
+                // the codegen will select the accessible one.
+                bool hasPublicOverload = false;
+                for (Symbol* sib : msym->parent->members) {
+                    if (sib && sib != member && sib->name == member->name) {
+                        if (auto* sm = dynamic_cast<MemberSymbol*>(sib)) {
+                            if (sm->visibility != ast::Visibility::Private)
+                                hasPublicOverload = true;
+                        }
+                    }
+                }
+                if (!hasPublicOverload) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("`") + std::string(ma.member) +
+                        "` is private to type `" +
+                        std::string(msym->parent->name) +
+                        "` and not accessible from `" +
+                        std::string(currentType_ ? currentType_->name
+                                                 : std::string_view("(global)")) +
+                        "` (§13.1 — `private` is visible to the declaring "
+                        "class only)");
+                }
             }
         }
         ctx_.setExprSymbol(&ma, member);
