@@ -8760,21 +8760,56 @@ private:
             // per §3: .Sort() — in-place ascending sort for int arrays.
             // Uses bz_array_sort with a built-in i32 comparator thunk.
             if (m == "Sort" && call.args.empty()) {
-                // Create or reuse a module-level int32 comparator function.
-                auto* cmpName = "bz$intcmp";
-                llvm::Function* cmpFn = module_->getFunction(cmpName);
-                if (!cmpFn) {
-                    auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                    cmpFn = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
-                                                   cmpName, module_.get());
-                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
-                    llvm::IRBuilder<> cmpB(bb);
-                    llvm::Value* a = &*cmpFn->arg_begin();
-                    llvm::Value* b = &*std::next(cmpFn->arg_begin());
-                    llvm::Value* av = cmpB.CreateLoad(i32(), a);
-                    llvm::Value* bv = cmpB.CreateLoad(i32(), b);
-                    // return av - bv (safe for non-extreme values)
-                    cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                // Choose comparator based on element type: int → bz$intcmp, string → bz$strcmp.
+                llvm::Type* elemTy2 = getElemTy();
+                bool isStringElem = elemTy2 == ptrTy();
+                llvm::Function* cmpFn = nullptr;
+                if (isStringElem) {
+                    // String comparator: load two ptr elements, call strcmp on their data.
+                    auto* cmpName2 = "bz$strcmp";
+                    cmpFn = module_->getFunction(cmpName2);
+                    if (!cmpFn) {
+                        auto* cmpTy2 = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                        cmpFn = llvm::Function::Create(cmpTy2, llvm::Function::InternalLinkage,
+                                                        cmpName2, module_.get());
+                        auto* bb2 = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+                        llvm::IRBuilder<> cmpB2(bb2);
+                        // Each argument is a ptr* (pointer to bz.string*).
+                        // Load the bz.string* from each slot, then load data pointer.
+                        llvm::Value* aSlot = &*cmpFn->arg_begin();
+                        llvm::Value* bSlot = &*std::next(cmpFn->arg_begin());
+                        llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
+                        llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
+                        // Load data pointer (field 0) from bz.string struct
+                        llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
+                            cmpB2.CreateStructGEP(stringType(), aStr, 0));
+                        llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
+                            cmpB2.CreateStructGEP(stringType(), bStr, 0));
+                        // Call strcmp
+                        auto* strcmpFn2 = module_->getFunction("strcmp");
+                        if (!strcmpFn2) {
+                            auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                            strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
+                                                               "strcmp", module_.get());
+                        }
+                        cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                    }
+                } else {
+                    // Integer comparator
+                    auto* cmpName = "bz$intcmp";
+                    cmpFn = module_->getFunction(cmpName);
+                    if (!cmpFn) {
+                        auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                        cmpFn = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
+                                                       cmpName, module_.get());
+                        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+                        llvm::IRBuilder<> cmpB(bb);
+                        llvm::Value* a = &*cmpFn->arg_begin();
+                        llvm::Value* b = &*std::next(cmpFn->arg_begin());
+                        llvm::Value* av = cmpB.CreateLoad(i32(), a);
+                        llvm::Value* bv = cmpB.CreateLoad(i32(), b);
+                        cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                    }
                 }
                 auto* sortFn = declareC("bz_array_sort", llvm::Type::getVoidTy(llvm_),
                                         {ptrTy(), i64(), ptrTy()});
