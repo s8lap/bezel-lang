@@ -238,6 +238,12 @@ private:
     // to associate a local with the concrete types of its initializer.
     std::unordered_map<std::string_view, llvm::Type*> lastCallGenericSubst_;
 
+    // Block-form property getter functions (§22.9 `get => do...end;`).
+    // Keyed by PropertyDecl so the same getter function is reused across
+    // multiple access sites (non-generic; generic getters are specialised).
+    std::unordered_map<const ast::PropertyDecl*, llvm::Function*>
+        propBlockGetterFns_;
+
     // CG26: external (FFI) function declared by an extern block (§32).
     std::unordered_map<const sema::ExternDeclSymbol*, llvm::Function*>
         externFns_;
@@ -2620,6 +2626,101 @@ private:
             }
         }
         return nullptr;
+    }
+
+    // §22.9: return the block-form getter accessor (get => do...end;) if the
+    // property has one, else null.  Arrow-expression getters are handled by
+    // computedGetterOf above.
+    const ast::PropertyAccessor* blockGetterOf(sema::Symbol* sym) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+        if (!ps || ps->isIndexer) return nullptr;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->isIndexer) return nullptr;
+        if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            for (const auto& acc : pd->accessors) {
+                if (!acc.isSet &&
+                    acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                    return &acc;
+            }
+        }
+        return nullptr;
+    }
+
+    // Emit (or retrieve cached) a standalone LLVM function for a block-form
+    // property getter body (`get => do…end;`).  Calling it with `this` as the
+    // sole argument returns the getter's value — avoids premature `ret` in the
+    // outer method when `return` appears inside the getter.
+    llvm::Function* ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
+                                              const ast::PropertyAccessor* acc) {
+        auto it = propBlockGetterFns_.find(pd);
+        if (it != propBlockGetterFns_.end()) return it->second;
+
+        llvm::Type* retTy = lowerType(pd->type.get());
+        if (!retTy) retTy = i32();
+
+        auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::GlobalValue::InternalLinkage,
+            "bz$prop$" + std::string(pd->name) + "$get", *module_);
+        propBlockGetterFns_[pd] = fn;
+        // no capture attribute added (Captures API varies by LLVM version)
+
+        auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+
+        // --- Save entire emitter state ---
+        auto* savedFn        = currentFn_;
+        auto  savedBB        = builder_.GetInsertBlock();
+        auto  savedBBOffset  = savedBB ? builder_.GetInsertPoint() : decltype(savedBB->begin()){};
+        auto* savedThis      = currentThis_;
+        auto  savedLocals    = locals_;
+        auto  savedParams    = paramSlots_;
+        auto  savedRef       = refParams_;
+        auto  savedDispose   = disposeStack_;
+        auto  savedLoop      = loopStack_;
+        auto* savedUnwind    = unwindTarget_;
+        auto* savedProp      = propagateBB_;
+        auto* savedCaught    = currentCaughtExc_;
+        auto  savedUD        = unwindScopeDepth_;
+        auto  savedDiv       = diverged_;
+        auto  savedGSubst    = genericSubst_;
+
+        // --- Switch into the getter function ---
+        currentFn_          = fn;
+        builder_.SetInsertPoint(entryBB);
+        currentThis_        = &*fn->args().begin();
+        locals_.clear();
+        paramSlots_.clear();
+        refParams_.clear();
+        disposeStack_.clear();
+        loopStack_.clear();
+        unwindTarget_       = nullptr;
+        propagateBB_        = nullptr;
+        currentCaughtExc_   = nullptr;
+        unwindScopeDepth_   = 0;
+        diverged_           = false;
+
+        // --- Emit body ---
+        lowerScopedBlock(acc->stmts);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            emitImplicitReturn(fn);
+
+        // --- Restore state ---
+        currentFn_          = savedFn;
+        currentThis_        = savedThis;
+        locals_             = std::move(savedLocals);
+        paramSlots_         = std::move(savedParams);
+        refParams_          = std::move(savedRef);
+        disposeStack_       = std::move(savedDispose);
+        loopStack_          = std::move(savedLoop);
+        unwindTarget_       = savedUnwind;
+        propagateBB_        = savedProp;
+        currentCaughtExc_   = savedCaught;
+        unwindScopeDepth_   = savedUD;
+        diverged_           = savedDiv;
+        genericSubst_       = std::move(savedGSubst);
+        if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
+
+        return fn;
     }
 
     // §22.9: the block-form setter accessor of the property `target` names,
@@ -5357,7 +5458,8 @@ private:
                      (tt->kind == sema::TypeRef::Kind::Named &&
                       !tt->declaration))) {
                     // Only intercept if it's not a computed property on the target.
-                    if (!computedGetterOf(ctx_.exprSymbol(e))) {
+                    if (!computedGetterOf(ctx_.exprSymbol(e)) &&
+                        !blockGetterOf(ctx_.exprSymbol(e))) {
                         llvm::Value* strPtr = lowerExpr(*ma->target);
                         if (strPtr && strPtr->getType()->isPointerTy()) {
                             // If the value is a bz_string struct pointer, load Length.
@@ -5464,6 +5566,21 @@ private:
                 genericSubst_ = std::move(savedSubst);
                 return v;
             }
+            // CG33b: block-form getter (`get => do … end;`) — emit as a
+            // standalone function so that `return` inside the body terminates
+            // only the getter, not the enclosing method (§22.9).
+            if (const ast::PropertyAccessor* acc =
+                    blockGetterOf(ctx_.exprSymbol(*ma))) {
+                if (!ma->target) return nullptr;
+                llvm::Value* obj = lowerExpr(*ma->target);
+                if (!obj) return nullptr;
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(
+                    dynamic_cast<sema::PropertySymbol*>(
+                        ctx_.exprSymbol(*ma))->decl);
+                llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc);
+                return builder_.CreateCall(getterFn->getFunctionType(),
+                                           getterFn, {obj});
+            }
         }
         // CG8: field read `obj.f`.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
@@ -5485,6 +5602,13 @@ private:
             // against the current `this`.
             if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e)))
                 return lowerExpr(*getter);
+            // CG33b: block-form getter (`get => do … end;`) accessed bare.
+            if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e));
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                llvm::Function* fn = ensurePropertyBlockGetter(pd, acc);
+                return builder_.CreateCall(fn->getFunctionType(), fn, {currentThis_});
+            }
             // CG12: a bare identifier resolving to a static field reads
             // its backing global.
             if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
