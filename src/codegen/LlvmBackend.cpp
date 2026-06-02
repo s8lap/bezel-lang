@@ -4046,35 +4046,48 @@ private:
                 if (cs->params.size() == args.size()) candidates.push_back(cs);
             }
             // For each candidate, check if positional arg sema types are
-            // compatible with param sema types.
+            // compatible with param sema types. We classify each type into:
+            //   0 = bool (i1)
+            //   1 = char / integer (i32/i64/etc)
+            //   2 = float/double
+            //   3 = ptr (class, string, char, nullable, function)
+            //  -1 = unknown / don't care
+            using P = sema::PrimitiveType;
+            auto typeClass = [&](const sema::TypeRef* t) -> int {
+                if (!t) return -1;
+                if (t->nullable) return 3;
+                if (t->kind == sema::TypeRef::Kind::Named) return 3;
+                if (t->kind == sema::TypeRef::Kind::Function) return 3;
+                if (t->kind == sema::TypeRef::Kind::Primitive) {
+                    switch (t->primitive) {
+                    case P::Bool:   return 0;
+                    case P::Char:   return 1; // char is i32 in LLVM
+                    case P::Int:   case P::Long:   case P::Byte:
+                    case P::SByte: case P::Short:  case P::UShort:
+                    case P::UInt:  case P::ULong:  return 1;
+                    case P::Float:  return 2;
+                    case P::Double: case P::Decimal: return 2;
+                    case P::String: return 3;
+                    default: return -1;
+                    }
+                }
+                return -1;
+            };
             for (auto* cs : candidates) {
                 auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
                 if (!cd || cd->params.size() != args.size()) continue;
                 bool match = true;
                 for (std::size_t pi = 0; pi < args.size() && match; ++pi) {
                     if (!args[pi].value || !cd->params[pi].type) continue;
-                    // Check if arg's sema type is "pointer-typed" (class/string)
-                    // vs "int-typed" — use this to discriminate class vs int params.
                     auto* argTy = ctx_.exprType(*args[pi].value);
-                    bool argIsPtr = argTy && (
-                        (argTy->kind == sema::TypeRef::Kind::Named) ||
-                        (argTy->kind == sema::TypeRef::Kind::Primitive &&
-                         (argTy->primitive == sema::PrimitiveType::String ||
-                          argTy->primitive == sema::PrimitiveType::Char)));
                     bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
                         args[pi].value.get()) != nullptr;
-                    argIsPtr = argIsPtr || argIsNull;
-
+                    int argCls = argIsNull ? 3 : typeClass(argTy);
                     auto* paramTy = ctx_.resolvedType(*cd->params[pi].type);
-                    bool paramIsPtr = paramTy && (
-                        (paramTy->kind == sema::TypeRef::Kind::Named) ||
-                        (paramTy->kind == sema::TypeRef::Kind::Primitive &&
-                         (paramTy->primitive == sema::PrimitiveType::String ||
-                          paramTy->primitive == sema::PrimitiveType::Char)) ||
-                        paramTy->nullable);
-
-                    // If one is ptr and other is not, no match.
-                    if (argIsPtr != paramIsPtr) match = false;
+                    int paramCls = typeClass(paramTy);
+                    // Both known: must agree. Unknown means any match.
+                    if (argCls != -1 && paramCls != -1 && argCls != paramCls)
+                        match = false;
                 }
                 if (match) return cs;
             }
