@@ -2371,6 +2371,19 @@ private:
             op == "mod" || op == "&" || op == "|" || op == "^" ||
             op == "<<" || op == ">>") {
             TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+            // §17.1: bitwise/shift ops (&, |, ^, <<, >>) require integer operands.
+            // Reject them on string/reference types to prevent IR corruption.
+            if ((op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") && lt) {
+                bool lIsStr = lt->kind == TypeRef::Kind::Primitive &&
+                    lt->primitive == PrimitiveType::String;
+                bool lIsRef = lt->kind == TypeRef::Kind::Named;
+                if (lIsStr || lIsRef) {
+                    ctx_.diagnostics().report(Severity::Error, be.span.begin,
+                        std::string("operator `") + std::string(op) +
+                        "` requires integer operands; use `+` for string concatenation");
+                    return;
+                }
+            }
             if (lt) ctx_.setExprType(&be, lt);
             return;
         }

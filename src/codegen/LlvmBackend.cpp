@@ -6881,12 +6881,16 @@ private:
                                   : builder_.CreateSDiv(l, r);
         if (op == "mod") return uns ? builder_.CreateURem(l, r)
                                     : builder_.CreateSRem(l, r);
-        if (op == "&") return builder_.CreateAnd(l, r);
-        if (op == "|") return builder_.CreateOr(l, r);
-        if (op == "^") return builder_.CreateXor(l, r);
-        if (op == "<<") return builder_.CreateShl(l, r);
-        if (op == ">>") return uns ? builder_.CreateLShr(l, r)
-                                   : builder_.CreateAShr(l, r);
+        // Bitwise ops only valid on integer-typed operands — pointers (string refs)
+        // would crash LLVM IR construction.
+        if (l->getType()->isIntegerTy() && r->getType()->isIntegerTy()) {
+            if (op == "&") return builder_.CreateAnd(l, r);
+            if (op == "|") return builder_.CreateOr(l, r);
+            if (op == "^") return builder_.CreateXor(l, r);
+            if (op == "<<") return builder_.CreateShl(l, r);
+            if (op == ">>") return uns ? builder_.CreateLShr(l, r)
+                                       : builder_.CreateAShr(l, r);
+        }
         // CG29b (§8.3): records compare structurally — dispatch before the
         // scalar integer path (ICmp doesn't accept struct operands).
         if ((op == "=" || op == "<>") && l->getType()->isStructTy()) {
