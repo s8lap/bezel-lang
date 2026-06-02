@@ -6651,6 +6651,35 @@ private:
             if (!init) continue;  // no initializer → calloc-zeroed
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
+            // §15.1 / §16: collection literal `[e1, e2, …]` initializer.
+            // Build the array in-place via GEP into the field slot.
+            if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
+                cl && !cl->isDict && !cl->elements.empty()) {
+                // Determine the struct field type (array type).
+                llvm::Value* fieldGep =
+                    builder_.CreateStructGEP(st, obj, idxIt->second);
+                llvm::Type* fieldTy = st->getElementType(idxIt->second);
+                if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(fieldTy)) {
+                    llvm::Type* elemTy = aty->getElementType();
+                    for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                        if (!cl->elements[i]) continue;
+                        llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                        if (!ev) continue;
+                        if (ev->getType() != elemTy &&
+                            ev->getType()->isIntegerTy() &&
+                            elemTy->isIntegerTy()) {
+                            unsigned eb = ev->getType()->getIntegerBitWidth();
+                            unsigned db = elemTy->getIntegerBitWidth();
+                            ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                         : builder_.CreateTrunc(ev, elemTy);
+                        }
+                        builder_.CreateStore(
+                            ev, builder_.CreateGEP(fieldTy, fieldGep,
+                                {builder_.getInt32(0), builder_.getInt32(i)}));
+                    }
+                }
+                continue;
+            }
             llvm::Value* v = lowerExpr(*init);
             if (!v) continue;
             builder_.CreateStore(
