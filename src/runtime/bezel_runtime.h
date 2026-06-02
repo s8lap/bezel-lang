@@ -205,6 +205,19 @@ void  bz_task_then(void* task, void (*cont)(void* task, void* state), void* stat
 void  bz_task_free(void* task);
 
 // ---------------------------------------------------------------------------
+// Array enumerator (Part B2): wraps bz_array_t* as a vtable-based IEnumerator<T>.
+// The returned object has vtable slots: [0]=td/self, [1]=Dispose, [2]=MoveNext,
+// [3]=get_Current. This makes Array<T> usable wherever IEnumerator<T> is expected.
+//
+// Usage: bz_array_enum_alloc(arr, esz) → opaque enumerator ptr
+//        [vtable.MoveNext](self) → bool
+//        [vtable.get_Current](self) → void* (pointer to current element in arr)
+//        [vtable.Dispose](self) → void (frees the enumerator struct)
+//
+// elem_size: bytes per element (4 for int, 8 for ptr/double, etc.)
+void* bz_array_enum_alloc(void* arr, int64_t elem_size);
+
+// ---------------------------------------------------------------------------
 // Split a string by a delimiter: returns bz_array_t* of bz.string* (heap alloc'd).
 // Caller disposes result array. All pointers point into separately malloc'd strings.
 void* bz_string_split(const char* s, int64_t s_len,

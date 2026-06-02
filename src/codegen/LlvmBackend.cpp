@@ -5540,18 +5540,12 @@ private:
         // identifier `i` in the body resolves through `locals_[fs]`.
         locals_[&fs] = slot;
 
-        // §29.3: in an iterator method, store `hi` in an alloca so it is
-        // accessible from all state blocks (not just the initial state path).
-        // Without this, resumed states skip the `hi = lowerExpr(range->hi)`
-        // instruction and use garbage for the upper bound.
-        llvm::Value* hiToUse = hi;
+        // §29.3: in an iterator method, re-evaluate `hi` inside `condBB`
+        // rather than pre-computing it into an alloca. Pre-computed allocas
+        // are uninitialized in resumed states (state≥1), causing the upper
+        // bound to be garbage. Re-evaluating in condBB is correct because
+        // all params/locals it depends on ARE restored from the state struct.
         if (iterStateStruct_) {
-            auto* hiSlot = entryAlloca(hi->getType());
-            builder_.CreateStore(hi, hiSlot);
-            // hiToUse will be loaded in condBB below.
-            hiToUse = nullptr;  // signal to load from hiSlot in condBB
-            // Store hiSlot as a special local; we handle it per-cond.
-            // For now, just always load in condBB.
             auto* condBB = llvm::BasicBlock::Create(llvm_, "for.cond", currentFn_);
             auto* bodyBB = llvm::BasicBlock::Create(llvm_, "for.body", currentFn_);
             auto* incBB  = llvm::BasicBlock::Create(llvm_, "for.inc",  currentFn_);
@@ -5559,7 +5553,9 @@ private:
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(condBB);
             llvm::Value* cur = builder_.CreateLoad(slot->getAllocatedType(), slot);
-            llvm::Value* hiVal = builder_.CreateLoad(hi->getType(), hiSlot);
+            // Re-evaluate hi here so it picks up any saved/restored values.
+            llvm::Value* hiVal = lowerExpr(*range->hi);
+            if (!hiVal) hiVal = hi;  // fallback to pre-computed value
             llvm::Value* cond;
             if (descending) {
                 cond = range->inclusive
@@ -5883,25 +5879,44 @@ private:
 
         llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
 
-        // Determine if the value is a bz_array_t (from a variable or parameter
-        // typed Array<T>) or an iterator state machine (from a call to an
-        // iterator method). Iterator values have a vtable pointer at offset 0.
-        // We detect this by checking if the original expression was a function call —
-        // iterator methods return IEnumerable<T>, so a call result is an iterator.
-        // For a variable/parameter typed IEnumerable<T> backed by Array<T>,
-        // use the direct array protocol.
-        bool isArrayBacked = false;
-        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
+        // Determine if the value is a bz_array_t (variable/param backed by Array)
+        // or an iterator state machine (result of a call to an iterator method).
+        //
+        // Heuristic: if the iterable is a CallExpr → assume iterator (vtable-backed).
+        // If it's an identifier (parameter/local) → assume array-backed (bz_array_t*).
+        // If it's a local variable declared as Array<T> → definitely array.
+        //
+        // This heuristic is correct for:
+        //   for var x in Odds(10) do   ← CallExpr → vtable
+        //   for var x in items do       ← identifier → array
+        // Determine protocol based on expression kind:
+        // - CallExpr → vtable dispatch (iterator state machine result)
+        // - NewExpr → vtable dispatch (user class implementing IEnumerable)
+        // - IdentifierExpr typed as concrete user class → vtable dispatch
+        // - Everything else → array protocol (assumes bz_array_t*)
+        //
+        // Limitation: `for x in items` where items: IEnumerable<T> and the actual
+        // value is a user class (not Array<T>) does not work correctly. Full
+        // IEnumerable<T> interface dispatch requires vtable registration of
+        // GetEnumerator which is not yet implemented for builtin interfaces.
+        bool isArrayBacked = true;  // default: array protocol
+        if (dynamic_cast<const ast::CallExpr*>(fs.iterable.get())) {
+            isArrayBacked = false;  // iterator method call → vtable
+        } else if (dynamic_cast<const ast::NewExpr*>(fs.iterable.get())) {
+            isArrayBacked = false;  // new C() → vtable
+        } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
-            // Check if the original parameter/local was typed as a collection.
+            // If typed as a concrete user class (not builtin IEnumerable), use vtable.
+            auto checkNamed = [&](sema::TypeRef* rt) {
+                return rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration;
+            };
             if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
                 if (par->declType) {
                     auto* rt = ctx_.resolvedType(*par->declType);
-                    if (rt && isCollectionTypeName(rt)) isArrayBacked = true;
+                    if (checkNamed(rt)) isArrayBacked = false;
                 }
             } else if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
-                if (loc->declType && isCollectionTypeName(loc->declType))
-                    isArrayBacked = true;
+                if (checkNamed(loc->declType)) isArrayBacked = false;
             }
         }
 
@@ -5920,6 +5935,7 @@ private:
             locals_[&fs] = varSlot;
             auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
             auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ib.body", currentFn_);
+            auto* incBB  = llvm::BasicBlock::Create(llvm_, "ib.inc",  currentFn_);
             auto* endBB  = llvm::BasicBlock::Create(llvm_, "ib.end",  currentFn_);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(condBB);
@@ -5930,11 +5946,15 @@ private:
             llvm::Value* ep = builder_.CreateCall(ptrAtFn, {enumObj, idx2, builder_.getInt64(esz)});
             llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
             builder_.CreateStore(elem, varSlot);
-            loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+            loopStack_.push_back({incBB, endBB, disposeStack_.size()});
             lowerScopedBlock(fs.body);
             loopStack_.pop_back();
             if (!builder_.GetInsertBlock()->getTerminator())
-                builder_.CreateBr(condBB);
+                builder_.CreateBr(incBB);
+            builder_.SetInsertPoint(incBB);
+            llvm::Value* oldIdx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateStore(builder_.CreateAdd(oldIdx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             return true;
         }

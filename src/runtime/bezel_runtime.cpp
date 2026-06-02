@@ -814,6 +814,44 @@ struct bz_string_struct {
     int8_t  width;
 };
 
+// bz_array_enum_t: vtable-backed array enumerator for IEnumerator<T> protocol.
+// Vtable layout matches our iterator state machines: [td, Dispose, MoveNext, Current].
+struct bz_array_enum_t {
+    void* vtable;      // points to bz_array_enum_vtable
+    void* arr;         // the underlying bz_array_t*
+    int64_t idx;       // current index (-1 = before first)
+    int64_t esz;       // element size in bytes
+};
+
+static int32_t bz_array_enum_movenext(bz_array_enum_t* e) {
+    e->idx++;
+    return (e->idx < bz_array_len(e->arr)) ? 1 : 0;
+}
+static void* bz_array_enum_current(bz_array_enum_t* e) {
+    return bz_array_ptr_at(e->arr, e->idx, e->esz);
+}
+static void bz_array_enum_dispose(bz_array_enum_t* e) {
+    free(e);
+}
+
+// Static vtable: [self-ptr, Dispose, MoveNext, get_Current]
+static void* bz_array_enum_vtable[4] = {
+    nullptr,  // slot 0: filled at startup (see bz_array_enum_alloc)
+    (void*)bz_array_enum_dispose,
+    (void*)bz_array_enum_movenext,
+    (void*)bz_array_enum_current
+};
+
+void* bz_array_enum_alloc(void* arr, int64_t elem_size) {
+    auto* e = (bz_array_enum_t*)calloc(1, sizeof(bz_array_enum_t));
+    bz_array_enum_vtable[0] = bz_array_enum_vtable;  // self-referential td
+    e->vtable = bz_array_enum_vtable;
+    e->arr = arr;
+    e->idx = -1;
+    e->esz = elem_size;
+    return e;
+}
+
 void* bz_string_split(const char* s, int64_t s_len,
                        const char* delim, int64_t delim_len) {
     void* arr = bz_array_alloc(8, 8);
