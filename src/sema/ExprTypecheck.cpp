@@ -2292,21 +2292,40 @@ private:
             if (nm->target) visitExpr(*nm->target);
         } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
             if (ce->callee) visitExpr(*ce->callee);
+            // Resolve callee's parameter list to type out-var locals.
+            sema::Symbol* calleeSym2 = ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr;
+            const ast::MethodDecl* calleeMd2 = nullptr;
+            if (auto* ms2 = dynamic_cast<sema::MethodSymbol*>(calleeSym2))
+                calleeMd2 = dynamic_cast<const ast::MethodDecl*>(ms2->decl);
+            std::size_t pos2 = 0;
             for (const auto& a : ce->args) {
                 // §22.4: `out var x` declares x in the current scope.
                 // Register the symbol BEFORE visiting the IdentifierExpr so
-                // lookup finds it. Type is inferred later from the param type.
+                // lookup finds it. Infer type from the callee's parameter.
                 if (a.modifier == "out var" && a.value && currentScope_) {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                                        a.value.get())) {
                         auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                         lsym->name = id->name;
-                        lsym->decl = id;    // IdentifierExpr IS the decl node
-                        lsym->declType = nullptr;  // filled by codegen/inference
+                        lsym->decl = id;
+                        // Infer type from the callee's formal parameter.
+                        if (calleeMd2 && pos2 < calleeMd2->params.size() &&
+                            calleeMd2->params[pos2].type) {
+                            lsym->declType = ctx_.resolvedType(
+                                *calleeMd2->params[pos2].type);
+                            // out params are nullable refs — strip nullable
+                            // (the variable holds the non-nullable value).
+                            if (lsym->declType && lsym->declType->nullable) {
+                                TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
+                                nn->nullable = false;
+                                lsym->declType = nn;
+                            }
+                        }
                         currentScope_->names[id->name] = lsym;
                     }
                 }
                 if (a.value) visitExpr(*a.value);
+                ++pos2;
             }
         } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
             if (nc->callee) visitExpr(*nc->callee);
