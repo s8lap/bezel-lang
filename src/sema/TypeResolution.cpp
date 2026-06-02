@@ -520,9 +520,21 @@ public:
             n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
             n == "ICollection" || n == "IList" ||
             n == "IOwnedCollection" || n == "IOwnedList" ||
-            n == "IEvent" || n == "IAsyncEvent") {
+            n == "IEvent" || n == "IAsyncEvent" ||
+            // §3 stdlib collection types (arity 1):
+            n == "Stack" || n == "OwnedStack" ||
+            n == "Queue" || n == "OwnedQueue" ||
+            n == "Set" || n == "OwnedSet" ||
+            n == "LinkedList" || n == "OwnedLinkedList") {
             return 1;
         }
+        // §3 stdlib two-parameter collection types (arity 2):
+        if (n == "Dictionary" || n == "OwnedDictionary") return 2;
+        // §3 nullary stdlib classes:
+        if (n == "StringBuilder" || n == "Random" ||
+            n == "DateTime" || n == "TimeSpan" ||
+            n == "File" || n == "Directory" || n == "Path" ||
+            n == "Encoding" || n == "Linq") return 0;
         return kNotBuiltin;
     }
 
