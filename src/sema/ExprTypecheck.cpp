@@ -1816,6 +1816,10 @@ private:
                             ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                             return;
                         }
+                        if (mbr == "TryParse") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                            return;
+                        }
                     }
                 }
             }

@@ -8179,6 +8179,38 @@ private:
             return emitStringOrdCmp(a, b);
         }
 
+        // double.TryParse / float.TryParse(s, out result): bool — stdlib §5.2
+        if (m == "TryParse" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value &&
+            (pt == P::Double || pt == P::Float)) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Value* strData = loadStringData(strVal);
+            llvm::Type* et = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+            if (!outAddr) return nullptr;
+            // strtod(data, &endptr)
+            auto* strtodFn = declareC("strtod",
+                llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
+            auto* endSlot = entryAlloca(ptrTy());
+            llvm::Value* valD = builder_.CreateCall(
+                strtodFn, {strData, endSlot}, "tryp.d");
+            llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlot);
+            llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "tryp.adv");
+            auto* i8Ty3 = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* endCh = builder_.CreateLoad(i8Ty3, endPtr, "tryp.end");
+            llvm::Value* atNul = builder_.CreateICmpEQ(
+                endCh, llvm::ConstantInt::get(i8Ty3, 0), "tryp.nul");
+            llvm::Value* ok = builder_.CreateAnd(advanced, atNul, "tryp.ok");
+            if (pt == P::Float) {
+                builder_.CreateStore(
+                    builder_.CreateFPTrunc(valD, llvm::Type::getFloatTy(llvm_)), outAddr);
+            } else {
+                builder_.CreateStore(valD, outAddr);
+            }
+            return ok;
+        }
+
         // int.TryParse(s, out result): bool — stdlib §5.2
         // Returns true and sets result if s is a valid integer; false and sets
         // result to 0 otherwise.
