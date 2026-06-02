@@ -245,6 +245,9 @@ private:
     // argument for a function-typed parameter.  lowerLambda reads this to
     // infer the LLVM types for unannotated lambda parameters.
     const sema::TypeRef* expectedFunctionType_ = nullptr;
+    // currentEnumMethod_: when we're emitting an enum instance method, set to
+    // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
+    const sema::TypeSymbol* currentEnumMethod_ = nullptr;
 
     // Block-form property getter functions (§22.9 `get => do...end;`).
     // Keyed by PropertyDecl so the same getter function is reused across
@@ -3014,6 +3017,12 @@ private:
     // local/parameter's declared type (a scrutinee identifier often carries
     // only an exprSymbol, not an exprType).
     const sema::TypeSymbol* enumTypeOf(const ast::Expr& e) {
+        // CG30: `this` inside an enum instance method — sema does not set
+        // an exprType for `this`; use currentEnumMethod_ instead.
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            if ((id->name == "this" || id->name == "base") && currentEnumMethod_)
+                return currentEnumMethod_;
+        }
         const sema::TypeRef* rt = ctx_.exprType(e);
         if (!rt) {
             sema::Symbol* sym = ctx_.exprSymbol(e);
@@ -3195,7 +3204,13 @@ private:
             llvm::Type* retTy = isMain(ms) ? i32()
                                            : lowerType(ci.returnType);
             std::vector<llvm::Type*> paramTys;
-            if (!isStaticMethod(ms)) paramTys.push_back(ptrTy());  // this
+            if (!isStaticMethod(ms)) {
+                // CG30: enum instance methods take the enum value (i32) as
+                // `this`, not a pointer — enums are value types.
+                bool isEnumMethod = ms->parent &&
+                    ms->parent->kind == ast::TypeDeclKind::Enum;
+                paramTys.push_back(isEnumMethod ? i32() : ptrTy());
+            }
             for (const auto& p : *ci.params) {
                 paramTys.push_back(isByRefMod(p.modifier)
                                        ? ptrTy()  // CG50: ref/out by reference
@@ -3863,6 +3878,13 @@ private:
             for (auto& [cs, sfn] : staticCtors_) builder_.CreateCall(sfn, {});
         }
 
+        // CG30: for enum instance methods, record the enum type so that
+        // `case this` arms can resolve enum constant patterns.
+        const sema::TypeSymbol* savedEnumMethod = currentEnumMethod_;
+        if (!isStaticMethod(ms) && ms->parent &&
+            ms->parent->kind == ast::TypeDeclKind::Enum)
+            currentEnumMethod_ = ms->parent;
+
         bool terminated = false;
         if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
             llvm::Value* v = lowerExpr(*ci.exprBody);
@@ -3871,6 +3893,7 @@ private:
             terminated = lowerScopedBlock(*ci.stmts);
         }
         if (!terminated) emitImplicitReturn(fn);
+        currentEnumMethod_ = savedEnumMethod;
     }
 
     // CG10: emit a constructor body. Always an instance function (leading
