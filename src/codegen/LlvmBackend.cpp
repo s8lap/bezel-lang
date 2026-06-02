@@ -5633,6 +5633,18 @@ private:
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
             if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(*ma))) {
                 if (!ma->target) return nullptr;
+                // CG33b: for static properties (accessed via type name), the
+                // receiver is a class type identifier, not an instance — skip
+                // the obj/currentThis_ setup and evaluate the body directly.
+                auto* propSym = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+                bool isStaticProp = propSym && !propSym->isIndexer &&
+                    std::any_of(propSym->modifiers.begin(),
+                                propSym->modifiers.end(),
+                                [](const auto& m){ return m == "static"; });
+                if (isStaticProp) {
+                    // Static property: no 'this', just evaluate the getter body.
+                    return lowerExpr(*getter);
+                }
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (!obj) return nullptr;
                 // CG-generic: set up genericSubst_ for the receiver's type so
