@@ -7058,6 +7058,10 @@ private:
             if (auto* rt = ctx_.exprType(argE))
                 if (rt->kind == sema::TypeRef::Kind::Primitive)
                     srcPrim = rt->primitive;
+            // For unresolved generic T that resolved to ptr (e.g. T=string),
+            // infer from the LLVM type: ptr → string, i32 → int, etc.
+            if (srcPrim == P::Int && src->getType()->isPointerTy())
+                srcPrim = P::String;
             // Already a string → identity.
             if (srcPrim == P::String) return src;
             return emitPrimitiveToString(src, srcPrim);
