@@ -2436,8 +2436,60 @@ private:
     // Lower a resolved TypeRef. `()`/null → void; primitives → scalars;
     // class/interface references → opaque pointer (heap reference).
     // Other kinds fall back to i32 (refined as more types are lowered).
+    // CG-nullable: helpers for nullable primitive value types (int?, bool?, etc.)
+    // Represented as a packed struct {i1 hasValue; primType value} per §18.9.
+    // Is rt a nullable VALUE primitive (int?, bool?, double?, etc.)?
+    // Excludes reference-like primitives (String, Char, Object) and None.
+    // These are the types represented as tagged {i8, primTy} structs.
+    bool isNullablePrimTy(const sema::TypeRef* rt) {
+        if (!rt || !rt->nullable ||
+            rt->kind != sema::TypeRef::Kind::Primitive) return false;
+        using P = sema::PrimitiveType;
+        switch (rt->primitive) {
+            case P::Bool:
+            case P::Byte: case P::SByte:
+            case P::Short: case P::UShort:
+            case P::Int: case P::UInt:
+            case P::Long: case P::ULong:
+            case P::Float: case P::Double:
+                return true;
+            default: return false;  // String, Char, Object, Decimal, None
+        }
+    }
+    // {i8 hasValue, primType value}  — i8 instead of i1 avoids x86 JIT ABI issues
+    // (LLVM can't emit physreg-copy for i1 in struct return/param contexts).
+    llvm::Type* nullablePrimHasValTy() { return llvm::Type::getInt8Ty(llvm_); }
+    llvm::StructType* nullablePrimStructTy(sema::PrimitiveType pt) {
+        return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), lowerPrimitive(pt)});
+    }
+    // Constant null for a nullable primitive: {i8 0, primType 0}
+    llvm::Constant* nullablePrimNull(sema::PrimitiveType pt) {
+        return llvm::ConstantAggregateZero::get(nullablePrimStructTy(pt));
+    }
+    // Wrap a primitive value into a nullable: {i8 1, value}
+    llvm::Value* wrapNullablePrim(sema::PrimitiveType pt, llvm::Value* val) {
+        auto* st = nullablePrimStructTy(pt);
+        auto* hasValTy = nullablePrimHasValTy();
+        llvm::Value* result =
+            builder_.CreateInsertValue(llvm::UndefValue::get(st),
+                llvm::ConstantInt::get(hasValTy, 1), {0u});
+        return builder_.CreateInsertValue(result, val, {1u});
+    }
+    // Extract the hasValue field (nonzero = has value, 0 = null) as i1.
+    llvm::Value* nullablePrimHasValue(llvm::Value* nv) {
+        llvm::Value* hv8 = builder_.CreateExtractValue(nv, {0u}, "has.val8");
+        return builder_.CreateICmpNE(hv8,
+            llvm::ConstantInt::get(nullablePrimHasValTy(), 0), "has.val");
+    }
+    // Extract the primitive value field (valid only if hasValue is true).
+    llvm::Value* nullablePrimValue(llvm::Value* nv) {
+        return builder_.CreateExtractValue(nv, {1u}, "nv.val");
+    }
+
     llvm::Type* lowerTypeRef(const sema::TypeRef* rt) {
         if (!rt) return i32();
+        // CG-nullable: nullable primitive → {i1 hasValue; primType value}
+        if (isNullablePrimTy(rt)) return nullablePrimStructTy(rt->primitive);
         switch (rt->kind) {
             case sema::TypeRef::Kind::Unit:
                 return llvm::Type::getVoidTy(llvm_);
@@ -4210,9 +4262,28 @@ private:
 
     bool emitReturn(llvm::Function* fn, llvm::Value* v) {
         if (fn->getReturnType()->isVoidTy()) builder_.CreateRetVoid();
-        else builder_.CreateRet(v ? v
-                                  : llvm::Constant::getNullValue(
-                                        fn->getReturnType()));
+        else {
+            llvm::Type* retTy = fn->getReturnType();
+            // CG-nullable: coerce plain primitive to nullable-prim struct
+            // when the function's return type is {i1, primType}.
+            if (v && v->getType() != retTy &&
+                llvm::isa<llvm::StructType>(retTy)) {
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(retTy)) {
+                    if (st->getNumElements() == 2 && st->getElementType(0) == nullablePrimHasValTy()) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v)) {
+                            v = llvm::ConstantAggregateZero::get(retTy);
+                        } else if (v->getType() == st->getElementType(1)) {
+                            llvm::Value* res = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(retTy),
+                                llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+                            v = builder_.CreateInsertValue(res, v, {1u});
+                        }
+                    }
+                }
+            }
+            builder_.CreateRet(v ? v : llvm::Constant::getNullValue(retTy));
+        }
         return true;
     }
 
@@ -4279,6 +4350,30 @@ private:
             if (llvm::isa<llvm::ArrayType>(declaredTy) &&
                 (v == nullptr || dynamic_cast<const ast::NullLiteralExpr*>(init)))
                 slotTy = declaredTy;
+        }
+        // CG-nullable: when the declared type is a nullable-prim struct but
+        // the value is a plain primitive, wrap it: int? := 5 → {true, 5}.
+        // Also fix: int? := null should produce the null struct, not ptr null.
+        if (declaredTy && llvm::isa<llvm::StructType>(declaredTy) && v) {
+            if (v->getType() != declaredTy) {
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(declaredTy)) {
+                    if (st->getNumElements() == 2 &&
+                        st->getElementType(0) == nullablePrimHasValTy()) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v)) {
+                            // null → {false, 0}
+                            v = llvm::ConstantAggregateZero::get(declaredTy);
+                        } else if (v->getType() == st->getElementType(1)) {
+                            // plain prim → {true, value}
+                            llvm::Value* res = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(declaredTy),
+                                llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+                            v = builder_.CreateInsertValue(res, v, {1u});
+                        }
+                        slotTy = declaredTy;
+                    }
+                }
+            }
         }
         llvm::AllocaInst* slot = entryAlloca(slotTy);
         locals_[declNode] = slot;
@@ -4438,6 +4533,24 @@ private:
                 if (!addr) return false;
                 llvm::Value* rhs = lowerExpr(*as->value);
                 if (!rhs) return false;
+                // CG-nullable: if target slot is a nullable-prim struct and
+                // rhs is a plain primitive, wrap it (or fix null literal).
+                if (elemTy && llvm::isa<llvm::StructType>(elemTy)) {
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(elemTy)) {
+                        if (st->getNumElements() == 2 && st->getElementType(0) == nullablePrimHasValTy() &&
+                            rhs->getType() != elemTy) {
+                            if (rhs->getType()->isPointerTy() &&
+                                llvm::isa<llvm::ConstantPointerNull>(rhs)) {
+                                rhs = llvm::ConstantAggregateZero::get(elemTy);
+                            } else if (rhs->getType() == st->getElementType(1)) {
+                                llvm::Value* res = builder_.CreateInsertValue(
+                                    llvm::UndefValue::get(elemTy),
+                                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+                                rhs = builder_.CreateInsertValue(res, rhs, {1u});
+                            }
+                        }
+                    }
+                }
                 if (as->op == ":=") {
                     builder_.CreateStore(rhs, addr);
                 } else if (as->op == "??=") {
@@ -5257,7 +5370,29 @@ private:
                         }
                     }
                     auto* rt = ctx_.exprType(*part.expr);
-                    if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
+                    // CG-nullable: for nullable primitives, extract the value.
+                    // If null, format as "null"; otherwise format the inner value.
+                    if (rt && isNullablePrimTy(rt) && ev->getType()->isStructTy()) {
+                        llvm::Value* hasVal = nullablePrimHasValue(ev);
+                        llvm::Value* primVal = nullablePrimValue(ev);
+                        auto* valBB = llvm::BasicBlock::Create(llvm_, "np.val", currentFn_);
+                        auto* nullBB = llvm::BasicBlock::Create(llvm_, "np.null", currentFn_);
+                        auto* endBB = llvm::BasicBlock::Create(llvm_, "np.end", currentFn_);
+                        builder_.CreateCondBr(hasVal, valBB, nullBB);
+                        builder_.SetInsertPoint(valBB);
+                        llvm::Value* vStr = emitPrimitiveToString(primVal, rt->primitive);
+                        auto* valEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(nullBB);
+                        llvm::Value* nStr = lowerStringLiteral("\"null\"", false);
+                        auto* nullEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(endBB);
+                        auto* phi = builder_.CreatePHI(ptrTy(), 2);
+                        phi->addIncoming(vStr, valEnd);
+                        phi->addIncoming(nStr, nullEnd);
+                        pv = phi;
+                    } else if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
                         pv = emitPrimitiveToString(ev, rt->primitive);
                     } else if (!rt || rt->kind != sema::TypeRef::Kind::Primitive) {
                         // Type not set or not primitive — infer from LLVM type.
@@ -5339,8 +5474,12 @@ private:
             }
             return acc;
         }
-        // CG23: the `null` literal is a null reference pointer.
+        // CG23: the `null` literal. For nullable primitive types (int?, etc.)
+        // produce the tagged-struct null; for reference types produce nullptr.
         if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
+            if (auto* rt = ctx_.exprType(e))
+                if (isNullablePrimTy(rt))
+                    return nullablePrimNull(rt->primitive);
             return llvm::ConstantPointerNull::get(ptrTy());
         }
         // CG37: `default(T)` is the zero value of T (0 / false / 0.0 / null).
@@ -5353,6 +5492,18 @@ private:
             llvm::Value* v = bang->operand ? lowerExpr(*bang->operand)
                                            : nullptr;
             if (!v) return nullptr;
+            // CG-nullable: nullable primitive (int?, bool?, etc.) — check
+            // hasValue field and extract the primitive value.
+            if (bang->operand) {
+                if (auto* rt = ctx_.exprType(*bang->operand)) {
+                    if (isNullablePrimTy(rt)) {
+                        llvm::Value* hasVal = nullablePrimHasValue(v);
+                        emitGuardThrow(builder_.CreateNot(hasVal),
+                                       "NullReferenceException");
+                        return nullablePrimValue(v);
+                    }
+                }
+            }
             if (v->getType()->isPointerTy()) {
                 emitGuardThrow(builder_.CreateICmpEQ(
                                    v, llvm::ConstantPointerNull::get(ptrTy())),
@@ -6347,6 +6498,27 @@ private:
                                   bin.left.get())) ||
                 (bin.right && dynamic_cast<const ast::NullLiteralExpr*>(
                                    bin.right.get()));
+            // CG-nullable: `x = null` / `x <> null` for nullable primitives.
+            // The nullable-prim struct type is not ptr-typed, so the normal
+            // ptr-null check below wouldn't fire. Extract the hasValue field.
+            if (eitherNull && (op == "=" || op == "<>")) {
+                // Determine which side is the nullable-prim value (non-null side).
+                const ast::Expr* nvExpr = nullptr;
+                llvm::Value* nvVal = nullptr;
+                if (bin.left && !dynamic_cast<const ast::NullLiteralExpr*>(bin.left.get())) {
+                    if (auto* rt = ctx_.exprType(*bin.left))
+                        if (isNullablePrimTy(rt)) { nvExpr = bin.left.get(); nvVal = l; }
+                } else if (bin.right && !dynamic_cast<const ast::NullLiteralExpr*>(bin.right.get())) {
+                    if (auto* rt = ctx_.exprType(*bin.right))
+                        if (isNullablePrimTy(rt)) { nvExpr = bin.right.get(); nvVal = r; }
+                }
+                if (nvVal && nvVal->getType()->isStructTy()) {
+                    // hasValue field (index 0). isNull when hasValue=false.
+                    llvm::Value* hasVal = nullablePrimHasValue(nvVal);
+                    // = null → !hasValue; <> null → hasValue
+                    return op == "=" ? builder_.CreateNot(hasVal) : hasVal;
+                }
+            }
             bool lIsStr = isStr(bin.left.get()) || isGenericString(bin.left.get());
             bool rIsStr = isStr(bin.right.get()) || isGenericString(bin.right.get());
             bool lIsPtr = l->getType()->isPointerTy();
@@ -6563,8 +6735,34 @@ private:
     llvm::Value* lowerCoalesce(const ast::BinaryExpr& bin) {
         llvm::Value* l = lowerExpr(*bin.left);
         if (!l) return nullptr;
-        if (!l->getType()->isPointerTy())
-            return nullptr;  // nullable value-type `??` deferred
+        // CG-nullable: `int? ?? expr` — struct {i1 hasValue; primType value}.
+        // If hasValue is true, return the value; otherwise evaluate and return rhs.
+        if (!l->getType()->isPointerTy() && bin.left) {
+            if (auto* lt = ctx_.exprType(*bin.left)) {
+                if (isNullablePrimTy(lt)) {
+                    auto* entryBB = builder_.GetInsertBlock();
+                    auto* rhsBB = llvm::BasicBlock::Create(llvm_, "coal.rhs", currentFn_);
+                    auto* endBB = llvm::BasicBlock::Create(llvm_, "coal.end", currentFn_);
+                    llvm::Value* hasVal = nullablePrimHasValue(l);
+                    llvm::Value* primVal = nullablePrimValue(l);
+                    builder_.CreateCondBr(hasVal, endBB, rhsBB);
+                    builder_.SetInsertPoint(rhsBB);
+                    llvm::Value* r = lowerExpr(*bin.right);
+                    bool rhsDiv = diverged_;
+                    if (!r) return nullptr;
+                    llvm::BasicBlock* rhsEndBB = nullptr;
+                    if (!rhsDiv) { rhsEndBB = builder_.GetInsertBlock(); builder_.CreateBr(endBB); }
+                    builder_.SetInsertPoint(endBB);
+                    diverged_ = false;
+                    if (rhsDiv) return primVal;
+                    auto* phi = builder_.CreatePHI(primVal->getType(), 2);
+                    phi->addIncoming(primVal, entryBB);
+                    phi->addIncoming(r, rhsEndBB);
+                    return phi;
+                }
+            }
+            return nullptr;  // other non-ptr — cannot coalesce
+        }
         auto* entryBB = builder_.GetInsertBlock();
         auto* rhsBB = llvm::BasicBlock::Create(llvm_, "coalesce.rhs", currentFn_);
         auto* endBB = llvm::BasicBlock::Create(llvm_, "coalesce.end", currentFn_);
@@ -7442,6 +7640,22 @@ private:
                 expectedFunctionType_ = savedExpected;
             }
             if (!v) return false;
+            // CG-nullable: if the formal parameter is a nullable primitive
+            // but the argument value is a plain primitive, wrap it.
+            if (params[idx].type) {
+                sema::TypeRef* formalTy = ctx_.resolvedType(*params[idx].type);
+                if (isNullablePrimTy(formalTy)) {
+                    auto* expectedSt = nullablePrimStructTy(formalTy->primitive);
+                    if (v->getType() != expectedSt) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v)) {
+                            v = nullablePrimNull(formalTy->primitive);
+                        } else if (v->getType() == expectedSt->getElementType(1)) {
+                            v = wrapNullablePrim(formalTy->primitive, v);
+                        }
+                    }
+                }
+            }
             ordered[idx] = v;
         }
         for (std::size_t j = 0; j < params.size(); ++j) {
