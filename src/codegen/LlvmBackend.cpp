@@ -4392,6 +4392,28 @@ private:
             // returned value reflects pre-disposal state.
             llvm::Value* v = rs->value ? lowerExpr(*rs->value) : nullptr;
             if (diverged_) return true;  // CG40: the value expression threw
+            // §28.3 ownership transfer: if the return expression is a bare
+            // `using var` local, exclude it from disposal — ownership moves
+            // to the caller.  Without this, the local would be freed before
+            // `ret`, giving the caller a dangling pointer.
+            llvm::AllocaInst* retSlot = nullptr;
+            if (rs->value) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(rs->value.get())) {
+                    sema::Symbol* sym = ctx_.exprSymbol(*rs->value);
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                        auto lit = locals_.find(loc->decl);
+                        if (lit != locals_.end()) retSlot = lit->second;
+                    }
+                }
+            }
+            if (retSlot) {
+                for (auto& scope : disposeStack_) {
+                    scope.erase(
+                        std::remove_if(scope.begin(), scope.end(),
+                            [retSlot](const auto& e) { return e.slot == retSlot; }),
+                        scope.end());
+                }
+            }
             emitAllDisposals();
             emitReturn(currentFn_, v);
             return true;
