@@ -540,7 +540,26 @@ int32_t bz_dir_create(const char* path) {
     return (r == 0 || errno == EEXIST) ? 0 : -errno;
 }
 
-int32_t bz_dir_delete(const char* path, bool /*recursive*/) {
+static int rmdir_recursive(const char* path) {
+    DIR* d = opendir(path);
+    if (!d) return -errno;
+    struct dirent* entry;
+    char buf[4096];
+    while ((entry = readdir(d))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        snprintf(buf, sizeof(buf), "%s/%s", path, entry->d_name);
+        struct stat st;
+        if (stat(buf, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) rmdir_recursive(buf);
+            else unlink(buf);
+        }
+    }
+    closedir(d);
+    return rmdir(path) == 0 ? 0 : -errno;
+}
+
+int32_t bz_dir_delete(const char* path, bool recursive) {
+    if (recursive) return rmdir_recursive(path);
     return rmdir(path) == 0 ? 0 : -errno;
 }
 

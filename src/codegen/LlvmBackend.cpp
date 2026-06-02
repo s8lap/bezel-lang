@@ -9884,6 +9884,18 @@ private:
                 auto* fn = declareC("bz_dir_create", i32(), {ptrTy()});
                 return builder_.CreateCall(fn, {strToPath(s)});
             }
+            if (m == "Delete" && call.args.size() >= 1 && call.args[0].value) {
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                // Second arg: recursive (bool), default false
+                llvm::Value* recursive = builder_.getFalse();
+                if (call.args.size() >= 2 && call.args[1].value) {
+                    llvm::Value* r = lowerExpr(*call.args[1].value);
+                    if (r) recursive = r;
+                }
+                auto* fn = declareC("bz_dir_delete", i32(), {ptrTy(), i1()});
+                return builder_.CreateCall(fn, {strToPath(s), recursive});
+            }
         }
         if (cls == "Path") {
             auto make1arg = [&](const char* fnName) -> llvm::Value* {
