@@ -1790,7 +1790,8 @@ private:
                             ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                             return;
                         }
-                        if (mbr == "Concat" || mbr == "Join" || mbr == "Empty") {
+                        if (mbr == "Concat" || mbr == "Join" || mbr == "Empty" ||
+                            mbr == "From" || mbr == "Format" || mbr == "Repeat") {
                             ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                             return;
                         }

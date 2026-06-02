@@ -6176,6 +6176,11 @@ private:
                 if (op == "=") return emitStringEq(l, r);
                 return builder_.CreateNot(emitStringEq(l, r));
             }
+            // §4.6: string concat when at least one side is a known string and
+            // both operands are ptr-typed (handles e.g. string.From(ch) + s where
+            // the From(ch) result may not be sema-annotated as string yet).
+            if ((lIsStr || rIsStr) && lIsPtr && rIsPtr && !eitherNull && op == "+")
+                return emitStringConcat(l, r);
             if (lIsStr && !eitherNull) {
                 if (op == "=") return emitStringEq(l, r);
                 if (op == "<>") return builder_.CreateNot(emitStringEq(l, r));
