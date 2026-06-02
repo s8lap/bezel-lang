@@ -754,3 +754,44 @@ void bz_task_free(void* tp) {
     free(task->error_msg);
     delete task;
 }
+
+// ---------------------------------------------------------------------------
+// StringBuilder helper
+// ---------------------------------------------------------------------------
+
+// The bz.string struct layout: {ptr data, i64 len, i8 width}
+struct bz_string_struct {
+    void*   data;
+    int64_t len;
+    int8_t  width;
+};
+
+void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len) {
+    auto* arr = (bz_array_t*)parts_arr;
+    if (!arr || arr->count == 0) {
+        *out_data = (char*)calloc(1, 1);
+        *out_len = 0;
+        return;
+    }
+    // Compute total byte length (width 1 for all parts; we treat as bytes)
+    int64_t total = 0;
+    for (int64_t i = 0; i < arr->count; i++) {
+        void* sptr = ((void**)arr->data)[i];
+        if (!sptr) continue;
+        auto* s = (bz_string_struct*)sptr;
+        total += s->len * s->width;
+    }
+    char* buf = (char*)malloc((size_t)(total + 1));
+    int64_t off = 0;
+    for (int64_t i = 0; i < arr->count; i++) {
+        void* sptr = ((void**)arr->data)[i];
+        if (!sptr) continue;
+        auto* s = (bz_string_struct*)sptr;
+        int64_t bytes = s->len * s->width;
+        memcpy(buf + off, s->data, (size_t)bytes);
+        off += bytes;
+    }
+    buf[off] = '\0';
+    *out_data = buf;
+    *out_len = off;
+}

@@ -1558,6 +1558,88 @@ private:
         //   `handlers[i]`), use funcReturn as the call's return type.
         // - Otherwise (intrinsic member like `n.ToString()`), use the callee
         //   type directly.
+        // §3: infer return types for stdlib collection and IO instance methods
+        // (no MethodSymbol exists, so the normal calleeSym path doesn't apply).
+        if (!calleeSym) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+                if (ma->target) {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    auto colName = [&]() -> std::string_view {
+                        if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
+                            recvTy->declaration || !recvTy->astNode ||
+                            !recvTy->astNode->name || recvTy->astNode->name->parts.empty())
+                            return {};
+                        return recvTy->astNode->name->parts[0];
+                    }();
+                    using P = PrimitiveType;
+                    const auto& m = ma->member;
+                    if (!colName.empty()) {
+                        // Array/Stack/Queue/Set/LinkedList methods
+                        bool isArrLike = colName == "Array" || colName == "OwnedArray" ||
+                            colName == "Stack" || colName == "OwnedStack" ||
+                            colName == "Queue" || colName == "OwnedQueue" ||
+                            colName == "Set" || colName == "OwnedSet" ||
+                            colName == "LinkedList" || colName == "OwnedLinkedList";
+                        if (isArrLike) {
+                            if (m == "Length" || m == "Count")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                            else if (m == "IsEmpty")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                            else if (m == "Get" || m == "Peek" || m == "Pop" || m == "Dequeue") {
+                                // Return type = element type (first generic arg)
+                                if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                                    ctx_.setExprType(&ce, recvTy->genericArgs[0]);
+                            }
+                            // Add/Push/Enqueue/Set/RemoveAt/Clear → unit (void)
+                        }
+                        // Dictionary methods
+                        if (colName == "Dictionary" || colName == "OwnedDictionary") {
+                            if (m == "Count")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                            else if (m == "ContainsKey" || m == "Remove" || m == "TryGetValue")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        }
+                        // StringBuilder methods
+                        if (colName == "StringBuilder") {
+                            if (m == "ToString")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                            else if (m == "Length" || m == "Count")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                            else if (m == "Append" || m == "AppendLine" || m == "Clear")
+                                ctx_.setExprType(&ce, recvTy);  // returns same StringBuilder
+                        }
+                        // Random instance methods
+                        if (colName == "Random") {
+                            if (m == "Next")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                            else if (m == "NextDouble")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                        }
+                        // File static methods
+                        if (colName == "File") {
+                            if (m == "ReadAllText")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                            else if (m == "Exists" || m == "Delete")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        }
+                        // Path static methods
+                        if (colName == "Path") {
+                            if (m == "Combine" || m == "GetFileName" ||
+                                m == "GetExtension" || m == "GetFileNameWithoutExtension" ||
+                                m == "GetDirectoryName" || m == "GetFullPath")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        }
+                        if (colName == "Directory") {
+                            if (m == "Exists")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        }
+                        // DateTime
+                        if (colName == "DateTime" && (m == "Now" || m == "UtcNow"))
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Long));
+                    }
+                }
+            }
+        }
         if (!calleeSym) {
             if (auto* rt = ctx_.exprType(*ce.callee)) {
                 if (rt->kind == TypeRef::Kind::Function && rt->funcReturn)

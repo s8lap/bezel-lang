@@ -199,6 +199,14 @@ void  bz_task_then(void* task, void (*cont)(void* task, void* state), void* stat
 // Free the task object. Must be called after the result has been consumed.
 void  bz_task_free(void* task);
 
+// ---------------------------------------------------------------------------
+// StringBuilder helper — concatenates an array of bz.string pointers.
+// Caller must free *out_data with free() after use.
+// ---------------------------------------------------------------------------
+void bz_strbuilder_to_string(void* parts_arr,  // bz_array_t* of bz.string ptrs
+                              char** out_data,
+                              int64_t* out_len);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

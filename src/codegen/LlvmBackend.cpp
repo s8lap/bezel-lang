@@ -8113,7 +8113,11 @@ private:
         auto* recvTy = ctx_.exprType(*ma->target);
         bool isArr  = isCollectionTypeName(recvTy);
         bool isDict = isDictTypeName(recvTy);
-        if (!isArr && !isDict) return nullptr;
+        // Check for StringBuilder
+        bool isStrBld = (recvTy && recvTy->astNode && recvTy->astNode->name &&
+                         !recvTy->astNode->name->parts.empty() &&
+                         recvTy->astNode->name->parts[0] == "StringBuilder");
+        if (!isArr && !isDict && !isStrBld) return nullptr;
 
         llvm::Value* recv = lowerExpr(*ma->target);
         if (!recv) return nullptr;
@@ -8304,6 +8308,115 @@ private:
                     builder_.CreateStore(valPtr, outAddr);
                 }
                 return found;
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // StringBuilder — bz_array_t of string pointers (parts list).
+        // Append adds a string part; ToString concatenates all parts.
+        // ---------------------------------------------------------------------------
+        if (isStrBld) {
+            constexpr int64_t SB_ESZ = 8;  // pointer-sized elements (string ptrs)
+
+            // Helper: coerce value to string
+            auto toStr = [&](llvm::Value* v, const ast::Expr* expr) -> llvm::Value* {
+                if (!v) return nullptr;
+                auto* rt = expr ? ctx_.exprType(*expr) : nullptr;
+                if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                    rt->primitive != sema::PrimitiveType::String)
+                    return emitPrimitiveToString(v, rt->primitive);
+                if (v->getType()->isPointerTy()) return v;
+                // Fallback: format as integer
+                llvm::Value* iv = v->getType()->isIntegerTy(64)
+                    ? v : builder_.CreateSExt(v, i64());
+                return emitPrimitiveToString(iv, sema::PrimitiveType::Long);
+            };
+
+            if ((m == "Append" || m == "AppendLine") && !call.args.empty()) {
+                llvm::Value* s = nullptr;
+                if (call.args[0].value) {
+                    s = toStr(lowerExpr(*call.args[0].value), call.args[0].value.get());
+                }
+                if (s) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    builder_.CreateStore(s, slot);
+                    auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy(), i64()});
+                    builder_.CreateCall(fn, {recv, slot, builder_.getInt64(SB_ESZ)});
+                }
+                if (m == "AppendLine") {
+                    llvm::Value* nl = lowerStringLiteral("\"\n\"", false);
+                    llvm::AllocaInst* nlSlot = entryAlloca(ptrTy());
+                    builder_.CreateStore(nl, nlSlot);
+                    auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy(), i64()});
+                    builder_.CreateCall(fn, {recv, nlSlot, builder_.getInt64(SB_ESZ)});
+                }
+                return recv;  // allow chaining
+            }
+            if (m == "AppendLine" && call.args.empty()) {
+                llvm::Value* nl = lowerStringLiteral("\"\n\"", false);
+                llvm::AllocaInst* nlSlot = entryAlloca(ptrTy());
+                builder_.CreateStore(nl, nlSlot);
+                auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(fn, {recv, nlSlot, builder_.getInt64(SB_ESZ)});
+                return recv;
+            }
+            if (m == "Clear" && call.args.empty()) {
+                auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {recv});
+                return recv;
+            }
+            if (m == "Length" || m == "Count") {
+                // Sum of lengths of all string parts
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* nParts = builder_.CreateCall(lenFn, {recv});
+                auto* sumSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), sumSlot);
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "sb.len.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sb.len.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "sb.len.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, nParts), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot);
+                llvm::Value* ep = builder_.CreateCall(ptrAtFn, {recv, idx2, builder_.getInt64(SB_ESZ)});
+                llvm::Value* part = builder_.CreateLoad(ptrTy(), ep);
+                llvm::Value* plen = loadStringLen(part);
+                llvm::Value* curSum = builder_.CreateLoad(i64(), sumSlot);
+                builder_.CreateStore(builder_.CreateAdd(curSum, plen), sumSlot);
+                builder_.CreateStore(builder_.CreateAdd(idx2, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                llvm::Value* total = builder_.CreateLoad(i64(), sumSlot);
+                return builder_.CreateTrunc(total, i32());
+            }
+            if (m == "ToString" && call.args.empty()) {
+                // Use the runtime helper to concatenate all string parts.
+                auto* outDataSlot = entryAlloca(ptrTy());
+                auto* outLenSlot  = entryAlloca(i64());
+                auto* fn = declareC("bz_strbuilder_to_string",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {recv, outDataSlot, outLenSlot});
+                llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
+                llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
+                // Build a bz.string object from the malloc'd buffer.
+                auto* sobj = builder_.CreateCall(
+                    callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+                builder_.CreateStore(data,
+                    builder_.CreateStructGEP(stringType(), sobj, 0));
+                builder_.CreateStore(len,
+                    builder_.CreateStructGEP(stringType(), sobj, 1));
+                builder_.CreateStore(builder_.getInt8(1),
+                    builder_.CreateStructGEP(stringType(), sobj, 2));
+                return sobj;
             }
         }
 
