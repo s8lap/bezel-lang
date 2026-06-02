@@ -953,6 +953,27 @@ public:
     // base member of the same name is itself an overload set, this
     // matches against the single representative S15 recorded — refining
     // to overload-aware matching awaits the overload-resolution slice.
+    // §12.1 / §14: when a derived class overrides a method from a generic
+    // base class (e.g. `class Box : Container<int>`), the base method's
+    // type references use the generic param (T). Apply the substitution
+    // T→int before comparing against the override's concrete types.
+    // Returns the substituted TypeRef if `tr` is a generic param that
+    // appears in `genericSubst`, otherwise returns `tr` unchanged.
+    TypeRef* applyGenericSubst(
+            TypeRef* tr,
+            const std::unordered_map<std::string_view, TypeRef*>& genericSubst) {
+        if (!tr) return tr;
+        if (tr->kind == TypeRef::Kind::Named && !tr->declaration) {
+            // Unresolved named type — might be a generic param.
+            if (tr->astNode && tr->astNode->name &&
+                tr->astNode->name->parts.size() == 1) {
+                auto it = genericSubst.find(tr->astNode->name->parts[0]);
+                if (it != genericSubst.end()) return it->second;
+            }
+        }
+        return tr;
+    }
+
     void checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                      MemberSymbol* baseSym) {
         auto* derived = dynamic_cast<MethodSymbol*>(derivedSym);
@@ -964,6 +985,32 @@ public:
                 std::string("override of `") + std::string(derived->name) +
                 "` does not match the base member's " + what + " (§12.1)");
         };
+
+        // Build generic substitution map: base class's T → concrete arg.
+        // Example: Container<T> base, IntBox : Container<int> derived →
+        // {T → int}. Look up the base type's TypeRef from the derived
+        // class's baseTypeRefs (which store the resolved generic args).
+        std::unordered_map<std::string_view, TypeRef*> genericSubst;
+        TypeSymbol* derivedClass = derived->parent;
+        TypeSymbol* baseClass = base->parent;
+        if (derivedClass && baseClass) {
+            for (std::size_t bi = 0; bi < derivedClass->baseTypes.size(); ++bi) {
+                if (derivedClass->baseTypes[bi] != baseClass) continue;
+                TypeRef* baseRef = (bi < derivedClass->baseTypeRefs.size())
+                                   ? derivedClass->baseTypeRefs[bi] : nullptr;
+                if (!baseRef) break;
+                // Match base class generic params to the concrete args.
+                for (std::size_t gi = 0; gi < baseClass->genericParams.size() &&
+                     gi < baseRef->genericArgs.size(); ++gi) {
+                    if (auto* gp = dynamic_cast<GenericParamSymbol*>(
+                                      baseClass->genericParams[gi])) {
+                        genericSubst[gp->name] = baseRef->genericArgs[gi];
+                    }
+                }
+                break;
+            }
+        }
+
         // Visibility must match exactly.
         if (derived->visibility != base->visibility) {
             err("visibility");
@@ -976,8 +1023,10 @@ public:
                 ? ctx_.resolvedType(*dDecl->returnType) : nullptr;
             TypeRef* bRet = bDecl->returnType
                 ? ctx_.resolvedType(*bDecl->returnType) : nullptr;
+            // Apply substitution to base return type (T → int, etc.).
+            TypeRef* bRetSubst = applyGenericSubst(bRet, genericSubst);
             bool bothNullReturn = !dDecl->returnType && !bDecl->returnType;
-            if (!bothNullReturn && !typeRefEqual(dRet, bRet)) {
+            if (!bothNullReturn && !typeRefEqual(dRet, bRetSubst)) {
                 err("return type");
             }
             if (dDecl->returnOwned != bDecl->returnOwned) {
@@ -1001,7 +1050,9 @@ public:
                                        : nullptr;
             TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
                                        : nullptr;
-            if (dt && bt && !typeRefEqual(dt, bt)) {
+            // Apply substitution to base parameter type.
+            TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
+            if (dt && btSubst && !typeRefEqual(dt, btSubst)) {
                 err("parameter types");
                 return;
             }
@@ -1277,6 +1328,7 @@ private:
             if (tsym && ref && ref->kind == TypeRef::Kind::Named &&
                 ref->declaration) {
                 tsym->baseTypes.push_back(ref->declaration);
+                tsym->baseTypeRefs.push_back(ref);  // preserve generic args
                 TypeSymbol* base = ref->declaration;
                 // Slice S9: a sealed class cannot be inherited from.
                 if (base->kind == ast::TypeDeclKind::Class) {

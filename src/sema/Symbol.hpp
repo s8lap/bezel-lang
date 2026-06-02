@@ -73,6 +73,11 @@ struct TypeSymbol : Symbol {
     // interfaces. Sema slice 5 doesn't yet distinguish — member lookup
     // walks all of them.
     std::vector<TypeSymbol*> baseTypes;
+    // Resolved TypeRef for each base type (parallel to baseTypes),
+    // including generic args (e.g. Container<int> → TypeRef with
+    // genericArgs[0]=int). Used by override-signature checking to
+    // apply the concrete substitution before comparing types.
+    std::vector<TypeRef*> baseTypeRefs;
 };
 
 // A.2 TypeAliasDecl — its target type is resolved by Type Resolution.
