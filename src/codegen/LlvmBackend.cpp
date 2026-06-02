@@ -241,6 +241,10 @@ private:
     // to the sema TypeRef of the concrete substitution.  Used in binary
     // expression lowering to distinguish string vs. class pointer equality.
     std::unordered_map<std::string_view, const sema::TypeRef*> genericSubstSemaTy_;
+    // expectedFunctionType_: set by buildOrderedArgs when processing a lambda
+    // argument for a function-typed parameter.  lowerLambda reads this to
+    // infer the LLVM types for unannotated lambda parameters.
+    const sema::TypeRef* expectedFunctionType_ = nullptr;
 
     // Block-form property getter functions (§22.9 `get => do...end;`).
     // Keyed by PropertyDecl so the same getter function is reused across
@@ -6345,6 +6349,7 @@ private:
         // Build user-visible parameter type list.
         std::vector<llvm::Type*> userParamTys;
         if (paramSyms) {
+            std::size_t pi = 0;
             for (sema::Symbol* ps : *paramSyms) {
                 auto* par = dynamic_cast<sema::ParameterSymbol*>(ps);
                 llvm::Type* ty = i32();
@@ -6352,7 +6357,17 @@ private:
                     if (sema::TypeRef* rt = ctx_.resolvedType(*par->declType))
                         ty = lowerTypeRef(rt);
                 }
+                // If the param type is still i32 (unresolved) but we have an
+                // expected function type from the call site, infer from that.
+                if (ty == i32() && expectedFunctionType_ &&
+                    pi < expectedFunctionType_->funcParams.size() &&
+                    expectedFunctionType_->funcParams[pi].type) {
+                    llvm::Type* expected = lowerTypeRef(
+                        expectedFunctionType_->funcParams[pi].type);
+                    if (expected != i32()) ty = expected;
+                }
                 userParamTys.push_back(ty);
+                ++pi;
             }
         }
 
@@ -7046,7 +7061,18 @@ private:
                 llvm::Type* et = nullptr;
                 v = lvalueAddr(*a.value, et);
             } else {
+                // When the argument is a lambda and the formal parameter has a
+                // function type, inform lowerLambda of the expected param types
+                // so unannotated lambda params get the right LLVM type.
+                const sema::TypeRef* savedExpected = expectedFunctionType_;
+                if (dynamic_cast<const ast::LambdaExpr*>(a.value.get()) &&
+                    params[idx].type) {
+                    sema::TypeRef* pt = ctx_.resolvedType(*params[idx].type);
+                    if (pt && pt->kind == sema::TypeRef::Kind::Function)
+                        expectedFunctionType_ = pt;
+                }
                 v = lowerExpr(*a.value);
+                expectedFunctionType_ = savedExpected;
             }
             if (!v) return false;
             ordered[idx] = v;
@@ -8214,13 +8240,33 @@ private:
             for (std::size_t pi = 0; pi < rt->funcParams.size(); ++pi) {
                 llvm::Type* declared =
                     rt->funcParams[pi].type ? lowerTypeRef(rt->funcParams[pi].type) : i32();
-                // CG-generic: if declared resolved to i32 (unresolved T) but
-                // the actual argument has a more specific type, prefer that.
+                // CG-generic: if declared resolved to i32 (unresolved generic T)
+                // but the actual arg is a pointer (string/class), upgrade to ptr.
+                // For float/double mismatches, convert the arg rather than upgrading
+                // the type — the lambda was compiled with i32 params and changing the
+                // call type would break ABI.
                 std::size_t ai = pi + 1;  // +1 for env_ptr
                 if (declared == i32() && ai < args.size() &&
-                    args[ai]->getType() != i32())
+                    args[ai]->getType()->isPointerTy())
                     declared = args[ai]->getType();
                 allArgTys.push_back(declared);
+            }
+            // Coerce args to match declared param types (e.g. f64 → i32 for
+            // an untyped lambda param used with a double argument — ideally the
+            // caller annotates the lambda, but we convert rather than crash).
+            for (std::size_t ai = 1; ai < args.size(); ++ai) {
+                llvm::Type* declTy = (ai < allArgTys.size()) ? allArgTys[ai] : nullptr;
+                if (!declTy || args[ai]->getType() == declTy) continue;
+                if (declTy->isIntegerTy() && args[ai]->getType()->isFloatingPointTy())
+                    args[ai] = builder_.CreateFPToSI(args[ai], declTy);
+                else if (declTy->isFloatingPointTy() && args[ai]->getType()->isIntegerTy())
+                    args[ai] = builder_.CreateSIToFP(args[ai], declTy);
+                else if (declTy->isIntegerTy() && args[ai]->getType()->isIntegerTy()) {
+                    unsigned db = declTy->getIntegerBitWidth();
+                    unsigned sb = args[ai]->getType()->getIntegerBitWidth();
+                    if (db > sb) args[ai] = builder_.CreateSExt(args[ai], declTy);
+                    else args[ai] = builder_.CreateTrunc(args[ai], declTy);
+                }
             }
             // Similarly fix up the return type if it's an unresolved generic.
             if (retTy == i32() && !args.empty()) {
