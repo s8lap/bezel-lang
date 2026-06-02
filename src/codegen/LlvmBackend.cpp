@@ -5645,6 +5645,16 @@ private:
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         call->callee.get())) {
                     if (ma->target) {
+                        // Pre-warm lambda param type hint for the target identifier.
+                        if (!ctx_.exprType(*ma->target)) {
+                            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                                    ma->target.get())) {
+                                sema::Symbol* sym = ctx_.exprSymbol(*tid);
+                                auto hit = lambdaParamTypeHint_.find(sym);
+                                if (hit != lambdaParamTypeHint_.end())
+                                    ctx_.setExprType(ma->target.get(), hit->second);
+                            }
+                        }
                         auto* tt = ctx_.exprType(*ma->target);
                         if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
                             if (tt->primitive == sema::PrimitiveType::String) {
