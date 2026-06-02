@@ -2103,9 +2103,9 @@ private:
             if (!operand) return nullptr;
             TypeSymbol* ts = memberTargetType(operand);
             if (!ts) return nullptr;
-            if ((be.op == "=" || be.op == "<>") &&
-                ts->kind == ast::TypeDeclKind::Class)
-                return nullptr;
+            // §25: user-defined `operator =` and `<>` on class types take
+            // precedence over built-in reference equality — only skip when
+            // no user-defined operator exists (handled by falling through).
             for (Symbol* m : ts->members) {
                 auto* ms = dynamic_cast<MethodSymbol*>(m);
                 if (ms && ms->isOperator && ms->operatorToken == be.op &&
