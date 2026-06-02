@@ -282,3 +282,32 @@ BEZEL_TEST(codegen_generic, int_is_null_is_false) {
         "  end Main; "
         "end Program;"), 1);
 }
+
+// Test: inline array collection literal initializer — §15.1/§16
+BEZEL_TEST(codegen_generic, collection_literal_local) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var arr: [5]int := [10, 20, 30, 40, 50]; "
+        "    return arr[2]; "
+        "  end Main; "
+        "end Program;"), 30);
+}
+
+// Test: collection literal in class field — §15.1/§16
+BEZEL_TEST(codegen_generic, collection_literal_field) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class V "
+        "  public _d: [4]int := [10, 20, 30, 40]; "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "end V; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var v := new V(); "
+        "    return v._d[1]; "
+        "  end Main; "
+        "end Program;"), 20);
+}
