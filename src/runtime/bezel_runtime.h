@@ -128,6 +128,11 @@ int32_t bz_file_read_all_bytes(const char* path, uint8_t** out, int64_t* len);
 // Read entire file as UTF-8 text (NUL-terminated). *out is malloc'd.
 int32_t bz_file_read_all_text(const char* path, char** out, int64_t* byte_len);
 
+// Read file as lines — returns bz_array_t* of bz_string_struct* (heap-alloc'd).
+// Each line string is malloc'd; the array itself is a bz_array_t of pointers.
+// Caller disposes via bz_array_free(result, free) or manages lifetime.
+void* bz_file_read_all_lines(const char* path);
+
 // Write bytes to file (creates or truncates).
 int32_t bz_file_write_all_bytes(const char* path, const uint8_t* data, int64_t len);
 

@@ -446,6 +446,35 @@ int32_t bz_file_read_all_text(const char* path, char** out, int64_t* byte_len) {
     return r;
 }
 
+// bz.string layout: { void* data (8), int64_t len (8), int8_t width (1) } = 24 bytes.
+static const int64_t BZ_STRING_SIZEOF = 24;
+
+void* bz_file_read_all_lines(const char* path) {
+    uint8_t* buf; int64_t len;
+    if (bz_file_read_all_bytes(path, &buf, &len) != 0)
+        return bz_array_alloc(8, 0);  // empty array on error
+    void* arr = bz_array_alloc(8, 16);  // array of bz.string* pointers
+    int64_t start = 0;
+    for (int64_t i = 0; i <= len; ++i) {
+        if (i == len || buf[i] == '\n') {
+            int64_t lineLen = i - start;
+            if (lineLen > 0 && buf[start + lineLen - 1] == '\r') lineLen--;
+            // Build a bz.string struct: { data ptr, len i64, width i8 }
+            char* lineData = (char*)malloc((size_t)(lineLen + 1));
+            memcpy(lineData, buf + start, (size_t)lineLen);
+            lineData[lineLen] = '\0';
+            uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+            memcpy(s, &lineData, sizeof(void*));            // data
+            memcpy(s + 8, &lineLen, sizeof(int64_t));      // len
+            s[16] = 1;                                      // width = 1 (ASCII)
+            bz_array_add(arr, &s, 8);  // store the pointer to s
+            start = i + 1;
+        }
+    }
+    free(buf);
+    return arr;
+}
+
 int32_t bz_file_write_all_bytes(const char* path, const uint8_t* data, int64_t len) {
     FILE* f = fopen(path, "wb");
     if (!f) return -errno;

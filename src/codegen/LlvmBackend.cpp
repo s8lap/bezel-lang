@@ -8344,6 +8344,58 @@ private:
                 return builder_.CreateLoad(i32(), cntSlot, "cnt.r");
             }
 
+            // per §5 LINQ: .Select(fn: (T)->U): Array<U>
+            if (m == "Select" && call.args.size() == 1 && call.args[0].value) {
+                // Determine output element type from the lambda's return type.
+                sema::TypeRef* retSemaType = nullptr;
+                llvm::Type* retElemTy = i32();  // default
+                if (auto* lamTy = ctx_.exprType(*call.args[0].value)) {
+                    if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                        retSemaType = lamTy->funcReturn;
+                        retElemTy = lowerTypeRef(retSemaType);
+                    }
+                }
+                int64_t retEsz = 8;
+                if (retElemTy) {
+                    if (retElemTy->isIntegerTy(32) || retElemTy->isFloatTy()) retEsz = 4;
+                    else if (retElemTy->isIntegerTy(1) || retElemTy->isIntegerTy(8)) retEsz = 1;
+                    else if (retElemTy->isIntegerTy(16)) retEsz = 2;
+                    else retEsz = 8;
+                }
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
+                if (!closure) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                llvm::Value* result = builder_.CreateCall(allocFn,
+                    {builder_.getInt64(retEsz), builder_.getInt64(16)});
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "sel.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sel.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "sel.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* mapped = callClosure(closure, el, retElemTy ? retElemTy
+                                                                          : i32());
+                auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), i64()});
+                auto* mapSlot = entryAlloca(mapped->getType());
+                builder_.CreateStore(mapped, mapSlot);
+                builder_.CreateCall(addFn, {result, mapSlot, builder_.getInt64(retEsz)});
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return result;
+            }
+
             // per §5 LINQ: .Where(pred: (T)->bool): Array<T>
             if (m == "Where" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
@@ -9390,6 +9442,12 @@ private:
                 llvm::Value* ptr = builder_.CreateLoad(ptrTy(), outSlot);
                 llvm::Value* len = builder_.CreateLoad(i64(), lenSlot);
                 return ptrToStr(ptr, len);
+            }
+            if (m == "ReadAllLines" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                auto* fn = declareC("bz_file_read_all_lines", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {strToPath(s)}, "lines.arr");
             }
             if (m == "WriteAllText" && call.args.size() == 2 &&
                 call.args[0].value && call.args[1].value) {

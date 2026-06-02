@@ -1632,6 +1632,8 @@ private:
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                             else if (m == "Exists" || m == "Delete")
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                            // ReadAllLines → Array<string>; sema type set when callee
+                            // is typed explicitly (var lines: Array<string> := ...).
                         }
                         // Path static methods
                         if (colName == "Path") {
