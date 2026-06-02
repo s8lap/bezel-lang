@@ -180,6 +180,20 @@ private:
     // CG13: the compiler-generated Dispose function for each class.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
 
+    // CG21c (§31.2): when a `return`/`break`/`continue` exits a `try`-with-
+    // `finally` block, the finally body must run before the actual jump.
+    // Each active try-with-finally pushes a frame; innermost is at back.
+    struct FinallyFrame {
+        llvm::BasicBlock* finNormalBB;  // the finally block for normal exits
+        llvm::AllocaInst* exitModSlot;  // i32: 0=fall-through, 1=return, 2=break, 3=cont
+        llvm::AllocaInst* retValSlot;   // alloca for return value (null if void)
+        llvm::Type*       retTy;        // function return type
+        llvm::BasicBlock* afterBB;      // continuation after the try
+        llvm::BasicBlock* breakBB;      // outer loop break target at try-entry time
+        llvm::BasicBlock* contBB;       // outer loop continue target at try-entry time
+    };
+    std::vector<FinallyFrame> finallyStack_;
+
     // CG20: exception handling (explicit-unwinding model). A module-level
     // global holds the in-flight exception (null when none). A `throw` and
     // any call that leaves the global non-null branch to the current
@@ -2703,7 +2717,7 @@ private:
         paramSlots_.clear();
         refParams_.clear();
         disposeStack_.clear();
-        loopStack_.clear();
+        loopStack_.clear(); finallyStack_.clear();
         unwindTarget_       = nullptr;
         propagateBB_        = nullptr;
         currentCaughtExc_   = nullptr;
@@ -3692,7 +3706,7 @@ private:
         paramSlots_.clear();
         refParams_.clear();
         disposeStack_.clear();
-        loopStack_.clear();
+        loopStack_.clear(); finallyStack_.clear();
         propagateBB_ = nullptr;
         unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr;
@@ -3862,7 +3876,7 @@ private:
         paramSlots_.clear();
         refParams_.clear();
         disposeStack_.clear();
-        loopStack_.clear();
+        loopStack_.clear(); finallyStack_.clear();
         propagateBB_ = nullptr;
         unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr;
@@ -3913,7 +3927,7 @@ private:
         paramSlots_.clear();
         refParams_.clear();
         disposeStack_.clear();
-        loopStack_.clear();
+        loopStack_.clear(); finallyStack_.clear();
         propagateBB_ = nullptr;
         unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr;
@@ -3931,7 +3945,7 @@ private:
         paramSlots_.clear();
         refParams_.clear();
         disposeStack_.clear();
-        loopStack_.clear();
+        loopStack_.clear(); finallyStack_.clear();
         propagateBB_ = nullptr;
         unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr;
@@ -4506,6 +4520,16 @@ private:
                 }
             }
             emitAllDisposals();
+            // CG21c (§31.2): if inside a try-with-finally, stash the return
+            // value and route through the finally block instead of ret-ing now.
+            if (!finallyStack_.empty()) {
+                auto& fr = finallyStack_.back();
+                if (fr.retValSlot && v)
+                    builder_.CreateStore(v, fr.retValSlot);
+                builder_.CreateStore(builder_.getInt32(1), fr.exitModSlot);
+                builder_.CreateBr(fr.finNormalBB);
+                return true;
+            }
             emitReturn(currentFn_, v);
             return true;
         }
@@ -4538,10 +4562,17 @@ private:
         // CG11: break / continue jump to the innermost loop's exit /
         // condition block. CG13: they first dispose the loop body's (and
         // any nested) `using var`s. Both terminate the current block.
+        // CG21c (§31.2): if inside a try-with-finally, route through finally.
         if (dynamic_cast<const ast::BreakStmt*>(&s)) {
             if (!loopStack_.empty()) {
                 emitLoopDisposals(loopStack_.back().scopeDepth);
-                builder_.CreateBr(loopStack_.back().breakTarget);
+                if (!finallyStack_.empty()) {
+                    auto& fr = finallyStack_.back();
+                    builder_.CreateStore(builder_.getInt32(2), fr.exitModSlot);
+                    builder_.CreateBr(fr.finNormalBB);
+                } else {
+                    builder_.CreateBr(loopStack_.back().breakTarget);
+                }
                 return true;
             }
             return false;
@@ -4549,7 +4580,13 @@ private:
         if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
             if (!loopStack_.empty()) {
                 emitLoopDisposals(loopStack_.back().scopeDepth);
-                builder_.CreateBr(loopStack_.back().continueTarget);
+                if (!finallyStack_.empty()) {
+                    auto& fr = finallyStack_.back();
+                    builder_.CreateStore(builder_.getInt32(3), fr.exitModSlot);
+                    builder_.CreateBr(fr.finNormalBB);
+                } else {
+                    builder_.CreateBr(loopStack_.back().continueTarget);
+                }
                 return true;
             }
             return false;
@@ -4586,12 +4623,11 @@ private:
     // re-propagates to the enclosing unwind target.
     bool lowerTry(const ast::TryStmt& trys) {
         bool hasFin = trys.hasFinally;
-        // CG21b: a `finally` runs on every exit from the try. The normal
-        // exits (body / arm fall-through) flow through finNormalBB; the
-        // exception exits (no arm matched, or an arm threw) flow through
-        // finUnwindBB, which re-propagates to the enclosing unwind target.
-        // (Deferred: a return/break/continue inside the try or a catch arm
-        // does not yet route through finally.)
+        // CG21b/CG21c: a `finally` runs on every exit from the try.
+        // Normal flow-through and return/break/continue all go through
+        // finNormalBB; exception exits go through finUnwindBB.
+        // An exit-mode slot (i32) tracks which kind of exit happened so
+        // finNormalBB's resume block can dispatch to the right successor.
         llvm::BasicBlock* outerUnwind =
             hasFin ? (unwindTarget_ ? unwindTarget_ : propagateBB()) : nullptr;
         auto* dispatchBB =
@@ -4606,6 +4642,24 @@ private:
                    : nullptr;
         // Where a normal exit (body/arm fall-through) goes.
         llvm::BasicBlock* normalExit = hasFin ? finNormalBB : afterBB;
+
+        // CG21c: per-try-with-finally exit mode + return value storage.
+        llvm::AllocaInst* exitModSlot = nullptr;
+        llvm::AllocaInst* retValSlot  = nullptr;
+        llvm::Type* retTy = currentFn_ ? currentFn_->getReturnType() : nullptr;
+        llvm::BasicBlock* loopBreakBB = loopStack_.empty()
+            ? nullptr : loopStack_.back().breakTarget;
+        llvm::BasicBlock* loopContBB  = loopStack_.empty()
+            ? nullptr : loopStack_.back().continueTarget;
+        if (hasFin) {
+            exitModSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(0), exitModSlot);
+            if (retTy && !retTy->isVoidTy())
+                retValSlot = entryAlloca(retTy);
+            finallyStack_.push_back({finNormalBB, exitModSlot, retValSlot,
+                                     retTy, afterBB,
+                                     loopBreakBB, loopContBB});
+        }
 
         llvm::BasicBlock* savedUnwind = unwindTarget_;
         std::size_t savedDepth = unwindScopeDepth_;
@@ -4633,12 +4687,6 @@ private:
                 if (!desc) continue;
                 matched = builder_.CreateOr(matched, emitIsA(exc, desc));
             }
-            // CG: a binding (`catch var e: T`) and/or a `when` guard run in a
-            // prep block reached only on a type match. The binding stores the
-            // exception value to a slot for `e`; the guard is evaluated there
-            // (so it can read `e`) and, if false, control falls to the next
-            // arm with the exception still pending. The global is consumed
-            // only once an arm is actually entered.
             bool needsPrep =
                 arm.guard || (arm.hasBinding && arm.body);
             if (needsPrep) {
@@ -4684,10 +4732,69 @@ private:
         builder_.CreateBr(hasFin ? finUnwindBB : unwindBB());
 
         if (hasFin) {
-            // Normal-exit finally → afterBB.
+            // Pop the frame — outer frames (if any) are now at back().
+            finallyStack_.pop_back();
+            FinallyFrame* outerFr = finallyStack_.empty()
+                ? nullptr : &finallyStack_.back();
+
+            // finNormalBB: run finally body, then dispatch based on exit mode.
             builder_.SetInsertPoint(finNormalBB);
-            if (!lowerScopedBlock(trys.finallyBody)) builder_.CreateBr(afterBB);
-            // Exception-exit finally → re-propagate (exc still set).
+            bool finTerm = lowerScopedBlock(trys.finallyBody);
+            auto* resumeBB = llvm::BasicBlock::Create(llvm_, "finally.resume",
+                                                      currentFn_);
+            if (!finTerm) builder_.CreateBr(resumeBB);
+
+            // Build the dispatch block after finally.
+            builder_.SetInsertPoint(resumeBB);
+            llvm::Value* mode = builder_.CreateLoad(i32(), exitModSlot);
+            // Default (mode=0): fall through to afterBB.
+            auto* sw = builder_.CreateSwitch(mode, afterBB, 3);
+
+            // mode=1: return — propagate through outer finally or emit ret.
+            auto* retDispBB = llvm::BasicBlock::Create(llvm_,"finally.ret",currentFn_);
+            sw->addCase(builder_.getInt32(1), retDispBB);
+            builder_.SetInsertPoint(retDispBB);
+            if (outerFr) {
+                // Route through outer finally (nested try-with-finally).
+                builder_.CreateStore(builder_.getInt32(1), outerFr->exitModSlot);
+                if (retValSlot && outerFr->retValSlot) {
+                    llvm::Value* rv = builder_.CreateLoad(retTy, retValSlot);
+                    builder_.CreateStore(rv, outerFr->retValSlot);
+                }
+                builder_.CreateBr(outerFr->finNormalBB);
+            } else {
+                llvm::Value* rv = (retValSlot && retTy && !retTy->isVoidTy())
+                    ? builder_.CreateLoad(retTy, retValSlot) : nullptr;
+                emitReturn(currentFn_, rv);
+            }
+
+            // mode=2: break — propagate through outer finally or jump to break.
+            if (loopBreakBB) {
+                auto* brkDispBB = llvm::BasicBlock::Create(llvm_,"finally.brk",currentFn_);
+                sw->addCase(builder_.getInt32(2), brkDispBB);
+                builder_.SetInsertPoint(brkDispBB);
+                if (outerFr) {
+                    builder_.CreateStore(builder_.getInt32(2), outerFr->exitModSlot);
+                    builder_.CreateBr(outerFr->finNormalBB);
+                } else {
+                    builder_.CreateBr(loopBreakBB);
+                }
+            }
+
+            // mode=3: continue — propagate through outer finally or jump to cond.
+            if (loopContBB) {
+                auto* cntDispBB = llvm::BasicBlock::Create(llvm_,"finally.cnt",currentFn_);
+                sw->addCase(builder_.getInt32(3), cntDispBB);
+                builder_.SetInsertPoint(cntDispBB);
+                if (outerFr) {
+                    builder_.CreateStore(builder_.getInt32(3), outerFr->exitModSlot);
+                    builder_.CreateBr(outerFr->finNormalBB);
+                } else {
+                    builder_.CreateBr(loopContBB);
+                }
+            }
+
+            // finUnwindBB: exception exit — run finally, then re-propagate.
             builder_.SetInsertPoint(finUnwindBB);
             if (!lowerScopedBlock(trys.finallyBody))
                 builder_.CreateBr(outerUnwind);
@@ -5948,7 +6055,7 @@ private:
         currentFn_ = thunk;
         currentThis_ = nullptr;
         locals_.clear(); paramSlots_.clear(); refParams_.clear();
-        disposeStack_.clear(); loopStack_.clear();
+        disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
         unwindTarget_ = nullptr; propagateBB_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
         builder_.SetInsertPoint(
@@ -6687,7 +6794,7 @@ private:
         paramSlots_.clear();
         refParams_.clear();
         disposeStack_.clear();
-        loopStack_.clear();
+        loopStack_.clear(); finallyStack_.clear();
         unwindTarget_ = nullptr;
         propagateBB_ = nullptr;
         currentCaughtExc_ = nullptr;
@@ -9085,7 +9192,7 @@ private:
         currentCaughtExc_ = nullptr;
         unwindScopeDepth_ = 0;
         diverged_ = false;
-        loopStack_.clear();
+        loopStack_.clear(); finallyStack_.clear();
         disposeStack_.clear();
 
         // Bind `this` and params.
