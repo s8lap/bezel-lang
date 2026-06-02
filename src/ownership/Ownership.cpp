@@ -300,30 +300,97 @@ private:
             return;
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-            recordMovesInArgs(call->args);
+            recordMovesInArgs(call->args, call->callee.get());
             return;
         }
         // A constructor call `new T(owned x)` / `new T(move x)` consumes its
         // owned arguments exactly as a method call does — most commonly
         // `using var b := new Box(move r);`.
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
-            recordMovesInArgs(ne->args);
+            // §28.8: find the matching constructor to detect implicit owned params.
+            // Build a synthetic check by examining the ctor's parameter list directly.
+            const ast::ConstructorDecl* cd = nullptr;
+            if (ne->type) {
+                if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                    if (rt->declaration) {
+                        std::size_t nArgs = ne->args.size();
+                        for (sema::Symbol* m : rt->declaration->members) {
+                            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
+                                auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                                if (d && d->params.size() == nArgs) { cd = d; break; }
+                            }
+                        }
+                    }
+                }
+            }
+            std::size_t pos = 0;
+            for (const auto& a : ne->args) {
+                if (!a.value) { ++pos; continue; }
+                if (a.modifier == "owned") {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                        markMovedByName(id->name, id->span.begin);
+                        ++pos; continue;
+                    }
+                }
+                // §28.8 implicit transfer: bare id to `owned` formal param.
+                if (a.modifier.empty() && cd && pos < cd->params.size() &&
+                    (cd->params[pos].modifier == "owned" ||
+                     cd->params[pos].modifier == "out owned")) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                        markMovedByName(id->name, id->span.begin);
+                        ++pos; continue;
+                    }
+                }
+                recordMovesIn(*a.value);
+                ++pos;
+            }
             return;
         }
     }
 
-    void recordMovesInArgs(const std::vector<ast::CallArgument>& args) {
+    void recordMovesInArgs(const std::vector<ast::CallArgument>& args,
+                           const ast::Expr* callee = nullptr) {
+        // Resolve callee parameter list for implicit ownership transfer check.
+        const ast::MethodDecl*     calleeMethod = nullptr;
+        const ast::ConstructorDecl* calleeCtor  = nullptr;
+        if (callee) {
+            sema::Symbol* sym = ctx_.exprSymbol(*callee);
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
+                calleeMethod = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
+                calleeCtor = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            }
+        }
+        std::size_t pos = 0;
         for (const auto& a : args) {
-            if (!a.value) continue;
+            if (!a.value) { ++pos; continue; }
             // Slice O14: `owned x` argument modifier consumes x.
             if (a.modifier == "owned") {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         a.value.get())) {
                     markMovedByName(id->name, id->span.begin);
-                    continue;
+                    ++pos; continue;
+                }
+            }
+            // §28.8 implicit ownership transfer: a bare identifier passed
+            // to an `owned` formal parameter transfers ownership without
+            // an explicit `owned` or `move` at the call site.
+            {
+                const std::vector<ast::Param>* params = nullptr;
+                if (calleeMethod)  params = &calleeMethod->params;
+                if (calleeCtor)    params = &calleeCtor->params;
+                if (params && pos < params->size() &&
+                    ((*params)[pos].modifier == "owned" ||
+                     (*params)[pos].modifier == "out owned")) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            a.value.get())) {
+                        markMovedByName(id->name, id->span.begin);
+                        ++pos; continue;
+                    }
                 }
             }
             recordMovesIn(*a.value);
+            ++pos;
         }
     }
 
@@ -334,19 +401,32 @@ private:
     // Slice O2: before marking, check the current state — re-disposing
     // or re-moving an already-Disposed/MovedFrom local is a diagnostic
     // (the §28.3 "read of moved-from / disposed" rules).
+    // §28.8: check if argument at position `pos` in `args` is an implicit
+    // ownership transfer based on the callee's formal parameter list.
+    bool isImplicitOwned(const std::vector<ast::CallArgument>& args,
+                         std::size_t pos, const ast::Expr* callee) {
+        if (!callee) return false;
+        sema::Symbol* sym = ctx_.exprSymbol(*callee);
+        const ast::MethodDecl*     md = nullptr;
+        const ast::ConstructorDecl* cd = nullptr;
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+            md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym))
+            cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        const std::vector<ast::Param>* params =
+            md ? &md->params : (cd ? &cd->params : nullptr);
+        if (!params || pos >= params->size()) return false;
+        const std::string_view mod = (*params)[pos].modifier;
+        return mod == "owned" || mod == "out owned";
+    }
+
     void handleDischarge(const ast::Expr& e) {
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             if (call->callee) checkRead(*call->callee, /*selfTarget=*/true);
-            // Slice O14: argument-mode handling. Each argument's role
-            // determines whether the local it names is consumed or
-            // merely read:
-            //   * `owned x` (modifier on the argument) — caller transfers
-            //     ownership; x becomes MovedFrom.
-            //   * `move x` (UnaryExpr op=move on a bare identifier in
-            //     argument position) — same as above; x is consumed.
-            //   * everything else — ordinary read; checkRead applies.
+            // Slice O14 + §28.8: argument-mode handling.
+            std::size_t pos = 0;
             for (const auto& a : call->args) {
-                if (!a.value) continue;
+                if (!a.value) { ++pos; continue; }
                 bool consumed = false;
                 if (a.modifier == "owned") {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
@@ -377,7 +457,17 @@ private:
                         }
                     }
                 }
+                // §28.8 implicit transfer: bare id to an `owned` formal param.
+                if (!consumed && a.modifier.empty() &&
+                    isImplicitOwned(call->args, pos, call->callee.get())) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            a.value.get())) {
+                        markMovedByName(id->name, id->span.begin);
+                        consumed = true;
+                    }
+                }
                 if (!consumed) checkRead(*a.value, /*selfTarget=*/false);
+                ++pos;
             }
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                     call->callee.get())) {
@@ -415,6 +505,54 @@ private:
             }
             // Other unary ops — sub-expression is a regular read.
             if (un->operand) checkRead(*un->operand, /*selfTarget=*/false);
+            return;
+        }
+        // §28.8 implicit ownership transfer for constructor calls `new T(x)`.
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+            // Find the matching constructor by arity to get its param list.
+            const ast::ConstructorDecl* cd = nullptr;
+            if (ne->type) {
+                if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                    if (rt->declaration) {
+                        std::size_t nArgs = ne->args.size();
+                        for (sema::Symbol* m : rt->declaration->members) {
+                            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
+                                auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                                if (d && d->params.size() == nArgs) { cd = d; break; }
+                            }
+                        }
+                    }
+                }
+            }
+            std::size_t pos = 0;
+            for (const auto& a : ne->args) {
+                if (!a.value) { ++pos; continue; }
+                bool consumed = false;
+                if (a.modifier == "owned") {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                        markMovedByName(id->name, id->span.begin);
+                        consumed = true;
+                    }
+                } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
+                    if (un->op == "move") {
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get())) {
+                            markMovedByName(id->name, id->span.begin);
+                            consumed = true;
+                        }
+                    }
+                }
+                // §28.8: bare id to an `owned` formal param = implicit transfer.
+                if (!consumed && a.modifier.empty() && cd && pos < cd->params.size() &&
+                    (cd->params[pos].modifier == "owned" ||
+                     cd->params[pos].modifier == "out owned")) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                        markMovedByName(id->name, id->span.begin);
+                        consumed = true;
+                    }
+                }
+                if (!consumed) checkRead(*a.value, /*selfTarget=*/false);
+                ++pos;
+            }
             return;
         }
         // Fallback: just check the expression as a read.
