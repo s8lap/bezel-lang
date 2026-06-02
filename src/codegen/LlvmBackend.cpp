@@ -10249,6 +10249,66 @@ private:
                 return builder_.CreateCall(fn, {strToPath(s), recursive});
             }
         }
+        // §7: Directory.GetFiles / GetDirectories — return Array<string>
+        // bz_dir_get_files returns char** with count via int64_t*.
+        // We convert to a bz_array_t of bz.string objects.
+        if (cls == "Directory") {
+            auto makeFilesList = [&](const char* fnName) -> llvm::Value* {
+                if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                auto* cntSlotG = entryAlloca(i64());
+                auto* getFilesFn = declareC(fnName, ptrTy(), {ptrTy(), ptrTy()});
+                // Returns char** (array of NUL-terminated paths)
+                llvm::Value* rawArr = builder_.CreateCall(getFilesFn,
+                    {strToPath(s), cntSlotG});
+                llvm::Value* cnt = builder_.CreateLoad(i64(), cntSlotG);
+                auto* allocFn3 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                llvm::Value* result = builder_.CreateCall(allocFn3,
+                    {builder_.getInt64(8), cnt});
+                auto* addFn3 = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy(), i64()});
+                auto* strlenFn3 = declareC("strlen", i64(), {ptrTy()});
+                auto* mallocFn3 = declareC("malloc", ptrTy(), {i64()});
+                auto* memcpyFn3 = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                auto* callocFn4 = declareC("calloc", ptrTy(), {i64(), i64()});
+                auto* i8Ty3 = llvm::Type::getInt8Ty(llvm_);
+                uint64_t strSz3 = module_->getDataLayout().getTypeAllocSize(stringType());
+                auto* idxSlotG = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlotG);
+                auto* cG = llvm::BasicBlock::Create(llvm_, "gf.c", currentFn_);
+                auto* bG = llvm::BasicBlock::Create(llvm_, "gf.b", currentFn_);
+                auto* eG = llvm::BasicBlock::Create(llvm_, "gf.e", currentFn_);
+                builder_.CreateBr(cG);
+                builder_.SetInsertPoint(cG);
+                llvm::Value* iG = builder_.CreateLoad(i64(), idxSlotG);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(iG, cnt), bG, eG);
+                builder_.SetInsertPoint(bG);
+                llvm::Value* pG = builder_.CreateGEP(ptrTy(), rawArr, iG);
+                llvm::Value* cstrG = builder_.CreateLoad(ptrTy(), pG);
+                llvm::Value* lenG = builder_.CreateCall(strlenFn3, {cstrG});
+                llvm::Value* dataSzG = builder_.CreateAdd(lenG, builder_.getInt64(1));
+                llvm::Value* dataCpG = builder_.CreateCall(mallocFn3, {dataSzG});
+                builder_.CreateCall(memcpyFn3, {dataCpG, cstrG, lenG});
+                llvm::Value* nulPtrG = builder_.CreateGEP(i8Ty3, dataCpG, lenG);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty3, 0), nulPtrG);
+                llvm::Value* strObjG = builder_.CreateCall(callocFn4,
+                    {builder_.getInt64(1), builder_.getInt64(strSz3)});
+                builder_.CreateStore(dataCpG, builder_.CreateStructGEP(stringType(), strObjG, 0));
+                builder_.CreateStore(lenG, builder_.CreateStructGEP(stringType(), strObjG, 1));
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty3, 1),
+                    builder_.CreateStructGEP(stringType(), strObjG, 2));
+                auto* slotG = entryAlloca(ptrTy());
+                builder_.CreateStore(strObjG, slotG);
+                builder_.CreateCall(addFn3, {result, slotG, builder_.getInt64(8)});
+                builder_.CreateStore(builder_.CreateAdd(iG, builder_.getInt64(1)), idxSlotG);
+                builder_.CreateBr(cG);
+                builder_.SetInsertPoint(eG);
+                return result;
+            };
+            if (m == "GetFiles") return makeFilesList("bz_dir_get_files");
+            if (m == "GetDirectories") return makeFilesList("bz_dir_get_dirs");
+        }
         if (cls == "Path") {
             auto make1arg = [&](const char* fnName) -> llvm::Value* {
                 if (call.args.size() != 1 || !call.args[0].value) return nullptr;
