@@ -6547,10 +6547,24 @@ private:
                     for (auto& [n, ty] : newSubst)
                         if (ty == i32()) { hasUnresolved = true; break; }
                     if (hasUnresolved) {
-                        sema::Symbol* sym = ctx_.exprSymbol(*ma.target);
+                        // Chase through PostfixBangExpr/MemberAccessExpr to
+                        // find the root local variable (e.g. root._left!._val
+                        // peels !._left to reach `root`).
+                        const ast::Expr* cur = ma.target.get();
                         const ast::Node* decl = nullptr;
-                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym))
-                            decl = loc->decl;
+                        while (cur && !decl) {
+                            sema::Symbol* sym = ctx_.exprSymbol(*cur);
+                            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym))
+                                decl = loc->decl;
+                            if (!decl) {
+                                if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(cur))
+                                    cur = bg->operand.get();
+                                else if (auto* sub = dynamic_cast<const ast::MemberAccessExpr*>(cur))
+                                    cur = sub->target.get();
+                                else
+                                    break;
+                            }
+                        }
                         if (decl) {
                             auto lit = localGenericSubst_.find(decl);
                             if (lit != localGenericSubst_.end())
