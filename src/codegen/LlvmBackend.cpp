@@ -6173,6 +6173,67 @@ private:
                 }
             }
         }
+        // §3: Dictionary<K,V>.Keys — property returning Array<string> of all keys.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target && ma->member == "Keys") {
+                auto* tt = ctx_.exprType(*ma->target);
+                if (isDictTypeName(tt)) {
+                    llvm::Value* dictObj = lowerExpr(*ma->target);
+                    if (!dictObj) return nullptr;
+                    auto* keysOutSlot = entryAlloca(ptrTy());
+                    auto* lensOutSlot = entryAlloca(ptrTy());
+                    auto* cntSlot2 = entryAlloca(i64());
+                    auto* keysFn2 = declareC("bz_dict_keys_str", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(keysFn2, {dictObj, keysOutSlot, lensOutSlot, cntSlot2});
+                    llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
+                    llvm::Value* lensArr = builder_.CreateLoad(ptrTy(), lensOutSlot);
+                    llvm::Value* cnt2 = builder_.CreateLoad(i64(), cntSlot2);
+                    auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                    llvm::Value* result2 = builder_.CreateCall(allocFn2,
+                        {builder_.getInt64(8), cnt2});
+                    auto* addFn2 = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy(), ptrTy(), i64()});
+                    auto* mallocFn2 = declareC("malloc", ptrTy(), {i64()});
+                    auto* memcpyFn2 = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                    auto* callocFn3 = declareC("calloc", ptrTy(), {i64(), i64()});
+                    auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+                    uint64_t strSz2 = module_->getDataLayout().getTypeAllocSize(stringType());
+                    auto* idxSlot3 = entryAlloca(i64());
+                    builder_.CreateStore(builder_.getInt64(0), idxSlot3);
+                    auto* condBB2b = llvm::BasicBlock::Create(llvm_, "ks2.c", currentFn_);
+                    auto* bodyBB2b = llvm::BasicBlock::Create(llvm_, "ks2.b", currentFn_);
+                    auto* endBB2b  = llvm::BasicBlock::Create(llvm_, "ks2.e", currentFn_);
+                    builder_.CreateBr(condBB2b);
+                    builder_.SetInsertPoint(condBB2b);
+                    llvm::Value* idx3 = builder_.CreateLoad(i64(), idxSlot3);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(idx3, cnt2), bodyBB2b, endBB2b);
+                    builder_.SetInsertPoint(bodyBB2b);
+                    llvm::Value* kpPtr2 = builder_.CreateGEP(ptrTy(), keysArr, idx3);
+                    llvm::Value* kp2 = builder_.CreateLoad(ptrTy(), kpPtr2);
+                    llvm::Value* lpPtr2 = builder_.CreateGEP(i64(), lensArr, idx3);
+                    llvm::Value* kl3 = builder_.CreateLoad(i64(), lpPtr2);
+                    llvm::Value* dataSz3 = builder_.CreateAdd(kl3, builder_.getInt64(1));
+                    llvm::Value* dataCopy3 = builder_.CreateCall(mallocFn2, {dataSz3});
+                    builder_.CreateCall(memcpyFn2, {dataCopy3, kp2, kl3});
+                    llvm::Value* nulPtr3 = builder_.CreateGEP(i8Ty2, dataCopy3, kl3);
+                    builder_.CreateStore(llvm::ConstantInt::get(i8Ty2, 0), nulPtr3);
+                    llvm::Value* strObj3 = builder_.CreateCall(callocFn3,
+                        {builder_.getInt64(1), builder_.getInt64(strSz2)});
+                    builder_.CreateStore(dataCopy3, builder_.CreateStructGEP(stringType(), strObj3, 0));
+                    builder_.CreateStore(kl3, builder_.CreateStructGEP(stringType(), strObj3, 1));
+                    builder_.CreateStore(llvm::ConstantInt::get(i8Ty2, 1),
+                        builder_.CreateStructGEP(stringType(), strObj3, 2));
+                    auto* slotK2 = entryAlloca(ptrTy());
+                    builder_.CreateStore(strObj3, slotK2);
+                    builder_.CreateCall(addFn2, {result2, slotK2, builder_.getInt64(8)});
+                    builder_.CreateStore(builder_.CreateAdd(idx3, builder_.getInt64(1)), idxSlot3);
+                    builder_.CreateBr(condBB2b);
+                    builder_.SetInsertPoint(endBB2b);
+                    return result2;
+                }
+            }
+        }
         // CG22+: Exception.Message — built-in exceptions store a message
         // string pointer at byte offset 8 (slot 1) of the exception object.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
