@@ -9237,6 +9237,18 @@ private:
                 else if (callPrimTy == P::Float) slotTy = llvm::Type::getFloatTy(llvm_);
                 else if (callPrimTy == P::Long || callPrimTy == P::ULong) slotTy = i64();
                 else slotTy = i32();
+            } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+                // §3: collection instance calls (e.g. dict.TryGetValue).
+                // Infer out-param type from the collection's generic args.
+                if (ma->target) {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    const auto& m = ma->member;
+                    if (isDictTypeName(recvTy) && m == "TryGetValue" &&
+                        recvTy->genericArgs.size() >= 2 && recvTy->genericArgs[1]) {
+                        // Value type = second generic arg of Dictionary<K,V>
+                        slotTy = lowerTypeRef(recvTy->genericArgs[1]);
+                    }
+                }
             }
             llvm::AllocaInst* slot = entryAlloca(slotTy);
             locals_[id] = slot;
