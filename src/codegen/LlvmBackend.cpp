@@ -8904,6 +8904,213 @@ private:
             }
         }
 
+        // ---------------------------------------------------------------------------
+        // §2.5 DateTime — static members and methods via bz_datetime_* runtime.
+        // ---------------------------------------------------------------------------
+        if (cls == "DateTime") {
+            if (m == "Now" && call.args.empty()) {
+                auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
+                return builder_.CreateCall(fn, {}, "dt.now");
+            }
+            if (m == "UtcNow" && call.args.empty()) {
+                auto* fn = declareC("bz_datetime_utcnow_ticks", i64(), {});
+                return builder_.CreateCall(fn, {}, "dt.utcnow");
+            }
+            // DateTime.FromTicks(ticks: long): long (identity)
+            if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
+                return lowerExpr(*call.args[0].value);
+            }
+        }
+        if (cls == "TimeSpan") {
+            // TimeSpan.FromSeconds(n): long  (n * 10_000_000L)
+            if (m == "FromSeconds" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                if (!v->getType()->isIntegerTy(64)) v = builder_.CreateSExt(v, i64());
+                return builder_.CreateMul(v, builder_.getInt64(10000000LL), "ts.sec");
+            }
+            if (m == "FromMilliseconds" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                if (!v->getType()->isIntegerTy(64)) v = builder_.CreateSExt(v, i64());
+                return builder_.CreateMul(v, builder_.getInt64(10000LL), "ts.ms");
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // §7 System.IO — File, Directory, Path static methods via bz_* runtime.
+        // ---------------------------------------------------------------------------
+        auto loadBzString = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
+            return {loadStringData(s), loadStringLen(s)};
+        };
+        auto strToPath = [&](llvm::Value* s) -> llvm::Value* {
+            // Convert bz.string to C NUL-terminated string via snprintf
+            llvm::Value* data = loadStringData(s);
+            llvm::Value* len64 = loadStringLen(s);
+            // Create a temp buffer of len+1 bytes
+            llvm::Value* bufLen = builder_.CreateAdd(len64, builder_.getInt64(1));
+            auto* fn = declareC("malloc", ptrTy(), {i64()});
+            llvm::Value* buf = builder_.CreateCall(fn, {bufLen});
+            auto* mcpFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(mcpFn, {buf, data, len64});
+            // NUL-terminate
+            llvm::Value* nul = builder_.CreateGEP(
+                llvm::Type::getInt8Ty(llvm_), buf, len64);
+            builder_.CreateStore(builder_.getInt8(0), nul);
+            return buf;
+        };
+        auto ptrToStr = [&](llvm::Value* ptr, llvm::Value* lenVal) -> llvm::Value* {
+            // Build a bz.string from a malloc'd C string (ptr, len, width=1).
+            auto* sobj = builder_.CreateCall(
+                callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+            builder_.CreateStore(ptr,
+                builder_.CreateStructGEP(stringType(), sobj, 0));
+            builder_.CreateStore(lenVal,
+                builder_.CreateStructGEP(stringType(), sobj, 1));
+            builder_.CreateStore(builder_.getInt8(1),
+                builder_.CreateStructGEP(stringType(), sobj, 2));
+            return sobj;
+        };
+
+        if (cls == "File") {
+            if (m == "Exists" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                llvm::Value* path = strToPath(s);
+                auto* fn = declareC("bz_file_exists", i1(), {ptrTy()});
+                return builder_.CreateCall(fn, {path});
+            }
+            if (m == "Delete" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                auto* fn = declareC("bz_file_delete", i1(), {ptrTy()});
+                return builder_.CreateCall(fn, {strToPath(s)});
+            }
+            if (m == "ReadAllText" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                auto* outSlot = entryAlloca(ptrTy());
+                auto* lenSlot = entryAlloca(i64());
+                auto* fn = declareC("bz_file_read_all_text", i32(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {strToPath(s), outSlot, lenSlot});
+                llvm::Value* ptr = builder_.CreateLoad(ptrTy(), outSlot);
+                llvm::Value* len = builder_.CreateLoad(i64(), lenSlot);
+                return ptrToStr(ptr, len);
+            }
+            if (m == "WriteAllText" && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* path = lowerExpr(*call.args[0].value);
+                llvm::Value* text = lowerExpr(*call.args[1].value);
+                if (!path || !text) return nullptr;
+                auto [td, tl] = loadBzString(text);
+                auto* fn = declareC("bz_file_write_all_text", i32(),
+                                    {ptrTy(), ptrTy(), i64()});
+                return builder_.CreateCall(fn, {strToPath(path), td, tl});
+            }
+            if (m == "AppendAllText" && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* path = lowerExpr(*call.args[0].value);
+                llvm::Value* text = lowerExpr(*call.args[1].value);
+                if (!path || !text) return nullptr;
+                auto [td, tl] = loadBzString(text);
+                auto* fn = declareC("bz_file_append_all_text", i32(),
+                                    {ptrTy(), ptrTy(), i64()});
+                return builder_.CreateCall(fn, {strToPath(path), td, tl});
+            }
+        }
+        if (cls == "Directory") {
+            if (m == "Exists" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                auto* fn = declareC("bz_dir_exists", i1(), {ptrTy()});
+                return builder_.CreateCall(fn, {strToPath(s)});
+            }
+            if (m == "CreateDirectory" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                auto* fn = declareC("bz_dir_create", i32(), {ptrTy()});
+                return builder_.CreateCall(fn, {strToPath(s)});
+            }
+        }
+        if (cls == "Path") {
+            auto make1arg = [&](const char* fnName) -> llvm::Value* {
+                if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+                llvm::Value* s = lowerExpr(*call.args[0].value);
+                if (!s) return nullptr;
+                llvm::Value* p = strToPath(s);
+                auto* fn = declareC(fnName, ptrTy(), {ptrTy()});
+                llvm::Value* result = builder_.CreateCall(fn, {p});
+                // result is a malloc'd C string; compute its length via strlen
+                auto* strl = declareC("strlen", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(strl, {result});
+                return ptrToStr(result, len);
+            };
+            if (m == "GetFileName") return make1arg("bz_path_filename");
+            if (m == "GetExtension") return make1arg("bz_path_extension");
+            if (m == "GetFileNameWithoutExtension") return make1arg("bz_path_stem");
+            if (m == "GetDirectoryName") return make1arg("bz_path_dirname");
+            if (m == "GetFullPath") return make1arg("bz_path_absolute");
+            if (m == "Combine" && call.args.size() == 2 &&
+                call.args[0].value && call.args[1].value) {
+                llvm::Value* a = lowerExpr(*call.args[0].value);
+                llvm::Value* b = lowerExpr(*call.args[1].value);
+                if (!a || !b) return nullptr;
+                auto* fn = declareC("bz_path_combine", ptrTy(), {ptrTy(), ptrTy()});
+                llvm::Value* result = builder_.CreateCall(fn, {strToPath(a), strToPath(b)});
+                auto* strl = declareC("strlen", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(strl, {result});
+                return ptrToStr(result, len);
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // §2.6 Random — instance methods via bz_random_* runtime.
+        // (Static Random.Next etc. are handled via the bare class above.)
+        // ---------------------------------------------------------------------------
+        if (!id) {  // instance call on a Random object
+            if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+                if (ma2->target) {
+                    auto* recvTy = ctx_.exprType(*ma2->target);
+                    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        !recvTy->declaration && recvTy->astNode &&
+                        recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
+                        recvTy->astNode->name->parts[0] == "Random") {
+                        llvm::Value* rng = lowerExpr(*ma2->target);
+                        if (!rng) return nullptr;
+                        const auto& mname = ma2->member;
+                        if (mname == "Next" && call.args.empty()) {
+                            auto* fn = declareC("bz_random_next_int", i32(),
+                                                {ptrTy(), i32(), i32()});
+                            return builder_.CreateCall(fn,
+                                {rng, builder_.getInt32(0),
+                                 builder_.getInt32(2147483647)});
+                        }
+                        if (mname == "Next" && call.args.size() == 1 && call.args[0].value) {
+                            llvm::Value* hi = lowerExpr(*call.args[0].value);
+                            auto* fn = declareC("bz_random_next_int", i32(),
+                                                {ptrTy(), i32(), i32()});
+                            return builder_.CreateCall(fn,
+                                {rng, builder_.getInt32(0), hi});
+                        }
+                        if (mname == "Next" && call.args.size() == 2 &&
+                            call.args[0].value && call.args[1].value) {
+                            llvm::Value* lo = lowerExpr(*call.args[0].value);
+                            llvm::Value* hi = lowerExpr(*call.args[1].value);
+                            auto* fn = declareC("bz_random_next_int", i32(),
+                                                {ptrTy(), i32(), i32()});
+                            return builder_.CreateCall(fn, {rng, lo, hi});
+                        }
+                        if (mname == "NextDouble" && call.args.empty()) {
+                            auto* fn = declareC("bz_random_next_double",
+                                                llvm::Type::getDoubleTy(llvm_), {ptrTy()});
+                            return builder_.CreateCall(fn, {rng});
+                        }
+                    }
+                }
+            }
+        }
+
         return nullptr;
     }
 
