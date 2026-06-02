@@ -8811,6 +8811,99 @@ private:
                 builder_.SetInsertPoint(endBB);
                 return llvm::ConstantInt::get(i32(), 0);
             }
+            // per §5 LINQ: .OrderBy(key: (T)->int): Array<T> — stable sort by int key (asc).
+            // Implemented as selection sort on a copy using the key closure.
+            if ((m == "OrderBy" || m == "OrderByDescending") &&
+                call.args.size() == 1 && call.args[0].value) {
+                bool desc = (m == "OrderByDescending");
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+                if (!closure) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                // Copy source into result array.
+                auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                llvm::Value* result = builder_.CreateCall(allocFn2,
+                    {builder_.getInt64(esz), len});
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), i64()});
+                {
+                    auto* idxS = entryAlloca(i64());
+                    builder_.CreateStore(builder_.getInt64(0), idxS);
+                    auto* cBB = llvm::BasicBlock::Create(llvm_, "ob.cc", currentFn_);
+                    auto* bBB = llvm::BasicBlock::Create(llvm_, "ob.cb", currentFn_);
+                    auto* eBB = llvm::BasicBlock::Create(llvm_, "ob.ce", currentFn_);
+                    builder_.CreateBr(cBB);
+                    builder_.SetInsertPoint(cBB);
+                    llvm::Value* ci = builder_.CreateLoad(i64(), idxS);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(ci, len), bBB, eBB);
+                    builder_.SetInsertPoint(bBB);
+                    llvm::Value* ep2 = builder_.CreateCall(ptrFn, {recv, ci, builder_.getInt64(esz)});
+                    builder_.CreateCall(addFn, {result, ep2, builder_.getInt64(esz)});
+                    builder_.CreateStore(builder_.CreateAdd(ci, builder_.getInt64(1)), idxS);
+                    builder_.CreateBr(cBB);
+                    builder_.SetInsertPoint(eBB);
+                }
+                // Insertion sort on result using the key closure.
+                auto* iSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(1), iSlot);
+                auto* isortCond = llvm::BasicBlock::Create(llvm_, "ob.ic", currentFn_);
+                auto* isortBody = llvm::BasicBlock::Create(llvm_, "ob.ib", currentFn_);
+                auto* isortEnd  = llvm::BasicBlock::Create(llvm_, "ob.ie", currentFn_);
+                builder_.CreateBr(isortCond);
+                builder_.SetInsertPoint(isortCond);
+                llvm::Value* oi = builder_.CreateLoad(i64(), iSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(oi, len), isortBody, isortEnd);
+                builder_.SetInsertPoint(isortBody);
+                // key_i = closure(result[oi]); elem_i = result[oi]
+                llvm::Value* piPtr = builder_.CreateCall(ptrFn, {result, oi, builder_.getInt64(esz)});
+                llvm::Value* elem_i = builder_.CreateLoad(elemTy, piPtr);
+                llvm::Value* key_i  = callClosure(closure, elem_i, i32());
+                // Store key and elem temporaries
+                auto* keySlot = entryAlloca(i32());
+                auto* elemSlot = entryAlloca(elemTy);
+                builder_.CreateStore(key_i, keySlot);
+                builder_.CreateStore(elem_i, elemSlot);
+                // j = oi - 1; while j >= 0 && key(result[j]) > key_i: shift right
+                auto* jSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.CreateSub(oi, builder_.getInt64(1)), jSlot);
+                auto* wCond = llvm::BasicBlock::Create(llvm_, "ob.wc", currentFn_);
+                auto* wBody = llvm::BasicBlock::Create(llvm_, "ob.wb", currentFn_);
+                auto* wEnd  = llvm::BasicBlock::Create(llvm_, "ob.we", currentFn_);
+                auto* wKeyBB = llvm::BasicBlock::Create(llvm_, "ob.wk", currentFn_);
+                builder_.CreateBr(wCond);
+                builder_.SetInsertPoint(wCond);
+                llvm::Value* oj = builder_.CreateLoad(i64(), jSlot);
+                llvm::Value* jValid = builder_.CreateICmpSGE(oj, builder_.getInt64(0));
+                builder_.CreateCondBr(jValid, wKeyBB, wEnd);
+                builder_.SetInsertPoint(wKeyBB);
+                llvm::Value* pjPtr = builder_.CreateCall(ptrFn, {result, oj, builder_.getInt64(esz)});
+                llvm::Value* elem_j = builder_.CreateLoad(elemTy, pjPtr);
+                llvm::Value* key_j  = callClosure(closure, elem_j, i32());
+                llvm::Value* needShift = desc
+                    ? builder_.CreateICmpSLT(key_j, builder_.CreateLoad(i32(), keySlot))
+                    : builder_.CreateICmpSGT(key_j, builder_.CreateLoad(i32(), keySlot));
+                builder_.CreateCondBr(needShift, wBody, wEnd);
+                builder_.SetInsertPoint(wBody);
+                // result[j+1] = result[j]
+                llvm::Value* pj1Ptr = builder_.CreateCall(ptrFn, {result,
+                    builder_.CreateAdd(oj, builder_.getInt64(1)), builder_.getInt64(esz)});
+                builder_.CreateStore(elem_j, pj1Ptr);
+                builder_.CreateStore(builder_.CreateSub(oj, builder_.getInt64(1)), jSlot);
+                builder_.CreateBr(wCond);
+                builder_.SetInsertPoint(wEnd);
+                // result[j+1] = elem_i
+                llvm::Value* ojEnd = builder_.CreateLoad(i64(), jSlot);
+                llvm::Value* pInsert = builder_.CreateCall(ptrFn, {result,
+                    builder_.CreateAdd(ojEnd, builder_.getInt64(1)), builder_.getInt64(esz)});
+                builder_.CreateStore(builder_.CreateLoad(elemTy, elemSlot), pInsert);
+                builder_.CreateStore(builder_.CreateAdd(oi, builder_.getInt64(1)), iSlot);
+                builder_.CreateBr(isortCond);
+                builder_.SetInsertPoint(isortEnd);
+                return result;
+            }
             // per §3: .IndexOf(item): int — index of first match, -1 if not found
             if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* target = lowerExpr(*call.args[0].value);
