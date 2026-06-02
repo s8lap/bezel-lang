@@ -968,7 +968,17 @@ public:
             if (tr->astNode && tr->astNode->name &&
                 tr->astNode->name->parts.size() == 1) {
                 auto it = genericSubst.find(tr->astNode->name->parts[0]);
-                if (it != genericSubst.end()) return it->second;
+                if (it != genericSubst.end()) {
+                    TypeRef* substituted = it->second;
+                    // Preserve the nullable modifier from the generic type
+                    // reference: T? → int? when T→int.
+                    if (tr->nullable && substituted && !substituted->nullable) {
+                        TypeRef* nn = ctx_.makeTypeRef(*substituted);
+                        nn->nullable = true;
+                        return nn;
+                    }
+                    return substituted;
+                }
             }
         }
         return tr;
