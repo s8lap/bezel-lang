@@ -6400,6 +6400,26 @@ private:
             if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody))
                 retTy = lowerTypeRef(rt);
         }
+        // If return type is still i32 (unresolved generic), try the expected
+        // function type's return type (from the call site context).
+        if (retTy == i32() && expectedFunctionType_ &&
+            expectedFunctionType_->funcReturn) {
+            llvm::Type* expected = lowerTypeRef(expectedFunctionType_->funcReturn);
+            if (expected != i32()) retTy = expected;
+        }
+        // Also try to resolve via genericSubst_ when the sema return type is
+        // an unresolved named generic param (e.g. C in Curried<A,B,C>).
+        if (retTy == i32() && lam.exprBody) {
+            if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody)) {
+                if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    rt->astNode->name->parts.size() == 1) {
+                    auto sit = genericSubst_.find(rt->astNode->name->parts[0]);
+                    if (sit != genericSubst_.end() && sit->second != i32())
+                        retTy = sit->second;
+                }
+            }
+        }
 
         // Collect outer captured variables (everything in the outer frame
         // that may be referenced in the body). We include all outer params
@@ -8280,16 +8300,71 @@ private:
             llvm::Type* retTy = rt->funcReturn
                                     ? lowerTypeRef(rt->funcReturn)
                                     : llvm::Type::getVoidTy(llvm_);
+            // CG-generic: if return type is i32 (unresolved generic param C),
+            // try to resolve via the callee's localGenericSubst_.  This handles
+            // the case of a generic method returning a function type (B)->C where
+            // C is a type parameter — the local variable's stored substitution
+            // maps C to the concrete type (e.g. f64 for Curried<…,double>).
+            if (retTy == i32() && rt->funcReturn) {
+                auto* fr = rt->funcReturn;
+                if (fr->kind == sema::TypeRef::Kind::Named && !fr->declaration &&
+                    fr->astNode && fr->astNode->name &&
+                    fr->astNode->name->parts.size() == 1) {
+                    std::string_view paramName = fr->astNode->name->parts[0];
+                    // Look up in the callee's localGenericSubst_.
+                    sema::Symbol* calleeSym2 = ctx_.exprSymbol(*call.callee);
+                    const ast::Node* decl = nullptr;
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(calleeSym2))
+                        decl = loc->decl;
+                    if (decl) {
+                        auto lit = localGenericSubst_.find(decl);
+                        if (lit != localGenericSubst_.end()) {
+                            auto sit = lit->second.find(paramName);
+                            if (sit != lit->second.end() && sit->second != i32())
+                                retTy = sit->second;
+                        }
+                    }
+                    // Also try current genericSubst_.
+                    if (retTy == i32()) {
+                        auto sit = genericSubst_.find(paramName);
+                        if (sit != genericSubst_.end() && sit->second != i32())
+                            retTy = sit->second;
+                    }
+                }
+            }
             std::vector<llvm::Type*> allArgTys;
             allArgTys.push_back(ptrTy());  // env
+            // Resolve callee's generic substitution for param/return types.
+            // When the closure is a local variable from a generic method call,
+            // its localGenericSubst_ has the concrete type mapping.
+            const std::unordered_map<std::string_view, llvm::Type*>* calleeSubst = nullptr;
+            {
+                sema::Symbol* calleeSym3 = ctx_.exprSymbol(*call.callee);
+                const ast::Node* decl3 = nullptr;
+                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(calleeSym3))
+                    decl3 = loc->decl;
+                if (decl3) {
+                    auto lit = localGenericSubst_.find(decl3);
+                    if (lit != localGenericSubst_.end())
+                        calleeSubst = &lit->second;
+                }
+            }
             for (std::size_t pi = 0; pi < rt->funcParams.size(); ++pi) {
                 llvm::Type* declared =
                     rt->funcParams[pi].type ? lowerTypeRef(rt->funcParams[pi].type) : i32();
-                // CG-generic: if declared resolved to i32 (unresolved generic T)
-                // but the actual arg is a pointer (string/class), upgrade to ptr.
-                // For float/double mismatches, convert the arg rather than upgrading
-                // the type — the lambda was compiled with i32 params and changing the
-                // call type would break ABI.
+                // CG-generic: if declared resolved to i32 (unresolved generic T):
+                // 1. Try callee's localGenericSubst_ to resolve the generic param name.
+                // 2. If still i32, upgrade to ptr if the actual arg is a pointer.
+                if (declared == i32() && rt->funcParams[pi].type) {
+                    auto* fp = rt->funcParams[pi].type;
+                    if (fp->kind == sema::TypeRef::Kind::Named && !fp->declaration &&
+                        fp->astNode && fp->astNode->name &&
+                        fp->astNode->name->parts.size() == 1 && calleeSubst) {
+                        auto sit = calleeSubst->find(fp->astNode->name->parts[0]);
+                        if (sit != calleeSubst->end() && sit->second != i32())
+                            declared = sit->second;
+                    }
+                }
                 std::size_t ai = pi + 1;  // +1 for env_ptr
                 if (declared == i32() && ai < args.size() &&
                     args[ai]->getType()->isPointerTy())
