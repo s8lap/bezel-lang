@@ -237,6 +237,10 @@ private:
     // method call. Set by lowerCallImpl before restoring; read by lowerLocalDecl
     // to associate a local with the concrete types of its initializer.
     std::unordered_map<std::string_view, llvm::Type*> lastCallGenericSubst_;
+    // genericSubstSemaTy_: parallel to genericSubst_, maps generic param name
+    // to the sema TypeRef of the concrete substitution.  Used in binary
+    // expression lowering to distinguish string vs. class pointer equality.
+    std::unordered_map<std::string_view, const sema::TypeRef*> genericSubstSemaTy_;
 
     // Block-form property getter functions (§22.9 `get => do...end;`).
     // Keyed by PropertyDecl so the same getter function is reused across
@@ -6009,13 +6013,33 @@ private:
                 return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                        rt->primitive == sema::PrimitiveType::String;
             };
+            // Check if an expression has an unresolved generic type (T) that
+            // is concretely substituted to string via genericSubstSemaTy_.
+            auto isGenericString = [&](const ast::Expr* e) {
+                if (!e || genericSubstSemaTy_.empty()) return false;
+                auto* rt = ctx_.exprType(*e);
+                if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+                    rt->declaration) return false;
+                // Unresolved generic param — check if any substitution is String.
+                if (rt->astNode && rt->astNode->name &&
+                    rt->astNode->name->parts.size() == 1) {
+                    auto sit = genericSubstSemaTy_.find(
+                        rt->astNode->name->parts[0]);
+                    if (sit != genericSubstSemaTy_.end() && sit->second) {
+                        auto* srt = sit->second;
+                        return srt->kind == sema::TypeRef::Kind::Primitive &&
+                               srt->primitive == sema::PrimitiveType::String;
+                    }
+                }
+                return false;
+            };
             bool eitherNull =
                 (bin.left && dynamic_cast<const ast::NullLiteralExpr*>(
                                   bin.left.get())) ||
                 (bin.right && dynamic_cast<const ast::NullLiteralExpr*>(
                                    bin.right.get()));
-            bool lIsStr = isStr(bin.left.get());
-            bool rIsStr = isStr(bin.right.get());
+            bool lIsStr = isStr(bin.left.get()) || isGenericString(bin.left.get());
+            bool rIsStr = isStr(bin.right.get()) || isGenericString(bin.right.get());
             bool lIsPtr = l->getType()->isPointerTy();
             bool rIsPtr = r->getType()->isPointerTy();
             // Equality/inequality: use string ops when at least one side is a
@@ -6609,6 +6633,7 @@ private:
         // set up the type-parameter substitution before classStruct so that
         // field types are computed with the concrete type arguments.
         auto savedSubst = genericSubst_;  // save outer subst (nested generics)
+        auto savedSemaTy = genericSubstSemaTy_;
         if (!rt->genericArgs.empty() && t->decl) {
             auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
             if (td && td->genericParams.size() == rt->genericArgs.size()) {
@@ -6616,11 +6641,17 @@ private:
                 // that `new Pair<T>` inside a `Pair<string>` method correctly
                 // maps T → ptr (string) rather than the i32 fallback.
                 std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
                 for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
                     llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
-                    newSubst[td->genericParams[gi].name] = concrTy;
+                    std::string_view pname = td->genericParams[gi].name;
+                    newSubst[pname] = concrTy;
+                    // Record the sema TypeRef for the concrete arg so the
+                    // binary `=` handler can distinguish string vs. class ptr.
+                    newSema[pname] = rt->genericArgs[gi];
                 }
                 genericSubst_ = std::move(newSubst);
+                genericSubstSemaTy_ = std::move(newSema);
             }
         }
 
@@ -6768,6 +6799,7 @@ private:
             lastCallGenericSubst_ = genericSubst_;
         // Restore the outer generic substitution.
         genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
         return obj;
     }
 
@@ -8292,6 +8324,7 @@ private:
         // has generic args and the parent TypeSymbol has genericParams,
         // set up the substitution for the method body specialization.
         auto savedSubst = genericSubst_;
+        auto savedSemaTy = genericSubstSemaTy_;
         if (!isStaticMethod(ms) && ms->parent && !args.empty()) {
             // Find the receiver expression to get its type.
             const ast::Expr* recvExpr = nullptr;
@@ -8310,10 +8343,13 @@ private:
                         // Resolve generic args using the OUTER substitution so
                         // that `Pair<T>` in `Pair<string>` context resolves T→ptr.
                         std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                        std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
                         for (std::size_t gi = 0;
                              gi < td->genericParams.size(); ++gi) {
                             llvm::Type* concrTy = lowerTypeRef(recvTy->genericArgs[gi]);
-                            newSubst[td->genericParams[gi].name] = concrTy;
+                            std::string_view pname = td->genericParams[gi].name;
+                            newSubst[pname] = concrTy;
+                            newSema[pname] = recvTy->genericArgs[gi];
                         }
                         // Check if any resolved arg is still i32 (unresolved generic
                         // fallback). If so, try the localGenericSubst_ for the receiver.
@@ -8333,6 +8369,7 @@ private:
                             }
                         }
                         genericSubst_ = std::move(newSubst);
+                        genericSubstSemaTy_ = std::move(newSema);
                     }
                 }
             }
@@ -8343,6 +8380,7 @@ private:
         if (!genericSubst_.empty())
             lastCallGenericSubst_ = genericSubst_;
         genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
         return result;
     }
 
