@@ -6447,6 +6447,23 @@ private:
             captures.push_back(ce);
         }
 
+        // Capture `this` if we're inside an instance method — the lambda body
+        // may access instance fields via implicit this. Slot index: last entry.
+        // Use sym=nullptr/decl=nullptr as sentinel; restoration sets currentThis_.
+        bool capturesThis = (currentThis_ != nullptr);
+        std::size_t thisCaptureIdx = captures.size();
+        if (capturesThis) {
+            // Spill `this` (a value, not a slot) to a temporary alloca so we
+            // can store it into the env struct.
+            CaptureEntry ce;
+            ce.ty = ptrTy();
+            ce.outerSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(currentThis_, ce.outerSlot);
+            ce.sym = nullptr;
+            ce.decl = nullptr;
+            captures.push_back(ce);
+        }
+
         // Build env struct type (one slot per capture).
         std::vector<llvm::Type*> envFieldTys;
         for (const auto& ce : captures) envFieldTys.push_back(ce.ty);
@@ -6489,10 +6506,15 @@ private:
                 llvm::Value* fieldPtr = builder_.CreateStructGEP(
                     envTy, envPtr, static_cast<unsigned>(i));
                 llvm::Value* val = builder_.CreateLoad(ce.ty, fieldPtr);
-                auto* slot = entryAlloca(ce.ty);
-                builder_.CreateStore(val, slot);
-                if (ce.sym) paramSlots_[ce.sym] = slot;
-                if (ce.decl) locals_[ce.decl] = slot;
+                if (capturesThis && i == thisCaptureIdx) {
+                    // Restore 'this' from the captured ptr value.
+                    currentThis_ = val;
+                } else {
+                    auto* slot = entryAlloca(ce.ty);
+                    builder_.CreateStore(val, slot);
+                    if (ce.sym) paramSlots_[ce.sym] = slot;
+                    if (ce.decl) locals_[ce.decl] = slot;
+                }
             }
         }
 
