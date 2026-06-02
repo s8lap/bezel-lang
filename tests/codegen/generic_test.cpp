@@ -193,3 +193,92 @@ BEZEL_TEST(codegen_generic, computed_property_named_length) {
         "  return v.Length; "   // should be 10 (5*2), not garbage
         "end Main; end C;"), 10);
 }
+
+// Test: nullable generic field chain (root._left!._val)
+BEZEL_TEST(codegen_generic, nullable_generic_field_chain) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class TreeNode<T> "
+        "  public _val: T; "
+        "  public _left: TreeNode<T>? := null; "
+        "  public constructor(v: T) _val := v; end constructor; "
+        "  destructor end destructor; "
+        "end TreeNode<T>; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var root := new TreeNode<string>(\"hello\"); "
+        "    using var left := new TreeNode<string>(\"apple\"); "
+        "    root._left := left; "
+        "    if root._left is not null then "
+        "      var leftVal := root._left!._val; "
+        "      if leftVal = \"apple\" then return 1; end; "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
+
+// Test: block-form property getter (get => do...end;) — per §22.9/A.4
+BEZEL_TEST(codegen_generic, block_form_property_getter) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Acc "
+        "  private _d: [10]int; private _n: int := 0; "
+        "  public constructor() end constructor; "
+        "  public method Add(v: int) _d[_n] := v; _n := _n + 1; end Add; "
+        "  public property Sum: int "
+        "    get => do "
+        "      var s := 0; "
+        "      for var i in 0.._n-1 do s := s + _d[i]; end; "
+        "      return s; "
+        "    end; "
+        "  end Sum; "
+        "  destructor end destructor; "
+        "end Acc; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var a := new Acc(); "
+        "    a.Add(10); a.Add(20); a.Add(30); "
+        "    return a.Sum; "
+        "  end Main; "
+        "end Program;"), 60);
+}
+
+// Test: string(n) explicit conversion — per §5.2/§9.6
+BEZEL_TEST(codegen_generic, string_int_explicit_conv) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var n := 42; "
+        "    if string(n) = \"42\" then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
+
+// Test: static double field initialization — per §22.13
+BEZEL_TEST(codegen_generic, static_double_field_init) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Consts public static Pi: double := 3.14159265358979; end Consts; "
+        "class Program "
+        "  public static method Main(): int "
+        "    if Consts.Pi > 3.14 then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
+
+// Test: int is null returns false — per §17.4 (value types can't be null)
+BEZEL_TEST(codegen_generic, int_is_null_is_false) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var n := 5; "
+        "    if n is null then return 0; end; "
+        "    return 1; "
+        "  end Main; "
+        "end Program;"), 1);
+}
