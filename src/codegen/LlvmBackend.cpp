@@ -8411,7 +8411,13 @@ private:
                 }
             }
             // Similarly fix up the return type if it's an unresolved generic.
-            if (retTy == i32() && !args.empty()) {
+            // ONLY upgrade if funcReturn is an unresolved generic (Named with no decl);
+            // do NOT upgrade for concrete primitives like Int (would make (string)->int
+            // call return ptr instead of i32, causing ICmpInst type mismatches).
+            if (retTy == i32() && !args.empty() &&
+                rt->funcReturn &&
+                rt->funcReturn->kind == sema::TypeRef::Kind::Named &&
+                !rt->funcReturn->declaration) {
                 // If the last param type was resolved to ptr, the return is likely ptr too.
                 bool anyPtr = false;
                 for (std::size_t ai = 1; ai < args.size(); ++ai)
