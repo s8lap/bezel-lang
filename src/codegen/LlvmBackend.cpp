@@ -5997,6 +5997,42 @@ private:
                             }
                             return builder_.CreateCall(getpidFn, {}, "pid.ret");
                         }
+                        if (ma->member == "ProcessorCount") {
+                            // nproc via sysconf(_SC_NPROCESSORS_ONLN) = sysconf(84)
+                            auto* scFn = module_->getFunction("sysconf");
+                            if (!scFn) {
+                                auto* ft = llvm::FunctionType::get(i64(), {i32()}, false);
+                                scFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "sysconf", module_.get());
+                            }
+                            llvm::Value* n = builder_.CreateCall(scFn, {builder_.getInt32(84)});
+                            return builder_.CreateTrunc(n, i32(), "nproc");
+                        }
+                        if (ma->member == "CurrentDirectory") {
+                            // getcwd(NULL, 0) on Linux allocates a buffer; wrap as bz.string
+                            auto* getcwdFn = module_->getFunction("getcwd");
+                            if (!getcwdFn) {
+                                auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i64()}, false);
+                                getcwdFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "getcwd", module_.get());
+                            }
+                            auto* strlenFn = module_->getFunction("strlen");
+                            if (!strlenFn) {
+                                auto* ft2 = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                                strlenFn = llvm::Function::Create(ft2, llvm::Function::ExternalLinkage, "strlen", module_.get());
+                            }
+                            llvm::Value* raw = builder_.CreateCall(getcwdFn, {
+                                llvm::ConstantPointerNull::get(ptrTy()), builder_.getInt64(0)});
+                            llvm::Value* len = builder_.CreateCall(strlenFn, {raw});
+                            // Build bz.string from malloc'd C string (raw, len)
+                            auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+                            uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
+                            llvm::Value* strObj = builder_.CreateCall(callocFn2,
+                                {builder_.getInt64(1), builder_.getInt64(strSz)});
+                            builder_.CreateStore(raw, builder_.CreateStructGEP(stringType(), strObj, 0));
+                            builder_.CreateStore(len, builder_.CreateStructGEP(stringType(), strObj, 1));
+                            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                                builder_.CreateStructGEP(stringType(), strObj, 2));
+                            return strObj;
+                        }
                     }
                     if (id->name == "int") {
                         if (ma->member == "MaxValue")
@@ -8441,6 +8477,123 @@ private:
                 auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
                 llvm::Value* len64 = builder_.CreateCall(fn, {recv});
                 return builder_.CreateTrunc(len64, i32(), "arr.len");
+            }
+            // per §5 LINQ: .Sum(fn: (T)->int): int  /  .Sum(): int (for Array<int>)
+            if (m == "Sum") {
+                llvm::Type* elemTy = getElemTy();
+                sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+                llvm::Value* closure = call.args.empty() ? nullptr
+                    : lowerLinqLambda(call.args[0].value.get(), retTyRef);
+                if (!call.args.empty() && !closure) return nullptr;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                auto* accSlot = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                builder_.CreateStore(builder_.getInt32(0), accSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "sum.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sum.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "sum.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* val = closure ? callClosure(closure, el, i32()) : el;
+                // Widen to i32 if needed
+                if (val->getType() != i32()) val = builder_.CreateTrunc(val, i32());
+                llvm::Value* acc = builder_.CreateLoad(i32(), accSlot);
+                builder_.CreateStore(builder_.CreateAdd(acc, val), accSlot);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return builder_.CreateLoad(i32(), accSlot, "sum.r");
+            }
+            // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
+            if ((m == "Min" || m == "Max") &&
+                (call.args.empty() || call.args.size() == 1)) {
+                bool isMax = (m == "Max");
+                llvm::Type* elemTy = getElemTy();
+                sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+                llvm::Value* closure = call.args.empty() ? nullptr
+                    : lowerLinqLambda(call.args[0].value.get(), retTyRef);
+                if (!call.args.empty() && !closure) return nullptr;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot  = entryAlloca(i64());
+                auto* accSlot  = entryAlloca(i32());
+                auto* initSlot = entryAlloca(i1());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                builder_.CreateStore(builder_.getInt32(0), accSlot);
+                builder_.CreateStore(builder_.getFalse(), initSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "mm.c",  currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mm.b",  currentFn_);
+                auto* updBB  = llvm::BasicBlock::Create(llvm_, "mm.u",  currentFn_);
+                auto* nextBB = llvm::BasicBlock::Create(llvm_, "mm.n",  currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "mm.e",  currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* val = closure ? callClosure(closure, el, i32()) : el;
+                if (val->getType() != i32()) val = builder_.CreateTrunc(val, i32());
+                llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
+                llvm::Value* acc = builder_.CreateLoad(i32(), accSlot);
+                llvm::Value* cmp = isMax ? builder_.CreateICmpSGT(val, acc)
+                                         : builder_.CreateICmpSLT(val, acc);
+                builder_.CreateCondBr(builder_.CreateOr(builder_.CreateNot(inited), cmp),
+                                      updBB, nextBB);
+                builder_.SetInsertPoint(updBB);
+                builder_.CreateStore(val, accSlot);
+                builder_.CreateStore(builder_.getTrue(), initSlot);
+                builder_.CreateBr(nextBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return builder_.CreateLoad(i32(), accSlot, "mm.r");
+            }
+            // per §5 LINQ: .First(pred: (T)->bool): T  (throws if empty/not found)
+            if (m == "First" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                if (!closure) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* resultSlot = entryAlloca(elemTy);
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB  = llvm::BasicBlock::Create(llvm_, "fst.c", currentFn_);
+                auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "fst.b", currentFn_);
+                auto* foundBB = llvm::BasicBlock::Create(llvm_, "fst.f", currentFn_);
+                auto* nextBB  = llvm::BasicBlock::Create(llvm_, "fst.n", currentFn_);
+                auto* endBB   = llvm::BasicBlock::Create(llvm_, "fst.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* ok = callClosure(closure, el, i1());
+                builder_.CreateCondBr(ok, foundBB, nextBB);
+                builder_.SetInsertPoint(foundBB);
+                builder_.CreateStore(el, resultSlot);
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return builder_.CreateLoad(elemTy, resultSlot, "fst.r");
             }
             // .Add(v) / .Push(v) / .Enqueue(v)
             if ((m == "Add" || m == "Push" || m == "Enqueue") &&

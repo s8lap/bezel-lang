@@ -1594,13 +1594,15 @@ private:
                                 if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                     ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                             }
-                            // per §5 LINQ: Any/All → bool, Count → int, Where → Array<T>
+                            // per §5 LINQ: Any/All → bool, Count → int, Where/Select → Array<T>
                             else if (m == "Any" || m == "All")
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                             else if (m == "Count" && !ce.args.empty())
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
-                            else if (m == "Where")
+                            else if (m == "Where" || m == "Select")
                                 ctx_.setExprType(&ce, recvTy);  // same Array<T> type
+                            else if (m == "Sum" || m == "Min" || m == "Max")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                             // Add/Push/Enqueue/Set/RemoveAt/Clear → unit (void)
                         }
                         // Dictionary methods
