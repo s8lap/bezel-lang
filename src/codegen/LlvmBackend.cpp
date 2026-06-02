@@ -5847,13 +5847,30 @@ private:
                 if (op == "=") return emitStringEq(l, r);
                 if (op == "<>") return builder_.CreateNot(emitStringEq(l, r));
                 if (op == "+") {
-                    // §4.6: string + T — if the right operand is not a string
-                    // (e.g. char), convert it via emitPrimitiveToString first.
+                    // §4.6: string + T — if the right operand is not a string,
+                    // convert it via emitPrimitiveToString first.
                     llvm::Value* rStr = r;
                     auto* rt = ctx_.exprType(*bin.right);
                     if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
-                        rt->primitive != sema::PrimitiveType::String)
+                        rt->primitive != sema::PrimitiveType::String) {
                         rStr = emitPrimitiveToString(r, rt->primitive);
+                    } else if (!r->getType()->isPointerTy()) {
+                        // Fallback: r has unknown/non-primitive sema type but is
+                        // an integer-typed LLVM value (e.g. char from a generic
+                        // context T=char). Infer the type from the LLVM type and
+                        // convert to string. i32 → Char (preserves code-point).
+                        using P = sema::PrimitiveType;
+                        if (r->getType()->isIntegerTy(1))
+                            rStr = emitPrimitiveToString(r, P::Bool);
+                        else if (r->getType()->isIntegerTy(32))
+                            rStr = emitPrimitiveToString(r, P::Char);
+                        else if (r->getType()->isIntegerTy(64))
+                            rStr = emitPrimitiveToString(r, P::Long);
+                        else if (r->getType()->isDoubleTy())
+                            rStr = emitPrimitiveToString(r, P::Double);
+                        else if (r->getType()->isFloatTy())
+                            rStr = emitPrimitiveToString(r, P::Float);
+                    }
                     return emitStringConcat(l, rStr);
                 }
                 // CG27b (§4.6): ordinal comparison operators.
