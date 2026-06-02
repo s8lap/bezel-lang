@@ -390,3 +390,70 @@ BEZEL_TEST(codegen_generic, ref_param_in_spec_inorder) {
         "  end Main; "
         "end Program;"), 1);
 }
+
+// Test: closures capture 'this' for instance field access — §21.5/CG60
+BEZEL_TEST(codegen_generic, closure_captures_this_field) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Acc "
+        "  public Total: int := 0; "
+        "  public constructor() end constructor; "
+        "  public method MakeAdder(w: int): (int) -> () "
+        "    return (x: int) => do Total := Total + x * w; end; "
+        "  end MakeAdder; "
+        "  destructor end destructor; "
+        "end Acc; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var a := new Acc(); "
+        "    var add1 := a.MakeAdder(1); "
+        "    var add2 := a.MakeAdder(2); "
+        "    add1(10); add2(5); add1(3); "
+        "    return a.Total; "  // 10*1 + 5*2 + 3*1 = 23
+        "  end Main; "
+        "end Program;"), 23);
+}
+
+// Test: user-defined operator= on class types — §25
+BEZEL_TEST(codegen_generic, user_defined_operator_eq_class) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class V "
+        "  public X: int; public Y: int; "
+        "  public constructor(x: int, y: int) X := x; Y := y; end constructor; "
+        "  public static method operator =(a: V, b: V): bool "
+        "    return a.X = b.X and a.Y = b.Y; "
+        "  end operator =; "
+        "  destructor end destructor; "
+        "end V; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var a := new V(3, 4); "
+        "    using var b := new V(3, 4); "
+        "    using var c := new V(1, 2); "
+        "    if a = b and not (a = c) then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
+
+// Test: enum instance method with case this dispatch — §10.1/§30
+BEZEL_TEST(codegen_generic, enum_instance_method_case_this) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "enum Color Red, Green, Blue; "
+        "  public method Name(): string "
+        "    return case this "
+        "      Color.Red => \"red\", "
+        "      Color.Green => \"green\", "
+        "      _ => \"blue\" "
+        "    end; "
+        "  end Name; "
+        "end Color; "
+        "class Program "
+        "  public static method Main(): int "
+        "    if Color.Red.Name() = \"red\" and Color.Blue.Name() = \"blue\" then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
