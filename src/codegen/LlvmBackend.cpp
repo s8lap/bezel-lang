@@ -4149,8 +4149,16 @@ private:
         // CG40: a diverging initializer (`var x := throw E;`) terminated the
         // block; allocate the slot but emit no store.
         if (diverged_) return;
-        llvm::Type* slotTy =
-            v ? v->getType() : (declType ? lowerType(declType) : i32());
+        llvm::Type* declaredTy = declType ? lowerType(declType) : nullptr;
+        llvm::Type* slotTy = v ? v->getType() : (declaredTy ? declaredTy : i32());
+        // Prefer the declared type when the value's type is less specific —
+        // e.g. `var arr: [N]T := null` produces a ptr null literal but the
+        // slot must be [N x ptr], not just ptr.
+        if (declaredTy && slotTy != declaredTy) {
+            if (llvm::isa<llvm::ArrayType>(declaredTy) &&
+                (v == nullptr || dynamic_cast<const ast::NullLiteralExpr*>(init)))
+                slotTy = declaredTy;
+        }
         llvm::AllocaInst* slot = entryAlloca(slotTy);
         locals_[declNode] = slot;
         // CG-generic: record the concrete substitution for this local so that
