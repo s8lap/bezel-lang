@@ -8179,6 +8179,41 @@ private:
             return emitStringOrdCmp(a, b);
         }
 
+        // int.TryParse(s, out result): bool — stdlib §5.2
+        // Returns true and sets result if s is a valid integer; false and sets
+        // result to 0 otherwise.
+        if (m == "TryParse" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value &&
+            (pt == P::Int || pt == P::Long)) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Value* strData = loadStringData(strVal);
+            // Get address of the out parameter.
+            llvm::Type* et = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+            if (!outAddr) return nullptr;
+            // strtol(data, &endptr, 10) for validation.
+            auto* strtolFn = declareC("strtol", i64(), {ptrTy(), ptrTy(), i32()});
+            auto* endSlot = entryAlloca(ptrTy());
+            llvm::Value* val64 = builder_.CreateCall(
+                strtolFn, {strData, endSlot, builder_.getInt32(10)}, "tryp.val");
+            llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlot);
+            // ok = (endPtr != strData) && (*endPtr == '\0')
+            llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "tryp.adv");
+            auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* endCh = builder_.CreateLoad(i8Ty2, endPtr, "tryp.end");
+            llvm::Value* atNul = builder_.CreateICmpEQ(
+                endCh, llvm::ConstantInt::get(i8Ty2, 0), "tryp.nul");
+            llvm::Value* ok = builder_.CreateAnd(advanced, atNul, "tryp.ok");
+            // Store result.
+            if (pt == P::Long) {
+                builder_.CreateStore(val64, outAddr);
+            } else {
+                builder_.CreateStore(builder_.CreateTrunc(val64, i32()), outAddr);
+            }
+            return ok;
+        }
+
         // int.Parse(s) / long.Parse(s) / double.Parse(s) etc.
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* arg = lowerExpr(*call.args[0].value);

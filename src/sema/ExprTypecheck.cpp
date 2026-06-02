@@ -1800,6 +1800,16 @@ private:
                             ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                             return;
                         }
+                        // int.TryParse(s, out result): bool — §3.4/stdlib §5.2
+                        if (mbr == "TryParse") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                            return;
+                        }
+                        // int.MaxValue / int.MinValue: int
+                        if (mbr == "MaxValue" || mbr == "MinValue") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
+                            return;
+                        }
                     }
                     if (pt == PrimitiveType::Double || pt == PrimitiveType::Float) {
                         if (mbr == "Parse") {
