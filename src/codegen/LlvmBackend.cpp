@@ -4107,6 +4107,44 @@ private:
     // declared type (or i32).
     void lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         const ast::Type* declType) {
+        // §15.1 / §16: collection literal `[e1, e2, …]` used as an inline-array
+        // initializer.  lowerExpr returns null for CollectionLiteralExpr (not a
+        // general expression), so handle it here where we have the slot.
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init)) {
+            if (!cl->isDict && !cl->elements.empty()) {
+                llvm::Type* arrTy = declType ? lowerType(declType) : nullptr;
+                if (!arrTy) {
+                    // Infer from the first element.
+                    llvm::Value* first = lowerExpr(*cl->elements[0]);
+                    if (!first) return;
+                    arrTy = llvm::ArrayType::get(first->getType(),
+                                                 cl->elements.size());
+                }
+                llvm::AllocaInst* slot = entryAlloca(arrTy);
+                locals_[declNode] = slot;
+                // Store each element via GEP.
+                auto* aty = llvm::dyn_cast<llvm::ArrayType>(arrTy);
+                llvm::Type* elemTy = aty ? aty->getElementType() : i32();
+                for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                    if (!cl->elements[i]) continue;
+                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                    if (!ev) continue;
+                    // Coerce element to the array's element type if needed.
+                    if (ev->getType() != elemTy) {
+                        if (ev->getType()->isIntegerTy() && elemTy->isIntegerTy()) {
+                            unsigned eb = ev->getType()->getIntegerBitWidth();
+                            unsigned db = elemTy->getIntegerBitWidth();
+                            ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                         : builder_.CreateTrunc(ev, elemTy);
+                        }
+                    }
+                    llvm::Value* gep = builder_.CreateGEP(
+                        arrTy, slot, {builder_.getInt32(0), builder_.getInt32(i)});
+                    builder_.CreateStore(ev, gep);
+                }
+                return;
+            }
+        }
         llvm::Value* v = init ? lowerExpr(*init) : nullptr;
         // CG40: a diverging initializer (`var x := throw E;`) terminated the
         // block; allocate the slot but emit no store.
