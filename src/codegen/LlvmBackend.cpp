@@ -8739,7 +8739,22 @@ private:
             }
         }
         auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
-        if (!ms) return nullptr;
+        if (!ms) {
+            // CG13/CG18: explicit `obj.Dispose()` call where Dispose is a
+            // compiler-generated method (no MethodSymbol in sema). Emit a
+            // dynamic vtable dispatch to the object's Dispose function (slot 1).
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get())) {
+                if (ma->member == "Dispose" && ma->target) {
+                    llvm::Value* recv = lowerExpr(*ma->target);
+                    if (recv && recv->getType()->isPointerTy()) {
+                        emitDynamicDispose(recv);
+                        return nullptr;
+                    }
+                }
+            }
+            return nullptr;
+        }
 
         std::vector<llvm::Value*> args;
         bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
