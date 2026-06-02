@@ -7966,6 +7966,18 @@ private:
             }
         }
 
+        // string.From(char): string — one-character string from a char code point.
+        // string.From(c) is equivalent to char.ToString(c).
+        if (pt == P::String && m == "From" &&
+            call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            // Normalize to i32 if needed.
+            if (!arg->getType()->isIntegerTy(32))
+                arg = builder_.CreateSExt(arg, i32());
+            return emitPrimitiveToString(arg, P::Char);
+        }
+
         // string.IsNullOrEmpty(s): bool — true if s is null or length 0.
         if (pt == P::String && m == "IsNullOrEmpty" &&
             call.args.size() == 1 && call.args[0].value) {
