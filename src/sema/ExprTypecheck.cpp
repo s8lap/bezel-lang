@@ -2173,7 +2173,11 @@ private:
         // is a call or postfix-`!` expression whose own type is not recorded.
         if (op == "??") {
             TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
-            if (lt) {
+            // When the LHS is a null literal (typed as nullable Object) or is
+            // untyped, prefer the RHS type — `null ?? x` has x's type.
+            bool lhsIsNullLiteral =
+                be.left && dynamic_cast<const ast::NullLiteralExpr*>(be.left.get());
+            if (lt && !lhsIsNullLiteral) {
                 if (lt->nullable) {
                     TypeRef* nn = ctx_.makeTypeRef(*lt);
                     nn->nullable = false;
@@ -2182,7 +2186,7 @@ private:
                     ctx_.setExprType(&be, lt);  // already non-nullable
                 }
             } else if (be.right) {
-                // LHS untyped — fall back to the RHS type when available.
+                // LHS untyped or null literal — fall back to the RHS type.
                 if (TypeRef* rt = ctx_.exprType(*be.right))
                     ctx_.setExprType(&be, rt);
             }
