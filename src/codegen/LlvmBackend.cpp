@@ -8261,12 +8261,24 @@ private:
                 llvm::Value* v = lowerExpr(*call.args[1].value);
                 if (!k || !v) return nullptr;
                 auto [kd, kl] = strDataLen(k);
-                // v must be passed as ptr; if it's a plain value, box it
+                // Encode value as void* for storage. For pointer types: store
+                // directly. For integer/float types: widen to i64 and use
+                // inttoptr so each stored value is self-contained (avoids
+                // aliasing from a shared stack alloca across loop iterations).
                 llvm::Value* vPtr = v;
                 if (!v->getType()->isPointerTy()) {
-                    llvm::AllocaInst* slot = entryAlloca(v->getType());
-                    builder_.CreateStore(v, slot);
-                    vPtr = slot;
+                    llvm::Value* asI64 = v;
+                    if (v->getType()->isFloatingPointTy()) {
+                        // Bitcast float/double to same-size int
+                        if (v->getType()->isDoubleTy())
+                            asI64 = builder_.CreateBitCast(v, i64());
+                        else
+                            asI64 = builder_.CreateZExt(
+                                builder_.CreateBitCast(v, i32()), i64());
+                    } else if (!v->getType()->isIntegerTy(64)) {
+                        asI64 = builder_.CreateZExt(v, i64());
+                    }
+                    vPtr = builder_.CreateIntToPtr(asI64, ptrTy());
                 }
                 auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
@@ -8292,18 +8304,30 @@ private:
                 llvm::Type* outTy = nullptr;
                 llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
                 if (!outAddr) return nullptr;
-                // bz_dict_try_get_str writes a void* to *outPtrSlot
-                // We need a temp void* slot, then copy the value
+                // bz_dict_try_get_str writes the stored void* into *tmpSlot.
+                // For pointer values: the void* IS the string/object pointer.
+                // For integer/float values: the void* encodes the value via
+                // inttoptr (mirroring the Add encoding above). Decode via ptrtoint.
                 auto* tmpSlot = entryAlloca(ptrTy());
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
                 llvm::Value* found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
-                // If found, load the value pointer and store through out slot
                 llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
                 if (outTy && !outTy->isPointerTy()) {
-                    // Value type: load the pointed-to value
-                    llvm::Value* loaded = builder_.CreateLoad(outTy, valPtr);
-                    builder_.CreateStore(loaded, outAddr);
+                    // Decode: ptrtoint → truncate/bitcast to target type
+                    llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
+                    llvm::Value* decoded = asI64;
+                    if (outTy->isFloatingPointTy()) {
+                        if (outTy->isDoubleTy())
+                            decoded = builder_.CreateBitCast(asI64, outTy);
+                        else {
+                            llvm::Value* trunc = builder_.CreateTrunc(asI64, i32());
+                            decoded = builder_.CreateBitCast(trunc, outTy);
+                        }
+                    } else if (!outTy->isIntegerTy(64)) {
+                        decoded = builder_.CreateTrunc(asI64, outTy);
+                    }
+                    builder_.CreateStore(decoded, outAddr);
                 } else {
                     builder_.CreateStore(valPtr, outAddr);
                 }
@@ -9181,7 +9205,10 @@ private:
         // §2.6 Random — instance methods via bz_random_* runtime.
         // (Static Random.Next etc. are handled via the bare class above.)
         // ---------------------------------------------------------------------------
-        if (!id) {  // instance call on a Random object
+        // Random instance methods: `rng.Next(...)` where rng is a variable.
+        // The `id` check above resolved `cls = "rng"` (the variable name), not
+        // a class name. Instead check the receiver's sema type.
+        {  // always enter this block (was wrongly guarded by `!id`)
             if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
                 if (ma2->target) {
                     auto* recvTy = ctx_.exprType(*ma2->target);
