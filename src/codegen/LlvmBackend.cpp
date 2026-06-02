@@ -6763,8 +6763,25 @@ private:
     // checks — §5.2 raises OverflowException — are deferred.)
     llvm::Value* lowerConversion(sema::PrimitiveType target,
                                  const ast::CallExpr& call) {
+        using P = sema::PrimitiveType;
         if (call.args.size() != 1 || !call.args[0].value) return nullptr;
         const ast::Expr& argE = *call.args[0].value;
+        // §5.2 / §9.6: string(x) converts any primitive to its string
+        // representation.  Route through emitPrimitiveToString (which handles
+        // int/long/double/float/bool/char) — the ordinary numeric-type paths
+        // below would crash because stringType() is a struct, not an integer.
+        if (target == P::String) {
+            llvm::Value* src = lowerExpr(argE);
+            if (!src) return nullptr;
+            // Infer source primitive from sema type; default to Int.
+            P srcPrim = P::Int;
+            if (auto* rt = ctx_.exprType(argE))
+                if (rt->kind == sema::TypeRef::Kind::Primitive)
+                    srcPrim = rt->primitive;
+            // Already a string → identity.
+            if (srcPrim == P::String) return src;
+            return emitPrimitiveToString(src, srcPrim);
+        }
         llvm::Value* src = lowerExpr(argE);
         if (!src) return nullptr;
         llvm::Type* dstTy = lowerPrimitive(target);
