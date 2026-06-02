@@ -1495,6 +1495,35 @@ private:
                     ctx_.setExprType(&ce, rt);
                 // If Function with null funcReturn: leave untyped (void/unknown)
             }
+            // §6 / stdlib §5: Math.Abs and Math.Sign are polymorphic — the
+            // return type matches the argument type, not always Int. If the
+            // member access was typed as Int but the first argument is
+            // float/double, override with Double so the string formatter and
+            // type inference work correctly.
+            if (auto* rt = ctx_.exprType(ce)) {
+                if (rt->kind == TypeRef::Kind::Primitive &&
+                    rt->primitive == PrimitiveType::Int &&
+                    !ce.args.empty() && ce.args[0].value) {
+                    const ast::Expr& argE = *ce.args[0].value;
+                    if (auto* argTy = ctx_.exprType(argE)) {
+                        if (argTy->kind == TypeRef::Kind::Primitive &&
+                            (argTy->primitive == PrimitiveType::Double ||
+                             argTy->primitive == PrimitiveType::Float ||
+                             argTy->primitive == PrimitiveType::Long)) {
+                            // Determine which method this is — only override
+                            // for the numeric functions that return same-as-arg.
+                            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                                    ce.callee.get())) {
+                                if (ma->member == "Abs" || ma->member == "Sign" ||
+                                    ma->member == "Min" || ma->member == "Max" ||
+                                    ma->member == "Clamp") {
+                                    ctx_.setExprType(&ce, argTy);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         // CallExpr where the callee is a constructor reference (e.g.
         // `T(args)` form — rare in Bezel since `new T(args)` is the
