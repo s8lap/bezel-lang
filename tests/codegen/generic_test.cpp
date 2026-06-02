@@ -311,3 +311,57 @@ BEZEL_TEST(codegen_generic, collection_literal_field) {
         "  end Main; "
         "end Program;"), 20);
 }
+
+// Test: generic Contains on string stack uses content equality — §14/§4.6
+BEZEL_TEST(codegen_generic, string_generic_contains) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Stk<T> "
+        "  private _d: [10]T; private _n: int := 0; "
+        "  public constructor() end constructor; "
+        "  public method Push(v: T) _d[_n] := v; _n := _n + 1; end Push; "
+        "  public method Contains(item: T): bool "
+        "    for var i in 0.._n-1 do if _d[i] = item then return true; end; end; "
+        "    return false; "
+        "  end Contains; "
+        "  destructor end destructor; "
+        "end Stk; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var s := new Stk<string>(); "
+        "    s.Push(\"hello\"); s.Push(\"world\"); "
+        "    if s.Contains(\"hello\") then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
+
+// Test: two-param generic map with string keys — §14
+BEZEL_TEST(codegen_generic, two_param_string_key_map) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Map<K, V> "
+        "  private _k: [10]K; private _v: [10]V; private _n: int := 0; "
+        "  public constructor() end constructor; "
+        "  private method Idx(key: K): int "
+        "    for var i in 0.._n-1 do if _k[i] = key then return i; end; end; "
+        "    return -1; "
+        "  end Idx; "
+        "  public method Set(key: K, val: V) "
+        "    var i := Idx(key); "
+        "    if i >= 0 then _v[i] := val; return; end; "
+        "    _k[_n] := key; _v[_n] := val; _n := _n + 1; "
+        "  end Set; "
+        "  public method Get(key: K): V var i := Idx(key); return _v[i]; end Get; "
+        "  public method Has(key: K): bool => Idx(key) >= 0; "
+        "  destructor end destructor; "
+        "end Map; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var m := new Map<string, int>(); "
+        "    m.Set(\"a\", 10); m.Set(\"b\", 20); m.Set(\"a\", 30); "
+        "    if m.Get(\"a\") = 30 and m.Has(\"b\") and not m.Has(\"c\") then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
