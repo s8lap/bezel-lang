@@ -8595,6 +8595,60 @@ private:
                 builder_.SetInsertPoint(endBB);
                 return builder_.CreateLoad(elemTy, resultSlot, "fst.r");
             }
+            // per §3: .Sort() — in-place ascending sort for int arrays.
+            // Uses bz_array_sort with a built-in i32 comparator thunk.
+            if (m == "Sort" && call.args.empty()) {
+                // Create or reuse a module-level int32 comparator function.
+                auto* cmpName = "bz$intcmp";
+                llvm::Function* cmpFn = module_->getFunction(cmpName);
+                if (!cmpFn) {
+                    auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    cmpFn = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
+                                                   cmpName, module_.get());
+                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+                    llvm::IRBuilder<> cmpB(bb);
+                    llvm::Value* a = &*cmpFn->arg_begin();
+                    llvm::Value* b = &*std::next(cmpFn->arg_begin());
+                    llvm::Value* av = cmpB.CreateLoad(i32(), a);
+                    llvm::Value* bv = cmpB.CreateLoad(i32(), b);
+                    // return av - bv (safe for non-extreme values)
+                    cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                }
+                auto* sortFn = declareC("bz_array_sort", llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(sortFn, {recv, builder_.getInt64(esz), cmpFn});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+            // per §3: .Reverse() — in-place reverse.
+            if (m == "Reverse" && call.args.empty()) {
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "rev.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rev.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "rev.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* i = builder_.CreateLoad(i64(), idxSlot);
+                llvm::Value* half = builder_.CreateSDiv(len, builder_.getInt64(2));
+                builder_.CreateCondBr(builder_.CreateICmpSLT(i, half), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* j = builder_.CreateSub(builder_.CreateSub(len, i), builder_.getInt64(1));
+                llvm::Value* pa = builder_.CreateCall(ptrFn, {recv, i, builder_.getInt64(esz)});
+                llvm::Value* pb = builder_.CreateCall(ptrFn, {recv, j, builder_.getInt64(esz)});
+                // Swap: temp = *pa; *pa = *pb; *pb = temp
+                llvm::Value* ta = builder_.CreateLoad(elemTy, pa);
+                llvm::Value* tb = builder_.CreateLoad(elemTy, pb);
+                builder_.CreateStore(tb, pa);
+                builder_.CreateStore(ta, pb);
+                builder_.CreateStore(builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return llvm::ConstantInt::get(i32(), 0);
+            }
             // .Add(v) / .Push(v) / .Enqueue(v)
             if ((m == "Add" || m == "Push" || m == "Enqueue") &&
                 call.args.size() == 1 && call.args[0].value) {
