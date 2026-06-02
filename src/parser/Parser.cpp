@@ -2287,7 +2287,16 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
     auto ce = std::make_unique<ast::CaseExpr>();
     // Slice 38 requires the scrutinee form. The bare-`case` form
     // (`case CaseArm* end`, no scrutinee) is deferred.
-    ce->scrutinee = parseExpression();
+    //
+    // §19: the scrutinee is limited to operators above the relational level
+    // (precedence ≥ 8) so that relop patterns (`>=90`, `<0`, etc.) are
+    // recognised as arm patterns rather than consumed as part of a boolean
+    // scrutinee. Users needing a full boolean expression as scrutinee can
+    // wrap it in parentheses.
+    {
+        SourceLocation start = current_.location;
+        ce->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
+    }
     ce->arms.push_back(parseCaseArm());
     while (consumePunctuator(",")) {
         // Trailing `","?` per the grammar — `,` followed immediately by
@@ -2388,7 +2397,12 @@ ast::CaseArm Parser::parseCaseStmtArm() {
 std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
     advance(); // past `case`
     auto cs = std::make_unique<ast::CaseStmt>();
-    cs->scrutinee = parseExpression();
+    // Same scrutinee restriction as parseCaseExpr (stop before relational
+    // operators so relop patterns like `>=90` can appear in arm position).
+    {
+        SourceLocation start = current_.location;
+        cs->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
+    }
     cs->arms.push_back(parseCaseStmtArm());
     while (consumePunctuator(",")) {
         if (isKeyword("end")) break;
