@@ -8571,6 +8571,7 @@ private:
         llvm::Value* savedThis = currentThis_;
         auto savedLocals = locals_;
         auto savedParams = paramSlots_;
+        auto savedRef = refParams_;
         llvm::BasicBlock* savedProp = propagateBB_;
         llvm::BasicBlock* savedUnwind = unwindTarget_;
         llvm::Value* savedCaught = currentCaughtExc_;
@@ -8585,6 +8586,7 @@ private:
         builder_.SetInsertPoint(entryBB);
         locals_.clear();
         paramSlots_.clear();
+        refParams_.clear();
         propagateBB_ = nullptr;
         unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr;
@@ -8601,10 +8603,20 @@ private:
         } else {
             currentThis_ = nullptr;
         }
+        auto* md2 = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         for (std::size_t pi = 0; pi < ms->params.size(); ++pi, ++argIt) {
-            auto* slot = entryAlloca(argIt->getType());
-            builder_.CreateStore(&*argIt, slot);
-            paramSlots_[ms->params[pi]] = slot;
+            sema::Symbol* psym = ms->params[pi];
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
+            // CG50: ref/out params are passed as pointers; register in refParams_
+            // so reads/writes go through the pointer (same as non-spec methods).
+            if (ps && isByRefMod(ps->modifier)) {
+                llvm::Type* elemTy = ps->declType ? lowerType(ps->declType) : i32();
+                refParams_[psym] = {&*argIt, elemTy};
+            } else {
+                auto* slot = entryAlloca(argIt->getType());
+                builder_.CreateStore(&*argIt, slot);
+                paramSlots_[psym] = slot;
+            }
         }
 
         // Emit block body.
@@ -8617,6 +8629,7 @@ private:
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
         paramSlots_ = std::move(savedParams);
+        refParams_ = std::move(savedRef);
         propagateBB_ = savedProp;
         unwindTarget_ = savedUnwind;
         currentCaughtExc_ = savedCaught;
