@@ -2293,6 +2293,19 @@ private:
         } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
             if (ce->callee) visitExpr(*ce->callee);
             for (const auto& a : ce->args) {
+                // §22.4: `out var x` declares x in the current scope.
+                // Register the symbol BEFORE visiting the IdentifierExpr so
+                // lookup finds it. Type is inferred later from the param type.
+                if (a.modifier == "out var" && a.value && currentScope_) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                       a.value.get())) {
+                        auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                        lsym->name = id->name;
+                        lsym->decl = id;    // IdentifierExpr IS the decl node
+                        lsym->declType = nullptr;  // filled by codegen/inference
+                        currentScope_->names[id->name] = lsym;
+                    }
+                }
                 if (a.value) visitExpr(*a.value);
             }
         } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {

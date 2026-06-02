@@ -7421,6 +7421,8 @@ private:
             if (idx >= params.size() || ordered[idx]) return false;
             // CG50: a ref/out parameter receives the address of its argument
             // lvalue; an ordinary parameter receives the argument's value.
+            // §22.4: `out var x` — ensureOutVarSlots already allocated the
+            // slot; lvalueAddr will find it via locals_ lookup.
             llvm::Value* v;
             if (isByRefMod(params[idx].modifier)) {
                 llvm::Type* et = nullptr;
@@ -8570,8 +8572,74 @@ private:
         return nullptr;
     }
 
+    // §22.4: Pre-create alloca slots for any `out var x` arguments before the
+    // call is dispatched (primitive-static, builtin, or regular method). This
+    // ensures lvalueAddr() finds the slot regardless of which code path handles
+    // the call. Must be called at the start of lowerCall.
+    void ensureOutVarSlots(const ast::CallExpr& call) {
+        // Try to resolve the called method so we know its parameter types.
+        // For primitive static calls (int.TryParse, double.TryParse, etc.)
+        // we can read the callee primitive type from the member access.
+        sema::PrimitiveType callPrimTy = sema::PrimitiveType::None;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma->target) {
+                if (auto* rt = ctx_.exprType(*ma->target)) {
+                    if (rt->kind == sema::TypeRef::Kind::Primitive)
+                        callPrimTy = rt->primitive;
+                }
+                // Also check type name for static access (e.g. IdentifierExpr("double"))
+                if (callPrimTy == sema::PrimitiveType::None) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+                        callPrimTy = sema::primitiveFromName(id->name);
+                    }
+                }
+            }
+        }
+        // Look up regular method params via callee symbol.
+        sema::MethodSymbol* ms = nullptr;
+        if (auto* calleeSym = ctx_.exprSymbol(*call.callee))
+            ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
+
+        std::size_t pos = 0;
+        for (const auto& a : call.args) {
+            if (a.modifier != "out var" || !a.value) { pos++; continue; }
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (!id) { pos++; continue; }
+            // Skip if slot already created.
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+            if (loc && loc->decl && locals_.count(loc->decl)) { pos++; continue; }
+            if (locals_.count(id)) { pos++; continue; }
+            // Determine slot type:
+            // 1. From the sema-resolved method parameter at position `pos`.
+            // 2. From the callee primitive type (for double/float TryParse).
+            // 3. Default to i32.
+            llvm::Type* slotTy = i32();
+            if (ms) {
+                auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                if (md && pos < md->params.size() && md->params[pos].type) {
+                    sema::TypeRef* pt = ctx_.resolvedType(*md->params[pos].type);
+                    if (pt) slotTy = lowerTypeRef(pt);
+                }
+            } else if (callPrimTy != sema::PrimitiveType::None) {
+                using P = sema::PrimitiveType;
+                // For TryParse, the out result is the same primitive type.
+                if (callPrimTy == P::Double) slotTy = llvm::Type::getDoubleTy(llvm_);
+                else if (callPrimTy == P::Float) slotTy = llvm::Type::getFloatTy(llvm_);
+                else if (callPrimTy == P::Long || callPrimTy == P::ULong) slotTy = i64();
+                else slotTy = i32();
+            }
+            llvm::AllocaInst* slot = entryAlloca(slotTy);
+            locals_[id] = slot;
+            if (loc && loc->decl) locals_[loc->decl] = slot;
+            pos++;
+        }
+    }
+
     llvm::Value* lowerCall(const ast::CallExpr& call) {
         if (!call.callee) return nullptr;
+        // Pre-create out var slots so lvalueAddr can find them in all paths.
+        ensureOutVarSlots(call);
         // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
         if (tryLowerConsoleCall(call)) return nullptr;  // unit result
         // Console.ReadLine() → string? / Console.ReadKey() → char
