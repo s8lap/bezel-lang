@@ -6111,7 +6111,15 @@ private:
                 // string). Only apply when the target has NO declaration (built-in
                 // exceptions) and NOT a Named type with a known user declaration
                 // (which might have a computed 'Length' property of its own).
-                if (ma->member == "Length" &&
+                // Exclude StringBuilder from the string-fallback (it has its own
+                // Length handler that sums part lengths).
+                auto notStrBld = [&]() -> bool {
+                    return !(tt && tt->kind == sema::TypeRef::Kind::Named &&
+                             !tt->declaration && tt->astNode && tt->astNode->name &&
+                             !tt->astNode->name->parts.empty() &&
+                             tt->astNode->name->parts[0] == "StringBuilder");
+                };
+                if (ma->member == "Length" && notStrBld() &&
                     (!tt ||
                      (tt->kind == sema::TypeRef::Kind::Named &&
                       !tt->declaration))) {
@@ -6151,10 +6159,46 @@ private:
             }
         }
         // §3: Array<T>.Length / .Count — runtime bz_array_len.
+        // StringBuilder.Length — sum of part lengths (total chars).
         // Dictionary<K,V>.Count — runtime bz_dict_count.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
             if (ma->target && (ma->member == "Length" || ma->member == "Count")) {
                 auto* tt = ctx_.exprType(*ma->target);
+                // StringBuilder.Length: sum of all part lengths.
+                bool isSB = (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                             !tt->declaration && tt->astNode && tt->astNode->name &&
+                             !tt->astNode->name->parts.empty() &&
+                             tt->astNode->name->parts[0] == "StringBuilder");
+                if (isSB) {
+                    llvm::Value* sb = lowerExpr(*ma->target);
+                    if (sb) {
+                        constexpr int64_t SB_ESZ2 = 8;
+                        auto* lenFn2 = declareC("bz_array_len", i64(), {ptrTy()});
+                        auto* ptrFn2 = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                        llvm::Value* nP = builder_.CreateCall(lenFn2, {sb});
+                        auto* sumSlot = entryAlloca(i64());
+                        auto* idxSlot = entryAlloca(i64());
+                        builder_.CreateStore(builder_.getInt64(0), sumSlot);
+                        builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                        auto* cBB = llvm::BasicBlock::Create(llvm_, "sbl.c", currentFn_);
+                        auto* bBB = llvm::BasicBlock::Create(llvm_, "sbl.b", currentFn_);
+                        auto* eBB = llvm::BasicBlock::Create(llvm_, "sbl.e", currentFn_);
+                        builder_.CreateBr(cBB);
+                        builder_.SetInsertPoint(cBB);
+                        llvm::Value* si = builder_.CreateLoad(i64(), idxSlot);
+                        builder_.CreateCondBr(builder_.CreateICmpSLT(si, nP), bBB, eBB);
+                        builder_.SetInsertPoint(bBB);
+                        llvm::Value* ep = builder_.CreateCall(ptrFn2, {sb, si, builder_.getInt64(SB_ESZ2)});
+                        llvm::Value* part = builder_.CreateLoad(ptrTy(), ep);
+                        llvm::Value* plen = loadStringLen(part);
+                        llvm::Value* cur = builder_.CreateLoad(i64(), sumSlot);
+                        builder_.CreateStore(builder_.CreateAdd(cur, plen), sumSlot);
+                        builder_.CreateStore(builder_.CreateAdd(si, builder_.getInt64(1)), idxSlot);
+                        builder_.CreateBr(cBB);
+                        builder_.SetInsertPoint(eBB);
+                        return builder_.CreateTrunc(builder_.CreateLoad(i64(), sumSlot), i32());
+                    }
+                }
                 if (isCollectionTypeName(tt)) {
                     llvm::Value* obj = lowerExpr(*ma->target);
                     if (obj) {
