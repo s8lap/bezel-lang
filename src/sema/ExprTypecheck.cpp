@@ -1740,6 +1740,11 @@ private:
                             ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Char));
                             return;
                         }
+                        // char.ToString(c) → string.
+                        if (mbr == "ToString") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                            return;
+                        }
                     }
                     // string static methods → bool or string.
                     if (pt == PrimitiveType::String) {

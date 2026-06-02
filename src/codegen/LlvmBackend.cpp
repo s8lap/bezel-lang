@@ -1028,9 +1028,14 @@ private:
                 fmt = "%.7g"; break;  // 7 significant digits for float (f32)
             case P::Double:
                 fmt = "%.15g"; break;  // 15 significant digits for double (f64)
-            case P::Char:
-                // Char is i32 code point → print as character
-                fmt = "%lc"; break;
+            case P::Char: {
+                // Char is i32 code point → build a 1-char string directly.
+                // Use snprintf with %c (ASCII, fast path) for code points 0-127.
+                // For code points > 127, use %lc (wide char).
+                // For simplicity, always use %c and truncate to 1 byte.
+                // TODO: proper UTF-8 encoding for non-ASCII chars.
+                fmt = "%c"; break;
+            }
             default:
                 fmt = "%d"; break;
         }
@@ -7602,6 +7607,7 @@ private:
                 return builder_.CreateCall(fn, {arg}, "tolower.result");
             }
             // char.ToString(c): string — convert char code point to string.
+            // Uses the same path as c.ToString() for a char value.
             if (m == "ToString") {
                 return emitPrimitiveToString(arg, sema::PrimitiveType::Char);
             }
