@@ -1628,6 +1628,11 @@ private:
                             else if (m == "NextDouble")
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
                         }
+                        // string static methods (§9.6)
+                        if (colName == "string" || colName == "String") {
+                            if (m == "Join")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        }
                         // File static methods
                         if (colName == "File") {
                             if (m == "ReadAllText")
