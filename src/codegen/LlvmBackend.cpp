@@ -7062,18 +7062,27 @@ private:
         //    method) → GEP it as-is;
         //  - a temporary record value (e.g. a freshly returned record) → spill
         //    it to a stack slot and GEP that.
-        // Records are immutable (§9.2), so none of these can lose a write.
         if (ms->parent->kind == ast::TypeDeclKind::Record) {
-            llvm::Value* base = localSlot(*ma.target);
-            if (!base) {
-                llvm::Value* obj = lowerExpr(*ma.target);
-                if (!obj) return nullptr;
-                if (obj->getType()->isPointerTy()) {
-                    base = obj;
-                } else {
-                    llvm::Value* tmp = entryAlloca(st);
-                    builder_.CreateStore(obj, tmp);
-                    base = tmp;
+            // CG29: prefer lvalue address so writes go to the original
+            // memory (e.g. grid[2].Cells[x] := v must update grid[2],
+            // not a stack copy). Fall back to lowerExpr for temporaries
+            // (e.g. a freshly returned record value).
+            llvm::Value* base = nullptr;
+            llvm::Type* baseTy = nullptr;
+            if (llvm::AllocaInst* slot = localSlot(*ma.target)) {
+                base = slot;
+            } else {
+                base = lvalueAddr(*ma.target, baseTy);
+                if (!base) {
+                    llvm::Value* obj = lowerExpr(*ma.target);
+                    if (!obj) return nullptr;
+                    if (obj->getType()->isPointerTy()) {
+                        base = obj;
+                    } else {
+                        llvm::Value* tmp = entryAlloca(st);
+                        builder_.CreateStore(obj, tmp);
+                        base = tmp;
+                    }
                 }
             }
             elemTy = st->getElementType(idxIt->second);
