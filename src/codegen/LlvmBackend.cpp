@@ -8758,6 +8758,84 @@ private:
                 llvm::Value* len = builder_.CreateCall(lenFn, {recv});
                 return builder_.CreateICmpEQ(len, builder_.getInt64(0), "arr.empty");
             }
+            // per §3: .AddRange(other: Array<T>) — append all elements from another array
+            if (m == "AddRange" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* other = lowerExpr(*call.args[0].value);
+                if (!other) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* otherLen = builder_.CreateCall(lenFn, {other});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "ar.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ar.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "ar.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, otherLen), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {other, idx, builder_.getInt64(esz)});
+                auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(addFn, {recv, ep, builder_.getInt64(esz)});
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+            // per §3: .Contains(item: T): bool (for int/value types only)
+            if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* target = lowerExpr(*call.args[0].value);
+                if (!target) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "con.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "con.b", currentFn_);
+                auto* foundBB = llvm::BasicBlock::Create(llvm_, "con.f", currentFn_);
+                auto* nextBB = llvm::BasicBlock::Create(llvm_, "con.n", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "con.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                // Compare: for integers use icmp eq; for pointers use string eq
+                llvm::Value* eq;
+                if (el->getType()->isPointerTy() && target->getType()->isPointerTy()) {
+                    eq = emitStringEq(el, target);  // string comparison
+                } else {
+                    llvm::Value* elNorm = el, *tNorm = target;
+                    if (el->getType() != target->getType()) {
+                        if (el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
+                            unsigned ew = el->getType()->getIntegerBitWidth();
+                            unsigned tw = target->getType()->getIntegerBitWidth();
+                            llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
+                            elNorm = builder_.CreateSExt(el, wide);
+                            tNorm = builder_.CreateSExt(target, wide);
+                        }
+                    }
+                    eq = builder_.CreateICmpEQ(elNorm, tNorm);
+                }
+                builder_.CreateCondBr(eq, foundBB, nextBB);
+                builder_.SetInsertPoint(foundBB);
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                auto* phiCon = builder_.CreatePHI(i1(), 2, "con.r");
+                phiCon->addIncoming(builder_.getTrue(), foundBB);
+                phiCon->addIncoming(builder_.getFalse(), condBB);
+                return phiCon;
+            }
         }
 
         // -----------------------------------------------------------------------

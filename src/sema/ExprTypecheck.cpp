@@ -1594,6 +1594,9 @@ private:
                                 if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                     ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                             }
+                            // per §3: Contains → bool
+                            else if (m == "Contains")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                             // per §5 LINQ: Any/All → bool, Count → int, Where/Select → Array<T>
                             else if (m == "Any" || m == "All")
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
