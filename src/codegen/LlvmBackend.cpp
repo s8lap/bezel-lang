@@ -5831,7 +5831,19 @@ private:
                                   bin.left.get())) ||
                 (bin.right && dynamic_cast<const ast::NullLiteralExpr*>(
                                    bin.right.get()));
-            if (isStr(bin.left.get()) && !eitherNull) {
+            bool lIsStr = isStr(bin.left.get());
+            bool rIsStr = isStr(bin.right.get());
+            bool lIsPtr = l->getType()->isPointerTy();
+            bool rIsPtr = r->getType()->isPointerTy();
+            // Equality/inequality: use string ops when at least one side is a
+            // known string AND both are ptr-typed (the other ptr is also a string
+            // from a generic context where the sema type is unresolved T=string).
+            bool useStrEq = (lIsStr || rIsStr) && lIsPtr && rIsPtr && !eitherNull;
+            if (useStrEq && (op == "=" || op == "<>")) {
+                if (op == "=") return emitStringEq(l, r);
+                return builder_.CreateNot(emitStringEq(l, r));
+            }
+            if (lIsStr && !eitherNull) {
                 if (op == "=") return emitStringEq(l, r);
                 if (op == "<>") return builder_.CreateNot(emitStringEq(l, r));
                 if (op == "+") {
