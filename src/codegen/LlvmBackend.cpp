@@ -6723,8 +6723,14 @@ private:
                     for (std::size_t ai = 0; ai < args.size(); ++ai)
                         if (args[ai]->getType() != callFnTy->getParamType(ai))
                             { typesMismatch = true; break; }
+                    // CG-generic: even when all LLVM types match (e.g. ptr == ptr
+                    // for function-typed fields), the struct layout may differ
+                    // between the non-spec and spec versions.  Always inline
+                    // constructors for generic classes when a substitution is
+                    // active so GEPs use the spec struct layout.
+                    bool needsInlineForLayout = !genericSubst_.empty();
 
-                    if (!typesMismatch || genericSubst_.empty()) {
+                    if (!typesMismatch && !needsInlineForLayout) {
                         builder_.CreateCall(it->second, args);
                     } else {
                         // Inline the constructor body with the generic
@@ -8143,16 +8149,7 @@ private:
             llvm::Value* envSlot = builder_.CreateGEP(
                 ptrTy(), closurePtr, {builder_.getInt32(1)});
             llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot);
-            // Build function type: (ptr env, user_params...) -> ret.
-            llvm::Type* retTy = rt->funcReturn
-                                    ? lowerTypeRef(rt->funcReturn)
-                                    : llvm::Type::getVoidTy(llvm_);
-            std::vector<llvm::Type*> allArgTys;
-            allArgTys.push_back(ptrTy());  // env
-            for (const auto& fp : rt->funcParams)
-                allArgTys.push_back(fp.type ? lowerTypeRef(fp.type) : i32());
-            auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
-            // Build call args.
+            // Build call args first so we can reconcile types.
             std::vector<llvm::Value*> args;
             args.push_back(envPtr);  // env_ptr first
             for (const auto& a : call.args) {
@@ -8161,6 +8158,41 @@ private:
                 if (!v) return nullptr;
                 args.push_back(v);
             }
+            // Build function type: (ptr env, user_params...) -> ret.
+            // Use the actual argument LLVM types where the declared type resolves
+            // to i32 (unresolved generic param T) — e.g. (T)->T with T=string
+            // needs ptr->ptr, not i32->i32.
+            llvm::Type* retTy = rt->funcReturn
+                                    ? lowerTypeRef(rt->funcReturn)
+                                    : llvm::Type::getVoidTy(llvm_);
+            std::vector<llvm::Type*> allArgTys;
+            allArgTys.push_back(ptrTy());  // env
+            for (std::size_t pi = 0; pi < rt->funcParams.size(); ++pi) {
+                llvm::Type* declared =
+                    rt->funcParams[pi].type ? lowerTypeRef(rt->funcParams[pi].type) : i32();
+                // CG-generic: if declared resolved to i32 (unresolved T) but
+                // the actual argument has a more specific type, prefer that.
+                std::size_t ai = pi + 1;  // +1 for env_ptr
+                if (declared == i32() && ai < args.size() &&
+                    args[ai]->getType() != i32())
+                    declared = args[ai]->getType();
+                allArgTys.push_back(declared);
+            }
+            // Similarly fix up the return type if it's an unresolved generic.
+            if (retTy == i32() && !args.empty()) {
+                // If the last param type was resolved to ptr, the return is likely ptr too.
+                bool anyPtr = false;
+                for (std::size_t ai = 1; ai < args.size(); ++ai)
+                    if (args[ai]->getType()->isPointerTy()) { anyPtr = true; break; }
+                // Only upgrade if all non-env params are ptr (same-type function).
+                if (anyPtr && allArgTys.size() > 1) {
+                    bool allPtrs = true;
+                    for (std::size_t ti = 1; ti < allArgTys.size(); ++ti)
+                        if (!allArgTys[ti]->isPointerTy()) { allPtrs = false; break; }
+                    if (allPtrs) retTy = ptrTy();
+                }
+            }
+            auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
             if (args.size() != allArgTys.size()) return nullptr;
             return builder_.CreateCall(fnTy, fnPtr, args);
         };
