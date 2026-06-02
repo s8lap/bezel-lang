@@ -2096,16 +2096,29 @@ private:
         if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
             if (msym->visibility == ast::Visibility::Private &&
                 msym->parent && msym->parent != currentType_) {
-                ctx_.diagnostics().report(
-                    Severity::Error, nm.span.begin,
-                    std::string("`") + std::string(nm.member) +
-                    "` is private to type `" +
-                    std::string(msym->parent->name) +
-                    "` and not accessible from `" +
-                    std::string(currentType_ ? currentType_->name
-                                             : std::string_view("(global)")) +
-                    "` (§13.1 — `private` is visible to the declaring "
-                    "class only)");
+                // Suppress error if a non-private sibling with the same name
+                // exists (overload set) — codegen will pick the accessible one.
+                bool hasPublicOverload = false;
+                for (Symbol* sib : msym->parent->members) {
+                    if (sib && sib != member && sib->name == member->name) {
+                        if (auto* sm = dynamic_cast<MemberSymbol*>(sib)) {
+                            if (sm->visibility != ast::Visibility::Private)
+                                hasPublicOverload = true;
+                        }
+                    }
+                }
+                if (!hasPublicOverload) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nm.span.begin,
+                        std::string("`") + std::string(nm.member) +
+                        "` is private to type `" +
+                        std::string(msym->parent->name) +
+                        "` and not accessible from `" +
+                        std::string(currentType_ ? currentType_->name
+                                                 : std::string_view("(global)")) +
+                        "` (§13.1 — `private` is visible to the declaring "
+                        "class only)");
+                }
             }
         }
         ctx_.setExprSymbol(&nm, member);
