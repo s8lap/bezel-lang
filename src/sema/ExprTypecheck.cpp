@@ -87,6 +87,10 @@ private:
     // IdentifierExpr handling can diagnose `this`/`base` in static
     // member bodies.
     bool inStaticMember_ = false;
+    // §5 / issue #184: when a LocalDecl has an explicit wider integer type
+    // (long, ulong, uint) and the initializer is an unsuffixed int literal
+    // that overflows int, widen it to the declared type instead of erroring.
+    PrimitiveType currentLiteralWideningHint_ = PrimitiveType::None;
     // Slice S7: tracks whether we're inside a constructor (or static
     // constructor) body — the only places where `this.<readonly>` may
     // be assigned. Field initializers are handled separately (slice
@@ -719,7 +723,26 @@ private:
     void visitStmt(const ast::Stmt& s) {
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
             // Initializer evaluates BEFORE the local comes into scope.
+            // §5 / issue #184: if the variable has an explicit wider integer
+            // type, pass it as a hint so unsuffixed int literals can be
+            // widened instead of rejected.
+            PrimitiveType savedHint = currentLiteralWideningHint_;
+            if (ld->type && ld->initializer) {
+                if (auto* rt = ctx_.resolvedType(*ld->type)) {
+                    if (rt->kind == TypeRef::Kind::Primitive) {
+                        using P = PrimitiveType;
+                        switch (rt->primitive) {
+                            case P::Long: case P::ULong:
+                            case P::UInt:
+                                currentLiteralWideningHint_ = rt->primitive;
+                                break;
+                            default: break;
+                        }
+                    }
+                }
+            }
             if (ld->initializer) visitExpr(*ld->initializer);
+            currentLiteralWideningHint_ = savedHint;
             if (currentScope_ && !ld->name.empty()) {
                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                 lsym->name = ld->name;
@@ -1159,16 +1182,41 @@ private:
             else if (hasL) pt = PrimitiveType::Long;
             else if (hasU) pt = PrimitiveType::UInt;
             // §5: an unsuffixed integer literal must fit in `int`; if it does
-            // not, the literal requires a suffix (it is not silently widened).
+            // not, it either requires a suffix OR the declared target type
+            // (long/ulong/uint) allows implicit widening (issue #184).
             if (pt == PrimitiveType::Int) {
                 unsigned long long mag = 0;
                 if (intLiteralMagnitude(il->text, mag) &&
                     (errno == ERANGE || mag > 2147483647ull)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, il->span.begin,
-                        "integer literal does not fit in `int`; add a suffix "
-                        "(`L` for long, `U`/`UL` for unsigned) to widen it "
-                        "(§5)");
+                    using P = PrimitiveType;
+                    bool widened = false;
+                    // Widen to the declared type when in a typed variable context.
+                    if (currentLiteralWideningHint_ != P::None) {
+                        bool fits = false;
+                        switch (currentLiteralWideningHint_) {
+                            case P::Long:
+                                fits = (errno != ERANGE && mag <= 9223372036854775807ULL);
+                                break;
+                            case P::ULong:
+                                fits = (errno != ERANGE);  // any positive value fits
+                                break;
+                            case P::UInt:
+                                fits = (errno != ERANGE && mag <= 4294967295ULL);
+                                break;
+                            default: break;
+                        }
+                        if (fits) {
+                            pt = currentLiteralWideningHint_;
+                            widened = true;
+                        }
+                    }
+                    if (!widened) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, il->span.begin,
+                            "integer literal does not fit in `int`; add a suffix "
+                            "(`L` for long, `U`/`UL` for unsigned) to widen it "
+                            "(§5)");
+                    }
                 }
             }
             ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
