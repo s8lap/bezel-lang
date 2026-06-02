@@ -4557,9 +4557,29 @@ private:
                     // §4.7: null-coalescing assignment `x ??= e` — store e
                     // into x only when x is currently null.
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    llvm::Value* isNull = nullptr;
                     if (cur->getType()->isPointerTy()) {
-                        auto* isNull = builder_.CreateICmpEQ(
+                        isNull = builder_.CreateICmpEQ(
                             cur, llvm::ConstantPointerNull::get(ptrTy()));
+                    } else if (cur->getType()->isStructTy()) {
+                        // CG-nullable: nullable primitive {i8 hasValue; primType value}.
+                        // Null when hasValue == 0.
+                        isNull = builder_.CreateNot(nullablePrimHasValue(cur));
+                        // Wrap rhs (plain prim) into nullable struct for the store.
+                        if (rhs->getType() != elemTy) {
+                            if (auto* st = llvm::dyn_cast<llvm::StructType>(elemTy)) {
+                                if (st->getNumElements() == 2 &&
+                                    st->getElementType(0) == nullablePrimHasValTy() &&
+                                    rhs->getType() == st->getElementType(1)) {
+                                    llvm::Value* wrapped = builder_.CreateInsertValue(
+                                        llvm::UndefValue::get(elemTy),
+                                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+                                    rhs = builder_.CreateInsertValue(wrapped, rhs, {1u});
+                                }
+                            }
+                        }
+                    }
+                    if (isNull) {
                         auto* assignBB = llvm::BasicBlock::Create(llvm_, "coaleq.do", currentFn_);
                         auto* endBB = llvm::BasicBlock::Create(llvm_, "coaleq.end", currentFn_);
                         builder_.CreateCondBr(isNull, assignBB, endBB);
