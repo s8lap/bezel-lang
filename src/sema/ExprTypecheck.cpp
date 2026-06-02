@@ -1746,7 +1746,7 @@ private:
                             return;
                         }
                     }
-                    // string static methods → bool or string.
+                    // string static methods → bool or string or int.
                     if (pt == PrimitiveType::String) {
                         if (mbr == "IsNullOrEmpty" || mbr == "IsNullOrWhiteSpace") {
                             ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
@@ -1754,6 +1754,27 @@ private:
                         }
                         if (mbr == "Concat" || mbr == "Join" || mbr == "Empty") {
                             ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                            return;
+                        }
+                        // string.Compare → int (ordinal comparison result).
+                        if (mbr == "Compare") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                            return;
+                        }
+                    }
+                    // int static methods → int or bool.
+                    if (pt == PrimitiveType::Int || pt == PrimitiveType::Long ||
+                        pt == PrimitiveType::Byte || pt == PrimitiveType::SByte ||
+                        pt == PrimitiveType::Short || pt == PrimitiveType::UShort ||
+                        pt == PrimitiveType::UInt || pt == PrimitiveType::ULong) {
+                        if (mbr == "Parse") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
+                            return;
+                        }
+                    }
+                    if (pt == PrimitiveType::Double || pt == PrimitiveType::Float) {
+                        if (mbr == "Parse") {
+                            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                             return;
                         }
                     }
