@@ -259,6 +259,11 @@ private:
     // argument for a function-typed parameter.  lowerLambda reads this to
     // infer the LLVM types for unannotated lambda parameters.
     const sema::TypeRef* expectedFunctionType_ = nullptr;
+    // lambdaParamTypeHint_: maps ParameterSymbol* → sema TypeRef* for lambda
+    // params whose type is inferred from expectedFunctionType_ (no declType AST
+    // node).  Used in identifier lookup to supply the missing sema type so that
+    // string subscript, member access, etc. work on inferred-type params.
+    std::unordered_map<const sema::Symbol*, sema::TypeRef*> lambdaParamTypeHint_;
     // currentEnumMethod_: when we're emitting an enum instance method, set to
     // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
     const sema::TypeSymbol* currentEnumMethod_ = nullptr;
@@ -5773,7 +5778,21 @@ private:
                 return nullptr;
             // CG27e (§4.6): string indexer `s[i]` → char (i32 code point).
             {
+                // Pre-warm: if the target has no sema type yet (lambda param with
+                // inferred type), lower it first so the type hint gets injected
+                // into the sema map, then check the type.
                 auto* tt = ctx_.exprType(*ix->target);
+                if (!tt) {
+                    // Probe the type without side effects — just check the hint map.
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix->target.get())) {
+                        sema::Symbol* sym = ctx_.exprSymbol(*id);
+                        auto hit = lambdaParamTypeHint_.find(sym);
+                        if (hit != lambdaParamTypeHint_.end()) {
+                            ctx_.setExprType(ix->target.get(), hit->second);
+                            tt = hit->second;
+                        }
+                    }
+                }
                 if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
                     tt->primitive == sema::PrimitiveType::String) {
                     llvm::Value* strPtr = lowerExpr(*ix->target);
@@ -6208,6 +6227,14 @@ private:
             }
         }
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            // Inject lambda-param type hints so type-gated branches below
+            // (string subscript, member access) see the correct type.
+            if (!ctx_.exprType(e)) {
+                sema::Symbol* sym = ctx_.exprSymbol(e);
+                auto hit = lambdaParamTypeHint_.find(sym);
+                if (hit != lambdaParamTypeHint_.end())
+                    ctx_.setExprType(&e, hit->second);
+            }
             // CG9: `this` (and `base`, same instance) is the receiver ptr.
             if (id->name == "this" || id->name == "base") return currentThis_;
             // CG33b: a bare computed-property read evaluates its getter
@@ -6969,12 +6996,21 @@ private:
                 }
                 // If the param type is still i32 (unresolved) but we have an
                 // expected function type from the call site, infer from that.
+                // Also propagate the sema TypeRef to the ParameterSymbol so that
+                // identifier lookups in the lambda body (e.g. s.Length) get the
+                // correct type (e.g. string → ptr, enabling string subscript codegen).
                 if (ty == i32() && expectedFunctionType_ &&
                     pi < expectedFunctionType_->funcParams.size() &&
                     expectedFunctionType_->funcParams[pi].type) {
-                    llvm::Type* expected = lowerTypeRef(
-                        expectedFunctionType_->funcParams[pi].type);
-                    if (expected != i32()) ty = expected;
+                    sema::TypeRef* expRT = expectedFunctionType_->funcParams[pi].type;
+                    llvm::Type* expected = lowerTypeRef(expRT);
+                    if (expected != i32()) {
+                        ty = expected;
+                        // Backfill: give the ParameterSymbol a resolved sema type so
+                        // that body identifier references pick up the right TypeRef.
+                        if (par && !par->declType)
+                            lambdaParamTypeHint_[par] = expRT;
+                    }
                 }
                 userParamTys.push_back(ty);
                 ++pi;
@@ -7021,6 +7057,7 @@ private:
         std::vector<CaptureEntry> captures;
 
         // Save state (needed for capture slot access and restoration).
+        auto savedLambdaParamHints = lambdaParamTypeHint_;  // restore after body
         llvm::Function* savedFn = currentFn_;
         llvm::Value* savedThis = currentThis_;
         llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
@@ -7151,6 +7188,7 @@ private:
         }
 
         // --- Restore emitter state ---
+        lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
         currentFn_ = savedFn;
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
@@ -8127,6 +8165,224 @@ private:
         // -----------------------------------------------------------------------
         if (isArr) {
             int64_t esz = collectionElemSize(recvTy);
+
+            // per §5 LINQ: closure struct { ptr fn, ptr env }; call as fn(env, elem).
+            auto callClosure = [&](llvm::Value* closure,
+                                   llvm::Value* elem,
+                                   llvm::Type* retTy) -> llvm::Value* {
+                llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
+                llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure,
+                                                          {builder_.getInt32(1)});
+                llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+                auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy(), elem->getType()},
+                                                     false);
+                return builder_.CreateCall(fnTy, fnPtr, {envPtr, elem}, "cl.ret");
+            };
+
+            // Get element LLVM type from generic arg (default i32).
+            auto getElemTy = [&]() -> llvm::Type* {
+                if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                    if (auto* et = lowerTypeRef(recvTy->genericArgs[0])) return et;
+                return i32();
+            };
+
+            // Lower the lambda argument with expectedFunctionType_ set so unannotated
+            // lambda params get the right LLVM type (e.g. string elem → ptr, not i32).
+            // retTypeRef: the TypeRef for the lambda's return type (bool/unit/etc).
+            auto lowerLinqLambda = [&](const ast::Expr* argExpr,
+                                       sema::TypeRef* retTypeRef) -> llvm::Value* {
+                sema::TypeRef* elemTypeRef = (recvTy && !recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
+                // Build a synthetic Function TypeRef: (elemType) -> retType.
+                auto* funcRef = ctx_.makeTypeRef();
+                funcRef->kind = sema::TypeRef::Kind::Function;
+                funcRef->funcReturn = retTypeRef;
+                if (elemTypeRef) {
+                    sema::TypeRef::FuncParam fp;
+                    fp.type = elemTypeRef;
+                    funcRef->funcParams.push_back(std::move(fp));
+                }
+                const sema::TypeRef* savedExpected = expectedFunctionType_;
+                expectedFunctionType_ = funcRef;
+                llvm::Value* v = lowerExpr(*argExpr);
+                expectedFunctionType_ = savedExpected;
+                return v;
+            };
+
+            // per §5 LINQ: .Any(pred: (T)->bool): bool
+            if (m == "Any" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                if (!closure) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB  = llvm::BasicBlock::Create(llvm_, "any.c", currentFn_);
+                auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "any.b", currentFn_);
+                auto* nextBB  = llvm::BasicBlock::Create(llvm_, "any.n", currentFn_);
+                auto* endBB   = llvm::BasicBlock::Create(llvm_, "any.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* ok = callClosure(closure, el, i1());
+                builder_.CreateCondBr(ok, endBB, nextBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                auto* phi = builder_.CreatePHI(i1(), 2, "any.r");
+                phi->addIncoming(builder_.getFalse(), condBB);
+                phi->addIncoming(builder_.getTrue(), bodyBB);
+                return phi;
+            }
+
+            // per §5 LINQ: .All(pred: (T)->bool): bool
+            if (m == "All" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                if (!closure) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB  = llvm::BasicBlock::Create(llvm_, "all.c", currentFn_);
+                auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "all.b", currentFn_);
+                auto* nextBB  = llvm::BasicBlock::Create(llvm_, "all.n", currentFn_);
+                auto* endBB   = llvm::BasicBlock::Create(llvm_, "all.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* ok = callClosure(closure, el, i1());
+                builder_.CreateCondBr(ok, nextBB, endBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                auto* phi = builder_.CreatePHI(i1(), 2, "all.r");
+                phi->addIncoming(builder_.getTrue(), condBB);
+                phi->addIncoming(builder_.getFalse(), bodyBB);
+                return phi;
+            }
+
+            // per §5 LINQ: .ForEach(fn: (T)->())
+            if (m == "ForEach" && call.args.size() == 1 && call.args[0].value) {
+                auto* unitRef = ctx_.makeTypeRef();
+                unitRef->kind = sema::TypeRef::Kind::Unit;
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), unitRef);
+                if (!closure) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "fe.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "fe.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "fe.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                callClosure(closure, el, llvm::Type::getVoidTy(llvm_));
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+
+            // per §5 LINQ: .Count(pred: (T)->bool): int
+            if (m == "Count" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                if (!closure) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                auto* cntSlot = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                builder_.CreateStore(builder_.getInt32(0), cntSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "cnt.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cnt.b", currentFn_);
+                auto* incrBB = llvm::BasicBlock::Create(llvm_, "cnt.i", currentFn_);
+                auto* nextBB = llvm::BasicBlock::Create(llvm_, "cnt.n", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "cnt.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* ok = callClosure(closure, el, i1());
+                builder_.CreateCondBr(ok, incrBB, nextBB);
+                builder_.SetInsertPoint(incrBB);
+                llvm::Value* c = builder_.CreateLoad(i32(), cntSlot);
+                builder_.CreateStore(builder_.CreateAdd(c, builder_.getInt32(1)), cntSlot);
+                builder_.CreateBr(nextBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return builder_.CreateLoad(i32(), cntSlot, "cnt.r");
+            }
+
+            // per §5 LINQ: .Where(pred: (T)->bool): Array<T>
+            if (m == "Where" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                if (!closure) return nullptr;
+                llvm::Type* elemTy = getElemTy();
+                auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                llvm::Value* result = builder_.CreateCall(allocFn,
+                    {builder_.getInt64(esz), builder_.getInt64(16)});
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "whr.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "whr.b", currentFn_);
+                auto* addBB  = llvm::BasicBlock::Create(llvm_, "whr.a", currentFn_);
+                auto* nextBB = llvm::BasicBlock::Create(llvm_, "whr.n", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "whr.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* ok = callClosure(closure, el, i1());
+                builder_.CreateCondBr(ok, addBB, nextBB);
+                builder_.SetInsertPoint(addBB);
+                auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+                builder_.CreateBr(nextBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                return result;
+            }
 
             // .Length: int / .Count: int
             if ((m == "Length" || m == "Count") && call.args.empty()) {

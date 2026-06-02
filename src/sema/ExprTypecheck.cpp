@@ -1565,11 +1565,15 @@ private:
                 if (ma->target) {
                     auto* recvTy = ctx_.exprType(*ma->target);
                     auto colName = [&]() -> std::string_view {
-                        if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
-                            recvTy->declaration || !recvTy->astNode ||
-                            !recvTy->astNode->name || recvTy->astNode->name->parts.empty())
-                            return {};
-                        return recvTy->astNode->name->parts[0];
+                        if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                            !recvTy->declaration && recvTy->astNode &&
+                            recvTy->astNode->name && !recvTy->astNode->name->parts.empty())
+                            return recvTy->astNode->name->parts[0];
+                        // Builtin class identifiers (File, Directory, etc.) are given a
+                        // symbol but no TypeRef; fall back to reading the identifier name.
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+                            return id->name;
+                        return {};
                     }();
                     using P = PrimitiveType;
                     const auto& m = ma->member;
@@ -1590,6 +1594,13 @@ private:
                                 if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                     ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                             }
+                            // per §5 LINQ: Any/All → bool, Count → int, Where → Array<T>
+                            else if (m == "Any" || m == "All")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                            else if (m == "Count" && !ce.args.empty())
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                            else if (m == "Where")
+                                ctx_.setExprType(&ce, recvTy);  // same Array<T> type
                             // Add/Push/Enqueue/Set/RemoveAt/Clear → unit (void)
                         }
                         // Dictionary methods
