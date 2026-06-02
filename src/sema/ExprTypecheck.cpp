@@ -915,6 +915,38 @@ private:
                                    tt->primitive == PrimitiveType::String) {
                             lsym->declType =
                                 ctx_.primitiveTypeRef(PrimitiveType::Char);
+                        // §3 / §29.2: runtime Array<T> or other IEnumerable<T>
+                        // with a Named TypeRef — element type from first generic arg.
+                        } else if (tt->kind == TypeRef::Kind::Named &&
+                                   !tt->genericArgs.empty() &&
+                                   tt->genericArgs[0]) {
+                            // Covers Array<T>, Stack<T>, Queue<T>, user-defined
+                            // IEnumerable<T> types that expose their T directly.
+                            lsym->declType = tt->genericArgs[0];
+                        } else if (tt->kind == TypeRef::Kind::Named &&
+                                   tt->declaration) {
+                            // §29.2: user-defined IEnumerable<T> — find GetEnumerator
+                            // and read its return type's first generic arg (T).
+                            auto* ts = tt->declaration;
+                            // Walk ts and its base types (simple BFS).
+                            std::vector<const TypeSymbol*> queue = {ts};
+                            for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+                                const TypeSymbol* t = queue[qi];
+                                for (auto* m : t->members) {
+                                    auto* ms = dynamic_cast<MethodSymbol*>(m);
+                                    if (ms && ms->name == "GetEnumerator" && ms->decl) {
+                                        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                                        if (md && md->returnType) {
+                                            auto* rt = ctx_.resolvedType(*md->returnType);
+                                            if (rt && !rt->genericArgs.empty() && rt->genericArgs[0])
+                                                lsym->declType = rt->genericArgs[0];
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (lsym->declType) break;
+                                for (auto* bt : t->baseTypes) if (bt) queue.push_back(bt);
+                            }
                         }
                     } else if (auto* cl =
                                    dynamic_cast<const ast::CollectionLiteralExpr*>(

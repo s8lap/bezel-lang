@@ -2542,7 +2542,17 @@ private:
                         n == "Set" || n == "OwnedSet" ||
                         n == "LinkedList" || n == "OwnedLinkedList" ||
                         n == "StringBuilder" || n == "Random" ||
-                        n == "DateTime" || n == "TimeSpan")
+                        n == "DateTime" || n == "TimeSpan" ||
+                        // §29: iteration interfaces are heap-allocated objects.
+                        n == "IEnumerable" || n == "IEnumerator" ||
+                        n == "OwnedEnumerable" || n == "OwnedEnumerator" ||
+                        n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
+                        n == "OwnedAsyncEnumerable" || n == "OwnedAsyncEnumerator" ||
+                        n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
+                        n == "ICollection" || n == "IList" ||
+                        n == "IOwnedCollection" || n == "IOwnedList" ||
+                        // §30: Task types are also heap-allocated.
+                        n == "Task" || n == "OwnedTask")
                         return ptrTy();
                 }
                 if (rt->declaration &&
@@ -4722,7 +4732,12 @@ private:
             if (lowerArrayFor(*fors)) return false;
             // §4.6: `for var c in s` over a string — iterates chars.
             if (lowerStringFor(*fors)) return false;
-            // Non-range, non-array, non-string iterables are not yet lowered.
+            // §29.2 (B1): `for var x in items` where items is IEnumerable<T>
+            // typed as a builtin interface — treat runtime value as bz_array_t*.
+            if (lowerIEnumerableBuiltinFor(*fors)) return false;
+            // §29.2 (A): `for var x in obj` over user-defined IEnumerable<T>.
+            if (lowerIEnumerableFor(*fors)) return false;
+            // Non-range, non-array, non-string, non-IEnumerable iterables.
             ctx_.diagnostics().report(
                 Severity::Error, s.span.begin,
                 "not yet implemented: codegen for this for statement");
@@ -5338,6 +5353,259 @@ private:
         llvm::Value* idxInc = builder_.CreateLoad(i64(), idxSlot);
         builder_.CreateStore(builder_.CreateAdd(idxInc, builder_.getInt64(1)), idxSlot);
         builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(endBB);
+        return true;
+    }
+
+    // §29.2: `for var x in obj` over a user-defined IEnumerable<T> type,
+    // or over a runtime Array<T>/collection when the iterable's type has
+    // a concrete GetEnumerator() / MoveNext() / Current interface.
+    // Desugar per spec:
+    //   using var __enum := obj.GetEnumerator();
+    //   while __enum.MoveNext() do
+    //     var x := __enum.Current;
+    //     body
+    //   end;
+    //   __enum.Dispose();   ← via disposeStack_ at scope exit
+    // §29.2 (B1): `for var x in items` where items is typed as IEnumerable<T> /
+    // IReadOnlyCollection<T> etc. with null declaration (builtin interface).
+    // Since Array<T> is the only IEnumerable<T> implementation at this point,
+    // we treat the value as a bz_array_t* and emit a direct indexed loop.
+    bool lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
+        if (!fs.iterable) return false;
+        auto* iterTy = ctx_.exprType(*fs.iterable);
+        if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named ||
+            iterTy->declaration || !iterTy->astNode || !iterTy->astNode->name ||
+            iterTy->astNode->name->parts.empty())
+            return false;
+        // Only handle the iteration-interface family.
+        auto n = iterTy->astNode->name->parts[0];
+        if (n != "IEnumerable" && n != "IReadOnlyCollection" && n != "IReadOnlyList" &&
+            n != "ICollection" && n != "IList" &&
+            n != "OwnedEnumerable")
+            return false;
+        // Must have a generic arg to determine element type.
+        if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
+
+        llvm::Value* arrObj = lowerExpr(*fs.iterable);
+        if (!arrObj) return false;
+
+        llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+        int64_t esz = 8;  // default pointer size
+        {
+            llvm::Type* et = elemTy;
+            if (et && (et->isIntegerTy(32) || et->isFloatTy())) esz = 4;
+            else if (et && (et->isIntegerTy(1) || et->isIntegerTy(8))) esz = 1;
+            else if (et && et->isIntegerTy(16)) esz = 2;
+        }
+
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        llvm::Value* len = builder_.CreateCall(lenFn, {arrObj});
+        auto* idxSlot = entryAlloca(i64());
+        builder_.CreateStore(builder_.getInt64(0), idxSlot);
+        auto* varSlot = entryAlloca(elemTy);
+        locals_[&fs] = varSlot;
+
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ib.body", currentFn_);
+        auto* incBB  = llvm::BasicBlock::Create(llvm_, "ib.inc",  currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "ib.end",  currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot);
+        llvm::Value* ep = builder_.CreateCall(ptrAtFn, {arrObj, idx2, builder_.getInt64(esz)});
+        llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
+        builder_.CreateStore(elem, varSlot);
+        loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+        lowerScopedBlock(fs.body);
+        loopStack_.pop_back();
+        llvm::Value* idx3 = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateStore(builder_.CreateAdd(idx3, builder_.getInt64(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return true;
+    }
+
+    bool lowerIEnumerableFor(const ast::ForStmt& fs) {
+        if (!fs.iterable) return false;
+        auto* iterTy = ctx_.exprType(*fs.iterable);
+        if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
+        auto* ts = iterTy->declaration;
+        if (!ts) return false;  // builtin/interface without concrete class — skip
+
+        // Find GetEnumerator on ts (walks base types).
+        sema::MethodSymbol* getEnumSym = findMethodByName(ts, "GetEnumerator");
+        if (!getEnumSym) return false;
+
+        // Find the enumerator class. GetEnumerator's return type is typically
+        // the builtin `IEnumerator<T>` (null declaration). We need the concrete
+        // class that implements it — search all compiled TypeSymbols for a class
+        // whose base types include a name starting with "IEnumerator".
+        auto* getEnumDecl = dynamic_cast<const ast::MethodDecl*>(getEnumSym->decl);
+        if (!getEnumDecl || !getEnumDecl->returnType) return false;
+        auto* enumTyRef = ctx_.resolvedType(*getEnumDecl->returnType);
+        if (!enumTyRef) return false;
+
+        // Try to get the concrete TypeSymbol from the return type's declaration.
+        auto* enumTs = (enumTyRef->kind == sema::TypeRef::Kind::Named)
+                       ? enumTyRef->declaration : nullptr;
+
+        // If null (builtin IEnumerator<T>), search for a user class that
+        // implements it by checking all compiled TypeSymbols.
+        // If enumTs is null (builtin IEnumerator<T> interface), find the
+        // concrete class structurally: any user class with both "MoveNext"
+        // and ("Current" or a property) in its compiled methods.
+        if (!enumTs) {
+            for (const auto& sym : ctx_.symbols()) {
+                auto* candidate = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+                if (!candidate || candidate->kind != ast::TypeDeclKind::Class) continue;
+                if (candidate == ts) continue;  // skip the iterable itself
+                bool hasMoveNext = false, hasCurrent = false;
+                for (auto* m : candidate->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                    if (!ms || !methodFns_.count(ms)) continue;
+                    if (ms->name == "MoveNext") hasMoveNext = true;
+                    if (ms->name == "Current") hasCurrent = true;
+                }
+                // Also check PropertySymbol for Current
+                if (!hasCurrent) {
+                    for (auto* m : candidate->members) {
+                        auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                        if (ps && ps->name == "Current") { hasCurrent = true; break; }
+                    }
+                }
+                if (hasMoveNext && hasCurrent) {
+                    enumTs = const_cast<sema::TypeSymbol*>(candidate);
+                    break;
+                }
+            }
+        }
+        if (!enumTs) return false;  // couldn't find concrete enumerator class
+
+        // Find MoveNext on the enumerator type.
+        sema::MethodSymbol* moveNextSym = findMethodByName(enumTs, "MoveNext");
+        if (!moveNextSym) return false;
+
+        // Find Current — may be a PropertySymbol (readonly property) or MethodSymbol.
+        sema::MethodSymbol* currentSym = findMethodByName(enumTs, "Current");
+        sema::PropertySymbol* currentPropSym = nullptr;
+        if (!currentSym) {
+            for (auto* m : enumTs->members) {
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                if (ps && ps->name == "Current") { currentPropSym = ps; break; }
+            }
+        }
+
+        // Evaluate the iterable to get the source object pointer.
+        llvm::Value* srcPtr = lowerExpr(*fs.iterable);
+        if (!srcPtr) return false;
+
+        // Call GetEnumerator() → enumerator object (ptr).
+        std::vector<llvm::Value*> geArgs = {srcPtr};
+        llvm::Value* enumPtr = emitMethodCall(getEnumSym, geArgs, false);
+        if (!enumPtr) return false;
+
+        // Store the enumerator in a slot so it can be disposed at loop exit.
+        auto* enumSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(enumPtr, enumSlot);
+
+        // Register enumerator for disposal via disposeStack_ so `break`,
+        // early `return`, or normal loop exit all call Dispose().
+        // We push a Disposal entry with the enumerator's TypeSymbol.
+        if (!disposeStack_.empty() && disposerFns_.count(enumTs))
+            disposeStack_.back().push_back({enumSlot, enumTs});
+
+        // Determine the loop variable's element type.
+        llvm::Type* elemTy = ptrTy();  // default: reference type
+        if (currentSym) {
+            auto* curDecl = dynamic_cast<const ast::MethodDecl*>(currentSym->decl);
+            if (curDecl && curDecl->returnType) {
+                if (auto* rt = ctx_.resolvedType(*curDecl->returnType))
+                    elemTy = lowerTypeRef(rt);
+            }
+        } else if (currentPropSym) {
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
+            if (pd && pd->type) {
+                if (auto* rt = ctx_.resolvedType(*pd->type))
+                    elemTy = lowerTypeRef(rt);
+            }
+        }
+        // Fall back to first generic arg of enumerator's return type.
+        if (elemTy == ptrTy() && !enumTyRef->genericArgs.empty() && enumTyRef->genericArgs[0]) {
+            llvm::Type* ga = lowerTypeRef(enumTyRef->genericArgs[0]);
+            if (ga != ptrTy()) elemTy = ga;
+        }
+
+        // Loop variable slot — the body sees `x` here.
+        auto* varSlot = entryAlloca(elemTy);
+        locals_[&fs] = varSlot;
+
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "ien.cond", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ien.body", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "ien.end",  currentFn_);
+        builder_.CreateBr(condBB);
+
+        // cond: __enum.MoveNext() → bool.
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* enumObj = builder_.CreateLoad(ptrTy(), enumSlot);
+        std::vector<llvm::Value*> mnArgs = {enumObj};
+        llvm::Value* moved = emitMethodCall(moveNextSym, mnArgs, false);
+        if (!moved) {
+            // If MoveNext can't be resolved via vtable, fall back to false.
+            moved = builder_.getFalse();
+        }
+        builder_.CreateCondBr(moved, bodyBB, endBB);
+
+        // body: x := __enum.Current; then run the user body.
+        builder_.SetInsertPoint(bodyBB);
+        {
+            llvm::Value* enumObj2 = builder_.CreateLoad(ptrTy(), enumSlot);
+            llvm::Value* curVal = nullptr;
+            if (currentSym) {
+                // Method-form Current.
+                std::vector<llvm::Value*> curArgs = {enumObj2};
+                curVal = emitMethodCall(currentSym, curArgs, false);
+            } else if (currentPropSym) {
+                // Property-form Current — evaluate the getter with enumObj2 as this.
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
+                if (pd) {
+                    // Save/restore currentThis_.
+                    llvm::Value* savedThis = currentThis_;
+                    currentThis_ = enumObj2;
+                    // Try expression getter (get => expr).
+                    if (const ast::Expr* getterExpr = computedGetterOf(currentPropSym)) {
+                        curVal = lowerExpr(*getterExpr);
+                    }
+                    // Try block getter (get => do...end).
+                    else if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
+                        llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc);
+                        if (getterFn) {
+                            auto* fnTy = getterFn->getFunctionType();
+                            curVal = builder_.CreateCall(fnTy, getterFn, {enumObj2});
+                        }
+                    }
+                    currentThis_ = savedThis;
+                }
+            }
+            if (curVal) {
+                // Coerce to elemTy if sizes differ.
+                if (curVal->getType() != elemTy && elemTy->isIntegerTy() &&
+                    curVal->getType()->isIntegerTy())
+                    curVal = builder_.CreateTrunc(curVal, elemTy);
+                if (curVal->getType() == elemTy)
+                    builder_.CreateStore(curVal, varSlot);
+            }
+        }
+
+        loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+        bool term = lowerScopedBlock(fs.body);
+        loopStack_.pop_back();
+        if (!term) builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(endBB);
         return true;
