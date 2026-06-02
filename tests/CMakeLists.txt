@@ -199,6 +199,7 @@ set(BEZEL_TEST_SOURCES
     codegen/lambda_test.cpp
     codegen/generic_test.cpp
     codegen/collection_test.cpp
+    codegen/linq_test.cpp
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
