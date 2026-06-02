@@ -6086,6 +6086,44 @@ private:
                 l, r, llvm::cast<llvm::StructType>(l->getType()));
             return op == "=" ? eq : builder_.CreateNot(eq);
         }
+        // Guard against type mismatch when one operand is a null literal
+        // (ptrTy()) and the other is a non-pointer value type (e.g. `n is null`
+        // desugars to `n = null` but `n: int` can never be null).
+        {
+        bool eitherNull2 =
+            (bin.left && dynamic_cast<const ast::NullLiteralExpr*>(bin.left.get())) ||
+            (bin.right && dynamic_cast<const ast::NullLiteralExpr*>(bin.right.get()));
+        if (l->getType() != r->getType()) {
+            if ((op == "=" || op == "<>") && eitherNull2) {
+                // Type mismatch with a null literal: one side is a null ptr,
+                // the other is a non-pointer (value) type that can never be null.
+                bool lIsPtr = l->getType()->isPointerTy();
+                bool rIsPtr = r->getType()->isPointerTy();
+                if (lIsPtr && rIsPtr) {
+                    // Both pointer — compare normally (fall through).
+                } else if (lIsPtr) {
+                    // Left is ptr, right is non-ptr value — compare left to null.
+                    llvm::Value* eq = builder_.CreateICmpEQ(
+                        l, llvm::ConstantPointerNull::get(ptrTy()));
+                    return op == "=" ? eq : builder_.CreateNot(eq);
+                } else if (rIsPtr) {
+                    // Right is ptr (the null literal), left is non-ptr — non-ptr
+                    // can never be null: = null is always false, <> null is true.
+                    return builder_.getInt1(op == "<>");
+                } else {
+                    // Neither is a ptr — both are value types (shouldn't be null).
+                    return builder_.getInt1(op == "<>");
+                }
+            }
+            // For other mismatched integer comparisons, extend to match widths.
+            if (l->getType()->isIntegerTy() && r->getType()->isIntegerTy()) {
+                unsigned lb = l->getType()->getIntegerBitWidth();
+                unsigned rb = r->getType()->getIntegerBitWidth();
+                if (lb < rb) l = builder_.CreateSExt(l, r->getType());
+                else r = builder_.CreateSExt(r, l->getType());
+            }
+        }
+        } // end eitherNull2 guard
         // CG4: integer comparisons → i1.
         if (op == "=") return builder_.CreateICmpEQ(l, r);
         if (op == "<>") return builder_.CreateICmpNE(l, r);
