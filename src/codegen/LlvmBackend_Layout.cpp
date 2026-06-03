@@ -834,6 +834,33 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
         phi->addIncoming(cmp, cmpEnd);
         return phi;
     }
+    // per §8.3/§9.1: a NULLABLE VALUE field (int?, bool?, double?, … the value
+    // primitives isNullablePrimTy recognizes) lowers to a tagged struct {i8
+    // hasValue; T value} (isNullablePrimTy /
+    // nullablePrimStructTy). The null-safe `=` of §8.4 is: both-null → equal;
+    // exactly-one-null → not-equal; neither-null → the inner T's `=`. Drive it
+    // off the hasValue tags so the `value` slot is only compared when both are
+    // present (an absent value's slot is zero-filled but meaningless).
+    if (isNullablePrimTy(fieldTy) && l->getType()->isStructTy() &&
+        r->getType()->isStructTy()) {
+        llvm::Value* lHas = nullablePrimHasValue(l);   // i1
+        llvm::Value* rHas = nullablePrimHasValue(r);
+        llvm::Value* tagsEq = builder_.CreateICmpEQ(lHas, rHas, "eq.nvtag");
+        llvm::Value* bothHave = builder_.CreateAnd(lHas, rHas, "eq.nvboth");
+        // Inner T equality of the value slots — primitives/enums compare by
+        // value (the fall-through ICmp/FCmp below, reached via a nullable-off
+        // recursion so floats use FCmp).
+        sema::TypeRef innerTy = *fieldTy;
+        innerTy.nullable = false;
+        llvm::Value* valEq = emitValueEquality(
+            nullablePrimValue(l), nullablePrimValue(r), &innerTy);
+        // equal  iff  tags equal AND (both-null OR inner values equal).
+        // both-null is (tags equal AND !bothHave); neither-null path needs
+        // valEq. Combine: tagsEq AND (NOT bothHave OR valEq).
+        llvm::Value* notBoth = builder_.CreateNot(bothHave, "eq.nvnotboth");
+        llvm::Value* inner = builder_.CreateOr(notBoth, valEq, "eq.nvinner");
+        return builder_.CreateAnd(tagsEq, inner, "eq.nullableval");
+    }
     // String field: content equality (§4.6), not pointer identity. per §8.3
     bool isString = fieldTy && fieldTy->kind == K::Primitive &&
                     fieldTy->primitive == sema::PrimitiveType::String;

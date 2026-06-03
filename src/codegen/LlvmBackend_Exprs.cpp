@@ -2454,6 +2454,23 @@ llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
                 if (!args[i].value) return nullptr;
                 llvm::Value* v = lowerExpr(*args[i].value);
                 if (!v) return nullptr;
+                // CG-nullable: a NULLABLE VALUE field (int?, bool?, …) stores
+                // the tagged struct {i8 hasValue; T value}, never a bare T.
+                // Wrap a plain primitive argument (and lower a `null` literal
+                // to the all-zero null), mirroring buildOrderedArgs — without
+                // this the bare T would be stored into the wider struct slot,
+                // leaving the value half uninitialized. per §9.1
+                const sema::TypeRef* fty = recordMemberType(fields[i]);
+                if (isNullablePrimTy(fty)) {
+                    auto* expectedSt = nullablePrimStructTy(fty->primitive);
+                    if (v->getType() != expectedSt) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v))
+                            v = nullablePrimNull(fty->primitive);
+                        else if (v->getType() == expectedSt->getElementType(1))
+                            v = wrapNullablePrim(fty->primitive, v);
+                    }
+                }
                 auto idxIt = fieldIndex_.find(fields[i]);
                 if (idxIt == fieldIndex_.end()) return nullptr;
                 builder_.CreateStore(
@@ -2480,6 +2497,20 @@ llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
         if (idxIt == fieldIndex_.end()) continue;
         llvm::Value* v = lowerExpr(*init);
         if (!v) continue;
+        // CG-nullable: a NULLABLE VALUE field initialized with a plain value
+        // (`property N: int? := 9;`) must wrap the bare primitive into the
+        // {i8 hasValue; T value} struct, like the positional path above. per §9.2
+        const sema::TypeRef* fty = recordMemberType(m);
+        if (isNullablePrimTy(fty)) {
+            auto* expectedSt = nullablePrimStructTy(fty->primitive);
+            if (v->getType() != expectedSt) {
+                if (v->getType()->isPointerTy() &&
+                    llvm::isa<llvm::ConstantPointerNull>(v))
+                    v = nullablePrimNull(fty->primitive);
+                else if (v->getType() == expectedSt->getElementType(1))
+                    v = wrapNullablePrim(fty->primitive, v);
+            }
+        }
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, slot, idxIt->second));
     }

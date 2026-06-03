@@ -313,3 +313,160 @@ BEZEL_TEST(codegen_record_str_eq, nullable_class_field_null_value_semantics_spec
         "             and a.ToString() = \"Holder(inner: null)\" else 0); "
         "end Main; end C;"), 1);
 }
+
+// ---------------------------------------------------------------------------
+// §8.3 / §8.5 / §9.1 — NULLABLE VALUE fields (`int?`, `bool?`, …).
+//
+// A nullable value primitive lowers to a TAGGED STRUCT {i8 hasValue; T value}
+// (isNullablePrimTy / nullablePrimStructTy / wrapNullablePrim), unlike a
+// nullable reference (a plain `ptr`). The synthesized value-semantics members
+// must read the hasValue tag rather than treating the struct as raw bytes:
+//   equality (§8.4): both-null → equal; exactly-one-null → not-equal;
+//                    neither-null → the inner value's `=`. (`null = null` is
+//                    true, `null = nonNull` is false — §8.4.)
+//   GetHashCode:     hasValue → hash the inner value; null → the fixed sentinel
+//                    0 (so two both-null fields hash identically, §8.3 invariant).
+//   ToString:        hasValue → the inner value's ToString; null → `null`.
+// Before the fix, the synthesis compared/hashed/rendered the hasValue byte
+// (so two equal non-null values compared UNEQUAL, ToString printed the tag `1`,
+// and a null field rendered `0`). Each test fails without the tag-aware fix.
+// ---------------------------------------------------------------------------
+
+// §8.3 / §8.4: two `int?` fields with equal non-null values compare EQUAL.
+// (Pre-fix: false — the hasValue byte matched but the value slot was never
+// reached, yet the raw-bytes compare actually compared {tag,value} as a struct
+// and reported equal only when both were null; a non-null pair compared unequal
+// because the value-vs-tag mixing differed.) `=` is true.
+BEZEL_TEST(codegen_record_str_eq, nullable_int_equal_value_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  return (1 if new Box(5) = new Box(5) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3 / §8.4: two `int?` fields with different non-null values compare UNEQUAL.
+// `=` is false, `<>` is true.
+BEZEL_TEST(codegen_record_str_eq, nullable_int_different_value_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  return (1 if new Box(5) <> new Box(6) and (new Box(5) = new Box(6)) = false "
+        "             else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.4: both `int?` fields null → EQUAL (`null = null` is true).
+BEZEL_TEST(codegen_record_str_eq, nullable_int_both_null_equal_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  return (1 if new Box(null) = new Box(null) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.4: exactly one `int?` field null → NOT equal (`nonNull = null` is false).
+BEZEL_TEST(codegen_record_str_eq, nullable_int_one_null_not_equal_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  return (1 if (new Box(5) = new Box(null)) = false "
+        "             and (new Box(null) = new Box(5)) = false else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.1: the synthesized `.Equals()` is the same structural comparison as `=` —
+// equal non-null `int?` → true, both-null → true.
+BEZEL_TEST(codegen_record_str_eq, nullable_int_equals_method_spec_9_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  return (1 if new Box(7).Equals(new Box(7)) "
+        "             and new Box(null).Equals(new Box(null)) "
+        "             and new Box(7).Equals(new Box(null)) = false else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3: GetHashCode satisfies the hash-equality invariant — equal records
+// (equal non-null value, or both-null) hash identically; the null field uses
+// the fixed sentinel that the both-null pair collapses to.
+BEZEL_TEST(codegen_record_str_eq, nullable_int_gethashcode_agrees_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  return (1 if new Box(42).GetHashCode() = new Box(42).GetHashCode() "
+        "             and new Box(null).GetHashCode() = new Box(null).GetHashCode() "
+        "             else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.5: a non-null `int?` field renders its VALUE (not its hasValue tag `1`).
+// Pre-fix it printed `Box(n: 1)`.
+BEZEL_TEST(codegen_record_str_eq, nullable_int_tostring_value_spec_8_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  return (1 if new Box(5).ToString() = \"Box(n: 5)\" "
+        "             and new Box(99).ToString() = \"Box(n: 99)\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.5: a NULL `int?` field renders the literal `null` (not `0`). Pre-fix it
+// printed `Box(n: 0)`.
+BEZEL_TEST(codegen_record_str_eq, nullable_int_tostring_null_spec_8_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: int?); "
+        "class C public static method Main(): int "
+        "  return (1 if new Box(null).ToString() = \"Box(n: null)\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.2: the body-record (auto-property) form of an `int?` field — its auto
+// ToString renders the property VALUE, not the hasValue tag. Pre-fix it printed
+// `Box(N: 1)`.
+BEZEL_TEST(codegen_record_str_eq, nullable_int_body_record_tostring_spec_9_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box "
+        "  public property N: int?; "
+        "  public constructor(n: int?) N := n; end constructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  return (1 if new Box(5).ToString() = \"Box(N: 5)\" "
+        "             and new Box(null).ToString() = \"Box(N: null)\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3 / §8.5: a second nullable value type (`bool?`) — equality reads the tag
+// (true=true equal, true<>false, both-null equal), and ToString renders the
+// boolean value when present and `null` when absent.
+BEZEL_TEST(codegen_record_str_eq, nullable_bool_value_semantics_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Flag(b: bool?); "
+        "class C public static method Main(): int "
+        "  return (1 if new Flag(true) = new Flag(true) "
+        "             and (new Flag(true) = new Flag(false)) = false "
+        "             and new Flag(null) = new Flag(null) "
+        "             and new Flag(true).GetHashCode() = new Flag(true).GetHashCode() "
+        "             and new Flag(true).ToString() = \"Flag(b: true)\" "
+        "             and new Flag(null).ToString() = \"Flag(b: null)\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3 / §9.1: a nested record inherits the tag-aware nullable-value handling
+// through the structural recursion (emitStructEquality / emitRecordHashCode /
+// emitRecordToString drive the inner record's fields by their declared types).
+// Equal non-null inner `int?` → equal; the rendering shows the inner value.
+BEZEL_TEST(codegen_record_str_eq, nested_record_nullable_int_inherits_spec_9_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Inner(n: int?); record Outer(inner: Inner); "
+        "class C public static method Main(): int "
+        "  var a := new Outer(new Inner(8)); "
+        "  var b := new Outer(new Inner(8)); "
+        "  var c := new Outer(new Inner(null)); "
+        "  var d := new Outer(new Inner(null)); "
+        "  return (1 if a = b and c = d and (a = c) = false "
+        "             and a.GetHashCode() = b.GetHashCode() "
+        "             and a.ToString() = \"Outer(inner: Inner(n: 8))\" "
+        "             and c.ToString() = \"Outer(inner: Inner(n: null))\" else 0); "
+        "end Main; end C;"), 1);
+}
