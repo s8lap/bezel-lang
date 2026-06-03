@@ -852,6 +852,292 @@ void* bz_array_enum_alloc(void* arr, int64_t elem_size) {
     return e;
 }
 
+// ---------------------------------------------------------------------------
+// Lazy LINQ enumerators (stdlib §5: "All are lazy unless documented otherwise").
+//
+// Every LINQ operator returns a deferred enumerator that does no work until it
+// is enumerated (by a for-loop or a materializer like ToArray). The enumerators
+// share the iterator vtable protocol [td, Dispose, MoveNext, Current] used by
+// the codegen iterator state machines (LlvmBackend_Iterators.cpp) and the array
+// enumerator above:
+//   slot 0 = type descriptor (self-pointer sentinel)
+//   slot 1 = Dispose(self) -> void
+//   slot 2 = MoveNext(self) -> int32 (1 = advanced, 0 = exhausted)
+//   slot 3 = Current(self)  -> void* (pointer to the current element's bytes)
+//
+// Element data is type-erased (raw bytes of `esz` bytes). Closures (predicates,
+// selectors, key functions) are invoked through codegen-emitted trampolines
+// with fixed C signatures so the runtime stays element-type-agnostic:
+//   predicate trampoline: int32_t f(void* closure, const void* elem_ptr)
+//   selector  trampoline: void    f(void* closure, const void* elem_ptr, void* out_ptr)
+//   key       trampoline: int64_t f(void* closure, const void* elem_ptr)
+// A lazy operator over an Array<T> wraps the array via bz_lazy_from_array; over
+// another lazy enumerator it stores the upstream enumerator pointer directly,
+// so chains (`a.Where(..).Select(..).Take(n)`) compose without materializing.
+// ---------------------------------------------------------------------------
+
+typedef int32_t (*bz_pred_fn)(void* closure, const void* elem);
+typedef void    (*bz_sel_fn)(void* closure, const void* elem, void* out);
+typedef int64_t (*bz_key_fn)(void* closure, const void* elem);
+// Element equality trampoline (Distinct): content-aware comparison the runtime
+// cannot do over type-erased bytes (e.g. string content equality vs. raw bytes).
+typedef int32_t (*bz_eq_fn)(const void* a, const void* b);
+
+enum bz_lazy_kind {
+    BZ_LAZY_ARRAY,    // source = bz_array_t*, iterate by index
+    BZ_LAZY_WHERE,    // filter via predicate
+    BZ_LAZY_SELECT,   // project via selector (esz = output element size)
+    BZ_LAZY_TAKE,     // first `n` elements
+    BZ_LAZY_SKIP,     // skip first `n` elements
+    BZ_LAZY_DISTINCT, // de-duplicate (raw-byte equality, order preserved)
+    BZ_LAZY_ORDERBY,  // materialize-on-first-MoveNext: sorted snapshot
+};
+
+struct bz_lazy_t {
+    void*   vtable;     // shared bz_lazy_vtable
+    int32_t kind;
+    int64_t esz;        // element size in bytes (output size for SELECT)
+    // Source: either an upstream lazy enumerator (`up`) or an array (`arr`).
+    bz_lazy_t* up;      // upstream enumerator (null for ARRAY)
+    void*   arr;        // bz_array_t* (ARRAY kind)
+    int64_t idx;        // ARRAY: current index; TAKE/SKIP: count consumed
+    int64_t n;          // TAKE/SKIP threshold
+    // Closure + trampoline (WHERE/SELECT/ORDERBY).
+    void*   closure;
+    bz_pred_fn pred;
+    bz_sel_fn  sel;
+    bz_key_fn  keyfn;
+    bz_eq_fn   eqfn;    // DISTINCT: element equality (null = raw memcmp)
+    int32_t descending; // ORDERBY direction
+    // Scratch storage for the current element bytes (Current returns cur).
+    void*   cur;        // malloc'd, esz bytes
+    // DISTINCT: a dynamic array of seen elements.
+    void*   seen;       // bz_array_t* of element bytes (DISTINCT)
+    // ORDERBY: materialized + sorted snapshot, iterated by index.
+    void*   sorted;     // bz_array_t* (ORDERBY)
+    int32_t skipped;    // SKIP: have we already dropped the first n?
+    int32_t materialized;
+};
+
+// Advance the upstream enumerator and return a pointer to its current element,
+// or null when exhausted.
+static const void* bz_lazy_up_next(bz_lazy_t* up) {
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    void** vt = (void**)up->vtable;
+    if (!((mn_t)vt[2])(up)) return nullptr;
+    return ((cur_t)vt[3])(up);
+}
+
+static int32_t bz_lazy_movenext(bz_lazy_t* e);
+static void*   bz_lazy_current(bz_lazy_t* e) { return e->cur; }
+static void    bz_lazy_dispose(bz_lazy_t* e) {
+    if (!e) return;
+    if (e->up) bz_lazy_dispose(e->up);
+    if (e->cur) free(e->cur);
+    if (e->seen) bz_array_free(e->seen, nullptr);
+    if (e->sorted) bz_array_free(e->sorted, nullptr);
+    free(e);
+}
+
+static void* bz_lazy_vtable[4] = {
+    nullptr,
+    (void*)bz_lazy_dispose,
+    (void*)bz_lazy_movenext,
+    (void*)bz_lazy_current,
+};
+
+static bz_lazy_t* bz_lazy_new(int32_t kind, int64_t esz) {
+    auto* e = (bz_lazy_t*)calloc(1, sizeof(bz_lazy_t));
+    bz_lazy_vtable[0] = bz_lazy_vtable;  // self-referential td sentinel
+    e->vtable = bz_lazy_vtable;
+    e->kind = kind;
+    e->esz = esz;
+    e->idx = 0;
+    if (esz > 0) e->cur = malloc((size_t)esz);
+    return e;
+}
+
+extern "C" void* bz_lazy_from_array(void* arr, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
+    e->arr = arr;
+    return e;
+}
+
+extern "C" void* bz_lazy_where(void* up, void* closure, void* pred) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_WHERE, u->esz);
+    e->up = u;
+    e->closure = closure;
+    e->pred = (bz_pred_fn)pred;
+    return e;
+}
+
+extern "C" void* bz_lazy_select(void* up, int64_t out_esz,
+                                void* closure, void* sel) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_SELECT, out_esz);
+    e->up = u;
+    e->closure = closure;
+    e->sel = (bz_sel_fn)sel;
+    return e;
+}
+
+extern "C" void* bz_lazy_take(void* up, int64_t n) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_TAKE, u->esz);
+    e->up = u;
+    e->n = n;
+    return e;
+}
+
+extern "C" void* bz_lazy_skip(void* up, int64_t n) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_SKIP, u->esz);
+    e->up = u;
+    e->n = n;
+    return e;
+}
+
+extern "C" void* bz_lazy_distinct(void* up, void* eqfn) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_DISTINCT, u->esz);
+    e->up = u;
+    e->eqfn = (bz_eq_fn)eqfn;
+    e->seen = bz_array_alloc(u->esz, 8);
+    return e;
+}
+
+extern "C" void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
+                                 int32_t descending) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_ORDERBY, u->esz);
+    e->up = u;
+    e->closure = closure;
+    e->keyfn = (bz_key_fn)keyfn;
+    e->descending = descending;
+    return e;
+}
+
+// ORDERBY: drain upstream into a snapshot, then stable-sort by the int64 key.
+static void bz_lazy_orderby_materialize(bz_lazy_t* e) {
+    e->sorted = bz_array_alloc(e->esz, 8);
+    const void* p;
+    while ((p = bz_lazy_up_next(e->up)) != nullptr)
+        bz_array_add(e->sorted, p, e->esz);
+    auto* arr = (bz_array_t*)e->sorted;
+    int64_t cnt = arr->count;
+    // Stable insertion sort by int64 key (matches the spec's stable-ordering
+    // guarantee for OrderBy; n is small in test scenarios).
+    void* tmp = malloc((size_t)e->esz);
+    for (int64_t i = 1; i < cnt; ++i) {
+        memcpy(tmp, (char*)arr->data + i * e->esz, (size_t)e->esz);
+        int64_t key_i = e->keyfn(e->closure, tmp);
+        int64_t j = i - 1;
+        while (j >= 0) {
+            int64_t key_j = e->keyfn(e->closure, (char*)arr->data + j * e->esz);
+            int shift = e->descending ? (key_j < key_i) : (key_j > key_i);
+            if (!shift) break;
+            memcpy((char*)arr->data + (j + 1) * e->esz,
+                   (char*)arr->data + j * e->esz, (size_t)e->esz);
+            --j;
+        }
+        memcpy((char*)arr->data + (j + 1) * e->esz, tmp, (size_t)e->esz);
+    }
+    free(tmp);
+    e->idx = 0;
+    e->materialized = 1;
+}
+
+static int32_t bz_lazy_movenext(bz_lazy_t* e) {
+    switch (e->kind) {
+    case BZ_LAZY_ARRAY: {
+        if (e->idx >= bz_array_len(e->arr)) return 0;
+        memcpy(e->cur, bz_array_ptr_at(e->arr, e->idx, e->esz), (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
+    case BZ_LAZY_WHERE: {
+        const void* p;
+        while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+            if (e->pred(e->closure, p)) {
+                memcpy(e->cur, p, (size_t)e->esz);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case BZ_LAZY_SELECT: {
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) return 0;
+        e->sel(e->closure, p, e->cur);  // selector writes esz output bytes
+        return 1;
+    }
+    case BZ_LAZY_TAKE: {
+        if (e->idx >= e->n) return 0;
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) return 0;
+        memcpy(e->cur, p, (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
+    case BZ_LAZY_SKIP: {
+        if (!e->skipped) {
+            const void* p;
+            while (e->idx < e->n && (p = bz_lazy_up_next(e->up)) != nullptr)
+                e->idx++;
+            e->skipped = 1;
+        }
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) return 0;
+        memcpy(e->cur, p, (size_t)e->esz);
+        return 1;
+    }
+    case BZ_LAZY_DISTINCT: {
+        const void* p;
+        auto* seen = (bz_array_t*)e->seen;
+        while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+            int dup = 0;
+            for (int64_t i = 0; i < seen->count; ++i) {
+                const void* s = (char*)seen->data + i * e->esz;
+                int same = e->eqfn ? e->eqfn(s, p)
+                                   : (memcmp(s, p, (size_t)e->esz) == 0);
+                if (same) { dup = 1; break; }
+            }
+            if (!dup) {
+                bz_array_add(e->seen, p, e->esz);
+                memcpy(e->cur, p, (size_t)e->esz);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case BZ_LAZY_ORDERBY: {
+        if (!e->materialized) bz_lazy_orderby_materialize(e);
+        auto* arr = (bz_array_t*)e->sorted;
+        if (e->idx >= arr->count) return 0;
+        memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
+    }
+    return 0;
+}
+
+// Materialize a lazy enumerator into a fresh owned Array<T> (stdlib §5 ToArray,
+// the eager materialization point). Consumes (drains + disposes) the pipeline.
+extern "C" void* bz_lazy_to_array(void* lazy, int64_t esz) {
+    auto* e = (bz_lazy_t*)lazy;
+    void* arr = bz_array_alloc(esz, 8);
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    while (((mn_t)vt[2])(e))
+        bz_array_add(arr, ((cur_t)vt[3])(e), esz);
+    bz_lazy_dispose(e);
+    return arr;
+}
+
 void* bz_string_split(const char* s, int64_t s_len,
                        const char* delim, int64_t delim_len) {
     void* arr = bz_array_alloc(8, 8);

@@ -218,6 +218,24 @@ void  bz_task_free(void* task);
 void* bz_array_enum_alloc(void* arr, int64_t elem_size);
 
 // ---------------------------------------------------------------------------
+// Lazy LINQ enumerators (stdlib §5). Each operator returns a deferred
+// enumerator (vtable [td, Dispose, MoveNext(->i32), Current(->void*)]) that
+// does no work until enumerated. Operators compose by storing the upstream
+// enumerator; an Array<T> source is wrapped via bz_lazy_from_array. Closures
+// are invoked through codegen trampolines (fixed C signatures, see .cpp).
+// ---------------------------------------------------------------------------
+void* bz_lazy_from_array(void* arr, int64_t elem_size);
+void* bz_lazy_where(void* up, void* closure, void* pred);            // pred: i32(closure, elem)
+void* bz_lazy_select(void* up, int64_t out_elem_size,
+                     void* closure, void* sel);                      // sel: void(closure, elem, out)
+void* bz_lazy_take(void* up, int64_t n);
+void* bz_lazy_skip(void* up, int64_t n);
+void* bz_lazy_distinct(void* up, void* eqfn);                        // eqfn: i32(a, b) (null = raw bytes)
+void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
+                      int32_t descending);                           // keyfn: i64(closure, elem)
+void* bz_lazy_to_array(void* lazy, int64_t elem_size);
+
+// ---------------------------------------------------------------------------
 // Split a string by a delimiter: returns bz_array_t* of bz.string* (heap alloc'd).
 // Caller disposes result array. All pointers point into separately malloc'd strings.
 void* bz_string_split(const char* s, int64_t s_len,

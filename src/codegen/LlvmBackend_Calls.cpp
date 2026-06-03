@@ -450,97 +450,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return builder_.CreateLoad(i32(), cntSlot, "cnt.r");
         }
 
-        // per §5 LINQ: .Select(fn: (T)->U): Array<U>
-        if (m == "Select" && call.args.size() == 1 && call.args[0].value) {
-            // Determine output element type from the lambda's return type.
-            sema::TypeRef* retSemaType = nullptr;
-            llvm::Type* retElemTy = i32();  // default
-            if (auto* lamTy = ctx_.exprType(*call.args[0].value)) {
-                if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
-                    retSemaType = lamTy->funcReturn;
-                    retElemTy = lowerTypeRef(retSemaType);
-                }
-            }
-            int64_t retEsz = 8;
-            if (retElemTy) {
-                if (retElemTy->isIntegerTy(32) || retElemTy->isFloatTy()) retEsz = 4;
-                else if (retElemTy->isIntegerTy(1) || retElemTy->isIntegerTy(8)) retEsz = 1;
-                else if (retElemTy->isIntegerTy(16)) retEsz = 2;
-                else retEsz = 8;
-            }
-            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
-            if (!closure) return nullptr;
-            llvm::Type* elemTy = getElemTy();
-            auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
-            llvm::Value* result = builder_.CreateCall(allocFn,
-                {builder_.getInt64(retEsz), builder_.getInt64(16)});
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "sel.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sel.b", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sel.e", currentFn_);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
-            builder_.SetInsertPoint(bodyBB);
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            llvm::Value* mapped = callClosure(closure, el, retElemTy ? retElemTy
-                                                                      : i32());
-            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
-                                   {ptrTy(), ptrTy(), i64()});
-            auto* mapSlot = entryAlloca(mapped->getType());
-            builder_.CreateStore(mapped, mapSlot);
-            builder_.CreateCall(addFn, {result, mapSlot, builder_.getInt64(retEsz)});
-            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(endBB);
-            return result;
-        }
-
-        // per §5 LINQ: .Where(pred: (T)->bool): Array<T>
-        if (m == "Where" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
-                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
-            if (!closure) return nullptr;
-            llvm::Type* elemTy = getElemTy();
-            auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
-            llvm::Value* result = builder_.CreateCall(allocFn,
-                {builder_.getInt64(esz), builder_.getInt64(16)});
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "whr.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "whr.b", currentFn_);
-            auto* addBB  = llvm::BasicBlock::Create(llvm_, "whr.a", currentFn_);
-            auto* nextBB = llvm::BasicBlock::Create(llvm_, "whr.n", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "whr.e", currentFn_);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
-            builder_.SetInsertPoint(bodyBB);
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            llvm::Value* ok = callClosure(closure, el, i1());
-            builder_.CreateCondBr(ok, addBB, nextBB);
-            builder_.SetInsertPoint(addBB);
-            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
-                                   {ptrTy(), ptrTy(), i64()});
-            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
-            builder_.CreateBr(nextBB);
-            builder_.SetInsertPoint(nextBB);
-            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(endBB);
-            return result;
-        }
+        // per §5 LINQ: .Select / .Where are LAZY — see tryLowerLazyLinqCall,
+        // dispatched before this collection path.
 
         // .Length: int / .Count: int
         if ((m == "Length" || m == "Count") && call.args.empty()) {
@@ -665,77 +576,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             return builder_.CreateLoad(elemTy, resultSlot, "fst.r");
         }
-        // per §5 LINQ: .Skip(n: int): Array<T> — return elements from index n onward
-        if (m == "Skip" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* nV = lowerExpr(*call.args[0].value);
-            if (!nV) return nullptr;
-            llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
-                : builder_.CreateSExt(nV, i64(), "sk.n");
-            llvm::Type* elemTy = getElemTy();
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            // startIdx = max(0, min(n, len))
-            llvm::Value* clampedN = builder_.CreateSelect(
-                builder_.CreateICmpSLT(n64, builder_.getInt64(0)), builder_.getInt64(0),
-                builder_.CreateSelect(builder_.CreateICmpSGT(n64, len), len, n64));
-            auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
-            llvm::Value* result = builder_.CreateCall(allocFn2,
-                {builder_.getInt64(esz), builder_.getInt64(16)});
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(clampedN, idxSlot);
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "sk.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sk.b", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sk.e", currentFn_);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
-            builder_.SetInsertPoint(bodyBB);
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
-                                   {ptrTy(), ptrTy(), i64()});
-            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
-            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(endBB);
-            return result;
-        }
-        // per §5 LINQ: .Take(n: int): Array<T> — return first n elements
-        if (m == "Take" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* nV = lowerExpr(*call.args[0].value);
-            if (!nV) return nullptr;
-            llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
-                : builder_.CreateSExt(nV, i64(), "tk.n");
-            llvm::Type* elemTy = getElemTy();
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            llvm::Value* endIdx = builder_.CreateSelect(
-                builder_.CreateICmpSLT(n64, builder_.getInt64(0)), builder_.getInt64(0),
-                builder_.CreateSelect(builder_.CreateICmpSGT(n64, len), len, n64));
-            auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
-            llvm::Value* result = builder_.CreateCall(allocFn2,
-                {builder_.getInt64(esz), builder_.getInt64(16)});
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "tk.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "tk.b", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "tk.e", currentFn_);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, endIdx), bodyBB, endBB);
-            builder_.SetInsertPoint(bodyBB);
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
-                                   {ptrTy(), ptrTy(), i64()});
-            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
-            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(endBB);
-            return result;
-        }
+        // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
+
         // per §3: .Sort() — in-place ascending sort for int arrays.
         // Uses bz_array_sort with a built-in i32 comparator thunk.
         if (m == "Sort" && call.args.empty()) {
@@ -825,99 +667,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             return llvm::ConstantInt::get(i32(), 0);
         }
-        // per §5 LINQ: .OrderBy(key: (T)->int): Array<T> — stable sort by int key (asc).
-        // Implemented as selection sort on a copy using the key closure.
-        if ((m == "OrderBy" || m == "OrderByDescending") &&
-            call.args.size() == 1 && call.args[0].value) {
-            bool desc = (m == "OrderByDescending");
-            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
-                ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
-            if (!closure) return nullptr;
-            llvm::Type* elemTy = getElemTy();
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            // Copy source into result array.
-            auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
-            llvm::Value* result = builder_.CreateCall(allocFn2,
-                {builder_.getInt64(esz), len});
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
-                                   {ptrTy(), ptrTy(), i64()});
-            {
-                auto* idxS = entryAlloca(i64());
-                builder_.CreateStore(builder_.getInt64(0), idxS);
-                auto* cBB = llvm::BasicBlock::Create(llvm_, "ob.cc", currentFn_);
-                auto* bBB = llvm::BasicBlock::Create(llvm_, "ob.cb", currentFn_);
-                auto* eBB = llvm::BasicBlock::Create(llvm_, "ob.ce", currentFn_);
-                builder_.CreateBr(cBB);
-                builder_.SetInsertPoint(cBB);
-                llvm::Value* ci = builder_.CreateLoad(i64(), idxS);
-                builder_.CreateCondBr(builder_.CreateICmpSLT(ci, len), bBB, eBB);
-                builder_.SetInsertPoint(bBB);
-                llvm::Value* ep2 = builder_.CreateCall(ptrFn, {recv, ci, builder_.getInt64(esz)});
-                builder_.CreateCall(addFn, {result, ep2, builder_.getInt64(esz)});
-                builder_.CreateStore(builder_.CreateAdd(ci, builder_.getInt64(1)), idxS);
-                builder_.CreateBr(cBB);
-                builder_.SetInsertPoint(eBB);
-            }
-            // Insertion sort on result using the key closure.
-            auto* iSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(1), iSlot);
-            auto* isortCond = llvm::BasicBlock::Create(llvm_, "ob.ic", currentFn_);
-            auto* isortBody = llvm::BasicBlock::Create(llvm_, "ob.ib", currentFn_);
-            auto* isortEnd  = llvm::BasicBlock::Create(llvm_, "ob.ie", currentFn_);
-            builder_.CreateBr(isortCond);
-            builder_.SetInsertPoint(isortCond);
-            llvm::Value* oi = builder_.CreateLoad(i64(), iSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(oi, len), isortBody, isortEnd);
-            builder_.SetInsertPoint(isortBody);
-            // key_i = closure(result[oi]); elem_i = result[oi]
-            llvm::Value* piPtr = builder_.CreateCall(ptrFn, {result, oi, builder_.getInt64(esz)});
-            llvm::Value* elem_i = builder_.CreateLoad(elemTy, piPtr);
-            llvm::Value* key_i  = callClosure(closure, elem_i, i32());
-            // Store key and elem temporaries
-            auto* keySlot = entryAlloca(i32());
-            auto* elemSlot = entryAlloca(elemTy);
-            builder_.CreateStore(key_i, keySlot);
-            builder_.CreateStore(elem_i, elemSlot);
-            // j = oi - 1; while j >= 0 && key(result[j]) > key_i: shift right
-            auto* jSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.CreateSub(oi, builder_.getInt64(1)), jSlot);
-            auto* wCond = llvm::BasicBlock::Create(llvm_, "ob.wc", currentFn_);
-            auto* wBody = llvm::BasicBlock::Create(llvm_, "ob.wb", currentFn_);
-            auto* wEnd  = llvm::BasicBlock::Create(llvm_, "ob.we", currentFn_);
-            auto* wKeyBB = llvm::BasicBlock::Create(llvm_, "ob.wk", currentFn_);
-            builder_.CreateBr(wCond);
-            builder_.SetInsertPoint(wCond);
-            llvm::Value* oj = builder_.CreateLoad(i64(), jSlot);
-            llvm::Value* jValid = builder_.CreateICmpSGE(oj, builder_.getInt64(0));
-            builder_.CreateCondBr(jValid, wKeyBB, wEnd);
-            builder_.SetInsertPoint(wKeyBB);
-            llvm::Value* pjPtr = builder_.CreateCall(ptrFn, {result, oj, builder_.getInt64(esz)});
-            llvm::Value* elem_j = builder_.CreateLoad(elemTy, pjPtr);
-            llvm::Value* key_j  = callClosure(closure, elem_j, i32());
-            llvm::Value* needShift = desc
-                ? builder_.CreateICmpSLT(key_j, builder_.CreateLoad(i32(), keySlot))
-                : builder_.CreateICmpSGT(key_j, builder_.CreateLoad(i32(), keySlot));
-            builder_.CreateCondBr(needShift, wBody, wEnd);
-            builder_.SetInsertPoint(wBody);
-            // result[j+1] = result[j]
-            llvm::Value* pj1Ptr = builder_.CreateCall(ptrFn, {result,
-                builder_.CreateAdd(oj, builder_.getInt64(1)), builder_.getInt64(esz)});
-            builder_.CreateStore(elem_j, pj1Ptr);
-            builder_.CreateStore(builder_.CreateSub(oj, builder_.getInt64(1)), jSlot);
-            builder_.CreateBr(wCond);
-            builder_.SetInsertPoint(wEnd);
-            // result[j+1] = elem_i
-            llvm::Value* ojEnd = builder_.CreateLoad(i64(), jSlot);
-            llvm::Value* pInsert = builder_.CreateCall(ptrFn, {result,
-                builder_.CreateAdd(ojEnd, builder_.getInt64(1)), builder_.getInt64(esz)});
-            builder_.CreateStore(builder_.CreateLoad(elemTy, elemSlot), pInsert);
-            builder_.CreateStore(builder_.CreateAdd(oi, builder_.getInt64(1)), iSlot);
-            builder_.CreateBr(isortCond);
-            builder_.SetInsertPoint(isortEnd);
-            return result;
-        }
+        // per §5 LINQ: .OrderBy / .OrderByDescending are LAZY — see
+        // tryLowerLazyLinqCall (the sorted snapshot is built on first
+        // enumeration, after which iteration is deferred per element).
+
         // per §3: .IndexOf(item): int — index of first match, -1 if not found
         if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
@@ -968,69 +721,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phiIdx->addIncoming(builder_.getInt64(-1), condBB);
             return builder_.CreateTrunc(phiIdx, i32(), "iof.i32");
         }
-        // per §5 LINQ: .Distinct(): Array<T> — remove duplicates (order preserved)
-        if (m == "Distinct" && call.args.empty()) {
-            llvm::Type* elemTy = getElemTy();
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
-            llvm::Value* result = builder_.CreateCall(allocFn2,
-                {builder_.getInt64(esz), builder_.getInt64(16)});
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "dst.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dst.b", currentFn_);
-            auto* addBB  = llvm::BasicBlock::Create(llvm_, "dst.a", currentFn_);
-            auto* nextBB = llvm::BasicBlock::Create(llvm_, "dst.n", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "dst.e", currentFn_);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
-            builder_.SetInsertPoint(bodyBB);
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            // Check if el already in result — use Contains logic inline
-            auto* resLenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* resLen = builder_.CreateCall(resLenFn, {result});
-            auto* idxSlot2 = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot2);
-            auto* chkCond = llvm::BasicBlock::Create(llvm_, "dst.cc", currentFn_);
-            auto* chkBody = llvm::BasicBlock::Create(llvm_, "dst.cb", currentFn_);
-            auto* chkEnd  = llvm::BasicBlock::Create(llvm_, "dst.ce", currentFn_);
-            builder_.CreateBr(chkCond);
-            builder_.SetInsertPoint(chkCond);
-            llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot2);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx2, resLen), chkBody, chkEnd);
-            builder_.SetInsertPoint(chkBody);
-            llvm::Value* ep2 = builder_.CreateCall(ptrFn, {result, idx2, builder_.getInt64(esz)});
-            llvm::Value* el2 = builder_.CreateLoad(elemTy, ep2);
-            llvm::Value* eq;
-            if (el->getType()->isPointerTy() && el2->getType()->isPointerTy())
-                eq = emitStringEq(el, el2);
-            else
-                eq = builder_.CreateICmpEQ(el, el2);
-            builder_.CreateCondBr(eq, chkEnd, [&]{ // found dup → exit check
-                builder_.CreateStore(builder_.CreateAdd(idx2, builder_.getInt64(1)), idxSlot2);
-                return chkCond;
-            }());
-            builder_.SetInsertPoint(chkEnd);
-            // If idx2 == resLen → not found → add; else → dup → skip
-            llvm::Value* idx2End = builder_.CreateLoad(i64(), idxSlot2);
-            llvm::Value* notDup = builder_.CreateICmpEQ(idx2End, resLen);
-            builder_.CreateCondBr(notDup, addBB, nextBB);
-            builder_.SetInsertPoint(addBB);
-            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
-                                   {ptrTy(), ptrTy(), i64()});
-            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
-            builder_.CreateBr(nextBB);
-            builder_.SetInsertPoint(nextBB);
-            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(endBB);
-            return result;
-        }
+        // per §5 LINQ: .Distinct() is LAZY — see tryLowerLazyLinqCall.
+
         // .Add(v) / .Push(v) / .Enqueue(v)
         if ((m == "Add" || m == "Push" || m == "Enqueue") &&
             call.args.size() == 1 && call.args[0].value) {
@@ -2782,6 +2474,11 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     }
     // §3.4: primitive type static methods: int.Parse(s), double.Parse(s), etc.
     if (auto* v = tryLowerPrimitiveStaticCall(call)) return v;
+    // stdlib §5: deferred LINQ operators (Where/Select/Take/Skip/Distinct/
+    // OrderBy[Descending]) and the ToArray materializer. Handled before the
+    // collection path so they intercept LINQ calls on both Array<T> receivers
+    // and lazy IEnumerable<T> receivers (chaining).
+    if (auto* v = tryLowerLazyLinqCall(call)) return v;
     // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
@@ -3562,6 +3259,243 @@ bool Emitter::isStringExprType(const ast::Expr& e) {
     auto* rt = ctx_.exprType(e);
     return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
            rt->primitive == sema::PrimitiveType::String;
+}
+
+
+// ===========================================================================
+// stdlib §5: deferred (lazy) LINQ operators.
+//
+// LINQ operators do no work until enumerated. Each operator lowers to a call
+// into the runtime lazy-enumerator family (bz_lazy_*). Closures (predicates,
+// selectors, key functions) are bridged to the type-erased runtime via small
+// trampoline functions emitted here.
+// ===========================================================================
+
+// The byte size of an element of LLVM type `ty` as stored in a type-erased
+// array slot (mirrors collectionElemSize's element-size choices).
+static int64_t lazyElemSize(llvm::Type* ty) {
+    if (!ty) return 8;
+    if (ty->isIntegerTy(32) || ty->isFloatTy()) return 4;
+    if (ty->isIntegerTy(1) || ty->isIntegerTy(8)) return 1;
+    if (ty->isIntegerTy(16)) return 2;
+    return 8;  // i64 / double / pointer (string, class)
+}
+
+bool Emitter::isLazyEnumerableType(const sema::TypeRef* rt) {
+    // The lazy LINQ sentinel: a Named TypeRef with no declaration and no
+    // astNode, carrying the element type as genericArgs[0]. Produced only by
+    // the LINQ-operator typing in ExprTypecheck_Calls.cpp.
+    return rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+           !rt->astNode && !rt->genericArgs.empty();
+}
+
+llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
+                                             llvm::Type* outTy) {
+    // Build a fresh internal function (each LINQ-operator site gets its own;
+    // they are tiny and the closure type is baked into the IR).
+    llvm::FunctionType* fty = nullptr;
+    if (kind == 0)        // predicate: i32(ptr closure, ptr elem)
+        fty = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+    else if (kind == 1)   // selector: void(ptr closure, ptr elem, ptr out)
+        fty = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                      {ptrTy(), ptrTy(), ptrTy()}, false);
+    else if (kind == 2)   // key: i64(ptr closure, ptr elem)
+        fty = llvm::FunctionType::get(i64(), {ptrTy(), ptrTy()}, false);
+    else                  // equality: i32(ptr a, ptr b) — no closure
+        fty = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$linq$tramp", module_.get());
+    // Save/restore the builder's insert point AND currentFn_ — buildLinqTrampoline
+    // is called mid-lowering of the enclosing function, and helpers like
+    // emitStringEq create basic blocks in currentFn_, which must be the
+    // trampoline while we emit its body.
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+
+    if (kind == 3) {
+        // Element equality (Distinct): content-aware compare of two elements.
+        llvm::Value* a = builder_.CreateLoad(elemTy, fn->getArg(0), "eq.a");
+        llvm::Value* b = builder_.CreateLoad(elemTy, fn->getArg(1), "eq.b");
+        llvm::Value* eq = (elemTy->isPointerTy())
+            ? emitStringEq(a, b)               // string content equality (§4.6)
+            : builder_.CreateICmpEQ(a, b);     // value equality
+        builder_.CreateRet(builder_.CreateZExt(eq, i32()));
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        return fn;
+    }
+
+    llvm::Value* closure = fn->getArg(0);
+    llvm::Value* elemPtr = fn->getArg(1);
+    // Load the element value from the type-erased pointer.
+    llvm::Value* elem = builder_.CreateLoad(elemTy, elemPtr, "tramp.elem");
+    // Closure ABI: { ptr fn, ptr env }; call as fn(env, elem).
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
+    llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+
+    if (kind == 1) {
+        // Selector: call returns outTy; store it through the out pointer.
+        auto* clTy = llvm::FunctionType::get(outTy, {ptrTy(), elemTy}, false);
+        llvm::Value* mapped = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "cl.ret");
+        builder_.CreateStore(mapped, fn->getArg(2));
+        builder_.CreateRetVoid();
+    } else if (kind == 0) {
+        // Predicate: closure returns i1; widen to i32 for the C ABI.
+        auto* clTy = llvm::FunctionType::get(i1(), {ptrTy(), elemTy}, false);
+        llvm::Value* ok = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "cl.ret");
+        builder_.CreateRet(builder_.CreateZExt(ok, i32()));
+    } else {
+        // Key: closure returns the int key; widen to i64.
+        auto* clTy = llvm::FunctionType::get(i32(), {ptrTy(), elemTy}, false);
+        llvm::Value* k = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "cl.ret");
+        builder_.CreateRet(builder_.CreateSExt(k, i64()));
+    }
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
+                                            sema::TypeRef*& elemRef) {
+    auto* recvTy = ctx_.exprType(recvExpr);
+    llvm::Value* recv = lowerExpr(recvExpr);
+    if (!recv) return nullptr;
+    if (isLazyEnumerableType(recvTy)) {
+        // Already a lazy enumerator (chained LINQ): use it directly.
+        elemRef = recvTy->genericArgs[0];
+        return recv;
+    }
+    // Concrete collection (Array<T> family): wrap it as a lazy ARRAY source.
+    elemRef = (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                       : nullptr;
+    int64_t esz = collectionElemSize(recvTy);
+    auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+    return builder_.CreateCall(wrapFn, {recv, builder_.getInt64(esz)}, "lazy.src");
+}
+
+llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+
+    // Only intercept on a collection or lazy-enumerable receiver.
+    auto* recvTy = ctx_.exprType(*ma->target);
+    bool collRecv = isCollectionTypeName(recvTy);
+    bool lazyRecv = isLazyEnumerableType(recvTy);
+    if (!collRecv && !lazyRecv) return nullptr;
+
+    // Element LLVM type for the receiver's element TypeRef.
+    auto elemLlvmOf = [&](sema::TypeRef* er) -> llvm::Type* {
+        if (er) if (auto* t = lowerTypeRef(er)) return t;
+        return i32();
+    };
+
+    // ----- ToArray: materialize the (lazy) pipeline into an owned Array<T> ---
+    if (m == "ToArray" && call.args.empty()) {
+        sema::TypeRef* elemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
+        if (!lazy) return nullptr;
+        int64_t esz = lazyElemSize(elemLlvmOf(elemRef));
+        auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)}, "linq.toarr");
+    }
+
+    // The deferred operators. Lower the source to a lazy enumerator first.
+    bool isOp = (m == "Where" || m == "Select" || m == "Take" || m == "Skip" ||
+                 m == "Distinct" || m == "OrderBy" || m == "OrderByDescending");
+    if (!isOp) return nullptr;
+
+    sema::TypeRef* elemRef = nullptr;
+    llvm::Value* src = lowerToLazyEnumerator(*ma->target, elemRef);
+    if (!src) return nullptr;
+    llvm::Type* elemTy = elemLlvmOf(elemRef);
+
+    // Lower a LINQ lambda argument with the expected (T)->ret function type so
+    // unannotated lambda params get the right LLVM type.
+    auto lowerLinqLambda = [&](const ast::Expr* argExpr,
+                               sema::TypeRef* retTypeRef) -> llvm::Value* {
+        auto* funcRef = ctx_.makeTypeRef();
+        funcRef->kind = sema::TypeRef::Kind::Function;
+        funcRef->funcReturn = retTypeRef;
+        if (elemRef) {
+            sema::TypeRef::FuncParam fp;
+            fp.type = elemRef;
+            funcRef->funcParams.push_back(std::move(fp));
+        }
+        const sema::TypeRef* saved = expectedFunctionType_;
+        expectedFunctionType_ = funcRef;
+        llvm::Value* v = lowerExpr(*argExpr);
+        expectedFunctionType_ = saved;
+        return v;
+    };
+
+    if (m == "Where" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* closure = lowerLinqLambda(
+            call.args[0].value.get(),
+            ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildLinqTrampoline(0, elemTy, nullptr);
+        auto* whereFn = declareC("bz_lazy_where", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(whereFn, {src, closure, tramp}, "linq.where");
+    }
+    if (m == "Select" && call.args.size() == 1 && call.args[0].value) {
+        sema::TypeRef* retSemaType = nullptr;
+        llvm::Type* outTy = i32();
+        if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                retSemaType = lamTy->funcReturn;
+                if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
+            }
+        llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildLinqTrampoline(1, elemTy, outTy);
+        int64_t outEsz = lazyElemSize(outTy);
+        auto* selFn = declareC("bz_lazy_select", ptrTy(),
+                               {ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(selFn,
+            {src, builder_.getInt64(outEsz), closure, tramp}, "linq.select");
+    }
+    if (m == "Take" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* nV = lowerExpr(*call.args[0].value);
+        if (!nV) return nullptr;
+        llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
+            : builder_.CreateSExt(nV, i64(), "tk.n");
+        auto* takeFn = declareC("bz_lazy_take", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(takeFn, {src, n64}, "linq.take");
+    }
+    if (m == "Skip" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* nV = lowerExpr(*call.args[0].value);
+        if (!nV) return nullptr;
+        llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
+            : builder_.CreateSExt(nV, i64(), "sk.n");
+        auto* skipFn = declareC("bz_lazy_skip", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(skipFn, {src, n64}, "linq.skip");
+    }
+    if (m == "Distinct" && call.args.empty()) {
+        llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr);
+        auto* distFn = declareC("bz_lazy_distinct", ptrTy(), {ptrTy(), ptrTy()});
+        return builder_.CreateCall(distFn, {src, eqTramp}, "linq.distinct");
+    }
+    if ((m == "OrderBy" || m == "OrderByDescending") &&
+        call.args.size() == 1 && call.args[0].value) {
+        int32_t desc = (m == "OrderByDescending") ? 1 : 0;
+        llvm::Value* closure = lowerLinqLambda(
+            call.args[0].value.get(),
+            ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildLinqTrampoline(2, elemTy, nullptr);
+        auto* obFn = declareC("bz_lazy_orderby", ptrTy(),
+                              {ptrTy(), ptrTy(), ptrTy(), i32()});
+        return builder_.CreateCall(obFn,
+            {src, closure, tramp, builder_.getInt32(desc)}, "linq.orderby");
+    }
+    return nullptr;
 }
 
 

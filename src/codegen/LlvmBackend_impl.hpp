@@ -1233,6 +1233,14 @@ private:
 
     bool lowerIEnumerableFor(const ast::ForStmt& fs);
 
+    // stdlib §5: `for var x in <lazy LINQ pipeline>` — when the iterable is a
+    // deferred LINQ operator call (or a chain of them), iterate the resulting
+    // lazy enumerator via its vtable: MoveNext at slot 2 (-> i32), Current at
+    // slot 3 (-> void* pointer to the element bytes). Distinct from the
+    // builtin/state-machine path because the lazy enumerators' Current returns
+    // a pointer (type-erased), not a value.
+    bool lowerLazyLinqFor(const ast::ForStmt& fs);
+
     // If `e` names a local or parameter, return its storage slot; else null.
     // CG50: if `e` names a ref/out parameter, return its storage address
     // (the incoming pointer) and set `elemTy` to the referent type.
@@ -1403,6 +1411,35 @@ private:
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
+
+    // stdlib §5: is `rt` a builtin (un-declared) IEnumerable<T> family type —
+    // the type carried by a lazy LINQ operator result?
+    static bool isLazyEnumerableType(const sema::TypeRef* rt);
+
+    // stdlib §5: lower a deferred LINQ operator call (Where/Select/Take/Skip/
+    // Distinct/OrderBy[Descending]) or ToArray. Operators return a lazy
+    // enumerator (bz_lazy_*); ToArray materializes it. The receiver may be a
+    // concrete collection (wrapped via bz_lazy_from_array) or another lazy
+    // enumerator (chained). Returns the lowered value, or null if `call` is not
+    // a lazy LINQ operator. `elemRef` is set to the element TypeRef on success.
+    llvm::Value* tryLowerLazyLinqCall(const ast::CallExpr& call);
+
+    // stdlib §5: lower a receiver expression to a lazy enumerator pointer. If
+    // the receiver is a collection (Array<T> etc.), wraps it with
+    // bz_lazy_from_array(esz); if it is already a lazy enumerator
+    // (IEnumerable<T>), returns the lowered value unchanged. `elemRef` receives
+    // the element TypeRef.
+    llvm::Value* lowerToLazyEnumerator(const ast::Expr& recvExpr,
+                                       sema::TypeRef*& elemRef);
+
+    // stdlib §5: build a trampoline LLVM function the runtime can call to
+    // invoke a Bezel closure on a type-erased element. `kind`:
+    //   0 = predicate  i32(closure, elem_ptr)        (loads elemTy, calls, ext)
+    //   1 = selector   void(closure, elem_ptr, out)  (calls, stores outTy)
+    //   2 = key        i64(closure, elem_ptr)         (loads elemTy, calls, sext)
+    // `elemTy` is the input element LLVM type; `outTy` the selector output type.
+    llvm::Function* buildLinqTrampoline(int kind, llvm::Type* elemTy,
+                                        llvm::Type* outTy);
 
     // Detect Convert.ToInt32(s) / Convert.ToInt64(s) / Math.Abs(n) etc.
     // as intrinsic static class method calls. Returns a lowered value or null.
