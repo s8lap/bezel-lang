@@ -1269,6 +1269,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
                 // Seed → unit (leave untyped)
             }
+        } else if (targetType->kind == ast::TypeDeclKind::Record ||
+                   targetType->kind == ast::TypeDeclKind::Enum) {
+            // §8 / §9 / §10: the value-semantics members the compiler
+            // synthesizes for records and enums. No MemberSymbol exists for
+            // them, but the call result is well-typed so callers (and string
+            // interpolation) can infer it. ToString → string (§8.5/§9.1);
+            // GetHashCode → int (§8.3); Equals → bool (§8.3/§8.4).
+            const auto& m = ma.member;
+            if (m == "ToString")
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+            else if (m == "GetHashCode")
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+            else if (m == "Equals")
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         }
         // Slice 3d intentionally does NOT diagnose unknown members.
         return;

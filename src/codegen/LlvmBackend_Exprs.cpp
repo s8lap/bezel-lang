@@ -121,6 +121,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     pv = phi;
                 } else if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
                     pv = emitPrimitiveToString(ev, rt->primitive);
+                } else if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                           rt->declaration &&
+                           rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                    // §8.5: an enum interpolates as the type's qualified name
+                    // (the default ToString), not its underlying integer.
+                    pv = lowerStringLiteral(
+                        std::string("\"") +
+                        std::string(rt->declaration->name) + "\"", false);
                 } else if (!rt || rt->kind != sema::TypeRef::Kind::Primitive) {
                     // Type not set or not primitive — infer from LLVM type.
                     using P = sema::PrimitiveType;
@@ -189,8 +197,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             builder_.CreateStore(ev, spill);
                             std::vector<llvm::Value*> args{spill};
                             pv = emitMethodCall(toStr, args, false);
+                        } else if (ts->kind == ast::TypeDeclKind::Record) {
+                            // §9.1: a record with no user ToString gets the
+                            // synthesized `TypeName(Field: value, ...)` form.
+                            pv = emitRecordToString(ev, ts);
                         } else {
-                            // No ToString — use type name.
+                            // No ToString — use type name (§8.5).
                             pv = lowerStringLiteral(
                                 std::string("\"") + std::string(ts->name) + "\"", false);
                         }

@@ -1841,4 +1841,192 @@ llvm::Value* Emitter::emitCheckedArith(llvm::Intrinsic::ID id, llvm::Value* l,
 }
 
 
+// ---------------------------------------------------------------------------
+// §8 / §9 / §10: compiler-synthesized value-semantics members
+// (ToString, GetHashCode) for records and enums.
+// ---------------------------------------------------------------------------
+
+const sema::TypeRef* Emitter::recordFieldType(const sema::FieldSymbol* fs) {
+    // §9.1: a positional field carries its type on the originating Param;
+    // a body field on its FieldDecl.
+    if (fs->posParam && fs->posParam->type)
+        return ctx_.resolvedType(*fs->posParam->type);
+    if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+        if (fd->type)
+            return ctx_.resolvedType(*fd->type);
+    return nullptr;
+}
+
+// Format a single field/element value of static type `fieldTy` as a string,
+// recursing for nested records (§9.1) and using each type's own ToString.
+llvm::Value* Emitter::emitValueToString(llvm::Value* val,
+                                        const sema::TypeRef* fieldTy) {
+    using K = sema::TypeRef::Kind;
+    if (fieldTy && fieldTy->kind == K::Primitive) {
+        // §9.1: strings are formatted by their own ToString — which for
+        // string is identity (§9.6); the value is the bz_string itself.
+        return emitPrimitiveToString(val, fieldTy->primitive);
+    }
+    if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration) {
+        const sema::TypeSymbol* ts = fieldTy->declaration;
+        if (ts->kind == ast::TypeDeclKind::Record && val->getType()->isStructTy())
+            return emitRecordToString(val, ts);          // §9.1 recurse
+        if (ts->kind == ast::TypeDeclKind::Enum)
+            // §8.5: enum default ToString is the type's qualified name.
+            return lowerStringLiteral(
+                std::string("\"") + std::string(ts->name) + "\"", false);
+        if (ts->kind == ast::TypeDeclKind::Class && val->getType()->isPointerTy()) {
+            // §8.5: a class field formats via its ToString override if any,
+            // else the type name. Walk the class chain for a ToString method.
+            sema::MethodSymbol* toStr = nullptr;
+            for (auto* cur = ts; cur && !toStr;) {
+                for (auto* sym : cur->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                    if (ms && ms->name == "ToString" && ms->params.empty()) {
+                        toStr = ms; break;
+                    }
+                }
+                sema::TypeSymbol* nxt = nullptr;
+                for (auto* b : cur->baseTypes)
+                    if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+                cur = nxt;
+            }
+            if (toStr) {
+                std::vector<llvm::Value*> a{val};
+                if (llvm::Value* r = emitMethodCall(toStr, a, false)) return r;
+            }
+            return lowerStringLiteral(
+                std::string("\"") + std::string(ts->name) + "\"", false);
+        }
+    }
+    // Fallback: format by the LLVM shape (string ptr → identity; integer → int).
+    if (val->getType()->isPointerTy()) return val;            // assume bz_string
+    if (val->getType()->isIntegerTy(64))
+        return emitPrimitiveToString(val, sema::PrimitiveType::Long);
+    if (val->getType()->isIntegerTy(1))
+        return emitPrimitiveToString(val, sema::PrimitiveType::Bool);
+    if (val->getType()->isIntegerTy())
+        return emitPrimitiveToString(val, sema::PrimitiveType::Int);
+    if (val->getType()->isDoubleTy())
+        return emitPrimitiveToString(val, sema::PrimitiveType::Double);
+    if (val->getType()->isFloatTy())
+        return emitPrimitiveToString(val, sema::PrimitiveType::Float);
+    return lowerStringLiteral("\"\"", false);
+}
+
+// §9.1: build `"TypeName(Field1: value1, Field2: value2)"` from the record's
+// non-static fields in declaration order (the same order emitStructEquality
+// and recordStruct iterate). A zero-field record yields `"TypeName()"`
+// (§9.2 — the natural specialization of the property-listing format).
+llvm::Value* Emitter::emitRecordToString(llvm::Value* recVal,
+                                         const sema::TypeSymbol* rec) {
+    llvm::Value* acc = lowerStringLiteral(
+        std::string("\"") + std::string(rec->name) + "(\"", false);
+    unsigned idx = 0;       // struct element index
+    bool first = true;
+    for (const sema::Symbol* m : rec->members) {
+        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+        if (!fs || isStaticField(fs)) continue;
+        if (!first)
+            acc = emitStringConcat(acc, lowerStringLiteral("\", \"", false));
+        first = false;
+        // `FieldName: ` prefix — the field's declared name verbatim (§9.1:
+        // "the compiler does not transform them").
+        acc = emitStringConcat(acc, lowerStringLiteral(
+            std::string("\"") + std::string(fs->name) + ": \"", false));
+        llvm::Value* fieldVal = builder_.CreateExtractValue(recVal, {idx});
+        acc = emitStringConcat(acc,
+                               emitValueToString(fieldVal, recordFieldType(fs)));
+        ++idx;
+    }
+    acc = emitStringConcat(acc, lowerStringLiteral("\")\"", false));
+    return acc;
+}
+
+// §8.3 / §9.1: hash a single field value of static type `fieldTy` → i32.
+// Strings hash by content (consistent with content equality); nested records
+// recurse; enums hash by their integer value; primitives by value.
+llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
+                                        const sema::TypeRef* fieldTy) {
+    using K = sema::TypeRef::Kind;
+    // Nested record (§9.1 transitivity): combine its own field hashes.
+    if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
+        fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
+        val->getType()->isStructTy())
+        return emitRecordHashCode(val, fieldTy->declaration);
+    bool isString = fieldTy && fieldTy->kind == K::Primitive &&
+                    fieldTy->primitive == sema::PrimitiveType::String;
+    if (isString || (!fieldTy && val->getType()->isPointerTy())) {
+        // §4.6: hash a bz_string by folding its code points (FNV-style:
+        // h = h*31 + cp). Equal content → equal hash, consistent with the
+        // content-equality the language gives strings.
+        auto* hashSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), hashSlot);
+        auto* idxSlot = entryAlloca(i64());
+        builder_.CreateStore(builder_.getInt64(0), idxSlot);
+        llvm::Value* len = loadStringLen(val);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "shash.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "shash.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "shash.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* i = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateCondBr(builder_.CreateICmpSLT(i, len), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* i2 = builder_.CreateLoad(i64(), idxSlot);
+        llvm::Value* cp = loadCodePoint(val, i2);            // i32 code point
+        llvm::Value* h = builder_.CreateLoad(i32(), hashSlot);
+        h = builder_.CreateAdd(builder_.CreateMul(h, builder_.getInt32(31)), cp);
+        builder_.CreateStore(h, hashSlot);
+        builder_.CreateStore(builder_.CreateAdd(i2, builder_.getInt64(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return builder_.CreateLoad(i32(), hashSlot);
+    }
+    // Numeric / bool / char / enum: derive an i32 from the bits.
+    if (val->getType()->isIntegerTy()) {
+        if (val->getType()->isIntegerTy(64)) {
+            // long → fold high/low halves into i32 (§8.3 value-based hash).
+            llvm::Value* lo = builder_.CreateTrunc(val, i32());
+            llvm::Value* hi = builder_.CreateTrunc(
+                builder_.CreateLShr(val, builder_.getInt64(32)), i32());
+            return builder_.CreateXor(lo, hi);
+        }
+        return builder_.CreateZExtOrTrunc(val, i32());
+    }
+    if (val->getType()->isDoubleTy())
+        return builder_.CreateTrunc(
+            builder_.CreateBitCast(val, i64()), i32());
+    if (val->getType()->isFloatTy())
+        return builder_.CreateBitCast(val, i32());
+    return builder_.getInt32(0);
+}
+
+// §8.3 / §9.1: combine per-field hashes in declaration order with
+// h = h*31 + fieldHash. Order-dependent (so Pair(1,2) and Pair(2,1) differ)
+// and consistent with the structural equality of emitStructEquality: equal
+// records (same field values) compute the same fold. A zero-field record
+// returns a fixed constant (§9.2).
+llvm::Value* Emitter::emitRecordHashCode(llvm::Value* recVal,
+                                         const sema::TypeSymbol* rec) {
+    auto* hashSlot = entryAlloca(i32());
+    builder_.CreateStore(builder_.getInt32(17), hashSlot);   // non-zero seed
+    unsigned idx = 0;
+    bool any = false;
+    for (const sema::Symbol* m : rec->members) {
+        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+        if (!fs || isStaticField(fs)) continue;
+        any = true;
+        llvm::Value* fieldVal = builder_.CreateExtractValue(recVal, {idx});
+        llvm::Value* fh = emitValueHashCode(fieldVal, recordFieldType(fs));
+        llvm::Value* h = builder_.CreateLoad(i32(), hashSlot);
+        h = builder_.CreateAdd(builder_.CreateMul(h, builder_.getInt32(31)), fh);
+        builder_.CreateStore(h, hashSlot);
+        ++idx;
+    }
+    (void)any;  // §9.2: zero-field record keeps the fixed seed constant.
+    return builder_.CreateLoad(i32(), hashSlot);
+}
+
+
 }  // namespace bezel::codegen
