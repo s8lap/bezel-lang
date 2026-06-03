@@ -31,9 +31,16 @@
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
+#include "sema/TypeRef.hpp"
 
 namespace bezel::sema {
 
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx);
+
+// Structural equality of two resolved TypeRefs (§19/§22.6 "exact match").
+// Returns false (conservatively) when either is null or an Error kind.
+// Exposes the resolver's existing structural-equality utility for reuse by
+// other passes (e.g. §22.6 overload resolution).
+bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 
 } // namespace bezel::sema
