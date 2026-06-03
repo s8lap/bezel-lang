@@ -351,3 +351,98 @@ BEZEL_TEST(linq, lazy_record_pipeline_foreach_spec_5) {
         "  return int(n = 2 and s = 60); "  // Point(2,20).y + Point(4,40).y
         "end Main; end C;"), 1);
 }
+
+// --- #366: element-returning LINQ ops type their result as the element T -----
+// stdlib §5: First/Last/Single/ElementAt each return T (the source element
+// type). Previously these were typed only over a lazy IEnumerable receiver, not
+// over an eager Array<T> receiver, so `var p := a.First(pred)` left `p` untyped
+// and a later `p.field` was dropped (workaround: an explicit `var p: T`). These
+// tests drop the explicit annotation; they are load-bearing — without the §5
+// result typing the inferred local is untyped and the field read collapses to 0.
+
+// §5 First(predicate) over records, RESULT TYPE INFERRED (no `: Point`): the
+// inferred local p is the element type Point, so `p.y` resolves. Point(2,20)
+// matches `q.x = 2`, so p.y = 20.
+BEZEL_TEST(linq, first_predicate_record_inferred_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); a.Add(new Point(3, 30)); "
+        "  var p := a.First((q) => q.x = 2); "
+        "  return p.y; "
+        "end Main; end C;"), 20);
+}
+
+// §5 member access directly on a record-returning call result: `a.First(pred).y`.
+// The call yields a by-value record struct; reading `.y` spills it to a slot and
+// field-accesses. Point(2,20) matches, so the result is 20.
+BEZEL_TEST(linq, first_predicate_record_member_on_call_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); a.Add(new Point(3, 30)); "
+        "  return a.First((q) => q.x = 2).y; "
+        "end Main; end C;"), 20);
+}
+
+// §5 First() (no predicate) over records, result type inferred → first element.
+BEZEL_TEST(linq, first_noarg_record_inferred_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(7, 11)); a.Add(new Point(2, 22)); "
+        "  var p := a.First(); "
+        "  return p.y; "  // first element Point(7,11).y
+        "end Main; end C;"), 11);
+}
+
+// §5 Last() over records, result type inferred → last element.
+BEZEL_TEST(linq, last_record_inferred_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); a.Add(new Point(3, 30)); "
+        "  var p := a.Last(); "
+        "  return p.y; "  // last element Point(3,30).y
+        "end Main; end C;"), 30);
+}
+
+// §5 Single() over a one-element record array, result type inferred.
+BEZEL_TEST(linq, single_record_inferred_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(9, 99)); "
+        "  var p := a.Single(); "
+        "  return p.y; "  // the only element Point(9,99).y
+        "end Main; end C;"), 99);
+}
+
+// §5 ElementAt(i) over records, result type inferred; member access on the call.
+BEZEL_TEST(linq, element_at_record_member_on_call_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); a.Add(new Point(3, 30)); "
+        "  return a.ElementAt(1).y; "  // Point(2,20).y
+        "end Main; end C;"), 20);
+}
+
+// §5 int-element First() control: result inferred as int, returned directly.
+// (No member access — proves the element-type inference is correct for a
+// primitive element, not only for records.)
+BEZEL_TEST(linq, first_noarg_int_inferred_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(42); a.Add(7); a.Add(3); "
+        "  var n := a.First(); "
+        "  return n; "
+        "end Main; end C;"), 42);
+}

@@ -678,6 +678,43 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             return builder_.CreateLoad(elemTy, resultSlot, "fst.r");
         }
+        // per §5 LINQ element access (no-predicate forms): First()/Single()
+        // return the first element; Last() returns the last; ElementAt(i)
+        // returns the element at index i (stdlib §5 — each `: T`). These read
+        // an element from the eager Array source via bz_array_get. (The
+        // empty/not-exactly-one throwing semantics noted in stdlib §5 are not
+        // modeled in the JIT happy path, consistent with First(pred) above.)
+        if ((m == "First" || m == "Single") && call.args.empty()) {
+            llvm::Type* retTy = getElemTy();
+            llvm::AllocaInst* out = entryAlloca(retTy);
+            auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(getFn,
+                {recv, builder_.getInt64(0), out, builder_.getInt64(esz)});
+            return builder_.CreateLoad(retTy, out, "fst.r");
+        }
+        if (m == "Last" && call.args.empty()) {
+            llvm::Type* retTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            llvm::Value* idx = builder_.CreateSub(len, builder_.getInt64(1));
+            llvm::AllocaInst* out = entryAlloca(retTy);
+            auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
+            return builder_.CreateLoad(retTy, out, "lst.r");
+        }
+        if (m == "ElementAt" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* idx = lowerExpr(*call.args[0].value);
+            if (!idx) return nullptr;
+            idx = builder_.CreateSExt(idx, i64());
+            llvm::Type* retTy = getElemTy();
+            llvm::AllocaInst* out = entryAlloca(retTy);
+            auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
+            return builder_.CreateLoad(retTy, out, "elemat.r");
+        }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
 
         // per §3: .Sort() — in-place ascending sort for int arrays.
