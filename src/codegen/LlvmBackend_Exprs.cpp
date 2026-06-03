@@ -1116,8 +1116,11 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             return builder_.CreateLoad(refElem, a);
         }
         // CG3: a reference to a local variable loads from its slot.
+        // §27.5: a captured ("boxed") local reads through its shared cell.
         if (llvm::AllocaInst* slot = localSlot(e)) {
-            return builder_.CreateLoad(slot->getAllocatedType(), slot);
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(slot, ety);
+            return builder_.CreateLoad(ety, addr);
         }
         // CG60: a bare identifier resolving to a static method —
         // produce a closure struct { thunk_ptr, null_env } so it can
@@ -1738,15 +1741,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
     }
 
-    // Collect outer captured variables (everything in the outer frame
-    // that may be referenced in the body). We include all outer params
-    // and locals conservatively; unused captures are harmless.
-    // Entries: { llvm::Type*, outer_slot_ptr }
+    // §27.5: captured variables are heap-allocated in a closure object and
+    // shared by reference — a mutation inside the lambda is visible outside
+    // and vice versa. We compute the capture set (the outer locals/params the
+    // body actually references), promote each captured outer slot to a shared
+    // heap cell, and store the cell *pointer* in the env. Both the enclosing
+    // function and the lambda then load/store through the same cell.
+    //
+    // Each env field holds a `ptr`: a boxed capture stores the cell pointer;
+    // the `this` capture stores the receiver pointer directly (by value, as
+    // `this` is not reassignable so it needs no shared cell).
     struct CaptureEntry {
-        llvm::Type*            ty;
-        llvm::AllocaInst*      outerSlot;
+        llvm::Type*            valTy;     // the captured variable's value type
+        llvm::Value*           envValue;  // value to store into the env field
         const sema::Symbol*    sym;   // non-null for param captures
         const ast::Node*       decl;  // non-null for local captures
+        bool                   isThis = false;
     };
     std::vector<CaptureEntry> captures;
 
@@ -1755,10 +1765,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     llvm::Function* savedFn = currentFn_;
     llvm::Value* savedThis = currentThis_;
     llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
-    auto savedLocals = locals_;
-    auto savedParams = paramSlots_;
     auto savedRefParams = refParams_;
-    auto savedDisposeStack = disposeStack_;
     auto savedLoopStack = loopStack_;
     llvm::BasicBlock* savedUnwind = unwindTarget_;
     llvm::BasicBlock* savedProp = propagateBB_;
@@ -1766,45 +1773,76 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     std::size_t savedUnwindDepth = unwindScopeDepth_;
     bool savedDiverged = diverged_;
 
-    // Collect outer params as potential captures.
+    // §27.5: the set of outer locals/params the body references.
+    std::unordered_set<const sema::Symbol*> capturedSyms;
+    collectCapturedSyms(lam, capturedSyms);
+
+    // Box and collect captured outer params. Boxing promotes the variable's
+    // storage to a shared heap cell held in a fresh ptr-slot, which we rebind.
+    // Collect the symbols first to avoid mutating the map while iterating.
+    std::vector<const sema::Symbol*> capturedParamSyms;
     for (auto& [sym, slot] : paramSlots_) {
+        (void)slot;
+        if (capturedSyms.find(sym) != capturedSyms.end())
+            capturedParamSyms.push_back(sym);
+    }
+    for (const sema::Symbol* sym : capturedParamSyms) {
+        llvm::AllocaInst* slot = paramSlots_[sym];
         CaptureEntry ce;
-        ce.ty = slot->getAllocatedType();
-        ce.outerSlot = slot;
+        ce.valTy = cellVars_.count(slot) ? cellVars_[slot]
+                                         : slot->getAllocatedType();
+        llvm::AllocaInst* newSlot = nullptr;
+        ce.envValue = boxLocalSlot(slot, newSlot);  // the shared cell pointer
+        paramSlots_[sym] = newSlot;  // rebind to the ptr cell-holder
+        rebindDisposalSlot(slot, newSlot);
         ce.sym = sym;
         ce.decl = nullptr;
         captures.push_back(ce);
     }
-    // Collect outer locals as potential captures.
+    // Box and collect captured outer locals.
+    std::vector<const ast::Node*> capturedLocalDecls;
     for (auto& [decl, slot] : locals_) {
+        (void)slot;
+        for (const sema::Symbol* s : capturedSyms) {
+            if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
+                if (loc->decl == decl) { capturedLocalDecls.push_back(decl); break; }
+            }
+        }
+    }
+    for (const ast::Node* decl : capturedLocalDecls) {
+        llvm::AllocaInst* slot = locals_[decl];
         CaptureEntry ce;
-        ce.ty = slot->getAllocatedType();
-        ce.outerSlot = slot;
+        ce.valTy = cellVars_.count(slot) ? cellVars_[slot]
+                                         : slot->getAllocatedType();
+        llvm::AllocaInst* newSlot = nullptr;
+        ce.envValue = boxLocalSlot(slot, newSlot);  // the shared cell pointer
+        locals_[decl] = newSlot;  // rebind to the ptr cell-holder
+        rebindDisposalSlot(slot, newSlot);
         ce.sym = nullptr;
         ce.decl = decl;
         captures.push_back(ce);
     }
 
     // Capture `this` if we're inside an instance method — the lambda body
-    // may access instance fields via implicit this. Slot index: last entry.
-    // Use sym=nullptr/decl=nullptr as sentinel; restoration sets currentThis_.
-    bool capturesThis = (currentThis_ != nullptr);
-    std::size_t thisCaptureIdx = captures.size();
-    if (capturesThis) {
-        // Spill `this` (a value, not a slot) to a temporary alloca so we
-        // can store it into the env struct.
+    // may access instance fields via implicit this. `this` is captured by
+    // value (it is not reassignable, so no shared cell is needed).
+    if (currentThis_ != nullptr) {
         CaptureEntry ce;
-        ce.ty = ptrTy();
-        ce.outerSlot = entryAlloca(ptrTy());
-        builder_.CreateStore(currentThis_, ce.outerSlot);
+        ce.valTy = ptrTy();
+        ce.envValue = currentThis_;
         ce.sym = nullptr;
         ce.decl = nullptr;
+        ce.isThis = true;
         captures.push_back(ce);
     }
 
-    // Build env struct type (one slot per capture).
+    // Build env struct type. Every field is a `ptr`: a boxed capture stores
+    // its cell pointer; the `this` capture stores the receiver pointer.
     std::vector<llvm::Type*> envFieldTys;
-    for (const auto& ce : captures) envFieldTys.push_back(ce.ty);
+    for (const auto& ce : captures) {
+        (void)ce;
+        envFieldTys.push_back(ptrTy());
+    }
 
     // Build the LLVM function type: (ptr env, user_params...) -> ret.
     std::vector<llvm::Type*> allParamTys;
@@ -1819,11 +1857,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         fnTy, llvm::Function::InternalLinkage, lamName, module_.get());
 
     // --- Emit the lambda function body ---
+    // Snapshot the slot/cell state *after* boxing the outer slots so the
+    // outer-frame rebindings persist when restored (the enclosing function
+    // keeps accessing the now-shared variables through their cells, via the
+    // rebound ptr-slots, after the lambda returns). These supersede the
+    // pre-boxing state.
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedCellVars = cellVars_;
+    auto savedDisposeStack = disposeStack_;
     currentFn_ = fn;
     currentThis_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
     refParams_.clear();
+    cellVars_.clear();
     disposeStack_.clear();
     loopStack_.clear(); finallyStack_.clear();
     unwindTarget_ = nullptr;
@@ -1834,22 +1882,28 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     builder_.SetInsertPoint(
         llvm::BasicBlock::Create(llvm_, "entry", fn));
 
-    // Arg 0 is env_ptr; extract captured vars from it.
+    // Arg 0 is env_ptr; bind captured vars from it.
     llvm::Value* envPtr = &*fn->args().begin();
-    // Re-create alloca slots for captured vars, loading from env.
     if (!captures.empty() && !envFieldTys.empty()) {
         auto* envTy = llvm::StructType::get(llvm_, envFieldTys);
         for (std::size_t i = 0; i < captures.size(); ++i) {
             const CaptureEntry& ce = captures[i];
             llvm::Value* fieldPtr = builder_.CreateStructGEP(
                 envTy, envPtr, static_cast<unsigned>(i));
-            llvm::Value* val = builder_.CreateLoad(ce.ty, fieldPtr);
-            if (capturesThis && i == thisCaptureIdx) {
-                // Restore 'this' from the captured ptr value.
-                currentThis_ = val;
+            // The env field holds a pointer: the shared cell (boxed captures)
+            // or the receiver (`this`).
+            llvm::Value* ptrVal = builder_.CreateLoad(ptrTy(), fieldPtr);
+            if (ce.isThis) {
+                // Restore 'this' from the captured receiver pointer.
+                currentThis_ = ptrVal;
             } else {
-                auto* slot = entryAlloca(ce.ty);
-                builder_.CreateStore(val, slot);
+                // §27.5: bind the captured variable to its shared cell. The
+                // slot holds the cell pointer; cellVars_ marks it boxed so
+                // reads/writes in the body route through the cell — sharing
+                // storage with the enclosing function.
+                auto* slot = entryAlloca(ptrTy());
+                builder_.CreateStore(ptrVal, slot);
+                cellVars_[slot] = ce.valTy;
                 if (ce.sym) paramSlots_[ce.sym] = slot;
                 if (ce.decl) locals_[ce.decl] = slot;
             }
@@ -1888,6 +1942,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
     refParams_ = std::move(savedRefParams);
+    cellVars_ = std::move(savedCellVars);
     disposeStack_ = std::move(savedDisposeStack);
     loopStack_ = std::move(savedLoopStack);
     unwindTarget_ = savedUnwind;
@@ -1916,11 +1971,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                                        {builder_.getInt64(1), envSize});
         for (std::size_t i = 0; i < captures.size(); ++i) {
             const CaptureEntry& ce = captures[i];
-            // Load current value from outer slot.
-            llvm::Value* val = builder_.CreateLoad(ce.ty, ce.outerSlot);
+            // §27.5: store the shared cell pointer (boxed captures) or the
+            // receiver pointer (`this`) into the env. Both are pointers.
             llvm::Value* dst = builder_.CreateStructGEP(
                 envTy, envAlloc, static_cast<unsigned>(i));
-            builder_.CreateStore(val, dst);
+            builder_.CreateStore(ce.envValue, dst);
         }
     }
     // Store env_ptr at offset sizeof(ptr).

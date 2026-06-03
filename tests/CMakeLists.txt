@@ -207,6 +207,7 @@ set(BEZEL_TEST_SOURCES
     codegen/string_for_in_test.cpp
     codegen/range_for_test.cpp
     codegen/lambda_test.cpp
+    codegen/closure_capture_test.cpp
     codegen/generic_test.cpp
     codegen/collection_test.cpp
     codegen/record_key_test.cpp

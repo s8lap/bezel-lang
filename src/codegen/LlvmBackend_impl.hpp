@@ -150,6 +150,15 @@ private:
     // {address, element type}.
     std::unordered_map<const sema::Symbol*, std::pair<llvm::Value*, llvm::Type*>>
         refParams_;
+    // §27.5: a captured local/parameter is shared by-reference through a
+    // heap cell so that mutations inside a lambda are visible outside and
+    // vice versa. When a variable is "boxed", its `locals_`/`paramSlots_`
+    // alloca no longer holds the value directly — it holds a `ptr` to the
+    // heap cell, and the cell holds the value. This map records, for each
+    // such alloca, the value's element type. Accessors route reads/writes
+    // through the cell (see `boxedStorage`). The set is part of the saved/
+    // restored emitter state across nested-function emission.
+    std::unordered_map<llvm::AllocaInst*, llvm::Type*> cellVars_;
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
@@ -1313,6 +1322,34 @@ private:
     llvm::Value* refParamAddr(const ast::Expr& e, llvm::Type*& elemTy);
 
     llvm::AllocaInst* localSlot(const ast::Expr& e);
+
+    // §27.5: given a local/param slot, return the address at which the
+    // variable's value actually lives and set `elemTy` to its type. For an
+    // ordinary slot this is the alloca itself; for a captured ("boxed")
+    // variable the alloca holds a pointer to a shared heap cell, so this
+    // loads the cell pointer and returns it. Reads and writes both route
+    // through this so the in-function side and the closure side share storage.
+    llvm::Value* boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy);
+
+    // §27.5: promote a local/param slot to a shared heap cell (if not
+    // already), copying the current value into the cell. Because the value
+    // slot may be too small to hold a pointer (e.g. an `alloca i32`), a fresh
+    // `ptr`-typed alloca is created to hold the cell pointer; it is returned
+    // through `newSlot` and recorded in `cellVars_` with the value type. The
+    // caller rebinds its locals_/paramSlots_ entry to `newSlot`. Returns the
+    // cell pointer (the value to store in a closure env).
+    llvm::Value* boxLocalSlot(llvm::AllocaInst* slot, llvm::AllocaInst*& newSlot);
+
+    // §27.5: when a `using var` local is boxed for capture its storage slot
+    // changes; update any pending disposal entry so scope-end disposal loads
+    // the object through the new (cell-holder) slot.
+    void rebindDisposalSlot(llvm::AllocaInst* oldSlot, llvm::AllocaInst* newSlot);
+
+    // §27.5: collect the local/parameter symbols a lambda body references
+    // from the enclosing scope (its capture set). Nested lambdas contribute
+    // their captures too. Identifier resolution uses sema's exprSymbol map.
+    void collectCapturedSyms(const ast::LambdaExpr& lam,
+                             std::unordered_set<const sema::Symbol*>& out);
 
     // Lower an expression to an LLVM value.
     //   CG1: integer literals.

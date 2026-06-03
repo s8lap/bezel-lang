@@ -1200,7 +1200,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope) {
         // CG18: dispatch Dispose dynamically through the object's
         // vtable, so a `using var` bound to a subclass instance runs
         // the correct runtime Dispose.
-        llvm::Value* obj = builder_.CreateLoad(ptrTy(), it->slot);
+        // §27.5: a captured ("boxed") `using var` local lives in a shared
+        // heap cell; load the object through the cell, not the cell pointer.
+        llvm::Type* ety = nullptr;
+        llvm::Value* addr = boxedStorage(it->slot, ety);
+        llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
         emitDynamicDispose(obj);
     }
 }

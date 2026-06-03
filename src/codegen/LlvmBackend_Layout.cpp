@@ -50,8 +50,8 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
     // CG50: a ref/out parameter — its address is the incoming pointer.
     if (llvm::Value* a = refParamAddr(target, elemTy)) return a;
     if (llvm::AllocaInst* slot = localSlot(target)) {
-        elemTy = slot->getAllocatedType();
-        return slot;
+        // §27.5: a captured ("boxed") local's address is its shared cell.
+        return boxedStorage(slot, elemTy);
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
         if (llvm::Value* a = fieldAddr(*ma, elemTy)) return a;
@@ -450,6 +450,215 @@ llvm::AllocaInst* Emitter::localSlot(const ast::Expr& e) {
 }
 
 
+// §27.5: route a local/param access through its shared heap cell when the
+// variable has been boxed for capture; otherwise use the alloca directly.
+llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) {
+    auto it = cellVars_.find(slot);
+    if (it != cellVars_.end()) {
+        elemTy = it->second;
+        // The alloca holds a pointer to the heap cell; the value lives there.
+        return builder_.CreateLoad(ptrTy(), slot, "cell");
+    }
+    elemTy = slot->getAllocatedType();
+    return slot;
+}
+
+
+// §27.5: promote a local/param slot to a shared heap cell so that the
+// enclosing function and any capturing closure access the same storage.
+// Idempotent: a slot already boxed is reused (multiple lambdas capturing the
+// same variable share one cell). Returns the cell pointer and, through
+// `newSlot`, the `ptr`-typed alloca that now holds it.
+llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
+                                   llvm::AllocaInst*& newSlot) {
+    auto it = cellVars_.find(slot);
+    if (it != cellVars_.end()) {
+        // Already boxed: the slot is already a ptr-alloca holding the cell.
+        newSlot = slot;
+        return builder_.CreateLoad(ptrTy(), slot, "cell");
+    }
+    llvm::Type* valTy = slot->getAllocatedType();
+    // Allocate a one-value heap cell sized to the value type.
+    llvm::Value* cellSize = builder_.CreatePtrToInt(
+        builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
+                           {builder_.getInt32(1)}),
+        i64());
+    llvm::Value* cell = builder_.CreateCall(callocFn(),
+                                            {builder_.getInt64(1), cellSize});
+    // Copy the current value out of the original slot into the cell.
+    llvm::Value* cur = builder_.CreateLoad(valTy, slot, "preboxed");
+    builder_.CreateStore(cur, cell);
+    // A value slot (e.g. `alloca i32`) cannot hold a pointer, so use a fresh
+    // `ptr`-typed alloca as the cell holder. The caller rebinds the variable
+    // to this slot; cellVars_ marks it boxed.
+    newSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(cell, newSlot);
+    cellVars_[newSlot] = valTy;
+    return cell;
+}
+
+
+// §27.5: rebind a boxed `using var`'s pending disposal to its new slot.
+void Emitter::rebindDisposalSlot(llvm::AllocaInst* oldSlot,
+                                 llvm::AllocaInst* newSlot) {
+    if (oldSlot == newSlot) return;
+    for (auto& scope : disposeStack_)
+        for (auto& d : scope)
+            if (d.slot == oldSlot) d.slot = newSlot;
+}
+
+
+namespace {
+// §27.5: recursive capture-set walker. Visits every sub-expression and
+// sub-statement of a node, recording the symbol of any identifier reference.
+// Nested lambdas are descended into so their captures of an outer scope are
+// counted too. The walk over-approximates harmlessly (e.g. it records a
+// lambda's own parameters and inner locals as well); the caller intersects
+// the result against the enclosing function's known locals/params.
+struct CaptureWalker {
+    const sema::SemaContext& ctx;
+    std::unordered_set<const sema::Symbol*>& out;
+
+    void expr(const ast::Expr* e) {
+        if (!e) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (sema::Symbol* s = ctx.exprSymbol(*id)) out.insert(s);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(m->target.get()); return; }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get()); return; }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get());
+            for (auto& a : c->args) expr(a.value.get());
+            return; }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(c->callee.get());
+            for (auto& a : c->args) expr(a.value.get());
+            return; }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get());
+            for (auto& a : ix->indices) expr(a.value.get());
+            return; }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get()); expr(b->right.get()); return; }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get()); return; }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get()); return; }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get()); return; }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get()); expr(c->thenValue.get());
+            expr(c->elseValue.get()); return; }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get()); return; }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get()); expr(r->hi.get()); expr(r->step.get());
+            return; }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get());
+            return; }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get());
+            for (auto& a : w->assigns) expr(a.value.get());
+            return; }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get());
+            for (auto& k : cl->keys) expr(k.get());
+            return; }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get());
+            return; }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // Descend into nested lambdas: their references reach the
+            // grandparent scope too.
+            if (lam->exprBody) expr(lam->exprBody.get());
+            for (auto& s : lam->stmts) stmt(s.get());
+            return; }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get());
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get());
+                expr(arm.exprBody.get());
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return; }
+        // Literals and other leaf expressions: nothing to do.
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            expr(ld->initializer.get()); return; }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get()); return; }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get()); return; }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get()); return; }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get()); return; }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            expr(as->target.get()); expr(as->value.get()); return; }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get()); return; }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get()); return; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get()); return; }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get());
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get());
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return; }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get());
+            for (auto& b : ws->body) stmt(b.get());
+            return; }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get()); expr(fs->withExpr.get());
+            for (auto& b : fs->body) stmt(b.get());
+            return; }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return; }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get());
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return; }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get());
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get());
+                expr(arm.exprBody.get());
+                for (auto& a : arm.stmts) stmt(a.get());
+            }
+            return; }
+        // BreakStmt / ContinueStmt: no sub-expressions.
+    }
+};
+}  // namespace
+
+
+void Emitter::collectCapturedSyms(
+        const ast::LambdaExpr& lam,
+        std::unordered_set<const sema::Symbol*>& out) {
+    CaptureWalker w{ctx_, out};
+    if (lam.exprBody) w.expr(lam.exprBody.get());
+    for (auto& s : lam.stmts) w.stmt(s.get());
+}
+
+
 llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
                              llvm::Value* receiverVal) {
     auto it = methodFns_.find(ms);
@@ -717,7 +926,9 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         llvm::Value* base = nullptr;
         llvm::Type* baseTy = nullptr;
         if (llvm::AllocaInst* slot = localSlot(*ma.target)) {
-            base = slot;
+            // §27.5: a captured record local lives in its shared cell.
+            llvm::Type* ety = nullptr;
+            base = boxedStorage(slot, ety);
         } else {
             base = lvalueAddr(*ma.target, baseTy);
             if (!base) {
