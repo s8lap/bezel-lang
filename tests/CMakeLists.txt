@@ -209,6 +209,7 @@ set(BEZEL_TEST_SOURCES
     ownership/borrow_escape_test.cpp
     ownership/move_on_fields_test.cpp
     ownership/exception_path_test.cpp
+    ownership/exception_discharge_test.cpp
     ownership/owned_field_da_test.cpp
     ownership/owned_return_test.cpp
     ownership/call_arg_move_test.cpp

@@ -2,11 +2,13 @@
 // implicit auto-dispose (§28.3 "Exception-path discharge").
 //
 // On exception unwinding the compiler auto-disposes still-Owned
-// locals via the implicit try/finally. So a body that unconditionally
-// throws doesn't need explicit discharge — the auto-dispose covers
-// it. The slice-O11 (simple) approximation: if the body's lexically-
-// last statement is a ThrowStmt, suppress the undischarged-owned-
-// local diagnostic.
+// locals via the implicit try/finally. So a value live-and-owned on an
+// exception edge doesn't need explicit discharge — the auto-dispose
+// covers it. O11-real consults the real CFG exception edges (a `throw`,
+// or a throwable call inside a try body), so the suppression is
+// path-precise rather than the O11-simple "lexically-last throw"
+// approximation. Richer try/catch/finally cases live in
+// exception_discharge_test.cpp.
 
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -36,15 +38,23 @@ BEZEL_TEST(own_exc, body_ending_normally_still_diagnoses) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(own_exc, throw_in_middle_does_not_suppress_later_check) {
-    // The slice-O11 simple model only honors a TRAILING throw. A throw
-    // in the middle of the body, with normal-exit code afterwards,
-    // doesn't suppress the check.
+BEZEL_TEST(own_exc, throw_in_middle_auto_disposes_x_on_only_reachable_path) {
+    // O11-real (§28.3 exception-path discharge): the throw is the only
+    // reachable exit path. On that path `x` is live-and-owned, so the
+    // implicit try/finally disposes it during stack unwinding — no leak.
+    // The trailing `var y := 0;` is dead code (unreachable; sema diagnoses
+    // dead code, not ownership) and `y` is an int with no owned obligation.
+    // So §28.3 reports NO ownership error.
+    //
+    // OUTCOME CHANGE vs O11-simple: under the superseded approximation this
+    // case was expected to ERROR, because that model only suppressed the
+    // leak when a throw was the *lexically-last* statement. That was an
+    // artifact of the approximation, not the spec; O11-real consults the
+    // real CFG exception edges and gets the path-precise answer. (Reported
+    // in the O11-real change for adjudication.)
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); throw new Error(); var y := 0;"));
-    // The trailing stmt is a LocalDecl (not throw), so the
-    // undischarged-x check fires.
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(own_exc, throw_after_dispose_is_clean) {
