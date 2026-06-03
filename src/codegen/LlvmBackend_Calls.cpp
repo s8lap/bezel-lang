@@ -3126,8 +3126,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (rt && rt->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = nullptr;
             auto pit = paramSlots_.find(par);
-            if (pit != paramSlots_.end())
-                closurePtr = builder_.CreateLoad(ptrTy(), pit->second);
+            if (pit != paramSlots_.end()) {
+                // §27.5: a captured function-typed param reads its closure
+                // value through the shared cell.
+                llvm::Type* ety = nullptr;
+                llvm::Value* addr = boxedStorage(pit->second, ety);
+                closurePtr = builder_.CreateLoad(ptrTy(), addr);
+            }
             return emitClosureCall(closurePtr, rt);
         }
     }
@@ -3137,8 +3142,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             llvm::Value* closurePtr = nullptr;
             if (loc->decl) {
                 auto lit = locals_.find(loc->decl);
-                if (lit != locals_.end())
-                    closurePtr = builder_.CreateLoad(ptrTy(), lit->second);
+                if (lit != locals_.end()) {
+                    // §27.5: a captured function-typed local reads through
+                    // its shared cell.
+                    llvm::Type* ety = nullptr;
+                    llvm::Value* addr = boxedStorage(lit->second, ety);
+                    closurePtr = builder_.CreateLoad(ptrTy(), addr);
+                }
             }
             return emitClosureCall(closurePtr, rt);
         }
