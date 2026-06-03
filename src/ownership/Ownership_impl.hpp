@@ -33,20 +33,20 @@ namespace bezel::ownership {
 // handleReturn and the move/dispose/read helpers in Ownership_Checks.cpp)
 // are unchanged; the driver feeds each CFG basic block's straight-line
 // statement sequence through them, and merges predecessor exit states at
-// block entry using the §28.3 asymmetric meet (`joinInto`). This is a
-// behavior-preserving refactor — it reproduces the previous walker's
-// diagnostics exactly:
+// block entry using the §28.3 asymmetric meet (`joinInto`).
 //
 //   - if/elif/else joins flow through real CFG merge blocks (the merge
 //     carries the originating `IfStmt` so the clash diagnostic lands at
-//     the if's span, as before);
-//   - loops are still walked a single time with zero-trip-path semantics
-//     matching the old walker (back-edges and the loop-skip edge are
-//     excluded from the meet — a real fixpoint is deferred to O3b);
-//   - try/catch/finally is emitted opaquely into the CFG (one statement)
-//     and walked by the existing structured `visitStmt` recursion, so the
-//     O11-simple "throw is lexically last" suppression is unchanged
-//     (real per-exception-edge discharge is deferred to O11-real).
+//     the if's span);
+//   - loops are iterated to a fixpoint (O3b): back-edges and the zero-trip
+//     header→after skip edge participate in the meet, so the analysis is
+//     sound for the never-executed loop path;
+//   - try/catch/finally is expanded into the real F2 exception-edge CFG
+//     (O11-real, `treatTryAsOpaque=false`). The driver applies §28.3
+//     "Exception-path discharge" per edge: when state flows along an
+//     exception (unwinding) edge — a `throw`, or a throwable call inside a
+//     try body — every live owned local is auto-disposed by the implicit
+//     try/finally, so it is not reported as leaked on that edge.
 using BlockState = std::unordered_map<sema::Symbol*, LocalOwnership>;
 
 class MethodOwnership {
@@ -60,11 +60,6 @@ public:
     // every normal-exit path (same rule as `var x := producer-of-owned;`).
     void run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
              const std::vector<sema::Symbol*>* paramSyms = nullptr);
-
-    // Slice O11 approximation: returns true if the body's lexically-
-    // last reachable statement is a ThrowStmt. Skips trailing nulls.
-    bool bodyEndsInThrow(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
 private:
     sema::SemaContext& ctx_;

@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -86,6 +87,30 @@ struct CFGBlock {
     // distinguish loop headers from if-condition branches without a
     // separate dominator computation.
     bool isLoopHeader = false;
+
+    // F2 / O11-real: successor targets reached only along an *exception*
+    // (stack-unwinding) edge from this block — an explicit `throw`, or the
+    // over-approximated "a throwable call inside the try body" edge from a
+    // try-body end to its catch dispatcher. An analysis can ask, for a
+    // given (from → to) edge, whether it is an exception edge by testing
+    // whether `to` is in `from->exceptionSuccs`. The ownership pass uses
+    // this to model §28.3 "Exception-path discharge": owned locals live on
+    // an exception edge are auto-disposed by the implicit unwind, so they
+    // are not reported as leaked on that edge. A target may appear in both
+    // `succs` (normal) and `exceptionSuccs` (exceptional) when distinct
+    // edges to it exist; the set membership marks only the exceptional one.
+    std::unordered_set<const CFGBlock*> exceptionSuccs;
+
+    // O11-real: when this block is a try's catch-dispatch (the landing pad
+    // for exception edges out of that try's body), `tryForDispatch` points
+    // at the originating `TryStmt`. An analysis modelling §28.3
+    // exception-path discharge uses it to scope the auto-dispose to exactly
+    // the locals whose declaration lives in that try's body — locals
+    // declared in *enclosing* scopes remain live in the catch and after the
+    // try, so they are not disposed by this unwind. Null for every other
+    // block (and for the function exit, where an uncaught exception unwinds
+    // the whole method, so *all* in-scope owned locals are disposed).
+    const ast::TryStmt* tryForDispatch = nullptr;
 };
 
 class CFG {
@@ -111,6 +136,17 @@ public:
     // predecessor lists.
     void addEdge(CFGBlock* from, CFGBlock* to);
 
+    // F2 / O11-real: add an exception (stack-unwinding) edge from `from`
+    // to `to`. Maintains the same succ/pred lists as a normal edge, and
+    // additionally records the edge in `from->exceptionSuccs` so an
+    // analysis can distinguish exceptional from normal control transfer.
+    void addExceptionEdge(CFGBlock* from, CFGBlock* to);
+
+    // True when the (from → to) edge was created as an exception edge.
+    static bool isExceptionEdge(const CFGBlock* from, const CFGBlock* to) {
+        return from->exceptionSuccs.count(to) != 0;
+    }
+
 private:
     std::vector<std::unique_ptr<CFGBlock>> blocks_;
     CFGBlock* entry_ = nullptr;
@@ -127,11 +163,12 @@ private:
 // `treatTryAsOpaque` (additive, default false): when true, a `TryStmt`
 // is NOT expanded into the F2 try/catch/finally exception-edge shape —
 // it is emitted as a single opaque statement in the current linear
-// block, exactly like an unknown statement kind. The ownership pass
-// (slice O3a) uses this so it can keep handling try/catch with its
-// existing structured walk (matching the O11-simple behavior) while
-// driving the rest of the body as a forward dataflow over the CFG. The
-// default preserves the full F2 expansion for flow tests.
+// block, exactly like an unknown statement kind. This was used by the
+// ownership pass during slices O3a/O11-simple while it still walked
+// try/catch structurally. As of O11-real the ownership pass consumes the
+// real exception-edge expansion (`treatTryAsOpaque=false`, the default)
+// and models §28.3 exception-path discharge per `exceptionSuccs`. The
+// flag is retained for any consumer that still wants the opaque shape.
 std::unique_ptr<CFG> buildCFG(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     bool treatTryAsOpaque = false);

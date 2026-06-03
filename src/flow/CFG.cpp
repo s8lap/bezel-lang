@@ -23,6 +23,15 @@ void CFG::addEdge(CFGBlock* from, CFGBlock* to) {
     to->preds.push_back(from);
 }
 
+void CFG::addExceptionEdge(CFGBlock* from, CFGBlock* to) {
+    // F2 / O11-real: an exception edge participates in the normal succ/pred
+    // lists (it is still a control transfer) but is additionally tagged so
+    // a dataflow analysis can apply the §28.3 exception-path discharge rule.
+    from->succs.push_back(to);
+    to->preds.push_back(from);
+    from->exceptionSuccs.insert(to);
+}
+
 namespace {
 
 // Loop context: where `break` and `continue` should branch to. The CFG
@@ -121,9 +130,11 @@ private:
         if (dynamic_cast<const ast::ThrowStmt*>(&s)) {
             // F2: throws route to the nearest enclosing catch dispatcher,
             // falling through to the function exit when no try frame is
-            // active.
+            // active. The transfer is an exception (unwinding) edge — tag
+            // it so the ownership pass applies §28.3 exception-path
+            // discharge to owned locals live at the throw.
             from->stmts.push_back(&s);
-            cfg_.addEdge(from, exceptionTarget());
+            cfg_.addExceptionEdge(from, exceptionTarget());
             return nullptr;
         }
         if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
@@ -196,6 +207,12 @@ private:
             cfg_.addEdge(current, elseEntry);
             Builder inner(cfg_, treatTryAsOpaque_);
             inner.loops_ = loops_;
+            // Propagate the enclosing try frames so a `throw` (or throwable
+            // operation) nested in this branch routes to the right catch
+            // dispatcher / finally, not straight to the function exit. F2
+            // built nested control flow without this; O11-real needs the
+            // exception edges to be complete for §28.3 discharge.
+            inner.tryHandlers_ = tryHandlers_;
             CFGBlock* elseExit = inner.runInto(s.elseBody, elseEntry);
             if (elseExit) cfg_.addEdge(elseExit, merge);
         } else {
@@ -215,6 +232,9 @@ private:
         // Walk the branch body in a sub-Builder so loops_ are preserved.
         Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
+        // Propagate enclosing try frames (see else-branch note above) so a
+        // `throw` in this branch routes to the enclosing catch / finally.
+        inner.tryHandlers_ = tryHandlers_;
         CFGBlock* end = inner.runInto(b.body, bodyEntry);
         if (end) cfg_.addEdge(end, merge);
         return end;
@@ -231,6 +251,10 @@ private:
         Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
         inner.loops_.push_back({header, after});
+        // Propagate enclosing try frames so a `throw` in the loop body
+        // routes to the enclosing catch / finally (O11-real exception
+        // edges); see the else-branch note in visitIfBranches.
+        inner.tryHandlers_ = tryHandlers_;
         CFGBlock* bodyEnd = inner.runInto(s.body, bodyEntry);
         if (bodyEnd) cfg_.addEdge(bodyEnd, header); // back-edge
         return after;
@@ -249,6 +273,10 @@ private:
         Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
         inner.loops_.push_back({header, after});
+        // Propagate enclosing try frames so a `throw` in the loop body
+        // routes to the enclosing catch / finally (O11-real exception
+        // edges); see the else-branch note in visitIfBranches.
+        inner.tryHandlers_ = tryHandlers_;
         CFGBlock* bodyEnd = inner.runInto(s.body, bodyEntry);
         if (bodyEnd) cfg_.addEdge(bodyEnd, header);
         return after;
@@ -277,6 +305,9 @@ private:
         // it just unconditionally routes to finally (or beyond).
         CFGBlock* catchDispatch =
             cfg_.makeBlock(CFGBlock::Kind::Branch);
+        // O11-real: record the originating try so the ownership pass can
+        // scope §28.3 exception-path discharge to this try body's locals.
+        catchDispatch->tryForDispatch = &s;
 
         cfg_.addEdge(from, tryEntry);
 
@@ -295,8 +326,10 @@ private:
             // possible exception edge from the body's end. A more precise
             // F2 would emit one edge per throwable call site; for now we
             // over-approximate with a single edge — sound for ownership
-            // (it sees the throw-path as reachable from the body end).
-            cfg_.addEdge(tryBodyEnd, catchDispatch);
+            // (it sees the throw-path as reachable from the body end). Tag
+            // it as an exception edge so §28.3 exception-path discharge
+            // applies to owned locals live at that point.
+            cfg_.addExceptionEdge(tryBodyEnd, catchDispatch);
         }
 
         // Build each catch arm.
@@ -347,6 +380,10 @@ private:
         // do/end is pure sequencing — same as inlining the body.
         Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
+        // Propagate enclosing try frames so a `throw` in the do-block
+        // routes to the enclosing catch / finally (O11-real exception
+        // edges); see the else-branch note in visitIfBranches.
+        inner.tryHandlers_ = tryHandlers_;
         CFGBlock* end = inner.runInto(s.body, from);
         return end;
     }

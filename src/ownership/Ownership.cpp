@@ -40,52 +40,46 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             }
         }
     }
-    // Slice O3a: run the analysis as a forward dataflow over the body's
-    // CFG. `treatTryAsOpaque=true` keeps `try` a single statement so the
-    // structured `visitStmt` walk handles it (preserving O11-simple); the
-    // straight-line / if-else / loop flow is driven by the CFG. The
-    // returned state is the meet of everything reaching the CFG exit and
-    // is what the end-of-method checks below examine (in place of the old
-    // single-pass `states_`).
-    auto cfg = flow::buildCFG(body, /*treatTryAsOpaque=*/true);
+    // Slice O11-real: run the analysis as a forward dataflow over the
+    // body's full CFG, including the real F2 try/catch/finally exception
+    // edges (`treatTryAsOpaque=false`). The straight-line / if-else / loop /
+    // try flow is all driven by the CFG. The returned state is the meet of
+    // everything reaching the CFG exit; exception edges discharge their live
+    // owned locals implicitly (§28.3 "Exception-path discharge"), so a value
+    // that reaches exit only via a throw has been dropped from `endState`
+    // and does not trip the undischarged check below.
+    auto cfg = flow::buildCFG(body, /*treatTryAsOpaque=*/false);
     BlockState endState = runDataflow(*cfg, entry);
-    // Slice O11 (simple): if the body's last statement is an
-    // unconditional terminator that does not reach scope exit on
-    // any normal path (throw or — for a method whose return type
-    // is `()` — return), the §28.3 "exception-path discharge" rule
-    // covers any still-undischarged owned locals via the implicit
-    // try/finally during stack unwinding. Skip the undischarged
-    // check in that case.
-    //
-    // O3a keeps this approximation byte-for-byte: the gate is still the
-    // lexically-last statement being a ThrowStmt. A throw inside an
-    // if-branch doesn't suppress the check (the other branches still
-    // normally exit). O11-real (a later step) sharpens this to "every
-    // normal-exit path ends in throw/return" using the CFG exception
-    // edges that O3a deliberately does not yet consult.
-    // Scope-exit: every plain `var` owned local must have been
-    // discharged. `using var` locals carry implicit discharge.
-    // The field-move check below is NOT suppressed: the enclosing object
-    // survives the throw and its field invariant must still hold.
-    if (!bodyEndsInThrow(body)) {
-        for (const auto& [sym, st] : endState) {
-            if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
-                ctx_.diagnostics().report(
-                    Severity::Error,
-                    st.obligationOrigin ? st.obligationOrigin->span.begin
-                                        : SourceLocation{},
-                    std::string("owned value in `") +
-                    std::string(sym->name) +
-                    "` would be dropped here without disposal "
-                    "(§28.3 — consider `using var`, explicit "
-                    "`.Dispose()`, `move`, or `return`)");
-            }
+    // §28.3 "Owned-local discharge requirement": an owned local must reach
+    // an owned slot (or be disposed) before it goes out of scope on a
+    // *normal-exit* path. The exception-path discharge is handled inside the
+    // dataflow (runDataflow / computeEntry): a value live-and-owned on an
+    // exception edge is auto-disposed by the implicit try/finally during
+    // stack unwinding, so the meet at any exception successor — and
+    // ultimately at the function exit — sees it Disposed, not Owned. Hence
+    // the check here fires only for locals that survive Owned to a
+    // normal-exit edge.
+    for (const auto& [sym, st] : endState) {
+        if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
+            ctx_.diagnostics().report(
+                Severity::Error,
+                st.obligationOrigin ? st.obligationOrigin->span.begin
+                                    : SourceLocation{},
+                std::string("owned value in `") +
+                std::string(sym->name) +
+                "` would be dropped here without disposal "
+                "(§28.3 — consider `using var`, explicit "
+                "`.Dispose()`, `move`, or `return`)");
         }
     }
     // Slice O8 / §28.8.1: a `move this.field` leaves the field in
     // moved-from state. The field must be reassigned before the
     // surrounding method exits — otherwise the field's invariant
-    // is broken on method return.
+    // is broken on method return. Per §28.8.1 "Exception paths are not
+    // exempt", this is NOT covered by the §28.3 exception-path discharge:
+    // even when the method exits via a throw, the destructor on `this`
+    // would observe the field moved-from during unwinding, so the check
+    // fires unconditionally (path-insensitively) here.
     for (const auto& [name, moved] : fieldMovedFrom_) {
         if (moved) {
             ctx_.diagnostics().report(
@@ -98,15 +92,6 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 "(§28.8.1 — reassign the field before exiting)");
         }
     }
-}
-
-bool MethodOwnership::bodyEndsInThrow(
-    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-    for (auto it = body.rbegin(); it != body.rend(); ++it) {
-        if (!*it) continue;
-        return dynamic_cast<const ast::ThrowStmt*>(it->get()) != nullptr;
-    }
-    return false;
 }
 
 namespace {
@@ -191,6 +176,116 @@ bool sameState(const BlockState& a, const BlockState& b) {
     return true;
 }
 
+// Collect every LocalDecl AST node declared (directly or in a nested
+// block) within a statement list, into `out`. Used to scope §28.3
+// exception-path discharge to exactly the locals whose scope the unwind
+// destroys (a try body's own locals), leaving enclosing-scope locals
+// untouched — they remain live in the catch and after the try.
+void collectLocalDecls(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                       std::unordered_set<const ast::Node*>& out);
+
+void collectLocalDeclsStmt(const ast::Stmt& s,
+                           std::unordered_set<const ast::Node*>& out) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        out.insert(ld);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        collectLocalDecls(ifs->ifBranch.body, out);
+        for (const auto& el : ifs->elifBranches) collectLocalDecls(el.body, out);
+        collectLocalDecls(ifs->elseBody, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        collectLocalDecls(ws->body, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        collectLocalDecls(fs->body, out);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        collectLocalDecls(dob->body, out);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        // A nested try's body / catch / finally locals are also destroyed
+        // when an exception escapes the *outer* try through them.
+        collectLocalDecls(ts->body, out);
+        for (const auto& arm : ts->catches) {
+            if (arm.body) collectLocalDeclsStmt(*arm.body, out);
+        }
+        collectLocalDecls(ts->finallyBody, out);
+        return;
+    }
+}
+
+void collectLocalDecls(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                       std::unordered_set<const ast::Node*>& out) {
+    for (const auto& s : body) {
+        if (s) collectLocalDeclsStmt(*s, out);
+    }
+}
+
+// §28.3 "Exception-path discharge": when control transfers along an
+// exception (stack-unwinding) edge, every owned local or owned parameter
+// whose scope the unwind *destroys* is disposed implicitly by the
+// compiler's implicit try/finally. Returns a copy of `pe` with each such
+// Owned local *removed* — modelling that the unwind both disposed it (so it
+// carries no leak obligation past this edge) and ended its scope (so it
+// does not exist at the handler or after the try). Removing rather than
+// marking Disposed is deliberate: the value's scope is gone, and a leftover
+// Disposed entry would otherwise meet the *normal*-exit path's Owned entry
+// for the same local at the post-try join and mask a real normal-path leak
+// (§28.6). Dropping the entry lets the normal path's Owned obligation
+// survive the join intact (callers fold normal predecessors first so the
+// surviving entry is seeded from a normal edge).
+//
+// `unwoundDecls` is non-null when the edge lands at a try's catch dispatch:
+// only locals whose declaration is in that set (declared inside the try
+// body the exception is escaping) go out of scope; locals from enclosing
+// scopes are still live in the catch and after the try, so they are left
+// untouched. When `unwoundDecls` is null the edge leaves the method (an
+// uncaught exception), so the whole method unwinds and *all* in-scope owned
+// locals are disposed.
+//
+// The transform applies to both plain `var` and `using var` owned locals:
+// "On exception paths, both behave identically — the value is disposed by
+// the implicit cleanup pass." It deliberately leaves the states the spec
+// lists as NOT auto-disposed untouched: MovedFrom (already moved out),
+// Disposed (already disposed), Borrowed (no obligation), Uninitialized /
+// PolyNull / Poisoned (no live owned value).
+BlockState dischargeOnExceptionEdge(
+    const BlockState& pe,
+    const std::unordered_set<const ast::Node*>* unwoundDecls) {
+    BlockState out = pe;
+    for (auto it = out.begin(); it != out.end();) {
+        sema::Symbol* sym = it->first;
+        const LocalOwnership& st = it->second;
+        bool unwind = st.state == OwnershipState::Owned;
+        if (unwind && unwoundDecls) {
+            // Caught by an enclosing try: only this try body's own locals
+            // unwind. A symbol's `decl` is its declaration AST node (the
+            // LocalDecl for a local, the parameter for an owned parameter);
+            // it is stable across reassignment, unlike the obligation
+            // origin. An owned parameter is declared in the method scope,
+            // which encloses the try, so its decl is not in `unwoundDecls`
+            // and it is NOT disposed here — it stays Owned and must still be
+            // discharged after the try.
+            if (sym->decl == nullptr ||
+                unwoundDecls->count(sym->decl) == 0) {
+                unwind = false;
+            }
+        }
+        if (unwind) {
+            it = out.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 BlockState MethodOwnership::runDataflow(
@@ -221,6 +316,28 @@ BlockState MethodOwnership::runDataflow(
     std::unordered_map<const flow::CFGBlock*, BlockState> exitState;
     std::unordered_set<const flow::CFGBlock*> evaluated;
 
+    // §28.3 exception-path discharge scoping. For an exception edge that
+    // lands at a try's catch dispatch, only the locals declared in that try
+    // body unwind; for an edge that leaves the method (lands at the exit),
+    // the whole method unwinds. Cache, per try AST node, the set of
+    // LocalDecls declared in its body. The resolver returns that set for a
+    // catch-dispatch target, or nullptr ("unwind everything") for the exit.
+    std::unordered_map<const ast::TryStmt*,
+                       std::unordered_set<const ast::Node*>> tryUnwound;
+    auto unwoundDeclsFor =
+        [&](const flow::CFGBlock* target)
+        -> const std::unordered_set<const ast::Node*>* {
+        const ast::TryStmt* ts = target->tryForDispatch;
+        if (!ts) return nullptr;  // exit / non-dispatch → whole-method unwind
+        auto it = tryUnwound.find(ts);
+        if (it == tryUnwound.end()) {
+            std::unordered_set<const ast::Node*> decls;
+            collectLocalDecls(ts->body, decls);
+            it = tryUnwound.emplace(ts, std::move(decls)).first;
+        }
+        return &it->second;
+    };
+
     // Compute one block's entry state as the §28.3 meet over its evaluated
     // predecessors' exit states. O3b: every predecessor participates,
     // INCLUDING back-edges and the zero-trip header→after skip edge —
@@ -241,11 +358,24 @@ BlockState MethodOwnership::runDataflow(
         SourceLocation joinLoc =
             b->sourceStmt ? b->sourceStmt->span.begin : SourceLocation{};
         const bool isIfMerge = b->kind == flow::CFGBlock::Kind::Merge;
-        for (const flow::CFGBlock* p : b->preds) {
-            if (!evaluated.count(p)) continue;
+        // §28.3 exception-path discharge: along an exception (unwinding)
+        // edge, the unwound owned locals are auto-disposed by the implicit
+        // try/finally and their scope ends, so the predecessor's exit state
+        // is fed to the meet with those locals dropped (see
+        // dischargeOnExceptionEdge). Normal predecessors are folded FIRST so
+        // a local that is still Owned on a normal-exit edge into `b` seeds
+        // the meet result and survives the union with the exception edges
+        // that dropped it — preserving a real normal-path leak (§28.6).
+        auto foldPred = [&](const flow::CFGBlock* p, bool excEdge) {
+            if (!evaluated.count(p)) return;
             const bool loopEdge =
                 backEdges.count({p, b}) != 0 || isLoopSkipEdge(p, b);
-            const BlockState& pe = exitState[p];
+            const BlockState& peRaw = exitState[p];
+            BlockState peDischarged;
+            if (excEdge)
+                peDischarged =
+                    dischargeOnExceptionEdge(peRaw, unwoundDeclsFor(b));
+            const BlockState& pe = excEdge ? peDischarged : peRaw;
             if (!haveIn) {
                 in = pe;
                 haveIn = true;
@@ -254,7 +384,11 @@ BlockState MethodOwnership::runDataflow(
                          /*emitClash=*/emitOnMerge && isIfMerge && !loopEdge,
                          /*unionKeys=*/loopEdge);
             }
-        }
+        };
+        for (const flow::CFGBlock* p : b->preds)
+            if (!flow::CFG::isExceptionEdge(p, b)) foldPred(p, false);
+        for (const flow::CFGBlock* p : b->preds)
+            if (flow::CFG::isExceptionEdge(p, b)) foldPred(p, true);
         return in;
     };
 
@@ -306,14 +440,23 @@ BlockState MethodOwnership::runDataflow(
     // emitClash stays false (a clash on two paths to exit was already
     // reported at its originating Merge block; the old walker never met at
     // exit). unionKeys=true so an owned obligation that survives on any
-    // path — e.g. a loop-body local that reaches exit still Owned — is
-    // preserved for the undischarged-owned check in run() (§28.3 / §28.6:
-    // an owned value must be discharged on every path).
+    // NORMAL path — e.g. a loop-body local that reaches exit still Owned —
+    // is preserved for the undischarged-owned check in run() (§28.3 /
+    // §28.6: an owned value must be discharged on every normal-exit path).
+    // A predecessor reaching exit along an exception edge (a naked `throw`
+    // with no enclosing handler) contributes its post-unwind state, in
+    // which the unwound owned locals have been dropped (§28.3 exception-path
+    // discharge), so the throw path never produces a leak diagnostic.
     BlockState endState;
     bool haveEnd = false;
-    for (const flow::CFGBlock* p : cfg.exit()->preds) {
-        if (!evaluated.count(p)) continue;
-        const BlockState& pe = exitState[p];
+    auto foldExitPred = [&](const flow::CFGBlock* p, bool excEdge) {
+        if (!evaluated.count(p)) return;
+        const BlockState& peRaw = exitState[p];
+        BlockState peDischarged;
+        if (excEdge)
+            peDischarged =
+                dischargeOnExceptionEdge(peRaw, unwoundDeclsFor(cfg.exit()));
+        const BlockState& pe = excEdge ? peDischarged : peRaw;
         if (!haveEnd) {
             endState = pe;
             haveEnd = true;
@@ -321,7 +464,14 @@ BlockState MethodOwnership::runDataflow(
             joinInto(endState, pe, SourceLocation{}, /*emitClash=*/false,
                      /*unionKeys=*/true);
         }
-    }
+    };
+    // Normal-exit predecessors first (same rationale as computeEntry: a
+    // normal-path Owned obligation must seed and survive the union with the
+    // exception edges that dropped the local).
+    for (const flow::CFGBlock* p : cfg.exit()->preds)
+        if (!flow::CFG::isExceptionEdge(p, cfg.exit())) foldExitPred(p, false);
+    for (const flow::CFGBlock* p : cfg.exit()->preds)
+        if (flow::CFG::isExceptionEdge(p, cfg.exit())) foldExitPred(p, true);
     if (!haveEnd) {
         // No path reaches exit. Fall back to the entry-block exit state.
         auto it = exitState.find(cfg.entry());
@@ -331,12 +481,14 @@ BlockState MethodOwnership::runDataflow(
 }
 
 void MethodOwnership::processBlock(const flow::CFGBlock& block) {
-    // Each CFG block (with try treated opaquely) holds only straight-line
-    // statements plus opaque TryStmt / break / continue / return / throw.
-    // The existing per-statement transfer functions handle them; the
-    // if/while/for/do branches inside visitStmt are never reached from a
-    // block's statement list (the CFG already extracted that control flow)
-    // but remain in use for the structured walk inside an opaque try body.
+    // Each CFG block holds only straight-line statements plus the leaf
+    // terminators break / continue / return / throw. The existing
+    // per-statement transfer functions handle them. As of O11-real the CFG
+    // expands try/catch/finally into real blocks and exception edges, so —
+    // like if/while/for/do — a TryStmt is never seen here as a block
+    // statement; the if/while/for/do/try branches inside visitStmt are
+    // retained but unreachable from a block's statement list (the CFG
+    // already extracted that control flow).
     for (const ast::Stmt* s : block.stmts) {
         if (s) visitStmt(*s);
     }
