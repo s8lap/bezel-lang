@@ -1,5 +1,9 @@
 #include "ownership/Ownership_impl.hpp"
 
+#include <functional>
+#include <string>
+#include <vector>
+
 namespace bezel::ownership {
 
 // The MethodOwnership class is declared in Ownership_impl.hpp; this
@@ -442,6 +446,317 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
             "rule; bind the source in the caller's scope and "
             "return the borrow from there instead)");
         return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §28.9 closure-escape and §9.7 borrow-bearing-record escape (issue #360).
+//
+// The direct-return forms of two soundness holes: a returned closure that
+// captures an owned scope-bound local (the closure outlives the local's
+// scope, so it reads the value after the local's `using var`/owned discharge
+// at scope exit — a use-after-dispose), and a returned borrow-bearing record
+// that carries a borrow of such a local (same lifetime violation through a
+// record field). Indirect escapes (store into a field, pass to an out-param)
+// are out of scope for this slice and remain deferred.
+// ---------------------------------------------------------------------------
+
+void MethodOwnership::collectIdentifiersIn(
+    const ast::Expr& e,
+    std::vector<const ast::IdentifierExpr*>& out) const {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        out.push_back(id);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) collectIdentifiersIn(*ma->target, out);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) collectIdentifiersIn(*nm->target, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) collectIdentifiersIn(*ce->callee, out);
+        for (const auto& a : ce->args)
+            if (a.value) collectIdentifiersIn(*a.value, out);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) collectIdentifiersIn(*nc->callee, out);
+        for (const auto& a : nc->args)
+            if (a.value) collectIdentifiersIn(*a.value, out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) collectIdentifiersIn(*ix->target, out);
+        for (const auto& a : ix->indices)
+            if (a.value) collectIdentifiersIn(*a.value, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) collectIdentifiersIn(*be->left, out);
+        if (be->right) collectIdentifiersIn(*be->right, out);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) collectIdentifiersIn(*un->operand, out);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) collectIdentifiersIn(*pb->operand, out);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) collectIdentifiersIn(*tt->operand, out);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->thenValue) collectIdentifiersIn(*cd->thenValue, out);
+        if (cd->condition) collectIdentifiersIn(*cd->condition, out);
+        if (cd->elseValue) collectIdentifiersIn(*cd->elseValue, out);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) collectIdentifiersIn(*a.value, out);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) collectIdentifiersIn(*th->operand, out);
+        return;
+    }
+    // A nested lambda's captures are themselves captures of the enclosing
+    // lambda, so descend into it.
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        collectLambdaIdentifiers(*lam, out);
+        return;
+    }
+    // Other expression forms carry no identifier that could be a tracked
+    // method-scope local capture (literals, default/typeof/nameof, …).
+}
+
+void MethodOwnership::collectIdentifiersInStmt(
+    const ast::Stmt& s,
+    std::vector<const ast::IdentifierExpr*>& out) const {
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) collectIdentifiersIn(*es->expr, out);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) collectIdentifiersIn(*rs->value, out);
+        return;
+    }
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) collectIdentifiersIn(*ld->initializer, out);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) collectIdentifiersIn(*as->target, out);
+        if (as->value) collectIdentifiersIn(*as->value, out);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) collectIdentifiersIn(*ds->value, out);
+        return;
+    }
+    // Control-flow statements inside a lambda block body (if/while/for/…)
+    // are not walked: this bounded slice diagnoses the direct
+    // `() => localRef.field` / single-statement-body forms exercised by the
+    // reproducer. Deeper block-body capture analysis is deferred (and would
+    // only add rejections, never relax one).
+}
+
+void MethodOwnership::collectLambdaIdentifiers(
+    const ast::LambdaExpr& lam,
+    std::vector<const ast::IdentifierExpr*>& out) const {
+    if (lam.exprBody) {
+        collectIdentifiersIn(*lam.exprBody, out);
+    } else {
+        for (const auto& st : lam.stmts)
+            if (st) collectIdentifiersInStmt(*st, out);
+    }
+}
+
+void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
+    // Gather every lambda appearing in the returned expression. The
+    // returned expression is most commonly the lambda itself
+    // (`return () => r.V;`), but it may also wrap it (e.g. a conditional).
+    std::vector<const ast::LambdaExpr*> lambdas;
+    std::function<void(const ast::Expr&)> findLambdas =
+        [&](const ast::Expr& x) {
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&x)) {
+                lambdas.push_back(lam);
+                return;  // its captures are walked below, not here
+            }
+            if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&x)) {
+                if (cd->thenValue) findLambdas(*cd->thenValue);
+                if (cd->elseValue) findLambdas(*cd->elseValue);
+                return;
+            }
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(&x)) {
+                for (const auto& a : ce->args)
+                    if (a.value) findLambdas(*a.value);
+                return;
+            }
+            if (auto* ne = dynamic_cast<const ast::NewExpr*>(&x)) {
+                for (const auto& a : ne->args)
+                    if (a.value) findLambdas(*a.value);
+                return;
+            }
+        };
+    findLambdas(e);
+    if (lambdas.empty()) return;
+
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            // Resolve against the dataflow-tracked method-scope locals. A
+            // captured lambda parameter is not in `states_`, so it is
+            // naturally excluded; only an enclosing-method local/owned-param
+            // can match.
+            auto it = states_.find(sym);
+            if (it == states_.end()) continue;
+            const LocalOwnership& st = it->second;
+            // §28.9: capturing an *owned* local (a `using var` or an
+            // owned-producing local / `owned` parameter) is a borrow whose
+            // source is the local's enclosing scope; the returned closure
+            // outlives that scope. Only the Owned state carries this
+            // scope-bound discharge obligation — a value-typed or
+            // runtime-managed (string/function) local is never Owned, so
+            // capturing one is not constrained and is not diagnosed here.
+            if (st.state != OwnershipState::Owned) continue;
+            // Belt-and-braces: confirm the captured local's declared type is
+            // a class/interface reference (the only thing a §28.9 borrow can
+            // alias). An Owned non-reference would be surprising, but the
+            // type gate keeps the check from ever firing on a value-typed
+            // local even if a future producer marked one Owned.
+            const sema::TypeRef* declTy = nullptr;
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+                declTy = ls->declType;
+            else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                if (ps->declType) declTy = ctx_.resolvedType(*ps->declType);
+                else declTy = ps->resolvedDeclType;
+            }
+            // Null declType → unknown; isBorrowableType is conservative
+            // (true), but we additionally already gated on Owned, so this
+            // only admits genuine owned-reference captures.
+            if (declTy && !isBorrowableType(declTy)) continue;
+            report(
+                Severity::Error, id->span.begin,
+                std::string("returned closure captures `") +
+                std::string(sym->name) +
+                "` whose source is disposed at scope end — capturing an "
+                "owned local does not transfer ownership; the capture is a "
+                "borrow of the enclosing scope and the returned closure "
+                "would outlive it (use-after-dispose). (§28.9 closure-"
+                "capture escape; keep the owned location in a longer-lived "
+                "scope, or restructure so the closure does not escape)");
+            return;  // one diagnostic per return is enough
+        }
+    }
+}
+
+bool MethodOwnership::isBorrowBearingRecord(const sema::TypeRef* rt) const {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    const auto* decl =
+        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+    if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
+
+    // §9.7: a record is borrow-bearing when it holds at least one
+    // borrow-carrying field of a non-runtime-managed type: a class/
+    // interface reference field (nullable or not), an inline array whose
+    // element is a reference type, or another borrow-bearing record
+    // (transitivity). string / function / boxed and value-typed fields do
+    // not make a record borrow-bearing.
+    auto fieldIsBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
+        if (!ft) return false;
+        switch (ft->kind) {
+            case sema::TypeRef::Kind::Named: {
+                if (!ft->declaration) return false;  // generic param
+                if (ft->declaration->kind == ast::TypeDeclKind::Class ||
+                    ft->declaration->kind == ast::TypeDeclKind::Interface)
+                    return true;
+                if (ft->declaration->kind == ast::TypeDeclKind::Record)
+                    return isBorrowBearingRecord(ft);  // transitive
+                return false;  // enum
+            }
+            case sema::TypeRef::Kind::InlineArray:
+                return ft->arrayElement &&
+                       !ft->arrayOwned &&
+                       isBorrowableType(ft->arrayElement);
+            case sema::TypeRef::Kind::Primitive:
+                // string / Object / numeric: runtime-managed or value type;
+                // never a borrow source. (Object is boxed when holding a
+                // value; the §9.7 list excludes boxed value types.)
+                return false;
+            default:
+                return false;  // Unit, Function (runtime-managed), Error
+        }
+    };
+
+    // Positional record fields (§9.1).
+    for (const ast::Param& f : decl->positionalFields) {
+        if (!f.type) continue;
+        if (fieldIsBorrowCarrying(ctx_.resolvedType(*f.type))) return true;
+    }
+    // Body-record reference fields / auto-properties (§9.2).
+    for (const auto& m : decl->members) {
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+            if (fd->type &&
+                fieldIsBorrowCarrying(ctx_.resolvedType(*fd->type)))
+                return true;
+        }
+    }
+    return false;
+}
+
+void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
+    // Direct form: `return new Rec(...);` where Rec is a borrow-bearing
+    // record (§9.7). The static type of the returned expression must be a
+    // borrow-bearing record, and at least one constructor argument must
+    // alias a scope-bound (`using var` / owned) local — the borrow whose
+    // source is disposed at this method's exit.
+    const auto* ne = dynamic_cast<const ast::NewExpr*>(&e);
+    if (!ne) return;
+    const sema::TypeRef* rt =
+        ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(e);
+    if (!isBorrowBearingRecord(rt)) return;
+
+    for (const ast::CallArgument& a : ne->args) {
+        if (!a.value) continue;
+        const ast::IdentifierExpr* root = identifierRoot(*a.value);
+        if (!root) continue;
+        sema::Symbol* sym = ctx_.exprSymbol(*root);
+        const LocalOwnership* st = nullptr;
+        if (sym) {
+            auto it = states_.find(sym);
+            if (it != states_.end()) st = &it->second;
+        }
+        if (!st) {
+            // Fallback for an argument identifier sema left unbound: match
+            // by name against a tracked owned local (parallels the
+            // by-name match in checkBorrowEscapesOnReturn).
+            for (const auto& [s, lo] : states_) {
+                if (s->name == root->name) { st = &lo; break; }
+            }
+        }
+        if (!st || st->state != OwnershipState::Owned) continue;
+        report(
+            Severity::Error, ne->span.begin,
+            std::string("returned borrow-bearing record carries a borrow of "
+                        "`") +
+            std::string(root->name) +
+            "` whose source is disposed at scope end — a borrow-bearing "
+            "record may not outlive the source of any borrow it carries, "
+            "and returning it from this method does (§9.7 record borrow-"
+            "lifetime rule; bind the source in the caller's scope and build "
+            "the record there instead)");
+        return;  // one diagnostic per return is enough
     }
 }
 
