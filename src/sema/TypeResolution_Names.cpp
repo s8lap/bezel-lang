@@ -46,6 +46,15 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "DateTime" || n == "TimeSpan" ||
         n == "File" || n == "Directory" || n == "Path" ||
         n == "Encoding" || n == "Linq") return 0;
+    // §32.5 / stdlib §10: FFI-boundary types. IntPtr/UIntPtr are
+    // compiler-intrinsic value types (pointer-sized integers); CString,
+    // WString, RawBytes are FFI-boundary classes. They have no user
+    // TypeDecl, so — like the §3 built-ins above — they resolve to a
+    // Named TypeRef with a null declaration. All are nullary. Making them
+    // resolvable lets §32 extern signatures using them compile (§32.5);
+    // before this they errored "unresolved type name".
+    if (n == "IntPtr" || n == "UIntPtr" ||
+        n == "CString" || n == "WString" || n == "RawBytes") return 0;
     return kNotBuiltin;
 }
 

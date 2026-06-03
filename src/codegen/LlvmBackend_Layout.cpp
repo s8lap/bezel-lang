@@ -194,6 +194,18 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 }
                 return i32();  // unresolved generic param → i32 fallback
             }
+            // §32.5 / §32.7 / stdlib §10: FFI-boundary types. IntPtr and
+            // UIntPtr are pointer-sized integers — on the host target that is
+            // 64-bit, so they lower to i64. CString/WString/RawBytes are
+            // opaque pointers at the C boundary (char*, wchar*, void*).
+            if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty()) {
+                auto fn = rt->astNode->name->parts[0];
+                if (fn == "IntPtr" || fn == "UIntPtr")
+                    return i64();  // per §32.7: pointer-sized integer (i64 host)
+                if (fn == "CString" || fn == "WString" || fn == "RawBytes")
+                    return ptrTy();  // per §32.5: opaque C-boundary pointer
+            }
             // §3 stdlib: collection and IO built-in classes (no user TypeDecl).
             // All are heap-allocated opaque pointers to runtime structs.
             if (!rt->declaration && rt->astNode && rt->astNode->name &&

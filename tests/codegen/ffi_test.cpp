@@ -81,6 +81,86 @@ BEZEL_TEST(codegen_cg26, putchar_writes_stdout) {
     BEZEL_EXPECT_EQ(out, std::string("Hi\n"));
 }
 
+// ---------------------------------------------------------------------------
+// §32.5 / stdlib §10 FFI-boundary named types: CString, WString, RawBytes,
+// IntPtr, UIntPtr. Issue #340 — before this work these names errored
+// "unresolved type name" in extern signatures. These tests assert the
+// signatures now RESOLVE (the program compiles and `main` runs), and — for
+// CString — that an extern call marshals a Bezel `string` end-to-end.
+// ---------------------------------------------------------------------------
+
+// §32.7 / stdlib §10.0: IntPtr / UIntPtr resolve as extern param + return
+// types (pointer-sized integers). The block is declared but uncalled; that
+// `main` runs at all proves the signatures compiled.
+BEZEL_TEST(codegen_ffi_types, intptr_uintptr_resolve_32_7) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" "
+        "  public method f(a: IntPtr, b: UIntPtr): IntPtr; end; "
+        "class C public static method Main(): int return 7; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// §32.5 / stdlib §10.1: CString resolves as an extern param + return type.
+BEZEL_TEST(codegen_ffi_types, cstring_resolve_32_5) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" public method strdup(s: CString): CString; end; "
+        "class C public static method Main(): int return 1; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// §32.1: a nullable CString return (`CString?`, as in the spec's `strdup`
+// example) resolves and is FFI-permitted.
+BEZEL_TEST(codegen_ffi_types, nullable_cstring_resolve_32_1) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" public method strdup(s: CString): CString?; end; "
+        "class C public static method Main(): int return 2; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 2);
+}
+
+// §32.5 / stdlib §10.2 / §10.3: WString and RawBytes resolve as extern types.
+BEZEL_TEST(codegen_ffi_types, wstring_rawbytes_resolve_32_5) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" "
+        "  public method w(s: WString): IntPtr; "
+        "  public method b(buf: RawBytes): IntPtr; end; "
+        "class C public static method Main(): int return 3; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 3);
+}
+
+// §32.5 / §32.6: a Bezel `string` argument marshals to a `CString` (char*)
+// parameter end-to-end. libc atoi("42") parses the null-terminated UTF-8 data
+// pointer of the bz_string and returns 42, observable as the JIT exit code.
+BEZEL_TEST(codegen_ffi_types, cstring_arg_marshals_to_libc_atoi_32_6) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" public method atoi(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  return atoi(\"42\"); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// §32.5 / §32.6: a CString argument round-trips through libc puts, which
+// writes the string + newline to stdout — observable end-to-end output.
+BEZEL_TEST(codegen_ffi_types, cstring_arg_marshals_to_libc_puts_32_6) {
+    std::string out = compileAndCapture(
+        "module M; "
+        "extern \"c\" public method puts(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  var _ := puts(\"hello-ffi\"); return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(out, std::string("hello-ffi\n"));
+}
+
 // §2.3: Console is always available; Write/WriteLine are intrinsics lowered
 // via POSIX write(2). These tests use compileAndCapture to observe stdout.
 
