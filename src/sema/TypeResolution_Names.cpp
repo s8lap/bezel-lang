@@ -86,9 +86,24 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
                    dynamic_cast<const ast::ExternBlock*>(&decl)) {
         for (const auto& d : xb->methods) {
             for (const auto& p : d.params) {
-                if (p.type) resolveType(*p.type, parent);
+                if (p.type) {
+                    resolveType(*p.type, parent);
+                    // per §32.5: only FFI-compatible types may appear in an
+                    // extern method signature. A parameter is never a return
+                    // position, so the unit type `()` is not admitted here.
+                    checkExternType(*p.type, /*returnPosition=*/false,
+                                    std::string("parameter `") +
+                                        std::string(p.name) + "`");
+                }
             }
-            if (d.returnType) resolveType(*d.returnType, parent);
+            if (d.returnType) {
+                resolveType(*d.returnType, parent);
+                // per §32.5: the return slot may additionally be the unit
+                // type `()`. (An omitted `: T` clause leaves returnType null
+                // and is already a unit-returning method — §32.5.)
+                checkExternType(*d.returnType, /*returnPosition=*/true,
+                                "return type");
+            }
         }
     }
 }

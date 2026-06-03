@@ -97,6 +97,7 @@ add_library(bezel_core STATIC
     src/sema/ExprTypecheck_Exprs.cpp
     src/sema/ExprTypecheck_Calls.cpp
     src/sema/DefiniteAssignment.cpp
+    src/sema/EntryPoint.cpp
     src/flow/CFG.cpp
     src/ownership/OwnershipChecker.cpp
     src/ownership/Ownership.cpp
