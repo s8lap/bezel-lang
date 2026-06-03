@@ -2200,6 +2200,19 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
 
+    // per §24.1: initialize each instance event's backing EventSource<T> slot
+    // to a fresh, empty source during construction. (calloc zeroed it; an
+    // empty source is what an event must hold before any subscription.)
+    for (const sema::Symbol* m : storage) {
+        if (!dynamic_cast<const sema::EventSymbol*>(m)) continue;
+        auto idxIt = fieldIndex_.find(m);
+        if (idxIt == fieldIndex_.end()) continue;
+        auto* newFn = declareC("bz_event_source_new", ptrTy(), {});
+        llvm::Value* esrc = builder_.CreateCall(newFn, {});
+        builder_.CreateStore(
+            esrc, builder_.CreateStructGEP(st, obj, idxIt->second));
+    }
+
     // CG10: run the explicit constructor (if any) after the field
     // initializers, passing the new instance as `this` plus the
     // lowered positional arguments. (Constructor overloads and

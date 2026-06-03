@@ -1206,6 +1206,122 @@ extern "C" void* bz_lazy_to_array(void* lazy, int64_t esz) {
     return arr;
 }
 
+// ---------------------------------------------------------------------------
+// Events (language spec §24). An EventSource holds an ordered handler list.
+// Each handler is a Bezel closure value (a { fn_ptr, env_ptr } struct pointer).
+// Raise is lowered in codegen; the runtime only stores/produces the list.
+// ---------------------------------------------------------------------------
+
+struct bz_event_handler_t {
+    void*   closure;  // closure { fn_ptr, env_ptr } struct pointer
+    int64_t token;    // unique, monotonically increasing (>0)
+    bool    active;   // false once removed (tombstone)
+};
+
+struct bz_event_source_t {
+    bz_event_handler_t* handlers;
+    int64_t             count;     // number of slots in use (incl. tombstones)
+    int64_t             capacity;
+    int64_t             next_token;
+};
+
+struct bz_subscription_t {
+    bz_event_source_t* src;
+    int64_t            token;
+    bool               disposed;
+};
+
+extern "C" void* bz_event_source_new(void) {
+    auto* s = (bz_event_source_t*)calloc(1, sizeof(bz_event_source_t));
+    s->next_token = 1;  // tokens are >0 so 0 can mean "none"
+    return s;
+}
+
+extern "C" int64_t bz_event_add(void* srcp, void* closure) {
+    auto* s = (bz_event_source_t*)srcp;
+    if (!s) return 0;
+    if (s->count >= s->capacity) {
+        int64_t nc = s->capacity < 4 ? 4 : s->capacity * 2;
+        s->handlers = (bz_event_handler_t*)realloc(
+            s->handlers, (size_t)nc * sizeof(bz_event_handler_t));
+        s->capacity = nc;
+    }
+    int64_t tok = s->next_token++;
+    s->handlers[s->count].closure = closure;
+    s->handlers[s->count].token = tok;
+    s->handlers[s->count].active = true;
+    s->count++;
+    return tok;
+}
+
+extern "C" int64_t bz_event_count(void* srcp) {
+    auto* s = (bz_event_source_t*)srcp;
+    if (!s) return 0;
+    int64_t n = 0;
+    for (int64_t i = 0; i < s->count; ++i)
+        if (s->handlers[i].active) ++n;
+    return n;
+}
+
+extern "C" void* bz_event_handler_at(void* srcp, int64_t idx) {
+    auto* s = (bz_event_source_t*)srcp;
+    if (!s) return nullptr;
+    int64_t n = 0;
+    for (int64_t i = 0; i < s->count; ++i) {
+        if (!s->handlers[i].active) continue;
+        if (n == idx) return s->handlers[i].closure;
+        ++n;
+    }
+    return nullptr;
+}
+
+extern "C" void bz_event_remove_closure(void* srcp, void* closure) {
+    auto* s = (bz_event_source_t*)srcp;
+    if (!s) return;
+    // §24.4: -= removes the FIRST matching handler.
+    for (int64_t i = 0; i < s->count; ++i) {
+        if (s->handlers[i].active && s->handlers[i].closure == closure) {
+            s->handlers[i].active = false;
+            return;
+        }
+    }
+}
+
+extern "C" void bz_event_remove_token(void* srcp, int64_t token) {
+    auto* s = (bz_event_source_t*)srcp;
+    if (!s || token == 0) return;
+    for (int64_t i = 0; i < s->count; ++i) {
+        if (s->handlers[i].token == token) {
+            s->handlers[i].active = false;  // idempotent: re-clearing is harmless
+            return;
+        }
+    }
+}
+
+extern "C" void* bz_event_subscribe(void* srcp, void* closure) {
+    auto* s = (bz_event_source_t*)srcp;
+    int64_t tok = bz_event_add(s, closure);
+    auto* sub = (bz_subscription_t*)calloc(1, sizeof(bz_subscription_t));
+    sub->src = s;
+    sub->token = tok;
+    sub->disposed = false;
+    return sub;
+}
+
+extern "C" void bz_subscription_dispose(void* subp) {
+    auto* sub = (bz_subscription_t*)subp;
+    if (!sub || sub->disposed) return;  // §2.11: Dispose is idempotent
+    sub->disposed = true;
+    if (sub->src) bz_event_remove_token(sub->src, sub->token);
+}
+
+extern "C" void bz_event_source_free(void* srcp) {
+    auto* s = (bz_event_source_t*)srcp;
+    if (!s) return;
+    free(s->handlers);
+    free(s);
+}
+
 void* bz_string_split(const char* s, int64_t s_len,
                        const char* delim, int64_t delim_len) {
     void* arr = bz_array_alloc(8, 8);

@@ -275,6 +275,10 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
         return lowerType(fd->type.get());
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
         return lowerType(pd->type.get());
+    // per §24.1: an event's backing EventSource<T> field is a runtime object
+    // referenced by an opaque pointer.
+    if (dynamic_cast<const sema::EventSymbol*>(m))
+        return ptrTy();
     return i32();
 }
 

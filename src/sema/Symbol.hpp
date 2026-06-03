@@ -171,6 +171,12 @@ struct ParameterSymbol : Symbol {
     // Null if the parameter has no declared type (lambda params with
     // inferred types — slice S3e/lambda only).
     const ast::Type* declType = nullptr;
+    // per §24.3: an already-resolved type for a parameter that has no syntactic
+    // `: Type` annotation but whose type is supplied by context — currently
+    // only an event-handler lambda param, typed as the event payload `T`.
+    // Preferred over `declType` (which is null in that case) by identifier
+    // resolution. Null otherwise.
+    TypeRef* resolvedDeclType = nullptr;
 };
 
 // A.3 ExtensionDecl — collected at module level. Its target type is

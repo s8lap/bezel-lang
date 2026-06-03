@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <map>
 #include <unordered_map>
@@ -727,6 +728,16 @@ private:
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (fs && !isStaticField(fs)) { out.push_back(m); continue; }
             if (isAutoProperty(m)) out.push_back(m);
+            // per §24.1: each (instance, synchronous) event declaration gets a
+            // compiler-generated owned backing field of type EventSource<T>,
+            // laid out as a plain `ptr` slot. Static events (static owned field)
+            // and async events (AsyncEventSource<T>) are deferred — async isn't
+            // implemented and static-field events would need static-init.
+            if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
+                if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
+                    if (!ed->isStatic && !ed->isAsync) out.push_back(m);
+                }
+            }
         }
     }
 
@@ -1538,6 +1549,40 @@ private:
     void ensureOutVarSlots(const ast::CallExpr& call);
 
     llvm::Value* lowerCall(const ast::CallExpr& call);
+
+    // per §24: events. `eventSourcePtr` lowers an event-access expression
+    // (a bare `Clicked` implicit-`this` identifier, or `obj.Clicked` /
+    // `this.Clicked` member access whose symbol is an EventSymbol) to the
+    // loaded backing EventSource<T> pointer; null if `e` is not an event
+    // access. `payloadType` returns the resolved payload TypeRef of an event
+    // member (the `: T` annotation, or the unit type when omitted). These
+    // support Subscribe/Add/Remove/Raise lowering.
+    const sema::EventSymbol* eventSymbolOf(const ast::Expr& e);
+    llvm::Value* eventSourcePtr(const ast::Expr& e);
+    const sema::TypeRef* eventPayloadType(const sema::EventSymbol* es);
+
+    // per §24.3 / §24.5: recognize and lower an event method call —
+    // `<event>.Subscribe(h)` (returns owned Subscription), `<event>.Add(h)`,
+    // `<event>.Remove(h)`, `<event>.Raise(payload)` / `<event>.Raise()`.
+    // Returns the produced value (Subscription ptr for Subscribe; null/unit for
+    // the others), or std::nullopt when `call` is not an event method call so
+    // the caller continues normal dispatch.
+    std::optional<llvm::Value*> tryLowerEventCall(const ast::CallExpr& call);
+
+    // per §24.4: `<event> += h` / `<event> -= h` inside the declaring class —
+    // a fixed desugaring to Add/Remove. Returns true when handled.
+    bool tryLowerEventCompound(const ast::AssignmentStmt& as);
+
+    // per §2.11 / §24.4: true when `e` is (or names a local bound to) an event
+    // `Subscribe(...)` call result — i.e. a Subscription. Used to route
+    // `sub.Dispose()` to bz_subscription_dispose (a Subscription has no vtable).
+    bool isSubscriptionExpr(const ast::Expr& e);
+
+    // per §24.5: emit the handler-invocation loop for `Raise(payload)` — call
+    // every active handler closure with `payload` (already lowered, or null for
+    // the no-payload unit form). `payloadLL`/`payloadTy` describe the argument.
+    void emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
+                        llvm::Type* payloadTy);
 
     // CG17/CG18/CG35: emit a call to `ms` with fully-built `args` (receiver
     // first for instance methods). Dynamic dispatch loads the receiver's

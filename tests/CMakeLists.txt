@@ -210,6 +210,7 @@ set(BEZEL_TEST_SOURCES
     codegen/collection_test.cpp
     codegen/record_key_test.cpp
     codegen/linq_test.cpp
+    codegen/event_test.cpp
 
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp

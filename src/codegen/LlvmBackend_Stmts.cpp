@@ -15,6 +15,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         if (as->target && as->value) {
+            // per §24.4: `event += handler` / `event -= handler` (inside the
+            // declaring class) desugar to Add/Remove — not a real compound
+            // assignment. Checked first so the event target is not treated as
+            // an lvalue.
+            if (tryLowerEventCompound(*as)) return false;
             // §22.9: `obj.P := v` / `obj.P OP= v` where P is a block-form
             // property runs its setter body (with `value` = v); compound
             // assignment is a read-modify-write through getter + setter.

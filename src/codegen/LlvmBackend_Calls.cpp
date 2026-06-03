@@ -2662,10 +2662,201 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
 }
 
 
+// per §24: the EventSymbol an event-access expression refers to, or null.
+// A bare identifier (`Clicked` — implicit `this`) or a member access
+// (`obj.Clicked` / `this.Clicked`) both carry the EventSymbol on the expr.
+const sema::EventSymbol* Emitter::eventSymbolOf(const ast::Expr& e) {
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&e) &&
+        !dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return nullptr;
+    return dynamic_cast<const sema::EventSymbol*>(ctx_.exprSymbol(e));
+}
+
+// per §24.1: load the backing EventSource<T> pointer for an event access.
+llvm::Value* Emitter::eventSourcePtr(const ast::Expr& e) {
+    const sema::EventSymbol* es = eventSymbolOf(e);
+    if (!es || !es->parent) return nullptr;
+    auto idxIt = fieldIndex_.find(es);
+    if (idxIt == fieldIndex_.end()) return nullptr;  // static event (deferred)
+    // Receiver: implicit `this` for a bare identifier; the target object for
+    // `obj.Clicked` / `this.Clicked`.
+    llvm::Value* recv = nullptr;
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        recv = currentThis_;
+    } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) recv = lowerExpr(*ma->target);
+    }
+    if (!recv) return nullptr;
+    llvm::StructType* st = classStruct(es->parent);
+    llvm::Value* slot = builder_.CreateStructGEP(st, recv, idxIt->second);
+    return builder_.CreateLoad(ptrTy(), slot, "event.src");
+}
+
+// per §24.1 / §24.3: the resolved payload type of an event member (the `: T`
+// annotation), or null when the event has no payload (unit `()` form).
+const sema::TypeRef* Emitter::eventPayloadType(const sema::EventSymbol* es) {
+    if (!es) return nullptr;
+    auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+    if (!ed || !ed->type) return nullptr;  // no-payload event → unit
+    return ctx_.resolvedType(*ed->type);
+}
+
+// per §24.5: invoke every active handler closure with `payloadLL` (the lowered
+// payload value, or null for the no-payload unit form). Each handler is a
+// Bezel closure { fn_ptr, env_ptr }; the call convention is
+// (env_ptr, payload?) -> void. Handlers run in subscription order; with zero
+// subscribers this is a no-op (no null check at the call site, per §24.5).
+//
+// NOTE (§24.5, deferred): "if a handler throws, subsequent handlers are not
+// invoked and the exception propagates" — handler exception propagation is not
+// wired here (handlers are plain closure calls without an unwind edge). With
+// the current synchronous closure-call path a throwing handler would still
+// abort the loop via the process-level unwind, but the spec's precise
+// stop-and-propagate semantics are not yet enforced. Reported as deferred.
+void Emitter::emitEventRaise(llvm::Value* srcPtr, llvm::Value* payloadLL,
+                             llvm::Type* payloadTy) {
+    if (!srcPtr) return;
+    auto* countFn = declareC("bz_event_count", i64(), {ptrTy()});
+    auto* atFn = declareC("bz_event_handler_at", ptrTy(), {ptrTy(), i64()});
+    llvm::Value* n = builder_.CreateCall(countFn, {srcPtr}, "event.n");
+
+    // Build the handler function type: (env_ptr, payload?) -> void.
+    std::vector<llvm::Type*> handlerArgTys;
+    handlerArgTys.push_back(ptrTy());  // env_ptr
+    if (payloadLL) handlerArgTys.push_back(payloadTy);
+    auto* handlerFnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), handlerArgTys, false);
+
+    // for (i = 0; i < n; ++i) { c = handler_at(src, i); fn = c[0];
+    //                           env = c[1]; fn(env, payload?); }
+    llvm::Function* fn = currentFn_;
+    auto* loopBB = llvm::BasicBlock::Create(llvm_, "raise.loop", fn);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "raise.body", fn);
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "raise.end", fn);
+    auto* iSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), iSlot);
+    builder_.CreateBr(loopBB);
+
+    builder_.SetInsertPoint(loopBB);
+    llvm::Value* i = builder_.CreateLoad(i64(), iSlot);
+    builder_.CreateCondBr(builder_.CreateICmpSLT(i, n), bodyBB, endBB);
+
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* iv = builder_.CreateLoad(i64(), iSlot);
+    llvm::Value* closure = builder_.CreateCall(atFn, {srcPtr, iv}, "event.h");
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "h.fn");
+    llvm::Value* envSlot =
+        builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "h.env");
+    std::vector<llvm::Value*> callArgs;
+    callArgs.push_back(envPtr);
+    if (payloadLL) callArgs.push_back(payloadLL);
+    builder_.CreateCall(handlerFnTy, fnPtr, callArgs);
+    builder_.CreateStore(builder_.CreateAdd(iv, builder_.getInt64(1)), iSlot);
+    builder_.CreateBr(loopBB);
+
+    builder_.SetInsertPoint(endBB);
+}
+
+std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return std::nullopt;
+    // The target of `.Subscribe`/`.Raise`/`.Add`/`.Remove` must itself be an
+    // event access.
+    const sema::EventSymbol* es = eventSymbolOf(*ma->target);
+    if (!es) return std::nullopt;
+    const auto& method = ma->member;
+    const bool isSubscribe = method == "Subscribe" && call.args.size() == 1;
+    const bool isAdd       = method == "Add"       && call.args.size() == 1;
+    const bool isRemove    = method == "Remove"    && call.args.size() == 1;
+    const bool isRaise     = method == "Raise";
+    if (!isSubscribe && !isAdd && !isRemove && !isRaise)
+        return std::nullopt;
+
+    llvm::Value* src = eventSourcePtr(*ma->target);
+    if (!src) return std::nullopt;
+
+    if (isSubscribe || isAdd || isRemove) {
+        // per §24.3 / stdlib §6.5: the handler argument is a function value
+        // (lambda or method reference) lowered to a closure { fn, env }.
+        // Inform lowerLambda of the expected handler type so an untyped lambda
+        // param `(e) => …` resolves the payload type.
+        const sema::TypeRef* saved = expectedFunctionType_;
+        sema::TypeRef handlerTy;  // synthesized (payload) -> ()
+        handlerTy.kind = sema::TypeRef::Kind::Function;
+        if (const sema::TypeRef* pt = eventPayloadType(es)) {
+            sema::TypeRef::FuncParam p;
+            p.type = const_cast<sema::TypeRef*>(pt);
+            handlerTy.funcParams.push_back(p);
+        }
+        expectedFunctionType_ = &handlerTy;
+        llvm::Value* closure = lowerExpr(*call.args[0].value);
+        expectedFunctionType_ = saved;
+        if (!closure) return std::optional<llvm::Value*>(nullptr);
+        if (isSubscribe) {
+            auto* subFn =
+                declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
+            return std::optional<llvm::Value*>(
+                builder_.CreateCall(subFn, {src, closure}, "subscription"));
+        }
+        if (isAdd) {
+            auto* addFn = declareC("bz_event_add", i64(), {ptrTy(), ptrTy()});
+            builder_.CreateCall(addFn, {src, closure});
+            return std::optional<llvm::Value*>(nullptr);  // Add returns unit
+        }
+        // isRemove
+        auto* remFn = declareC("bz_event_remove_closure",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(remFn, {src, closure});
+        return std::optional<llvm::Value*>(nullptr);  // Remove returns unit
+    }
+
+    // isRaise — per §24.5: invoke each subscribed handler with the payload.
+    llvm::Value* payloadLL = nullptr;
+    llvm::Type* payloadTy = nullptr;
+    if (!call.args.empty() && call.args[0].value) {
+        payloadLL = lowerExpr(*call.args[0].value);
+        if (!payloadLL) return std::optional<llvm::Value*>(nullptr);
+        payloadTy = payloadLL->getType();
+    }
+    emitEventRaise(src, payloadLL, payloadTy);
+    return std::optional<llvm::Value*>(nullptr);  // Raise returns unit
+}
+
+
+bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
+    // Direct form: `<event>.Subscribe(h)`.
+    auto isSubscribeCall = [&](const ast::Expr& x) -> bool {
+        auto* ce = dynamic_cast<const ast::CallExpr*>(&x);
+        if (!ce || !ce->callee) return false;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+        if (!ma || ma->member != "Subscribe" || !ma->target ||
+            ce->args.size() != 1)
+            return false;
+        return eventSymbolOf(*ma->target) != nullptr;
+    };
+    if (isSubscribeCall(e)) return true;
+    // Local form: `var sub := <event>.Subscribe(h); … sub.Dispose();`.
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(e))) {
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl)) {
+                if (ld->initializer) return isSubscribeCall(*ld->initializer);
+            }
+        }
+    }
+    return false;
+}
+
+
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // Pre-create out var slots so lvalueAddr can find them in all paths.
     ensureOutVarSlots(call);
+    // per §24.3/§24.5: event method calls — `<event>.Subscribe(h)` (returns an
+    // owned Subscription), `.Add`/`.Remove` (the += / -= desugaring targets),
+    // and `.Raise(payload)` / `.Raise()`. Checked first so the event member
+    // access does not fall through to ordinary (no-such-method) dispatch.
+    if (auto v = tryLowerEventCall(call)) return *v;
     // §8/§9/§10: compiler-synthesized value-semantics members (ToString,
     // GetHashCode, Equals) on a record/enum receiver. Checked before the
     // ordinary dispatch so a record with no user ToString gets the §9.1 form
@@ -2985,6 +3176,21 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
             if (ma->member == "Dispose" && ma->target) {
+                // per §2.11 / §24.4: disposing a Subscription removes the
+                // handler from its event source. A Subscription is the value
+                // produced by `<event>.Subscribe(...)`; a local bound to such a
+                // call (`var sub := …Subscribe(…)`) carries no resolved type,
+                // so detect it structurally (the local's initializer is an
+                // event Subscribe call, or the receiver is the call itself).
+                if (isSubscriptionExpr(*ma->target)) {
+                    llvm::Value* recv = lowerExpr(*ma->target);
+                    if (recv && recv->getType()->isPointerTy()) {
+                        auto* fn = declareC("bz_subscription_dispose",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {recv});
+                    }
+                    return nullptr;
+                }
                 llvm::Value* recv = lowerExpr(*ma->target);
                 if (recv && recv->getType()->isPointerTy()) {
                     // §3: collection types use bz_array_free / bz_dict_free.
