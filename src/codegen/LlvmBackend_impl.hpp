@@ -1330,6 +1330,25 @@ private:
     // a pointer (type-erased), not a value.
     bool lowerLazyLinqFor(const ast::ForStmt& fs);
 
+    // issue #370 / §4.10: `for var x in <set>` over a dict-backed Set<T>
+    // (records, primitives/enums, strings — all generic-table-backed). Returns
+    // false if the iterable is not such a set (so other for-handlers run).
+    bool lowerDictBackedSetFor(const ast::ForStmt& fs);
+
+    // issue #370 / §4.8: `for var k in <dict>.Keys` — iterate a Dictionary's
+    // keys. The string-key dict uses the bz_dict_keys_str enumeration; a
+    // non-string-key (generic-table) dict uses bz_dict_keys_gen. Returns false
+    // if the iterable is not a `<dict>.Keys` access.
+    bool lowerDictKeysFor(const ast::ForStmt& fs);
+
+    // issue #370: emit a counted loop over a snapshot of generic-table keys
+    // (from bz_dict_keys_gen). `tableObj` is the bz_dict_t*; `elemTyRef` is the
+    // key/element TypeRef (its LLVM type is how each key is loaded and bound to
+    // the loop variable). Used by both lowerDictBackedSetFor and the
+    // non-string branch of lowerDictKeysFor.
+    bool emitGenericKeyTableFor(const ast::ForStmt& fs, llvm::Value* tableObj,
+                                const sema::TypeRef* elemTyRef);
+
     // If `e` names a local or parameter, return its storage slot; else null.
     // CG50: if `e` names a ref/out parameter, return its storage address
     // (the incoming pointer) and set `elemTy` to the referent type.

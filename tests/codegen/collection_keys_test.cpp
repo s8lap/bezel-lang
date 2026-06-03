@@ -206,3 +206,154 @@ BEZEL_TEST(codegen_collection_keys, set_int_remove_spec_4_10) {
         "         and not s.Contains(2) and s.Contains(1) and s.Contains(3)); "
         "end Main; end C;"), 1);
 }
+
+// --- #370: iteration over a dict-backed Set<T> (§4.10) ---
+//
+// A Set<T> is `ICollection<T>` (§4.10), so `for var x in set` yields the
+// elements. The set is now generic-hash-table-backed (D8), so the array-backed
+// for-loop read garbage; iteration must enumerate the table's keys. The loop
+// variable's element type comes from the set's `T` (sema types the set), so the
+// element value is usable in the body.
+
+// §4.10: `for var x in <Set<int>>` sums the DEDUPED elements. Add(5), Add(7),
+// Add(5) → {5, 7}; the sum is 12 (the duplicate 5 contributes once). Before the
+// fix this iterated bz_array_* over the dict bytes and produced garbage.
+BEZEL_TEST(codegen_collection_keys, for_in_set_int_sum_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var s := new Set<int>(); "
+        "  s.Add(5); s.Add(7); s.Add(5); "
+        "  var sum := 0; "
+        "  for var x in s do sum := sum + x; end; "
+        "  return sum; "                              // 5 + 7 = 12
+        "end Main; end C;"), 12);
+}
+
+// §4.10: `for var x in <Set<int>>` runs once per DISTINCT element — a counted
+// loop over the deduped set yields 2 iterations for {5,7}.
+BEZEL_TEST(codegen_collection_keys, for_in_set_int_count_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var s := new Set<int>(); "
+        "  s.Add(5); s.Add(7); s.Add(5); "
+        "  var n := 0; "
+        "  for var x in s do n := n + 1; end; "
+        "  return n; "                                // 2 distinct elements
+        "end Main; end C;"), 2);
+}
+
+// §4.10 / §4.6: `for var x in <Set<string>>` binds each string element; the
+// element value is usable (sum of element lengths). "ab", "cde", "ab" dedup to
+// {"ab","cde"}; total length 2 + 3 = 5.
+BEZEL_TEST(codegen_collection_keys, for_in_set_string_value_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var s := new Set<string>(); "
+        "  s.Add(\"ab\"); s.Add(\"cde\"); s.Add(\"ab\"); "
+        "  var total := 0; "
+        "  for var x in s do total := total + x.Length; end; "
+        "  return total; "                            // 2 + 3 = 5
+        "end Main; end C;"), 5);
+}
+
+// §4.10 / §9.1: `for var p in <Set<Point>>` binds each record element; the
+// record's fields are usable in the body. {(1,2),(3,4)} → sum of x+y = 10. The
+// loop variable is typed Point (sema types the set's element), so `p.x`/`p.y`
+// resolve to the record fields.
+BEZEL_TEST(codegen_collection_keys, for_in_set_record_fields_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var s := new Set<Point>(); "
+        "  s.Add(new Point(1, 2)); "
+        "  s.Add(new Point(3, 4)); "
+        "  s.Add(new Point(1, 2)); "                  // dup → collapsed
+        "  var sum := 0; "
+        "  for var p in s do sum := sum + p.x + p.y; end; "
+        "  return sum; "                              // (1+2) + (3+4) = 10
+        "end Main; end C;"), 10);
+}
+
+// --- #370: iteration over Dictionary<K,V>.Keys (§4.8) ---
+//
+// `Dictionary<K,V>.Keys` is `ICollection<K>` (§4.8); the spec idiom
+// `for var key in dict.Keys do …` iterates the keys. A non-string key lives in
+// the generic hash table, so its Keys uses bz_dict_keys_gen (not the string-key
+// bz_dict_keys_str path, which would reinterpret the key bytes as a pointer).
+
+// §4.8: `for var k in <Dictionary<int,int>>.Keys` sums the keys. Keys {3,4} → 7.
+// (The string-key Keys path would have crashed on the integer keys.)
+BEZEL_TEST(codegen_collection_keys, for_in_dict_int_keys_sum_spec_4_8) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var d := new Dictionary<int, int>(); "
+        "  d.Set(3, 100); "
+        "  d.Set(4, 200); "
+        "  var sum := 0; "
+        "  for var k in d.Keys do sum := sum + k; end; "
+        "  return sum; "                              // 3 + 4 = 7
+        "end Main; end C;"), 7);
+}
+
+// §4.8: `for var k in <Dictionary<int,int>>.Keys` iterates once per key — a
+// counted loop over a 2-entry dictionary's keys yields 2 iterations.
+BEZEL_TEST(codegen_collection_keys, for_in_dict_int_keys_count_spec_4_8) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var d := new Dictionary<int, int>(); "
+        "  d.Set(3, 100); "
+        "  d.Set(4, 200); "
+        "  d.Set(3, 111); "                           // updates key 3, no new key
+        "  var n := 0; "
+        "  for var k in d.Keys do n := n + 1; end; "
+        "  return n; "                                // 2 distinct keys
+        "end Main; end C;"), 2);
+}
+
+// §4.8 / §4.6: `for var k in <Dictionary<string,int>>.Keys` binds each string
+// key; the key value is usable (sum of key lengths). Keys {"ab","cde"} → 5.
+// (This is the string-key Keys path: bz_dict_keys_str enumeration.)
+BEZEL_TEST(codegen_collection_keys, for_in_dict_string_keys_value_spec_4_8) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var d := new Dictionary<string, int>(); "
+        "  d.Set(\"ab\", 1); "
+        "  d.Set(\"cde\", 2); "
+        "  var total := 0; "
+        "  for var k in d.Keys do total := total + k.Length; end; "
+        "  return total; "                            // 2 + 3 = 5
+        "end Main; end C;"), 5);
+}
+
+// §4.10: iterating an EMPTY dict-backed Set runs zero times (no crash on the
+// empty generic table — the key snapshot is length 0).
+BEZEL_TEST(codegen_collection_keys, for_in_set_empty_no_iterations_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var s := new Set<int>(); "
+        "  var n := 0; "
+        "  for var x in s do n := n + 1; end; "
+        "  return n; "                                // 0 iterations
+        "end Main; end C;"), 0);
+}
+
+// §4.10 / §21.5: `break` out of a dict-backed Set iteration stops the loop and
+// runs the per-iteration cleanup correctly (the snapshot is freed at loop exit).
+BEZEL_TEST(codegen_collection_keys, for_in_set_break_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var s := new Set<int>(); "
+        "  s.Add(1); s.Add(2); s.Add(3); "
+        "  var n := 0; "
+        "  for var x in s do n := n + 1; if n = 2 then break; end; end; "
+        "  return n; "                                // stops after 2
+        "end Main; end C;"), 2);
+}
