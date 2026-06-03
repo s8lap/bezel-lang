@@ -1,3 +1,7 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+
 const sema::PropertySymbol* Emitter::findIndexer(
     const sema::TypeSymbol* ts) const {
     for (const sema::Symbol* m : ts->members) {
@@ -380,3 +384,5 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     return true;
 }
 
+
+}  // namespace bezel::codegen

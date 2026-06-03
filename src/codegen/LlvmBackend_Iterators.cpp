@@ -1,3 +1,7 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+
 void Emitter::collectIterLocals(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
@@ -321,3 +325,5 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     }
 }
 
+
+}  // namespace bezel::codegen

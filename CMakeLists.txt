@@ -98,6 +98,14 @@ add_library(bezel_core STATIC
     src/ownership/Ownership.cpp
     src/codegen/CodeGen.cpp
     src/codegen/LlvmBackend.cpp
+    src/codegen/LlvmBackend_Setup.cpp
+    src/codegen/LlvmBackend_String.cpp
+    src/codegen/LlvmBackend_Layout.cpp
+    src/codegen/LlvmBackend_Assign.cpp
+    src/codegen/LlvmBackend_Iterators.cpp
+    src/codegen/LlvmBackend_Stmts.cpp
+    src/codegen/LlvmBackend_Exprs.cpp
+    src/codegen/LlvmBackend_Calls.cpp
     src/driver/Driver.cpp)
 target_include_directories(bezel_core PUBLIC src)
 # LLVM headers as SYSTEM so their warnings don't trip our -Wall/-Werror.

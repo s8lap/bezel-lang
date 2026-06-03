@@ -1,3 +1,7 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+
 llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // CG30: an enum constant (`Color.Green`) is its integer value.
@@ -2570,3 +2574,5 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     return phi;
 }
 
+
+}  // namespace bezel::codegen

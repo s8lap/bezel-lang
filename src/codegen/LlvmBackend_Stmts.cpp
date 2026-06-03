@@ -1,3 +1,7 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
@@ -1281,3 +1285,5 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     return false;
 }
 
+
+}  // namespace bezel::codegen

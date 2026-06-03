@@ -11,17 +11,9 @@
 
 namespace bezel::codegen {
 
-// The Emitter method definitions are split across several units. In this
-// header-extraction step they are still text-included here (one translation
-// unit); the next step converts each to a separately-compiled LlvmBackend_*.cpp.
-#include "LlvmBackend_String.inc"
-#include "LlvmBackend_Layout.inc"
-#include "LlvmBackend_Setup.inc"
-#include "LlvmBackend_Assign.inc"
-#include "LlvmBackend_Iterators.inc"
-#include "LlvmBackend_Stmts.inc"
-#include "LlvmBackend_Exprs.inc"
-#include "LlvmBackend_Calls.inc"
+// The Emitter class is declared in LlvmBackend_impl.hpp; its method
+// definitions live in the sibling LlvmBackend_*.cpp translation units. This
+// file holds the public entry points.
 
 std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
                                          sema::SemaContext& ctx,

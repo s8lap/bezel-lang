@@ -11,6 +11,7 @@
 // anonymous-namespace placement gave, while allowing the definitions to live
 // in separately-compiled units.
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
