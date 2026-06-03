@@ -28,6 +28,7 @@
 #include <vector>
 #include <thread>
 #include <functional>
+#include <unordered_set>
 
 // ---------------------------------------------------------------------------
 // bz_array_t — dynamic array
@@ -1329,6 +1330,25 @@ extern "C" void bz_event_remove_token(void* srcp, int64_t token) {
     }
 }
 
+// Set of live (subscribed, not-yet-disposed) bz_subscription_t* nodes. A node
+// is inserted by bz_event_subscribe and erased+freed by bz_subscription_dispose.
+// Membership is the authority for "is this handle still alive": Dispose must be
+// idempotent (§2.11), but the fix below frees the node on dispose, so a second
+// Dispose with the same (now-freed) pointer must NOT dereference it. Checking
+// the set before any field access keeps the second call a safe no-op with no
+// use-after-free. (Codegen relies on Subscription.Dispose being idempotent —
+// e.g. an explicit `.Dispose()` plus a scope-exit/`using var` disposal both
+// hand the same pointer here.) Guarded by a mutex because subscriptions, like
+// the rest of the events runtime, may be touched from multiple threads.
+static std::mutex&                     bz_sub_live_mutex() {
+    static std::mutex m;
+    return m;
+}
+static std::unordered_set<void*>&      bz_sub_live_set() {
+    static std::unordered_set<void*> s;
+    return s;
+}
+
 extern "C" void* bz_event_subscribe(void* srcp, void* closure) {
     auto* s = (bz_event_source_t*)srcp;
     int64_t tok = bz_event_add(s, closure);
@@ -1336,14 +1356,27 @@ extern "C" void* bz_event_subscribe(void* srcp, void* closure) {
     sub->src = s;
     sub->token = tok;
     sub->disposed = false;
+    {
+        std::lock_guard<std::mutex> lk(bz_sub_live_mutex());
+        bz_sub_live_set().insert(sub);
+    }
     return sub;
 }
 
 extern "C" void bz_subscription_dispose(void* subp) {
+    if (!subp) return;
+    {
+        // §2.11: Dispose is idempotent. Only a live (registered) node is acted
+        // on; a second call finds the pointer absent and returns without ever
+        // dereferencing the freed node (no double-free, no use-after-free).
+        std::lock_guard<std::mutex> lk(bz_sub_live_mutex());
+        if (bz_sub_live_set().erase(subp) == 0) return;
+    }
     auto* sub = (bz_subscription_t*)subp;
-    if (!sub || sub->disposed) return;  // §2.11: Dispose is idempotent
     sub->disposed = true;
     if (sub->src) bz_event_remove_token(sub->src, sub->token);
+    sub->src = nullptr;  // null the back-pointer before freeing
+    free(sub);           // fixes #372: the node was previously never freed
 }
 
 extern "C" void bz_event_source_free(void* srcp) {
