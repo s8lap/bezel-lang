@@ -336,6 +336,22 @@ private:
     // can't be classified (built-ins, unresolved, generic param) so the
     // caller defers; otherwise sets `decided=true` and returns the verdict.
     bool argSatisfiesNew(const TypeRef* arg, bool& decided);
+
+    // §32.5: validate that the AST type `t`, appearing in an `extern` method
+    // signature, is an FFI-compatible type. `returnPosition` permits the unit
+    // type `()` (valid as a return type only). `declSpelling` names the
+    // offending site for the diagnostic message ("parameter `x`" or "return
+    // type"). Reports a §32.5 error when `t` is not FFI-compatible and returns
+    // false; returns true when compatible. The check is shape-driven on the
+    // AST so it recognizes the FFI-boundary named types
+    // (CString/WString/RawBytes/IntPtr/UIntPtr), which have no user TypeSymbol.
+    bool checkExternType(const ast::Type& t, bool returnPosition,
+                         const std::string& declSpelling);
+
+    // §32.5: the FFI-compatibility predicate without diagnostics. Used by
+    // checkExternType and, recursively, for inline-array element types and
+    // function-type parameter/return types. `returnPosition` permits unit.
+    static bool isFfiCompatibleType(const ast::Type& t, bool returnPosition);
 };
 
 }  // namespace bezel::sema

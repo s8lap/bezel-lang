@@ -1342,4 +1342,143 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
     }
 }
 
+// per §32.5: the set of primitive types admissible at the FFI boundary —
+// all integer types plus `float` and `double` and `bool`. `string`, `char`,
+// and `decimal` are explicitly excluded (§32.5 prose: "Not allowed: Bezel
+// `string` ... `char` ...").
+static bool isFfiPrimitive(PrimitiveType p) {
+    switch (p) {
+        case PrimitiveType::Bool:
+        case PrimitiveType::Byte:
+        case PrimitiveType::SByte:
+        case PrimitiveType::Short:
+        case PrimitiveType::UShort:
+        case PrimitiveType::Int:
+        case PrimitiveType::UInt:
+        case PrimitiveType::Long:
+        case PrimitiveType::ULong:
+        case PrimitiveType::Float:
+        case PrimitiveType::Double:
+            return true;
+        // §32.5: excluded.
+        case PrimitiveType::Char:
+        case PrimitiveType::String:
+        case PrimitiveType::Decimal:
+        case PrimitiveType::Object:
+        case PrimitiveType::None:
+            return false;
+    }
+    return false;
+}
+
+// per §32.5: the FFI-boundary class/value types named in §32.5 and stdlib
+// §10 (CString, WString, RawBytes, IntPtr, UIntPtr). These have no user
+// TypeSymbol in the current front-end, so they are recognized by name on
+// the AST. Inline-array element validation reuses the primitive check above.
+static bool isFfiBoundaryNamedType(std::string_view n) {
+    return n == "CString" || n == "WString" || n == "RawBytes" ||
+           n == "IntPtr" || n == "UIntPtr";
+}
+
+// A best-effort source-like spelling of an AST type, for FFI diagnostics.
+// Covers the shapes that can appear in an extern signature (§32.5); falls
+// back to a generic label for anything else.
+static std::string spellExternType(const ast::Type& t) {
+    std::string out;
+    switch (t.kind) {
+        case ast::TypeKind::Unit:
+            out = "()";
+            break;
+        case ast::TypeKind::Named:
+            if (t.name && !t.name->parts.empty()) {
+                for (std::size_t i = 0; i < t.name->parts.size(); ++i) {
+                    if (i) out += ".";
+                    out += std::string(t.name->parts[i]);
+                }
+            } else {
+                out = "<type>";
+            }
+            break;
+        case ast::TypeKind::InlineArray:
+            out = t.arrayOwned ? "[N owned]" : "[N]";
+            out += t.arrayElement ? spellExternType(*t.arrayElement) : "?";
+            break;
+        case ast::TypeKind::Function:
+            out = "(...) -> ";
+            out += t.funcReturn ? spellExternType(*t.funcReturn) : "()";
+            break;
+    }
+    if (t.nullable) out += "?";
+    return out;
+}
+
+bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition) {
+    switch (t.kind) {
+        case ast::TypeKind::Unit:
+            // §32.5: the unit type `()` is valid as a return type only.
+            return returnPosition;
+        case ast::TypeKind::Named: {
+            if (!t.name || t.name->parts.size() != 1) return false;
+            std::string_view n = t.name->parts.front();
+            // §32.5: integer types, float, double, bool.
+            PrimitiveType prim = primitiveFromName(n);
+            if (prim != PrimitiveType::None) return isFfiPrimitive(prim);
+            // §32.5 / stdlib §10: IntPtr, UIntPtr, CString, WString, RawBytes.
+            // A nullable FFI-boundary type (`CString?`, e.g. `strdup`'s return
+            // in the §32.1 example) is admitted — the nullability rides the
+            // same pointer representation.
+            if (isFfiBoundaryNamedType(n)) return true;
+            // Anything else with a name — user classes/records/interfaces,
+            // `Array<T>`, generic params, etc. — is not FFI-compatible (§32.5
+            // "Not allowed: ... classes, records, interfaces, generic type
+            // parameters, Array<T>, ...").
+            return false;
+        }
+        case ast::TypeKind::InlineArray: {
+            // §32.5: inline arrays `[N]T` where T is an FFI-compatible
+            // primitive. Owning inline arrays (`[N owned]T`) are class-typed
+            // and not admitted; their element type is never a bare primitive,
+            // so the element check below already rejects them, but reject
+            // explicitly for clarity.
+            if (t.arrayOwned) return false;
+            if (!t.arrayElement) return false;
+            // The element must be an FFI-compatible *primitive* — §32.5 does
+            // not admit inline arrays of class/record/inline-array elements.
+            const ast::Type& elem = *t.arrayElement;
+            if (elem.kind != ast::TypeKind::Named || !elem.name ||
+                elem.name->parts.size() != 1)
+                return false;
+            PrimitiveType ep = primitiveFromName(elem.name->parts.front());
+            return ep != PrimitiveType::None && isFfiPrimitive(ep);
+        }
+        case ast::TypeKind::Function: {
+            // §32.5: function types whose parameters and return type are
+            // themselves FFI-compatible.
+            for (const auto& fp : t.funcParams) {
+                if (!fp.type ||
+                    !isFfiCompatibleType(*fp.type, /*returnPosition=*/false))
+                    return false;
+            }
+            // The function's return slot is a return position (unit allowed).
+            if (!t.funcReturn) return true;  // `-> ()` parsed as null return
+            return isFfiCompatibleType(*t.funcReturn,
+                                       /*returnPosition=*/true);
+        }
+    }
+    return false;
+}
+
+bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
+                               const std::string& declSpelling) {
+    if (isFfiCompatibleType(t, returnPosition)) return true;
+    // per §32.5: report the offending type and signature site. Use the
+    // AST type's source span so the diagnostic points at the declaration.
+    std::string what = spellExternType(t);
+    ctx_.diagnostics().report(
+        Severity::Error, t.span.begin,
+        std::string("extern method ") + declSpelling + " has type `" + what +
+            "`, which is not permitted at the FFI boundary (§32.5)");
+    return false;
+}
+
 }  // namespace bezel::sema
