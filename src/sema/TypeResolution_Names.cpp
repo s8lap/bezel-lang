@@ -411,6 +411,14 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         TypeRef* arg = resolveType(*ga, scope);
         ref.genericArgs.push_back(arg);
     }
+    // §14.2 / Appendix C.4: validate that each supplied type argument
+    // satisfies the constraints declared on its type parameter. Only for a
+    // resolved user TypeSymbol whose arity matches (a mismatch is already
+    // diagnosed above; checking a misaligned arg list would be noise).
+    if (tsym && !t.genericArgs.empty() &&
+        t.genericArgs.size() == tsym->genericParams.size()) {
+        checkGenericConstraints(t, tsym, ref.genericArgs, scope);
+    }
 }
 
 void Resolver::resolveTypesInBody(

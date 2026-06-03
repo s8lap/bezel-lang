@@ -1004,4 +1004,342 @@ bool Resolver::checkCycleFrom(
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// §14.2 / Appendix C.4 — generic constraint validation at instantiation sites.
+// ---------------------------------------------------------------------------
+
+bool Resolver::isGenericParamRef(const ast::Type& t, Scope* scope) {
+    // A single-identifier Named type that is NOT a primitive and resolves to
+    // an in-scope generic-param marker (a key present in the scope chain with
+    // a null Symbol*). resolveNamed records these as Named with no
+    // declaration; we must distinguish them from built-ins, which are not in
+    // scope at all.
+    if (t.kind != ast::TypeKind::Named || !t.name ||
+        t.name->parts.size() != 1) {
+        return false;
+    }
+    std::string_view n = t.name->parts.front();
+    if (primitiveFromName(n) != PrimitiveType::None) return false;
+    for (Scope* s = scope; s; s = s->parent) {
+        auto it = s->names.find(n);
+        if (it != s->names.end()) {
+            // Present in scope. A null entry is the generic-param marker;
+            // a non-null TypeSymbol entry is a concrete (e.g. nested) type.
+            return it->second == nullptr;
+        }
+    }
+    return false;
+}
+
+Resolver::TypeCategory Resolver::categorize(const TypeRef* a) {
+    if (!a) return TypeCategory::Unknown;
+    switch (a->kind) {
+        case TypeRef::Kind::Error:
+            return TypeCategory::Unknown;
+        case TypeRef::Kind::Unit:
+            // The unit type is a value type (§14.2 value table row).
+            return TypeCategory::Value;
+        case TypeRef::Kind::InlineArray:
+            // Inline arrays are value types (§14.2 / §15.1).
+            return TypeCategory::Value;
+        case TypeRef::Kind::Function:
+            // Function values are reference (runtime-managed) types (§14.2).
+            return TypeCategory::Reference;
+        case TypeRef::Kind::Primitive:
+            // `string` and `Object` are reference types; every other
+            // primitive (bool/char/numerics) is a value type (§14.2 / §3).
+            if (a->primitive == PrimitiveType::String ||
+                a->primitive == PrimitiveType::Object) {
+                return TypeCategory::Reference;
+            }
+            return TypeCategory::Value;
+        case TypeRef::Kind::Named:
+            if (a->declaration) {
+                // Classes and interfaces are reference types; records and
+                // enums are value types (§9 / §10 / §14.2).
+                switch (a->declaration->kind) {
+                    case ast::TypeDeclKind::Class:
+                    case ast::TypeDeclKind::Interface:
+                        return TypeCategory::Reference;
+                    case ast::TypeDeclKind::Record:
+                    case ast::TypeDeclKind::Enum:
+                        return TypeCategory::Value;
+                }
+            }
+            // Built-in named types (Array, OwnedArray, IEnumerable, …) carry
+            // no user declaration. Every built-in named type in the language
+            // is a class or interface — a reference type (§14.2). A generic
+            // parameter also lands here, but the caller filters those out via
+            // isGenericParamRef before calling categorize.
+            if (a->astNode && a->astNode->name &&
+                a->astNode->name->parts.size() == 1 &&
+                builtinTypeArity(a->astNode->name->parts.front()) !=
+                    kNotBuiltin) {
+                return TypeCategory::Reference;
+            }
+            return TypeCategory::Unknown;
+    }
+    return TypeCategory::Unknown;
+}
+
+bool Resolver::argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound) {
+    if (!arg || !bound) return false;
+    if (arg->kind != TypeRef::Kind::Named || !arg->declaration) return false;
+    if (bound->kind != TypeRef::Kind::Named || !bound->declaration) {
+        return false;
+    }
+    // BFS over the argument's transitive base/interface set, cycle-guarded.
+    // The argument conforms when `bound`'s declaration is the argument
+    // itself or any of its (transitive) bases. (Generic-argument matching of
+    // the bound — e.g. distinguishing IComparable<int> from IComparable<long>
+    // — is left to the variance/substitution slice; this check is by
+    // declaration identity, which is sound for the common monomorphic and
+    // single-instantiation cases and never over-rejects a true subtype.)
+    TypeSymbol* target = bound->declaration;
+    std::vector<TypeSymbol*> frontier{arg->declaration};
+    std::unordered_set<TypeSymbol*> seen{arg->declaration};
+    std::size_t i = 0;
+    while (i < frontier.size()) {
+        TypeSymbol* t = frontier[i++];
+        if (t == target) return true;
+        for (TypeSymbol* b : t->baseTypes) {
+            if (b && seen.insert(b).second) frontier.push_back(b);
+        }
+    }
+    return false;
+}
+
+bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
+    decided = false;
+    if (!arg) return false;
+    // Value types: `default(T)` stands in for `new T()`. We can only be sure
+    // the default is well-defined for primitives, enums, and the unit type;
+    // a record's default depends on its field types (a non-nullable
+    // reference field makes the default ill-formed, §17.11). To stay
+    // conservative we decide only the cases we can verify and defer the rest.
+    if (arg->kind == TypeRef::Kind::Primitive) {
+        // string / Object are reference types and handled below; the value
+        // primitives all have a well-defined zero (§17.11).
+        if (arg->primitive == PrimitiveType::String ||
+            arg->primitive == PrimitiveType::Object) {
+            decided = false;  // reference; fall through to class handling
+        } else {
+            decided = true;
+            return true;
+        }
+    }
+    if (arg->kind == TypeRef::Kind::Named && arg->declaration) {
+        TypeSymbol* d = arg->declaration;
+        if (d->kind == ast::TypeDeclKind::Enum) {
+            decided = true;  // enum default is the underlying-0 value (§17.11)
+            return true;
+        }
+        if (d->kind == ast::TypeDeclKind::Record) {
+            // A positional record satisfies new() iff default(R) is
+            // well-defined — every field has a well-defined default
+            // (§14.2 / §17.11). Verify each positional field's resolved type
+            // is not a non-nullable reference type.
+            auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
+            if (!td) return false;  // defer (decided stays false)
+            decided = true;
+            for (const auto& pf : td->positionalFields) {
+                if (!pf.type) continue;
+                TypeRef* ft = ctx_.resolvedType(*pf.type);
+                if (!ft) { decided = false; return false; }  // can't verify
+                if (ft->nullable) continue;  // nullable field → defaults null
+                if (categorize(ft) == TypeCategory::Reference) {
+                    return false;  // non-nullable reference field: no default
+                }
+            }
+            // Body fields of a record can also carry initializers; a record
+            // with body fields lacking defaults would be ill-formed under
+            // §17.11, but verifying that fully is the default-operator slice.
+            // The positional-field check covers the spec's worked example.
+            return true;
+        }
+        if (d->kind == ast::TypeDeclKind::Class) {
+            // A class satisfies new() iff it has an accessible parameterless
+            // constructor, or declares no constructor at all (the implicit
+            // default constructor, mirroring checkNewExprArgs). A class with
+            // a primary constructor carries its params on the TypeDecl, not a
+            // ConstructorSymbol; treat a non-empty primary param list as a
+            // non-parameterless constructor.
+            auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
+            if (td && td->hasPositionalFields &&
+                !td->positionalFields.empty()) {
+                decided = true;
+                return false;  // primary ctor has parameters
+            }
+            std::vector<const ConstructorSymbol*> ctors;
+            for (Symbol* m : d->members) {
+                if (auto* cs = dynamic_cast<const ConstructorSymbol*>(m)) {
+                    if (!cs->isStatic) ctors.push_back(cs);
+                }
+            }
+            decided = true;
+            if (ctors.empty()) return true;  // implicit default ctor
+            for (const ConstructorSymbol* cs : ctors) {
+                if (cs->params.empty() &&
+                    cs->visibility != ast::Visibility::Private) {
+                    return true;  // accessible parameterless ctor
+                }
+            }
+            return false;
+        }
+        if (d->kind == ast::TypeDeclKind::Interface) {
+            decided = true;
+            return false;  // interfaces are not constructible (§11.2)
+        }
+    }
+    // Built-ins, generic params, function/inline-array args: defer.
+    return false;
+}
+
+namespace {
+
+// Render an argument type's spelling for diagnostics from its AST node.
+// Falls back to "<type>" when the node has no name (function/inline-array
+// args, which constraint checks defer on anyway).
+std::string argSpelling(const ast::Type* argAst) {
+    if (!argAst) return "<type>";
+    std::string out;
+    if (argAst->kind == ast::TypeKind::Named && argAst->name) {
+        for (std::size_t i = 0; i < argAst->name->parts.size(); ++i) {
+            if (i) out += '.';
+            out += std::string(argAst->name->parts[i]);
+        }
+    } else {
+        out = "<type>";
+    }
+    if (argAst->nullable) out += '?';
+    return out.empty() ? "<type>" : out;
+}
+
+}  // namespace
+
+void Resolver::checkOneConstraint(const ast::Type& t,
+                                  std::string_view paramName,
+                                  const ast::ConstraintItem& item,
+                                  const ast::Type* argAst, TypeRef* arg,
+                                  Scope* boundScope) {
+    const std::string param(paramName);
+    const std::string argName = argSpelling(argAst);
+    auto report = [&](const std::string& reason) {
+        ctx_.diagnostics().report(
+            Severity::Error, t.span.begin,
+            std::string("type argument `") + argName +
+            "` does not satisfy the constraint `where " + param + ": " +
+            reason + "` (§14.2)");
+    };
+
+    if (item.kind == "notnull") {
+        // §14.2: non-nullable types only (value or reference).
+        if (arg->nullable) report("notnull");
+        return;
+    }
+    if (item.kind == "class") {
+        // §14.2: non-nullable reference types only.
+        if (arg->nullable) { report("class"); return; }
+        TypeCategory c = categorize(arg);
+        if (c == TypeCategory::Value) report("class");
+        // Unknown → defer (no diagnostic).
+        return;
+    }
+    if (item.kind == "value") {
+        // §14.2: value types only. A reference-typed argument is the clear
+        // violation; nullability of a value type is left to a later slice to
+        // avoid a false positive here.
+        TypeCategory c = categorize(arg);
+        if (c == TypeCategory::Reference) report("value");
+        return;
+    }
+    if (item.kind == "new") {
+        bool decided = false;
+        bool ok = argSatisfiesNew(arg, decided);
+        if (decided && !ok) report("new()");
+        return;
+    }
+    if (item.kind == "type") {
+        // §14.2: a type-bound (class or interface). Implies non-null T —
+        // a nullable argument never satisfies it.
+        if (!item.typeArg) return;
+        TypeRef* bound = ctx_.resolvedType(*item.typeArg);
+        if (!bound) {
+            // Not yet resolved (forward-declared generic type instantiated
+            // before its own constraint clause was visited). Resolve on
+            // demand in the declaring type's scope.
+            bound = resolveType(*item.typeArg, boundScope);
+        }
+        if (!bound || bound->kind == TypeRef::Kind::Error) return;  // defer
+        // We can only verify a type-bound when both sides are user-declared
+        // named types (BFS over baseTypes). Built-in bounds/args carry no
+        // base-type chain here; defer to avoid false positives.
+        if (bound->kind != TypeRef::Kind::Named || !bound->declaration) {
+            return;
+        }
+        if (arg->kind != TypeRef::Kind::Named || !arg->declaration) {
+            return;  // built-in / generic-param arg: defer
+        }
+        const std::string boundName(bound->declaration->name);
+        if (arg->nullable) { report(boundName); return; }
+        if (!argSatisfiesTypeBound(arg, bound)) report(boundName);
+        return;
+    }
+    // Unknown constraint kind: ignore (parser would not produce it).
+}
+
+void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
+                                       const std::vector<TypeRef*>& argRefs,
+                                       Scope* scope) {
+    // Constraints live on the declaring TypeDecl's `where` clauses, keyed by
+    // type-parameter name. Build name → constraint-items map.
+    auto* td = dynamic_cast<const ast::TypeDecl*>(tsym->decl);
+    if (!td || td->genericConstraints.empty()) return;
+
+    // Reconstruct a lookup scope for resolving constraint type-bounds on
+    // demand: module-scope names plus the declaring type's own generic-param
+    // names (so `where T: IComparable<T>` resolves T). Bound resolution is
+    // done lazily because instantiation sites are visited in source order and
+    // a forward-declared generic type's constraint clause may not yet be
+    // resolved.
+    Scope boundModule;
+    if (ctx_.module()) {
+        for (Symbol* child : ctx_.module()->children) {
+            if (!child->name.empty()) boundModule.names[child->name] = child;
+        }
+    }
+    Scope boundScope;
+    boundScope.parent = &boundModule;
+    for (Symbol* gp : tsym->genericParams) {
+        if (gp) boundScope.names[gp->name] = nullptr;  // generic-param marker
+    }
+
+    for (std::size_t pi = 0; pi < tsym->genericParams.size() &&
+         pi < t.genericArgs.size() && pi < argRefs.size(); ++pi) {
+        auto* gp = dynamic_cast<GenericParamSymbol*>(tsym->genericParams[pi]);
+        if (!gp) continue;
+        const ast::Type* argAst = t.genericArgs[pi].get();
+        TypeRef* arg = argRefs[pi];
+        if (!argAst || !arg) continue;
+        // Skip arguments that are themselves generic params — their
+        // classification is only known at the outer instantiation, where the
+        // outer constraints are checked (§14.2).
+        if (isGenericParamRef(*argAst, scope)) continue;
+        if (arg->kind == TypeRef::Kind::Error) continue;
+
+        // Find the constraint clause(s) for this parameter name.
+        for (const auto& gc : td->genericConstraints) {
+            if (gc.typeParam != gp->name) continue;
+            // The `is owned` / `is not owned` modifier-constraint form is
+            // historical (removed in v0.97, §14.4) and carries no
+            // instantiation-time obligation here; skip it.
+            if (!gc.modifierConstraint.empty()) continue;
+            for (const auto& item : gc.items) {
+                checkOneConstraint(t, gp->name, item, argAst, arg,
+                                   &boundScope);
+            }
+        }
+    }
+}
+
 }  // namespace bezel::sema
