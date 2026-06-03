@@ -223,44 +223,61 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                                             const ast::CallExpr& ce) {
     if (!initial || !initial->parent) return initial;
 
+    bool hasNamed = false;
+    for (const auto& a : ce.args)
+        if (!a.name.empty()) { hasNamed = true; break; }
+
     // Arity-based fallback used whenever §22.6 type resolution does not
-    // apply (named args, modifier args, undecidable types, or a single
-    // matching candidate): re-select the first same-name overload whose
-    // parameter count matches the call's argument count, preserving the
-    // prior first-wins behavior.
+    // apply (modifier args, undecidable types, or a single matching
+    // candidate): re-select the first same-name overload the call's
+    // arguments can §22.5-bind to, preserving the prior first-wins
+    // behavior. For all-positional calls this is the arity match; for
+    // named-arg calls it is the first candidate whose binding succeeds.
+    auto canBindTo = [&](const ast::MethodDecl* md) -> bool {
+        return bindArgsToParams(md->params, ce.args, ce.span.begin,
+                                /*calleeDesc=*/std::string(), /*emit=*/false)
+            .ok;
+    };
     auto arityFallback = [&]() -> MethodSymbol* {
-        if (initial->params.size() == ce.args.size()) return initial;
+        auto* initMd = dynamic_cast<const ast::MethodDecl*>(initial->decl);
+        if (!hasNamed && initial->params.size() == ce.args.size())
+            return initial;
+        if (hasNamed && initMd && canBindTo(initMd)) return initial;
         for (Symbol* m : initial->parent->members) {
             auto* cand = dynamic_cast<MethodSymbol*>(m);
-            if (cand && cand->name == initial->name &&
-                cand->params.size() == ce.args.size())
-                return cand;
+            if (!cand || cand->name != initial->name) continue;
+            if (!hasNamed) {
+                if (cand->params.size() == ce.args.size()) return cand;
+            } else {
+                auto* cmd = dynamic_cast<const ast::MethodDecl*>(cand->decl);
+                if (cmd && canBindTo(cmd)) return cand;
+            }
         }
         return initial;
     };
 
-    // §22.6 applies only to all-positional calls. Named-argument binding
-    // (§22.5) is a separate, deferred concern; bail to arity selection.
-    for (const auto& a : ce.args)
-        if (!a.name.empty()) return arityFallback();
-
-    // Collect same-name candidates filtered by this call's arity. Default
-    // parameters are not yet folded into §22.6 here (optional-param arity
-    // is handled by checkArgsAgainstParams' min/max); restrict to exact
-    // parameter-count matches so the candidate set is unambiguous on arity.
+    // Collect same-name candidates this call's arguments can §22.5-bind to.
+    // For all-positional calls binding reduces to an exact arity match
+    // (positionals fill parameters in order, all required must be filled);
+    // for named-arg calls it is the per-candidate name/order/required check.
+    // Each surviving candidate's parameter-ordered argument list is recorded
+    // so §22.6 ranking operates on the bound positions (§22.6: tie-breaking
+    // applies only after named-argument binding has filtered the candidates).
     std::vector<MethodSymbol*> cands;
     std::vector<const ast::MethodDecl*> decls;
+    std::vector<BindResult> binds;
     for (Symbol* m : initial->parent->members) {
         auto* cand = dynamic_cast<MethodSymbol*>(m);
         if (!cand || cand->name != initial->name) continue;
-        if (cand->params.size() != ce.args.size()) continue;
         auto* md = dynamic_cast<const ast::MethodDecl*>(cand->decl);
         if (!md) continue;
-        // Defensive: a candidate whose own arity (decl params) disagrees
-        // with the symbol's recorded params is skipped.
-        if (md->params.size() != ce.args.size()) continue;
+        BindResult b = bindArgsToParams(md->params, ce.args, ce.span.begin,
+                                        /*calleeDesc=*/std::string(),
+                                        /*emit=*/false);
+        if (!b.ok) continue;
         cands.push_back(cand);
         decls.push_back(md);
+        binds.push_back(std::move(b));
     }
     if (cands.empty()) return arityFallback();
     if (cands.size() == 1) return cands[0];
@@ -270,20 +287,50 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     for (const auto& a : ce.args)
         if (!a.modifier.empty() || a.isDiscard) return arityFallback();
 
-    // Build the argument-type and per-candidate parameter-type vectors.
-    std::vector<const TypeRef*> argTypes(ce.args.size(), nullptr);
-    for (std::size_t i = 0; i < ce.args.size(); ++i)
-        if (ce.args[i].value) argTypes[i] = ctx_.exprType(*ce.args[i].value);
-
+    // §22.6 ranks the bound argument positions. For each candidate, build
+    // its parameter-type vector and the matching per-parameter argument-type
+    // vector from the binding; a parameter filled by its default contributes
+    // no ranking pressure (its slot is dropped from both vectors so it is
+    // neither exact nor a conversion). All surviving candidates rank over the
+    // common set of bound parameters — which, for the same name and a fixed
+    // call, is the same shape across candidates.
     std::vector<std::vector<const TypeRef*>> paramTypes(cands.size());
+    std::vector<std::vector<const TypeRef*>> argTypeRows(cands.size());
+    std::vector<std::vector<int>> argIdxRows(cands.size());
     std::vector<std::string> candNames(cands.size());
     for (std::size_t c = 0; c < cands.size(); ++c) {
         const auto& params = decls[c]->params;
-        paramTypes[c].resize(params.size(), nullptr);
-        for (std::size_t i = 0; i < params.size(); ++i)
-            if (params[i].type)
-                paramTypes[c][i] = ctx_.resolvedType(*params[i].type);
+        for (std::size_t j = 0; j < params.size(); ++j) {
+            int ai = binds[c].paramToArg[j];
+            if (ai < 0) continue;  // defaulted slot — outside ranking.
+            const TypeRef* pt = params[j].type
+                                    ? ctx_.resolvedType(*params[j].type)
+                                    : nullptr;
+            const TypeRef* at = ce.args[static_cast<std::size_t>(ai)].value
+                                    ? ctx_.exprType(
+                                          *ce.args[static_cast<std::size_t>(ai)]
+                                               .value)
+                                    : nullptr;
+            paramTypes[c].push_back(pt);
+            argTypeRows[c].push_back(at);
+            argIdxRows[c].push_back(ai);
+        }
         candNames[c] = methodSignatureString(initial->name, params);
+    }
+    // resolveOverload classifies column i of every candidate against a single
+    // shared argument-type vector, so each column must correspond to the SAME
+    // call argument across all candidates. This holds when the surviving
+    // overloads share their parameter ordering for the bound parameters (the
+    // common case — overloads of one name differ by type, not by reordering
+    // names). If a candidate's bound-parameter shape (length, or which
+    // argument fills each column) differs, §22.6 ranking over a non-uniform
+    // shape is outside the worked examples; fall back to arity/first-bind.
+    const std::vector<const TypeRef*>& argTypes = argTypeRows[0];
+    for (std::size_t c = 0; c < cands.size(); ++c) {
+        if (argIdxRows[c].size() != argIdxRows[0].size())
+            return arityFallback();
+        for (std::size_t i = 0; i < argIdxRows[c].size(); ++i)
+            if (argIdxRows[c][i] != argIdxRows[0][i]) return arityFallback();
     }
 
     OverloadResult r = resolveOverload(
@@ -641,10 +688,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
 void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || !ms->parent) return;
-    // Bail if any argument is named (named-arg matching is deferred).
-    for (const auto& a : ce.args) {
-        if (!a.name.empty()) return;
-    }
+    // §22.5 named-argument binding is now performed by checkArgsAgainstParams,
+    // so a named-arg call is checked here too (no bail).
     // Bail if the name has more than one method overload in the type.
     int sameName = 0;
     for (Symbol* m : ms->parent->members) {
@@ -658,46 +703,104 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
                            std::string(ms->name) + "`");
 }
 
-// Slices T5/T6/T7: shared check of an all-positional argument list
-// against a parameter list — argument count within [required,
-// total] (optional params lower the minimum), then per-argument
-// assignability. Callers must have already ruled out named args
-// and overload ambiguity.
+// §22.5 argument-to-parameter binding. See header for the contract.
+// Positional arguments fill parameters in order; a named argument binds to
+// the parameter of that name; "named arguments may appear in any order after
+// positional arguments" — so a positional argument after a named one is an
+// error. Each parameter may be bound at most once; every required (no
+// default) parameter must be bound; an unknown parameter name is an error.
+ExprTC::BindResult ExprTC::bindArgsToParams(
+    const std::vector<ast::Param>& params,
+    const std::vector<ast::CallArgument>& args, SourceLocation loc,
+    const std::string& calleeDesc, bool emit) {
+    BindResult res;
+    res.paramToArg.assign(params.size(), -1);
+    auto fail = [&](const std::string& msg) -> BindResult {
+        if (emit) ctx_.diagnostics().report(Severity::Error, loc, msg);
+        res.ok = false;
+        return res;
+    };
+
+    bool sawNamed = false;
+    std::size_t pos = 0;  // next positional parameter slot
+    for (std::size_t ai = 0; ai < args.size(); ++ai) {
+        const ast::CallArgument& a = args[ai];
+        if (a.name.empty()) {
+            // per §22.5: positional arguments precede named arguments.
+            if (sawNamed)
+                return fail(calleeDesc +
+                            ": a positional argument may not follow a named "
+                            "argument (§22.5 — named arguments come after all "
+                            "positional arguments)");
+            if (pos >= params.size())
+                return fail(calleeDesc + " supplies " +
+                            std::to_string(args.size()) +
+                            " argument(s) but the parameter list has " +
+                            std::to_string(params.size()) + " (§22.5)");
+            res.paramToArg[pos] = static_cast<int>(ai);
+            ++pos;
+        } else {
+            sawNamed = true;
+            std::size_t idx = params.size();
+            for (std::size_t j = 0; j < params.size(); ++j)
+                if (params[j].name == a.name) { idx = j; break; }
+            // per §22.5: a named argument names an existing parameter.
+            if (idx >= params.size())
+                return fail(calleeDesc + " has no parameter named `" +
+                            std::string(a.name) + "` (§22.5)");
+            // per §22.5: no parameter may be bound twice (positionally then
+            // by name, or by two named arguments).
+            if (res.paramToArg[idx] != -1)
+                return fail(calleeDesc + ": parameter `" +
+                            std::string(a.name) +
+                            "` is bound more than once (§22.5)");
+            res.paramToArg[idx] = static_cast<int>(ai);
+        }
+    }
+
+    // per §22.5: every required (non-default) parameter must be bound, either
+    // positionally or by name; an unbound optional parameter takes its
+    // default.
+    for (std::size_t j = 0; j < params.size(); ++j) {
+        if (res.paramToArg[j] == -1 && !params[j].defaultValue)
+            return fail(calleeDesc + ": required parameter `" +
+                        std::string(params[j].name) +
+                        "` is not supplied (§22.5)");
+    }
+
+    res.ok = true;
+    return res;
+}
+
+// Slices T5/T6/T7: shared check of an argument list against a parameter
+// list — §22.5 binding (positional then named, arity, no-duplicate,
+// required-supplied), then per-argument assignability over the bound
+// mapping. Callers must have already ruled out overload ambiguity.
 void ExprTC::checkArgsAgainstParams(const std::vector<ast::Param>& params,
                                     const std::vector<ast::CallArgument>& args,
                                     SourceLocation loc,
                                     const std::string& calleeDesc) {
-    for (const auto& a : args) {
-        if (!a.name.empty()) return;  // named-arg call — defer
-    }
-    std::size_t total = params.size();
-    std::size_t required = 0;
-    for (const auto& p : params) {
-        if (!p.defaultValue) ++required;
-    }
-    std::size_t got = args.size();
-    if (got < required || got > total) {
-        ctx_.diagnostics().report(
-            Severity::Error, loc,
-            calleeDesc + " has " + std::to_string(got) +
-            " argument(s) but expects " +
-            (required == total
-                 ? std::to_string(total)
-                 : std::to_string(required) + "–" +
-                       std::to_string(total)) +
-            " (§22.5)");
-        return;
-    }
-    for (std::size_t i = 0; i < got && i < total; ++i) {
-        const ast::CallArgument& a = args[i];
+    // per §22.5: bind arguments to parameters. The binding emits its own
+    // arity / named-arg diagnostics; on failure there is no consistent
+    // per-parameter mapping to type-check, so stop here.
+    BindResult b = bindArgsToParams(params, args, loc, calleeDesc, /*emit=*/true);
+    if (!b.ok) return;
+    // per §5.1: each bound argument must be assignable to its parameter.
+    // Iterate in parameter order so a reordered named-arg call checks each
+    // argument against the parameter it actually fills.
+    for (std::size_t j = 0; j < params.size(); ++j) {
+        int ai = b.paramToArg[j];
+        if (ai < 0) continue;  // defaulted parameter — default-value typing
+                               // is checked at the declaration, not here.
+        const ast::CallArgument& a = args[static_cast<std::size_t>(ai)];
         if (!a.value || !a.modifier.empty() || a.isDiscard) continue;
-        const ast::Param& p = params[i];
+        const ast::Param& p = params[j];
         if (!p.type) continue;
         checkAssignable(ctx_.exprType(*a.value),
                         ctx_.resolvedType(*p.type),
                         a.value->span.begin,
-                        std::string("argument ") +
-                        std::to_string(i + 1) + " to " + calleeDesc);
+                        std::string("argument `") + std::string(p.name) +
+                        "` to " + calleeDesc);
     }
 }
 
@@ -720,42 +823,66 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         }
     }
     if (ctors.size() > 1) {
-        // §22.6 applies identically to constructor overload sets (§22.7).
-        // Named-argument binding is deferred → fall back (no check) on a
-        // named-arg `new`.
-        for (const auto& a : ne.args)
-            if (!a.name.empty()) return;
-        // Candidates filtered by this call's arity (all-positional). A
-        // call-site modifier on an argument is outside §22.6's ranking;
-        // skip resolution in that case.
-        for (const auto& a : ne.args)
-            if (!a.modifier.empty() || a.isDiscard) return;
+        // §22.6 applies identically to constructor overload sets (§22.7);
+        // §22.5 named-argument binding filters the candidate set first.
+        // Collect the candidates this call's arguments can bind to (§22.5)
+        // and record each binding so ranking operates on the bound positions.
         std::vector<const ast::ConstructorDecl*> decls;
+        std::vector<BindResult> binds;
         for (ConstructorSymbol* cs : ctors) {
             auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-            if (cd && cd->params.size() == ne.args.size()) decls.push_back(cd);
+            if (!cd) continue;
+            BindResult b = bindArgsToParams(cd->params, ne.args, ne.span.begin,
+                                            /*calleeDesc=*/std::string(),
+                                            /*emit=*/false);
+            if (!b.ok) continue;
+            decls.push_back(cd);
+            binds.push_back(std::move(b));
         }
-        if (decls.empty()) return;  // no same-arity ctor — defer (no check)
+        if (decls.empty()) return;  // no bindable ctor — defer (no check)
         if (decls.size() == 1) {
             checkArgsAgainstParams(decls[0]->params, ne.args, ne.span.begin,
                                    std::string("`new ") +
                                        std::string(t->name) + "`");
             return;
         }
-        std::vector<const TypeRef*> argTypes(ne.args.size(), nullptr);
-        for (std::size_t i = 0; i < ne.args.size(); ++i)
-            if (ne.args[i].value)
-                argTypes[i] = ctx_.exprType(*ne.args[i].value);
+        // A call-site modifier on an argument is outside §22.6's ranking;
+        // skip resolution in that case.
+        for (const auto& a : ne.args)
+            if (!a.modifier.empty() || a.isDiscard) return;
+        // Build the per-candidate parameter-type and bound argument-type rows
+        // (parameter order, defaulted slots dropped — they carry no ranking
+        // pressure), exactly as resolveMethodOverload does for §22.5 calls.
         std::vector<std::vector<const TypeRef*>> paramTypes(decls.size());
+        std::vector<std::vector<const TypeRef*>> argTypeRows(decls.size());
+        std::vector<std::vector<int>> argIdxRows(decls.size());
         std::vector<std::string> candNames(decls.size());
         for (std::size_t c = 0; c < decls.size(); ++c) {
             const auto& params = decls[c]->params;
-            paramTypes[c].resize(params.size(), nullptr);
-            for (std::size_t i = 0; i < params.size(); ++i)
-                if (params[i].type)
-                    paramTypes[c][i] = ctx_.resolvedType(*params[i].type);
+            for (std::size_t j = 0; j < params.size(); ++j) {
+                int ai = binds[c].paramToArg[j];
+                if (ai < 0) continue;
+                paramTypes[c].push_back(
+                    params[j].type ? ctx_.resolvedType(*params[j].type)
+                                   : nullptr);
+                argTypeRows[c].push_back(
+                    ne.args[static_cast<std::size_t>(ai)].value
+                        ? ctx_.exprType(
+                              *ne.args[static_cast<std::size_t>(ai)].value)
+                        : nullptr);
+                argIdxRows[c].push_back(ai);
+            }
             candNames[c] = std::string("new ") + std::string(t->name) +
                            methodSignatureString("", params);
+        }
+        // resolveOverload uses one shared argument vector across candidates,
+        // so each column must be the same call argument for every candidate;
+        // fall back if the bound shapes diverge (uncommon for ctor overloads).
+        const std::vector<const TypeRef*>& argTypes = argTypeRows[0];
+        for (std::size_t c = 0; c < decls.size(); ++c) {
+            if (argIdxRows[c].size() != argIdxRows[0].size()) return;
+            for (std::size_t i = 0; i < argIdxRows[c].size(); ++i)
+                if (argIdxRows[c][i] != argIdxRows[0][i]) return;
         }
         // resolveOverload emits the ambiguous / unreachable diagnostic; the
         // winner needs no further per-argument check (each arg is already
@@ -768,10 +895,8 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     if (ctors.empty()) {
         // Implicit default constructor: zero parameters. (A primary
         // constructor would surface as a ConstructorSymbol, so the
-        // empty case really is the no-arg default.)
-        for (const auto& a : ne.args) {
-            if (!a.name.empty()) return;
-        }
+        // empty case really is the no-arg default.) Any argument — named
+        // or positional — is too many for a zero-parameter constructor.
         if (!ne.args.empty()) {
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,

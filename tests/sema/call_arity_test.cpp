@@ -79,13 +79,17 @@ BEZEL_TEST(sema_arity, overloaded_method_not_checked) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(sema_arity, named_arg_call_not_checked) {
+BEZEL_TEST(sema_arity, named_arg_call_missing_required_diagnosed) {
+    // §22.5: named-argument binding is now performed (the prior
+    // "named-arg call not checked" bail was removed). `F(a := 1)` binds
+    // `a` by name but leaves the required parameter `b` unsupplied, which
+    // §22.5 requires every call to satisfy — so this is now diagnosed.
     auto r = parseSemaAll(
         "module M; class C "
         "  public method F(a: int, b: int) end F; "
         "  public method M() this.F(a := 1); end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(sema_arity, zero_arg_call_ok) {
