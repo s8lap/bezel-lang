@@ -127,6 +127,8 @@ set(BEZEL_TEST_SOURCES
     sema/base_visibility_test.cpp
     sema/definite_return_test.cpp
     sema/generic_constraints_test.cpp
+    sema/extern_ffi_type_test.cpp
+    sema/entry_point_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     codegen/jit_smoke_test.cpp

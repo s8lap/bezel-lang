@@ -14,6 +14,7 @@
 #include "ownership/OwnershipChecker.hpp"
 #include "parser/Parser.hpp"
 #include "sema/DefiniteAssignment.hpp"
+#include "sema/EntryPoint.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
@@ -96,6 +97,16 @@ CompileResult Driver::compileFile(const std::string& path,
 
         OwnershipChecker ownershipChecker(diagnostics);
         ownershipChecker.check(*unit);
+
+        // §33.5: an executable build requires exactly one qualifying `Main`.
+        // Scoped to the executable path (non-empty outputPath) so library
+        // compilation and the sema/JIT test harnesses — which run the shared
+        // front-end on snippets that legitimately omit `Main` (§33.6) — are
+        // not failed by this requirement. Only run when the front-end is
+        // otherwise clean, to avoid cascading on already-broken programs.
+        if (!outputPath.empty() && !diagnostics.hasErrors()) {
+            sema::checkEntryPoint(*unit, semaCtx);
+        }
 
         // Codegen: when an output path is requested and the front-end is
         // clean, lower to LLVM, emit a native object, and link an
