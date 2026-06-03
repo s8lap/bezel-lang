@@ -393,18 +393,19 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             expectedFunctionType_ = savedExpected;
         }
         if (!v) return false;
-        // CG-nullable: if the formal parameter is a nullable primitive
-        // but the argument value is a plain primitive, wrap it.
+        // CG-nullable: if the formal parameter is a nullable value type (a
+        // primitive, or a nullable enum — issue #364) but the argument value is
+        // a plain value, wrap it.
         if (params[idx].type) {
             sema::TypeRef* formalTy = ctx_.resolvedType(*params[idx].type);
-            if (isNullablePrimTy(formalTy)) {
-                auto* expectedSt = nullablePrimStructTy(formalTy->primitive);
+            if (isNullableValueTy(formalTy)) {
+                auto* expectedSt = nullableValueStructTy(formalTy);
                 if (v->getType() != expectedSt) {
                     if (v->getType()->isPointerTy() &&
                         llvm::isa<llvm::ConstantPointerNull>(v)) {
-                        v = nullablePrimNull(formalTy->primitive);
+                        v = nullableValueNull(formalTy);
                     } else if (v->getType() == expectedSt->getElementType(1)) {
-                        v = wrapNullablePrim(formalTy->primitive, v);
+                        v = wrapNullableValue(formalTy, v);
                     }
                 }
             }

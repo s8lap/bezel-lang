@@ -642,6 +642,41 @@ private:
     }
     // Wrap a primitive value into a nullable: {i8 1, value}
     llvm::Value* wrapNullablePrim(sema::PrimitiveType pt, llvm::Value* val);
+    // per §10 / issue #364: is rt a NULLABLE ENUM (a nullable Named TypeRef
+    // whose declaration is an enum)? A non-nullable enum lowers to its
+    // underlying integer (i32 — CG44), so `enum?` would also stay i32, making
+    // `null` indistinguishable from the value-0 member. To give `null` a real
+    // representation it lowers to the SAME tagged struct {i8 hasValue; i32
+    // value} the value primitives use (isNullablePrimTy). This predicate is the
+    // enum analogue of isNullablePrimTy; the two are unified by
+    // isNullableValueTy below.
+    bool isNullableEnumTy(const sema::TypeRef* rt);
+    // A nullable VALUE type — either a value primitive (isNullablePrimTy) or an
+    // enum (isNullableEnumTy). Both lower to the tagged {i8 hasValue; T value}
+    // struct; the only difference is T (the primitive's LLVM type vs i32). All
+    // null/wrap/value-semantics sites key off this combined predicate.
+    bool isNullableValueTy(const sema::TypeRef* rt) {
+        return isNullablePrimTy(rt) || isNullableEnumTy(rt);
+    }
+    // The tagged struct for a nullable value type (prim or enum). For an enum
+    // the value slot is the underlying integer (i32 — CG44).
+    llvm::StructType* nullableValueStructTy(const sema::TypeRef* rt) {
+        if (isNullableEnumTy(rt))
+            return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), i32()});
+        return nullablePrimStructTy(rt->primitive);
+    }
+    // Constant null for a nullable value type: {i8 0, T 0}.
+    llvm::Constant* nullableValueNull(const sema::TypeRef* rt) {
+        return llvm::ConstantAggregateZero::get(nullableValueStructTy(rt));
+    }
+    // Wrap a plain value (primitive or enum integer) into a nullable: {i8 1, v}.
+    llvm::Value* wrapNullableValue(const sema::TypeRef* rt, llvm::Value* val) {
+        auto* st = nullableValueStructTy(rt);
+        llvm::Value* res = builder_.CreateInsertValue(
+            llvm::UndefValue::get(st),
+            llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+        return builder_.CreateInsertValue(res, val, {1u});
+    }
     // Extract the hasValue field (nonzero = has value, 0 = null) as i1.
     llvm::Value* nullablePrimHasValue(llvm::Value* nv) {
         llvm::Value* hv8 = builder_.CreateExtractValue(nv, {0u}, "has.val8");

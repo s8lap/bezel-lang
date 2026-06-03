@@ -97,9 +97,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                 }
                 auto* rt = ctx_.exprType(*part.expr);
-                // CG-nullable: for nullable primitives, extract the value.
-                // If null, format as "null"; otherwise format the inner value.
-                if (rt && isNullablePrimTy(rt) && ev->getType()->isStructTy()) {
+                // CG-nullable: for nullable value types (primitives, and a
+                // nullable enum — issue #364), extract the value. If null,
+                // format as "null"; otherwise format the inner value (an enum's
+                // live value is its type name per §8.5, via emitValueToString
+                // with the non-nullable inner type).
+                if (rt && isNullableValueTy(rt) && ev->getType()->isStructTy()) {
                     llvm::Value* hasVal = nullablePrimHasValue(ev);
                     llvm::Value* primVal = nullablePrimValue(ev);
                     auto* valBB = llvm::BasicBlock::Create(llvm_, "np.val", currentFn_);
@@ -107,7 +110,9 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     auto* endBB = llvm::BasicBlock::Create(llvm_, "np.end", currentFn_);
                     builder_.CreateCondBr(hasVal, valBB, nullBB);
                     builder_.SetInsertPoint(valBB);
-                    llvm::Value* vStr = emitPrimitiveToString(primVal, rt->primitive);
+                    sema::TypeRef innerTy = *rt;
+                    innerTy.nullable = false;
+                    llvm::Value* vStr = emitValueToString(primVal, &innerTy);
                     auto* valEnd = builder_.GetInsertBlock();
                     builder_.CreateBr(endBB);
                     builder_.SetInsertPoint(nullBB);
@@ -226,12 +231,13 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         }
         return acc;
     }
-    // CG23: the `null` literal. For nullable primitive types (int?, etc.)
-    // produce the tagged-struct null; for reference types produce nullptr.
+    // CG23: the `null` literal. For nullable value types (int?, …, and a
+    // nullable enum — issue #364) produce the tagged-struct null; for reference
+    // types produce nullptr.
     if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
         if (auto* rt = ctx_.exprType(e))
-            if (isNullablePrimTy(rt))
-                return nullablePrimNull(rt->primitive);
+            if (isNullableValueTy(rt))
+                return nullableValueNull(rt);
         return llvm::ConstantPointerNull::get(ptrTy());
     }
     // CG37: `default(T)` is the zero value of T (0 / false / 0.0 / null).
@@ -244,11 +250,11 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         llvm::Value* v = bang->operand ? lowerExpr(*bang->operand)
                                        : nullptr;
         if (!v) return nullptr;
-        // CG-nullable: nullable primitive (int?, bool?, etc.) — check
-        // hasValue field and extract the primitive value.
+        // CG-nullable: nullable value type (int?, bool?, …, and a nullable
+        // enum — issue #364) — check hasValue field and extract the value.
         if (bang->operand) {
             if (auto* rt = ctx_.exprType(*bang->operand)) {
-                if (isNullablePrimTy(rt)) {
+                if (isNullableValueTy(rt)) {
                     llvm::Value* hasVal = nullablePrimHasValue(v);
                     emitGuardThrow(builder_.CreateNot(hasVal),
                                    "NullReferenceException");
@@ -1331,25 +1337,66 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                               bin.left.get())) ||
             (bin.right && dynamic_cast<const ast::NullLiteralExpr*>(
                                bin.right.get()));
-        // CG-nullable: `x = null` / `x <> null` for nullable primitives.
-        // The nullable-prim struct type is not ptr-typed, so the normal
-        // ptr-null check below wouldn't fire. Extract the hasValue field.
+        // CG-nullable: `x = null` / `x <> null` for nullable value types
+        // (primitives, and a nullable enum — issue #364). The tagged struct is
+        // not ptr-typed, so the normal ptr-null check below wouldn't fire.
+        // Extract the hasValue field.
         if (eitherNull && (op == "=" || op == "<>")) {
-            // Determine which side is the nullable-prim value (non-null side).
+            // Determine which side is the nullable value (non-null side).
             const ast::Expr* nvExpr = nullptr;
             llvm::Value* nvVal = nullptr;
             if (bin.left && !dynamic_cast<const ast::NullLiteralExpr*>(bin.left.get())) {
                 if (auto* rt = ctx_.exprType(*bin.left))
-                    if (isNullablePrimTy(rt)) { nvExpr = bin.left.get(); nvVal = l; }
+                    if (isNullableValueTy(rt)) { nvExpr = bin.left.get(); nvVal = l; }
             } else if (bin.right && !dynamic_cast<const ast::NullLiteralExpr*>(bin.right.get())) {
                 if (auto* rt = ctx_.exprType(*bin.right))
-                    if (isNullablePrimTy(rt)) { nvExpr = bin.right.get(); nvVal = r; }
+                    if (isNullableValueTy(rt)) { nvExpr = bin.right.get(); nvVal = r; }
             }
             if (nvVal && nvVal->getType()->isStructTy()) {
                 // hasValue field (index 0). isNull when hasValue=false.
                 llvm::Value* hasVal = nullablePrimHasValue(nvVal);
                 // = null → !hasValue; <> null → hasValue
                 return op == "=" ? builder_.CreateNot(hasVal) : hasVal;
+            }
+        }
+        // CG-nullable / issue #364: `x = v` / `x <> v` where ONE side is a
+        // nullable value (the tagged {i8 hasValue; T value} struct) and the
+        // other is a non-null plain value of the inner type T — e.g.
+        // `(c: Color?) = Color.Green`, the core test that a null `enum?` is
+        // distinct from any enum value (including the value-0 member). The
+        // struct-equality path below (op==`=` && l isStructTy) would feed a
+        // scalar T into emitStructEquality and crash; intercept here. The
+        // null-safe `=` of §8.4: null = nonNull is false; otherwise the inner
+        // T's `=`. So result = hasValue AND (innerValue = v).
+        if ((op == "=" || op == "<>") && !eitherNull) {
+            llvm::Value* structSide = nullptr;
+            llvm::Value* plainSide = nullptr;
+            const sema::TypeRef* nvTy = nullptr;
+            if (bin.left) {
+                if (auto* rt = ctx_.exprType(*bin.left))
+                    if (isNullableValueTy(rt) && l->getType()->isStructTy()) {
+                        structSide = l; plainSide = r; nvTy = rt;
+                    }
+            }
+            if (!structSide && bin.right) {
+                if (auto* rt = ctx_.exprType(*bin.right))
+                    if (isNullableValueTy(rt) && r->getType()->isStructTy()) {
+                        structSide = r; plainSide = l; nvTy = rt;
+                    }
+            }
+            if (structSide && plainSide && nvTy &&
+                plainSide->getType() == nullableValueStructTy(nvTy)
+                                            ->getElementType(1)) {
+                llvm::Value* hasVal = nullablePrimHasValue(structSide);
+                // Inner equality of the value slot against the plain value,
+                // computed by the inner (non-nullable) type's rule so an enum
+                // compares its i32 value and a float would use FCmp.
+                sema::TypeRef innerTy = *nvTy;
+                innerTy.nullable = false;
+                llvm::Value* innerEq = emitValueEquality(
+                    nullablePrimValue(structSide), plainSide, &innerTy);
+                llvm::Value* eq = builder_.CreateAnd(hasVal, innerEq);
+                return op == "=" ? eq : builder_.CreateNot(eq);
             }
         }
         bool lIsStr = isStr(bin.left.get()) || isGenericString(bin.left.get());
@@ -1577,11 +1624,13 @@ llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
 llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     llvm::Value* l = lowerExpr(*bin.left);
     if (!l) return nullptr;
-    // CG-nullable: `int? ?? expr` — struct {i1 hasValue; primType value}.
-    // If hasValue is true, return the value; otherwise evaluate and return rhs.
+    // CG-nullable: `int? ?? expr` (and `enum? ?? expr` — issue #364) — the LHS
+    // is the tagged struct {i8 hasValue; T value}. If hasValue is true, return
+    // the inner value; otherwise evaluate and return the rhs. For an enum the
+    // inner value (and the rhs, e.g. `Color.Red`) is the underlying i32.
     if (!l->getType()->isPointerTy() && bin.left) {
         if (auto* lt = ctx_.exprType(*bin.left)) {
-            if (isNullablePrimTy(lt)) {
+            if (isNullableValueTy(lt)) {
                 auto* entryBB = builder_.GetInsertBlock();
                 auto* rhsBB = llvm::BasicBlock::Create(llvm_, "coal.rhs", currentFn_);
                 auto* endBB = llvm::BasicBlock::Create(llvm_, "coal.end", currentFn_);
@@ -2458,21 +2507,22 @@ llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
                 if (!args[i].value) return nullptr;
                 llvm::Value* v = lowerExpr(*args[i].value);
                 if (!v) return nullptr;
-                // CG-nullable: a NULLABLE VALUE field (int?, bool?, …) stores
-                // the tagged struct {i8 hasValue; T value}, never a bare T.
-                // Wrap a plain primitive argument (and lower a `null` literal
-                // to the all-zero null), mirroring buildOrderedArgs — without
-                // this the bare T would be stored into the wider struct slot,
-                // leaving the value half uninitialized. per §9.1
+                // CG-nullable: a NULLABLE VALUE field (int?, bool?, …, and a
+                // nullable enum — issue #364) stores the tagged struct {i8
+                // hasValue; T value}, never a bare T. Wrap a plain value
+                // argument (and lower a `null` literal to the all-zero null),
+                // mirroring buildOrderedArgs — without this the bare T would be
+                // stored into the wider struct slot, leaving the value half
+                // uninitialized. per §9.1
                 const sema::TypeRef* fty = recordMemberType(fields[i]);
-                if (isNullablePrimTy(fty)) {
-                    auto* expectedSt = nullablePrimStructTy(fty->primitive);
+                if (isNullableValueTy(fty)) {
+                    auto* expectedSt = nullableValueStructTy(fty);
                     if (v->getType() != expectedSt) {
                         if (v->getType()->isPointerTy() &&
                             llvm::isa<llvm::ConstantPointerNull>(v))
-                            v = nullablePrimNull(fty->primitive);
+                            v = nullableValueNull(fty);
                         else if (v->getType() == expectedSt->getElementType(1))
-                            v = wrapNullablePrim(fty->primitive, v);
+                            v = wrapNullableValue(fty, v);
                     }
                 }
                 auto idxIt = fieldIndex_.find(fields[i]);
@@ -2502,17 +2552,18 @@ llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
         llvm::Value* v = lowerExpr(*init);
         if (!v) continue;
         // CG-nullable: a NULLABLE VALUE field initialized with a plain value
-        // (`property N: int? := 9;`) must wrap the bare primitive into the
-        // {i8 hasValue; T value} struct, like the positional path above. per §9.2
+        // (`property N: int? := 9;`, or `property C: Color? := Color.Green;` —
+        // issue #364) must wrap the bare value into the {i8 hasValue; T value}
+        // struct, like the positional path above. per §9.2
         const sema::TypeRef* fty = recordMemberType(m);
-        if (isNullablePrimTy(fty)) {
-            auto* expectedSt = nullablePrimStructTy(fty->primitive);
+        if (isNullableValueTy(fty)) {
+            auto* expectedSt = nullableValueStructTy(fty);
             if (v->getType() != expectedSt) {
                 if (v->getType()->isPointerTy() &&
                     llvm::isa<llvm::ConstantPointerNull>(v))
-                    v = nullablePrimNull(fty->primitive);
+                    v = nullableValueNull(fty);
                 else if (v->getType() == expectedSt->getElementType(1))
-                    v = wrapNullablePrim(fty->primitive, v);
+                    v = wrapNullableValue(fty, v);
             }
         }
         builder_.CreateStore(

@@ -1903,23 +1903,26 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         phi->addIncoming(nullStr, nullEnd);
         return phi;
     }
-    // per §8.5/§9.1: a NULLABLE VALUE field (int?, bool?, double?, … the value
-    // primitives isNullablePrimTy recognizes) is the tagged struct {i8
-    // hasValue; T value}. hasValue → format the inner T
-    // by its normal ToString (emitPrimitiveToString on the value slot); null →
-    // the literal "null" (matching null interpolation and the nullable-ref
-    // rendering above). Selecting off the tag avoids rendering the slot of an
-    // absent value (which would print the hasValue byte or a zero fill).
-    if (isNullablePrimTy(fieldTy) && val->getType()->isStructTy()) {
+    // per §8.5/§9.1 / issue #364: a NULLABLE VALUE field (int?, bool?, double?,
+    // … the value primitives isNullablePrimTy recognizes, AND a nullable enum —
+    // isNullableValueTy) is the tagged struct {i8 hasValue; T value}. hasValue →
+    // format the inner T by its normal ToString (recursing with the
+    // non-nullable inner type: a primitive uses emitPrimitiveToString, an enum
+    // its type name per §8.5); null → the literal "null" (matching null
+    // interpolation and the nullable-ref rendering above). Selecting off the tag
+    // avoids rendering the slot of an absent value (a zero fill).
+    if (isNullableValueTy(fieldTy) && val->getType()->isStructTy()) {
         llvm::Value* has = nullablePrimHasValue(val);          // i1
         auto* liveBB = llvm::BasicBlock::Create(llvm_, "ts.nvlive", currentFn_);
         auto* nullBB = llvm::BasicBlock::Create(llvm_, "ts.nvnull", currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "ts.nvend", currentFn_);
         builder_.CreateCondBr(has, liveBB, nullBB);
-        // hasValue: format the inner primitive value.
+        // hasValue: format the inner value by its non-nullable rule.
         builder_.SetInsertPoint(liveBB);
+        sema::TypeRef innerTy = *fieldTy;
+        innerTy.nullable = false;
         llvm::Value* liveStr =
-            emitPrimitiveToString(nullablePrimValue(val), fieldTy->primitive);
+            emitValueToString(nullablePrimValue(val), &innerTy);
         auto* liveEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
         // null: the literal "null".
@@ -2061,21 +2064,23 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
         phi->addIncoming(live, hashEnd);
         return phi;
     }
-    // per §8.3/§9.1: a NULLABLE VALUE field (int?, bool?, double?, … the value
-    // primitives isNullablePrimTy recognizes) is the tagged struct {i8
-    // hasValue; T value}. hasValue → hash the inner value;
-    // null → the fixed sentinel 0 — the SAME sentinel the null-equal pair
-    // collapses to, so the hash-equality invariant holds (two both-null fields
-    // are equal and hash identically). Mirrors the nullable-ref handling above.
-    if (isNullablePrimTy(fieldTy) && val->getType()->isStructTy()) {
+    // per §8.3/§9.1 / issue #364: a NULLABLE VALUE field (int?, bool?, double?,
+    // … the value primitives isNullablePrimTy recognizes, AND a nullable enum —
+    // isNullableValueTy) is the tagged struct {i8 hasValue; T value}. hasValue →
+    // hash the inner value; null → the fixed sentinel 0 — the SAME sentinel the
+    // null-equal pair collapses to, so the hash-equality invariant holds (two
+    // both-null fields are equal and hash identically). Mirrors the nullable-ref
+    // handling above.
+    if (isNullableValueTy(fieldTy) && val->getType()->isStructTy()) {
         llvm::Value* has = nullablePrimHasValue(val);          // i1
         auto* hashBB = llvm::BasicBlock::Create(llvm_, "h.nvlive", currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "h.nvend", currentFn_);
         auto* entryBB = builder_.GetInsertBlock();
         builder_.CreateCondBr(has, hashBB, endBB);
         builder_.SetInsertPoint(hashBB);
-        // Hash the inner primitive value by its non-nullable rule (the integer/
-        // float folds below, reached via a nullable-off recursion).
+        // Hash the inner value by its non-nullable rule (the integer/float folds
+        // below — an enum's i32 value hits the integer fold — via a
+        // nullable-off recursion).
         sema::TypeRef innerTy = *fieldTy;
         innerTy.nullable = false;
         llvm::Value* live = emitValueHashCode(nullablePrimValue(val), &innerTy);

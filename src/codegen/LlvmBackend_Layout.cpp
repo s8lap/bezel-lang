@@ -156,6 +156,19 @@ bool Emitter::isNullablePrimTy(const sema::TypeRef* rt) {
 }
 
 
+// per §10 / issue #364: a NULLABLE ENUM (a nullable Named TypeRef whose
+// declaration is an enum) is a value type that lacked a null representation —
+// a non-nullable enum lowers to its underlying integer (i32), so `enum?` stayed
+// i32 and `null` collided with the value-0 member. It now lowers, like the
+// value primitives, to the tagged {i8 hasValue; i32 value} struct, so null is
+// representable and distinct from every enum value.
+bool Emitter::isNullableEnumTy(const sema::TypeRef* rt) {
+    return rt && rt->nullable &&
+           rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Enum;
+}
+
+
 // per §8.3/§9.1: a nullable reference type lowers to a plain `ptr` whose null
 // is a real null pointer (no hasValue tag). The synthesized value-semantics
 // members must null-guard a field of such a type before dereferencing it.
@@ -191,8 +204,10 @@ llvm::Value* Emitter::wrapNullablePrim(sema::PrimitiveType pt, llvm::Value* val)
 
 llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
     if (!rt) return i32();
-    // CG-nullable: nullable primitive → {i1 hasValue; primType value}
-    if (isNullablePrimTy(rt)) return nullablePrimStructTy(rt->primitive);
+    // CG-nullable: nullable value type (prim or enum) → {i8 hasValue; T value}.
+    // For an enum the value slot is its underlying integer (i32 — CG44); per
+    // issue #364 this gives `enum?` a null distinct from the value-0 member.
+    if (isNullableValueTy(rt)) return nullableValueStructTy(rt);
     switch (rt->kind) {
         case sema::TypeRef::Kind::Unit:
             return llvm::Type::getVoidTy(llvm_);
@@ -842,14 +857,14 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
         phi->addIncoming(cmp, cmpEnd);
         return phi;
     }
-    // per §8.3/§9.1: a NULLABLE VALUE field (int?, bool?, double?, … the value
-    // primitives isNullablePrimTy recognizes) lowers to a tagged struct {i8
-    // hasValue; T value} (isNullablePrimTy /
-    // nullablePrimStructTy). The null-safe `=` of §8.4 is: both-null → equal;
+    // per §8.3/§9.1 / issue #364: a NULLABLE VALUE field (int?, bool?, double?,
+    // … the value primitives isNullablePrimTy recognizes, AND a nullable enum —
+    // isNullableValueTy) lowers to a tagged struct {i8 hasValue; T value}
+    // (nullableValueStructTy). The null-safe `=` of §8.4 is: both-null → equal;
     // exactly-one-null → not-equal; neither-null → the inner T's `=`. Drive it
     // off the hasValue tags so the `value` slot is only compared when both are
     // present (an absent value's slot is zero-filled but meaningless).
-    if (isNullablePrimTy(fieldTy) && l->getType()->isStructTy() &&
+    if (isNullableValueTy(fieldTy) && l->getType()->isStructTy() &&
         r->getType()->isStructTy()) {
         llvm::Value* lHas = nullablePrimHasValue(l);   // i1
         llvm::Value* rHas = nullablePrimHasValue(r);
@@ -857,7 +872,7 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
         llvm::Value* bothHave = builder_.CreateAnd(lHas, rHas, "eq.nvboth");
         // Inner T equality of the value slots — primitives/enums compare by
         // value (the fall-through ICmp/FCmp below, reached via a nullable-off
-        // recursion so floats use FCmp).
+        // recursion so floats use FCmp; an enum's i32 value uses ICmp).
         sema::TypeRef innerTy = *fieldTy;
         innerTy.nullable = false;
         llvm::Value* valEq = emitValueEquality(
