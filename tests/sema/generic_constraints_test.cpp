@@ -141,6 +141,29 @@ BEZEL_TEST(sema_generic_constraints, value_with_string_arg_diagnoses_14_2) {
     BEZEL_EXPECT_TRUE(hasConstraintError(r));
 }
 
+BEZEL_TEST(sema_generic_constraints, value_with_nullable_value_arg_diagnoses_14_2) {
+    // §14.2: "A nullable value type (e.g. `int?`) does not satisfy `value`."
+    // C<int?> must be rejected even though int is a value type — the nullable
+    // form is a distinct type (§7.1).
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<T> where T: value private _x: T?; end C; "
+        "class U private _u: C<int?>?; end U;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, value_with_nullable_record_arg_diagnoses_14_2) {
+    // §14.2: the nullable form of a record (a value type) does not satisfy
+    // `value`. C<Point?> is rejected; the non-nullable C<Point> is accepted
+    // (see value_with_record_arg_ok_14_2 above as the control).
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C<T> where T: value private _x: T?; end C; "
+        "class U private _u: C<Point?>?; end U;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
 // ---------------------------------------------------------------------------
 // where T: notnull  (§14.2 — non-nullable types only)
 // ---------------------------------------------------------------------------
@@ -164,11 +187,22 @@ BEZEL_TEST(sema_generic_constraints, notnull_with_class_arg_ok_14_2) {
 }
 
 BEZEL_TEST(sema_generic_constraints, notnull_with_nullable_arg_diagnoses_14_2) {
-    // C<int?> violates `where T: notnull`.
+    // C<int?> violates `where T: notnull` (nullable value type).
     auto r = parseSemaAll(
         "module M; "
         "class C<T> where T: notnull private _x: T?; end C; "
         "class U private _u: C<int?>?; end U;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, notnull_with_nullable_ref_arg_diagnoses_14_2) {
+    // §14.2: `where T: notnull` excludes EVERY nullable type — value OR
+    // reference. C<SomeClass?> (a nullable reference type) is rejected.
+    auto r = parseSemaAll(
+        "module M; "
+        "class SomeClass end SomeClass; "
+        "class C<T> where T: notnull private _x: T?; end C; "
+        "class U private _u: C<SomeClass?>?; end U;");
     BEZEL_EXPECT_TRUE(hasConstraintError(r));
 }
 

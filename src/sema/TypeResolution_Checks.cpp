@@ -1233,7 +1233,8 @@ void Resolver::checkOneConstraint(const ast::Type& t,
     };
 
     if (item.kind == "notnull") {
-        // §14.2: non-nullable types only (value or reference).
+        // §14.2: non-nullable types only — `where T: notnull` excludes
+        // EVERY nullable type, value or reference.
         if (arg->nullable) report("notnull");
         return;
     }
@@ -1246,9 +1247,12 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         return;
     }
     if (item.kind == "value") {
-        // §14.2: value types only. A reference-typed argument is the clear
-        // violation; nullability of a value type is left to a later slice to
-        // avoid a false positive here.
+        // §14.2: non-nullable value types only. A nullable value type
+        // (`int?`, `Priority?`, nullable record / enum / inline-array) is a
+        // distinct type from its non-nullable form (§7.1) and does NOT
+        // satisfy `value`; reject it regardless of underlying category. A
+        // reference-typed argument is the other clear violation.
+        if (arg->nullable) { report("value"); return; }
         TypeCategory c = categorize(arg);
         if (c == TypeCategory::Reference) report("value");
         return;
