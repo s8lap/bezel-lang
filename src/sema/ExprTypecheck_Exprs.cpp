@@ -584,6 +584,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // parameter is typed as `T`, letting its body resolve `e.Field`.
         TypeRef* eventPayload = ce->callee
             ? eventHandlerPayloadType(ce->callee.get()) : nullptr;
+        // stdlib §5 (D7): for a LINQ operator/aggregate over a collection or
+        // lazy receiver, the lambda argument is `(T) -> …` over the source
+        // element type T. Seed an untyped single-param lambda's parameter with
+        // T (same mechanism as the event-handler payload above) so its body
+        // resolves member access on the element (e.g. `p.x` over Array<Point>).
+        TypeRef* linqElem = ce->callee
+            ? linqLambdaElementType(ce->callee.get()) : nullptr;
         // Resolve callee's parameter list to type out-var locals.
         sema::Symbol* calleeSym2 = ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr;
         const ast::MethodDecl* calleeMd2 = nullptr;
@@ -617,11 +624,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 }
             }
             if (a.value) {
-                // per §24.3: type the (single) event-handler lambda param as T.
+                // per §24.3 / stdlib §5 (D7): type the (single) untyped lambda
+                // param as the event payload T (handler) or the LINQ source
+                // element T, so its body resolves member access on the param.
                 TypeRef* savedPending = pendingLambdaParamType_;
-                if (eventPayload &&
-                    dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
-                    pendingLambdaParamType_ = eventPayload;
+                if (auto* lam =
+                        dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
+                    if (eventPayload)     pendingLambdaParamType_ = eventPayload;
+                    else if (linqElem)    pendingLambdaParamType_ = linqElem;
+                    (void)lam;
+                }
                 visitExpr(*a.value);
                 pendingLambdaParamType_ = savedPending;
             }

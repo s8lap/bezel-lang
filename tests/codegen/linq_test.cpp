@@ -223,3 +223,131 @@ BEZEL_TEST(linq, select_projection) {
         "    return int(doubled.Get(0) = 2 and doubled.Get(2) = 6); "
         "  end Main; end C;"), 1);
 }
+
+// --- LINQ over a RECORD element sequence (stdlib §5 over §9 records) ----------
+// A LINQ lambda's untyped parameter over Array<record> is typed as the element
+// record (§5 `(T) -> …`), so its body reads the record's fields (§9.1). The
+// trampoline / eager loop must pass the ACTUAL record element to the closure —
+// a predicate reading a field must see the field's real value, not zero.
+
+// §5 Count(predicate): the predicate reads a record field. Point(5,0) satisfies
+// `p.x = 5`, so Count = 1. (Load-bearing: before the fix the record param was
+// untyped, `p.x` did not resolve, and the predicate body collapsed to a no-op.)
+BEZEL_TEST(linq, count_predicate_record_field_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(5, 0)); a.Add(new Point(3, 9)); a.Add(new Point(5, 7)); "
+        "  return a.Count((p) => p.x = 5); "
+        "end Main; end C;"), 2);
+}
+
+// §5 Any / All over records: quantifiers read record fields.
+BEZEL_TEST(linq, any_all_record_field_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(5, 0)); a.Add(new Point(7, 0)); "
+        "  return int(a.Any((p) => p.x = 5) and a.All((p) => p.y = 0) and "
+        "             not a.Any((p) => p.x = 99)); "
+        "end Main; end C;"), 1);
+}
+
+// §5 First(predicate) over records: the predicate reads a record field and the
+// first matching record is returned. The result is bound to an explicitly-typed
+// local (the §5 element type Point) so `p.y` resolves; the predicate sees the
+// real field values (matches Point(2,20), so p.y = 20 — not zero).
+BEZEL_TEST(linq, first_predicate_record_field_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); a.Add(new Point(3, 30)); "
+        "  var p: Point := a.First((q) => q.x = 2); "
+        "  return p.y; "
+        "end Main; end C;"), 20);
+}
+
+// §5 Where (lazy) over records: filter by a field, materialize, read fields back.
+BEZEL_TEST(linq, where_record_field_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(5, 1)); a.Add(new Point(2, 2)); a.Add(new Point(5, 3)); "
+        "  using var w: Array<Point> := a.Where((p) => p.x = 5).ToArray(); "
+        "  return int(w.Length = 2 and w.Get(0).y = 1 and w.Get(1).y = 3); "
+        "end Main; end C;"), 1);
+}
+
+// §5 Select (lazy) over records: project a record to one of its fields.
+BEZEL_TEST(linq, select_record_field_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(4, 0)); a.Add(new Point(6, 0)); "
+        "  using var xs: Array<int> := a.Select((p) => p.x).ToArray(); "
+        "  return int(xs.Get(0) = 4 and xs.Get(1) = 6); "
+        "end Main; end C;"), 1);
+}
+
+// §5 OrderBy a record sequence by a field key (`(T) -> TKey`, §9.1 field read).
+BEZEL_TEST(linq, orderby_record_field_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(5, 1)); a.Add(new Point(2, 2)); a.Add(new Point(8, 3)); "
+        "  using var s: Array<Point> := a.OrderBy((p) => p.x).ToArray(); "
+        "  return int(s.Get(0).x = 2 and s.Get(1).x = 5 and s.Get(2).x = 8 and "
+        "             s.Get(0).y = 2); "  // payload travels with the sort
+        "end Main; end C;"), 1);
+}
+
+// §5 Distinct over records dedups by structural equality (§9.1/§9.2), mirroring
+// Set<record>. Two equal Pt records collapse to one. (Load-bearing for D6:
+// before the fix, Distinct emitted an ICmp on the record aggregate and aborted
+// the compiler.)
+BEZEL_TEST(linq, distinct_record_structural_equality_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pt(x: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Pt>(); "
+        "  a.Add(new Pt(1)); a.Add(new Pt(2)); a.Add(new Pt(1)); a.Add(new Pt(2)); "
+        "  using var d: Array<Pt> := a.Distinct().ToArray(); "
+        "  return d.Length; "
+        "end Main; end C;"), 2);
+}
+
+// §5 Distinct over a multi-field record: equality is field-by-field (§9.1),
+// so Point(1,2) and Point(1,3) are distinct but the two Point(1,2) collapse.
+BEZEL_TEST(linq, distinct_record_multifield_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(1, 2)); a.Add(new Point(1, 3)); a.Add(new Point(1, 2)); "
+        "  using var d: Array<Point> := a.Distinct().ToArray(); "
+        "  return d.Length; "
+        "end Main; end C;"), 2);
+}
+
+// §5 a lazy pipeline over records consumed by a for-loop (no materialization):
+// Where filters by a field; the loop reads fields of each yielded record.
+BEZEL_TEST(linq, lazy_record_pipeline_foreach_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); "
+        "  a.Add(new Point(3, 30)); a.Add(new Point(4, 40)); "
+        "  var s := 0; var n := 0; "
+        "  for var p in a.Where((q) => q.x mod 2 = 0) do "
+        "    s := s + p.y; n := n + 1; "
+        "  end; "
+        "  return int(n = 2 and s = 60); "  // Point(2,20).y + Point(4,40).y
+        "end Main; end C;"), 1);
+}

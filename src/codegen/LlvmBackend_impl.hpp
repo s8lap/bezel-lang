@@ -1536,6 +1536,12 @@ private:
     static const sema::TypeSymbol* recordKeyType(const sema::TypeRef* collTy,
                                                  unsigned idx);
 
+    // issue #343 / §9.1 / §9.2: if `ref` itself resolves to an
+    // equality-bearing record type (positional or auto-equality body record),
+    // return its TypeSymbol; otherwise null. Used to route a record *element*
+    // sequence (e.g. lazy LINQ Distinct) through structural equality.
+    static const sema::TypeSymbol* recordTypeOfRef(const sema::TypeRef* ref);
+
     // issue #343 / §8.3: build C-ABI trampolines over a record key type's
     // synthesized hash / equality for the generic dict/set runtime variant.
     //   hash: uint64_t(const void* key)  — loads the record struct, hashes it.
@@ -1574,9 +1580,14 @@ private:
     //   0 = predicate  i32(closure, elem_ptr)        (loads elemTy, calls, ext)
     //   1 = selector   void(closure, elem_ptr, out)  (calls, stores outTy)
     //   2 = key        i64(closure, elem_ptr)         (loads elemTy, calls, sext)
+    //   3 = equality   i32(a_ptr, b_ptr)              (Distinct element compare)
     // `elemTy` is the input element LLVM type; `outTy` the selector output type.
+    // `elemRec` is non-null only for kind 3 over a record element type (D6):
+    // the comparison routes through synthesized structural equality
+    // (emitStructEquality, §9.1/§9.2) instead of an ICmp on the aggregate.
     llvm::Function* buildLinqTrampoline(int kind, llvm::Type* elemTy,
-                                        llvm::Type* outTy);
+                                        llvm::Type* outTy,
+                                        const sema::TypeSymbol* elemRec = nullptr);
 
     // Detect Convert.ToInt32(s) / Convert.ToInt64(s) / Math.Abs(n) etc.
     // as intrinsic static class method calls. Returns a lowered value or null.

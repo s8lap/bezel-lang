@@ -990,6 +990,38 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
     return ctx_.resolvedType(*ed->type);
 }
 
+// stdlib §5 (D7): if `callee` is a LINQ operator/aggregate on a collection or
+// lazy IEnumerable receiver whose lambda argument is `(T) -> …` over the
+// source element type T, return T (the receiver's first generic arg). This lets
+// an untyped LINQ lambda parameter (`(p) => p.x = 5`) be typed as the element
+// type so its body resolves member access (`p.x`) — exactly as the
+// event-handler payload mechanism (§24.3) types `(e) => …` handler params.
+// Null when the call is not such a LINQ operator (no seeding applied).
+TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+    // LINQ operators/aggregates whose (single) lambda is `(T) -> …` over the
+    // source element T (stdlib §5). Select's selector and OrderBy's key fn are
+    // also `(T) -> …`; Distinct/Take/Skip take no lambda (excluded).
+    bool elemLambda =
+        m == "Where" || m == "Select" || m == "Count" || m == "Any" ||
+        m == "All" || m == "First" || m == "Last" || m == "Single" ||
+        m == "OrderBy" || m == "OrderByDescending" || m == "ForEach" ||
+        m == "Min" || m == "Max" || m == "Sum";
+    if (!elemLambda) return nullptr;
+    auto* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
+        recvTy->genericArgs.empty() || !recvTy->genericArgs[0])
+        return nullptr;
+    // A collection (Array/Set/… — Named with astNode, no declaration) or a lazy
+    // IEnumerable sentinel (Named with neither). Either carries the element
+    // type as genericArgs[0]. A user class/interface (has declaration) is not
+    // a LINQ source and is excluded.
+    if (recvTy->declaration) return nullptr;
+    return recvTy->genericArgs[0];
+}
+
 // per §24.3: enforce the event visibility fence. `op` is the producer-side
 // operation being attempted on the event (`Raise`, `RaiseAsync`, `Add`,
 // `Remove`, or `+=` / `-=`). These are in scope only when the event's static
