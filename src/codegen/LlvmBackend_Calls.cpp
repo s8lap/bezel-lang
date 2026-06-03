@@ -300,23 +300,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     if (isArr) {
         int64_t esz = collectionElemSize(recvTy);
 
-        // issue #343 / §4.10: a record-element Set<T>/OwnedSet<T> is backed by
-        // the generic-key hash table (allocated in the `new` path). Route its
-        // core membership operations to the generic dict entry points so set
-        // semantics follow the element's synthesized hash/equality (§8.3).
-        // Element value is a non-null sentinel; only membership matters.
-        // Other Set operations (LINQ, set-algebra) on a record-element set are
-        // not wired in this slice and fall through.
+        // issues #343 / D8 / §4.10: a Set<T>/OwnedSet<T> is backed by the
+        // generic-key hash table (allocated in the `new` path). Route its core
+        // membership operations to the generic dict entry points so set
+        // semantics follow the element's hash/equality (§8.3). This covers
+        // records (#343), primitive/enum elements, AND string elements (D8) —
+        // none of which the array backing could deduplicate. Element value is a
+        // non-null sentinel; only membership matters. Other Set operations
+        // (LINQ, set-algebra) are not wired in this slice and fall through.
         bool isSetName = recvTy && recvTy->astNode && recvTy->astNode->name &&
                          !recvTy->astNode->name->parts.empty() &&
                          (recvTy->astNode->name->parts[0] == "Set" ||
                           recvTy->astNode->name->parts[0] == "OwnedSet");
         if (isSetName) {
-            if (const sema::TypeSymbol* elemRec = recordKeyType(recvTy, 0)) {
-                llvm::StructType* est = recordStruct(elemRec);
+            if (const sema::TypeRef* elemTy =
+                    genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)) {
+                // Spill the element to a stack slot of its natural LLVM type and
+                // return the byte pointer the generic runtime expects. A record
+                // value reaching us as a pointer is already an address; any
+                // scalar/string value (including a string POINTER, whose bytes
+                // are the key) is stored into a fresh slot of its own type.
+                bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
                 auto elemPtr = [&](llvm::Value* v) -> llvm::Value* {
-                    if (v->getType()->isPointerTy()) return v;
-                    llvm::AllocaInst* slot = entryAlloca(est);
+                    if (elemIsRecord && v->getType()->isPointerTy())
+                        return v;  // record already spilled to an address
+                    llvm::AllocaInst* slot = entryAlloca(v->getType());
                     builder_.CreateStore(v, slot);
                     return slot;
                 };
@@ -362,7 +370,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         builder_.getInt64(0), "set.empty");
                 }
                 // .Clear() — recreate via remove-all is unavailable; not wired.
-                return nullptr;  // other ops scoped out for record-element sets
+                return nullptr;  // other ops scoped out for dict-backed sets
             }
         }
 
@@ -994,11 +1002,28 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // Dictionary<string, V> methods (string-key variant)
     // -----------------------------------------------------------------------
     if (isDict) {
-        // issue #343 / §4.8: a record key routes through the generic-key runtime
-        // (bz_dict_*_gen), passing a pointer to the lowered key bytes; string
-        // keys keep the bz_dict_*_str fast path. `keyRec` is non-null only for
-        // record keys.
-        const sema::TypeSymbol* keyRec = recordKeyType(recvTy, 0);
+        // issues #343 / D3 / §4.8: a non-string key routes through the generic-
+        // key runtime (bz_dict_*_gen), passing a pointer to the lowered key
+        // bytes; the STRING key keeps the bz_dict_*_str fast path. `keyTy` is
+        // non-null for every generic-backed key (records and primitives/enums),
+        // null only for the string key.
+        const sema::TypeRef* keyTy =
+            genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
+        bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+        // issue D4 / §4.8: V is unconstrained for the borrowing dictionary, so
+        // it can be a record (aggregate). A record value is too wide for the
+        // inttoptr value-slot encoding; it is heap-boxed and the box pointer is
+        // stored, then loaded back on retrieval.
+        const sema::TypeRef* valTy =
+            (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
+                                                       : nullptr;
+        // Any record value (equality-bearing or not) is an aggregate and must be
+        // boxed — not just the equality-bearing ones recordTypeOfRef accepts.
+        const sema::TypeSymbol* valRec =
+            (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
+             valTy->declaration &&
+             valTy->declaration->kind == ast::TypeDeclKind::Record)
+                ? valTy->declaration : nullptr;
 
         // Helper: extract string data/len from bz.string ptr
         auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
@@ -1006,15 +1031,44 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* len  = loadStringLen(s);
             return {data, len};
         };
-        // issue #343: spill a record key value to a stack slot and return the
-        // byte pointer the generic runtime entry points expect.
-        auto recKeyPtr = [&](llvm::Value* k) -> llvm::Value* {
-            llvm::StructType* kst = recordStruct(keyRec);
-            if (k->getType()->isPointerTy())   // already an address (spilled)
-                return k;
-            llvm::AllocaInst* slot = entryAlloca(kst);
+        // issues #343 / D3: spill a generic key value to a stack slot and return
+        // the byte pointer the generic runtime entry points expect. A record key
+        // reaching us as a pointer is already an address; any other value
+        // (scalar/enum) is stored into a slot of its natural LLVM type.
+        auto genKeyPtr = [&](llvm::Value* k) -> llvm::Value* {
+            if (keyIsRecord && k->getType()->isPointerTy())
+                return k;  // record already spilled to an address
+            llvm::AllocaInst* slot = entryAlloca(k->getType());
             builder_.CreateStore(k, slot);
             return slot;
+        };
+        // Encode a value as the stored void*. Pointer values store directly;
+        // integer/float values widen to i64 and inttoptr so each stored value is
+        // self-contained (no shared-alloca aliasing across loop iterations);
+        // issue D4: a record value is heap-boxed (malloc + memcpy of its bytes)
+        // and the box pointer is stored.
+        auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
+            if (valRec && v->getType()->isStructTy()) {
+                llvm::StructType* vst = recordStruct(valRec);
+                uint64_t vsz = module_->getDataLayout().getTypeAllocSize(vst);
+                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                llvm::Value* box =
+                    builder_.CreateCall(mallocFn, {builder_.getInt64((int64_t)vsz)});
+                builder_.CreateStore(v, box);   // copy the record bytes into the box
+                return box;
+            }
+            if (v->getType()->isPointerTy()) return v;
+            llvm::Value* asI64 = v;
+            if (v->getType()->isFloatingPointTy()) {
+                if (v->getType()->isDoubleTy())
+                    asI64 = builder_.CreateBitCast(v, i64());
+                else
+                    asI64 = builder_.CreateZExt(
+                        builder_.CreateBitCast(v, i32()), i64());
+            } else if (!v->getType()->isIntegerTy(64)) {
+                asI64 = builder_.CreateZExt(v, i64());
+            }
+            return builder_.CreateIntToPtr(asI64, ptrTy());
         };
 
         // .Count: int
@@ -1028,9 +1082,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             call.args.size() == 1 && call.args[0].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
-            if (keyRec) {
+            if (keyTy) {
                 auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
-                return builder_.CreateCall(fn, {recv, recKeyPtr(k)}, "dict.contains");
+                return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
             }
             auto [kd, kl] = strDataLen(k);
             auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
@@ -1042,29 +1096,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             llvm::Value* v = lowerExpr(*call.args[1].value);
             if (!k || !v) return nullptr;
-            // Encode value as void* for storage. For pointer types: store
-            // directly. For integer/float types: widen to i64 and use
-            // inttoptr so each stored value is self-contained (avoids
-            // aliasing from a shared stack alloca across loop iterations).
-            llvm::Value* vPtr = v;
-            if (!v->getType()->isPointerTy()) {
-                llvm::Value* asI64 = v;
-                if (v->getType()->isFloatingPointTy()) {
-                    // Bitcast float/double to same-size int
-                    if (v->getType()->isDoubleTy())
-                        asI64 = builder_.CreateBitCast(v, i64());
-                    else
-                        asI64 = builder_.CreateZExt(
-                            builder_.CreateBitCast(v, i32()), i64());
-                } else if (!v->getType()->isIntegerTy(64)) {
-                    asI64 = builder_.CreateZExt(v, i64());
-                }
-                vPtr = builder_.CreateIntToPtr(asI64, ptrTy());
-            }
-            if (keyRec) {
+            llvm::Value* vPtr = encodeValue(v);
+            if (keyTy) {
                 auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {recv, recKeyPtr(k), vPtr});
+                builder_.CreateCall(fn, {recv, genKeyPtr(k), vPtr});
                 return llvm::ConstantInt::get(i32(), 0);
             }
             auto [kd, kl] = strDataLen(k);
@@ -1077,9 +1113,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
-            if (keyRec) {
+            if (keyTy) {
                 auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
-                return builder_.CreateCall(fn, {recv, recKeyPtr(k)}, "dict.remove");
+                return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.remove");
             }
             auto [kd, kl] = strDataLen(k);
             auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
@@ -1099,12 +1135,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // For pointer values: the void* IS the string/object pointer.
             // For integer/float values: the void* encodes the value via
             // inttoptr (mirroring the Add encoding above). Decode via ptrtoint.
+            // issue D4: for a record value the void* is the heap box; copy the
+            // record bytes from the box into the out slot.
             auto* tmpSlot = entryAlloca(ptrTy());
             llvm::Value* found;
-            if (keyRec) {
+            if (keyTy) {
                 auto* fn = declareC("bz_dict_try_get_gen", i1(),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, recKeyPtr(k), tmpSlot});
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
             } else {
                 auto [kd, kl] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
@@ -1112,7 +1150,21 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
             }
             llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
-            if (outTy && !outTy->isPointerTy()) {
+            if (valRec && outTy && outTy->isStructTy()) {
+                // Load the boxed record and store it into the out slot. Guard the
+                // box pointer (it is null on a not-found lookup) so we never
+                // dereference null: only copy on the found path.
+                auto* copyBB = llvm::BasicBlock::Create(llvm_, "tg.copy", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "tg.end", currentFn_);
+                llvm::Value* nonNull = builder_.CreateICmpNE(
+                    valPtr, llvm::ConstantPointerNull::get(ptrTy()), "tg.nn");
+                builder_.CreateCondBr(nonNull, copyBB, endBB);
+                builder_.SetInsertPoint(copyBB);
+                llvm::Value* recVal = builder_.CreateLoad(outTy, valPtr, "tg.rec");
+                builder_.CreateStore(recVal, outAddr);
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+            } else if (outTy && !outTy->isPointerTy()) {
                 // Decode: ptrtoint → truncate/bitcast to target type
                 llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
                 llvm::Value* decoded = asI64;
@@ -3241,7 +3293,23 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 if (recv && recv->getType()->isPointerTy()) {
                     // §3: collection types use bz_array_free / bz_dict_free.
                     auto* recvTy = ctx_.exprType(*ma->target);
-                    if (isCollectionTypeName(recvTy)) {
+                    // issues #343 / D8: a Set is dict-backed (records,
+                    // primitives, strings — see lowerNew), so it frees with
+                    // bz_dict_free, not bz_array_free.
+                    bool isSetName = recvTy && recvTy->astNode &&
+                        recvTy->astNode->name &&
+                        !recvTy->astNode->name->parts.empty() &&
+                        (recvTy->astNode->name->parts[0] == "Set" ||
+                         recvTy->astNode->name->parts[0] == "OwnedSet");
+                    bool dictBackedSet = isSetName &&
+                        genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)
+                            != nullptr;
+                    if (dictBackedSet) {
+                        auto* fn = declareC("bz_dict_free",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                        builder_.CreateCall(fn, {recv,
+                            llvm::ConstantPointerNull::get(ptrTy())});
+                    } else if (isCollectionTypeName(recvTy)) {
                         auto* fn = declareC("bz_array_free",
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                         builder_.CreateCall(fn, {recv,
@@ -3829,6 +3897,119 @@ llvm::Function* Emitter::buildRecordEqTrampoline(const sema::TypeSymbol* rec) {
     llvm::Value* a = builder_.CreateLoad(st, fn->getArg(0), "eq.a");
     llvm::Value* b = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
     builder_.CreateRet(emitStructEquality(a, b, st, rec));  // i1
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// issues D3 / D8 / §4.8 / §4.10: decide whether a Dictionary key / Set element
+// at generic-arg index `idx` needs the generic-key runtime backing, and if so
+// return its resolved TypeRef and the per-key byte count.
+//
+//   Dictionary (isSet=false): a string key keeps the bz_dict_*_str fast path
+//     (returns null). Every other equality-bearing key — primitives, enums,
+//     records (§4.8: "K must provide consistent Equals and GetHashCode") — uses
+//     the generic path. The stored key bytes are the key's natural LLVM layout.
+//   Set (isSet=true): the array backing cannot deduplicate (§4.10), so ALL
+//     element types route through the generic hash table — including strings.
+//
+// `*byteSize` receives the stored key/element byte count (the LLVM alloc size
+// of the key type: 8 for a string pointer, 4 for an int, sizeof(record), …).
+const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
+                                                 unsigned idx, bool isSet,
+                                                 uint64_t* byteSize) {
+    if (!collTy || collTy->genericArgs.size() <= idx) return nullptr;
+    const sema::TypeRef* ty = collTy->genericArgs[idx];
+    if (!ty) return nullptr;
+    using K = sema::TypeRef::Kind;
+    bool isString = ty->kind == K::Primitive &&
+                    ty->primitive == sema::PrimitiveType::String && !ty->nullable;
+    // Dictionary: string keys keep their dedicated fast path (bz_dict_*_str).
+    if (!isSet && isString) return nullptr;
+    // Eligible generic-backed types: a record (existing path) or a non-nullable
+    // primitive/enum scalar (D3) — plus string for sets (D8). Nullable keys and
+    // other shapes are not wired here.
+    bool eligible = false;
+    if (recordTypeOfRef(ty)) eligible = true;
+    else if (isString) eligible = true;  // set element only (dict returned above)
+    else if (!ty->nullable && ty->kind == K::Primitive &&
+             ty->primitive != sema::PrimitiveType::String &&
+             ty->primitive != sema::PrimitiveType::Object &&
+             ty->primitive != sema::PrimitiveType::Decimal)
+        eligible = true;  // int/long/bool/char/byte/short/uint/.../float/double
+    else if (!ty->nullable && ty->kind == K::Named && ty->declaration &&
+             ty->declaration->kind == ast::TypeDeclKind::Enum)
+        eligible = true;  // enum key/element (lowers to i32; value-compared)
+    if (!eligible) return nullptr;
+    if (byteSize) {
+        llvm::Type* lt = lowerTypeRef(ty);
+        *byteSize = lt ? module_->getDataLayout().getTypeAllocSize(lt)
+                       : (uint64_t)8;
+    }
+    return ty;
+}
+
+// issues D3 / D8 / §8.3: generic-dict hash trampoline `uint64_t(const void*)`
+// over an arbitrary equality-bearing value type. The runtime stores the key's
+// natural bytes; the trampoline reinterprets the byte pointer as a pointer to
+// the key's LLVM type, loads the value, and runs the same hash the language
+// uses for the type — emitValueHashCode (§8.3): a string folds its code points
+// (#346 content hash), a record folds its field hashes, a scalar derives an i32
+// from its bits. The i32 is zero-extended (the runtime keeps the low 32 bits).
+llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
+    // A record key reuses the existing record trampoline (tested path).
+    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty))
+        return buildRecordHashTrampoline(rec);
+    llvm::Type* lt = lowerTypeRef(ty);
+    auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$valkey$hash", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* v = builder_.CreateLoad(lt, fn->getArg(0), "key.val");
+    // emitValueHashCode hashes a string by content when fieldTy is the string
+    // primitive; a scalar by its bits.
+    llvm::Value* h = emitValueHashCode(v, ty);             // i32
+    builder_.CreateRet(builder_.CreateZExt(h, i64()));
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// issues D3 / D8 / §8.3: generic-dict equality trampoline
+// `bool(const void* a, const void* b)` over an arbitrary equality-bearing value
+// type. Loads both keys from their byte pointers and compares them by the
+// language's equality for the type: string content (emitStringEq, §4.6),
+// structural record equality (emitStructEquality, §9.1/§9.2 — consistent with
+// the hash), or an integer/float compare for primitives/enums.
+llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
+    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty))
+        return buildRecordEqTrampoline(rec);
+    llvm::Type* lt = lowerTypeRef(ty);
+    auto* fty = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$valkey$eq", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* a = builder_.CreateLoad(lt, fn->getArg(0), "eq.a");
+    llvm::Value* b = builder_.CreateLoad(lt, fn->getArg(1), "eq.b");
+    using K = sema::TypeRef::Kind;
+    bool isString = ty->kind == K::Primitive &&
+                    ty->primitive == sema::PrimitiveType::String;
+    llvm::Value* eq;
+    if (isString)
+        eq = emitStringEq(a, b);                           // §4.6 content compare
+    else if (lt->isFloatingPointTy())
+        eq = builder_.CreateFCmpOEQ(a, b);                 // float/double compare
+    else
+        eq = builder_.CreateICmpEQ(a, b);                  // int/bool/char/enum
+    builder_.CreateRet(eq);
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
     return fn;

@@ -1551,6 +1551,32 @@ private:
     llvm::Function* buildRecordHashTrampoline(const sema::TypeSymbol* rec);
     llvm::Function* buildRecordEqTrampoline(const sema::TypeSymbol* rec);
 
+    // issues D3 / D8 / §4.8 / §4.10: a Dictionary<K,V> key (idx=0) or Set<T>
+    // element (idx=0) needs the generic-key runtime variant (bz_dict_*_gen)
+    // when K/T is NOT a string-key-fast-path type. For dictionaries the
+    // string key keeps the fast path; every other equality-bearing key
+    // (int/long/bool/char/enum/double/float, or a record) goes generic.
+    // For sets the array backing cannot dedup (§4.10), so ALL element types go
+    // generic — including string elements. `isSet` selects the set rule.
+    // Returns the resolved element/key TypeRef when generic backing applies
+    // (and sets *byteSize to the stored key/element byte count); null when the
+    // string-key fast path (dictionary) applies.
+    const sema::TypeRef* genericBackingType(const sema::TypeRef* collTy,
+                                            unsigned idx, bool isSet,
+                                            uint64_t* byteSize);
+
+    // issues D3 / D8 / §8.3: build C-ABI trampolines over an ARBITRARY
+    // equality-bearing value type's hash / equality for the generic dict/set
+    // runtime variant. Generalizes buildRecord*Trampoline from records to
+    // primitives, enums, and strings. `ty` is the key/element TypeRef; the
+    // runtime stores `byteSize` raw bytes per key (8 for a string pointer or a
+    // scalar widened to a slot, sizeof(record) for a record). The hash reuses
+    // emitValueHashCode (§8.3) and the equality reuses emitStringEq (strings,
+    // §4.6), emitStructEquality (records, §9.1/§9.2), or an integer/float
+    // compare (primitives/enums).
+    llvm::Function* buildValueHashTrampoline(const sema::TypeRef* ty);
+    llvm::Function* buildValueEqTrampoline(const sema::TypeRef* ty);
+
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
