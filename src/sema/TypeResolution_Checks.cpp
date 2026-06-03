@@ -1,6 +1,15 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include "sema/TypeResolution.hpp"
+
 namespace bezel::sema {
+
+// Free-function wrapper exposing the resolver's structural type equality
+// for reuse by other passes (§22.6 overload resolution). Single source of
+// truth: delegates to Resolver::typeRefEqual.
+bool typeRefEqual(const TypeRef* a, const TypeRef* b) {
+    return Resolver::typeRefEqual(a, b);
+}
 
 int Resolver::effVisRank(ast::Visibility v) {
     int r = visRank(v);
