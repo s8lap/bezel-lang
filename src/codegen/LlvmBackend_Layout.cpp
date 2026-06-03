@@ -1,3 +1,7 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+
 llvm::Type* Emitter::lowerPrimitive(sema::PrimitiveType p) {
     using P = sema::PrimitiveType;
     switch (p) {
@@ -666,3 +670,5 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
     return builder_.CreateStructGEP(st, obj, idxIt->second);
 }
 
+
+}  // namespace bezel::codegen

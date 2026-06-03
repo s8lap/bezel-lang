@@ -1,3 +1,7 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+
 llvm::Value* Emitter::loadCodePoint(llvm::Value* strPtr, llvm::Value* idx) {
     auto* i8Ty  = llvm::Type::getInt8Ty(llvm_);
     auto* i16Ty = llvm::Type::getInt16Ty(llvm_);
@@ -1836,3 +1840,5 @@ llvm::Value* Emitter::emitCheckedArith(llvm::Intrinsic::ID id, llvm::Value* l,
     return res;
 }
 
+
+}  // namespace bezel::codegen

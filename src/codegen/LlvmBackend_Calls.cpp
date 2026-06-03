@@ -1,3 +1,7 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+
 llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
                                int fd) {
     // Declare POSIX write(2): ssize_t write(int, const void*, size_t)
@@ -3560,3 +3564,5 @@ bool Emitter::isStringExprType(const ast::Expr& e) {
            rt->primitive == sema::PrimitiveType::String;
 }
 
+
+}  // namespace bezel::codegen

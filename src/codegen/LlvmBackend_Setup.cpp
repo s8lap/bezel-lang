@@ -1,3 +1,7 @@
+#include "codegen/LlvmBackend_impl.hpp"
+
+namespace bezel::codegen {
+
 std::string Emitter::functionName(sema::MethodSymbol* ms) {
     if (isMain(ms)) return "main";
     std::string cls = ms->parent ? std::string(ms->parent->name) : "";
@@ -1221,3 +1225,5 @@ bool Emitter::lowerBody(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     return false;
 }
 
+
+}  // namespace bezel::codegen
