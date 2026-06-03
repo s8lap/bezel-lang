@@ -331,6 +331,26 @@ BEZEL_TEST(codegen_collection_keys, for_in_dict_string_keys_value_spec_4_8) {
         "end Main; end C;"), 5);
 }
 
+// #366/#370 / §4.8 / §9.1: `for var k in <Dictionary<Point,int>>.Keys` binds
+// each RECORD key; the key's fields are usable in the body (`k.y`). Previously
+// `d.Keys` carried no sema element type, so the loop variable was untyped and
+// `k.y` was dropped (the result collapsed to 0); the explicit `for var k: Point`
+// was the workaround. Now `d.Keys` is typed as a collection-of-K, so the loop
+// variable infers Point and `k.y` resolves. Keys {(1,10),(2,20)} → 10 + 20 = 30.
+// (Load-bearing: drop the §4.8 Keys-element typing and `k.y` reads zero.)
+BEZEL_TEST(codegen_collection_keys, for_in_dict_record_keys_field_spec_4_8) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var d := new Dictionary<Point, int>(); "
+        "  d.Set(new Point(1, 10), 100); "
+        "  d.Set(new Point(2, 20), 200); "
+        "  var sum := 0; "
+        "  for var k in d.Keys do sum := sum + k.y; end; "
+        "  return sum; "                              // 10 + 20 = 30
+        "end Main; end C;"), 30);
+}
+
 // §4.10: iterating an EMPTY dict-backed Set runs zero times (no crash on the
 // empty generic table — the key snapshot is length 0).
 BEZEL_TEST(codegen_collection_keys, for_in_set_empty_no_iterations_spec_4_10) {

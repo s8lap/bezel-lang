@@ -547,6 +547,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                 ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         }
+                        // per §5 LINQ element access: First/Last/Single/ElementAt
+                        // each return the source element type T (stdlib §5,
+                        // `public method First(): T`). Typing the result lets an
+                        // inferred local (`var p := a.First(pred)`) and member
+                        // access on the call result (`a.First(pred).y`) resolve;
+                        // without it the result stays untyped and `.y` is dropped.
+                        else if (m == "First" || m == "Last" || m == "Single" ||
+                                 m == "ElementAt") {
+                            if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                                ctx_.setExprType(&ce, recvTy->genericArgs[0]);
+                        }
                         // per §3: Contains → bool, IndexOf → int
                         else if (m == "Contains")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
@@ -1231,6 +1242,35 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     }
     if (!targetType) {
+        // #370 / §4.8: `Dictionary<K,V>.Keys` is `ICollection<K>` and
+        // `.Values` is `ICollection<V>`. The Dictionary has no user
+        // TypeSymbol (its TypeRef carries no declaration), so the ordinary
+        // member-lookup path never types these properties. Type the access as
+        // a collection-of-K (resp. V) carried structurally — a Named TypeRef
+        // with the element type as genericArgs[0]. That lets a `for var k in
+        // d.Keys` loop infer the loop variable's type as K (so `k.field`
+        // resolves over a record key). Codegen recognizes the `d.Keys` AST
+        // shape directly (issue #370), so it does not depend on this type.
+        if (ma.target && (ma.member == "Keys" || ma.member == "Values")) {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isDict =
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty() &&
+                    (tt->astNode->name->parts[0] == "Dictionary" ||
+                     tt->astNode->name->parts[0] == "OwnedDictionary");
+                std::size_t gi = ma.member == "Keys" ? 0 : 1;
+                if (isDict && tt->genericArgs.size() > gi && tt->genericArgs[gi]) {
+                    auto* coll = ctx_.makeTypeRef();
+                    coll->kind = TypeRef::Kind::Named;
+                    coll->declaration = nullptr;
+                    coll->astNode = nullptr;
+                    coll->genericArgs.push_back(tt->genericArgs[gi]);
+                    ctx_.setExprType(&ma, coll);
+                    return;
+                }
+            }
+        }
         // CG27a (§4.6): handle known intrinsic string members directly —
         // string has no user TypeSymbol in the symbol table.
         if (ma.target) {
