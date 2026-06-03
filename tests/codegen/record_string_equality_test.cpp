@@ -1,0 +1,182 @@
+// Codegen — structural equality of record string fields compares by CONTENT
+// (§8.3, §9.1, §9.2), not by pointer identity.
+//
+// §8.3: "the record's value is determined by its fields"; the auto-generated
+// `=` / `<>` / `Equals` / `GetHashCode` are memberwise over those fields, and
+// strings carry value semantics (§4.6) — two strings are equal iff their code
+// points are equal, independent of which heap object holds them. A record with
+// equal string content therefore compares equal even when its string fields are
+// distinct allocations. This must agree with the synthesized GetHashCode, which
+// already hashes strings by content (§8.3 hash-equality invariant).
+//
+// To make the by-content (not by-pointer) distinction observable, the two
+// records under test are built from independently-materialized strings: each
+// string literal lowers to its own global, and one operand is additionally
+// produced by concatenation (`+`), a fresh heap allocation. A by-pointer
+// comparison would report these unequal; by-content reports them equal.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+}  // namespace
+
+// §8.3 / §9.1: positional record with a single string field — equal content
+// (one side built by concatenation so the pointers differ) compares EQUAL.
+BEZEL_TEST(codegen_record_str_eq, positional_string_equal_content_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Name(value: string); "
+        "class C public static method Main(): int "
+        "  var a := new Name(\"Ann\"); "
+        "  var b := new Name(\"An\" + \"n\"); "  // distinct heap string
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3: `<>` is the negation of `=` — equal string content → `<>` is false.
+BEZEL_TEST(codegen_record_str_eq, positional_string_neq_false_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Name(value: string); "
+        "class C public static method Main(): int "
+        "  var a := new Name(\"Ann\"); "
+        "  var b := new Name(\"An\" + \"n\"); "
+        "  return (1 if a <> b else 0); "
+        "end Main; end C;"), 0);
+}
+
+// §9.1: the synthesized `.Equals()` is the same structural comparison as `=`
+// (shared emitStructEquality) — equal string content → true.
+BEZEL_TEST(codegen_record_str_eq, positional_string_equals_method_spec_9_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Name(value: string); "
+        "class C public static method Main(): int "
+        "  var a := new Name(\"Ann\"); "
+        "  var b := new Name(\"An\" + \"n\"); "
+        "  return (1 if a.Equals(b) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3: different string content compares UNEQUAL (`=` false, `<>` true).
+BEZEL_TEST(codegen_record_str_eq, positional_string_different_content_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Name(value: string); "
+        "class C public static method Main(): int "
+        "  var a := new Name(\"Ann\"); "
+        "  var b := new Name(\"Bob\"); "
+        "  return (1 if (a = b) or (a <> b = false) else 0); "
+        "end Main; end C;"), 0);
+}
+
+// §8.3 / §9.1: a mixed string+int positional record — both fields must match.
+// Equal string content AND equal int → equal.
+BEZEL_TEST(codegen_record_str_eq, mixed_string_int_all_equal_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Person(name: string, age: int); "
+        "class C public static method Main(): int "
+        "  var a := new Person(\"Ann\", 30); "
+        "  var b := new Person(\"An\" + \"n\", 30); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3: mixed record — equal string content but differing int → UNEQUAL.
+BEZEL_TEST(codegen_record_str_eq, mixed_string_int_int_differs_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Person(name: string, age: int); "
+        "class C public static method Main(): int "
+        "  var a := new Person(\"Ann\", 30); "
+        "  var b := new Person(\"An\" + \"n\", 31); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 0);
+}
+
+// §8.3: mixed record — equal int but differing string content → UNEQUAL.
+BEZEL_TEST(codegen_record_str_eq, mixed_string_int_string_differs_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Person(name: string, age: int); "
+        "class C public static method Main(): int "
+        "  var a := new Person(\"Ann\", 30); "
+        "  var b := new Person(\"Bob\", 30); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 0);
+}
+
+// §8.3 hash-equality invariant: equal records hash equal. With string fields now
+// compared by content, `=` and GetHashCode (which already hashes strings by
+// content, §4.6) agree — equal content → equal hash AND equal records.
+BEZEL_TEST(codegen_record_str_eq, gethashcode_agrees_with_equality_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Person(name: string, age: int); "
+        "class C public static method Main(): int "
+        "  var a := new Person(\"Ann\", 30); "
+        "  var b := new Person(\"An\" + \"n\", 30); "
+        "  return (1 if a = b and a.GetHashCode() = b.GetHashCode() else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.2: a body record with a string auto-property — equal content compares EQUAL
+// (the synthesis iterates auto-properties through the same emitStructEquality).
+BEZEL_TEST(codegen_record_str_eq, body_record_string_auto_property_spec_9_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Greeting "
+        "  public property Text: string; "
+        "  public constructor(text: string) Text := text; end constructor; "
+        "end Greeting; "
+        "class C public static method Main(): int "
+        "  var a := new Greeting(\"hi\"); "
+        "  var b := new Greeting(\"h\" + \"i\"); "
+        "  return (1 if a.Equals(b) "
+        "             and a.GetHashCode() = b.GetHashCode() else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.2: a body record with a string auto-property — differing content is
+// UNEQUAL via the synthesized Equals.
+BEZEL_TEST(codegen_record_str_eq, body_record_string_differs_spec_9_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Greeting "
+        "  public property Text: string; "
+        "  public constructor(text: string) Text := text; end constructor; "
+        "end Greeting; "
+        "class C public static method Main(): int "
+        "  var a := new Greeting(\"hi\"); "
+        "  var b := new Greeting(\"bye\"); "
+        "  return (1 if a.Equals(b) else 0); "
+        "end Main; end C;"), 0);
+}
+
+// §9.1 (transitivity): a nested record whose inner record has a string field —
+// the recursion into emitStructEquality must also content-compare the inner
+// string. Equal nested string content → equal outer records.
+BEZEL_TEST(codegen_record_str_eq, nested_record_inner_string_equal_spec_9_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Label(text: string); "
+        "record Tagged(label: Label, id: int); "
+        "class C public static method Main(): int "
+        "  var a := new Tagged(new Label(\"ok\"), 1); "
+        "  var b := new Tagged(new Label(\"o\" + \"k\"), 1); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.1: nested record — differing inner string content is detected → UNEQUAL.
+BEZEL_TEST(codegen_record_str_eq, nested_record_inner_string_differs_spec_9_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Label(text: string); "
+        "record Tagged(label: Label, id: int); "
+        "class C public static method Main(): int "
+        "  var a := new Tagged(new Label(\"ok\"), 1); "
+        "  var b := new Tagged(new Label(\"no\"), 1); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 0);
+}
