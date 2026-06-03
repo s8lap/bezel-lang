@@ -852,9 +852,18 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 }
             }
             if (isCollectionTypeName(tt)) {
+                // issue #343 / §4.10: a record-element Set is dict-backed, so
+                // its Count comes from bz_dict_count, not the array length.
+                bool isSetName = tt->astNode && tt->astNode->name &&
+                                 !tt->astNode->name->parts.empty() &&
+                                 (tt->astNode->name->parts[0] == "Set" ||
+                                  tt->astNode->name->parts[0] == "OwnedSet");
+                bool dictBacked = isSetName && recordKeyType(tt, 0) != nullptr;
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {
-                    auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
+                    auto* fn = dictBacked
+                        ? declareC("bz_dict_count", i64(), {ptrTy()})
+                        : declareC("bz_array_len", i64(), {ptrTy()});
                     llvm::Value* len64 = builder_.CreateCall(fn, {obj});
                     return builder_.CreateTrunc(len64, i32(), "col.len");
                 }
@@ -1996,6 +2005,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     else elemSize = 8;  // ptr, i64, double, struct
                 }
             }
+            // issue #343 / §4.10: a Set<T> (or OwnedSet<T>) whose element is a
+            // record is backed by the generic-key hash table so equality and
+            // hashing follow T's synthesized contract (§8.3) — real set
+            // semantics (dedup by content). Other element types keep the array
+            // backing. Stored value is a non-null sentinel (membership only).
+            if ((colName == "Set" || colName == "OwnedSet")) {
+                if (const sema::TypeSymbol* elemRec = recordKeyType(rt, 0)) {
+                    llvm::StructType* kst = recordStruct(elemRec);
+                    uint64_t ksz = module_->getDataLayout().getTypeAllocSize(kst);
+                    llvm::Function* hashT = buildRecordHashTrampoline(elemRec);
+                    llvm::Function* eqT   = buildRecordEqTrampoline(elemRec);
+                    auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
+                                             {i64(), ptrTy(), ptrTy()});
+                    return builder_.CreateCall(allocFn,
+                        {builder_.getInt64((int64_t)ksz), hashT, eqT});
+                }
+            }
             if (colName == "Array" || colName == "OwnedArray" ||
                 colName == "Stack" || colName == "OwnedStack" ||
                 colName == "Queue" || colName == "OwnedQueue" ||
@@ -2006,6 +2032,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     {builder_.getInt64(elemSize), builder_.getInt64(16)});
             }
             if (colName == "Dictionary" || colName == "OwnedDictionary") {
+                // issue #343 / §4.8: a record key uses the generic-key runtime
+                // variant, parameterized by the key's synthesized hash/eq via
+                // trampolines (§8.3). String/primitive keys keep the string
+                // fast path (bz_dict_alloc + the string-key entry points).
+                if (const sema::TypeSymbol* keyRec = recordKeyType(rt, 0)) {
+                    llvm::StructType* kst = recordStruct(keyRec);
+                    uint64_t ksz = module_->getDataLayout().getTypeAllocSize(kst);
+                    llvm::Function* hashT = buildRecordHashTrampoline(keyRec);
+                    llvm::Function* eqT   = buildRecordEqTrampoline(keyRec);
+                    auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
+                                             {i64(), ptrTy(), ptrTy()});
+                    return builder_.CreateCall(allocFn,
+                        {builder_.getInt64((int64_t)ksz), hashT, eqT});
+                }
                 auto* allocFn = declareC("bz_dict_alloc", ptrTy(), {});
                 return builder_.CreateCall(allocFn, {});
             }
