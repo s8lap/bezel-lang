@@ -484,7 +484,46 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             st.state = OwnershipState::Poisoned;
             continue;
         }
-        // Other mismatches (Disposed/MovedFrom on one side) — poison.
+        // §28.6 SOUNDNESS (issue #338): the discharge obligation is
+        // PER-PATH. When one incoming edge still holds the obligation
+        // (Owned) while the other discharged it (Disposed via an explicit
+        // `.Dispose()`, or MovedFrom via a move / owned-transfer), the meet
+        // must NOT drop the obligation: on the still-Owned path the value
+        // reaches the merge undischarged, and "an owned local must reach an
+        // owned slot before it goes out of scope ... on a *normal-exit*
+        // path" (§28.3). Demoting this merge to Poisoned (which the rest of
+        // the checker reads as "no remaining obligation") was unsound — it
+        // accepted a program that disposes on only SOME branches, a real
+        // leak on the others. The fix RETAINS the Owned state (carrying the
+        // Owned side's obligation origin and implicit-discharge flag) so the
+        // value surfaces at the end-of-scope leak check on the path that
+        // never discharged it.
+        //
+        // This deliberately does NOT introduce a double-dispose error for
+        // the dispose-on-ALL-paths case: there both edges are Disposed,
+        // `st.state == o.state` short-circuits at the top of the loop and
+        // never reaches here. Exception edges are unaffected: the unwound
+        // owned local is *removed* from the incoming state before the meet
+        // (dischargeOnExceptionEdge), so it is never the Disposed/Owned
+        // operand of this rule. // per §28.3, §28.6
+        const bool ownedDischargedSplit =
+            (st.state == OwnershipState::Owned &&
+             (o.state == OwnershipState::Disposed ||
+              o.state == OwnershipState::MovedFrom)) ||
+            ((st.state == OwnershipState::Disposed ||
+              st.state == OwnershipState::MovedFrom) &&
+             o.state == OwnershipState::Owned);
+        if (ownedDischargedSplit) {
+            // Keep the Owned record so obligationOrigin / implicitDischarge
+            // are the ones that drive the end-of-scope diagnostic. If the
+            // Owned side is `other`, copy its record over `into`'s.
+            if (st.state != OwnershipState::Owned) st = o;
+            continue;
+        }
+        // Other mismatches (e.g. Uninitialized on one side at a non-loop
+        // merge) — poison. The Owned ⊓ Uninitialized non-loop case retains
+        // the existing O4 treatment (silent poison; a subsequent read
+        // diagnoses), which the O4 branch-join tests pin.
         st.state = OwnershipState::Poisoned;
     }
     // O3b union-key meet (loop back-edge / zero-trip-skip merges only):
