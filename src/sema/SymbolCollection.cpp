@@ -364,6 +364,31 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec) {
     return true;
 }
 
+// §9.2/§8.4: a record outside the auto-equality-bearing set may still carry
+// valid equality if the author hand-wrote it. Per §9.2 "Authors who want
+// explicit equality on a record outside the auto-equality-bearing set declare
+// `=` and `<>` overloads in the body, along with `Equals(Object?)`,
+// `Equals(T)`, and `GetHashCode` overrides as needed." Detect any such member:
+// an `operator =` / `operator <>` overload, or an `Equals` / `GetHashCode`
+// method. The presence of any one of these means `=`/`<>`/`.Equals`/
+// `.GetHashCode` dispatch to the user's code, so the §9.2 non-auto-equality
+// compile error must NOT fire.
+bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
+    if (!rec) return false;
+    for (const Symbol* m : rec->members) {
+        if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
+            if (meth->isOperator) {
+                if (meth->operatorToken == "=" || meth->operatorToken == "<>")
+                    return true;
+                continue;
+            }
+            if (meth->name == "Equals" || meth->name == "GetHashCode")
+                return true;
+        }
+    }
+    return false;
+}
+
 bool collectSymbols(const ast::SourceFile& src, SemaContext& ctx) {
     auto* mod = ctx.makeSymbol<ModuleSymbol>();
     mod->scope = kModuleScope;
