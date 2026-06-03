@@ -110,10 +110,9 @@ BEZEL_TEST(codegen_body_record, rectangle_example_eligible_spec_9_2) {
 // §9.2 / §8.5: a string auto-property hashes by content and formats unquoted
 // (its own ToString is identity, §9.6) — same behavior as a positional
 // record's string field, since the synthesis iterates auto-properties the same
-// way. (Structural string *Equals* is intentionally not asserted here: the
-// shared emitStructEquality compares record string fields by reference, a
-// pre-existing limitation that affects positional records identically and is
-// outside this body-record synthesis change.)
+// way. (Structural string *Equals* over body-record string auto-properties is
+// covered by record_string_equality_test.cpp, which exercises the §8.3 content
+// comparison emitStructEquality now performs for string fields.)
 BEZEL_TEST(codegen_body_record, string_auto_property_spec_9_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "

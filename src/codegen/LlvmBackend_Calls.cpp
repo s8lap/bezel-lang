@@ -2528,7 +2528,9 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
         if (!other->getType()->isStructTy()) return nullptr;
-        return emitStructEquality(recv, other, st);
+        // §9.1/§9.2: drive per-field comparison off the record's declared
+        // member types so string fields compare by content (per §8.3).
+        return emitStructEquality(recv, other, st, ts);
     }
     return nullptr;
 }

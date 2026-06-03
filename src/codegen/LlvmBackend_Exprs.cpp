@@ -1436,10 +1436,21 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                    : builder_.CreateAShr(l, r);
     }
     // CG29b (§8.3): records compare structurally — dispatch before the
-    // scalar integer path (ICmp doesn't accept struct operands).
+    // scalar integer path (ICmp doesn't accept struct operands). Recover the
+    // record's declared type from either operand so per-field comparison knows
+    // the Bezel field types (string fields compare by content — per §8.3).
     if ((op == "=" || op == "<>") && l->getType()->isStructTy()) {
+        const sema::TypeSymbol* recTy = nullptr;
+        for (const ast::Expr* side : {bin.left.get(), bin.right.get()}) {
+            if (!side) continue;
+            if (auto* t = ctx_.exprType(*side))
+                if (t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+                    t->declaration->kind == ast::TypeDeclKind::Record) {
+                    recTy = t->declaration; break;
+                }
+        }
         llvm::Value* eq = emitStructEquality(
-            l, r, llvm::cast<llvm::StructType>(l->getType()));
+            l, r, llvm::cast<llvm::StructType>(l->getType()), recTy);
         return op == "=" ? eq : builder_.CreateNot(eq);
     }
     // Guard against type mismatch when one operand is a null literal

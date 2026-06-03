@@ -547,22 +547,75 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
 }
 
 
+// §8.3 / §9.1: compare one field value of declared Bezel type `fieldTy`.
+// Strings compare by content (§4.6) — the same content equality the `=`
+// operator gives strings, and consistent with the content-based hashing in
+// emitValueHashCode; two records with equal string content are equal even when
+// the strings are distinct heap objects. Nested records recurse structurally
+// (§9.1 transitivity). Primitives and enums compare by value; class references
+// compare by identity (reference equality, §8.4). When `fieldTy` is null the
+// comparison falls back to the LLVM value shape (string ptr → content, struct →
+// recurse, float → FCmp, integer/ptr → ICmp).
+llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
+                                        const sema::TypeRef* fieldTy) {
+    using K = sema::TypeRef::Kind;
+    // String field: content equality (§4.6), not pointer identity. per §8.3
+    bool isString = fieldTy && fieldTy->kind == K::Primitive &&
+                    fieldTy->primitive == sema::PrimitiveType::String;
+    if (isString && l->getType()->isPointerTy() && r->getType()->isPointerTy())
+        return emitStringEq(l, r);
+    // Nested record (§9.1 transitivity): recurse with its own type so that
+    // record's string fields are likewise compared by content.
+    if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
+        fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
+        l->getType()->isStructTy()) {
+        if (auto* nested = llvm::dyn_cast<llvm::StructType>(l->getType()))
+            return emitStructEquality(l, r, nested, fieldTy->declaration);
+    }
+    // Fallback by LLVM shape (covers null fieldTy and primitives/enums/refs).
+    // Nested structs recurse; floats use FCmp; everything else (integers,
+    // and ptr fields when the declared type is unknown) compares by ICmp —
+    // identical to the pre-fix behavior. A string field is only reliably
+    // identified by its declared type, so when `fieldTy` is absent we do NOT
+    // assume ptr-means-string (that would wrongly content-compare class
+    // references). Both real call sites pass the record type, so this fallback
+    // is purely defensive.
+    if (auto* nested = llvm::dyn_cast<llvm::StructType>(l->getType()))
+        return emitStructEquality(l, r, nested);
+    if (l->getType()->isFloatingPointTy())
+        return builder_.CreateFCmpOEQ(l, r);
+    return builder_.CreateICmpEQ(l, r);
+}
+
 llvm::Value* Emitter::emitStructEquality(llvm::Value* l, llvm::Value* r,
-                                llvm::StructType* st) {
+                                llvm::StructType* st,
+                                const sema::TypeSymbol* rec) {
     llvm::Value* acc = builder_.getInt1(true);
+    // §9.1/§9.2: when the record type is known, drive comparison off each
+    // storage member's declared Bezel type (the same order recordStruct lays
+    // out, and the same collectRecordStorage / recordMemberType machinery the
+    // synthesized GetHashCode uses) so string fields compare by content.
+    if (rec) {
+        std::vector<const sema::Symbol*> storage;
+        collectRecordStorage(rec, storage);
+        unsigned i = 0;
+        for (const sema::Symbol* m : storage) {
+            if (i >= st->getNumElements()) break;
+            llvm::Value* li = builder_.CreateExtractValue(l, {i});
+            llvm::Value* ri = builder_.CreateExtractValue(r, {i});
+            acc = builder_.CreateAnd(
+                acc, emitValueEquality(li, ri, recordMemberType(m)));
+            ++i;
+        }
+        return acc;
+    }
+    // No record type available: compare by LLVM field shape (per-field
+    // emitValueEquality with a null declared type — recurses into nested
+    // structs, content-compares ptr fields). per §8.3
     for (unsigned i = 0; i < st->getNumElements(); ++i) {
         llvm::Value* li = builder_.CreateExtractValue(l, {i});
         llvm::Value* ri = builder_.CreateExtractValue(r, {i});
-        llvm::Type* ft = st->getElementType(i);
-        llvm::Value* fieldEq;
-        if (auto* nested = llvm::dyn_cast<llvm::StructType>(ft)) {
-            fieldEq = emitStructEquality(li, ri, nested);
-        } else if (ft->isFloatingPointTy()) {
-            fieldEq = builder_.CreateFCmpOEQ(li, ri);
-        } else {
-            fieldEq = builder_.CreateICmpEQ(li, ri);
-        }
-        acc = builder_.CreateAnd(acc, fieldEq);
+        acc = builder_.CreateAnd(acc, emitValueEquality(li, ri, nullptr));
     }
     return acc;
 }

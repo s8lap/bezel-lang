@@ -1338,8 +1338,20 @@ private:
     // A record lowers to a first-class LLVM struct — the only Bezel value
     // that does — so a struct-typed operand uniquely identifies the record
     // case. We AND per-field equality, recursing into nested record structs.
+    // When `rec` is supplied, per-field comparison is driven by each storage
+    // member's declared Bezel type (§9.1/§9.2) so string fields compare by
+    // content (consistent with GetHashCode) rather than by pointer; nested
+    // records recurse with their own type. `rec` may be null (e.g. a defensive
+    // fallback), in which case comparison falls back to the LLVM field shapes.
     llvm::Value* emitStructEquality(llvm::Value* l, llvm::Value* r,
-                                    llvm::StructType* st);
+                                    llvm::StructType* st,
+                                    const sema::TypeSymbol* rec = nullptr);
+    // §8.3 / §9.1: compare a single field/element value of static type
+    // `fieldTy`. Strings compare by content (§4.6), nested records recurse,
+    // primitives/enums/class references compare by value/identity. Used by
+    // emitStructEquality (consistent with emitValueHashCode).
+    llvm::Value* emitValueEquality(llvm::Value* l, llvm::Value* r,
+                                   const sema::TypeRef* fieldTy);
 
     llvm::Value* lowerBinary(const ast::BinaryExpr& bin);
 
