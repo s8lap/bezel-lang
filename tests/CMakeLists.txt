@@ -100,6 +100,7 @@ set(BEZEL_TEST_SOURCES
     sema/return_form_test.cpp
     sema/toplevel_visibility_test.cpp
     sema/record_restrictions_test.cpp
+    sema/record_equality_eligibility_test.cpp
     sema/builtin_types_test.cpp
     sema/builtin_exceptions_test.cpp
     sema/string_member_diagnostic_test.cpp

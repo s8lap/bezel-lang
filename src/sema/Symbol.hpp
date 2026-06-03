@@ -223,4 +223,14 @@ bool isAutoPropertySymbol(const Symbol* m);
 // positional synthesis instead) and for non-record types.
 bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec);
 
+// §9.2/§8.4: does this type declare its own equality member, i.e. an
+// `operator =` / `operator <>` overload, or an `Equals` / `GetHashCode`
+// method? Per §9.2 "Authors who want explicit equality on a record outside
+// the auto-equality-bearing set declare `=` and `<>` overloads … along with
+// `Equals(Object?)`, `Equals(T)`, and `GetHashCode` overrides." Such a record
+// is *not* auto-equality-bearing, yet `=`/`<>`/`.Equals`/`.GetHashCode` are
+// valid on it (they dispatch to the user's member), so it must be excluded
+// from the §9.2 non-auto-equality compile error. Returns false for null.
+bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
+
 } // namespace bezel::sema
