@@ -287,22 +287,62 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
     checkRead(e, /*selfTarget=*/false);
 }
 
+// O3b: true if `sym` is an owned-relevant local — a plain `var` (not a
+// parameter) whose declared type is a non-nullable class or interface
+// (the disposable kinds §28.3 tracks). Used to gate the Uninitialized-
+// read diagnostic so it does not fire on value-typed locals (int, etc.),
+// whose definite-assignment is sema's concern, not ownership's.
+static bool isOwnedRelevantLocal(sema::Symbol* sym) {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || !ls->declType) return false;
+    const sema::TypeRef* rt = ls->declType;
+    if (rt->nullable) return false;
+    if (rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (!rt->declaration) return false;
+    return rt->declaration->kind == ast::TypeDeclKind::Class ||
+           rt->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
 void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         if (selfTarget) return;  // tolerated for discharge target
-        auto* st = lookupState(id->name);
+        // Find the tracked local by name so we can also inspect its
+        // declared type for the Uninitialized-read gate below.
+        sema::Symbol* sym = nullptr;
+        LocalOwnership* st = nullptr;
+        for (auto& [s, lo] : states_) {
+            if (s->name == id->name) { sym = s; st = &lo; break; }
+        }
         if (!st) return;
         if (st->state == OwnershipState::MovedFrom) {
-            ctx_.diagnostics().report(
+            report(
                 Severity::Error, id->span.begin,
                 std::string("owned value in `") + std::string(id->name) +
                 "` was already moved out at this point (§28.3)");
             st->state = OwnershipState::Poisoned;
         } else if (st->state == OwnershipState::Disposed) {
-            ctx_.diagnostics().report(
+            report(
                 Severity::Error, id->span.begin,
                 std::string("read of disposed local `") +
                 std::string(id->name) + "` (§28.3)");
+            st->state = OwnershipState::Poisoned;
+        } else if (st->state == OwnershipState::Uninitialized &&
+                   isOwnedRelevantLocal(sym)) {
+            // §28.3: a local declared without an initializer is
+            // uninitialized and may not be read until assigned. Under O3b
+            // this state reaches a read site when a loop body assigns the
+            // local but the loop's zero-trip path does not, e.g.
+            // `var x: Stream; while c do x := new Stream(); end;
+            // x.Dispose();` — on the path where the body never ran, x is
+            // still uninitialized at the read. (The gate to owned-relevant
+            // locals keeps value-typed definite-assignment, which is
+            // sema's concern, out of the ownership pass.)
+            report(
+                Severity::Error, id->span.begin,
+                std::string("local `") + std::string(id->name) +
+                "` may be read while uninitialized here: it is assigned "
+                "only on a loop path that may not execute (§28.3 — an "
+                "uninitialized local may not be read until assigned)");
             st->state = OwnershipState::Poisoned;
         }
         return;
@@ -361,7 +401,7 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
     for (const auto& [sym, st] : states_) {
         if (sym->name != root->name) continue;
         if (!st.implicitDischarge) continue;  // only `using var`
-        ctx_.diagnostics().report(
+        report(
             Severity::Error, root->span.begin,
             std::string("borrow returned from `") +
             std::string(root->name) +
@@ -391,7 +431,7 @@ const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
 void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>& into,
               const std::unordered_map<sema::Symbol*,
                                        LocalOwnership>& other,
-              SourceLocation joinLoc, bool emitClash) {
+              SourceLocation joinLoc, bool emitClash, bool unionKeys) {
     for (auto& [sym, st] : into) {
         auto it = other.find(sym);
         if (it == other.end()) continue;
@@ -403,6 +443,25 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             continue;
         }
         if (o.state == OwnershipState::PolyNull) continue;
+        // §28.3: "a local declared `var x: T;` without an initializer is
+        // uninitialized and may not be read until assigned." At a loop-
+        // carried merge (`unionKeys`), when one incoming path leaves the
+        // local uninitialized — most notably the zero-trip path of a loop
+        // whose body assigns it — the merged state stays Uninitialized: a
+        // subsequent read is then a §28.3 violation (the O3b zero-trip-leak
+        // signal, see runDataflow), and the obligation the assigned path
+        // carried is not silently honoured for the never-assigned path.
+        //
+        // This is intentionally scoped to loop merges. The if/elif/else
+        // merge keeps O4's existing treatment (Owned ⊓ Uninitialized →
+        // Poisoned, silent — a subsequent read diagnoses), which the O4
+        // branch-join tests pin (own_join.no_else_with_owned_in_then_is_
+        // clash). O3b changes loop behavior only.
+        if (unionKeys && (st.state == OwnershipState::Uninitialized ||
+                          o.state == OwnershipState::Uninitialized)) {
+            st.state = OwnershipState::Uninitialized;
+            continue;
+        }
         // Owned vs Borrowed is the spec-rejected case.
         const bool ownedBorrowedClash =
             (st.state == OwnershipState::Owned &&
@@ -414,7 +473,7 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             // see the declaration in Ownership_impl.hpp. The old walker
             // never met at exit; emitting there would add a diagnostic.
             if (emitClash) {
-                ctx_.diagnostics().report(
+                report(
                     Severity::Error, joinLoc,
                     std::string("branch ownership conflict for `") +
                     std::string(sym->name) +
@@ -427,6 +486,18 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
         }
         // Other mismatches (Disposed/MovedFrom on one side) — poison.
         st.state = OwnershipState::Poisoned;
+    }
+    // O3b union-key meet (loop back-edge / zero-trip-skip merges only):
+    // a local present on only one incoming path is carried into the
+    // result verbatim. For a loop-body-scoped owned local that reaches
+    // the loop's after-block on the body-exit path but does not exist on
+    // the zero-trip skip path, this preserves the §28.3 discharge
+    // obligation so the end-of-method leak check still fires. Carrying
+    // in Disposed/Borrowed/MovedFrom states is harmless (no obligation).
+    if (unionKeys) {
+        for (const auto& [sym, o] : other) {
+            if (into.find(sym) == into.end()) into[sym] = o;
+        }
     }
 }
 
@@ -452,7 +523,7 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
     auto* st = lookupState(name);
     if (!st) return;
     if (st->state == OwnershipState::Disposed) {
-        ctx_.diagnostics().report(
+        report(
             Severity::Error, loc,
             std::string("local `") + std::string(name) +
             "` was already disposed (§28.3 — `.Dispose()` is "
@@ -462,7 +533,7 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
         return;
     }
     if (st->state == OwnershipState::MovedFrom) {
-        ctx_.diagnostics().report(
+        report(
             Severity::Error, loc,
             std::string("cannot dispose `") + std::string(name) +
             "`: it was already moved out (§28.3)");
@@ -476,7 +547,7 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
     auto* st = lookupState(name);
     if (!st) return;
     if (st->state == OwnershipState::MovedFrom) {
-        ctx_.diagnostics().report(
+        report(
             Severity::Error, loc,
             std::string("owned value in `") + std::string(name) +
             "` was already moved out at this point (§28.3)");
@@ -484,7 +555,7 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         return;
     }
     if (st->state == OwnershipState::Disposed) {
-        ctx_.diagnostics().report(
+        report(
             Severity::Error, loc,
             std::string("cannot move from disposed local `") +
             std::string(name) + "` (§28.3)");
@@ -492,7 +563,7 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         return;
     }
     if (st->implicitDischarge) {
-        ctx_.diagnostics().report(
+        report(
             Severity::Error, loc,
             std::string("cannot move out of `using var` `") +
             std::string(name) +
