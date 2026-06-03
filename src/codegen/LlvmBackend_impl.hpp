@@ -745,11 +745,32 @@ private:
 
     // CG29 (§9.4): the LLVM struct backing a record value. Unlike a class,
     // a record has no vtable header — its data fields start at index 0. The
-    // fields are the record's non-static FieldSymbols in declaration order
-    // (positional fields plus any body fields). `fieldIndex_` is populated so
-    // field access reuses the same GEP path as classes. Records do not
-    // inherit (§9.6), so there is no prefix-layout walk.
+    // fields are the record's storage members in declaration order: positional
+    // fields and explicit body fields (FieldSymbol), plus body auto-properties
+    // (PropertySymbol, §9.2 — backed by compiler-generated storage like a
+    // field). `fieldIndex_` is populated so field access reuses the same GEP
+    // path as classes. Records do not inherit (§9.6), so there is no
+    // prefix-layout walk.
     llvm::StructType* recordStruct(const sema::TypeSymbol* t);
+
+    // §9.1 / §9.2: a record's instance storage members in declaration order —
+    // non-static FieldSymbols (positional + explicit body fields) and
+    // auto-property PropertySymbols (body-record storage). The same ordering
+    // recordStruct lays out, and the order the value-semantics synthesis
+    // (Equals / GetHashCode / ToString) iterates.
+    void collectRecordStorage(const sema::TypeSymbol* t,
+                              std::vector<const sema::Symbol*>& out) {
+        for (const sema::Symbol* m : t->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (fs && !isStaticField(fs)) { out.push_back(m); continue; }
+            if (sema::isAutoPropertySymbol(m)) out.push_back(m);
+        }
+    }
+
+    // §9.1 / §9.2: the resolved declared type of a record storage member —
+    // a positional Param, a body FieldDecl, or an auto-property PropertyDecl.
+    // Null if it cannot be determined.
+    const sema::TypeRef* recordMemberType(const sema::Symbol* m);
 
     // §33: the entry-point method's LLVM function is named `main`; every
     // other static method gets a mangled, collision-free name.

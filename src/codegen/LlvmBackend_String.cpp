@@ -1857,6 +1857,17 @@ const sema::TypeRef* Emitter::recordFieldType(const sema::FieldSymbol* fs) {
     return nullptr;
 }
 
+const sema::TypeRef* Emitter::recordMemberType(const sema::Symbol* m) {
+    // §9.1: FieldSymbol storage (positional Param or body FieldDecl).
+    if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
+        return recordFieldType(fs);
+    // §9.2: body auto-property storage — type on the PropertyDecl.
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+        if (pd->type)
+            return ctx_.resolvedType(*pd->type);
+    return nullptr;
+}
+
 // Format a single field/element value of static type `fieldTy` as a string,
 // recursing for nested records (§9.1) and using each type's own ToString.
 llvm::Value* Emitter::emitValueToString(llvm::Value* val,
@@ -1914,29 +1925,31 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
     return lowerStringLiteral("\"\"", false);
 }
 
-// §9.1: build `"TypeName(Field1: value1, Field2: value2)"` from the record's
-// non-static fields in declaration order (the same order emitStructEquality
-// and recordStruct iterate). A zero-field record yields `"TypeName()"`
-// (§9.2 — the natural specialization of the property-listing format).
+// §8.5 / §9.1 / §9.2: build `"TypeName(Prop1: value1, Prop2: value2)"` from the
+// record's storage members in declaration order — positional/body fields for a
+// positional record (§9.1), the auto-properties for an eligible body record
+// (§9.2) — the same order emitStructEquality and recordStruct iterate. A
+// zero-storage record yields `"TypeName()"` (§9.2 — the natural specialization
+// of the property-listing format).
 llvm::Value* Emitter::emitRecordToString(llvm::Value* recVal,
                                          const sema::TypeSymbol* rec) {
     llvm::Value* acc = lowerStringLiteral(
         std::string("\"") + std::string(rec->name) + "(\"", false);
+    std::vector<const sema::Symbol*> storage;
+    collectRecordStorage(rec, storage);
     unsigned idx = 0;       // struct element index
     bool first = true;
-    for (const sema::Symbol* m : rec->members) {
-        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-        if (!fs || isStaticField(fs)) continue;
+    for (const sema::Symbol* m : storage) {
         if (!first)
             acc = emitStringConcat(acc, lowerStringLiteral("\", \"", false));
         first = false;
-        // `FieldName: ` prefix — the field's declared name verbatim (§9.1:
+        // `PropName: ` prefix — the member's declared name verbatim (§9.1:
         // "the compiler does not transform them").
         acc = emitStringConcat(acc, lowerStringLiteral(
-            std::string("\"") + std::string(fs->name) + ": \"", false));
+            std::string("\"") + std::string(m->name) + ": \"", false));
         llvm::Value* fieldVal = builder_.CreateExtractValue(recVal, {idx});
         acc = emitStringConcat(acc,
-                               emitValueToString(fieldVal, recordFieldType(fs)));
+                               emitValueToString(fieldVal, recordMemberType(m)));
         ++idx;
     }
     acc = emitStringConcat(acc, lowerStringLiteral("\")\"", false));
@@ -2002,29 +2015,28 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
     return builder_.getInt32(0);
 }
 
-// §8.3 / §9.1: combine per-field hashes in declaration order with
-// h = h*31 + fieldHash. Order-dependent (so Pair(1,2) and Pair(2,1) differ)
-// and consistent with the structural equality of emitStructEquality: equal
-// records (same field values) compute the same fold. A zero-field record
-// returns a fixed constant (§9.2).
+// §8.3 / §9.1 / §9.2: combine per-storage-member hashes in declaration order
+// with h = h*31 + memberHash, over the positional/body fields (§9.1) or the
+// auto-properties of an eligible body record (§9.2). Order-dependent (so
+// Pair(1,2) and Pair(2,1) differ) and consistent with the structural equality
+// of emitStructEquality: equal records (same storage values) compute the same
+// fold. A zero-storage record returns a fixed constant (§9.2).
 llvm::Value* Emitter::emitRecordHashCode(llvm::Value* recVal,
                                          const sema::TypeSymbol* rec) {
     auto* hashSlot = entryAlloca(i32());
     builder_.CreateStore(builder_.getInt32(17), hashSlot);   // non-zero seed
+    std::vector<const sema::Symbol*> storage;
+    collectRecordStorage(rec, storage);
     unsigned idx = 0;
-    bool any = false;
-    for (const sema::Symbol* m : rec->members) {
-        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-        if (!fs || isStaticField(fs)) continue;
-        any = true;
+    for (const sema::Symbol* m : storage) {
         llvm::Value* fieldVal = builder_.CreateExtractValue(recVal, {idx});
-        llvm::Value* fh = emitValueHashCode(fieldVal, recordFieldType(fs));
+        llvm::Value* fh = emitValueHashCode(fieldVal, recordMemberType(m));
         llvm::Value* h = builder_.CreateLoad(i32(), hashSlot);
         h = builder_.CreateAdd(builder_.CreateMul(h, builder_.getInt32(31)), fh);
         builder_.CreateStore(h, hashSlot);
         ++idx;
     }
-    (void)any;  // §9.2: zero-field record keeps the fixed seed constant.
+    // §9.2: zero-storage record keeps the fixed seed constant.
     return builder_.CreateLoad(i32(), hashSlot);
 }
 

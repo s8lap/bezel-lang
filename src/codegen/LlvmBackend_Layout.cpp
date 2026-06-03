@@ -327,11 +327,13 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
     structs_[t] = st;  // before filling, to support self-reference
     std::vector<llvm::Type*> fieldTys;
     unsigned idx = 0;
-    for (const sema::Symbol* m : t->members) {
-        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-        if (!fs || isStaticField(fs)) continue;
-        fieldTys.push_back(storageType(fs));
-        fieldIndex_[fs] = idx++;
+    // §9.1 / §9.2: storage = non-static FieldSymbols (positional + body
+    // fields) and body auto-properties (PropertySymbol), in declaration order.
+    std::vector<const sema::Symbol*> storage;
+    collectRecordStorage(t, storage);
+    for (const sema::Symbol* m : storage) {
+        fieldTys.push_back(storageType(m));
+        fieldIndex_[m] = idx++;
     }
     st->setBody(fieldTys);
     return st;
