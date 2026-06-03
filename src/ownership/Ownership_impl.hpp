@@ -75,6 +75,20 @@ private:
     std::unordered_map<std::string_view, bool> fieldMovedFrom_;
     std::unordered_map<std::string_view, SourceLocation> fieldMoveLoc_;
 
+    // Slice O3b: the loop fixpoint re-processes loop bodies until the
+    // per-block states stabilize. The transfer functions emit diagnostics
+    // as a side effect; running them while iterating to the fixpoint would
+    // emit each diagnostic once per pass. So the fixpoint iterations run
+    // with diagnostics suppressed, and a single final pass
+    // (suppressDiag_ == false) over the stabilized entry states emits each
+    // diagnostic exactly once. Every transfer-function report routes
+    // through `report()` so the flag is honoured in one place.
+    bool suppressDiag_ = false;
+    void report(Severity sev, SourceLocation loc, std::string msg) {
+        if (suppressDiag_) return;
+        ctx_.diagnostics().report(sev, loc, std::move(msg));
+    }
+
     void visitStmt(const ast::Stmt& s);
 
     // Categorize the initializer expression to determine the local's
@@ -147,16 +161,30 @@ private:
     // the function exit used only to derive the end-of-method
     // undischarged-owned state (the old walker never met at exit, so
     // emitting there would introduce a new diagnostic — O3a forbids that).
+    //
+    // Slice O3b: `unionKeys` controls the domain. When false (the if/elif/
+    // else merge), only locals present in `into` are met — a local declared
+    // inside one branch is out of scope after the merge and is dropped.
+    // When true (the loop back-edge and zero-trip skip merges), locals
+    // present in only one operand are carried into the result, preserving a
+    // §28.3 discharge obligation that exists on one incoming path but not
+    // the other (the zero-trip leak case). The carried-in state is the
+    // operand's state met against "absent" — Owned/Uninitialized survive so
+    // the end-of-method / read checks still see the hazard.
     void joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>& into,
                   const std::unordered_map<sema::Symbol*,
                                            LocalOwnership>& other,
-                  SourceLocation joinLoc, bool emitClash = true);
+                  SourceLocation joinLoc, bool emitClash = true,
+                  bool unionKeys = false);
 
-    // Slice O3a CFG driver: run the forward dataflow over `cfg`, seeding
-    // the entry block with `entry`. Returns the meet of all states
-    // reaching the CFG exit (used as the end-of-method state for the
-    // undischarged-owned check). Diagnostics for reads/moves/disposals
-    // and branch-join clashes are emitted during the walk.
+    // Slice O3a/O3b CFG driver: run the forward dataflow over `cfg`,
+    // seeding the entry block with `entry`. Loops are iterated to a
+    // fixpoint (O3b): the back-edge and the zero-trip header→after skip
+    // edge participate in the meet, so the analysis is sound for the
+    // never-executed loop path (§28). Returns the meet of all states
+    // reaching the CFG exit (used as the end-of-method undischarged-owned
+    // check). Diagnostics for reads/moves/disposals and branch-join
+    // clashes are emitted on the single final (non-suppressed) pass.
     BlockState runDataflow(const flow::CFG& cfg, const BlockState& entry);
 
     // Process one CFG block's straight-line statements, mutating
