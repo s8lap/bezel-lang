@@ -289,6 +289,81 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
 
 } // namespace
 
+// §9.2 / §22.9: see Symbol.hpp. An auto-property is a non-static, non-indexer
+// property declared in the auto form (`Name: T;` — no expression body, no
+// accessor block). Mirrors codegen's isAutoProperty so both layers classify
+// storage identically.
+bool isAutoPropertySymbol(const Symbol* m) {
+    auto* ps = dynamic_cast<const PropertySymbol*>(m);
+    if (!ps || ps->isIndexer) return false;
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd || pd->isIndexer || pd->bodyKind != ast::PropertyBodyKind::Auto)
+        return false;
+    for (auto mod : ps->modifiers)
+        if (mod == "static") return false;
+    return true;
+}
+
+// §9.2: auto-equality eligibility for a body record. The spec's membership
+// rule ("A body-only record receives auto-generated `=`, `<>`, `GetHashCode`,
+// and `ToString` over its auto-properties … when every member of the record
+// is one of: an auto-property; a method or expression-bodied property; an
+// overload of a non-equality operator; a constructor") is checked
+// structurally. The disqualifying members the spec names that are statically
+// decidable here are: an explicit field declaration (storage that is not an
+// auto-property), and a manually-declared equality member (per §8.5 the auto
+// package is suppressed when `Equals`/`GetHashCode`/`ToString` is hand-written,
+// and per the §9.2 "Authors who want explicit equality … declare `=` and `<>`"
+// clause a user `=`/`<>` overload opts out).
+//
+// The §9.2 "side-effecting computed property" and "non-trivial constructor
+// body" disqualifiers are not statically decided at this stage; computed
+// (expression-bodied / block) properties and constructors are treated as
+// non-disqualifying (the spec's stated default for the trivial forms). See the
+// PR note for that scoping.
+bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec) {
+    if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
+    // §9.3: a record with positional fields is positional / combined form; it
+    // gets the §9.1 positional synthesis, not this body-record path.
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl))
+        if (td->hasPositionalFields) return false;
+
+    for (const Symbol* m : rec->members) {
+        // An auto-property is the participating storage — always eligible.
+        if (isAutoPropertySymbol(m)) continue;
+        // A non-auto property (expression-bodied or block-form) is a computed
+        // member: it does not contribute storage and does not disqualify.
+        if (dynamic_cast<const PropertySymbol*>(m)) continue;
+        // An explicit field declaration is storage that is not an
+        // auto-property → disqualifies (§9.2).
+        if (dynamic_cast<const FieldSymbol*>(m)) return false;
+        if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
+            // A manually-declared equality member suppresses the auto package
+            // (§8.5 / §9.2): Equals / GetHashCode / ToString, or an `=`/`<>`
+            // operator overload.
+            if (meth->isOperator) {
+                if (meth->operatorToken == "=" || meth->operatorToken == "<>")
+                    return false;
+                continue;  // any other operator overload is fine (§9.2)
+            }
+            if (meth->name == "Equals" || meth->name == "GetHashCode" ||
+                meth->name == "ToString")
+                return false;
+            continue;  // ordinary methods do not disqualify (§9.2)
+        }
+        // Constructors do not disqualify (§9.2).
+        if (dynamic_cast<const ConstructorSymbol*>(m)) continue;
+        // Const members and nested types carry no instance storage and do not
+        // participate in equality; they are benign.
+        if (dynamic_cast<const ConstMemberSymbol*>(m)) continue;
+        if (dynamic_cast<const NestedTypeSymbol*>(m)) continue;
+        // Anything else (e.g. an event, a destructor — neither is valid on a
+        // record per §9.7) is conservatively treated as disqualifying.
+        return false;
+    }
+    return true;
+}
+
 bool collectSymbols(const ast::SourceFile& src, SemaContext& ctx) {
     auto* mod = ctx.makeSymbol<ModuleSymbol>();
     mod->scope = kModuleScope;

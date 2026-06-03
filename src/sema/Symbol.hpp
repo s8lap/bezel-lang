@@ -197,4 +197,24 @@ struct ExternDeclSymbol : Symbol {
     const ast::ExternDecl* externDecl = nullptr;
 };
 
+// §9.2 / §22.9: a member is an *auto-property* (`Name: T;`, optionally with an
+// initializer, no accessor bodies / arrow getter) — backed by compiler-
+// generated storage, exactly like a field. Indexers and static properties are
+// excluded. Shared by sema and codegen so both agree on what counts as
+// auto-property storage.
+bool isAutoPropertySymbol(const Symbol* m);
+
+// §9.2 auto-equality eligibility for a *body record* (a record with no
+// positional fields). Returns true iff the record is "auto-equality-bearing":
+// every member is an auto-property, a method, an expression-bodied or
+// block-form (computed) property, a constructor, or a non-equality operator
+// overload — and the record declares no explicit field storage, no `Equals`/
+// `GetHashCode`/`ToString` method, and no `=`/`<>` operator overload. An
+// eligible body record receives the §9.2/§8.5 auto-equality package
+// (`Equals`, `GetHashCode`, `ToString`) over its auto-properties.
+//
+// Returns false for positional / combined-form records (they get the §9.1
+// positional synthesis instead) and for non-record types.
+bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec);
+
 } // namespace bezel::sema

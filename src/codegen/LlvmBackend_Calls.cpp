@@ -2492,16 +2492,37 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         return nullptr;
     }
 
+    // §9.1 / §9.2: a positional / combined-form record always carries the
+    // synthesized value-semantics members (the §9.1 package). A *body* record
+    // carries them only when it is auto-equality-bearing (§9.2); an ineligible
+    // body record gets the type-name default for ToString (§8.5) and no auto
+    // equality.
+    bool positional = false;
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+        positional = td->hasPositionalFields;
+    bool autoBearing =
+        positional || sema::isAutoEqualityBearingBodyRecord(ts);
+
+    if (isToString && !autoBearing)
+        // §8.5: an ineligible body record's ToString is the type-name default.
+        return lowerStringLiteral(
+            std::string("\"") + std::string(ts->name) + "\"", false);
+    if ((isGetHashCode || isEquals) && !autoBearing)
+        // §9.2: an ineligible body record has no auto equality. Do not
+        // synthesize; fall through to ordinary dispatch (which finds the
+        // user's own override if one exists).
+        return nullptr;
+
     // Record: obtain the struct value (a `this` pointer or spill loads it).
     llvm::StructType* st = recordStruct(ts);
     if (recv->getType()->isPointerTy())
         recv = builder_.CreateLoad(st, recv);
     if (!recv->getType()->isStructTy()) return nullptr;
 
-    if (isToString)    return emitRecordToString(recv, ts);   // §9.1
-    if (isGetHashCode) return emitRecordHashCode(recv, ts);   // §8.3 / §9.1
+    if (isToString)    return emitRecordToString(recv, ts);   // §8.5 / §9.1 / §9.2
+    if (isGetHashCode) return emitRecordHashCode(recv, ts);   // §8.3 / §9.1 / §9.2
     if (isEquals && call.args[0].value) {
-        // §9.1: structural equality, same as the `=` operator (§8.3).
+        // §9.1 / §9.2: structural equality, same as the `=` operator (§8.3).
         llvm::Value* other = lowerExpr(*call.args[0].value);
         if (!other) return nullptr;
         if (other->getType()->isPointerTy())
