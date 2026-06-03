@@ -193,6 +193,30 @@ private:
 
     void checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms);
 
+    // §22.5 argument-to-parameter binding. Maps a call's argument list
+    // (positional, then named) onto a parameter list:
+    //   - positional arguments fill parameters in order;
+    //   - a named argument `name := expr` fills the parameter named `name`;
+    //   - "named arguments may appear in any order after positional
+    //     arguments" — a positional argument that follows a named one is an
+    //     error;
+    //   - an unknown parameter name, a parameter bound twice (positionally
+    //     then by name, or by two named args), and a required (non-default)
+    //     parameter left unfilled are each errors.
+    // When `emit` is true the diagnostics above are reported (with `loc` /
+    // `calleeDesc`); when false the routine is silent (used to test a
+    // candidate's applicability during §22.6 overload resolution).
+    struct BindResult {
+        bool ok = false;            // binding succeeded with no violations
+        // paramToArg[p] = index into `args` filling parameter p, or -1 when
+        // the parameter takes its default (valid only when `ok`).
+        std::vector<int> paramToArg;
+    };
+    BindResult bindArgsToParams(const std::vector<ast::Param>& params,
+                               const std::vector<ast::CallArgument>& args,
+                               SourceLocation loc,
+                               const std::string& calleeDesc, bool emit);
+
     // §5.1: is a value of static type `from` implicitly convertible to
     // `to`? Identity is NOT counted here (that is the "exact" relation,
     // tested with typeRefEqual); this returns true only for a non-trivial

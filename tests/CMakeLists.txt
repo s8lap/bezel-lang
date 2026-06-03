@@ -112,6 +112,7 @@ set(BEZEL_TEST_SOURCES
     sema/accessor_visibility_test.cpp
     sema/call_arity_test.cpp
     sema/call_arg_types_test.cpp
+    sema/named_arguments_test.cpp
     sema/overload_resolution_test.cpp
     sema/field_init_restrictions_test.cpp
     sema/const_type_test.cpp
