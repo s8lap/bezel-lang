@@ -621,7 +621,12 @@ void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
     bool terminated = false;
     if (const ast::DestructorDecl* dd = findDestructor(ts)) {
+        // #383 / §28.8.1: suppress dynamic disposal of `using var u := move
+        // this._f;` inside the destructor — the auto field-dispose below would
+        // dispose the same (moved-from) field, double-freeing it.
+        emittingDisposerBody_ = true;
         terminated = lowerScopedBlock(dd->body);
+        emittingDisposerBody_ = false;
     }
     // §28.4: after the destructor body, dispose owned fields (reverse
     // declaration order), then chain to the base class's Dispose.
@@ -717,8 +722,10 @@ llvm::BasicBlock* Emitter::unwindBB() {
 
 
 void Emitter::emitUnwindDisposals() {
+    // #383: the unwind path — a `caughtException` entry is skipped (the
+    // exception stays in flight; the enclosing handler frees it).
     for (std::size_t i = disposeStack_.size(); i-- > unwindScopeDepth_;)
-        emitDisposals(disposeStack_[i]);
+        emitDisposals(disposeStack_[i], /*isUnwind=*/true);
 }
 
 
@@ -1293,9 +1300,95 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     }
 
     const sema::TypeSymbol* cls = classOfLocal(ld);
-    if (!cls) return;
-    if (disposerFns_.find(cls) == disposerFns_.end()) return;
-    disposeStack_.back().push_back({it->second, cls});
+    if (cls && disposerFns_.find(cls) != disposerFns_.end()) {
+        disposeStack_.back().push_back({it->second, cls});
+        return;
+    }
+    // #383 / §28.8.1: `using var u := move x.f;` — the using var now owns the
+    // moved-out class object and discharges it at scope end (dynamically; the
+    // concrete class is the field's runtime type). Skipped inside a destructor
+    // body to avoid double-freeing the same field (see emittingDisposerBody_).
+    if (usingVarIsMovedClassObject(ld)) {
+        Disposal d{it->second, nullptr};
+        d.dynamicDispose = true;
+        disposeStack_.back().push_back(d);
+        return;
+    }
+    // #383 / §28: a `using var` owning a class/interface object whose concrete
+    // class classOfLocal does not capture — an interface-typed slot, or a call
+    // returning `owned T` (NOT a borrow return, per §28.10). Dispose via the
+    // object's own vtable.
+    if (usingVarOwnsClassObjectDynamically(ld)) {
+        Disposal d{it->second, nullptr};
+        d.dynamicDispose = true;
+        disposeStack_.back().push_back(d);
+        return;
+    }
+}
+
+
+// #383 / §28: a reference TypeRef carrying a vtable — a user class or
+// interface (Named, with a class/interface declaration). Such objects are
+// disposed dynamically through their own vtable slot 1.
+static bool isClassOrInterfaceRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    return rt->declaration->kind == ast::TypeDeclKind::Class ||
+           rt->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
+
+bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
+    // (a) Interface-typed slot. classOfLocal returns the interface symbol but
+    // an interface has no disposerFns_ entry; the concrete object behind it
+    // still has a vtable, so dispose it dynamically. An interface-typed slot
+    // initialized by `new`/factory always holds an owned class instance here
+    // (matching the existing class-annotation policy, which disposes a
+    // class-typed using var regardless of owned/borrow — see
+    // abstract_dynamic_dispose_test's using_var_subclass_disposed_dynamically).
+    if (ld->type) {
+        const sema::TypeRef* rt = ctx_.resolvedType(*ld->type);
+        if (rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+            rt->declaration->kind == ast::TypeDeclKind::Interface)
+            return true;
+    }
+    // (b) An inferred using var whose initializer is a call returning `owned T`
+    // (T a class/interface). §28.10: a borrow return (no `owned`) assumes NO
+    // disposal — so only the `owned`-return case registers here. A `new`/
+    // class-annotation initializer was already handled by classOfLocal; an
+    // interface-annotation by (a). This case covers `using var x := Make();`
+    // where `Make(): owned IShape` / `owned Square` and x has no annotation.
+    if (!ld->type) {
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(
+                ld->initializer.get())) {
+            if (call->callee) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                    ctx_.exprSymbol(*call->callee));
+                if (ms) {
+                    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                    if (md && md->returnOwned &&
+                        isClassOrInterfaceRef(ctx_.exprType(*ld->initializer)))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+
+bool Emitter::usingVarIsMovedClassObject(const ast::LocalDecl* ld) {
+    // #383 / §28.8.1: `using var u := move <expr>` — the moved value is owned
+    // and discharged at scope end. Inside a destructor body the field's
+    // auto-dispose pass would also dispose it (codegen has no moved-from
+    // tracking), so suppress there.
+    if (emittingDisposerBody_) return false;
+    auto* un = dynamic_cast<const ast::UnaryExpr*>(ld->initializer.get());
+    if (!un || un->op != "move") return false;
+    // The moved value's type is the field/slot element type; require a
+    // class/interface object (records and value types free their own storage
+    // and never reach the dynamic-dispose path).
+    return isClassOrInterfaceRef(ctx_.exprType(*ld->initializer));
 }
 
 
@@ -1353,8 +1446,19 @@ bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& bo
 }
 
 
-void Emitter::emitDisposals(const std::vector<Disposal>& scope) {
+void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
+        // #383 / §31.1: the caught exception object. On a normal handled exit
+        // it is freed (destructor + base chain + block, via its vtable); on the
+        // unwind path it is SKIPPED — a re-raise/throw leaving the arm keeps it
+        // in flight for the enclosing handler. It is non-null here (it was the
+        // in-flight exception that matched this arm).
+        if (it->caughtException) {
+            if (isUnwind) continue;
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), it->slot);
+            emitDynamicDispose(obj);
+            continue;
+        }
         // per §2.11: a `using var` Subscription auto-disposes by removing its
         // registration through the events runtime — it has no vtable. (Dispose
         // is idempotent, so a null/already-removed handle is safe.)
@@ -1382,6 +1486,29 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {arr, disp});
+            continue;
+        }
+        // #383 / §28: a `using var` owning a class/interface object whose
+        // concrete class is not statically known here (interface-typed slot,
+        // call returning `owned T`, or `move x.f`). Dispose dynamically through
+        // its own vtable, null-guarded — an interface/nullable slot may hold
+        // null. The dynamic dispatch runs the most-derived destructor + base
+        // chain and reclaims the block (#380), so the object is freed once.
+        if (it->dynamicDispose) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "using.dispose",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "using.cont",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            emitDynamicDispose(obj);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         if (disposerFns_.find(it->cls) == disposerFns_.end()) continue;

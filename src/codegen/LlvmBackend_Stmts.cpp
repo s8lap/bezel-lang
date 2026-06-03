@@ -426,6 +426,25 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             llvm::ConstantPointerNull::get(ptrTy()), excGlobal());
         llvm::Value* savedCaught = currentCaughtExc_;
         currentCaughtExc_ = exc;
+        // #383 / §31.1: ownership of the exception transfers to the runtime,
+        // which disposes it after the matching catch arm completes. Register
+        // the caught object as a `caughtException` disposal in a dedicated
+        // scope around the arm body: a NORMAL handled exit (fall-through,
+        // return, break, continue) frees it via the disposal machinery
+        // (emitDynamicDispose — destructor + base chain + free, #380); the
+        // UNWIND path (a re-raise `throw;` or `throw expr` from the arm body)
+        // SKIPS it (emitDisposals' isUnwind), keeping it in flight so the
+        // enclosing handler frees it exactly once. The binding is a borrow
+        // (§31.1) that may not escape; disposal runs after the body's last
+        // use (return values are evaluated before disposal — §28.3).
+        disposeStack_.emplace_back();
+        {
+            llvm::AllocaInst* excSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(exc, excSlot);
+            Disposal d{excSlot, nullptr};
+            d.caughtException = true;
+            disposeStack_.back().push_back(d);
+        }
         // An exception thrown by the arm body must still run finally.
         if (hasFin) { unwindTarget_ = finUnwindBB; unwindScopeDepth_ =
                           disposeStack_.size(); }
@@ -433,6 +452,12 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         if (arm.body) armTerm = lowerStmt(*arm.body);
         if (hasFin) { unwindTarget_ = savedUnwind;
                       unwindScopeDepth_ = savedDepth; }
+        // On a normal handled fall-through, dispose (free) the caught
+        // exception via the scope, then continue to the normal exit. A
+        // terminating arm body (return/break/continue) already freed it via
+        // emitAllDisposals/emitLoopDisposals; a re-raise/throw skipped it.
+        if (!armTerm) emitDisposals(disposeStack_.back());
+        disposeStack_.pop_back();
         currentCaughtExc_ = savedCaught;
         if (!armTerm) builder_.CreateBr(normalExit);
 
