@@ -1425,6 +1425,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // interpolation) can infer it. ToString → string (§8.5/§9.1);
             // GetHashCode → int (§8.3); Equals → bool (§8.3/§8.4).
             const auto& m = ma.member;
+            // §9.2/§8.3: a direct `.Equals(...)` / `.GetHashCode()` on a body
+            // record that is not auto-equality-bearing and declares no equality
+            // of its own is a compile error at the call site. "Calling
+            // `someRecord.Equals(other)` or `someRecord.GetHashCode()` on a
+            // non-auto-equality-bearing record without a user-defined override is
+            // a compile error … The error covers `Equals(Object?)`, `Equals(T)`
+            // … and `GetHashCode`." (We reach this branch only when lookupMember
+            // found no user member of that name, so any hand-written
+            // `Equals`/`GetHashCode` is already excluded; the operator-only
+            // explicit-equality form is excluded via recordHasUserDeclaredEquality.
+            // ToString is *not* covered: ineligible records keep the type-name
+            // default ToString per §8.5/§9.2.) Positional records, enums, and
+            // eligible body records are unaffected.
+            if ((m == "Equals" || m == "GetHashCode") &&
+                targetType->kind == ast::TypeDeclKind::Record) {
+                bool positional = false;
+                if (auto* td = dynamic_cast<const ast::TypeDecl*>(targetType->decl))
+                    positional = td->hasPositionalFields;
+                if (!positional &&
+                    !isAutoEqualityBearingBodyRecord(targetType) &&
+                    !recordHasUserDeclaredEquality(targetType)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`." + std::string(m) + "` is not available on record `" +
+                        std::string(targetType->name) +
+                        "`: it is not auto-equality-bearing (§9.2). Declare `=`"
+                        " and `<>` overloads (with `Equals`/`GetHashCode`), or"
+                        " simplify the record to an auto-equality-bearing form.");
+                }
+            }
             if (m == "ToString")
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
             else if (m == "GetHashCode")

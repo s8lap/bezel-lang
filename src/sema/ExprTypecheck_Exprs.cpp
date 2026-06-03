@@ -459,6 +459,40 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             return;
         }
     }
+    // §9.2/§8.3: `=` / `<>` on a body record that is not auto-equality-bearing
+    // and that declares no equality of its own is a compile error at the use
+    // site. "A body record is **not** auto-equality-bearing — and `=` on it
+    // without an explicit overload is a compile error — when it contains [an
+    // explicit field, a side-effecting computed property, or a non-trivial
+    // constructor body]." A user `=`/`<>` overload would already have been
+    // selected by findBinaryOperator above (so we never reach here for those);
+    // a record carrying a hand-written `Equals`/`GetHashCode` (but no operator)
+    // is likewise excluded via recordHasUserDeclaredEquality. Positional
+    // records, enums, and eligible body records are unaffected.
+    if (op == "=" || op == "<>") {
+        for (const ast::Expr* operand : {be.left.get(), be.right.get()}) {
+            TypeSymbol* ts = memberTargetType(operand);
+            if (ts && ts->kind == ast::TypeDeclKind::Record &&
+                !isAutoEqualityBearingBodyRecord(ts) &&
+                !recordHasUserDeclaredEquality(ts)) {
+                // §9.3: skip positional / combined-form records (they get §9.1
+                // positional value equality, not the body-record rule).
+                bool positional = false;
+                if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+                    positional = td->hasPositionalFields;
+                if (!positional) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, be.span.begin,
+                        "`" + std::string(op) + "` is not available on record `" +
+                        std::string(ts->name) +
+                        "`: it is not auto-equality-bearing (§9.2). Declare `=`"
+                        " and `<>` overloads (with `Equals`/`GetHashCode`), or"
+                        " simplify the record to an auto-equality-bearing form.");
+                    break;
+                }
+            }
+        }
+    }
     if (op == "=" || op == "<>" || op == "<" || op == ">" ||
         op == "<=" || op == ">=" || op == "and" || op == "or") {
         ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
