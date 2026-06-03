@@ -1728,6 +1728,15 @@ llvm::FunctionCallee Emitter::callocFn() {
 }
 
 
+llvm::FunctionCallee Emitter::freeFn() {
+    // #380: libc free — the counterpart to callocFn() used to reclaim a
+    // disposed class instance's heap block at the most-derived Dispose.
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, false);
+    return module_->getOrInsertFunction("free", fnTy);
+}
+
+
 llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     const std::vector<sema::Symbol*>* paramSyms = ctx_.lambdaParams(&lam);
 

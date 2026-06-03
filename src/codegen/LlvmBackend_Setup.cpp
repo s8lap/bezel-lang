@@ -746,6 +746,19 @@ void Emitter::emitDynamicDispose(llvm::Value* obj) {
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     builder_.CreateCall(fnTy, disposeFn, {obj});
+    // #380 / §28: "dispose" means run the destructor AND reclaim the object's
+    // heap block (no GC). The vtable Dispose just dispatched is the MOST-DERIVED
+    // disposer; it has run the destructor body, owned-field disposals, and the
+    // full base-dispose chain (emitBaseDisposeChain calls base disposers
+    // DIRECTLY, never re-entering this dynamic-dispatch path). So freeing the
+    // object's `calloc`'d block here frees it exactly once, last, after every
+    // destructor has finished operating on valid memory. This dynamic path is
+    // the single entry for every class-instance dispose site (using-var
+    // scope-end, owned-field disposal, explicit .Dispose(), and exception
+    // unwind), so all of them reclaim the block; collection/dict/set/boxed/
+    // string types and value records never reach here (they free their own
+    // storage). free(null) is a no-op, matching the pre-existing null tolerance.
+    builder_.CreateCall(freeFn(), {obj});
 }
 
 
@@ -776,6 +789,12 @@ llvm::Function* Emitter::elementDisposerThunk() {
     auto* dispTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                            {ptrTy()}, /*isVarArg=*/false);
     b.CreateCall(dispTy, disposeFn, {obj});
+    // #380 / §28: an owning collection's element is a heap class instance; after
+    // its (most-derived) Dispose runs the destructor + base chain, reclaim its
+    // block. This thunk is the element-dispose path that does NOT route through
+    // emitDynamicDispose (it is invoked per live element by bz_array_free), so
+    // the free must be emitted here too. obj is non-null in this block.
+    b.CreateCall(freeFn(), {obj});
     b.CreateBr(retBB);
     b.SetInsertPoint(retBB);
     b.CreateRetVoid();

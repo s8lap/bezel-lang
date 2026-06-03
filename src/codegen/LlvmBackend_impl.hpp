@@ -1534,6 +1534,10 @@ private:
     // allocation, matching value-type field defaults.
     llvm::FunctionCallee callocFn();
 
+    // #380: declare (once) `void @free(ptr)` from libc — the counterpart to
+    // callocFn() that reclaims a disposed class instance's heap block.
+    llvm::FunctionCallee freeFn();
+
     // CG60: lower a lambda expression. Lambdas are represented as a
     // heap-allocated two-pointer closure struct { fn_ptr, env_ptr }.
     //
