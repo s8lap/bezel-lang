@@ -2445,10 +2445,83 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
 }
 
 
+// §8 / §9 / §10: intercept the compiler-synthesized value-semantics members
+// — `ToString`, `GetHashCode`, and (for records) `Equals` — on a record- or
+// enum-typed receiver when the type declares no user member of that name.
+// Returns the lowered value, or null when this is not such a call.
+llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const auto& member = ma->member;
+    bool isToString    = member == "ToString"    && call.args.empty();
+    bool isGetHashCode = member == "GetHashCode"  && call.args.empty();
+    bool isEquals      = member == "Equals"       && call.args.size() == 1;
+    if (!isToString && !isGetHashCode && !isEquals) return nullptr;
+
+    // A user-declared method of this name wins (the callee resolves to it).
+    if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee)))
+        return nullptr;
+
+    auto* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+        !recvTy->declaration)
+        return nullptr;
+    const sema::TypeSymbol* ts = recvTy->declaration;
+    bool isRecord = ts->kind == ast::TypeDeclKind::Record;
+    bool isEnum   = ts->kind == ast::TypeDeclKind::Enum;
+    if (!isRecord && !isEnum) return nullptr;
+
+    llvm::Value* recv = lowerExpr(*ma->target);
+    if (!recv) return nullptr;
+
+    if (isEnum) {
+        // §8.5: enum ToString → the type's qualified name (spec default).
+        if (isToString)
+            return lowerStringLiteral(
+                std::string("\"") + std::string(ts->name) + "\"", false);
+        // §8.3: enum GetHashCode → the underlying integer value (i32).
+        if (isGetHashCode)
+            return builder_.CreateZExtOrTrunc(recv, i32());
+        // §8.4/§10: enum Equals → integer comparison.
+        if (isEquals && call.args[0].value) {
+            llvm::Value* other = lowerExpr(*call.args[0].value);
+            if (!other) return nullptr;
+            return builder_.CreateICmpEQ(
+                recv, builder_.CreateZExtOrTrunc(other, recv->getType()));
+        }
+        return nullptr;
+    }
+
+    // Record: obtain the struct value (a `this` pointer or spill loads it).
+    llvm::StructType* st = recordStruct(ts);
+    if (recv->getType()->isPointerTy())
+        recv = builder_.CreateLoad(st, recv);
+    if (!recv->getType()->isStructTy()) return nullptr;
+
+    if (isToString)    return emitRecordToString(recv, ts);   // §9.1
+    if (isGetHashCode) return emitRecordHashCode(recv, ts);   // §8.3 / §9.1
+    if (isEquals && call.args[0].value) {
+        // §9.1: structural equality, same as the `=` operator (§8.3).
+        llvm::Value* other = lowerExpr(*call.args[0].value);
+        if (!other) return nullptr;
+        if (other->getType()->isPointerTy())
+            other = builder_.CreateLoad(st, other);
+        if (!other->getType()->isStructTy()) return nullptr;
+        return emitStructEquality(recv, other, st);
+    }
+    return nullptr;
+}
+
+
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // Pre-create out var slots so lvalueAddr can find them in all paths.
     ensureOutVarSlots(call);
+    // §8/§9/§10: compiler-synthesized value-semantics members (ToString,
+    // GetHashCode, Equals) on a record/enum receiver. Checked before the
+    // ordinary dispatch so a record with no user ToString gets the §9.1 form
+    // rather than falling through to the no-method path.
+    if (auto* v = tryLowerValueSemanticsCall(call)) return v;
     // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
     if (tryLowerConsoleCall(call)) return nullptr;  // unit result
     // Console.ReadLine() → string? / Console.ReadKey() → char

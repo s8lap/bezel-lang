@@ -528,6 +528,40 @@ private:
     llvm::Value* emitPrimitiveToString(llvm::Value* val,
                                        sema::PrimitiveType prim);
 
+    // §8 / §9 / §10: compiler-synthesized value-semantics members for records
+    // and enums. Each returns the lowered value, or null if the member is not
+    // a synthesized one (so callers fall through to ordinary dispatch).
+    //
+    // §9.1: record ToString → `"TypeName(Field1: value1, Field2: value2)"`,
+    // built from the field values in declaration order (each field's value is
+    // formatted by its own type's ToString — recursing into nested records).
+    llvm::Value* emitRecordToString(llvm::Value* recVal,
+                                    const sema::TypeSymbol* rec);
+    // §8.3 / §9.1: record GetHashCode → fold the per-field hashes in
+    // declaration order with hash = hash*31 + fieldHash. Consistent with the
+    // structural equality emitted by emitStructEquality.
+    llvm::Value* emitRecordHashCode(llvm::Value* recVal,
+                                    const sema::TypeSymbol* rec);
+    // §8.5: enum ToString → the type's qualified name (the spec default for
+    // enums; member-name formatting is left to user code via Type.EnumNames).
+    // §8.3: enum GetHashCode → the underlying integer value.
+    // Helper that converts a single field/element value of static type
+    // `fieldTy` to its string form (used by emitRecordToString).
+    llvm::Value* emitValueToString(llvm::Value* val,
+                                   const sema::TypeRef* fieldTy);
+    // Helper that computes the i32 hash of a single field value of static
+    // type `fieldTy` (used by emitRecordHashCode).
+    llvm::Value* emitValueHashCode(llvm::Value* val,
+                                   const sema::TypeRef* fieldTy);
+    // CG: intercept `.ToString()`, `.GetHashCode()`, and `.Equals(x)` on a
+    // record- or enum-typed receiver (the value-semantics members the compiler
+    // synthesizes, §8/§9/§10). Returns the lowered value, or null if not such
+    // a call (caller falls through to ordinary method dispatch).
+    llvm::Value* tryLowerValueSemanticsCall(const ast::CallExpr& call);
+    // The resolved sema TypeRef of a record field's declared type (positional
+    // Param or body FieldDecl). Null if it cannot be determined.
+    const sema::TypeRef* recordFieldType(const sema::FieldSymbol* fs);
+
     // CG27b (§4.6): ordinal comparison of two bz_string pointers → i32.
     // Returns negative / 0 / positive (same sign contract as memcmp/strcmp).
     // Ordinal = code-point-by-code-point; shorter string is "less" when it
