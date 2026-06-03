@@ -136,6 +136,18 @@ private:
     // A missed borrow for T=class is acceptable at this stage (§14).
     static bool isBorrowableType(const sema::TypeRef* rt);
 
+    // §28.3 borrow-escape gate: true when the returned expression could
+    // be a borrow aliasing into its identifier root (so it must be checked
+    // against `using var` scope). False when the returned value is a
+    // value-typed copy (an int/bool/enum/record-by-value projection),
+    // which can never outlive its source. Prefers sema's resolved expr
+    // type (`isBorrowableType`); for a bare property/field access that
+    // sema left untyped — most notably a built-in collection's value-
+    // typed `Length`/`Count`/`IsEmpty` projection, which sema types only
+    // on the call form — it falls back to recognizing the spec/stdlib
+    // value-typed projection by member name (still a copy, never a borrow).
+    bool returnedExprMayBorrow(const ast::Expr& e) const;
+
     // Walk the return value's expression and, for each path that ends
     // in a local-identifier root, verify the root isn't a `using var`.
     void checkBorrowEscapesOnReturn(const ast::Expr& e);
