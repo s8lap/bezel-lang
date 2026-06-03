@@ -6,7 +6,7 @@ ensures that each one is disposed exactly once.
 
 The language is paper-designed: the normative spec lives in `docs/`, and this
 repository hosts the compiler that implements it. Start with `CLAUDE.md` for the
-project's working discipline and `docs/Bezel_Language_Spec_0_127.md` for the
+project's working discipline and `docs/Bezel_Language_Spec_0_128.md` for the
 language itself.
 
 ## Status
