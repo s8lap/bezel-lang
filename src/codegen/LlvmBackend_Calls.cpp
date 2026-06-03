@@ -2732,12 +2732,38 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* xd = dynamic_cast<sema::ExternDeclSymbol*>(calleeSym)) {
         auto it = externFns_.find(xd);
         if (it == externFns_.end()) return nullptr;
+        const ast::ExternDecl* ed = xd->externDecl;
+        // per §32.5: an extern parameter declared `CString` is a
+        // null-terminated UTF-8 `char*`. When a Bezel `string` is passed
+        // there, marshal it by handing the native side the bz_string data
+        // pointer (field 0), which is null-terminated (see makeCodePointArray)
+        // — this matches §32.6 "the C side reads a char* until the null".
+        // The data is the byte content; for ASCII it is valid UTF-8 (a
+        // non-ASCII non-width-1 string would need a re-encode — deferred,
+        // see report).
+        auto cstringParamAt = [&](std::size_t i) -> bool {
+            if (!ed || i >= ed->params.size()) return false;
+            const ast::Type* pt = ed->params[i].type.get();
+            return pt && pt->kind == ast::TypeKind::Named && pt->name &&
+                   pt->name->parts.size() == 1 &&
+                   pt->name->parts.front() == "CString";
+        };
         std::vector<llvm::Value*> args;
+        std::size_t idx = 0;
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) return nullptr;
+            // Marshal a Bezel `string` argument into a CString parameter by
+            // extracting its (null-terminated) data pointer (§32.5 / §32.6).
+            if (cstringParamAt(idx)) {
+                const sema::TypeRef* at = ctx_.exprType(*a.value);
+                if (at && at->kind == sema::TypeRef::Kind::Primitive &&
+                    at->primitive == sema::PrimitiveType::String)
+                    v = loadStringData(v);
+            }
             args.push_back(v);
+            ++idx;
         }
         if (args.size() != it->second->arg_size()) return nullptr;
         return builder_.CreateCall(it->second, args);
