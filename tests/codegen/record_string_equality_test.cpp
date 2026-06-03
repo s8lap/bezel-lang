@@ -180,3 +180,136 @@ BEZEL_TEST(codegen_record_str_eq, nested_record_inner_string_differs_spec_9_1) {
         "  return (1 if a = b else 0); "
         "end Main; end C;"), 0);
 }
+
+// ---------------------------------------------------------------------------
+// §8.3 / §9.1 — NULLABLE string fields (`string?`).
+//
+// A `string?` lowers to a plain `ptr` whose null is a real null pointer (it has
+// no hasValue tag, unlike a nullable value primitive). The synthesized
+// value-semantics members (`=`, `<>`, `Equals`, `GetHashCode`, `ToString`)
+// must null-guard such a field before any content operation, or a null field
+// SIGSEGVs (loadStringLen on a null pointer). The contract:
+//   equality:    both-null → equal; exactly-one-null → not-equal;
+//                neither-null → content equality.
+//   GetHashCode: a null field hashes to the fixed sentinel 0.
+//   ToString:    a null field renders as the literal `null` (the same
+//                rendering null interpolation uses).
+// Each of these crashes without the null guard; they are regression tests for
+// that class of crash.
+// ---------------------------------------------------------------------------
+
+// §8.3: both `string?` fields null → records compare EQUAL via `=`. (The
+// same-pointer fast path already collapses two real nulls, but the guard must
+// keep this true once it short-circuits before loadStringLen.)
+BEZEL_TEST(codegen_record_str_eq, nullable_string_both_null_equal_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Name(value: string?); "
+        "class C public static method Main(): int "
+        "  var a := new Name(null); "
+        "  var b := new Name(null); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3: exactly one `string?` field null → NOT equal (and would SIGSEGV in the
+// content compare without the one-null guard). `=` is false.
+BEZEL_TEST(codegen_record_str_eq, nullable_string_one_null_not_equal_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Name(value: string?); "
+        "class C public static method Main(): int "
+        "  var a := new Name(null); "
+        "  var b := new Name(\"x\"); "
+        "  return (1 if a = b else 0); "
+        "end Main; end C;"), 0);
+}
+
+// §8.3: `<>` is the negation of `=` — exactly one field null → `<>` is true.
+BEZEL_TEST(codegen_record_str_eq, nullable_string_one_null_neq_true_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Name(value: string?); "
+        "class C public static method Main(): int "
+        "  var a := new Name(null); "
+        "  var b := new Name(\"x\"); "
+        "  return (1 if a <> b else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.1: the synthesized `.Equals()` is the same comparison as `=` — both fields
+// null → true; one null → false.
+BEZEL_TEST(codegen_record_str_eq, nullable_string_equals_method_spec_9_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Data(msg: string?); "
+        "class C public static method Main(): int "
+        "  var a := new Data(null); "
+        "  var b := new Data(null); "
+        "  var c := new Data(\"x\"); "
+        "  return (1 if a.Equals(b) and not a.Equals(c) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3: a null `string?` field hashes (its sentinel) consistently — two records
+// with a null field hash EQUAL; a record with a non-null field hashes
+// DIFFERENTLY. Without the guard, GetHashCode null-derefs the field.
+BEZEL_TEST(codegen_record_str_eq, nullable_string_gethashcode_null_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Data(msg: string?); "
+        "class C public static method Main(): int "
+        "  var a := new Data(null); "
+        "  var b := new Data(null); "
+        "  var c := new Data(\"x\"); "
+        "  return (1 if a.GetHashCode() = b.GetHashCode() "
+        "             and a.GetHashCode() <> c.GetHashCode() else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.5 / §9.1: ToString of a record with a null `string?` field renders the
+// field as `null` (matching null interpolation); a non-null field renders its
+// content. Without the guard, ToString null-derefs the field.
+BEZEL_TEST(codegen_record_str_eq, nullable_string_tostring_null_spec_8_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Msg(opt: string?); "
+        "class C public static method Main(): int "
+        "  var m := new Msg(null); "
+        "  var n := new Msg(\"hi\"); "
+        "  return (1 if m.ToString() = \"Msg(opt: null)\" "
+        "             and n.ToString() = \"Msg(opt: hi)\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.1: a record with a null nullable field round-trips through all of value
+// semantics in one program (equality both-null, Equals, hash, ToString) — the
+// combined regression for the SIGSEGV class.
+BEZEL_TEST(codegen_record_str_eq, nullable_string_field_roundtrip_spec_9_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(s: string?, n: int); "
+        "class C public static method Main(): int "
+        "  var a := new Box(null, 7); "
+        "  var b := new Box(null, 7); "
+        "  return (1 if a = b "
+        "             and a.Equals(b) "
+        "             and a.GetHashCode() = b.GetHashCode() "
+        "             and a.ToString() = \"Box(s: null, n: 7)\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §8.3 / §9.1: the guard is generic over NULLABLE REFERENCE fields, not just
+// string. A nullable class field (`Inner?`) set to null must likewise compare
+// equal (both-null), hash to the sentinel, and render `null` — never call
+// ToString on a null `this` nor deref. (Equality/hash were already non-crashing
+// for class refs; ToString previously rendered the type name and risked a
+// null-`this` ToString call — the guard makes all three consistent.)
+BEZEL_TEST(codegen_record_str_eq, nullable_class_field_null_value_semantics_spec_8_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Inner public V: int := 0; "
+        "  public override method ToString(): string return \"inner!\"; end ToString; "
+        "end Inner; "
+        "record Holder(inner: Inner?); "
+        "class C public static method Main(): int "
+        "  var a := new Holder(null); "
+        "  var b := new Holder(null); "
+        "  return (1 if a = b "
+        "             and a.GetHashCode() = b.GetHashCode() "
+        "             and a.ToString() = \"Holder(inner: null)\" else 0); "
+        "end Main; end C;"), 1);
+}
