@@ -215,6 +215,8 @@ set(BEZEL_TEST_SOURCES
     codegen/linq_test.cpp
     codegen/event_test.cpp
 
+    runtime/event_subscription_test.cpp
+
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
