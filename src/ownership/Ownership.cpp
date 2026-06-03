@@ -1,4 +1,5 @@
 #include "ownership/Ownership.hpp"
+#include "ownership/Ownership_impl.hpp"
 
 #include <string>
 #include <unordered_map>
@@ -11,841 +12,295 @@
 
 namespace bezel::ownership {
 
-namespace {
+// The MethodOwnership class is declared in Ownership_impl.hpp; its move /
+// borrow / discharge check definitions live in Ownership_Checks.cpp. This
+// file holds the statement/flow-walking definitions plus the public
+// checkOwnership entry point and its supporting free functions.
 
-// Per-method ownership analyzer (slice O1). Walks statements linearly
-// and tracks each LocalDecl's ownership state via its LocalSymbol.
-class MethodOwnership {
-public:
-    MethodOwnership(sema::SemaContext& ctx) : ctx_(ctx) {}
-
-    // Run the linear walk. `body` is the method/ctor/lambda body's
-    // statement list. `paramSyms` (slice O10) is the matching list of
-    // ParameterSymbols — `owned` params are introduced as Owned locals
-    // at method entry per §28.8 and must reach a discharge point on
-    // every normal-exit path (same rule as `var x := producer-of-owned;`).
-    void run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
-             const std::vector<sema::Symbol*>* paramSyms = nullptr) {
-        if (paramSyms) {
-            for (sema::Symbol* sym : *paramSyms) {
-                auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
-                if (!ps) continue;
-                if (ps->modifier == "owned" ||
-                    ps->modifier == "out owned") {
-                    LocalOwnership lo;
-                    lo.state = OwnershipState::Owned;
-                    lo.implicitDischarge = false;
-                    lo.obligationOrigin = ps->decl;
-                    states_[sym] = lo;
-                }
+void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+         const std::vector<sema::Symbol*>* paramSyms) {
+    if (paramSyms) {
+        for (sema::Symbol* sym : *paramSyms) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps) continue;
+            if (ps->modifier == "owned" ||
+                ps->modifier == "out owned") {
+                LocalOwnership lo;
+                lo.state = OwnershipState::Owned;
+                lo.implicitDischarge = false;
+                lo.obligationOrigin = ps->decl;
+                states_[sym] = lo;
             }
         }
-        for (const auto& s : body) {
-            if (s) visitStmt(*s);
-        }
-        // Slice O11 (simple): if the body's last statement is an
-        // unconditional terminator that does not reach scope exit on
-        // any normal path (throw or — for a method whose return type
-        // is `()` — return), the §28.3 "exception-path discharge" rule
-        // covers any still-undischarged owned locals via the implicit
-        // try/finally during stack unwinding. Skip the undischarged
-        // check in that case.
-        //
-        // The check is necessarily approximate without a CFG: we only
-        // honor it for the lexically-last statement being a ThrowStmt.
-        // A throw inside an if-branch doesn't suppress the check (the
-        // other branches still normally exit). Future ownership CFG
-        // refactor sharpens this to "every normal-exit path ends in
-        // throw/return".
-        // Scope-exit: every plain `var` owned local must have been
-        // discharged. `using var` locals carry implicit discharge.
-        // O11 (simple) suppresses *this* check when the body's last
-        // statement is throw — exception unwinding's implicit
-        // try/finally handles the discharge. The field-move check
-        // below is NOT suppressed: the enclosing object survives the
-        // throw and its field invariant must still hold.
-        if (!bodyEndsInThrow(body)) {
-            for (const auto& [sym, st] : states_) {
-                if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
-                    ctx_.diagnostics().report(
-                        Severity::Error,
-                        st.obligationOrigin ? st.obligationOrigin->span.begin
-                                            : SourceLocation{},
-                        std::string("owned value in `") +
-                        std::string(sym->name) +
-                        "` would be dropped here without disposal "
-                        "(§28.3 — consider `using var`, explicit "
-                        "`.Dispose()`, `move`, or `return`)");
-                }
-            }
-        }
-        // Slice O8 / §28.8.1: a `move this.field` leaves the field in
-        // moved-from state. The field must be reassigned before the
-        // surrounding method exits — otherwise the field's invariant
-        // is broken on method return.
-        for (const auto& [name, moved] : fieldMovedFrom_) {
-            if (moved) {
+    }
+    for (const auto& s : body) {
+        if (s) visitStmt(*s);
+    }
+    // Slice O11 (simple): if the body's last statement is an
+    // unconditional terminator that does not reach scope exit on
+    // any normal path (throw or — for a method whose return type
+    // is `()` — return), the §28.3 "exception-path discharge" rule
+    // covers any still-undischarged owned locals via the implicit
+    // try/finally during stack unwinding. Skip the undischarged
+    // check in that case.
+    //
+    // The check is necessarily approximate without a CFG: we only
+    // honor it for the lexically-last statement being a ThrowStmt.
+    // A throw inside an if-branch doesn't suppress the check (the
+    // other branches still normally exit). Future ownership CFG
+    // refactor sharpens this to "every normal-exit path ends in
+    // throw/return".
+    // Scope-exit: every plain `var` owned local must have been
+    // discharged. `using var` locals carry implicit discharge.
+    // O11 (simple) suppresses *this* check when the body's last
+    // statement is throw — exception unwinding's implicit
+    // try/finally handles the discharge. The field-move check
+    // below is NOT suppressed: the enclosing object survives the
+    // throw and its field invariant must still hold.
+    if (!bodyEndsInThrow(body)) {
+        for (const auto& [sym, st] : states_) {
+            if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
                 ctx_.diagnostics().report(
                     Severity::Error,
-                    fieldMoveLoc_.count(name)
-                        ? fieldMoveLoc_[name]
-                        : SourceLocation{},
-                    std::string("field `") + std::string(name) +
-                    "` left in moved-from state at method exit "
-                    "(§28.8.1 — reassign the field before exiting)");
-            }
-        }
-    }
-
-    // Slice O11 approximation: returns true if the body's lexically-
-    // last reachable statement is a ThrowStmt. Skips trailing nulls.
-    bool bodyEndsInThrow(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-        for (auto it = body.rbegin(); it != body.rend(); ++it) {
-            if (!*it) continue;
-            return dynamic_cast<const ast::ThrowStmt*>(it->get()) != nullptr;
-        }
-        return false;
-    }
-
-private:
-    sema::SemaContext& ctx_;
-    std::unordered_map<sema::Symbol*, LocalOwnership> states_;
-    // Slice O8: per-method tracker for `move this.field` — the field's
-    // name maps to its moved-from state. fieldMoveLoc_ stores the
-    // move-site location for diagnostics.
-    std::unordered_map<std::string_view, bool> fieldMovedFrom_;
-    std::unordered_map<std::string_view, SourceLocation> fieldMoveLoc_;
-
-    void visitStmt(const ast::Stmt& s) {
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-            handleLocalDecl(*ld);
-            return;
-        }
-        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-            if (es->expr) handleDischarge(*es->expr);
-            return;
-        }
-        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-            if (ds->value) handleDischarge(*ds->value);
-            return;
-        }
-        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-            handleAssignment(*as);
-            return;
-        }
-        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-            if (rs->value) handleReturn(*rs->value);
-            return;
-        }
-        // Slice O4: if-then-else handling with branch-join semantics
-        // per §28.3. Each branch is walked with a snapshot of the
-        // pre-branch state; the post-branch states are joined into the
-        // current state. Owned/Borrowed mismatch at the join is a
-        // diagnostic.
-        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-            // Snapshot the state entering the if-statement.
-            auto entry = states_;
-            // Walk the if-branch.
-            for (const auto& bs : ifs->ifBranch.body) if (bs) visitStmt(*bs);
-            auto branchEndStates = std::vector{states_};
-            // For each elif: restore entry, walk, snapshot.
-            for (const auto& el : ifs->elifBranches) {
-                states_ = entry;
-                for (const auto& bs : el.body) if (bs) visitStmt(*bs);
-                branchEndStates.push_back(states_);
-            }
-            // Else branch (or implicit fall-through == entry).
-            if (ifs->hasElse) {
-                states_ = entry;
-                for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
-                branchEndStates.push_back(states_);
-            } else {
-                // No else: the false edge falls through with entry state.
-                branchEndStates.push_back(entry);
-            }
-            // Join all branches. Start from the first; reduce in pairs.
-            auto joined = branchEndStates.front();
-            for (std::size_t i = 1; i < branchEndStates.size(); ++i) {
-                joinInto(joined, branchEndStates[i], ifs->span.begin);
-            }
-            states_ = std::move(joined);
-            return;
-        }
-        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-            for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
-            return;
-        }
-        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-            for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
-            return;
-        }
-        if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-            for (const auto& bs : dob->body) if (bs) visitStmt(*bs);
-            return;
-        }
-        if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-            for (const auto& bs : ts->body) if (bs) visitStmt(*bs);
-            for (const auto& arm : ts->catches) {
-                if (arm.body) visitStmt(*arm.body);
-            }
-            for (const auto& bs : ts->finallyBody) if (bs) visitStmt(*bs);
-            return;
-        }
-    }
-
-    // Categorize the initializer expression to determine the local's
-    // initial ownership state (slice O1 producer table — minimal).
-    OwnershipState producerState(const ast::Expr& e) {
-        // `new T(...)` is the canonical producer of Owned values — but only
-        // for reference types (classes). §9: a record is a value type with
-        // no disposal obligation (§9.7 forbids record destructors and owned
-        // fields), so `new Record(...)` yields a plain value, not an owned
-        // resource. (Enums and other value kinds likewise.)
-        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
-            if (ne->type) {
-                if (auto* rt = ctx_.resolvedType(*ne->type)) {
-                    if (rt->kind == sema::TypeRef::Kind::Named &&
-                        rt->declaration &&
-                        rt->declaration->kind != ast::TypeDeclKind::Class &&
-                        rt->declaration->kind != ast::TypeDeclKind::Interface) {
-                        return OwnershipState::Borrowed;  // value type: no obligation
-                    }
-                }
-            }
-            return OwnershipState::Owned;
-        }
-        // `null` is the polymorphic-null state (§28.3 null-literal row).
-        if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
-            return OwnershipState::PolyNull;
-        }
-        // Slice O13: a call to a method with an `owned T` return type
-        // produces an Owned value. The callee MethodSymbol resolution
-        // comes from sema; we look at its MethodDecl::returnOwned to
-        // decide. A null callee symbol (overload not yet pickable, or
-        // a call on a value with no symbol) falls through to Borrowed.
-        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
-            if (ce->callee) {
-                if (auto* sym = ctx_.exprSymbol(*ce->callee)) {
-                    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
-                        auto* md = dynamic_cast<const ast::MethodDecl*>(
-                            ms->decl);
-                        if (md && md->returnOwned) {
-                            return OwnershipState::Owned;
-                        }
-                    }
-                }
-            }
-        }
-        // Default: Borrowed.
-        return OwnershipState::Borrowed;
-    }
-
-    void handleLocalDecl(const ast::LocalDecl& ld) {
-        // Find the LocalSymbol that ExprTypecheck created for this decl.
-        sema::LocalSymbol* lsym = findLocalSymbol(ld);
-        if (!lsym) return;
-        LocalOwnership lo;
-        lo.obligationOrigin = &ld;
-        if (ld.isUsing) {
-            // `using var` is always Owned and implicitly discharged.
-            lo.state = OwnershipState::Owned;
-            lo.implicitDischarge = true;
-        } else if (ld.initializer) {
-            lo.state = producerState(*ld.initializer);
-        } else {
-            lo.state = OwnershipState::Uninitialized;
-        }
-        states_[lsym] = lo;
-        // Slice O8: if the initializer involves `move this.field`, mark
-        // the field as moved-from (the move side-effect happens at
-        // initializer evaluation time, regardless of the local's `using`
-        // status). This lets `using var old := move this._log;` correctly
-        // record that `_log` is now empty.
-        if (ld.initializer) {
-            recordMovesIn(*ld.initializer);
-        }
-    }
-
-    // Walk an expression and side-effect any `move` operations it
-    // contains. Used by handleLocalDecl so `move`-in-initializer
-    // properly transitions the source's state.
-    void recordMovesIn(const ast::Expr& e) {
-        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
-            if (un->op == "move") {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        un->operand.get())) {
-                    markMovedByName(id->name, id->span.begin);
-                    return;
-                }
-                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        un->operand.get())) {
-                    if (auto* tid =
-                            dynamic_cast<const ast::IdentifierExpr*>(
-                                ma->target.get())) {
-                        if (tid->name == "this") {
-                            fieldMovedFrom_[ma->member] = true;
-                            fieldMoveLoc_[ma->member] = un->span.begin;
-                            return;
-                        }
-                    }
-                }
-            }
-            if (un->operand) recordMovesIn(*un->operand);
-            return;
-        }
-        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-            if (be->left) recordMovesIn(*be->left);
-            if (be->right) recordMovesIn(*be->right);
-            return;
-        }
-        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-            recordMovesInArgs(call->args, call->callee.get());
-            return;
-        }
-        // A constructor call `new T(owned x)` / `new T(move x)` consumes its
-        // owned arguments exactly as a method call does — most commonly
-        // `using var b := new Box(move r);`.
-        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
-            // §28.8: find the matching constructor to detect implicit owned params.
-            // Build a synthetic check by examining the ctor's parameter list directly.
-            const ast::ConstructorDecl* cd = nullptr;
-            if (ne->type) {
-                if (auto* rt = ctx_.resolvedType(*ne->type)) {
-                    if (rt->declaration) {
-                        std::size_t nArgs = ne->args.size();
-                        for (sema::Symbol* m : rt->declaration->members) {
-                            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
-                                auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                                if (d && d->params.size() == nArgs) { cd = d; break; }
-                            }
-                        }
-                    }
-                }
-            }
-            std::size_t pos = 0;
-            for (const auto& a : ne->args) {
-                if (!a.value) { ++pos; continue; }
-                if (a.modifier == "owned") {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                        markMovedByName(id->name, id->span.begin);
-                        ++pos; continue;
-                    }
-                }
-                // §28.8 implicit transfer: bare id to `owned` formal param.
-                if (a.modifier.empty() && cd && pos < cd->params.size() &&
-                    (cd->params[pos].modifier == "owned" ||
-                     cd->params[pos].modifier == "out owned")) {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                        markMovedByName(id->name, id->span.begin);
-                        ++pos; continue;
-                    }
-                }
-                recordMovesIn(*a.value);
-                ++pos;
-            }
-            return;
-        }
-    }
-
-    void recordMovesInArgs(const std::vector<ast::CallArgument>& args,
-                           const ast::Expr* callee = nullptr) {
-        // Resolve callee parameter list for implicit ownership transfer check.
-        const ast::MethodDecl*     calleeMethod = nullptr;
-        const ast::ConstructorDecl* calleeCtor  = nullptr;
-        if (callee) {
-            sema::Symbol* sym = ctx_.exprSymbol(*callee);
-            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
-                calleeMethod = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-            } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
-                calleeCtor = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-            }
-        }
-        std::size_t pos = 0;
-        for (const auto& a : args) {
-            if (!a.value) { ++pos; continue; }
-            // Slice O14: `owned x` argument modifier consumes x.
-            if (a.modifier == "owned") {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        a.value.get())) {
-                    markMovedByName(id->name, id->span.begin);
-                    ++pos; continue;
-                }
-            }
-            // §28.8 implicit ownership transfer: a bare identifier passed
-            // to an `owned` formal parameter transfers ownership without
-            // an explicit `owned` or `move` at the call site.
-            {
-                const std::vector<ast::Param>* params = nullptr;
-                if (calleeMethod)  params = &calleeMethod->params;
-                if (calleeCtor)    params = &calleeCtor->params;
-                if (params && pos < params->size() &&
-                    ((*params)[pos].modifier == "owned" ||
-                     (*params)[pos].modifier == "out owned")) {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                            a.value.get())) {
-                        markMovedByName(id->name, id->span.begin);
-                        ++pos; continue;
-                    }
-                }
-            }
-            recordMovesIn(*a.value);
-            ++pos;
-        }
-    }
-
-    // Detect `local.Dispose()` patterns and mark the local as Disposed.
-    // Also detects `local` consumed as a `return` value (handleReturn
-    // path) and `move local` (UnaryExpr op=move on bare identifier).
-    //
-    // Slice O2: before marking, check the current state — re-disposing
-    // or re-moving an already-Disposed/MovedFrom local is a diagnostic
-    // (the §28.3 "read of moved-from / disposed" rules).
-    // §28.8: check if argument at position `pos` in `args` is an implicit
-    // ownership transfer based on the callee's formal parameter list.
-    bool isImplicitOwned(const std::vector<ast::CallArgument>& args,
-                         std::size_t pos, const ast::Expr* callee) {
-        if (!callee) return false;
-        sema::Symbol* sym = ctx_.exprSymbol(*callee);
-        const ast::MethodDecl*     md = nullptr;
-        const ast::ConstructorDecl* cd = nullptr;
-        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
-            md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-        else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym))
-            cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-        const std::vector<ast::Param>* params =
-            md ? &md->params : (cd ? &cd->params : nullptr);
-        if (!params || pos >= params->size()) return false;
-        const std::string_view mod = (*params)[pos].modifier;
-        return mod == "owned" || mod == "out owned";
-    }
-
-    void handleDischarge(const ast::Expr& e) {
-        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-            if (call->callee) checkRead(*call->callee, /*selfTarget=*/true);
-            // Slice O14 + §28.8: argument-mode handling.
-            std::size_t pos = 0;
-            for (const auto& a : call->args) {
-                if (!a.value) { ++pos; continue; }
-                bool consumed = false;
-                if (a.modifier == "owned") {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                            a.value.get())) {
-                        markMovedByName(id->name, id->span.begin);
-                        consumed = true;
-                    }
-                } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
-                               a.value.get())) {
-                    if (un->op == "move") {
-                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                                un->operand.get())) {
-                            markMovedByName(id->name, id->span.begin);
-                            consumed = true;
-                        } else if (auto* ma =
-                                       dynamic_cast<const ast::MemberAccessExpr*>(
-                                           un->operand.get())) {
-                            // `M(move this.field)` — field-move at call site.
-                            if (auto* tid =
-                                    dynamic_cast<const ast::IdentifierExpr*>(
-                                        ma->target.get())) {
-                                if (tid->name == "this") {
-                                    fieldMovedFrom_[ma->member] = true;
-                                    fieldMoveLoc_[ma->member] = un->span.begin;
-                                    consumed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                // §28.8 implicit transfer: bare id to an `owned` formal param.
-                if (!consumed && a.modifier.empty() &&
-                    isImplicitOwned(call->args, pos, call->callee.get())) {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                            a.value.get())) {
-                        markMovedByName(id->name, id->span.begin);
-                        consumed = true;
-                    }
-                }
-                if (!consumed) checkRead(*a.value, /*selfTarget=*/false);
-                ++pos;
-            }
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                    call->callee.get())) {
-                if (ma->member == "Dispose") {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                            ma->target.get())) {
-                        markDisposedByName(id->name, id->span.begin);
-                    }
-                }
-            }
-            return;
-        }
-        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
-            if (un->op == "move") {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        un->operand.get())) {
-                    markMovedByName(id->name, id->span.begin);
-                    return; // don't re-check the now-moved-from operand
-                }
-                // Slice O8: `move this.field` — mark the field as
-                // moved-from. The field must be reassigned before
-                // method exit.
-                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        un->operand.get())) {
-                    if (auto* tid =
-                            dynamic_cast<const ast::IdentifierExpr*>(
-                                ma->target.get())) {
-                        if (tid->name == "this") {
-                            fieldMovedFrom_[ma->member] = true;
-                            fieldMoveLoc_[ma->member] = un->span.begin;
-                            return;
-                        }
-                    }
-                }
-            }
-            // Other unary ops — sub-expression is a regular read.
-            if (un->operand) checkRead(*un->operand, /*selfTarget=*/false);
-            return;
-        }
-        // §28.8 implicit ownership transfer for constructor calls `new T(x)`.
-        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
-            // Find the matching constructor by arity to get its param list.
-            const ast::ConstructorDecl* cd = nullptr;
-            if (ne->type) {
-                if (auto* rt = ctx_.resolvedType(*ne->type)) {
-                    if (rt->declaration) {
-                        std::size_t nArgs = ne->args.size();
-                        for (sema::Symbol* m : rt->declaration->members) {
-                            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
-                                auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                                if (d && d->params.size() == nArgs) { cd = d; break; }
-                            }
-                        }
-                    }
-                }
-            }
-            std::size_t pos = 0;
-            for (const auto& a : ne->args) {
-                if (!a.value) { ++pos; continue; }
-                bool consumed = false;
-                if (a.modifier == "owned") {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                        markMovedByName(id->name, id->span.begin);
-                        consumed = true;
-                    }
-                } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
-                    if (un->op == "move") {
-                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get())) {
-                            markMovedByName(id->name, id->span.begin);
-                            consumed = true;
-                        }
-                    }
-                }
-                // §28.8: bare id to an `owned` formal param = implicit transfer.
-                if (!consumed && a.modifier.empty() && cd && pos < cd->params.size() &&
-                    (cd->params[pos].modifier == "owned" ||
-                     cd->params[pos].modifier == "out owned")) {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                        markMovedByName(id->name, id->span.begin);
-                        consumed = true;
-                    }
-                }
-                if (!consumed) checkRead(*a.value, /*selfTarget=*/false);
-                ++pos;
-            }
-            return;
-        }
-        // Fallback: just check the expression as a read.
-        checkRead(e, /*selfTarget=*/false);
-    }
-
-    // Recursively descend an expression and, at each IdentifierExpr that
-    // names a tracked local, verify the local's ownership state is
-    // readable. `selfTarget=true` for the `x` in `x.Dispose()` — we
-    // tolerate that as the discharge use site; the post-marking handles
-    // it. For everything else, MovedFrom / Disposed is a diagnostic.
-    void checkRead(const ast::Expr& e, bool selfTarget) {
-        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-            if (selfTarget) return;  // tolerated for discharge target
-            auto* st = lookupState(id->name);
-            if (!st) return;
-            if (st->state == OwnershipState::MovedFrom) {
-                ctx_.diagnostics().report(
-                    Severity::Error, id->span.begin,
-                    std::string("owned value in `") + std::string(id->name) +
-                    "` was already moved out at this point (§28.3)");
-                st->state = OwnershipState::Poisoned;
-            } else if (st->state == OwnershipState::Disposed) {
-                ctx_.diagnostics().report(
-                    Severity::Error, id->span.begin,
-                    std::string("read of disposed local `") +
-                    std::string(id->name) + "` (§28.3)");
-                st->state = OwnershipState::Poisoned;
-            }
-            return;
-        }
-        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-            if (ma->target) checkRead(*ma->target, /*selfTarget=*/false);
-            return;
-        }
-        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-            if (be->left) checkRead(*be->left, false);
-            if (be->right) checkRead(*be->right, false);
-            return;
-        }
-        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-            // Treat the callee as a member-access-target for discharge
-            // tolerance (so `x.M(x)` doesn't flag x).
-            if (call->callee) checkRead(*call->callee, true);
-            for (const auto& a : call->args) {
-                if (a.value) checkRead(*a.value, false);
-            }
-            return;
-        }
-        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
-            if (un->operand) checkRead(*un->operand, false);
-            return;
-        }
-        // Other expression forms — not exhaustive; later slices extend.
-    }
-
-    void handleAssignment(const ast::AssignmentStmt& as) {
-        // Slice O4: `x := EXPR` where x is a tracked local updates x's
-        // state to match the producer of EXPR.
-        if (as.op != ":=") return;
-        if (!as.target || !as.value) return;
-        // Slice O15: side-effects in the RHS — `x := move y` should
-        // transition y to MovedFrom. recordMovesIn handles `move local`,
-        // `move this.field`, and `f(owned z)` in any position.
-        recordMovesIn(*as.value);
-        if (const auto* id =
-                dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
-            for (auto& [sym, st] : states_) {
-                if (sym->name != id->name) continue;
-                st.state = producerState(*as.value);
-                st.obligationOrigin = &as;
-                return;
-            }
-            return;
-        }
-        // Slice O8: `this.field := value` clears the moved-from mark
-        // on the field. (We track only `this.field` shape — `other.f`
-        // and indexer-set are sema's broader concern.)
-        if (const auto* ma =
-                dynamic_cast<const ast::MemberAccessExpr*>(as.target.get())) {
-            if (const auto* tid =
-                    dynamic_cast<const ast::IdentifierExpr*>(
-                        ma->target.get())) {
-                if (tid->name == "this") {
-                    fieldMovedFrom_[ma->member] = false;
-                }
-            }
-        }
-    }
-
-    void handleReturn(const ast::Expr& e) {
-        // For slice O1, treat `return x;` (bare identifier) as a
-        // discharge. The "is the method's return type owned T?" check
-        // is sema's; here we just satisfy the discharge requirement
-        // pessimistically.
-        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-            markDisposedByName(id->name, id->span.begin);
-            return;
-        }
-        // Slice O7: borrow-escape check. `return localRef.M(...)` /
-        // `return localRef.f` returns a borrow whose source is the
-        // local. If the local is a `using var` (scope-bound), the
-        // borrow outlives its source — error per §28.3.
-        checkBorrowEscapesOnReturn(e);
-        // For `move x` return arm: covered by handleDischarge inside
-        // the expression — but we also call it here.
-        handleDischarge(e);
-    }
-
-    // A returned value is only a *borrow* of its local root when it has
-    // reference type; a value-typed projection (e.g. `r.V` where V is an
-    // int, or `r.Size()` returning int) is a copy and cannot dangle.
-    // Generic type parameters (Named with no declaration) are treated as
-    // non-borrowable: the ownership checker runs on generic code without
-    // knowing the concrete instantiation (e.g. Box<int>.Value has sema type
-    // T which looks like an unresolved Named), and conservatively treating T
-    // as borrowable produces false positives for value-type instantiations.
-    // A missed borrow for T=class is acceptable at this stage (§14).
-    static bool isBorrowableType(const sema::TypeRef* rt) {
-        if (!rt) return true;            // unknown → conservative
-        if (rt->nullable) return true;   // nullable reference
-        switch (rt->kind) {
-            case sema::TypeRef::Kind::Primitive:
-                return rt->primitive == sema::PrimitiveType::String ||
-                       rt->primitive == sema::PrimitiveType::Object;
-            case sema::TypeRef::Kind::Function:
-                return true;
-            case sema::TypeRef::Kind::Named:
-                if (!rt->declaration) return false;  // generic param → not conservative
-                return rt->declaration->kind == ast::TypeDeclKind::Class ||
-                       rt->declaration->kind == ast::TypeDeclKind::Interface;
-            case sema::TypeRef::Kind::Error:
-                return true;             // unresolved → conservative
-            default:
-                return false;            // Unit, InlineArray, enum, record
-        }
-    }
-
-    // Walk the return value's expression and, for each path that ends
-    // in a local-identifier root, verify the root isn't a `using var`.
-    void checkBorrowEscapesOnReturn(const ast::Expr& e) {
-        const ast::IdentifierExpr* root = identifierRoot(e);
-        if (!root) return;
-        // A value-typed return is a copy, not a borrow of the local — it
-        // cannot outlive its source (§28.3 governs borrows).
-        if (!isBorrowableType(ctx_.exprType(e))) return;
-        for (const auto& [sym, st] : states_) {
-            if (sym->name != root->name) continue;
-            if (!st.implicitDischarge) continue;  // only `using var`
-            ctx_.diagnostics().report(
-                Severity::Error, root->span.begin,
-                std::string("borrow returned from `") +
-                std::string(root->name) +
-                "` would outlive its source — `using var` `" +
-                std::string(root->name) +
-                "` is disposed at scope end (§28.3 borrow-lifetime "
-                "rule; bind the source in the caller's scope and "
-                "return the borrow from there instead)");
-            return;
-        }
-    }
-
-    // Find the identifier at the root of a chain like `x.f.g[i].M(...)`.
-    // Returns null if the root isn't a bare identifier.
-    const ast::IdentifierExpr* identifierRoot(const ast::Expr& e) {
-        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
-            return id;
-        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
-            return ma->target ? identifierRoot(*ma->target) : nullptr;
-        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e))
-            return nm->target ? identifierRoot(*nm->target) : nullptr;
-        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
-            return ce->callee ? identifierRoot(*ce->callee) : nullptr;
-        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
-            return ix->target ? identifierRoot(*ix->target) : nullptr;
-        return nullptr;
-    }
-
-    // §28.3 join. Per the spec the join is asymmetric: matching states
-    // carry forward (with their auxiliary data, e.g. Owned's discharge
-    // obligation), but mismatched owned-vs-borrowed is rejected (the
-    // spec's "silently demoting an owned obligation to a borrowed state
-    // at the join would leak the resource"). Mutates `into` in place.
-    void joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>& into,
-                  const std::unordered_map<sema::Symbol*,
-                                           LocalOwnership>& other,
-                  SourceLocation joinLoc) {
-        for (auto& [sym, st] : into) {
-            auto it = other.find(sym);
-            if (it == other.end()) continue;
-            const LocalOwnership& o = it->second;
-            if (st.state == o.state) continue;
-            // PolyNull absorbs: PolyNull ⊓ X = X.
-            if (st.state == OwnershipState::PolyNull) {
-                st = o;
-                continue;
-            }
-            if (o.state == OwnershipState::PolyNull) continue;
-            // Owned vs Borrowed is the spec-rejected case.
-            const bool ownedBorrowedClash =
-                (st.state == OwnershipState::Owned &&
-                 o.state == OwnershipState::Borrowed) ||
-                (st.state == OwnershipState::Borrowed &&
-                 o.state == OwnershipState::Owned);
-            if (ownedBorrowedClash) {
-                ctx_.diagnostics().report(
-                    Severity::Error, joinLoc,
-                    std::string("branch ownership conflict for `") +
+                    st.obligationOrigin ? st.obligationOrigin->span.begin
+                                        : SourceLocation{},
+                    std::string("owned value in `") +
                     std::string(sym->name) +
-                    "`: one branch produced an owned value, the other a "
-                    "borrowed value (§28.3 — equalize the branches before "
-                    "the merge per the two Patterns)");
-                st.state = OwnershipState::Poisoned;
-                continue;
-            }
-            // Other mismatches (Disposed/MovedFrom on one side) — poison.
-            st.state = OwnershipState::Poisoned;
-        }
-    }
-
-    sema::LocalSymbol* findLocalSymbol(const ast::LocalDecl& ld) {
-        // Walk all collected symbols and find the LocalSymbol whose
-        // decl matches. Sema slice 3b created these on demand.
-        for (const auto& s : ctx_.symbols()) {
-            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s.get())) {
-                if (ls->decl == &ld) return ls;
+                    "` would be dropped here without disposal "
+                    "(§28.3 — consider `using var`, explicit "
+                    "`.Dispose()`, `move`, or `return`)");
             }
         }
-        return nullptr;
     }
+    // Slice O8 / §28.8.1: a `move this.field` leaves the field in
+    // moved-from state. The field must be reassigned before the
+    // surrounding method exits — otherwise the field's invariant
+    // is broken on method return.
+    for (const auto& [name, moved] : fieldMovedFrom_) {
+        if (moved) {
+            ctx_.diagnostics().report(
+                Severity::Error,
+                fieldMoveLoc_.count(name)
+                    ? fieldMoveLoc_[name]
+                    : SourceLocation{},
+                std::string("field `") + std::string(name) +
+                "` left in moved-from state at method exit "
+                "(§28.8.1 — reassign the field before exiting)");
+        }
+    }
+}
 
-    LocalOwnership* lookupState(std::string_view name) {
+bool MethodOwnership::bodyEndsInThrow(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (auto it = body.rbegin(); it != body.rend(); ++it) {
+        if (!*it) continue;
+        return dynamic_cast<const ast::ThrowStmt*>(it->get()) != nullptr;
+    }
+    return false;
+}
+
+void MethodOwnership::visitStmt(const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        handleLocalDecl(*ld);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) handleDischarge(*es->expr);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) handleDischarge(*ds->value);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        handleAssignment(*as);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) handleReturn(*rs->value);
+        return;
+    }
+    // Slice O4: if-then-else handling with branch-join semantics
+    // per §28.3. Each branch is walked with a snapshot of the
+    // pre-branch state; the post-branch states are joined into the
+    // current state. Owned/Borrowed mismatch at the join is a
+    // diagnostic.
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        // Snapshot the state entering the if-statement.
+        auto entry = states_;
+        // Walk the if-branch.
+        for (const auto& bs : ifs->ifBranch.body) if (bs) visitStmt(*bs);
+        auto branchEndStates = std::vector{states_};
+        // For each elif: restore entry, walk, snapshot.
+        for (const auto& el : ifs->elifBranches) {
+            states_ = entry;
+            for (const auto& bs : el.body) if (bs) visitStmt(*bs);
+            branchEndStates.push_back(states_);
+        }
+        // Else branch (or implicit fall-through == entry).
+        if (ifs->hasElse) {
+            states_ = entry;
+            for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
+            branchEndStates.push_back(states_);
+        } else {
+            // No else: the false edge falls through with entry state.
+            branchEndStates.push_back(entry);
+        }
+        // Join all branches. Start from the first; reduce in pairs.
+        auto joined = branchEndStates.front();
+        for (std::size_t i = 1; i < branchEndStates.size(); ++i) {
+            joinInto(joined, branchEndStates[i], ifs->span.begin);
+        }
+        states_ = std::move(joined);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body) if (bs) visitStmt(*bs);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : ts->body) if (bs) visitStmt(*bs);
+        for (const auto& arm : ts->catches) {
+            if (arm.body) visitStmt(*arm.body);
+        }
+        for (const auto& bs : ts->finallyBody) if (bs) visitStmt(*bs);
+        return;
+    }
+}
+
+OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
+    // `new T(...)` is the canonical producer of Owned values — but only
+    // for reference types (classes). §9: a record is a value type with
+    // no disposal obligation (§9.7 forbids record destructors and owned
+    // fields), so `new Record(...)` yields a plain value, not an owned
+    // resource. (Enums and other value kinds likewise.)
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        if (ne->type) {
+            if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                if (rt->kind == sema::TypeRef::Kind::Named &&
+                    rt->declaration &&
+                    rt->declaration->kind != ast::TypeDeclKind::Class &&
+                    rt->declaration->kind != ast::TypeDeclKind::Interface) {
+                    return OwnershipState::Borrowed;  // value type: no obligation
+                }
+            }
+        }
+        return OwnershipState::Owned;
+    }
+    // `null` is the polymorphic-null state (§28.3 null-literal row).
+    if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
+        return OwnershipState::PolyNull;
+    }
+    // Slice O13: a call to a method with an `owned T` return type
+    // produces an Owned value. The callee MethodSymbol resolution
+    // comes from sema; we look at its MethodDecl::returnOwned to
+    // decide. A null callee symbol (overload not yet pickable, or
+    // a call on a value with no symbol) falls through to Borrowed.
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) {
+            if (auto* sym = ctx_.exprSymbol(*ce->callee)) {
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
+                    auto* md = dynamic_cast<const ast::MethodDecl*>(
+                        ms->decl);
+                    if (md && md->returnOwned) {
+                        return OwnershipState::Owned;
+                    }
+                }
+            }
+        }
+    }
+    // Default: Borrowed.
+    return OwnershipState::Borrowed;
+}
+
+void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
+    // Find the LocalSymbol that ExprTypecheck created for this decl.
+    sema::LocalSymbol* lsym = findLocalSymbol(ld);
+    if (!lsym) return;
+    LocalOwnership lo;
+    lo.obligationOrigin = &ld;
+    if (ld.isUsing) {
+        // `using var` is always Owned and implicitly discharged.
+        lo.state = OwnershipState::Owned;
+        lo.implicitDischarge = true;
+    } else if (ld.initializer) {
+        lo.state = producerState(*ld.initializer);
+    } else {
+        lo.state = OwnershipState::Uninitialized;
+    }
+    states_[lsym] = lo;
+    // Slice O8: if the initializer involves `move this.field`, mark
+    // the field as moved-from (the move side-effect happens at
+    // initializer evaluation time, regardless of the local's `using`
+    // status). This lets `using var old := move this._log;` correctly
+    // record that `_log` is now empty.
+    if (ld.initializer) {
+        recordMovesIn(*ld.initializer);
+    }
+}
+
+void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
+    // Slice O4: `x := EXPR` where x is a tracked local updates x's
+    // state to match the producer of EXPR.
+    if (as.op != ":=") return;
+    if (!as.target || !as.value) return;
+    // Slice O15: side-effects in the RHS — `x := move y` should
+    // transition y to MovedFrom. recordMovesIn handles `move local`,
+    // `move this.field`, and `f(owned z)` in any position.
+    recordMovesIn(*as.value);
+    if (const auto* id =
+            dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
         for (auto& [sym, st] : states_) {
-            if (sym->name == name) return &st;
+            if (sym->name != id->name) continue;
+            st.state = producerState(*as.value);
+            st.obligationOrigin = &as;
+            return;
         }
-        return nullptr;
+        return;
     }
+    // Slice O8: `this.field := value` clears the moved-from mark
+    // on the field. (We track only `this.field` shape — `other.f`
+    // and indexer-set are sema's broader concern.)
+    if (const auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(as.target.get())) {
+        if (const auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(
+                    ma->target.get())) {
+            if (tid->name == "this") {
+                fieldMovedFrom_[ma->member] = false;
+            }
+        }
+    }
+}
 
-    void markDisposedByName(std::string_view name, SourceLocation loc) {
-        auto* st = lookupState(name);
-        if (!st) return;
-        if (st->state == OwnershipState::Disposed) {
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                std::string("local `") + std::string(name) +
-                "` was already disposed (§28.3 — `.Dispose()` is "
-                "idempotent but re-calling it on a known-disposed local "
-                "indicates a bug)");
-            st->state = OwnershipState::Poisoned;
-            return;
-        }
-        if (st->state == OwnershipState::MovedFrom) {
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                std::string("cannot dispose `") + std::string(name) +
-                "`: it was already moved out (§28.3)");
-            st->state = OwnershipState::Poisoned;
-            return;
-        }
-        st->state = OwnershipState::Disposed;
+void MethodOwnership::handleReturn(const ast::Expr& e) {
+    // For slice O1, treat `return x;` (bare identifier) as a
+    // discharge. The "is the method's return type owned T?" check
+    // is sema's; here we just satisfy the discharge requirement
+    // pessimistically.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        markDisposedByName(id->name, id->span.begin);
+        return;
     }
+    // Slice O7: borrow-escape check. `return localRef.M(...)` /
+    // `return localRef.f` returns a borrow whose source is the
+    // local. If the local is a `using var` (scope-bound), the
+    // borrow outlives its source — error per §28.3.
+    checkBorrowEscapesOnReturn(e);
+    // For `move x` return arm: covered by handleDischarge inside
+    // the expression — but we also call it here.
+    handleDischarge(e);
+}
 
-    void markMovedByName(std::string_view name, SourceLocation loc) {
-        auto* st = lookupState(name);
-        if (!st) return;
-        if (st->state == OwnershipState::MovedFrom) {
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                std::string("owned value in `") + std::string(name) +
-                "` was already moved out at this point (§28.3)");
-            st->state = OwnershipState::Poisoned;
-            return;
-        }
-        if (st->state == OwnershipState::Disposed) {
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                std::string("cannot move from disposed local `") +
-                std::string(name) + "` (§28.3)");
-            st->state = OwnershipState::Poisoned;
-            return;
-        }
-        if (st->implicitDischarge) {
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                std::string("cannot move out of `using var` `") +
-                std::string(name) +
-                "`; `using var` is scope-bound (§28.3)");
-            st->state = OwnershipState::Poisoned;
-            return;
-        }
-        st->state = OwnershipState::MovedFrom;
-    }
-};
+namespace {
 
 // Top-level walker — visits every method/ctor body in the source.
 void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx);

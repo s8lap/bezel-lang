@@ -91,11 +91,16 @@ add_library(bezel_core STATIC
     src/sema/TypeChecker.cpp
     src/sema/SymbolCollection.cpp
     src/sema/TypeResolution.cpp
+    src/sema/TypeResolution_Names.cpp
+    src/sema/TypeResolution_Checks.cpp
     src/sema/ExprTypecheck.cpp
+    src/sema/ExprTypecheck_Exprs.cpp
+    src/sema/ExprTypecheck_Calls.cpp
     src/sema/DefiniteAssignment.cpp
     src/flow/CFG.cpp
     src/ownership/OwnershipChecker.cpp
     src/ownership/Ownership.cpp
+    src/ownership/Ownership_Checks.cpp
     src/codegen/CodeGen.cpp
     src/codegen/LlvmBackend.cpp
     src/codegen/LlvmBackend_Setup.cpp
