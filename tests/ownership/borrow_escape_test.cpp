@@ -84,3 +84,59 @@ BEZEL_TEST(own_escape, return_value_method_on_using_var_clean) {
         "end Get; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §28.3 (D15 reject-valid regression): a built-in collection's value-typed
+// `.Length` projection is `int` (stdlib §3), a copy — not a borrow of the
+// collection. Returning it from a `using var` collection is NOT a borrow
+// escape. Sema types `Length`/`Count` only on the *call* form, so the bare
+// property access reaches the ownership pass untyped; the value-typed
+// fallback (returnedExprMayBorrow) must still recognize it as a copy.
+BEZEL_TEST(own_escape, return_length_on_using_var_collection_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); a.Add(1); "
+        "    return a.Length; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 (D15): `.Count` is the same value-typed `int` projection (stdlib §9).
+BEZEL_TEST(own_escape, return_count_on_using_var_collection_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); a.Add(1); "
+        "    return a.Count; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 (D15): `.Get(0)` yields the value-typed element (`int` here), a
+// copy — sema types the CallExpr, so returning it is not a borrow escape.
+BEZEL_TEST(own_escape, return_value_element_get_on_using_var_collection_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); a.Add(7); "
+        "    return a.Get(0); "
+        "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 GUARD (must NOT be weakened by the value-typed fix): returning a
+// REFERENCE-typed *field* of a `using var` still aliases into the scope-
+// bound source and is rejected as a borrow escape. The value-typed fallback
+// recognizes Length/Count/IsEmpty by name only; a class-typed field `.Inner`
+// is typed by sema as a borrowable class type, so it is still diagnosed —
+// the fix narrows acceptance to value-typed copies only.
+BEZEL_TEST(own_escape, return_reference_field_on_using_var_still_diagnosed) {
+    auto r = parseAndCheckOwnership(
+        "module M; class View end View; "
+        "class Connection public Inner: View := null; end Connection; "
+        "class C public method Leak(): View "
+        "  using var c := new Connection(); "
+        "  return c.Inner; "
+        "end Leak; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
