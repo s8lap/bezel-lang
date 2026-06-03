@@ -677,6 +677,13 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
 }
 
 void MethodOwnership::handleReturn(const ast::Expr& e) {
+    // §28.9 / §9.7 escape checks (issue #360). These run before the
+    // bare-identifier discharge fast-path below so that a returned
+    // closure or borrow-bearing record is examined even when it is the
+    // whole returned expression. Neither check marks any local disposed;
+    // they only diagnose. The discharge handling below is unchanged.
+    checkClosureEscapesOnReturn(e);       // D1: §28.9 closure capture escape
+    checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement

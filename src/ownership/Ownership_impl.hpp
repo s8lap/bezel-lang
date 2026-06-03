@@ -152,6 +152,44 @@ private:
     // in a local-identifier root, verify the root isn't a `using var`.
     void checkBorrowEscapesOnReturn(const ast::Expr& e);
 
+    // §28.9 closure-escape (issue #360, D1): a returned lambda whose
+    // captured set includes an owned (`using var` or owned-producing)
+    // method-scope local of reference type. Capturing such a local does
+    // not transfer ownership; the capture is a borrow whose source is the
+    // local's enclosing scope, and the returned closure outlives that
+    // scope — a use-after-dispose. Walks the returned expression for any
+    // LambdaExpr and diagnoses each offending capture.
+    void checkClosureEscapesOnReturn(const ast::Expr& e);
+
+    // Free-variable walk of a lambda body. Appends to `out` every
+    // IdentifierExpr in the body (and in nested lambdas) — sema has
+    // already attached each identifier's resolved Symbol via exprSymbol,
+    // and a captured method-scope local resolves to the same LocalSymbol
+    // key the dataflow tracks in `states_`, so resolving against `states_`
+    // by symbol identifies exactly the captured method-scope locals.
+    void collectLambdaIdentifiers(
+        const ast::LambdaExpr& lam,
+        std::vector<const ast::IdentifierExpr*>& out) const;
+    void collectIdentifiersIn(
+        const ast::Expr& e,
+        std::vector<const ast::IdentifierExpr*>& out) const;
+    void collectIdentifiersInStmt(
+        const ast::Stmt& s,
+        std::vector<const ast::IdentifierExpr*>& out) const;
+
+    // §9.7 borrow-bearing-record escape (issue #360, D2): a returned
+    // expression whose static type is a borrow-bearing record that
+    // carries a borrow of a scope-bound (`using var` / owned) local.
+    // Handles the direct `return new Rec(...localUsingVar...)` form.
+    void checkRecordBorrowEscapesOnReturn(const ast::Expr& e);
+
+    // §9.7: true when `rt` is a record type that holds at least one
+    // borrow-carrying field of a non-runtime-managed type (a class/
+    // interface reference field, an inline array of reference elements,
+    // or another borrow-bearing record). String/function/boxed and
+    // value-typed fields do not make a record borrow-bearing.
+    bool isBorrowBearingRecord(const sema::TypeRef* rt) const;
+
     // Find the identifier at the root of a chain like `x.f.g[i].M(...)`.
     // Returns null if the root isn't a bare identifier.
     const ast::IdentifierExpr* identifierRoot(const ast::Expr& e);
