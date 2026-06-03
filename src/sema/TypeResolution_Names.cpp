@@ -146,6 +146,13 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
             }
         }
     }
+    // §14.2: track the type whose body we're resolving, so a deferred
+    // generic-param argument inside an inner instantiation (`C<W>`) can be
+    // attributed to its owning type (Box) and re-checked at Box's concrete
+    // instantiation sites. Save/restore around the body so a nested type
+    // restores its enclosing type's value on exit.
+    TypeSymbol* savedOuter = currentOuterType_;
+    if (tsym) currentOuterType_ = tsym;
     // Slice S10: a class has at most one class-kind base; the
     // rest must be interfaces. Records and enums don't take
     // base classes (we don't enforce here — that's a separate
@@ -206,6 +213,7 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     }
     // Enum constants don't carry types syntactically (their `:= value`
     // is a Const expression; types come from the underlying-int).
+    currentOuterType_ = savedOuter;  // §14.2: restore enclosing-type context
 }
 
 void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
@@ -442,6 +450,22 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (tsym && !t.genericArgs.empty() &&
         t.genericArgs.size() == tsym->genericParams.size()) {
         checkGenericConstraints(t, tsym, ref.genericArgs, scope);
+        // §14.2: record this concrete instantiation so a deferred inner
+        // obligation owned by `tsym` (recorded while resolving tsym's body)
+        // can be re-checked against the binding it supplies here. Recording
+        // every well-formed instantiation (not only constrained ones) keeps
+        // the final join order-independent: the instantiation site may be
+        // visited before tsym's body, so the body's obligations may not yet
+        // exist when we get here.
+        GenericInstantiation inst;
+        inst.type = tsym;
+        inst.enclosingType = currentOuterType_;  // body this site sits in
+        inst.site = &t;
+        for (std::size_t i = 0; i < ref.genericArgs.size(); ++i) {
+            inst.argRefs.push_back(ref.genericArgs[i]);
+            inst.argAsts.push_back(t.genericArgs[i].get());
+        }
+        instantiations_.push_back(std::move(inst));
     }
 }
 

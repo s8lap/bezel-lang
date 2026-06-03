@@ -1321,10 +1321,17 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
         const ast::Type* argAst = t.genericArgs[pi].get();
         TypeRef* arg = argRefs[pi];
         if (!argAst || !arg) continue;
-        // Skip arguments that are themselves generic params — their
-        // classification is only known at the outer instantiation, where the
-        // outer constraints are checked (§14.2).
-        if (isGenericParamRef(*argAst, scope)) continue;
+        // §14.2: an argument that is itself a generic parameter of the type
+        // whose body we are resolving (e.g. `C<W>` inside `class Box<W>`)
+        // cannot be classified here — W's identity is only known at Box's
+        // concrete instantiation sites. Record the inner constraint as a
+        // deferred obligation, attributed to the outer parameter (W) and its
+        // owning type (Box), and re-check it after the whole pass once every
+        // instantiation site is known (checkDeferredNestedConstraints).
+        if (isGenericParamRef(*argAst, scope)) {
+            recordDeferredNested(*argAst, *gp, *td, t);
+            continue;
+        }
         if (arg->kind == TypeRef::Kind::Error) continue;
 
         // Find the constraint clause(s) for this parameter name.
@@ -1338,6 +1345,150 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                 checkOneConstraint(t, gp->name, item, argAst, arg,
                                    &boundScope);
             }
+        }
+    }
+}
+
+void Resolver::recordDeferredNested(const ast::Type& argAst,
+                                    const GenericParamSymbol& innerParam,
+                                    const ast::TypeDecl& innerDecl,
+                                    const ast::Type& innerSite) {
+    // §14.2: only obligations parameterised by a generic param of the type
+    // whose body we are resolving can be discharged by re-checking that
+    // type's concrete instantiation sites. A *method*-level generic param
+    // (or a stray ref with no owning type context) binds at the call site, a
+    // separate mechanism — leave it deferred as before to avoid false joins.
+    if (!currentOuterType_) return;
+    std::string_view outerParam = argAst.name->parts.front();
+    bool ownedByOuter = false;
+    for (Symbol* gp : currentOuterType_->genericParams) {
+        if (gp && gp->name == outerParam) { ownedByOuter = true; break; }
+    }
+    if (!ownedByOuter) return;
+
+    // The inner constraints for `innerParam` are the obligations. Skip the
+    // historical `is owned` / `is not owned` modifier form (§14.4) — it
+    // carries no instantiation-time obligation, mirroring checkGenericConstraints.
+    for (const auto& gc : innerDecl.genericConstraints) {
+        if (gc.typeParam != innerParam.name) continue;
+        if (!gc.modifierConstraint.empty()) continue;
+        for (const auto& item : gc.items) {
+            DeferredNestedObligation ob;
+            ob.outerType = currentOuterType_;
+            ob.outerParamName = outerParam;
+            ob.innerParamName = innerParam.name;
+            ob.item = &item;
+            ob.innerSite = &innerSite;
+            deferredNested_.push_back(ob);
+        }
+    }
+}
+
+void Resolver::checkDeferredNestedConstraints() {
+    // §14.2: discharge each deferred inner obligation against the concrete
+    // bindings the program supplies for it. Example: `class Box<W> ... C<W>
+    // ...` with `class C<T> where T: new()` yields an obligation (outer=Box,
+    // outerParam=W, item=new()). The instantiation `Box<IFoo>` binds W=IFoo,
+    // so we check that IFoo satisfies `where T: new()` — rejecting the
+    // indirect form exactly as the direct form `C<IFoo>` is rejected.
+    //
+    // Bindings may chain through several nesting generics: `Outer<X>` binds
+    // `Box<X>`, and `Outer<IFoo>` binds X=IFoo, so the obligation on Box's W
+    // re-keys to Outer's X and resolves at `Outer<IFoo>`. We handle this with
+    // a worklist: a binding that is itself a generic parameter of the
+    // enclosing type re-targets the obligation to that (type, param), and a
+    // visited set keeps the closure finite.
+    Scope boundModule;
+    if (ctx_.module()) {
+        for (Symbol* child : ctx_.module()->children) {
+            if (!child->name.empty()) boundModule.names[child->name] = child;
+        }
+    }
+
+    // The propagation key for an obligation: which (type, param) currently
+    // carries it. The constraint item and inner-site span travel unchanged.
+    struct Pending {
+        TypeSymbol* outerType;
+        std::string_view outerParamName;
+        std::string_view innerParamName;
+        const ast::ConstraintItem* item;
+        const ast::Type* innerSite;
+    };
+
+    // A binding that is itself an in-scope generic parameter (not a primitive,
+    // not a built-in, no resolved user declaration) — i.e. a chained
+    // deferral that must re-key to the enclosing type's parameter.
+    auto isGenericParamBinding = [&](TypeRef* bound,
+                                     const ast::Type* boundAst) -> bool {
+        return bound && boundAst && !bound->declaration &&
+               bound->kind == TypeRef::Kind::Named &&
+               boundAst->kind == ast::TypeKind::Named && boundAst->name &&
+               boundAst->name->parts.size() == 1 &&
+               primitiveFromName(boundAst->name->parts.front()) ==
+                   PrimitiveType::None &&
+               builtinTypeArity(boundAst->name->parts.front()) == kNotBuiltin;
+    };
+
+    std::vector<Pending> work;
+    for (const DeferredNestedObligation& ob : deferredNested_) {
+        if (ob.item && ob.outerType) {
+            work.push_back({ob.outerType, ob.outerParamName,
+                            ob.innerParamName, ob.item, ob.innerSite});
+        }
+    }
+
+    // Visited set over (item, type, param) so a binding cycle (or a diamond
+    // of instantiation sites) does not re-enqueue the same obligation.
+    std::set<std::tuple<const ast::ConstraintItem*, TypeSymbol*,
+                        std::string_view>>
+        visited;
+
+    while (!work.empty()) {
+        Pending p = work.back();
+        work.pop_back();
+        if (!visited.insert({p.item, p.outerType, p.outerParamName}).second) {
+            continue;
+        }
+
+        // Index of the carrying parameter (W) in its owning type (Box).
+        std::size_t outerIdx = p.outerType->genericParams.size();
+        for (std::size_t i = 0; i < p.outerType->genericParams.size(); ++i) {
+            Symbol* gp = p.outerType->genericParams[i];
+            if (gp && gp->name == p.outerParamName) { outerIdx = i; break; }
+        }
+        if (outerIdx >= p.outerType->genericParams.size()) continue;
+
+        for (const GenericInstantiation& inst : instantiations_) {
+            if (inst.type != p.outerType) continue;
+            if (outerIdx >= inst.argRefs.size()) continue;
+            TypeRef* bound = inst.argRefs[outerIdx];
+            const ast::Type* boundAst = (outerIdx < inst.argAsts.size())
+                                            ? inst.argAsts[outerIdx] : nullptr;
+            if (!bound || !boundAst) continue;
+            if (bound->kind == TypeRef::Kind::Error) continue;
+
+            if (isGenericParamBinding(bound, boundAst)) {
+                // Chained: the binding is a generic param of the body this
+                // site sits in. Re-key the obligation to (enclosingType,
+                // that param) and continue the closure. Without an enclosing
+                // type the param cannot be a type-generic param we track, so
+                // there is nothing further to discharge here.
+                if (!inst.enclosingType) continue;
+                work.push_back({inst.enclosingType,
+                                boundAst->name->parts.front(),
+                                p.innerParamName, p.item, p.innerSite});
+                continue;
+            }
+
+            // Concrete binding: re-check the inner constraint against it. The
+            // diagnostic points at the inner site (`C<W>`), naming the
+            // concrete bound's spelling, so the message identifies which
+            // nested instantiation is unsatisfiable. boundScope only needs
+            // module names for type-bound resolution here.
+            Scope boundScope;
+            boundScope.parent = &boundModule;
+            checkOneConstraint(*p.innerSite, p.innerParamName, *p.item,
+                               boundAst, bound, &boundScope);
         }
     }
 }

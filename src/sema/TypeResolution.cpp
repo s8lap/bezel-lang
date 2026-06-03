@@ -49,6 +49,13 @@ void Resolver::run(const ast::SourceFile& src) {
         if (!decl) continue;
         resolveTopDecl(*decl, &moduleScope);
     }
+    // §14.2: now that every instantiation site and every deferred
+    // nested-generic obligation has been recorded, join them and re-check the
+    // inner constraints with the outer parameter bound to each concrete
+    // argument. This closes the soundness hole where a constraint on an inner
+    // generic (`C<T> where T: new()`) was silently skipped when reached
+    // through an outer generic (`Box<W>` ⇒ `C<W>`, then `Box<IFoo>`).
+    checkDeferredNestedConstraints();
     // Slice S12: after every base-type reference is resolved,
     // walk each TypeSymbol's inheritance chain and report cycles.
     bool hadCycle = checkInheritanceCycles();

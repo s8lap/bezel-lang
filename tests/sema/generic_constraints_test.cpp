@@ -357,10 +357,149 @@ BEZEL_TEST(sema_generic_constraints, combined_class_new_value_arg_diagnoses_14_2
 
 BEZEL_TEST(sema_generic_constraints, generic_param_arg_deferred_14_2) {
     // Inside Wrapper<U>, the instantiation C<U> cannot be classified here;
-    // no diagnostic should fire (the obligation is on the outer site).
+    // no diagnostic should fire (the obligation is on the outer site). With
+    // no concrete instantiation of Wrapper anywhere, the obligation never
+    // joins a binding and no diagnostic is produced.
     auto r = parseSemaAll(
         "module M; "
         "class C<T> where T: class private _x: T?; end C; "
         "class Wrapper<U> private _c: C<U>?; end Wrapper;");
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
+}
+
+// ---------------------------------------------------------------------------
+// Nested-generic constraint propagation (§14.2). A constraint on an inner
+// generic (`C<T> where T: ...`) must hold for the *concrete* type a nesting
+// generic binds its parameter to. `class Box<W> ... C<W> ...` defers W's
+// classification to Box's instantiation sites; `Box<IFoo>` binds W=IFoo, so
+// `C<W=IFoo>` is checked — and rejected — exactly as the direct form
+// `C<IFoo>` would be. Closes the soundness hole where the indirect form was
+// silently accepted.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(sema_generic_constraints, nested_new_indirect_violation_diagnoses_14_2) {
+    // Box<IFoo> ⇒ C<W=IFoo>; IFoo is an interface and does not satisfy new().
+    // The indirect form must be rejected, mirroring the direct C<IFoo>.
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<T> where T: new() private _x: T?; end C; "
+        "interface IFoo end IFoo; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "class App private _u: Box<IFoo>?; end App;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_new_direct_violation_diagnoses_14_2) {
+    // The direct form C<IFoo> (control): already rejected — IFoo (interface)
+    // does not satisfy where T: new().
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<T> where T: new() private _x: T?; end C; "
+        "interface IFoo end IFoo; "
+        "class App private _u: C<IFoo>?; end App;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_new_indirect_satisfied_ok_14_2) {
+    // Box<Good> ⇒ C<W=Good>; Good is a class with an implicit default ctor,
+    // so it satisfies where T: new(). The whole program compiles clean.
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<T> where T: new() private _x: T?; end C; "
+        "class Good end Good; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "class App private _u: Box<Good>?; end App;");
+    BEZEL_EXPECT_FALSE(hasConstraintError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_class_indirect_violation_diagnoses_14_2) {
+    // The propagation is constraint-kind agnostic: Box<int> ⇒ C<W=int> with
+    // where T: class is rejected (int is a value type).
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<T> where T: class private _x: T?; end C; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "class App private _u: Box<int>?; end App;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_iface_bound_indirect_violation_diagnoses_14_2) {
+    // Box<Plain> ⇒ C<W=Plain> with where T: IFoo; Plain does not conform.
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IFoo method F(); end IFoo; "
+        "class Plain end Plain; "
+        "class C<T> where T: IFoo private _x: T?; end C; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "class App private _u: Box<Plain>?; end App;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_indirect_source_order_independent_14_2) {
+    // The outer instantiation (App) precedes both the nesting generic (Box)
+    // and the constrained generic (C) in source order. The final join is
+    // order-independent, so the violation is still caught.
+    auto r = parseSemaAll(
+        "module M; "
+        "class App private _u: Box<IFoo>?; end App; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "interface IFoo end IFoo; "
+        "class C<T> where T: new() private _x: T?; end C;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_chained_generic_param_satisfied_ok_14_2) {
+    // Outer<X> binds Box<X>, and Box<W> ⇒ C<W>. With Outer<int> ⇒ Box<int>
+    // ⇒ C<int> and where T: new(), int satisfies new(): no diagnostic. This
+    // exercises the chained-binding path (Box's binding is itself a generic
+    // param X, re-keyed to Outer's instantiation).
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<T> where T: new() private _x: T?; end C; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "class Outer<X> private _o: Box<X>?; end Outer; "
+        "class App private _u: Outer<int>?; end App;");
+    BEZEL_EXPECT_FALSE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_chained_generic_param_violation_diagnoses_14_2) {
+    // The chain propagates violations too: Outer<IFoo> ⇒ Box<IFoo> ⇒
+    // C<W=IFoo>, and IFoo (interface) does not satisfy where T: new(). The
+    // worklist re-keys C's obligation through Box's W to Outer's X and
+    // discharges it at Outer<IFoo>.
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<T> where T: new() private _x: T?; end C; "
+        "interface IFoo end IFoo; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "class Outer<X> private _o: Box<X>?; end Outer; "
+        "class App private _u: Outer<IFoo>?; end App;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_value_indirect_satisfied_ok_14_2) {
+    // Guard against over-rejection: Box<int> ⇒ C<W=int> with where T: value;
+    // int is a value type and satisfies it. No diagnostic.
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<T> where T: value private _x: T?; end C; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "class App private _u: Box<int>?; end App;");
+    BEZEL_EXPECT_FALSE(hasConstraintError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_generic_constraints, nested_iface_bound_indirect_satisfied_ok_14_2) {
+    // Guard against over-rejection: Box<Impl> ⇒ C<W=Impl> with where T: IFoo;
+    // Impl implements IFoo (rule 1), so it conforms. No diagnostic.
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IFoo method F(); end IFoo; "
+        "class Impl : IFoo public method F() end F; end Impl; "
+        "class C<T> where T: IFoo private _x: T?; end C; "
+        "class Box<W> private _b: C<W>?; end Box; "
+        "class App private _u: Box<Impl>?; end App;");
+    BEZEL_EXPECT_FALSE(hasConstraintError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
