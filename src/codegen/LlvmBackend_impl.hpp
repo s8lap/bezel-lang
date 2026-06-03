@@ -203,6 +203,21 @@ private:
         // borrowing collection or value elements — only the backing is freed).
         bool collection = false;
         llvm::Value* collectionElemDisposer = nullptr;
+        // #383 / §28: a `using var` that owns a class/interface object but
+        // whose concrete class is not statically known here (an interface-
+        // typed slot, or a call/`move` initializer). Disposed via DYNAMIC
+        // dispatch through the object's own vtable (slot 1) — which runs the
+        // most-derived destructor + base chain and reclaims the block (#380),
+        // exactly like the `cls`-set path but without needing a TypeSymbol in
+        // disposerFns_. `cls` is null for these.
+        bool dynamicDispose = false;
+        // #383 / §31.1: the in-flight exception object caught by a catch arm.
+        // Freed (via the object's vtable — destructor + base chain + free) on a
+        // NORMAL handled exit of the arm (fall-through, return, break,
+        // continue), but SKIPPED on the UNWIND path (a re-raise/throw from the
+        // arm keeps it in flight for the enclosing handler). `slot` holds the
+        // object pointer; `cls` is null. See emitDisposals' isUnwind parameter.
+        bool caughtException = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // CG13: the compiler-generated Dispose function for each class.
@@ -297,6 +312,16 @@ private:
     // currentEnumMethod_: when we're emitting an enum instance method, set to
     // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
     const sema::TypeSymbol* currentEnumMethod_ = nullptr;
+
+    // #383 / §28.8.1: true while emitting a class's compiler-generated Dispose
+    // (a destructor body). A `using var u := move this._f;` inside a destructor
+    // is NOT registered for disposal: the destructor's auto field-dispose pass
+    // (emitOwnedFieldDisposals) already disposes _f, and codegen does not track
+    // moved-from state, so registering the moved value too would double-free.
+    // The field-restoration rule (§28.8.1) guarantees safety OUTSIDE a
+    // destructor (the field is reassigned to null/a fresh object on every exit,
+    // and field disposal is null-safe).
+    bool emittingDisposerBody_ = false;
 
     // Block-form property getter functions (§22.9 `get => do...end;`).
     // Keyed by PropertyDecl so the same getter function is reused across
@@ -1309,6 +1334,27 @@ private:
     // resolved type of a `new T(...)` initializer.
     const sema::TypeSymbol* classOfLocal(const ast::LocalDecl* ld);
 
+    // #383 / §28: a `using var` whose initializer yields an OWNED class/
+    // interface object whose concrete class is not captured by classOfLocal
+    // (which only matches a class-typed annotation or a `new`). Two cases:
+    //   (a) the declared/resolved type is an interface (a reference type with
+    //       a vtable, but no entry in disposerFns_); or
+    //   (b) the initializer is a call whose method returns `owned T` (T a
+    //       class or interface) — distinct from a borrow return (§28.10's
+    //       "initialized from a borrow", which assumes NO disposal).
+    // Returns true → register for dynamic disposal. The disposal dispatches
+    // through the object's own vtable, so the concrete class is unneeded.
+    bool usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld);
+
+    // #383 / §28.8.1: a `using var u := move x.f;` takes the owned field's
+    // value (a class object) and discharges it at scope end. Returns true if
+    // the initializer is `move <expr>` whose moved value is a class/interface
+    // object — register for dynamic disposal. Not registered while emitting a
+    // destructor body (where the auto field-dispose pass would also touch the
+    // moved-from field → a double-free; codegen does not track moved-from
+    // state — see emittingDisposerBody_).
+    bool usingVarIsMovedClassObject(const ast::LocalDecl* ld);
+
     // #362 / stdlib §4.5: the resolved collection TypeRef of a local (declared
     // type, then `new` initializer type, then inferred initializer type), or
     // null if the local is not a heap collection.
@@ -1322,8 +1368,11 @@ private:
                           std::size_t startIdx = 0);
 
     // CG13: emit Dispose calls for one scope's `using var`s, in reverse
-    // declaration order (§28.4 ordering).
-    void emitDisposals(const std::vector<Disposal>& scope);
+    // declaration order (§28.4 ordering). #383 / §31.1: when `isUnwind` is true
+    // (the exception-propagation path), a `caughtException` entry is SKIPPED —
+    // a re-raise/throw leaving a catch arm keeps the exception in flight for
+    // the enclosing handler to free.
+    void emitDisposals(const std::vector<Disposal>& scope, bool isUnwind = false);
 
     // CG13: dispose every open scope (innermost → outermost) — the
     // cleanup a `return` runs before leaving the method.
