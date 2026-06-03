@@ -193,6 +193,7 @@ set(BEZEL_TEST_SOURCES
     codegen/record_basics_test.cpp
     codegen/record_equality_test.cpp
     codegen/value_semantics_test.cpp
+    codegen/body_record_equality_test.cpp
     codegen/inline_array_test.cpp
     codegen/string_test.cpp
     codegen/string_compare_test.cpp

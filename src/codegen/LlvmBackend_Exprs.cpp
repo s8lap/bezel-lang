@@ -191,15 +191,28 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
                             cur = nxt;
                         }
+                        // §8.5 / §9.2: a positional / combined record, or an
+                        // eligible body record, gets the synthesized
+                        // property-listing ToString; an ineligible body record
+                        // gets the type-name default.
+                        bool positional = false;
+                        if (auto* td =
+                                dynamic_cast<const ast::TypeDecl*>(ts->decl))
+                            positional = td->hasPositionalFields;
+                        bool autoBearing =
+                            positional ||
+                            sema::isAutoEqualityBearingBodyRecord(ts);
                         if (toStr) {
                             // Spill the record value to an alloca so we have a ptr.
                             llvm::AllocaInst* spill = entryAlloca(ev->getType());
                             builder_.CreateStore(ev, spill);
                             std::vector<llvm::Value*> args{spill};
                             pv = emitMethodCall(toStr, args, false);
-                        } else if (ts->kind == ast::TypeDeclKind::Record) {
-                            // §9.1: a record with no user ToString gets the
-                            // synthesized `TypeName(Field: value, ...)` form.
+                        } else if (ts->kind == ast::TypeDeclKind::Record &&
+                                   autoBearing) {
+                            // §8.5 / §9.1 / §9.2: a record with no user ToString
+                            // gets the synthesized `TypeName(Prop: value, ...)`
+                            // form over its storage members.
                             pv = emitRecordToString(ev, ts);
                         } else {
                             // No ToString — use type name (§8.5).
@@ -2280,20 +2293,85 @@ llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
                               const std::vector<ast::CallArgument>& args) {
     llvm::StructType* st = recordStruct(t);
     llvm::Value* slot = entryAlloca(st);
+    // §9.1 / §9.2: storage = positional/body FieldSymbols + body
+    // auto-properties (PropertySymbol), in declaration order.
     std::vector<const sema::Symbol*> fields;
-    for (const sema::Symbol* m : t->members) {
-        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-        if (fs && !isStaticField(fs)) fields.push_back(fs);
+    collectRecordStorage(t, fields);
+
+    // §9.1 positional record: a bare positional argument list whose count
+    // matches the storage members maps each argument to its field by
+    // position. This is the original positional-record construction path,
+    // taken only when the record has no explicit constructor.
+    if (!hasAnyConstructor(t) && !args.empty() &&
+        args.size() == fields.size()) {
+        bool allPositional = true;
+        for (const auto& a : args)
+            if (!a.name.empty()) { allPositional = false; break; }
+        if (allPositional) {
+            for (std::size_t i = 0; i < fields.size(); ++i) {
+                if (!args[i].value) return nullptr;
+                llvm::Value* v = lowerExpr(*args[i].value);
+                if (!v) return nullptr;
+                auto idxIt = fieldIndex_.find(fields[i]);
+                if (idxIt == fieldIndex_.end()) return nullptr;
+                builder_.CreateStore(
+                    v, builder_.CreateStructGEP(st, slot, idxIt->second));
+            }
+            return builder_.CreateLoad(st, slot);
+        }
     }
-    if (args.size() != fields.size()) return nullptr;
-    for (std::size_t i = 0; i < fields.size(); ++i) {
-        if (!args[i].value) return nullptr;
-        llvm::Value* v = lowerExpr(*args[i].value);
-        if (!v) return nullptr;
-        auto idxIt = fieldIndex_.find(fields[i]);
-        if (idxIt == fieldIndex_.end()) return nullptr;
+
+    // §9.2 body record (or a record constructed through an explicit
+    // constructor): zero the storage, run auto-property / field
+    // initializers, then run the matching constructor with `this` bound to
+    // the struct slot. Mirrors the class construction path in lowerNew but
+    // for a by-value struct.
+    builder_.CreateStore(llvm::ConstantAggregateZero::get(st), slot);
+    for (const sema::Symbol* m : fields) {
+        const ast::Expr* init = nullptr;
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+            init = fd->initializer.get();
+        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+            init = pd->autoInitializer.get();  // §9.2: `property X := v;`
+        if (!init) continue;
+        auto idxIt = fieldIndex_.find(m);
+        if (idxIt == fieldIndex_.end()) continue;
+        llvm::Value* v = lowerExpr(*init);
+        if (!v) continue;
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, slot, idxIt->second));
+    }
+
+    if (sema::ConstructorSymbol* cs = ctorForArgs(t, args)) {
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) return nullptr;
+        // Inline the constructor body with `this` = the record slot pointer
+        // (record methods access fields through a struct pointer, §9.4) and
+        // the parameters bound to fresh slots.
+        std::vector<llvm::Value*> ordered;
+        ordered.push_back(slot);  // placeholder for the implicit receiver
+        if (!buildOrderedArgs(cd->params, args, ordered)) return nullptr;
+        llvm::Value* savedThis = currentThis_;
+        auto savedLocals = locals_;
+        auto savedParams = paramSlots_;
+        currentThis_ = slot;
+        locals_.clear();
+        paramSlots_.clear();
+        for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
+            llvm::Value* av = ordered[pi + 1];
+            auto* pslot = entryAlloca(av->getType());
+            builder_.CreateStore(av, pslot);
+            paramSlots_[cs->params[pi]] = pslot;
+        }
+        lowerScopedBlock(cd->body);
+        currentThis_ = savedThis;
+        locals_ = std::move(savedLocals);
+        paramSlots_ = std::move(savedParams);
+        emitPendingCheck();  // §28: a constructor may throw
+    } else if (!args.empty()) {
+        // Arguments were supplied but no constructor accepts them — fall
+        // back to a failure so the caller does not silently drop them.
+        return nullptr;
     }
     return builder_.CreateLoad(st, slot);  // the record value (by value)
 }
