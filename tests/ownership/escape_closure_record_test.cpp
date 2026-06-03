@@ -195,3 +195,183 @@ BEZEL_TEST(own_record_escape, return_record_borrowing_param_clean_9_7) {
         "end Wrap;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// =====================================================================
+// SECOND SLICE (issue #360): INDIRECT escapes via an aliasing local, and
+// borrowed-reference local captures. The escape is bound into a local one
+// statement earlier, then that local is returned. The owned source's borrow
+// would outlive the source, exactly as the direct forms above.
+// =====================================================================
+
+// A class with a reference field, so a re-borrow of a *reference* field of an
+// owned local (`var b := r.Inner;`) can be exercised distinctly from the
+// value-typed `r.V` projection.
+namespace {
+std::string wrapRefField(const std::string& method) {
+    return std::string(
+        "module M; "
+        "class R "
+        "  public V: int := 0; "
+        "  public Inner: R := null; "
+        "  destructor end destructor; "
+        "end R; "
+        "record Holder(Ref: R); "
+        "class C ") + method + " end C;";
+}
+} // namespace
+
+// --- Indirect re-borrow of an owned local then return (REJECT) ------------
+
+// `var b := r; return b;` — `b` is a borrow of the owned `using var` `r`
+// (§28.3: reading an owned local in a borrow-consuming position is a borrow,
+// source `r`). Returning `b` lets that borrow outlive `r`, disposed at scope
+// end. (§28.3 borrow-lifetime rule, reached indirectly through the local.)
+BEZEL_TEST(own_indirect_escape, return_reborrow_of_using_var_diagnosed_28_3) {
+    auto r = parseAndCheckOwnership(wrapClosure(
+        "public static method Leak(): R "
+        "  using var r := new R(); "
+        "  var b := r; "
+        "  return b; "
+        "end Leak;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// `var b := r.Inner; return b;` — a re-borrow of a *reference* field of an
+// owned local. The field access borrows `r` (§28.3: `obj.f` is a borrow,
+// source `obj`); returning `b` outlives `r`.
+BEZEL_TEST(own_indirect_escape, return_reborrow_of_reference_field_diagnosed_28_3) {
+    auto r = parseAndCheckOwnership(wrapRefField(
+        "public static method Leak(): R "
+        "  using var r := new R(); "
+        "  var b := r.Inner; "
+        "  return b; "
+        "end Leak;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// `var h := new Holder(r); return h;` — a borrow-bearing record bound to a
+// holder local, then returned. The record carries a borrow of the owned `r`
+// (§9.7); returning the holder lets it outlive `r`.
+BEZEL_TEST(own_indirect_escape, return_holder_record_aliasing_using_var_diagnosed_9_7) {
+    auto r = parseAndCheckOwnership(wrapRecord(
+        "public static method Leak(): Holder "
+        "  using var r := new R(); "
+        "  var h := new Holder(r); "
+        "  return h; "
+        "end Leak;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// `var f := () => r.V; return f;` — a closure capturing the owned `r` bound
+// to a holder local, then returned. Capturing an owned local is a borrow of
+// its enclosing scope (§28.9); returning the closure lets it outlive `r`.
+BEZEL_TEST(own_indirect_escape, return_closure_holder_capturing_using_var_diagnosed_28_9) {
+    auto r = parseAndCheckOwnership(wrapClosure(
+        "public static method Leak(): () -> int "
+        "  using var r := new R(); "
+        "  var f := () => r.V; "
+        "  return f; "
+        "end Leak;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// The borrow source can also be bound by a later ASSIGNMENT (not only the
+// declaration initializer): `var b: R? := null; b := r; return b;`. This
+// exercises the handleAssignment source-population path. The source `r` is a
+// `using var`, so the ONLY error here is the escape — making this test load-
+// bearing on the indirect-escape check (a `using var` has no independent leak
+// diagnostic to mask it).
+BEZEL_TEST(own_indirect_escape, return_reborrow_bound_by_assignment_diagnosed_28_3) {
+    auto r = parseAndCheckOwnership(wrapClosure(
+        "public static method Leak(): R? "
+        "  using var r := new R(); "
+        "  var b: R? := null; "
+        "  b := r; "
+        "  return b; "
+        "end Leak;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// --- Indirect controls: aliasing locals that do NOT escape (ACCEPT) -------
+
+// CONTROL: a VALUE-TYPED re-borrow (`var n := r.V;` where V is int) is a
+// copy, not a borrow of `r` (§28.3 value-typed returns). Returning it can
+// never outlive `r`, so it must be accepted. This is the key false-positive
+// guard for the soundness gate.
+BEZEL_TEST(own_indirect_escape, return_value_reborrow_clean_28_3) {
+    auto r = parseAndCheckOwnership(wrapClosure(
+        "public static method Take(): int "
+        "  using var r := new R(); "
+        "  var n := r.V; "
+        "  return n; "
+        "end Take;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL: a holder record built from a *parameter* borrow (source: caller's
+// frame, outlives this method) bound to a local and returned is accepted —
+// the parameter is not an owned scope-bound local. (Parallels the direct
+// param-borrow control.)
+BEZEL_TEST(own_indirect_escape, return_holder_aliasing_param_clean_9_7) {
+    auto r = parseAndCheckOwnership(wrapRecord(
+        "public static method Wrap(c: R): Holder "
+        "  var h := new Holder(c); "
+        "  return h; "
+        "end Wrap;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL: an indirect holder that is built but does NOT escape — it is used
+// locally (a value field read) and never returned. `r` is disposed normally
+// at scope end; no borrow outlives it.
+BEZEL_TEST(own_indirect_escape, holder_aliasing_using_var_not_returned_clean_9_7) {
+    auto r = parseAndCheckOwnership(wrapRecord(
+        "public static method Use(): int "
+        "  using var r := new R(); "
+        "  var h := new Holder(r); "
+        "  return h.Ref.V; "
+        "end Use;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL: a borrow used locally then the source disposed — `var b := r;`
+// where `r` is a plain owned `var` explicitly disposed before return; `b` is
+// never returned, only its value field is read while `r` is still alive.
+BEZEL_TEST(own_indirect_escape, reborrow_used_locally_then_source_disposed_clean_28_3) {
+    auto r = parseAndCheckOwnership(wrapClosure(
+        "public static method Use(): int "
+        "  var src := new R(); "
+        "  var b := src; "
+        "  var n := b.V; "
+        "  src.Dispose(); "
+        "  return n; "
+        "end Use;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL: a closure holder that is INVOKED locally (not returned) — its int
+// result leaves the method, the closure does not. `r` outlives every read.
+BEZEL_TEST(own_indirect_escape, closure_holder_invoked_locally_clean_28_9) {
+    auto r = parseAndCheckOwnership(wrapClosure(
+        "public static method Use(): int "
+        "  using var r := new R(); "
+        "  var f := () => r.V; "
+        "  return f(); "
+        "end Use;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL: rebinding the holder to a non-borrowing value before return clears
+// the tracked borrow source — `var b := r; b := null; return b;` does not
+// escape `r` (the returned value is null, no live borrow). Guards against a
+// stale-source false positive across reassignment.
+BEZEL_TEST(own_indirect_escape, reborrow_then_rebound_to_null_clean_28_3) {
+    auto r = parseAndCheckOwnership(wrapClosure(
+        "public static method Take(): R? "
+        "  using var r := new R(); "
+        "  var b: R? := r; "
+        "  b := null; "
+        "  return b; "
+        "end Take;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
