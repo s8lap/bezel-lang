@@ -918,6 +918,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* idx = lowerExpr(*call.args[0].value);
             if (!idx) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
+            // #362 / stdlib §4.5: OwnedArray<T>.RemoveAt disposes the removed
+            // element. Use the disposing variant for an owning class-element
+            // array; a borrowing array just removes the slot.
+            if (llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy)) {
+                auto* fn = declareC("bz_array_remove_at_disposing",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), i64(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz),
+                                         elemDisp});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
             auto* fn = declareC("bz_array_remove_at", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), i64(), i64()});
             builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz)});
@@ -944,6 +955,32 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // .Clear()
         if (m == "Clear" && call.args.empty()) {
+            // #362 / stdlib §4.5: OwnedArray<T>.Clear disposes every element.
+            // Use the disposing variant for an owning class-element array; a
+            // borrowing array just resets the count.
+            if (llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy)) {
+                auto* fn = declareC("bz_array_clear_disposing",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {recv, elemDisp});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+            auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy()});
+            builder_.CreateCall(fn, {recv});
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+        // .DisposeElements() — stdlib §4.5: dispose each class-typed element,
+        // then clear. For value-only element types it is equivalent to Clear().
+        // Unlike Add/Clear on an OWNING array, this is the explicit en-masse
+        // disposal a BORROWING Array<T> exposes; the disposer thunk is keyed on
+        // the element being a class, not on the collection being owning.
+        if (m == "DisposeElements" && call.args.empty()) {
+            if (collectionElemIsClass(recvTy, 0)) {
+                auto* fn = declareC("bz_array_clear_disposing",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {recv, elementDisposerThunk()});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
             auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy()});
             builder_.CreateCall(fn, {recv});
@@ -3366,10 +3403,17 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         builder_.CreateCall(fn, {recv,
                             llvm::ConstantPointerNull::get(ptrTy())});
                     } else if (isCollectionTypeName(recvTy)) {
+                        // #362 / stdlib §4.5: explicit Dispose() on an owning
+                        // collection cascades disposal into its class elements;
+                        // a borrowing collection frees only the backing.
+                        llvm::Function* elemDisp =
+                            owningCollectionElemDisposer(recvTy);
+                        llvm::Value* disp = elemDisp
+                            ? llvm::cast<llvm::Value>(elemDisp)
+                            : llvm::ConstantPointerNull::get(ptrTy());
                         auto* fn = declareC("bz_array_free",
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                        builder_.CreateCall(fn, {recv,
-                            llvm::ConstantPointerNull::get(ptrTy())});
+                        builder_.CreateCall(fn, {recv, disp});
                     } else if (isDictTypeName(recvTy)) {
                         auto* fn = declareC("bz_dict_free",
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});

@@ -43,6 +43,21 @@ void bz_array_remove_at(void* arr, int64_t idx, int64_t elem_size);
 // Set length to 0 (does NOT call dispose_elem; caller is responsible).
 void bz_array_clear(void* arr);
 
+// stdlib §4.5: dispose every (non-null) class-typed element, then set length to
+// 0. Used by OwnedArray<T>.Clear() and Array<T>.DisposeElements() where the
+// element type is a class. `dispose_elem` is null-safe per element. Treats each
+// element as a pointer-sized object reference (owning collections constrain
+// `where T: class`, so elements are always object pointers). The slots are
+// nulled as they are disposed so a subsequent Dispose finds nothing to redo.
+void bz_array_clear_disposing(void* arr, void (*dispose_elem)(void*));
+
+// stdlib §4.5: dispose the (non-null) class-typed element at `idx`, then remove
+// it (shifting subsequent elements down). Used by OwnedArray<T>.RemoveAt(i).
+// No-op if idx is out of range. Disposing happens before the shift so the slot
+// leaves the live range afterward (no double-dispose on a later Dispose).
+void bz_array_remove_at_disposing(void* arr, int64_t idx, int64_t elem_size,
+                                  void (*dispose_elem)(void*));
+
 // Free the array and, if `dispose_elem` is non-null, call it for each element
 // passing a pointer to the element's storage.
 void bz_array_free(void* arr, void (*dispose_elem)(void*));
