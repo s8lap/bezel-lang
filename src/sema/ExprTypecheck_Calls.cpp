@@ -1,10 +1,308 @@
 #include "sema/ExprTypecheck_impl.hpp"
 
+#include "sema/TypeResolution.hpp"  // typeRefEqual
+
 namespace bezel::sema {
 
 // This translation unit holds the call-resolution and member-access
 // definitions of the ExprTC worker: CallExpr return-type / arity checking
 // (typeCall and friends) and the `.` / `?.` member-access resolvers.
+
+// §5.1: implicit-conversion predicate used by §22.6 overload resolution.
+// Identity is NOT a §5.1 conversion (it is the "exact" relation), so a
+// pair of equal types returns false here. Conservative on everything the
+// type lattice can't yet judge, matching checkAssignable's stance.
+bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
+    if (!from || !to) return false;
+    // `Object` is the root supertype: every type converts to it (§12), and
+    // checkAssignable already treats an Object target as accepting anything.
+    // Mirror that here as a (non-exact) conversion so a candidate with an
+    // Object parameter is never spuriously made inapplicable. (typeRefEqual
+    // has already ruled out the exact Object→Object case before we are
+    // called for ranking.)
+    if (to->kind == TypeRef::Kind::Primitive &&
+        to->primitive == PrimitiveType::Object) {
+        bool fromIsObject = from->kind == TypeRef::Kind::Primitive &&
+                            from->primitive == PrimitiveType::Object;
+        if (!fromIsObject) return true;
+    }
+    // primitive → primitive: §5.1 numeric/char widening table.
+    if (from->kind == TypeRef::Kind::Primitive &&
+        to->kind == TypeRef::Kind::Primitive) {
+        // A nullable source cannot implicitly convert to a non-nullable
+        // target (that would drop the null case) — §7.
+        if (from->nullable && !to->nullable) return false;
+        if (from->primitive == to->primitive) {
+            // identity at the primitive level — only a conversion when the
+            // source is non-nullable and the target nullable (T → T?).
+            return !from->nullable && to->nullable;
+        }
+        return primitiveWidens(from->primitive, to->primitive);
+    }
+    // named → named: §12 subtype → supertype, and §7 reference → nullable.
+    if (from->kind == TypeRef::Kind::Named &&
+        to->kind == TypeRef::Kind::Named &&
+        from->declaration && to->declaration) {
+        if (from->nullable && !to->nullable) return false;
+        if (from->declaration == to->declaration) {
+            // identity declaration — a conversion only across nullability
+            // (reference → nullable, §7).
+            return !from->nullable && to->nullable;
+        }
+        // §22.6 ranks subtype → supertype as a conversion (not exact).
+        return isSubtype(from->declaration, to->declaration);
+    }
+    return false;
+}
+
+// §22.6 classify how `argTy` matches `paramTy` at one argument position.
+// Exact when the types are equal (Resolver::typeRefEqual); Convert when a
+// §5.1 implicit conversion applies; NotApplicable otherwise (the candidate
+// requiring a non-§5.1 conversion is unreachable through this argument).
+ExprTC::ArgMatch ExprTC::classifyArg(const TypeRef* argTy,
+                                     const TypeRef* paramTy) {
+    if (!argTy || !paramTy) return ArgMatch::Exact;  // can't judge → don't filter
+    if (typeRefEqual(argTy, paramTy)) return ArgMatch::Exact;
+    if (implicitlyConvertible(argTy, paramTy)) return ArgMatch::Convert;
+    return ArgMatch::NotApplicable;
+}
+
+// §22.6 overload resolution among same-arity, all-positional candidates.
+ExprTC::OverloadResult ExprTC::resolveOverload(
+    const std::vector<std::vector<const TypeRef*>>& paramTypes,
+    const std::vector<const TypeRef*>& argTypes,
+    const std::vector<std::string>& candNames, SourceLocation loc,
+    const std::string& calleeDesc) {
+    OverloadResult res;
+    const std::size_t nCand = paramTypes.size();
+    const std::size_t nArg = argTypes.size();
+
+    // Undecidable guard: §22.6 ranking is reliable only for the type pairs
+    // checkAssignable judges — primitive↔primitive and non-generic
+    // named↔named (plus the Object root). For anything else (unresolved
+    // types, generic instantiations, inline-array / function types, error
+    // sentinels) we cannot classify exact vs. convert vs. inapplicable
+    // without risking a spurious ambiguous/unreachable diagnostic, so we
+    // fall back to arity-based selection. (Per the project's
+    // conservative-typing stance — cf. checkAssignable.)
+    auto judgeable = [](const TypeRef* t) {
+        if (!t) return false;
+        switch (t->kind) {
+            case TypeRef::Kind::Primitive:
+            case TypeRef::Kind::Unit:
+                return true;
+            case TypeRef::Kind::Named:
+                // Non-generic, resolved named types only.
+                return t->declaration != nullptr && t->genericArgs.empty();
+            default:
+                return false;  // Error, InlineArray, Function
+        }
+    };
+    for (const TypeRef* a : argTypes)
+        if (!judgeable(a)) { res.outcome = OverloadOutcome::Undecidable; return res; }
+    for (const auto& pts : paramTypes) {
+        if (pts.size() != nArg) {
+            // arity already filtered upstream; defensively bail.
+            res.outcome = OverloadOutcome::Undecidable;
+            return res;
+        }
+        for (const TypeRef* p : pts)
+            if (!judgeable(p)) { res.outcome = OverloadOutcome::Undecidable; return res; }
+    }
+
+    // Classify every (candidate, argument) cell. ArgMatch::NotApplicable in
+    // any cell removes that candidate from the applicable set (§22.6 step 1).
+    std::vector<std::vector<ArgMatch>> grid(nCand);
+    std::vector<bool> applicable(nCand, true);
+    for (std::size_t c = 0; c < nCand; ++c) {
+        grid[c].resize(nArg);
+        for (std::size_t i = 0; i < nArg; ++i) {
+            ArgMatch m = classifyArg(argTypes[i], paramTypes[c][i]);
+            grid[c][i] = m;
+            if (m == ArgMatch::NotApplicable) applicable[c] = false;
+        }
+    }
+
+    std::vector<std::size_t> appl;
+    for (std::size_t c = 0; c < nCand; ++c)
+        if (applicable[c]) appl.push_back(c);
+
+    // §22.6 step 4: no applicable candidate → unreachable, no candidates
+    // cited.
+    if (appl.empty()) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "no overload of " + calleeDesc +
+                " is applicable to these arguments; every candidate would "
+                "require a conversion that §5.1 does not admit as implicit "
+                "(§22.6)");
+        res.outcome = OverloadOutcome::Unreachable;
+        return res;
+    }
+
+    if (appl.size() == 1) {
+        res.outcome = OverloadOutcome::Resolved;
+        res.winnerIndex = appl[0];
+        return res;
+    }
+
+    // §22.6 tie-break: X is "better than" Y at a position iff X is Exact
+    // there and Y is Convert. Two Converts (any pair) are equally ranked;
+    // two Exacts are equal. X is "unambiguously better" iff better-or-equal
+    // on every position and strictly better on at least one. The call
+    // resolves to a candidate unambiguously better than every other.
+    auto betterOrEqualAt = [](ArgMatch x, ArgMatch y) {
+        // x is not worse than y: worse only when x converts where y is exact.
+        return !(x == ArgMatch::Convert && y == ArgMatch::Exact);
+    };
+    auto strictlyBetterAt = [](ArgMatch x, ArgMatch y) {
+        return x == ArgMatch::Exact && y == ArgMatch::Convert;
+    };
+    auto unambiguouslyBetter = [&](std::size_t x, std::size_t y) {
+        bool anyStrict = false;
+        for (std::size_t i = 0; i < nArg; ++i) {
+            if (!betterOrEqualAt(grid[x][i], grid[y][i])) return false;
+            if (strictlyBetterAt(grid[x][i], grid[y][i])) anyStrict = true;
+        }
+        return anyStrict;
+    };
+
+    for (std::size_t cx : appl) {
+        bool dominatesAll = true;
+        for (std::size_t cy : appl) {
+            if (cx == cy) continue;
+            if (!unambiguouslyBetter(cx, cy)) { dominatesAll = false; break; }
+        }
+        if (dominatesAll) {
+            res.outcome = OverloadOutcome::Resolved;
+            res.winnerIndex = cx;
+            return res;
+        }
+    }
+
+    // §22.6 step 3: no candidate is unambiguously better → ambiguous,
+    // cite the applicable candidates.
+    std::string msg = "ambiguous call to " + calleeDesc +
+                      ": no overload is unambiguously better (§22.6); "
+                      "candidates:";
+    for (std::size_t c : appl) {
+        msg += "\n  ";
+        msg += (c < candNames.size() ? candNames[c] : std::string("(overload)"));
+    }
+    msg += "\nadd an explicit cast (§5.2) so exactly one candidate is an "
+           "exact match";
+    ctx_.diagnostics().report(Severity::Error, loc, msg);
+    res.outcome = OverloadOutcome::Ambiguous;
+    return res;
+}
+
+namespace {
+// A printable signature for a method candidate, e.g. "F(int, long)".
+std::string methodSignatureString(std::string_view name,
+                                  const std::vector<ast::Param>& params) {
+    std::string s(name);
+    s += '(';
+    bool first = true;
+    for (const auto& p : params) {
+        if (!first) s += ", ";
+        first = false;
+        if (!p.modifier.empty()) { s += std::string(p.modifier); s += ' '; }
+        // The parameter's source type name, if it's a simple named type.
+        if (p.type && p.type->name && !p.type->name->parts.empty())
+            s += std::string(p.type->name->parts.back());
+        else
+            s += "?";
+    }
+    s += ')';
+    return s;
+}
+}  // namespace
+
+// §22.6 method-overload resolution; see header for contract.
+MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
+                                            const ast::CallExpr& ce) {
+    if (!initial || !initial->parent) return initial;
+
+    // Arity-based fallback used whenever §22.6 type resolution does not
+    // apply (named args, modifier args, undecidable types, or a single
+    // matching candidate): re-select the first same-name overload whose
+    // parameter count matches the call's argument count, preserving the
+    // prior first-wins behavior.
+    auto arityFallback = [&]() -> MethodSymbol* {
+        if (initial->params.size() == ce.args.size()) return initial;
+        for (Symbol* m : initial->parent->members) {
+            auto* cand = dynamic_cast<MethodSymbol*>(m);
+            if (cand && cand->name == initial->name &&
+                cand->params.size() == ce.args.size())
+                return cand;
+        }
+        return initial;
+    };
+
+    // §22.6 applies only to all-positional calls. Named-argument binding
+    // (§22.5) is a separate, deferred concern; bail to arity selection.
+    for (const auto& a : ce.args)
+        if (!a.name.empty()) return arityFallback();
+
+    // Collect same-name candidates filtered by this call's arity. Default
+    // parameters are not yet folded into §22.6 here (optional-param arity
+    // is handled by checkArgsAgainstParams' min/max); restrict to exact
+    // parameter-count matches so the candidate set is unambiguous on arity.
+    std::vector<MethodSymbol*> cands;
+    std::vector<const ast::MethodDecl*> decls;
+    for (Symbol* m : initial->parent->members) {
+        auto* cand = dynamic_cast<MethodSymbol*>(m);
+        if (!cand || cand->name != initial->name) continue;
+        if (cand->params.size() != ce.args.size()) continue;
+        auto* md = dynamic_cast<const ast::MethodDecl*>(cand->decl);
+        if (!md) continue;
+        // Defensive: a candidate whose own arity (decl params) disagrees
+        // with the symbol's recorded params is skipped.
+        if (md->params.size() != ce.args.size()) continue;
+        cands.push_back(cand);
+        decls.push_back(md);
+    }
+    if (cands.empty()) return arityFallback();
+    if (cands.size() == 1) return cands[0];
+
+    // Any argument carrying a call-site modifier (ref/out/...) is outside
+    // the value-conversion ranking of §22.6's worked examples; fall back.
+    for (const auto& a : ce.args)
+        if (!a.modifier.empty() || a.isDiscard) return arityFallback();
+
+    // Build the argument-type and per-candidate parameter-type vectors.
+    std::vector<const TypeRef*> argTypes(ce.args.size(), nullptr);
+    for (std::size_t i = 0; i < ce.args.size(); ++i)
+        if (ce.args[i].value) argTypes[i] = ctx_.exprType(*ce.args[i].value);
+
+    std::vector<std::vector<const TypeRef*>> paramTypes(cands.size());
+    std::vector<std::string> candNames(cands.size());
+    for (std::size_t c = 0; c < cands.size(); ++c) {
+        const auto& params = decls[c]->params;
+        paramTypes[c].resize(params.size(), nullptr);
+        for (std::size_t i = 0; i < params.size(); ++i)
+            if (params[i].type)
+                paramTypes[c][i] = ctx_.resolvedType(*params[i].type);
+        candNames[c] = methodSignatureString(initial->name, params);
+    }
+
+    OverloadResult r = resolveOverload(
+        paramTypes, argTypes, candNames, ce.span.begin,
+        std::string("`") + std::string(initial->name) + "`");
+    switch (r.outcome) {
+        case OverloadOutcome::Resolved:
+            return cands[r.winnerIndex];
+        case OverloadOutcome::Ambiguous:
+        case OverloadOutcome::Unreachable:
+            // Diagnostic already emitted. Return a candidate so the return
+            // type is still inferred (keeps downstream typing best-effort);
+            // arity fallback gives a deterministic choice.
+            return arityFallback();
+        case OverloadOutcome::Undecidable:
+            return arityFallback();
+    }
+    return arityFallback();
+}
 
 // Slice 3h: resolve a CallExpr's return type from the callee's
 // resolved MethodSymbol.
@@ -49,22 +347,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             return;
         }
     }
-    // §22.6: arity-based overload resolution. The callee resolved to one
-    // method of its name; when that one's parameter count doesn't match
-    // this call's argument count, re-select the same-named overload
-    // whose parameter count does. (Type-based tie-breaking between
-    // equal-arity overloads is a later refinement.)
+    // §22.6: overload resolution. The callee initially resolved to one
+    // method of its name (first-in-source); re-select among the same-named
+    // overloads. When the name has multiple same-arity all-positional
+    // candidates and the argument/parameter types are decidable, this is
+    // the type-based exact-match-then-ambiguity precedence of §22.6;
+    // otherwise it falls back to arity-based first-wins selection.
     if (auto* ms0 = dynamic_cast<MethodSymbol*>(calleeSym)) {
-        if (ms0->parent && ms0->params.size() != ce.args.size()) {
-            for (Symbol* m : ms0->parent->members) {
-                auto* cand = dynamic_cast<MethodSymbol*>(m);
-                if (cand && cand->name == ms0->name &&
-                    cand->params.size() == ce.args.size()) {
-                    ctx_.setExprSymbol(ce.callee.get(), cand);
-                    calleeSym = cand;
-                    break;
-                }
-            }
+        MethodSymbol* chosen = resolveMethodOverload(ms0, ce);
+        if (chosen && chosen != ms0) {
+            ctx_.setExprSymbol(ce.callee.get(), chosen);
+            calleeSym = chosen;
         }
     }
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
@@ -337,10 +630,10 @@ void ExprTC::checkArgsAgainstParams(const std::vector<ast::Param>& params,
     }
 }
 
-// Slice T7: check `new T(args)` against T's sole constructor (if
-// any). Zero declared constructors → the implicit default ctor
-// takes no arguments. Multiple constructors → overload resolution
-// is deferred, so skip.
+// Slice T7 / §22.6: check `new T(args)` against T's constructors. Zero
+// declared constructors → the implicit default ctor takes no arguments.
+// One constructor → argument count/type check. Multiple constructors →
+// §22.6 type-based overload resolution (exact-match-then-ambiguity).
 void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     // A class with a primary constructor (parenthesized params after
     // the name) carries those params on the TypeDecl rather than as
@@ -355,7 +648,52 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             if (!cs->isStatic) ctors.push_back(cs);
         }
     }
-    if (ctors.size() > 1) return;  // overloaded — defer
+    if (ctors.size() > 1) {
+        // §22.6 applies identically to constructor overload sets (§22.7).
+        // Named-argument binding is deferred → fall back (no check) on a
+        // named-arg `new`.
+        for (const auto& a : ne.args)
+            if (!a.name.empty()) return;
+        // Candidates filtered by this call's arity (all-positional). A
+        // call-site modifier on an argument is outside §22.6's ranking;
+        // skip resolution in that case.
+        for (const auto& a : ne.args)
+            if (!a.modifier.empty() || a.isDiscard) return;
+        std::vector<const ast::ConstructorDecl*> decls;
+        for (ConstructorSymbol* cs : ctors) {
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (cd && cd->params.size() == ne.args.size()) decls.push_back(cd);
+        }
+        if (decls.empty()) return;  // no same-arity ctor — defer (no check)
+        if (decls.size() == 1) {
+            checkArgsAgainstParams(decls[0]->params, ne.args, ne.span.begin,
+                                   std::string("`new ") +
+                                       std::string(t->name) + "`");
+            return;
+        }
+        std::vector<const TypeRef*> argTypes(ne.args.size(), nullptr);
+        for (std::size_t i = 0; i < ne.args.size(); ++i)
+            if (ne.args[i].value)
+                argTypes[i] = ctx_.exprType(*ne.args[i].value);
+        std::vector<std::vector<const TypeRef*>> paramTypes(decls.size());
+        std::vector<std::string> candNames(decls.size());
+        for (std::size_t c = 0; c < decls.size(); ++c) {
+            const auto& params = decls[c]->params;
+            paramTypes[c].resize(params.size(), nullptr);
+            for (std::size_t i = 0; i < params.size(); ++i)
+                if (params[i].type)
+                    paramTypes[c][i] = ctx_.resolvedType(*params[i].type);
+            candNames[c] = std::string("new ") + std::string(t->name) +
+                           methodSignatureString("", params);
+        }
+        // resolveOverload emits the ambiguous / unreachable diagnostic; the
+        // winner needs no further per-argument check (each arg is already
+        // exact or §5.1-convertible). On Undecidable we defer (no check),
+        // matching the prior "overloaded → skip" behavior.
+        resolveOverload(paramTypes, argTypes, candNames, ne.span.begin,
+                        std::string("`new ") + std::string(t->name) + "`");
+        return;
+    }
     if (ctors.empty()) {
         // Implicit default constructor: zero parameters. (A primary
         // constructor would surface as a ConstructorSymbol, so the

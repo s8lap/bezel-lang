@@ -33,6 +33,14 @@ public:
 
     void run(const ast::SourceFile& src);
 
+    // Slice S19: structural equality of two resolved TypeRefs. Returns
+    // false (conservatively) when either is null or an Error kind — the
+    // caller skips the overload-equality check rather than risk a false
+    // collision on a not-yet-resolvable type. Public so other passes
+    // (§22.6 overload resolution) can reuse it via the free-function
+    // wrapper `bezel::sema::typeRefEqual` in TypeResolution.hpp.
+    static bool typeRefEqual(const TypeRef* a, const TypeRef* b);
+
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type
     // + per-method). Each scope contributes a small name → Symbol table.
@@ -143,12 +151,6 @@ private:
     // enclosing class for `protected` and no file-scope concept for
     // `private`.
     void checkTopLevelVisibility();
-
-    // Slice S19: structural equality of two resolved TypeRefs. Returns
-    // false (conservatively) when either is null or an Error kind — the
-    // caller skips the overload-equality check rather than risk a false
-    // collision on a not-yet-resolvable type.
-    static bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 
     // Slice S19: the overload-distinguishing form of a parameter
     // modifier (§22.6). `owned` on an ordinary parameter does NOT

@@ -193,6 +193,54 @@ private:
 
     void checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms);
 
+    // §5.1: is a value of static type `from` implicitly convertible to
+    // `to`? Identity is NOT counted here (that is the "exact" relation,
+    // tested with typeRefEqual); this returns true only for a non-trivial
+    // §5.1 conversion: numeric/char widening, non-nullable reference →
+    // nullable, or subtype → supertype. Conservative: returns false for
+    // type pairs the lattice can't yet judge, so a candidate is treated as
+    // inapplicable rather than spuriously applicable.
+    bool implicitlyConvertible(const TypeRef* from, const TypeRef* to);
+
+    // §22.6 per-argument match classification against a parameter type.
+    enum class ArgMatch { NotApplicable, Convert, Exact };
+    ArgMatch classifyArg(const TypeRef* argTy, const TypeRef* paramTy);
+
+    // §22.6 type-based overload resolution over a set of candidate
+    // callables sharing the call's arity and binding all-positional.
+    enum class OverloadOutcome {
+        Resolved,     // a unique winner: `winnerIndex` is set.
+        Ambiguous,    // diagnostic emitted (candidates cited); no winner.
+        Unreachable,  // diagnostic emitted (none cited); no winner.
+        Undecidable   // could not judge (unresolved arg/param types): the
+                      // caller should fall back to arity-based selection.
+    };
+    struct OverloadResult {
+        OverloadOutcome outcome = OverloadOutcome::Undecidable;
+        std::size_t winnerIndex = 0;  // valid only when Resolved
+    };
+
+    // `paramTypes[i]` holds candidate i's ordered parameter TypeRefs (each
+    // may be null when unresolved). `argTypes` holds the call's positional
+    // argument static types (null when unresolved). Emits the ambiguous /
+    // unreachable diagnostic itself when applicable. `candNames` supplies a
+    // display string per candidate for the ambiguous-case citation.
+    OverloadResult resolveOverload(
+        const std::vector<std::vector<const TypeRef*>>& paramTypes,
+        const std::vector<const TypeRef*>& argTypes,
+        const std::vector<std::string>& candNames, SourceLocation loc,
+        const std::string& calleeDesc);
+
+    // §22.6 method-overload resolution. Given the initially-resolved
+    // MethodSymbol for a call and the call site, returns the MethodSymbol
+    // the call resolves to: applies type-based §22.6 selection when the
+    // name has multiple same-arity, all-positional candidates and arg/param
+    // types are decidable; otherwise falls back to arity-based first-wins
+    // (preserving the prior behavior on named-arg / modifier / undecidable
+    // calls). Emits the ambiguous / unreachable diagnostics itself.
+    MethodSymbol* resolveMethodOverload(MethodSymbol* initial,
+                                        const ast::CallExpr& ce);
+
     // Slices T5/T6/T7: shared check of an all-positional argument list
     // against a parameter list — argument count within [required,
     // total] (optional params lower the minimum), then per-argument
