@@ -134,12 +134,27 @@ BEZEL_TEST(linq_int, count) {
 }
 
 BEZEL_TEST(linq_int, where) {
+    // stdlib §5: Where is LAZY — it returns a deferred IEnumerable<int>.
+    // Materialize with ToArray() to observe the filtered elements.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
-        "  using var evens := a.Where((x) => x mod 2 = 0); "
+        "  using var evens: Array<int> := a.Where((x) => x mod 2 = 0).ToArray(); "
         "  return int(evens.Length = 2 and evens.Get(0) = 2 and evens.Get(1) = 4); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(linq_int, where_lazy_foreach) {
+    // stdlib §5: a lazy Where pipeline is enumerable directly in a for-loop
+    // without materializing — the deferred contract end-to-end.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
+        "  var s := 0; var n := 0; "
+        "  for var x in a.Where((x) => x mod 2 = 0) do s := s + x; n := n + 1; end; "
+        "  return int(s = 6 and n = 2); "
         "end Main; end C;"), 1);
 }
 
@@ -169,7 +184,8 @@ BEZEL_TEST(linq_int, foreach_and_select) {
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); a.Add(3); "
-        "    using var doubled: Array<int> := a.Select((x: int) => x * 2); "
+        // stdlib §5: Select is LAZY — materialize with ToArray() to observe.
+        "    using var doubled: Array<int> := a.Select((x: int) => x * 2).ToArray(); "
         "    return int(doubled.Length = 3 and doubled.Get(0) = 2 and doubled.Get(2) = 6); "
         "  end Main; end C;"), 1);
 }
@@ -193,7 +209,8 @@ BEZEL_TEST(linq_string, where) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"hi\"); a.Add(\"hello\"); a.Add(\"hey\"); "
-        "  using var long2 := a.Where((s) => s.Length > 2); "
+        // stdlib §5: Where is LAZY — materialize with ToArray() to observe.
+        "  using var long2: Array<string> := a.Where((s) => s.Length > 2).ToArray(); "
         "  return int(long2.Length = 2 and long2.Get(0) = \"hello\"); "
         "end Main; end C;"), 1);
 }

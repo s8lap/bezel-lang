@@ -199,6 +199,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (lowerArrayFor(*fors)) return false;
         // §4.6: `for var c in s` over a string — iterates chars.
         if (lowerStringFor(*fors)) return false;
+        // stdlib §5: `for var x in <lazy LINQ pipeline>` — iterate the deferred
+        // enumerator without materializing it.
+        if (lowerLazyLinqFor(*fors)) return false;
         // §29.2 (B1): `for var x in items` where items is IEnumerable<T>
         // typed as a builtin interface — treat runtime value as bz_array_t*.
         if (lowerIEnumerableBuiltinFor(*fors)) return false;
@@ -1226,6 +1229,74 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     if (!term) builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(endBB);
+    return true;
+}
+
+
+bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
+    if (!fs.iterable) return false;
+    auto* iterTy = ctx_.exprType(*fs.iterable);
+    // Only a lazy LINQ pipeline result (the structural sentinel) is handled
+    // here; iterator state machines and Array<T> go through other paths.
+    if (!isLazyEnumerableType(iterTy)) return false;
+
+    llvm::Value* lazy = lowerExpr(*fs.iterable);
+    if (!lazy) return false;
+    llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+    if (!elemTy) elemTy = i32();
+
+    // Store the enumerator in a slot; iterate via its vtable.
+    // Lazy enumerator vtable: [0]=td, [1]=Dispose, [2]=MoveNext(->i32),
+    // [3]=Current(->void* element-bytes pointer).
+    auto* enumSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(lazy, enumSlot);
+
+    auto* moveNextTy = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+    auto* currentTy  = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+
+    auto* varSlot = entryAlloca(elemTy);
+    locals_[&fs] = varSlot;
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "lz.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "lz.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "lz.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    // cond: MoveNext (vtable slot 2) → i32 (1 = advanced).
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* obj = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* vtable = builder_.CreateLoad(ptrTy(), obj);
+    llvm::Value* mnSlot = builder_.CreateGEP(ptrTy(), vtable, {builder_.getInt32(2)});
+    llvm::Value* mnFn = builder_.CreateLoad(ptrTy(), mnSlot);
+    llvm::Value* moved = builder_.CreateCall(moveNextTy, mnFn, {obj}, "lz.moved");
+    llvm::Value* movedB = builder_.CreateICmpNE(moved, builder_.getInt32(0));
+    builder_.CreateCondBr(movedB, bodyBB, endBB);
+
+    // body: Current (vtable slot 3) → void*; load the element value.
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* obj2 = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* vtable2 = builder_.CreateLoad(ptrTy(), obj2);
+    llvm::Value* curSlot = builder_.CreateGEP(ptrTy(), vtable2, {builder_.getInt32(3)});
+    llvm::Value* curFn = builder_.CreateLoad(ptrTy(), curSlot);
+    llvm::Value* curPtr = builder_.CreateCall(currentTy, curFn, {obj2}, "lz.curp");
+    llvm::Value* curVal = builder_.CreateLoad(elemTy, curPtr, "lz.cur");
+    builder_.CreateStore(curVal, varSlot);
+
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+    lowerScopedBlock(fs.body);
+    loopStack_.pop_back();
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    // Dispose the enumerator chain (vtable slot 1).
+    llvm::Value* dObj = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* dVt = builder_.CreateLoad(ptrTy(), dObj);
+    llvm::Value* dSlot = builder_.CreateGEP(ptrTy(), dVt, {builder_.getInt32(1)});
+    llvm::Value* dFn = builder_.CreateLoad(ptrTy(), dSlot);
+    auto* disposeTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                              {ptrTy()}, false);
+    builder_.CreateCall(disposeTy, dFn, {dObj});
     return true;
 }
 

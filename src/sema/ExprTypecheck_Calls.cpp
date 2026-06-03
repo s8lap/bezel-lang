@@ -127,6 +127,69 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }();
                 using P = PrimitiveType;
                 const auto& m = ma->member;
+                // stdlib §5: build a lazy IEnumerable<T> result type for a
+                // deferred LINQ operator. Represented as a Named TypeRef with
+                // no declaration and no astNode (a structural sentinel the
+                // codegen recognizes as "lazy enumerable", distinct from the
+                // astNode-backed builtin IEnumerable<T> spelled in source).
+                auto makeLazyEnumerable = [&](TypeRef* elem) -> TypeRef* {
+                    auto* t = ctx_.makeTypeRef();
+                    t->kind = TypeRef::Kind::Named;
+                    t->declaration = nullptr;
+                    t->astNode = nullptr;
+                    if (elem) t->genericArgs.push_back(elem);
+                    return t;
+                };
+                // stdlib §5: type a deferred LINQ operator `m` whose source
+                // element type is `srcElem`. ToArray materializes to Array<T>
+                // (modeled here as the lazy element type carried on the call;
+                // codegen builds the concrete owned Array<T>). Returns true if
+                // `m` was a LINQ operator (typed) — caller falls through
+                // otherwise.
+                auto typeLinqOperator = [&](TypeRef* srcElem) -> bool {
+                    if (m == "Where" || m == "Skip" || m == "Take" ||
+                        m == "Distinct") {
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                        return true;
+                    }
+                    if (m == "OrderBy" || m == "OrderByDescending") {
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                        return true;
+                    }
+                    if (m == "Select" && !ce.args.empty() && ce.args[0].value) {
+                        TypeRef* outElem = srcElem;
+                        if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
+                            if (lamTy->kind == TypeRef::Kind::Function && lamTy->funcReturn)
+                                outElem = lamTy->funcReturn;
+                        ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
+                        return true;
+                    }
+                    return false;
+                };
+                // stdlib §5: chained LINQ on a lazy IEnumerable<T> receiver.
+                // The receiver carries no declaration/astNode (the lazy
+                // sentinel) but does carry the element type as genericArgs[0].
+                bool isLazyRecv = recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    !recvTy->declaration && !recvTy->astNode &&
+                    !recvTy->genericArgs.empty();
+                if (isLazyRecv) {
+                    TypeRef* srcElem = recvTy->genericArgs[0];
+                    if (m == "Any" || m == "All")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                    else if (m == "Count" || m == "Sum" || m == "Min" || m == "Max")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    else if (m == "First" || m == "Last" || m == "Single" ||
+                             m == "ElementAt")
+                        ctx_.setExprType(&ce, srcElem);
+                    else if (m == "ToArray" || m == "ToSet")
+                        // Materializers (stdlib §5). Typed as the lazy sentinel
+                        // carrying the element type; codegen builds the concrete
+                        // owned Array<T>/Set<T>. The result is bound to an
+                        // explicitly-typed local in practice, which supplies the
+                        // collection type for downstream member access.
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                    else if (typeLinqOperator(srcElem)) { /* typed */ }
+                }
                 if (!colName.empty()) {
                     // Array/Stack/Queue/Set/LinkedList methods
                     bool isArrLike = colName == "Array" || colName == "OwnedArray" ||
@@ -144,23 +207,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                 ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         }
-                        // per §3: Contains → bool, IndexOf → int, Distinct → Array<T>
+                        // per §3: Contains → bool, IndexOf → int
                         else if (m == "Contains")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "IndexOf")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
-                        else if (m == "Distinct")
-                            ctx_.setExprType(&ce, recvTy);
-                        // per §5 LINQ: Any/All → bool, Count → int, Where/Select → Array<T>
+                        // per §5 LINQ: Any/All → bool, Count(pred) → int
                         else if (m == "Any" || m == "All")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "Count" && !ce.args.empty())
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
-                        else if (m == "Where" || m == "Select" || m == "Skip" || m == "Take" ||
-                                 m == "OrderBy" || m == "OrderByDescending")
-                            ctx_.setExprType(&ce, recvTy);  // same Array<T> type
                         else if (m == "Sum" || m == "Min" || m == "Max")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // per §5 LINQ: ToArray/ToSet materialize the (already
+                        // eager, for an Array source) collection. Typed as the
+                        // lazy sentinel carrying the element type.
+                        else if ((m == "ToArray" || m == "ToSet") &&
+                                 !recvTy->genericArgs.empty())
+                            ctx_.setExprType(&ce, makeLazyEnumerable(recvTy->genericArgs[0]));
+                        // per §5 LINQ: Where/Select/Skip/Take/Distinct/OrderBy
+                        // are LAZY — they return a deferred IEnumerable<T>, not
+                        // a materialized Array<T> (stdlib §5).
+                        else if (!recvTy->genericArgs.empty() &&
+                                 typeLinqOperator(recvTy->genericArgs[0])) {
+                            /* typed as lazy IEnumerable<T> */
+                        }
                         // Add/Push/Enqueue/Set/RemoveAt/Clear → unit (void)
                     }
                     // Dictionary methods
