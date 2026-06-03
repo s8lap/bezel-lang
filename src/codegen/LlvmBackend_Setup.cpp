@@ -636,18 +636,42 @@ void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
 
 
 void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
-    std::vector<const sema::FieldSymbol*> owned;
+    // Each owned field carries either a class/interface object (disposed via
+    // its vtable) or — #362 / stdlib §4.5 — a heap collection (freed via
+    // bz_array_free, cascading into class elements for an owning collection).
+    struct OwnedField {
+        const sema::FieldSymbol* fs;
+        const sema::TypeRef* collTy;  // non-null → collection field
+    };
+    std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
         auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
-        if (!fs || !isOwnedReferenceField(fs)) continue;
+        if (!fs) continue;
         if (fieldIndex_.find(fs) == fieldIndex_.end()) continue;
-        owned.push_back(fs);
+        if (isOwnedReferenceField(fs)) {
+            owned.push_back({fs, nullptr});
+        } else if (const sema::TypeRef* ct = ownedCollectionFieldType(fs)) {
+            owned.push_back({fs, ct});
+        }
     }
     for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
         llvm::StructType* st = classStruct(ts);
-        unsigned idx = fieldIndex_[*it];
+        unsigned idx = fieldIndex_[it->fs];
         llvm::Value* addr = builder_.CreateStructGEP(st, currentThis_, idx);
         llvm::Value* val = builder_.CreateLoad(ptrTy(), addr);
+        // #362 / stdlib §4.5: an owned collection field frees its backing and
+        // cascades disposal into its class elements (for an owning collection).
+        // bz_array_free is null-safe, so no field null-check is needed here.
+        if (it->collTy) {
+            llvm::Function* elemDisp = owningCollectionElemDisposer(it->collTy);
+            llvm::Value* disp = elemDisp
+                ? llvm::cast<llvm::Value>(elemDisp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_array_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {val, disp});
+            continue;
+        }
         llvm::Value* isNull = builder_.CreateICmpEQ(
             val, llvm::ConstantPointerNull::get(ptrTy()));
         auto* dispBB = llvm::BasicBlock::Create(llvm_, "owned.dispose",
@@ -722,6 +746,66 @@ void Emitter::emitDynamicDispose(llvm::Value* obj) {
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     builder_.CreateCall(fnTy, disposeFn, {obj});
+}
+
+
+llvm::Function* Emitter::elementDisposerThunk() {
+    // #362 / stdlib §4.5: a standalone `void(void*)` thunk that runs an owning
+    // collection element's destructor via the element's own vtable (slot 1),
+    // skipping a null element. Built once with its own IRBuilder so the active
+    // `builder_` insert point is untouched.
+    if (elementDisposerThunk_) return elementDisposerThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$elemDispose", module_.get());
+    llvm::Argument* obj = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* dispBB = llvm::BasicBlock::Create(llvm_, "elem.dispose", fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "elem.ret", fn);
+    llvm::IRBuilder<> b(entry);
+    // A null/already-moved slot is safe to skip (no double-dispose / UAF).
+    llvm::Value* isNull = b.CreateICmpEQ(
+        obj, llvm::ConstantPointerNull::get(ptrTy()));
+    b.CreateCondBr(isNull, retBB, dispBB);
+    b.SetInsertPoint(dispBB);
+    // vtable layout: [0]=descriptor, [1]=Dispose. Dispatch through the element.
+    llvm::Value* vptr = b.CreateLoad(ptrTy(), obj);
+    llvm::Value* slot = b.CreateGEP(ptrTy(), vptr, {b.getInt32(1)});
+    llvm::Value* disposeFn = b.CreateLoad(ptrTy(), slot);
+    auto* dispTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy()}, /*isVarArg=*/false);
+    b.CreateCall(dispTy, disposeFn, {obj});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    elementDisposerThunk_ = fn;
+    return fn;
+}
+
+
+bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
+    if (!collTy || collTy->genericArgs.size() <= idx) return false;
+    const sema::TypeRef* el = collTy->genericArgs[idx];
+    if (!el || el->kind != sema::TypeRef::Kind::Named || !el->declaration)
+        return false;
+    return el->declaration->kind == ast::TypeDeclKind::Class;
+}
+
+
+llvm::Function* Emitter::owningCollectionElemDisposer(
+        const sema::TypeRef* collTy) {
+    // #362 / stdlib §4.5: only OWNING collections (name prefixed "Owned") with
+    // a class element type cascade disposal into their elements. Borrowing
+    // collections (Array<T> etc.) and value/string elements return null — only
+    // the backing storage is freed.
+    if (!collTy || !collTy->astNode || !collTy->astNode->name ||
+        collTy->astNode->name->parts.empty())
+        return nullptr;
+    std::string_view n = collTy->astNode->name->parts[0];
+    if (n.rfind("Owned", 0) != 0) return nullptr;  // not an owning collection
+    if (!collectionElemIsClass(collTy, 0)) return nullptr;
+    return elementDisposerThunk();
 }
 
 
@@ -1171,10 +1255,50 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         disposeStack_.back().push_back({it->second, nullptr, /*subscription=*/true});
         return;
     }
+    // #362 / stdlib §4.5: a `using var` bound to a heap collection
+    // (Array<T>/OwnedArray<T>/Dictionary/Set/…). These are builtins with no
+    // user TypeSymbol, so classOfLocal returns null; recognize them by name and
+    // register a collection disposal. For an OWNING collection of class
+    // elements the disposal cascades into the elements (the leak fixed here);
+    // a borrowing collection or value elements free only the backing.
+    if (const sema::TypeRef* collTy = collectionTypeOfLocal(ld)) {
+        if (isCollectionTypeName(collTy)) {
+            Disposal d{it->second, nullptr};
+            d.collection = true;
+            d.collectionElemDisposer = owningCollectionElemDisposer(collTy);
+            disposeStack_.back().push_back(d);
+            return;
+        }
+        // Dict/Set disposal is not wired in this slice; leave as-is (the
+        // pre-existing behaviour) to avoid changing other test outcomes.
+    }
+
     const sema::TypeSymbol* cls = classOfLocal(ld);
     if (!cls) return;
     if (disposerFns_.find(cls) == disposerFns_.end()) return;
     disposeStack_.back().push_back({it->second, cls});
+}
+
+
+const sema::TypeRef* Emitter::collectionTypeOfLocal(const ast::LocalDecl* ld) {
+    // #362: recover the local's resolved collection TypeRef (with generic args).
+    // Prefer the declared type, then a `new` initializer's type, then the
+    // initializer's inferred expression type.
+    if (ld->type) {
+        if (auto* rt = ctx_.resolvedType(*ld->type))
+            if (isCollectionTypeName(rt)) return rt;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+        if (ne->type) {
+            if (auto* rt = ctx_.resolvedType(*ne->type))
+                if (isCollectionTypeName(rt)) return rt;
+        }
+    }
+    if (ld->initializer) {
+        if (auto* rt = ctx_.exprType(*ld->initializer))
+            if (isCollectionTypeName(rt)) return rt;
+    }
+    return nullptr;
 }
 
 
@@ -1222,6 +1346,23 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope) {
             auto* fn = declareC("bz_subscription_dispose",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {sub});
+            continue;
+        }
+        // #362 / stdlib §4.5: a `using var` heap collection. Free the backing
+        // via bz_array_free; for an owning collection of class elements the
+        // element-disposer thunk cascades disposal into each (non-null) element
+        // exactly once (the thunk null-checks; the array iterates live slots).
+        if (it->collection) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* arr = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* disp = it->collectionElemDisposer
+                ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_array_free",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {arr, disp});
             continue;
         }
         if (disposerFns_.find(it->cls) == disposerFns_.end()) continue;

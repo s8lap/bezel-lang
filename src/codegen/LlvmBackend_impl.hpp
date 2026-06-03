@@ -196,10 +196,19 @@ private:
         llvm::AllocaInst* slot;
         const sema::TypeSymbol* cls;
         bool subscription = false;
+        // #362 / stdlib §4.5: a `using var` bound to a heap collection
+        // (Array<T>/OwnedArray<T>/…). At scope end it is freed via
+        // bz_array_free. `collectionElemDisposer` is the per-element dispose
+        // callback for an OWNING collection of class elements (null for a
+        // borrowing collection or value elements — only the backing is freed).
+        bool collection = false;
+        llvm::Value* collectionElemDisposer = nullptr;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // CG13: the compiler-generated Dispose function for each class.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
+    // #362 / stdlib §4.5: the cached per-element dispose thunk (built lazily).
+    llvm::Function* elementDisposerThunk_ = nullptr;
 
     // CG21c (§31.2): when a `return`/`break`/`continue` exits a `try`-with-
     // `finally` block, the finally body must run before the actual jump.
@@ -1043,6 +1052,24 @@ private:
 
     void emitDynamicDispose(llvm::Value* obj);
 
+    // #362 / stdlib §4.5: a module-level `void(void*)` thunk that runs an
+    // owning collection element's destructor via dynamic dispatch (vtable
+    // slot 1), null-checking the element first. Suitable as the `dispose_elem`
+    // callback for bz_array_free / bz_array_clear_disposing /
+    // bz_array_remove_at_disposing. Built once per module and cached.
+    llvm::Function* elementDisposerThunk();
+
+    // #362 / stdlib §4.5: if `collTy` is an OWNING collection (name prefixed
+    // "Owned") whose element type is a class, return the element-disposer thunk
+    // (so disposing the collection cascades into its elements); otherwise null.
+    // A borrowing collection, or one with value/string elements, has no element
+    // disposal obligation and returns null (only the backing is freed).
+    llvm::Function* owningCollectionElemDisposer(const sema::TypeRef* collTy);
+
+    // #362 / stdlib §4.5: is genericArgs[idx] of `collTy` a class type (whose
+    // runtime objects carry a vtable with a Dispose at slot 1)?
+    bool collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx = 0);
+
     // §28.4 step 3: chain to the base class's Dispose. baseTypes[0] is
     // conventionally the base class when it resolves to one.
     void emitBaseDisposeChain(const sema::TypeSymbol* ts);
@@ -1066,6 +1093,19 @@ private:
             return false;
         auto k = rt->declaration->kind;
         return k == ast::TypeDeclKind::Class || k == ast::TypeDeclKind::Interface;
+    }
+
+    // #362 / stdlib §4.5: if `fs` is an `owned` field whose type is a heap
+    // collection (Array<T>/OwnedArray<T>/…, builtins with no TypeSymbol so
+    // isOwnedReferenceField does not match them), return its resolved TypeRef;
+    // otherwise null. The owner's Dispose frees such a field's backing and
+    // cascades disposal into its class elements for an owning collection.
+    const sema::TypeRef* ownedCollectionFieldType(const sema::FieldSymbol* fs) {
+        if (!hasOwnedModifier(fs)) return nullptr;
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return nullptr;
+        auto* rt = ctx_.resolvedType(*fd->type);
+        return isCollectionTypeName(rt) ? rt : nullptr;
     }
 
     // §29.3: Pre-scan iterator body to collect all LocalDecl/ForStmt nodes and
@@ -1268,6 +1308,11 @@ private:
     // CG13: the class type of a local — from its declared type, else the
     // resolved type of a `new T(...)` initializer.
     const sema::TypeSymbol* classOfLocal(const ast::LocalDecl* ld);
+
+    // #362 / stdlib §4.5: the resolved collection TypeRef of a local (declared
+    // type, then `new` initializer type, then inferred initializer type), or
+    // null if the local is not a heap collection.
+    const sema::TypeRef* collectionTypeOfLocal(const ast::LocalDecl* ld);
 
     // CG13: lower a block as a disposal scope. Pushes a fresh scope; on
     // normal fall-through, disposes its `using var`s in reverse and pops.

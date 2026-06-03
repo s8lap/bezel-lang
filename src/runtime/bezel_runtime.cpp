@@ -99,6 +99,35 @@ void bz_array_clear(void* arrp) {
     if (arrp) ((bz_array_t*)arrp)->count = 0;
 }
 
+// stdlib §4.5: dispose every non-null class-typed element, then empty.
+void bz_array_clear_disposing(void* arrp, void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (dispose_elem && arr->data) {
+        for (int64_t i = 0; i < arr->count; ++i) {
+            void* elem_ptr = ((void**)arr->data)[i];
+            // Null the slot before disposing so the live range never re-reaches
+            // a disposed object (mirrors the spec's move-and-null pattern).
+            ((void**)arr->data)[i] = nullptr;
+            if (elem_ptr) dispose_elem(elem_ptr);
+        }
+    }
+    arr->count = 0;
+}
+
+// stdlib §4.5: dispose the non-null element at idx, then remove it.
+void bz_array_remove_at_disposing(void* arrp, int64_t idx, int64_t elem_size,
+                                  void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (idx < 0 || idx >= arr->count) return;
+    if (dispose_elem && arr->data) {
+        void* elem_ptr = ((void**)arr->data)[idx];
+        if (elem_ptr) dispose_elem(elem_ptr);
+    }
+    bz_array_remove_at(arrp, idx, elem_size);
+}
+
 void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;
