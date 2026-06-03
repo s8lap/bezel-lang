@@ -1475,6 +1475,21 @@ private:
 
     static bool isDictTypeName(const sema::TypeRef* rt);
 
+    // issue #343 / §4.8: if the type's key generic arg (genericArgs[idx]) is a
+    // record (a value type with synthesized GetHashCode/Equals), return its
+    // TypeSymbol; otherwise null (string/int keys use the existing fast paths).
+    static const sema::TypeSymbol* recordKeyType(const sema::TypeRef* collTy,
+                                                 unsigned idx);
+
+    // issue #343 / §8.3: build C-ABI trampolines over a record key type's
+    // synthesized hash / equality for the generic dict/set runtime variant.
+    //   hash: uint64_t(const void* key)  — loads the record struct, hashes it.
+    //   eq:   bool(const void* a, const void* b) — loads both, compares.
+    // The runtime stores raw key bytes; the trampolines reinterpret the byte
+    // pointer as a record-struct pointer.
+    llvm::Function* buildRecordHashTrampoline(const sema::TypeSymbol* rec);
+    llvm::Function* buildRecordEqTrampoline(const sema::TypeSymbol* rec);
+
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);

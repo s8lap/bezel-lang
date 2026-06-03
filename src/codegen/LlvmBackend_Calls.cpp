@@ -248,6 +248,28 @@ bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
 }
 
 
+// issue #343 / §4.8: a Dictionary<K,V> key (idx=0) or Set<T> element (idx=0)
+// is a "record key" when the generic arg resolves to a record TypeSymbol that
+// actually carries synthesized GetHashCode/Equals (positional records, or
+// auto-equality-bearing body records — §9.1 / §9.2). For such keys the generic
+// runtime variant is used; string and primitive keys keep their fast paths.
+const sema::TypeSymbol* Emitter::recordKeyType(const sema::TypeRef* collTy,
+                                               unsigned idx) {
+    if (!collTy || collTy->genericArgs.size() <= idx) return nullptr;
+    const sema::TypeRef* kr = collTy->genericArgs[idx];
+    if (!kr || kr->kind != sema::TypeRef::Kind::Named || !kr->declaration)
+        return nullptr;
+    const sema::TypeSymbol* ts = kr->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return nullptr;
+    bool positional = false;
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+        positional = td->hasPositionalFields;
+    if (positional || sema::isAutoEqualityBearingBodyRecord(ts))
+        return ts;
+    return nullptr;  // an ineligible body record has no auto equality (§9.2)
+}
+
+
 llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -271,6 +293,72 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // -----------------------------------------------------------------------
     if (isArr) {
         int64_t esz = collectionElemSize(recvTy);
+
+        // issue #343 / §4.10: a record-element Set<T>/OwnedSet<T> is backed by
+        // the generic-key hash table (allocated in the `new` path). Route its
+        // core membership operations to the generic dict entry points so set
+        // semantics follow the element's synthesized hash/equality (§8.3).
+        // Element value is a non-null sentinel; only membership matters.
+        // Other Set operations (LINQ, set-algebra) on a record-element set are
+        // not wired in this slice and fall through.
+        bool isSetName = recvTy && recvTy->astNode && recvTy->astNode->name &&
+                         !recvTy->astNode->name->parts.empty() &&
+                         (recvTy->astNode->name->parts[0] == "Set" ||
+                          recvTy->astNode->name->parts[0] == "OwnedSet");
+        if (isSetName) {
+            if (const sema::TypeSymbol* elemRec = recordKeyType(recvTy, 0)) {
+                llvm::StructType* est = recordStruct(elemRec);
+                auto elemPtr = [&](llvm::Value* v) -> llvm::Value* {
+                    if (v->getType()->isPointerTy()) return v;
+                    llvm::AllocaInst* slot = entryAlloca(est);
+                    builder_.CreateStore(v, slot);
+                    return slot;
+                };
+                // sentinel non-null value stored for present elements
+                llvm::Value* sentinel = builder_.CreateIntToPtr(
+                    builder_.getInt64(1), ptrTy());
+                // .Add(item) — insert (idempotent by content; §4.10 dedup).
+                if (m == "Add" && call.args.size() == 1 && call.args[0].value) {
+                    llvm::Value* item = lowerExpr(*call.args[0].value);
+                    if (!item) return nullptr;
+                    auto* fn = declareC("bz_dict_set_gen",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(fn, {recv, elemPtr(item), sentinel});
+                    return llvm::ConstantInt::get(i32(), 0);
+                }
+                // .Contains(item): bool
+                if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+                    llvm::Value* item = lowerExpr(*call.args[0].value);
+                    if (!item) return nullptr;
+                    auto* fn = declareC("bz_dict_contains_gen", i1(),
+                                        {ptrTy(), ptrTy()});
+                    return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.has");
+                }
+                // .Remove(item): bool
+                if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
+                    llvm::Value* item = lowerExpr(*call.args[0].value);
+                    if (!item) return nullptr;
+                    auto* fn = declareC("bz_dict_remove_gen", i1(),
+                                        {ptrTy(), ptrTy()});
+                    return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.rm");
+                }
+                // .Count: int
+                if (m == "Count" && call.args.empty()) {
+                    auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
+                    return builder_.CreateTrunc(
+                        builder_.CreateCall(fn, {recv}), i32(), "set.cnt");
+                }
+                // .IsEmpty(): bool
+                if (m == "IsEmpty" && call.args.empty()) {
+                    auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
+                    return builder_.CreateICmpEQ(
+                        builder_.CreateCall(fn, {recv}),
+                        builder_.getInt64(0), "set.empty");
+                }
+                // .Clear() — recreate via remove-all is unavailable; not wired.
+                return nullptr;  // other ops scoped out for record-element sets
+            }
+        }
 
         // per §5 LINQ: closure struct { ptr fn, ptr env }; call as fn(env, elem).
         auto callClosure = [&](llvm::Value* closure,
@@ -900,11 +988,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // Dictionary<string, V> methods (string-key variant)
     // -----------------------------------------------------------------------
     if (isDict) {
+        // issue #343 / §4.8: a record key routes through the generic-key runtime
+        // (bz_dict_*_gen), passing a pointer to the lowered key bytes; string
+        // keys keep the bz_dict_*_str fast path. `keyRec` is non-null only for
+        // record keys.
+        const sema::TypeSymbol* keyRec = recordKeyType(recvTy, 0);
+
         // Helper: extract string data/len from bz.string ptr
         auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
             llvm::Value* data = loadStringData(s);
             llvm::Value* len  = loadStringLen(s);
             return {data, len};
+        };
+        // issue #343: spill a record key value to a stack slot and return the
+        // byte pointer the generic runtime entry points expect.
+        auto recKeyPtr = [&](llvm::Value* k) -> llvm::Value* {
+            llvm::StructType* kst = recordStruct(keyRec);
+            if (k->getType()->isPointerTy())   // already an address (spilled)
+                return k;
+            llvm::AllocaInst* slot = entryAlloca(kst);
+            builder_.CreateStore(k, slot);
+            return slot;
         };
 
         // .Count: int
@@ -913,10 +1017,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* c = builder_.CreateCall(fn, {recv});
             return builder_.CreateTrunc(c, i32());
         }
-        // .ContainsKey(k): bool
-        if (m == "ContainsKey" && call.args.size() == 1 && call.args[0].value) {
+        // .ContainsKey(k) / .Contains(k) (alias, §4.8): bool
+        if ((m == "ContainsKey" || m == "Contains") &&
+            call.args.size() == 1 && call.args[0].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
+            if (keyRec) {
+                auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {recv, recKeyPtr(k)}, "dict.contains");
+            }
             auto [kd, kl] = strDataLen(k);
             auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
@@ -927,7 +1036,6 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             llvm::Value* v = lowerExpr(*call.args[1].value);
             if (!k || !v) return nullptr;
-            auto [kd, kl] = strDataLen(k);
             // Encode value as void* for storage. For pointer types: store
             // directly. For integer/float types: widen to i64 and use
             // inttoptr so each stored value is self-contained (avoids
@@ -947,6 +1055,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 }
                 vPtr = builder_.CreateIntToPtr(asI64, ptrTy());
             }
+            if (keyRec) {
+                auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {recv, recKeyPtr(k), vPtr});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
+            auto [kd, kl] = strDataLen(k);
             auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), i64(), ptrTy()});
             builder_.CreateCall(fn, {recv, kd, kl, vPtr});
@@ -956,6 +1071,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
+            if (keyRec) {
+                auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {recv, recKeyPtr(k)}, "dict.remove");
+            }
             auto [kd, kl] = strDataLen(k);
             auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
@@ -966,19 +1085,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             call.args[0].value && call.args[1].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
-            auto [kd, kl] = strDataLen(k);
             // Get the address of the out parameter
             llvm::Type* outTy = nullptr;
             llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
             if (!outAddr) return nullptr;
-            // bz_dict_try_get_str writes the stored void* into *tmpSlot.
+            // bz_dict_try_get_* writes the stored void* into *tmpSlot.
             // For pointer values: the void* IS the string/object pointer.
             // For integer/float values: the void* encodes the value via
             // inttoptr (mirroring the Add encoding above). Decode via ptrtoint.
             auto* tmpSlot = entryAlloca(ptrTy());
-            auto* fn = declareC("bz_dict_try_get_str", i1(),
-                                {ptrTy(), ptrTy(), i64(), ptrTy()});
-            llvm::Value* found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+            llvm::Value* found;
+            if (keyRec) {
+                auto* fn = declareC("bz_dict_try_get_gen", i1(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, recKeyPtr(k), tmpSlot});
+            } else {
+                auto [kd, kl] = strDataLen(k);
+                auto* fn = declareC("bz_dict_try_get_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+            }
             llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
             if (outTy && !outTy->isPointerTy()) {
                 // Decode: ptrtoint → truncate/bitcast to target type
@@ -3383,6 +3509,51 @@ bool Emitter::isLazyEnumerableType(const sema::TypeRef* rt) {
     // the LINQ-operator typing in ExprTypecheck_Calls.cpp.
     return rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
            !rt->astNode && !rt->genericArgs.empty();
+}
+
+// issue #343 / §8.3: trampoline matching the runtime's generic-dict hash fn
+// pointer `uint64_t(const void* key)`. The runtime stores raw record bytes; we
+// reinterpret the byte pointer as a record-struct pointer, load the value, and
+// run the synthesized GetHashCode (emitRecordHashCode, §9.1/§9.2). The i32 hash
+// is zero-extended to i64 (the runtime keeps the low 32 bits for bucketing).
+llvm::Function* Emitter::buildRecordHashTrampoline(const sema::TypeSymbol* rec) {
+    llvm::StructType* st = recordStruct(rec);
+    auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$reckey$hash", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* rv = builder_.CreateLoad(st, fn->getArg(0), "key.rec");
+    llvm::Value* h = emitRecordHashCode(rv, rec);          // i32
+    builder_.CreateRet(builder_.CreateZExt(h, i64()));
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// issue #343 / §8.3: trampoline matching the runtime's generic-dict equality fn
+// pointer `bool(const void* a, const void* b)`. Loads both record values and
+// runs the synthesized structural equality (emitStructEquality, §9.1/§9.2),
+// which compares string fields by content (#346) consistent with the hash.
+llvm::Function* Emitter::buildRecordEqTrampoline(const sema::TypeSymbol* rec) {
+    llvm::StructType* st = recordStruct(rec);
+    auto* fty = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$reckey$eq", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* a = builder_.CreateLoad(st, fn->getArg(0), "eq.a");
+    llvm::Value* b = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
+    builder_.CreateRet(emitStructEquality(a, b, st, rec));  // i1
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
 }
 
 llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,

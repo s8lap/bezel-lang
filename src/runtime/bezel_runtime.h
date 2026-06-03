@@ -86,6 +86,7 @@ void* bz_dict_alloc_generic(int64_t key_size,
 bool  bz_dict_try_get_gen(void* d, const void* key, void** out);
 void  bz_dict_set_gen(void* d, const void* key, void* val);
 bool  bz_dict_remove_gen(void* d, const void* key);
+bool  bz_dict_contains_gen(void* d, const void* key);
 
 // ---------------------------------------------------------------------------
 // Random number generator

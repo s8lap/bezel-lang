@@ -150,6 +150,12 @@ struct bz_dict_t {
     bz_entry_t* buckets;
     int64_t     count;
     int64_t     capacity;  // always a power of 2
+    // Generic-key mode (issue #343, §4.8 "K must provide consistent Equals and
+    // GetHashCode"). When key_size > 0 the table holds raw key bytes and uses
+    // the synthesized hash/eq function pointers instead of the string path.
+    int64_t     key_size;  // 0 = string-key mode; >0 = generic key byte count
+    uint64_t  (*hash_fn)(const void* key);
+    bool      (*eq_fn)(const void* a, const void* b);
 };
 
 static uint32_t fnv1a(const char* s, int64_t len) {
@@ -289,29 +295,91 @@ void bz_dict_keys_str(void* dp, char*** keys_out, int64_t** lens_out, int64_t* n
     if (n_out)    *n_out    = j;
 }
 
-// Generic-key variants (stub — implement similarly to string variant)
-void* bz_dict_alloc_generic(int64_t /*key_size*/,
-                              uint64_t (*/*hash*/)(const void*),
-                              bool     (*/*eq*/)(const void*, const void*)) {
-    // For now, delegate to the string-key variant treating keys as raw bytes.
-    return bz_dict_alloc();
+// Generic-key variants (issue #343, §4.8). Keys are raw byte blobs of
+// `key_size` bytes; hashing and equality are delegated to the synthesized
+// GetHashCode / Equals of the key type (§8.3 / §9.1 / §9.2) via the function
+// pointers the codegen passes at allocation time. This makes records (and any
+// value type with the equality contract) usable as Dictionary/Set keys.
+//
+// Storage reuses bz_entry_t: `key` holds a malloc'd copy of the key bytes and
+// `key_len` holds key_size, so bz_dict_free / dict_rehash work unchanged.
+
+// Find a generic key in the table. Returns the bucket index, or -(idx+1) for
+// the empty insertion slot, or -1 if full. Mirrors dict_find but compares with
+// the user-provided equality function (and matches the cached hash first).
+static int64_t dict_find_gen(bz_dict_t* d, const void* k, uint32_t h) {
+    int64_t mask = d->capacity - 1;
+    int64_t idx = h & mask;
+    for (int64_t probe = 0; probe < d->capacity; probe++) {
+        int64_t i = (idx + probe) & mask;
+        bz_entry_t& e = d->buckets[i];
+        if (!e.key && !e.deleted) return -(i + 1); // empty: not found, insert here
+        if (e.deleted) continue;
+        if (e.hash == h && d->eq_fn(e.key, k))
+            return i; // found
+    }
+    return -1; // table full (shouldn't happen with load factor management)
 }
 
-bool bz_dict_try_get_gen(void* d, const void* key, void** out) {
-    // Minimal: treat key as pointer (8-byte comparison)
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%p", key);
-    return bz_dict_try_get_str(d, buf, (int64_t)strlen(buf), out);
+void* bz_dict_alloc_generic(int64_t key_size,
+                              uint64_t (*hash)(const void* key),
+                              bool     (*eq)(const void* a, const void* b)) {
+    auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
+    d->capacity = 8;
+    d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
+    d->key_size = key_size > 0 ? key_size : 1;
+    d->hash_fn = hash;
+    d->eq_fn = eq;
+    return d;
 }
 
-void bz_dict_set_gen(void* d, const void* key, void* val) {
-    char buf[32]; snprintf(buf, sizeof(buf), "%p", key);
-    bz_dict_set_str(d, buf, (int64_t)strlen(buf), val);
+bool bz_dict_try_get_gen(void* dp, const void* key, void** out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    if (out) *out = d->buckets[idx].val;
+    return true;
 }
 
-bool bz_dict_remove_gen(void* d, const void* key) {
-    char buf[32]; snprintf(buf, sizeof(buf), "%p", key);
-    return bz_dict_remove_str(d, buf, (int64_t)strlen(buf));
+void bz_dict_set_gen(void* dp, const void* key, void* val) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return;
+    // Rehash at 75% load (same policy as the string variant).
+    if (d->count * 4 >= d->capacity * 3) dict_rehash(d);
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx >= 0) {
+        d->buckets[idx].val = val;
+        return;
+    }
+    int64_t ins = -(idx + 1);
+    char* kc = (char*)malloc((size_t)d->key_size);
+    memcpy(kc, key, (size_t)d->key_size);
+    d->buckets[ins].key = kc;
+    d->buckets[ins].key_len = d->key_size;
+    d->buckets[ins].val = val;
+    d->buckets[ins].hash = h;
+    d->buckets[ins].deleted = false;
+    d->count++;
+}
+
+bool bz_dict_remove_gen(void* dp, const void* key) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    return true;
+}
+
+bool bz_dict_contains_gen(void* dp, const void* key) {
+    return bz_dict_try_get_gen(dp, key, nullptr);
 }
 
 // ---------------------------------------------------------------------------
