@@ -392,12 +392,43 @@ bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
     }
 }
 
+// §28.3: decide whether a returned expression could carry a borrow that
+// aliases into its identifier root. A *value-typed* return (the spec's
+// "value-typed returns") is a copy and can never outlive its source, so
+// it is never a borrow escape and is reported here as may-borrow = false.
+bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
+    // Prefer sema's resolved type for the returned expression: user-type
+    // field/property/method-call results are typed here (e.g. `r.V`/`r.Size()`
+    // returning int → value type → not a borrow). isBorrowableType is
+    // conservative (unknown → borrowable).
+    if (const sema::TypeRef* t = ctx_.exprType(e))
+        return isBorrowableType(t);
+    // Sema left the returned expression untyped. The one form this reaches
+    // for a valid program is a bare property access on a built-in collection
+    // whose value-typed projections sema types only on the *call* form
+    // (Array/Stack/Queue/Set/LinkedList/Dictionary/StringBuilder/span). Those
+    // projections — `Length`/`Count` (`int`/`long`, stdlib §3/§9.6/§15) and
+    // `IsEmpty` (`bool`) — are value-typed copies, never a reference into the
+    // collection, so returning one is not a §28.3 borrow escape. An element-
+    // returning access (`Get`/`Peek`/…) is a CallExpr, which sema types, so
+    // it does not reach this fallback; nor does a record/field access on a
+    // user type. Be conservative for anything else still untyped.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->member == "Length" || ma->member == "Count" ||
+            ma->member == "IsEmpty")
+            return false;  // value-typed projection → copy, not a borrow
+    }
+    return true;  // unknown → conservative (still a borrow candidate)
+}
+
 void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
     const ast::IdentifierExpr* root = identifierRoot(e);
     if (!root) return;
     // A value-typed return is a copy, not a borrow of the local — it
-    // cannot outlive its source (§28.3 governs borrows).
-    if (!isBorrowableType(ctx_.exprType(e))) return;
+    // cannot outlive its source (§28.3: a borrowed local "may not be
+    // returned from a method at all unless ... value-typed returns ...";
+    // a value-typed projection is a copy, so it is never a borrow escape).
+    if (!returnedExprMayBorrow(e)) return;
     for (const auto& [sym, st] : states_) {
         if (sym->name != root->name) continue;
         if (!st.implicitDischarge) continue;  // only `using var`
