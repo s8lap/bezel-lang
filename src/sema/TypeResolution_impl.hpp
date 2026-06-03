@@ -13,8 +13,10 @@
 // namespace scope here would be a program-wide ODR clash. As a nested type it
 // cannot collide.
 
+#include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -352,6 +354,63 @@ private:
     // checkExternType and, recursively, for inline-array element types and
     // function-type parameter/return types. `returnPosition` permits unit.
     static bool isFfiCompatibleType(const ast::Type& t, bool returnPosition);
+
+    // ---- §14.2: nested-generic constraint propagation -------------------
+    //
+    // When an outer generic's body instantiates an inner constrained generic
+    // with one of the outer's own type parameters as the argument
+    // (e.g. `class Box<W> ... C<W> ...` where `class C<T> where T: new()`),
+    // the inner constraint cannot be checked while resolving the outer body —
+    // W's classification is unknown there. The obligation is deferred to each
+    // *concrete* instantiation of the outer generic (`Box<IFoo>` binds
+    // W = IFoo, so `C<W=IFoo>` must satisfy `where T: new()`).
+    //
+    // Resolution is a single source-order pass, so the outer instantiation
+    // site may be visited before *or* after the inner generic's body. To stay
+    // order-independent we record both halves during the pass and join them in
+    // a final step (checkDeferredNestedConstraints):
+    //   - DeferredNestedObligation: one inner constraint that depends on an
+    //     outer type parameter (recorded while resolving the outer body).
+    //   - GenericInstantiation: one concrete instantiation of a user generic
+    //     (recorded at every `Named<...>` site for a user TypeSymbol).
+
+    // The TypeSymbol whose body is currently being resolved (set in
+    // resolveTypeDecl). Null at module scope. Used to attribute a deferred
+    // generic-param argument to the type parameter / owner it belongs to.
+    TypeSymbol* currentOuterType_ = nullptr;
+
+    struct DeferredNestedObligation {
+        TypeSymbol* outerType = nullptr;        // e.g. Box (owns outerParam)
+        std::string_view outerParamName;        // e.g. "W"
+        std::string_view innerParamName;        // e.g. "T" (on innerType)
+        const ast::ConstraintItem* item = nullptr;  // the inner constraint
+        const ast::Type* innerSite = nullptr;   // the `C<W>` AST node (span)
+    };
+    std::vector<DeferredNestedObligation> deferredNested_;
+
+    struct GenericInstantiation {
+        TypeSymbol* type = nullptr;                  // e.g. Box
+        TypeSymbol* enclosingType = nullptr;         // body this site sits in
+        std::vector<TypeRef*> argRefs;               // concrete arg TypeRefs
+        std::vector<const ast::Type*> argAsts;       // arg AST nodes (spelling)
+        const ast::Type* site = nullptr;             // the `Box<IFoo>` node
+    };
+    std::vector<GenericInstantiation> instantiations_;
+
+    // §14.2: record deferred obligations for an inner instantiation whose
+    // argument `argAst` is a generic parameter of the type currently being
+    // resolved. `innerParam` is the inner generic's parameter the argument
+    // binds (its constraints, looked up in `innerDecl`'s `where` clauses, are
+    // the obligations); `innerSite` is the inner `Named<...>` AST node.
+    void recordDeferredNested(const ast::Type& argAst,
+                              const GenericParamSymbol& innerParam,
+                              const ast::TypeDecl& innerDecl,
+                              const ast::Type& innerSite);
+
+    // §14.2: final join — for every deferred inner obligation, re-check it
+    // against each concrete binding the outer type's instantiation sites
+    // supply for the obligation's outer parameter.
+    void checkDeferredNestedConstraints();
 };
 
 }  // namespace bezel::sema
