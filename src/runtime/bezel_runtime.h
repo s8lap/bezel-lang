@@ -237,6 +237,53 @@ void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
 void* bz_lazy_to_array(void* lazy, int64_t elem_size);
 
 // ---------------------------------------------------------------------------
+// Events (language spec §24). The backing object of an `event` declaration is
+// an EventSource holding an ordered list of subscribed handlers. Each handler
+// is a Bezel closure value — a heap-allocated { fn_ptr, env_ptr } struct
+// pointer (see codegen lowerLambda). The payload type is type-erased here:
+// `Raise` is lowered in codegen (it must call each closure with the concrete
+// payload type), so the runtime only stores/produces the handler list.
+//
+// Handlers carry a monotonically-increasing token so a `Subscription` can
+// later remove its own handler (idempotently) on Dispose without relying on
+// closure-pointer identity.
+// ---------------------------------------------------------------------------
+
+// Allocate an empty EventSource. Returned pointer is opaque to Bezel code.
+void* bz_event_source_new(void);
+
+// Add a handler closure; returns its token (a positive int64). Used by both
+// EventSource.Add and (indirectly) Subscribe.
+int64_t bz_event_add(void* src, void* closure);
+
+// Number of currently-active (not-yet-removed) handlers. Used by codegen's
+// Raise loop.
+int64_t bz_event_count(void* src);
+
+// The closure pointer of the i-th active handler (0-based). Returns null if
+// out of range. Codegen calls each with the payload.
+void* bz_event_handler_at(void* src, int64_t i);
+
+// Remove the (first) handler whose closure pointer equals `closure`. Used by
+// EventSource.Remove (`-=`). No-op if not found. (Pointer identity: matches a
+// handler subscribed via the same closure value — see §24 report note.)
+void bz_event_remove_closure(void* src, void* closure);
+
+// Remove the handler with the given token. Idempotent (second call is a
+// no-op). Used by Subscription.Dispose.
+void bz_event_remove_token(void* src, int64_t token);
+
+// Subscribe `closure`; returns an owned Subscription object (opaque). The
+// Subscription remembers (src, token) and removes the handler when disposed.
+void* bz_event_subscribe(void* src, void* closure);
+
+// Dispose a Subscription: removes its handler from the source (idempotent).
+void bz_subscription_dispose(void* sub);
+
+// Free an EventSource and its handler list.
+void bz_event_source_free(void* src);
+
+// ---------------------------------------------------------------------------
 // Split a string by a delimiter: returns bz_array_t* of bz.string* (heap alloc'd).
 // Caller disposes result array. All pointers point into separately malloc'd strings.
 void* bz_string_split(const char* s, int64_t s_len,

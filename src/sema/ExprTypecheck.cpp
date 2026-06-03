@@ -781,17 +781,39 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (es->expr) visitExpr(*es->expr);
     } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         if (as->target) visitExpr(*as->target);
-        if (as->value) visitExpr(*as->value);
-        // Slice S7: readonly field assignment outside a ctor.
-        checkReadonlyAssignment(*as);
-        // Slice T2: plain `:=` assignment must be primitive-
-        // assignable (compound ops like `+=` have their own
-        // operator semantics and are left to a later slice).
-        if (as->op == ":=" && as->target && as->value) {
-            checkAssignable(
-                ctx_.exprType(*as->value),
-                ctx_.exprType(*as->target),
-                as->value->span.begin, "assigned value");
+        // per §24.4: `event += handler` / `event -= handler` — type the
+        // handler lambda's param as the event payload `T` (these forms desugar
+        // to Add/Remove; they are not real compound assignments).
+        TypeRef* eventPayload = nullptr;
+        if ((as->op == "+=" || as->op == "-=") && as->target) {
+            if (auto* es = dynamic_cast<EventSymbol*>(
+                    ctx_.exprSymbol(*as->target))) {
+                if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
+                    if (ed->type) eventPayload = ctx_.resolvedType(*ed->type);
+            }
+        }
+        if (as->value) {
+            TypeRef* savedPending = pendingLambdaParamType_;
+            if (eventPayload &&
+                dynamic_cast<const ast::LambdaExpr*>(as->value.get()))
+                pendingLambdaParamType_ = eventPayload;
+            visitExpr(*as->value);
+            pendingLambdaParamType_ = savedPending;
+        }
+        // per §24.4: an event += / -= is not a real compound assignment, so
+        // the readonly / assignability checks below do not apply to it.
+        if (!eventPayload) {
+            // Slice S7: readonly field assignment outside a ctor.
+            checkReadonlyAssignment(*as);
+            // Slice T2: plain `:=` assignment must be primitive-
+            // assignable (compound ops like `+=` have their own
+            // operator semantics and are left to a later slice).
+            if (as->op == ":=" && as->target && as->value) {
+                checkAssignable(
+                    ctx_.exprType(*as->value),
+                    ctx_.exprType(*as->target),
+                    as->value->span.begin, "assigned value");
+            }
         }
     } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) visitExpr(*ds->value);

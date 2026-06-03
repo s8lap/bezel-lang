@@ -958,6 +958,10 @@ TypeSymbol* ExprTC::memberTargetType(const ast::Expr* target) {
                             targetType = rt->declaration;
                         }
                     }
+                } else if (par->resolvedDeclType &&
+                           par->resolvedDeclType->kind == TypeRef::Kind::Named) {
+                    // per §24.3: a context-typed lambda param (event handler).
+                    targetType = par->resolvedDeclType->declaration;
                 }
             } else if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
                 // Static member access `Type.member`: the target is a
@@ -967,6 +971,23 @@ TypeSymbol* ExprTC::memberTargetType(const ast::Expr* target) {
         }
     }
     return targetType;
+}
+
+// per §24.3: if `callee` is `<event>.Subscribe` / `.Add` / `.Remove`, return
+// the event's payload type (the `: T` annotation, or unit when omitted). The
+// callee's MemberAccess target carries the EventSymbol (set when the target was
+// visited). Null otherwise.
+TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return nullptr;
+    if (ma->member != "Subscribe" && ma->member != "Add" &&
+        ma->member != "Remove")
+        return nullptr;
+    auto* es = dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma->target));
+    if (!es) return nullptr;
+    auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+    if (!ed || !ed->type) return nullptr;  // no-payload event → unit (no param)
+    return ctx_.resolvedType(*ed->type);
 }
 
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
@@ -1112,6 +1133,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             targetType = rt->declaration;
                         }
                     }
+                } else if (par->resolvedDeclType &&
+                           par->resolvedDeclType->kind == TypeRef::Kind::Named) {
+                    // per §24.3: a context-typed lambda param (event handler).
+                    targetType = par->resolvedDeclType->declaration;
                 }
             } else if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
                 // Static member access `Type.member`: the target is a

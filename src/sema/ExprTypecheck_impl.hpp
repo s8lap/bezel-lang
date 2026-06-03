@@ -80,6 +80,19 @@ private:
     // state (`this`, `base`, instance members).
     bool inFieldInitializer_ = false;
 
+    // per §24.3: when about to visit an event-handler lambda argument
+    // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this
+    // holds the event's payload type so the lambda's untyped parameter is
+    // given the handler's parameter type `T` — letting the body resolve
+    // `e.Field` etc. Null when not in an event-handler context. Consumed (and
+    // cleared) by visitExpr(LambdaExpr).
+    TypeRef* pendingLambdaParamType_ = nullptr;
+
+    // per §24.3: the payload type of an event-handler call's callee, or null
+    // when `callee` is not `<event>.Subscribe/.Add/.Remove`. Used to set
+    // pendingLambdaParamType_ before visiting the handler argument.
+    TypeRef* eventHandlerPayloadType(const ast::Expr* callee);
+
     // §2.3: cache of synthetic TypeSymbol objects for always-available
     // built-in classes (Console, Math, Convert, Environment).
     std::unordered_map<std::string, TypeSymbol*> builtinClassCache_;

@@ -292,6 +292,45 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
 }
 
 
+// per §24.3 / §24.4: inside the declaring class, `event += handler` and
+// `event -= handler` are a fixed, language-defined desugaring to
+// `event.Add(handler)` and `event.Remove(handler)`. They are NOT the
+// compound-assignment statements of §17 (they neither read nor assign the
+// event), and `event` here has static type EventSource<T>, available only
+// inside the declaring class. Returns true when handled.
+bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
+    if (!as.target || !as.value) return false;
+    if (as.op != "+=" && as.op != "-=") return false;
+    const sema::EventSymbol* es = eventSymbolOf(*as.target);
+    if (!es) return false;
+    llvm::Value* src = eventSourcePtr(*as.target);
+    if (!src) return false;
+    // Lower the handler to a closure, hinting the expected (payload)->() type
+    // so an untyped lambda param resolves the payload type.
+    const sema::TypeRef* saved = expectedFunctionType_;
+    sema::TypeRef handlerTy;
+    handlerTy.kind = sema::TypeRef::Kind::Function;
+    if (const sema::TypeRef* pt = eventPayloadType(es)) {
+        sema::TypeRef::FuncParam p;
+        p.type = const_cast<sema::TypeRef*>(pt);
+        handlerTy.funcParams.push_back(p);
+    }
+    expectedFunctionType_ = &handlerTy;
+    llvm::Value* closure = lowerExpr(*as.value);
+    expectedFunctionType_ = saved;
+    if (!closure) return true;  // handled (error path); avoid bad fallthrough
+    if (as.op == "+=") {
+        auto* addFn = declareC("bz_event_add", i64(), {ptrTy(), ptrTy()});
+        builder_.CreateCall(addFn, {src, closure});
+    } else {
+        auto* remFn = declareC("bz_event_remove_closure",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(remFn, {src, closure});
+    }
+    return true;
+}
+
+
 bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
                         const std::vector<ast::CallArgument>& args) {
     std::vector<bool> filled(params.size(), false);

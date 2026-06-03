@@ -84,6 +84,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     if (auto* rt = ctx_.resolvedType(*par->declType)) {
                         ctx_.setExprType(&e, rt);
                     }
+                } else if (par->resolvedDeclType) {
+                    // per §24.3: a context-typed lambda param (event handler).
+                    ctx_.setExprType(&e, par->resolvedDeclType);
                 }
             } else if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
                 // Implicit `this.<field>` form: bare identifier
@@ -576,6 +579,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         if (nm->target) visitExpr(*nm->target);
     } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (ce->callee) visitExpr(*ce->callee);
+        // per §24.3: an event-handler argument (`<event>.Subscribe(h)` / .Add /
+        // .Remove) — push the event payload type so an untyped handler lambda's
+        // parameter is typed as `T`, letting its body resolve `e.Field`.
+        TypeRef* eventPayload = ce->callee
+            ? eventHandlerPayloadType(ce->callee.get()) : nullptr;
         // Resolve callee's parameter list to type out-var locals.
         sema::Symbol* calleeSym2 = ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr;
         const ast::MethodDecl* calleeMd2 = nullptr;
@@ -608,7 +616,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     currentScope_->names[id->name] = lsym;
                 }
             }
-            if (a.value) visitExpr(*a.value);
+            if (a.value) {
+                // per §24.3: type the (single) event-handler lambda param as T.
+                TypeRef* savedPending = pendingLambdaParamType_;
+                if (eventPayload &&
+                    dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
+                    pendingLambdaParamType_ = eventPayload;
+                visitExpr(*a.value);
+                pendingLambdaParamType_ = savedPending;
+            }
             ++pos2;
         }
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
@@ -653,6 +669,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // symbols. Each parameter becomes a ParameterSymbol whose
         // declType is inferred from the explicit type annotation (untyped
         // lambda params remain null — callers must supply context).
+        // per §24.3: an event-handler lambda — give its single untyped param
+        // the event payload type T. Consumed once (cleared) so nested lambdas
+        // don't inherit it.
+        TypeRef* eventParamType = pendingLambdaParamType_;
+        pendingLambdaParamType_ = nullptr;
         Scope lamScope;
         lamScope.parent = currentScope_;
         std::vector<sema::Symbol*> lamParamSyms;
@@ -661,6 +682,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             ps->name = p.name;
             ps->modifier = p.modifier;
             if (p.type) ps->declType = p.type.get();
+            else if (eventParamType && lam->params.size() == 1)
+                ps->resolvedDeclType = eventParamType;  // §24.3 handler param
             lamParamSyms.push_back(ps);
             if (!p.name.empty()) lamScope.names[p.name] = ps;
         }
