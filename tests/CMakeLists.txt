@@ -211,6 +211,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_test.cpp
     codegen/collection_test.cpp
     codegen/record_key_test.cpp
+    codegen/collection_keys_test.cpp
     codegen/linq_test.cpp
     codegen/event_test.cpp
 
