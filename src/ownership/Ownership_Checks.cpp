@@ -760,6 +760,107 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     }
 }
 
+bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
+    if (!sym) return false;
+    auto it = states_.find(sym);
+    return it != states_.end() &&
+           it->second.state == OwnershipState::Owned;
+}
+
+sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
+    // Shape 1 — a re-borrow rooted at an Owned local. Per §28.3 producers:
+    // a local read `r` of an owned local in a borrow-consuming position is a
+    // borrow (source: `r`); a field/indexer access `r.f` / `r[i]` is a
+    // borrow (source: `r`, the access target's root). identifierRoot peels
+    // member/index chains down to the root identifier. If that root resolves
+    // to a still-Owned scope-bound local, the re-borrow's source is that
+    // local. (A bare-identifier `var b := r;` and a reference field
+    // `var b := r.f;` both land here.) // per §28.3
+    //
+    // SOUNDNESS GATE — value-typed copies are never borrows. A projection
+    // like `var n := r.V;` where V is `int` is a copy, not a borrow of `r`
+    // (§28.3 "value-typed returns"), so it must NOT be recorded as aliasing
+    // `r`. returnedExprMayBorrow is exactly the borrow-vs-copy predicate
+    // (sema-typed; value-typed projection → false), so gating on it keeps a
+    // value-typed local from ever being flagged later. // per §28.3
+    if (dynamic_cast<const ast::IdentifierExpr*>(&rhs) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&rhs) ||
+        dynamic_cast<const ast::NullCondMemberExpr*>(&rhs) ||
+        dynamic_cast<const ast::IndexExpr*>(&rhs)) {
+        if (returnedExprMayBorrow(rhs)) {
+            if (const ast::IdentifierExpr* root = identifierRoot(rhs)) {
+                sema::Symbol* sym = ctx_.exprSymbol(*root);
+                if (isOwnedTrackedLocal(sym)) return sym;
+            }
+        }
+    }
+    // Shape 2 — a borrow-bearing-record construction whose constructor arg
+    // aliases an Owned local (§9.7). The constructed record value carries a
+    // borrow of that local; binding it to a holder local propagates the
+    // source. Mirrors checkRecordBorrowEscapesOnReturn's arg scan but here
+    // the record is bound to a local rather than returned directly.
+    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&rhs)) {
+        const sema::TypeRef* rt =
+            ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(rhs);
+        if (isBorrowBearingRecord(rt)) {
+            for (const ast::CallArgument& a : ne->args) {
+                if (!a.value) continue;
+                const ast::IdentifierExpr* root = identifierRoot(*a.value);
+                if (!root) continue;
+                sema::Symbol* sym = ctx_.exprSymbol(*root);
+                if (isOwnedTrackedLocal(sym)) return sym;
+            }
+        }
+    }
+    // Shape 3 — a closure capturing an Owned local (§28.9). Capturing an
+    // owned class-typed local does not transfer ownership; the capture is a
+    // borrow whose source is the local's enclosing scope. Binding the closure
+    // to a holder local propagates that source.
+    if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&rhs)) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (isOwnedTrackedLocal(sym)) return sym;
+        }
+    }
+    return nullptr;
+}
+
+void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
+    // §28.9 / §9.7 indirect form: `return holder;` where `holder` is a bare
+    // local whose tracked borrow-source aliases a still-owned scope-bound
+    // local. The returned expression must be the bare holder identifier — a
+    // value projection off the holder (`holder.SomeInt`, `holder()`) returns
+    // a copy, not the borrow, and is intentionally not flagged here (those
+    // are gated by returnedExprMayBorrow on the direct paths). Restricting to
+    // the bare-identifier shape keeps the locally-invoked-closure control
+    // (`return f();`) accepted: there the returned expression is a CallExpr,
+    // not the bare `f`.
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    const LocalOwnership* st = nullptr;
+    if (sym) {
+        auto it = states_.find(sym);
+        if (it != states_.end()) st = &it->second;
+    }
+    if (!st || !st->source) return;
+    // The source must still be a live owned scope-bound obligation at the
+    // return point. If it was already disposed / moved out, there is no live
+    // borrow to dangle (and a separate diagnostic would have covered misuse).
+    if (!isOwnedTrackedLocal(st->source->sym)) return;
+    std::string_view srcName = st->source->sym->name;
+    report(
+        Severity::Error, id->span.begin,
+        std::string("returned `") + std::string(id->name) +
+        "` carries a borrow of `" + std::string(srcName) +
+        "` whose source is disposed at scope end — the value aliases an "
+        "owned scope-bound local and returning it lets the borrow outlive "
+        "that local (§28.9 / §9.7 borrow-lifetime rule; bind the source in "
+        "the caller's scope and build the aliasing value there instead)");
+}
+
 const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
         return id;

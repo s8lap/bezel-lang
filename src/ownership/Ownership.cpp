@@ -639,6 +639,21 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // record that `_log` is now empty.
     if (ld.initializer) {
         recordMovesIn(*ld.initializer);
+        // §28.9 / §9.7 indirect-escape tracking (issue #360, second slice):
+        // when the initializer binds a borrow of an owned scope-bound local
+        // (a re-borrow `r`/`r.f`, a borrow-bearing record `new Holder(r)`, or
+        // a closure capturing `r`), record that owned source on this local so
+        // a later `return b;` can be diagnosed as a borrow escape. Computed
+        // AFTER recordMovesIn so a `move`d-out source (now MovedFrom, not
+        // Owned) is correctly NOT treated as a live borrow source. A `using
+        // var` is itself Owned, not a re-borrow, so it never gets a source.
+        if (!ld.isUsing) {
+            if (sema::Symbol* src = borrowSourceForExpr(*ld.initializer)) {
+                BorrowSource bs;
+                bs.sym = src;
+                states_[lsym].source = bs;
+            }
+        }
     }
 }
 
@@ -653,10 +668,24 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     recordMovesIn(*as.value);
     if (const auto* id =
             dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+        // §28.9 / §9.7 indirect-escape tracking: recompute the borrow source
+        // for the reassigned local. Computed before the states_ scan so it
+        // observes the pre-reassignment Owned states of any source local.
+        // Set when the RHS re-borrows / aliases an owned scope-bound local,
+        // and CLEARED otherwise so a stale source does not linger across a
+        // rebind to a non-borrowing value (e.g. `b := null;`).
+        sema::Symbol* src = borrowSourceForExpr(*as.value);
         for (auto& [sym, st] : states_) {
             if (sym->name != id->name) continue;
             st.state = producerState(*as.value);
             st.obligationOrigin = &as;
+            if (src && src != sym) {
+                BorrowSource bs;
+                bs.sym = src;
+                st.source = bs;
+            } else {
+                st.source.reset();
+            }
             return;
         }
         return;
@@ -684,6 +713,7 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // they only diagnose. The discharge handling below is unchanged.
     checkClosureEscapesOnReturn(e);       // D1: §28.9 closure capture escape
     checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
+    checkIndirectEscapeOnReturn(e);       // §28.9/§9.7 indirect-via-local
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement

@@ -183,6 +183,47 @@ private:
     // Handles the direct `return new Rec(...localUsingVar...)` form.
     void checkRecordBorrowEscapesOnReturn(const ast::Expr& e);
 
+    // §28.9 / §9.7 INDIRECT escape (issue #360, second slice): a returned
+    // *bare local* whose tracked borrow-source aliases a still-owned
+    // scope-bound local. This covers the tractable indirect forms where the
+    // alias was bound into a local one statement earlier:
+    //   var b := usingVarLocal;            return b;   // direct re-borrow
+    //   var b := usingVarLocal.refField;   return b;   // field-access borrow
+    //   var h := new Holder(usingVarLocal); return h;  // record holder
+    //   var f := () => usingVarLocal.V;     return f;  // closure holder
+    // In each case `b`/`h`/`f`'s LocalOwnership.source was populated at the
+    // declaration/assignment site by borrowSourceForExpr (below), pointing at
+    // the owned source local; returning the holder lets the borrow outlive
+    // that source. Deeper data-flow (store-to-field of an escaping object,
+    // multi-hop alias chains) is deferred. Only fires when the source local
+    // is still in the Owned state at the return point.
+    void checkIndirectEscapeOnReturn(const ast::Expr& e);
+
+    // Compute the owned scope-bound source local that the initializer/RHS
+    // expression `rhs` borrows from, or null if it borrows nothing owned.
+    // Used to populate LocalOwnership.source so an aliasing local can be
+    // recognized as an escape when it is later returned. Recognizes exactly
+    // the three borrow-binding shapes the indirect check above relies on:
+    //   - a re-borrow rooted at an Owned local (`r` or `r.f` / `r[i]`),
+    //   - a borrow-bearing-record construction whose arg aliases an Owned
+    //     local (`new Holder(r)`),
+    //   - a closure capturing an Owned local (`() => r.V`).
+    // Returns the FIRST owned source found. A value-typed result (e.g. an
+    // `int` re-borrow `var n := r.V;`) is never reported because the source
+    // is only taken when the alias carries a reference/record/closure borrow
+    // — the per-shape gating below ensures a value-typed local is never
+    // flagged. Conservative: returns null when it cannot prove an owned
+    // source, so it never manufactures a false escape.
+    sema::Symbol* borrowSourceForExpr(const ast::Expr& rhs);
+
+    // True when `sym` is a tracked local currently in the Owned state — the
+    // scope-bound discharge obligation that a borrow may not outlive. Used by
+    // borrowSourceForExpr to decide whether a re-borrow / capture aliases an
+    // owned source. (A parameter without `owned` enters Borrowed, never Owned,
+    // so plain-parameter borrows are correctly not treated as escapes — see
+    // the §9.7 param-borrow control.)
+    bool isOwnedTrackedLocal(sema::Symbol* sym) const;
+
     // §9.7: true when `rt` is a record type that holds at least one
     // borrow-carrying field of a non-runtime-managed type (a class/
     // interface reference field, an inline array of reference elements,
