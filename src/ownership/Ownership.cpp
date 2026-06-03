@@ -112,8 +112,8 @@ bool MethodOwnership::bodyEndsInThrow(
 namespace {
 
 // An edge identified by its endpoints, used to flag CFG back-edges so the
-// O3a forward pass walks each loop body exactly once (the old syntactic
-// walker did the same; a real loop fixpoint is O3b).
+// O3b loop fixpoint can distinguish loop-carried merges (back-edge / zero-
+// trip skip) from straight-line / if-else forward merges.
 struct Edge {
     const flow::CFGBlock* from;
     const flow::CFGBlock* to;
@@ -148,44 +148,26 @@ void collectBackEdges(const flow::CFGBlock* b,
 }
 
 // True if the edge from `pred` to `block` is a loop header's skip / exit
-// edge (header → succs[1], i.e. into the loop's after-block).
+// edge (header → succs[1], i.e. the zero-trip path into the loop's
+// after-block).
 bool isLoopSkipEdge(const flow::CFGBlock* pred, const flow::CFGBlock* block) {
     return pred->isLoopHeader && pred->succs.size() >= 2 &&
            pred->succs[1] == block;
 }
 
-// Reverse-postorder over the CFG, skipping back-edges so loops are not
-// revisited, AND re-routing each loop's skip edge (header → after-block)
-// to flow from the loop body's back-edge sources instead. The re-route
-// matters only for ORDERING: it forces a loop's after-block to be visited
-// after the loop body's fall-through end, so the forward pass can feed the
-// after-block the body-end (single-pass) state — reproducing the old
-// syntactic walker, which continued past a loop carrying the body-end
-// state of one pass (zero-trip leak detection is deferred to O3b). The
-// result is an order in which every block's data-predecessors precede it.
+// Reverse-postorder over the CFG following every forward (non-back) edge.
+// O3b uses this as the visitation order for the fixpoint iterations and
+// the final pass; back-edges are still excluded from the DFS so the order
+// is a true RPO (every block's forward-predecessors precede it), but the
+// fixpoint re-runs the whole order until exit states stabilize, so the
+// loop-carried state still reaches every block.
 void reversePostorder(const flow::CFGBlock* b,
                       const std::unordered_set<Edge, EdgeHash>& backEdges,
                       std::unordered_set<const flow::CFGBlock*>& seen,
                       std::vector<const flow::CFGBlock*>& post) {
     seen.insert(b);
-    std::vector<const flow::CFGBlock*> next;
     for (const flow::CFGBlock* s : b->succs) {
         if (backEdges.count({b, s})) continue;
-        if (b->isLoopHeader && isLoopSkipEdge(b, s)) {
-            // Don't descend to the after-block via the skip edge here;
-            // it is ordered via the body's back-edge sources below.
-            continue;
-        }
-        next.push_back(s);
-    }
-    // If this block is a loop body's back-edge source, also order the
-    // enclosing loop's after-block right after it.
-    for (const flow::CFGBlock* s : b->succs) {
-        if (!backEdges.count({b, s})) continue;
-        if (!s->isLoopHeader) continue;
-        if (s->succs.size() >= 2) next.push_back(s->succs[1]); // after-block
-    }
-    for (const flow::CFGBlock* s : next) {
         if (!seen.count(s)) {
             reversePostorder(s, backEdges, seen, post);
         }
@@ -193,127 +175,155 @@ void reversePostorder(const flow::CFGBlock* b,
     post.push_back(b);
 }
 
+// Compare two block states for fixpoint convergence: same key set, and
+// the same ownership state + implicit-discharge flag per key. The
+// auxiliary fields (obligation origin, borrow source) do not affect any
+// later transfer-function decision, so they are excluded — comparing them
+// would make pointer churn look like non-convergence.
+bool sameState(const BlockState& a, const BlockState& b) {
+    if (a.size() != b.size()) return false;
+    for (const auto& [sym, la] : a) {
+        auto it = b.find(sym);
+        if (it == b.end()) return false;
+        if (la.state != it->second.state) return false;
+        if (la.implicitDischarge != it->second.implicitDischarge) return false;
+    }
+    return true;
+}
+
 } // namespace
 
 BlockState MethodOwnership::runDataflow(
     const flow::CFG& cfg, const BlockState& entry) {
-    // Identify back-edges, then a reverse-postorder that respects every
-    // forward (non-back) edge.
+    // Identify back-edges, then a reverse-postorder over the forward edges.
     std::unordered_set<Edge, EdgeHash> backEdges;
     {
         std::unordered_set<const flow::CFGBlock*> gray, black;
         collectBackEdges(cfg.entry(), gray, black, backEdges);
     }
     std::vector<const flow::CFGBlock*> post;
-    std::vector<const flow::CFGBlock*> stragglers;
     {
         std::unordered_set<const flow::CFGBlock*> seen;
         reversePostorder(cfg.entry(), backEdges, seen, post);
-        // Safety net: an after-block whose loop body never falls through
-        // (always returns/breaks) is not reached via the body's back-edge
-        // re-route above. Collect any such still-unseen blocks in
-        // allocation order; they are appended at the end of the final
-        // order so they process after everything reachable (their entry
-        // meet then falls back to the loop header's exit — zero-trip).
+        // Safety net: a block unreachable from entry via forward edges
+        // (e.g. a loop after-block whose body always returns/breaks, so it
+        // is reached only across the back-edge-excluded skip) is appended
+        // in allocation order so the fixpoint still processes it.
         for (const auto& bp : cfg.blocks()) {
             if (!seen.count(bp.get())) {
                 seen.insert(bp.get());
-                stragglers.push_back(bp.get());
+                post.push_back(bp.get());
             }
         }
     }
     std::reverse(post.begin(), post.end()); // postorder → reverse-postorder
-    for (const flow::CFGBlock* s : stragglers) post.push_back(s);
 
     std::unordered_map<const flow::CFGBlock*, BlockState> exitState;
     std::unordered_set<const flow::CFGBlock*> evaluated;
 
-    for (const flow::CFGBlock* b : post) {
-        // Entry state = §28.3 meet over evaluated, non-back-edge,
-        // non-loop-skip predecessors' exit states.
+    // Compute one block's entry state as the §28.3 meet over its evaluated
+    // predecessors' exit states. O3b: every predecessor participates,
+    // INCLUDING back-edges and the zero-trip header→after skip edge —
+    // that is what makes the analysis sound for the never-executed loop
+    // path. Loop-carried merges (back-edge / skip) use union-key meet so a
+    // loop-body local that reaches the after-block keeps its discharge
+    // obligation, and never emit the §28.3 branch-join clash (only a real
+    // if/elif/else Merge block does, and only on the final pass via
+    // `emitOnMerge`).
+    auto computeEntry = [&](const flow::CFGBlock* b,
+                            bool emitOnMerge) -> BlockState {
         BlockState in;
         bool haveIn = false;
         if (b == cfg.entry()) {
             in = entry;
             haveIn = true;
         }
-        // The merge diagnostic location: for an if/elif/else merge the
-        // CFG records the originating IfStmt so the §28.3 branch-join
-        // clash lands at the if's span, exactly as the old walker did.
         SourceLocation joinLoc =
             b->sourceStmt ? b->sourceStmt->span.begin : SourceLocation{};
-        // A loop after-block is fed synthetic continuations (the old walker
-        // never merged loop continuations — it walked the body once into
-        // one shared state), so meets into it must not emit a clash
-        // diagnostic. Only a real if/elif/else merge emits.
-        bool isLoopAfter = false;
+        const bool isIfMerge = b->kind == flow::CFGBlock::Kind::Merge;
         for (const flow::CFGBlock* p : b->preds) {
-            if (isLoopSkipEdge(p, b)) { isLoopAfter = true; break; }
-        }
-        for (const flow::CFGBlock* p : b->preds) {
-            if (backEdges.count({p, b})) continue;
             if (!evaluated.count(p)) continue;
-            // Loop-skip edge (header → after-block): the old syntactic
-            // walker continued past a loop carrying the *body-end* state
-            // of a single pass — it walked the body once and never merged
-            // a zero-trip skip path. Reproduce that: the after-block
-            // inherits the meet of the header's back-edge predecessors
-            // (the loop body's fall-through ends), not the header's own
-            // pre-loop / zero-trip state. When the body has no fall-
-            // through back-edge (it always returns/breaks), fall back to
-            // the header's exit. A real fixpoint + zero-trip leak check
-            // is O3b.
-            std::vector<const flow::CFGBlock*> sources;
-            if (isLoopSkipEdge(p, b)) {
-                for (const flow::CFGBlock* bp : p->preds) {
-                    if (backEdges.count({bp, p}) && evaluated.count(bp)) {
-                        sources.push_back(bp);
-                    }
-                }
-                if (sources.empty()) sources.push_back(p);
+            const bool loopEdge =
+                backEdges.count({p, b}) != 0 || isLoopSkipEdge(p, b);
+            const BlockState& pe = exitState[p];
+            if (!haveIn) {
+                in = pe;
+                haveIn = true;
             } else {
-                sources.push_back(p);
-            }
-            for (const flow::CFGBlock* src : sources) {
-                const BlockState& pe = exitState[src];
-                if (!haveIn) {
-                    in = pe;
-                    haveIn = true;
-                } else {
-                    joinInto(in, pe, joinLoc, /*emitClash=*/!isLoopAfter);
-                }
+                joinInto(in, pe, joinLoc,
+                         /*emitClash=*/emitOnMerge && isIfMerge && !loopEdge,
+                         /*unionKeys=*/loopEdge);
             }
         }
-        // Process the block's straight-line statements through the
-        // existing transfer functions.
-        states_ = std::move(in);
-        processBlock(*b);
-        exitState[b] = states_;
-        evaluated.insert(b);
+        return in;
+    };
+
+    // --- O3b fixpoint phase (diagnostics suppressed) ----------------------
+    //
+    // Iterate the RPO until a full pass changes no block's exit state. The
+    // lattice per local is finite (seven states; PolyNull ⊓ X absorbs, and
+    // every disagreeing merge moves to a strictly higher fixed element —
+    // Poisoned or Uninitialized — never back down), so each block's exit
+    // state ascends a bounded chain and the iteration terminates. The
+    // `maxPasses` cap is a defensive backstop, sized to the block count
+    // times the lattice height; it should never be hit for a reducible
+    // (structured) CFG.
+    suppressDiag_ = true;
+    const std::size_t maxPasses = (post.size() + 1) * 8 + 4;
+    for (std::size_t pass = 0; pass < maxPasses; ++pass) {
+        bool changed = false;
+        for (const flow::CFGBlock* b : post) {
+            states_ = computeEntry(b, /*emitOnMerge=*/false);
+            processBlock(*b);
+            auto it = exitState.find(b);
+            if (it == exitState.end() || !sameState(it->second, states_)) {
+                changed = true;
+            }
+            exitState[b] = states_;
+            evaluated.insert(b);
+        }
+        if (!changed) break;
     }
 
-    // End-of-method state = the (silent) meet of every path reaching the
-    // CFG exit. Silent because the old walker never met at exit; emitting
-    // an owned/borrowed clash there would be a new diagnostic (forbidden
-    // in O3a).
+    // --- O3b final emit pass (diagnostics enabled) ------------------------
+    //
+    // The fixpoint above left `exitState` stable. Walk the RPO one last
+    // time with diagnostics on, so each block's reads/moves/disposals and
+    // branch-join clashes are reported exactly once, against the converged
+    // predecessor exit states. Reset the per-method field-move tracker so
+    // it reflects exactly this single walk (the suppressed fixpoint passes
+    // toggled it repeatedly).
+    suppressDiag_ = false;
+    fieldMovedFrom_.clear();
+    fieldMoveLoc_.clear();
+    for (const flow::CFGBlock* b : post) {
+        states_ = computeEntry(b, /*emitOnMerge=*/true);
+        processBlock(*b);
+        exitState[b] = states_;
+    }
+
+    // End-of-method state = the meet of every path reaching the CFG exit.
+    // emitClash stays false (a clash on two paths to exit was already
+    // reported at its originating Merge block; the old walker never met at
+    // exit). unionKeys=true so an owned obligation that survives on any
+    // path — e.g. a loop-body local that reaches exit still Owned — is
+    // preserved for the undischarged-owned check in run() (§28.3 / §28.6:
+    // an owned value must be discharged on every path).
     BlockState endState;
     bool haveEnd = false;
     for (const flow::CFGBlock* p : cfg.exit()->preds) {
-        if (backEdges.count({p, cfg.exit()})) continue;
         if (!evaluated.count(p)) continue;
         const BlockState& pe = exitState[p];
         if (!haveEnd) {
             endState = pe;
             haveEnd = true;
         } else {
-            joinInto(endState, pe, SourceLocation{}, /*emitClash=*/false);
+            joinInto(endState, pe, SourceLocation{}, /*emitClash=*/false,
+                     /*unionKeys=*/true);
         }
     }
     if (!haveEnd) {
-        // No path reaches exit (e.g. an empty body whose entry edges
-        // straight to exit was still evaluated above; this branch covers
-        // the degenerate case of an unreachable exit). Fall back to the
-        // entry-block exit state if present.
+        // No path reaches exit. Fall back to the entry-block exit state.
         auto it = exitState.find(cfg.entry());
         if (it != exitState.end()) endState = it->second;
     }
