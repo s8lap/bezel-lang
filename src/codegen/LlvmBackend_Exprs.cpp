@@ -980,6 +980,20 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
             llvm::Value* obj = lowerExpr(*ma->target);
             if (!obj) return nullptr;
+            // issue #347 / §9.2: a record is a by-value struct, not a heap
+            // pointer. The getter body reads its fields against `this` via a
+            // StructGEP, which requires a pointer base; binding a struct
+            // *value* as `this` produces malformed IR (GEP on a non-pointer)
+            // that crashes the backend. When the receiver is a record value
+            // (not already a pointer), spill it to a stack slot and bind that
+            // slot's address as `this` — mirroring the record field-access
+            // path in fieldAddr (CG29/#254) and the §9.2 record-storage
+            // access used by the synthesized ToString.
+            if (!obj->getType()->isPointerTy()) {
+                llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+                builder_.CreateStore(obj, tmp);
+                obj = tmp;
+            }
             // CG-generic: set up genericSubst_ for the receiver's type so
             // that fields accessed inside the getter use the right struct.
             auto savedSubst = genericSubst_;
@@ -1033,6 +1047,15 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             if (!ma->target) return nullptr;
             llvm::Value* obj = lowerExpr(*ma->target);
             if (!obj) return nullptr;
+            // issue #347 / §9.2: the block getter is a function taking a
+            // `this` pointer; a record receiver is a by-value struct, so spill
+            // it to a stack slot and pass that slot's address (see the
+            // expression-getter path above for the full rationale).
+            if (!obj->getType()->isPointerTy()) {
+                llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+                builder_.CreateStore(obj, tmp);
+                obj = tmp;
+            }
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(
                 dynamic_cast<sema::PropertySymbol*>(
                     ctx_.exprSymbol(*ma))->decl);

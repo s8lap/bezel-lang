@@ -191,6 +191,7 @@ set(BEZEL_TEST_SOURCES
     codegen/block_setter_test.cpp
     codegen/ref_out_params_test.cpp
     codegen/record_basics_test.cpp
+    codegen/record_computed_property_test.cpp
     codegen/record_equality_test.cpp
     codegen/value_semantics_test.cpp
     codegen/body_record_equality_test.cpp
