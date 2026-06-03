@@ -210,6 +210,7 @@ set(BEZEL_TEST_SOURCES
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
     ownership/branch_joins_test.cpp
+    ownership/branch_disposal_test.cpp
     ownership/owned_params_test.cpp
     ownership/borrow_escape_test.cpp
     ownership/move_on_fields_test.cpp
