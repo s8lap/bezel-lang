@@ -93,6 +93,13 @@ private:
     // pendingLambdaParamType_ before visiting the handler argument.
     TypeRef* eventHandlerPayloadType(const ast::Expr* callee);
 
+    // stdlib §5 (D7): the source element type T of a LINQ operator/aggregate
+    // call whose lambda argument is `(T) -> …` (Where/Select/Count/Any/All/
+    // First/OrderBy/…), or null otherwise. Used to set pendingLambdaParamType_
+    // before visiting the lambda argument so an untyped LINQ lambda parameter
+    // is typed as the element type (its body can then resolve `p.x`).
+    TypeRef* linqLambdaElementType(const ast::Expr* callee);
+
     // §2.3: cache of synthetic TypeSymbol objects for always-available
     // built-in classes (Console, Math, Convert, Environment).
     std::unordered_map<std::string, TypeSymbol*> builtinClassCache_;
