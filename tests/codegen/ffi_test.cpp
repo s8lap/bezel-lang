@@ -161,6 +161,61 @@ BEZEL_TEST(codegen_ffi_types, cstring_arg_marshals_to_libc_puts_32_6) {
     BEZEL_EXPECT_EQ(out, std::string("hello-ffi\n"));
 }
 
+// §32.5 / §32.6: a NON-ASCII string (storage width > 1) marshalled to CString
+// must be RE-ENCODED to null-terminated UTF-8, not handed over as the raw wide
+// data pointer. A width-2 string stores each code point in 2 bytes, so the raw
+// buffer has interior NUL bytes (e.g. U+0100 → 0x00 0x01) that truncate a C
+// `char*` read. "AĀB" is A (U+0041), Ā (U+0100), B (U+0042); its UTF-8 is
+// 0x41 0xC4 0x80 0x42 — 4 bytes. libc strlen over the marshalled CString must
+// therefore return 4. Without the re-encode, strlen stops at the first interior
+// NUL and returns 1 (silent corruption). Ā forces a single code point
+// above 0xFF so the literal lowers to storage width 2.
+BEZEL_TEST(codegen_ffi_types, cstring_nonascii_reencoded_to_utf8_strlen_32_6) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  var s := \"A\\u0100B\"; "
+        "  return strlen(s); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 4);
+}
+
+// §32.5 / §32.6: a width-1 (pure-ASCII) string still marshals correctly through
+// the same path — strlen("ABC") = 3. Guards against the fast path regressing.
+BEZEL_TEST(codegen_ffi_types, cstring_ascii_strlen_unchanged_32_6) {
+    auto r = runJit(
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  return strlen(\"ABC\"); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 3);
+}
+
+// §32.5 / §32.6: a non-ASCII (width-2) string round-trips through libc puts as
+// correct UTF-8 BYTES. "AĀB" → 0x41 0xC4 0x80 0x42 then puts' newline.
+// Without the re-encode, puts would emit only the leading 'A' before the
+// interior NUL. Observed end-to-end on stdout.
+BEZEL_TEST(codegen_ffi_types, cstring_nonascii_puts_utf8_bytes_32_6) {
+    std::string out = compileAndCapture(
+        "module M; "
+        "extern \"c\" public method puts(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  var _ := puts(\"A\\u0100B\"); return 0; "
+        "end Main; end C;");
+    // 0x41 0xC4 0x80 0x42 + '\n'
+    std::string expected;
+    expected.push_back((char)0x41);
+    expected.push_back((char)0xC4);
+    expected.push_back((char)0x80);
+    expected.push_back((char)0x42);
+    expected.push_back('\n');
+    BEZEL_EXPECT_EQ(out, expected);
+}
+
 // §2.3: Console is always available; Write/WriteLine are intrinsics lowered
 // via POSIX write(2). These tests use compileAndCapture to observe stdout.
 

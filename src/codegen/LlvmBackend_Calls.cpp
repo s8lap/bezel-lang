@@ -2926,12 +2926,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         const ast::ExternDecl* ed = xd->externDecl;
         // per §32.5: an extern parameter declared `CString` is a
         // null-terminated UTF-8 `char*`. When a Bezel `string` is passed
-        // there, marshal it by handing the native side the bz_string data
-        // pointer (field 0), which is null-terminated (see makeCodePointArray)
-        // — this matches §32.6 "the C side reads a char* until the null".
-        // The data is the byte content; for ASCII it is valid UTF-8 (a
-        // non-ASCII non-width-1 string would need a re-encode — deferred,
-        // see report).
+        // there, marshal it to a null-terminated UTF-8 buffer (§32.6 "the C
+        // side reads a char* until the null"). For a width-1 string the raw
+        // data pointer (field 0) is already null-terminated ASCII/UTF-8 and is
+        // handed over directly (the fast path). A width>1 string stores its
+        // code points in 2- or 4-byte units with interior zero bytes, so the
+        // raw pointer would truncate at the first such byte (bug B); for those
+        // we re-encode to a fresh UTF-8 buffer via bz_string_to_utf8z.
         auto cstringParamAt = [&](std::size_t i) -> bool {
             if (!ed || i >= ed->params.size()) return false;
             const ast::Type* pt = ed->params[i].type.get();
@@ -2945,13 +2946,42 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) return nullptr;
-            // Marshal a Bezel `string` argument into a CString parameter by
-            // extracting its (null-terminated) data pointer (§32.5 / §32.6).
+            // Marshal a Bezel `string` argument into a CString parameter
+            // (§32.5 / §32.6). Branch on the string's runtime byte width:
+            // width==1 → raw data pointer (already null-terminated UTF-8);
+            // width>1  → re-encode to a fresh null-terminated UTF-8 buffer so
+            //            interior zero bytes don't truncate the C-side read.
             if (cstringParamAt(idx)) {
                 const sema::TypeRef* at = ctx_.exprType(*a.value);
                 if (at && at->kind == sema::TypeRef::Kind::Primitive &&
-                    at->primitive == sema::PrimitiveType::String)
-                    v = loadStringData(v);
+                    at->primitive == sema::PrimitiveType::String) {
+                    llvm::Value* strPtr = v;
+                    llvm::Value* w = loadStringWidth(strPtr);
+                    llvm::Value* isW1 = builder_.CreateICmpEQ(
+                        w, llvm::ConstantInt::get(
+                               llvm::Type::getInt8Ty(llvm_), 1), "cstr.w1");
+                    auto* w1BB  = llvm::BasicBlock::Create(llvm_, "cstr.ascii", currentFn_);
+                    auto* wnBB  = llvm::BasicBlock::Create(llvm_, "cstr.utf8", currentFn_);
+                    auto* endBB = llvm::BasicBlock::Create(llvm_, "cstr.end", currentFn_);
+                    builder_.CreateCondBr(isW1, w1BB, wnBB);
+                    // width==1: raw data pointer.
+                    builder_.SetInsertPoint(w1BB);
+                    llvm::Value* rawData = loadStringData(strPtr);
+                    auto* w1End = builder_.GetInsertBlock();
+                    builder_.CreateBr(endBB);
+                    // width>1: bz_string_to_utf8z(strPtr) → fresh char*.
+                    builder_.SetInsertPoint(wnBB);
+                    llvm::Function* enc = declareC(
+                        "bz_string_to_utf8z", ptrTy(), {ptrTy()});
+                    llvm::Value* encData = builder_.CreateCall(enc, {strPtr});
+                    auto* wnEnd = builder_.GetInsertBlock();
+                    builder_.CreateBr(endBB);
+                    builder_.SetInsertPoint(endBB);
+                    auto* phi = builder_.CreatePHI(ptrTy(), 2, "cstr.data");
+                    phi->addIncoming(rawData, w1End);
+                    phi->addIncoming(encData, wnEnd);
+                    v = phi;
+                }
             }
             args.push_back(v);
             ++idx;

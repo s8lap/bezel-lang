@@ -173,3 +173,24 @@ BEZEL_TEST(codegen_events_24, event_backing_field_is_per_instance) {
         "b1.Fire(4); "       // b1's handler fires
         "return box.V; ")), 4);
 }
+
+// §24.4 / §24.5: subscribing MORE handlers than the event's initial backing
+// capacity (4) forces the handler array to grow via realloc (bz_event_add).
+// All handlers must remain live and fire on Raise after the growth. This
+// exercises the realloc-growth path whose return value is now captured (a
+// failed realloc returns 0 without overwriting the live array, rather than
+// NULLing it and dereferencing on the next write). Six handlers each add the
+// payload once → 6 * N on a single Fire.
+BEZEL_TEST(codegen_events_24, subscribe_past_capacity_grows_all_fire_24_5) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var box := new Box(); "
+        "var b := new Button(); "
+        "var s1 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s2 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s3 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s4 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s5 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "  // grows past 4
+        "var s6 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "b.Fire(5); "
+        "return box.V; ")), 30);  // 6 handlers * 5
+}

@@ -296,6 +296,16 @@ void bz_strbuilder_to_string(void* parts_arr,  // bz_array_t* of bz.string ptrs
                               char** out_data,
                               int64_t* out_len);
 
+// ---------------------------------------------------------------------------
+// per §32.5/§32.6: re-encode a bz_string (layout {ptr data, i64 len, i8 width})
+// into a freshly malloc'd, null-terminated UTF-8 byte buffer for the CString
+// FFI boundary. The internal storage holds raw code points at width 1/2/4 (a
+// width>1 string has interior zero bytes that a C `char*` reader would stop on),
+// so the marshalling path must produce true UTF-8 before handing the pointer to
+// native code. Returns a malloc'd buffer the caller may free(); never returns
+// NULL for a non-NULL input (an empty/allocation-failure case yields "").
+char* bz_string_to_utf8z(const void* str);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
