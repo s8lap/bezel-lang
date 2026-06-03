@@ -194,3 +194,162 @@ BEZEL_TEST(codegen_events_24, subscribe_past_capacity_grows_all_fire_24_5) {
         "b.Fire(5); "
         "return box.V; ")), 30);  // 6 handlers * 5
 }
+
+// D11 / §2.11 / §24.4: Subscription disposal is type-based, not tied to a
+// literal `.Subscribe(...)` declarator. A Subscription obtained from a
+// METHOD whose return type is `Subscription` disposes the same way: `.Dispose()`
+// removes the handler, so the subsequent Raise is a no-op. (Before the fix the
+// recognition was purely syntactic — a method-returned Subscription's `.Dispose`
+// was a no-op and the handler stayed subscribed, returning 50 here.)
+BEZEL_TEST(codegen_events_24, dispose_method_returned_subscription_unsubscribes) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class Button "
+        "  public event Clicked: Ev; "
+        "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+        "  public method Wire(box: Box): Subscription "         // returns Subscription
+        "    return Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "  end Wire; "
+        "end Button; "
+        "class C public static method Main(): int "
+        "  var box := new Box(); var b := new Button(); "
+        "  var s := b.Wire(box); "                              // method-returned Subscription
+        "  s.Dispose(); "                                       // §2.11 unsubscribe
+        "  b.Fire(50); "                                        // handler gone — no-op
+        "  return box.V; "
+        "end Main; end C;"), 0);
+}
+
+// D11 / §2.11 / §28.3: a `using var` of type `Subscription` auto-disposes at
+// scope end (the §28.3 disposal point) — removing the handler. Here the handler
+// adds 5 while the subscription is live (inside the inner block), then the inner
+// `using var` disposes at block end, so the outer Fire(100) does nothing. (Before
+// the fix the scope-end path didn't recognize a Subscription using-var, so the
+// handler survived and the result was 5 + 100 = 105.)
+BEZEL_TEST(codegen_events_24, using_var_subscription_scope_end_auto_disposes) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class Button "
+        "  public event Clicked: Ev; "
+        "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+        "end Button; "
+        "class C public static method Main(): int "
+        "  using var box := new Box(); using var b := new Button(); "
+        "  do "
+        "    using var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "    b.Fire(5); "                       // handler live → +5
+        "  end; "                               // §28.3: s disposes here
+        "  b.Fire(100); "                       // handler gone — no-op
+        "  return box.V; "
+        "end Main; end C;"), 5);
+}
+
+// D11 / §2.11: a Subscription passed as a PARAMETER disposes by type. The helper
+// receives `s: Subscription` and calls `s.Dispose()`, which unsubscribes the
+// original handler. (Before the fix a Subscription parameter lowered to a
+// non-pointer and the `.Dispose()` was skipped, returning 7.)
+BEZEL_TEST(codegen_events_24, dispose_parameter_subscription_unsubscribes) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class Button "
+        "  public event Clicked: Ev; "
+        "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+        "end Button; "
+        "class Helper "
+        "  public static method Kill(s: Subscription) s.Dispose(); end Kill; "
+        "end Helper; "
+        "class C public static method Main(): int "
+        "  var box := new Box(); var b := new Button(); "
+        "  var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "  Helper.Kill(s); "                    // dispose through a parameter
+        "  b.Fire(7); "                         // handler gone — no-op
+        "  return box.V; "
+        "end Main; end C;"), 0);
+}
+
+// D11 / §2.11: a Subscription held in a FIELD disposes by type. `Holder.sub` is
+// `Subscription?`; `Stop()` disposes it, unsubscribing the handler. (Before the
+// fix a Subscription field lowered to a non-pointer and the `.Dispose()` was
+// skipped, returning 9.)
+BEZEL_TEST(codegen_events_24, dispose_field_subscription_unsubscribes) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class Button "
+        "  public event Clicked: Ev; "
+        "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+        "end Button; "
+        "class Holder "
+        "  public sub: Subscription?; "
+        "  public method Stop() sub!.Dispose(); end Stop; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var box := new Box(); using var b := new Button(); "
+        "  using var h := new Holder(); "
+        "  h.sub := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "  h.Stop(); "                          // dispose through a field
+        "  b.Fire(9); "                         // handler gone — no-op
+        "  return box.V; "
+        "end Main; end C;"), 0);
+}
+
+// D11 control / §2.11: the original literal-declarator form must keep working.
+// `var s := evt.Subscribe(h); s.Dispose();` (the syntactic form recognized
+// before the fix) still unsubscribes — Fire(5) before dispose adds 5, the later
+// Fire(100) is a no-op.
+BEZEL_TEST(codegen_events_24, dispose_literal_declarator_subscription_still_works) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var box := new Box(); var b := new Button(); "
+        "var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "b.Fire(5); "                           // handler live → +5
+        "s.Dispose(); "                         // literal declarator dispose
+        "b.Fire(100); "                         // handler gone — no-op
+        "return box.V; ")), 5);
+}
+
+// D5 / §2.11 / §15.1: a Subscription stored into a [1]Subscription inline array
+// whose handler captures a value-typed (int) outer local. The [1] case (array
+// size exactly 1) previously SIGSEGV'd because Subscription lowered to a
+// non-pointer (i32), corrupting the single-element inline-array storage. With
+// Subscription lowering to a pointer the storage is correct and the program runs.
+BEZEL_TEST(codegen_events_24, subscription_in_size1_inline_array_runs_d5) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var total := 0; "
+        "var b := new Button(); "
+        "var subs: [1]Subscription; "
+        "subs[0] := b.Clicked.Subscribe((e) => do total := total + e.N; end); "
+        "return 42; ")), 42);
+}
+
+// D5 / §2.11 / §15.1: disposing the Subscription held in a [1]Subscription array
+// element unsubscribes the handler. Fire(3) while live adds 3; after the
+// element's `.Dispose()`, Fire(40) is a no-op.
+BEZEL_TEST(codegen_events_24, dispose_size1_inline_array_subscription_element) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var box := new Box(); var b := new Button(); "
+        "var subs: [1]Subscription; "
+        "subs[0] := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "b.Fire(3); "                           // handler live → +3
+        "subs[0].Dispose(); "                   // dispose the array element
+        "b.Fire(40); "                          // handler gone — no-op
+        "return box.V; ")), 3);
+}

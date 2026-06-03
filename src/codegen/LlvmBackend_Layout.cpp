@@ -246,7 +246,15 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "ICollection" || n == "IList" ||
                     n == "IOwnedCollection" || n == "IOwnedList" ||
                     // §30: Task types are also heap-allocated.
-                    n == "Task" || n == "OwnedTask")
+                    n == "Task" || n == "OwnedTask" ||
+                    // per §2.11 / §24.4: a Subscription is a runtime-managed
+                    // opaque handle (bz_subscription_t*), returned by
+                    // `<event>.Subscribe(...)` / CancellationToken.Register and
+                    // disposed via bz_subscription_dispose. Without this it fell
+                    // through to the i32 default, truncating the pointer when a
+                    // Subscription was a method return / parameter / field — so
+                    // its later `.Dispose()` saw a non-pointer and was skipped.
+                    n == "Subscription")
                     return ptrTy();
             }
             if (rt->declaration &&

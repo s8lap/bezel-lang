@@ -186,9 +186,16 @@ private:
     // and the class whose Dispose to call. Held in a stack of scopes; the
     // innermost block is the back. Disposed in reverse declaration order
     // at each scope's normal exit (§28.3).
+    //
+    // per §2.11: a `using var` of type `Subscription` has no user TypeSymbol
+    // (it is a runtime-managed opaque handle, not a class with a generated
+    // Dispose). For such entries `cls` is null and `subscription` is true; the
+    // scope-end path then calls bz_subscription_dispose instead of dispatching
+    // through a vtable.
     struct Disposal {
         llvm::AllocaInst* slot;
         const sema::TypeSymbol* cls;
+        bool subscription = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // CG13: the compiler-generated Dispose function for each class.
@@ -1654,10 +1661,17 @@ private:
     // a fixed desugaring to Add/Remove. Returns true when handled.
     bool tryLowerEventCompound(const ast::AssignmentStmt& as);
 
-    // per §2.11 / §24.4: true when `e` is (or names a local bound to) an event
-    // `Subscribe(...)` call result — i.e. a Subscription. Used to route
-    // `sub.Dispose()` to bz_subscription_dispose (a Subscription has no vtable).
+    // per §2.11 / §24.4: true when `e`'s static type is the built-in
+    // `Subscription` (stdlib §2.11), or — for an inferred local bound to a
+    // literal `.Subscribe(...)` whose result sema does not yet type — when it is
+    // structurally that call. Routes `sub.Dispose()` to bz_subscription_dispose
+    // (a Subscription is a runtime-managed opaque handle with no vtable).
     bool isSubscriptionExpr(const ast::Expr& e);
+
+    // per §2.11: true when the resolved type `rt` is the built-in
+    // `Subscription` — a Named TypeRef with no user declaration whose name is
+    // "Subscription" (resolved per TypeResolution_Names §24.4 / stdlib §2.11).
+    static bool isSubscriptionType(const sema::TypeRef* rt);
 
     // per §24.5: emit the handler-invocation loop for `Raise(payload)` — call
     // every active handler closure with `payload` (already lowered, or null for

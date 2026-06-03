@@ -1154,9 +1154,25 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
 
 void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (disposeStack_.empty()) return;
-    const sema::TypeSymbol* cls = classOfLocal(ld);
     auto it = locals_.find(ld);
-    if (!cls || it == locals_.end()) return;
+    if (it == locals_.end()) return;
+    // per §2.11: a `using var` of type `Subscription` auto-disposes at scope
+    // end by removing its registration (bz_subscription_dispose), not via a
+    // class vtable. A Subscription has no user TypeSymbol, so it never appears
+    // in `disposerFns_`; recognize it by its declared type, else (for an
+    // inferred local bound to a literal `.Subscribe(...)`, whose result sema
+    // does not type) structurally by its initializer.
+    bool isSub = false;
+    if (ld->type)
+        isSub = isSubscriptionType(ctx_.resolvedType(*ld->type));
+    if (!isSub && ld->initializer)
+        isSub = isSubscriptionExpr(*ld->initializer);
+    if (isSub) {
+        disposeStack_.back().push_back({it->second, nullptr, /*subscription=*/true});
+        return;
+    }
+    const sema::TypeSymbol* cls = classOfLocal(ld);
+    if (!cls) return;
     if (disposerFns_.find(cls) == disposerFns_.end()) return;
     disposeStack_.back().push_back({it->second, cls});
 }
@@ -1196,6 +1212,18 @@ bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& bo
 
 void Emitter::emitDisposals(const std::vector<Disposal>& scope) {
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
+        // per §2.11: a `using var` Subscription auto-disposes by removing its
+        // registration through the events runtime — it has no vtable. (Dispose
+        // is idempotent, so a null/already-removed handle is safe.)
+        if (it->subscription) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* sub = builder_.CreateLoad(ptrTy(), addr);
+            auto* fn = declareC("bz_subscription_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {sub});
+            continue;
+        }
         if (disposerFns_.find(it->cls) == disposerFns_.end()) continue;
         // CG18: dispatch Dispose dynamically through the object's
         // vtable, so a `using var` bound to a subclass instance runs

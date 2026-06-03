@@ -2882,8 +2882,28 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
 }
 
 
+// per §2.11 / §24.4: the built-in `Subscription` resolves (TypeResolution_Names)
+// to a Named TypeRef with a null user declaration whose first name part is
+// "Subscription". Same shape as the collection/StringBuilder built-in checks.
+bool Emitter::isSubscriptionType(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    return rt->astNode->name->parts[0] == "Subscription";
+}
+
 bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
-    // Direct form: `<event>.Subscribe(h)`.
+    // Primary, type-based recognition (per §2.11): any expression whose static
+    // type is `Subscription` disposes through the events runtime, regardless of
+    // syntactic position — method-returned, parameter, field, array element, or
+    // a local declared/inferred as Subscription. This replaces the previous
+    // purely-syntactic recognition, which only saw a literal `.Subscribe(...)`.
+    if (isSubscriptionType(ctx_.exprType(e))) return true;
+    // Fallback for the inferred-local literal form: `var sub := …Subscribe(…)`.
+    // The Subscribe call result is not (yet) typed as `Subscription` by sema,
+    // so an inferred local bound to it carries no exprType; recognize it
+    // structurally as before so the literal declarator keeps disposing.
     auto isSubscribeCall = [&](const ast::Expr& x) -> bool {
         auto* ce = dynamic_cast<const ast::CallExpr*>(&x);
         if (!ce || !ce->callee) return false;
@@ -2894,7 +2914,6 @@ bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
         return eventSymbolOf(*ma->target) != nullptr;
     };
     if (isSubscribeCall(e)) return true;
-    // Local form: `var sub := <event>.Subscribe(h); … sub.Dispose();`.
     if (dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(e))) {
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl)) {
