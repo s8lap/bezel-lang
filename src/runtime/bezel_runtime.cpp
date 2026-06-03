@@ -382,6 +382,32 @@ bool bz_dict_contains_gen(void* dp, const void* key) {
     return bz_dict_try_get_gen(dp, key, nullptr);
 }
 
+// Enumerate the generic table's keys (issue #370, §4.8 Dictionary.Keys /
+// §4.10 Set iteration). Returns a malloc'd array of `n` pointers, each a
+// malloc'd copy of one live key's `key_size` bytes. Mirrors bz_dict_keys_str
+// (which strdup's string keys) but copies the raw key blob instead, so it
+// serves int/enum/string/record keys uniformly. Iteration order is the
+// table's slot order — the same order bz_dict_keys_str already yields for the
+// string-key path (the open-addressing table does not track insertion order).
+void bz_dict_keys_gen(void* dp, void*** keys_out, int64_t* n_out) {
+    auto* d = (bz_dict_t*)dp;
+    int64_t n = d ? d->count : 0;
+    auto** keys = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
+    int64_t j = 0;
+    if (d && d->key_size > 0) {
+        for (int64_t i = 0; i < d->capacity && j < n; i++) {
+            bz_entry_t& e = d->buckets[i];
+            if (e.key && !e.deleted) {
+                void* kc = malloc((size_t)d->key_size);
+                memcpy(kc, e.key, (size_t)d->key_size);
+                keys[j++] = kc;
+            }
+        }
+    }
+    if (keys_out) *keys_out = keys; else free(keys);
+    if (n_out)    *n_out    = j;
+}
+
 // ---------------------------------------------------------------------------
 // Random
 // ---------------------------------------------------------------------------

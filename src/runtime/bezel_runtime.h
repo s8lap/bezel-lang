@@ -88,6 +88,15 @@ void  bz_dict_set_gen(void* d, const void* key, void* val);
 bool  bz_dict_remove_gen(void* d, const void* key);
 bool  bz_dict_contains_gen(void* d, const void* key);
 
+// Enumerate all generic-key entries (issue #370). `*keys_out` is a malloc'd
+// array of `n` pointers; each points to a malloc'd copy of the key's raw bytes
+// (key_size bytes). The caller frees each key pointer and the array with
+// free(). Used by Dictionary<K,V>.Keys for non-string keys and by iteration
+// over a dict-backed Set<T> (§4.8 / §4.10). For a STRING key/element the bytes
+// are the string-object pointer (key_size == sizeof(void*)); for a record they
+// are the record's value bytes.
+void bz_dict_keys_gen(void* d, void*** keys_out, int64_t* n_out);
+
 // ---------------------------------------------------------------------------
 // Random number generator
 // ---------------------------------------------------------------------------
