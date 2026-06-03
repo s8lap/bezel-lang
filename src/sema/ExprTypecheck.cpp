@@ -788,6 +788,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if ((as->op == "+=" || as->op == "-=") && as->target) {
             if (auto* es = dynamic_cast<EventSymbol*>(
                     ctx_.exprSymbol(*as->target))) {
+                // per §24.3: the `+=` / `-=` forms desugar to Add / Remove,
+                // which live on the EventSource<T> face — available only
+                // inside the declaring class (and inside a derived class for a
+                // `protected` event). Outside, the event is IEvent<T>, which
+                // has no Add / Remove.
+                checkEventVisibilityFence(es, as->op, as->span.begin);
                 if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
                     if (ed->type) eventPayload = ctx_.resolvedType(*ed->type);
             }

@@ -125,6 +125,7 @@ set(BEZEL_TEST_SOURCES
     sema/ctor_chain_test.cpp
     sema/static_ctor_params_test.cpp
     sema/base_visibility_test.cpp
+    sema/event_visibility_test.cpp
     sema/definite_return_test.cpp
     sema/generic_constraints_test.cpp
     sema/extern_ffi_type_test.cpp

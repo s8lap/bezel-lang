@@ -990,7 +990,58 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
     return ctx_.resolvedType(*ed->type);
 }
 
+// per §24.3: enforce the event visibility fence. `op` is the producer-side
+// operation being attempted on the event (`Raise`, `RaiseAsync`, `Add`,
+// `Remove`, or `+=` / `-=`). These are in scope only when the event's static
+// type is `EventSource<T>` / `AsyncEventSource<T>` — i.e. inside the declaring
+// class, or inside a derived class for a `protected` event (§24.5). Outside,
+// the member's type is `IEvent<T>` / `IAsyncEvent<T>`, which has no such
+// member, so the access is a compile error.
+void ExprTC::checkEventVisibilityFence(EventSymbol* es, std::string_view op,
+                                       SourceLocation loc) {
+    if (!es) return;
+    TypeSymbol* declaring = es->parent;
+    if (!declaring) return;  // defensive: an event always has a parent type
+    // Inside the declaring class: the EventSource<T> face is in scope.
+    if (currentType_ == declaring) return;
+    // §24.5: a derived class may use the producer-side face for a `protected`
+    // event declared on a base class. Any other event accessed from a subclass
+    // (or from anywhere else) is, outside its declaring class, only IEvent<T>.
+    if (es->visibility == ast::Visibility::Protected && currentType_ &&
+        isSubtype(currentType_, declaring))
+        return;
+    bool isOperator = (op == "+=" || op == "-=");
+    std::string detail =
+        isOperator
+            ? std::string("the `") + std::string(op) +
+                  "` form (which desugars to " +
+                  (op == "+=" ? "`Add`" : "`Remove`") + ")"
+            : std::string("`.") + std::string(op) + "`";
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string("event `") + std::string(es->name) +
+        "` is accessed from outside its declaring class `" +
+        std::string(declaring->name) + "`, where its static type is the "
+        "subscribe-only interface `IEvent<T>` — " + detail +
+        " is not available; only `.Subscribe` may be used here (§24.3)");
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
+    // per §24.3: the event visibility fence. When the access target resolves
+    // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
+    // `Add`, `Remove`) are only in scope inside the declaring class (and inside
+    // a derived class for a `protected` event); from outside, the event's
+    // static type is `IEvent<T>`, which has only `Subscribe`. The event member
+    // itself has no user TypeSymbol (it is `EventSource<T>` / `IEvent<T>`), so
+    // this runs before the ordinary member-lookup path below, which never
+    // resolves these names.
+    if (ma.target) {
+        if (auto* es = dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma.target))) {
+            if (ma.member == "Raise" || ma.member == "RaiseAsync" ||
+                ma.member == "Add" || ma.member == "Remove")
+                checkEventVisibilityFence(es, ma.member, ma.span.begin);
+        }
+    }
     TypeSymbol* targetType = nullptr;
     // `this.X` — currentType_ takes precedence over name lookup so
     // we don't have to teach `this` to be an expression with type
