@@ -307,6 +307,19 @@ private:
 
     void resolveMemberAccess(const ast::MemberAccessExpr& ma);
 
+    // §24.3: the event visibility fence. Outside the declaring class, an
+    // event member's static type is `IEvent<T>` / `IAsyncEvent<T>`, which
+    // exposes only `Subscribe`. The producer-side operations `Raise` /
+    // `RaiseAsync` / `Add` / `Remove` (and the `+=` / `-=` desugaring) live
+    // on `EventSource<T>` / `AsyncEventSource<T>`, the in-class face. Given
+    // an event member, the accessed operation name (one of the producer-side
+    // names, or `+=` / `-=`), and the access location, this emits a
+    // diagnostic when the access is from outside the declaring class. A
+    // derived class may use the producer-side face only for a `protected`
+    // event declared on a base class (§24.5). `Subscribe` is never flagged.
+    void checkEventVisibilityFence(EventSymbol* es, std::string_view op,
+                                   SourceLocation loc);
+
     // §7.5 null-conditional member access `x?.M`. Resolves the member on
     // the target's (non-nullable) type exactly like `.`, but the result
     // type is ALWAYS nullable (the access yields null when the target is
