@@ -44,7 +44,8 @@ struct TryHandlerContext {
 
 class Builder {
 public:
-    Builder(CFG& cfg) : cfg_(cfg) {}
+    Builder(CFG& cfg, bool treatTryAsOpaque = false)
+        : cfg_(cfg), treatTryAsOpaque_(treatTryAsOpaque) {}
 
     // Build the CFG. Returns the last "live" block on exit so the caller
     // can wire it to the function-level exit — null when control reaches
@@ -81,6 +82,7 @@ public:
 
 private:
     CFG& cfg_;
+    bool treatTryAsOpaque_ = false;
     std::vector<LoopContext> loops_;
     std::vector<TryHandlerContext> tryHandlers_;
 
@@ -125,6 +127,15 @@ private:
             return nullptr;
         }
         if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+            // Slice O3a: when the consumer requested opaque-try handling
+            // (the ownership pass), emit the TryStmt as a single linear
+            // statement instead of the F2 exception-edge expansion. The
+            // analysis then walks the try/catch/finally bodies itself,
+            // preserving the O11-simple behavior.
+            if (treatTryAsOpaque_) {
+                from->stmts.push_back(&s);
+                return from;
+            }
             return visitTry(*trys, from);
         }
         if (dynamic_cast<const ast::BreakStmt*>(&s)) {
@@ -157,6 +168,9 @@ private:
         // at the condition. Successors: [then-entry, else-or-elif-entry,
         // (...)] — chained elifs produce nested branch blocks.
         CFGBlock* merge = cfg_.makeBlock(CFGBlock::Kind::Merge);
+        // Record the originating `if` on the merge so a forward analysis
+        // can locate the §28.3 branch-join diagnostic at the if's span.
+        merge->sourceStmt = &s;
         visitIfBranches(s, from, merge);
         return merge;
     }
@@ -180,7 +194,7 @@ private:
         if (s.hasElse) {
             CFGBlock* elseEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
             cfg_.addEdge(current, elseEntry);
-            Builder inner(cfg_);
+            Builder inner(cfg_, treatTryAsOpaque_);
             inner.loops_ = loops_;
             CFGBlock* elseExit = inner.runInto(s.elseBody, elseEntry);
             if (elseExit) cfg_.addEdge(elseExit, merge);
@@ -199,7 +213,7 @@ private:
         CFGBlock* bodyEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
         cfg_.addEdge(from, bodyEntry);
         // Walk the branch body in a sub-Builder so loops_ are preserved.
-        Builder inner(cfg_);
+        Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
         CFGBlock* end = inner.runInto(b.body, bodyEntry);
         if (end) cfg_.addEdge(end, merge);
@@ -208,12 +222,13 @@ private:
 
     CFGBlock* visitWhile(const ast::WhileStmt& s, CFGBlock* from) {
         CFGBlock* header = cfg_.makeBlock(CFGBlock::Kind::Branch);
+        header->isLoopHeader = true;
         CFGBlock* bodyEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
         CFGBlock* after = cfg_.makeBlock(CFGBlock::Kind::Linear);
         cfg_.addEdge(from, header);
         cfg_.addEdge(header, bodyEntry); // true edge
         cfg_.addEdge(header, after);     // false edge
-        Builder inner(cfg_);
+        Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
         inner.loops_.push_back({header, after});
         CFGBlock* bodyEnd = inner.runInto(s.body, bodyEntry);
@@ -225,12 +240,13 @@ private:
         // For-loop CFG mirrors while-loop: header (the iteration check),
         // body, after.
         CFGBlock* header = cfg_.makeBlock(CFGBlock::Kind::Branch);
+        header->isLoopHeader = true;
         CFGBlock* bodyEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
         CFGBlock* after = cfg_.makeBlock(CFGBlock::Kind::Linear);
         cfg_.addEdge(from, header);
         cfg_.addEdge(header, bodyEntry);
         cfg_.addEdge(header, after);
-        Builder inner(cfg_);
+        Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
         inner.loops_.push_back({header, after});
         CFGBlock* bodyEnd = inner.runInto(s.body, bodyEntry);
@@ -265,7 +281,7 @@ private:
         cfg_.addEdge(from, tryEntry);
 
         // Build try body with this handler context active.
-        Builder inner(cfg_);
+        Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
         inner.tryHandlers_ = tryHandlers_;
         inner.tryHandlers_.push_back({catchDispatch, finallyEntry, afterTry});
@@ -291,7 +307,7 @@ private:
             // other Stmt). Visit it with the outer (one-frame-popped)
             // try handler stack — a throw in a catch handler shouldn't
             // route back to this catch.
-            Builder armInner(cfg_);
+            Builder armInner(cfg_, treatTryAsOpaque_);
             armInner.loops_ = loops_;
             armInner.tryHandlers_ = tryHandlers_;
             CFGBlock* armEnd = armEntry;
@@ -314,7 +330,7 @@ private:
 
         // Build the finally block (if present).
         if (finallyEntry) {
-            Builder finallyInner(cfg_);
+            Builder finallyInner(cfg_, treatTryAsOpaque_);
             finallyInner.loops_ = loops_;
             finallyInner.tryHandlers_ = tryHandlers_;
             CFGBlock* finallyEnd =
@@ -329,7 +345,7 @@ private:
 
     CFGBlock* visitDoEnd(const ast::DoEndBlock& s, CFGBlock* from) {
         // do/end is pure sequencing — same as inlining the body.
-        Builder inner(cfg_);
+        Builder inner(cfg_, treatTryAsOpaque_);
         inner.loops_ = loops_;
         CFGBlock* end = inner.runInto(s.body, from);
         return end;
@@ -353,9 +369,10 @@ private:
 } // namespace
 
 std::unique_ptr<CFG> buildCFG(
-    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    bool treatTryAsOpaque) {
     auto cfg = std::make_unique<CFG>();
-    Builder builder(*cfg);
+    Builder builder(*cfg, treatTryAsOpaque);
     CFGBlock* end = builder.build(body);
     if (end) {
         cfg->addEdge(end, cfg->exit());

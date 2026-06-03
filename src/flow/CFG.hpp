@@ -71,6 +71,21 @@ struct CFGBlock {
 
     // ID for diagnostics — stable across rebuilds for the same body.
     std::uint32_t id = 0;
+
+    // Optional back-pointer to the AST statement that originated this
+    // block. Populated additively (the F1/F2 builder fills it for Merge
+    // blocks with the originating `IfStmt`) so analyses that need the
+    // source node for diagnostics can recover it — the ownership pass
+    // uses it to locate the §28.3 branch-join diagnostic at the if's
+    // span. Null when no single statement is responsible.
+    const ast::Stmt* sourceStmt = nullptr;
+
+    // True for a loop's condition Branch (the header of a while/for).
+    // A back-edge targets this block, and its false successor (succs[1])
+    // is the loop-skip / exit edge. Additive: lets a forward analysis
+    // distinguish loop headers from if-condition branches without a
+    // separate dominator computation.
+    bool isLoopHeader = false;
 };
 
 class CFG {
@@ -108,7 +123,17 @@ private:
 // kinds documented in the file-header comment; encountering an unknown
 // shape produces a single Linear block containing the statement (so
 // later analyses see it as opaque rather than crashing).
+//
+// `treatTryAsOpaque` (additive, default false): when true, a `TryStmt`
+// is NOT expanded into the F2 try/catch/finally exception-edge shape —
+// it is emitted as a single opaque statement in the current linear
+// block, exactly like an unknown statement kind. The ownership pass
+// (slice O3a) uses this so it can keep handling try/catch with its
+// existing structured walk (matching the O11-simple behavior) while
+// driving the rest of the body as a forward dataflow over the CFG. The
+// default preserves the full F2 expansion for flow tests.
 std::unique_ptr<CFG> buildCFG(
-    const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    bool treatTryAsOpaque = false);
 
 } // namespace bezel::flow
