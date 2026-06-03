@@ -289,6 +289,53 @@ private:
     TypeRef* resolveType(const ast::Type& t, Scope* scope);
 
     void resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref);
+
+    // §14.2 / Appendix C.4: at a generic instantiation site
+    // (`Named<...>` type, including `new C<...>()`), verify every supplied
+    // type argument satisfies the constraints its corresponding type
+    // parameter declares in the type's `where` clause. `tsym` is the
+    // resolved generic type; `t` carries the AST argument nodes (used to
+    // skip arguments that are themselves generic params — those can't be
+    // classified statically); `argRefs` are the resolved argument TypeRefs
+    // (positionally aligned with `tsym->genericParams`); `scope` is used to
+    // detect whether an argument name is an in-scope generic parameter.
+    void checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
+                                 const std::vector<TypeRef*>& argRefs,
+                                 Scope* scope);
+
+    // §14.2: check a single constraint `item` (one of class / value /
+    // notnull / new() / a type-bound) against type argument `arg` (resolved)
+    // for the type parameter named `paramName`. `t` supplies the diagnostic
+    // span; `argAst` is the argument's AST node (for its spelling);
+    // `boundScope` resolves a type-bound constraint's bound on demand.
+    void checkOneConstraint(const ast::Type& t, std::string_view paramName,
+                            const ast::ConstraintItem& item,
+                            const ast::Type* argAst, TypeRef* arg,
+                            Scope* boundScope);
+
+    // §14.2: is the AST type node `t` a reference to a generic parameter
+    // currently in scope (rather than a concrete type)? Used to skip
+    // constraint checks on arguments whose classification is only known at
+    // the outer instantiation.
+    bool isGenericParamRef(const ast::Type& t, Scope* scope);
+
+    // §14.2 / Appendix C.4 reference-vs-value classification of a resolved
+    // argument TypeRef. Unknown means "can't classify here" (built-in named
+    // type with no user declaration, generic param, Error) — the caller
+    // defers rather than risk a false positive.
+    enum class TypeCategory { Reference, Value, Unknown };
+    TypeCategory categorize(const TypeRef* a);
+
+    // §14.2 interface/base conformance: does `arg` (a Named TypeRef with a
+    // resolved declaration) have `bound`'s declaration in its transitive
+    // base/interface set, or equal it? BFS over baseTypes, cycle-guarded.
+    bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound);
+
+    // §14.2 `where T: new()`: does the resolved argument type admit a
+    // parameterless construction? Sets `decided=false` when the argument
+    // can't be classified (built-ins, unresolved, generic param) so the
+    // caller defers; otherwise sets `decided=true` and returns the verdict.
+    bool argSatisfiesNew(const TypeRef* arg, bool& decided);
 };
 
 }  // namespace bezel::sema
