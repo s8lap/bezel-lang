@@ -253,13 +253,13 @@ bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
 // actually carries synthesized GetHashCode/Equals (positional records, or
 // auto-equality-bearing body records — §9.1 / §9.2). For such keys the generic
 // runtime variant is used; string and primitive keys keep their fast paths.
-const sema::TypeSymbol* Emitter::recordKeyType(const sema::TypeRef* collTy,
-                                               unsigned idx) {
-    if (!collTy || collTy->genericArgs.size() <= idx) return nullptr;
-    const sema::TypeRef* kr = collTy->genericArgs[idx];
-    if (!kr || kr->kind != sema::TypeRef::Kind::Named || !kr->declaration)
+// issue #343 / §9.1 / §9.2: if `ref` resolves to a record type that actually
+// carries synthesized GetHashCode/Equals (a positional record, or an
+// auto-equality-bearing body record), return its TypeSymbol; otherwise null.
+const sema::TypeSymbol* Emitter::recordTypeOfRef(const sema::TypeRef* ref) {
+    if (!ref || ref->kind != sema::TypeRef::Kind::Named || !ref->declaration)
         return nullptr;
-    const sema::TypeSymbol* ts = kr->declaration;
+    const sema::TypeSymbol* ts = ref->declaration;
     if (ts->kind != ast::TypeDeclKind::Record) return nullptr;
     bool positional = false;
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
@@ -267,6 +267,12 @@ const sema::TypeSymbol* Emitter::recordKeyType(const sema::TypeRef* collTy,
     if (positional || sema::isAutoEqualityBearingBodyRecord(ts))
         return ts;
     return nullptr;  // an ineligible body record has no auto equality (§9.2)
+}
+
+const sema::TypeSymbol* Emitter::recordKeyType(const sema::TypeRef* collTy,
+                                               unsigned idx) {
+    if (!collTy || collTy->genericArgs.size() <= idx) return nullptr;
+    return recordTypeOfRef(collTy->genericArgs[idx]);
 }
 
 
@@ -3829,7 +3835,8 @@ llvm::Function* Emitter::buildRecordEqTrampoline(const sema::TypeSymbol* rec) {
 }
 
 llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
-                                             llvm::Type* outTy) {
+                                             llvm::Type* outTy,
+                                             const sema::TypeSymbol* elemRec) {
     // Build a fresh internal function (each LINQ-operator site gets its own;
     // they are tiny and the closure type is baked into the IR).
     llvm::FunctionType* fty = nullptr;
@@ -3859,9 +3866,19 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
         // Element equality (Distinct): content-aware compare of two elements.
         llvm::Value* a = builder_.CreateLoad(elemTy, fn->getArg(0), "eq.a");
         llvm::Value* b = builder_.CreateLoad(elemTy, fn->getArg(1), "eq.b");
-        llvm::Value* eq = (elemTy->isPointerTy())
-            ? emitStringEq(a, b)               // string content equality (§4.6)
-            : builder_.CreateICmpEQ(a, b);     // value equality
+        llvm::Value* eq;
+        if (elemRec) {
+            // issue D6 / §9.1 / §9.2: a record element dedups by synthesized
+            // structural equality (the same machinery Set<record> uses), NOT an
+            // ICmp on the aggregate (which LLVM rejects). String fields compare
+            // by content, nested records recurse — consistent with the hash.
+            eq = emitStructEquality(a, b, llvm::cast<llvm::StructType>(elemTy),
+                                    elemRec);
+        } else if (elemTy->isPointerTy()) {
+            eq = emitStringEq(a, b);           // string content equality (§4.6)
+        } else {
+            eq = builder_.CreateICmpEQ(a, b);  // value equality
+        }
         builder_.CreateRet(builder_.CreateZExt(eq, i32()));
         builder_.restoreIP(savedIP);
         currentFn_ = savedFn;
@@ -4017,7 +4034,12 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         return builder_.CreateCall(skipFn, {src, n64}, "linq.skip");
     }
     if (m == "Distinct" && call.args.empty()) {
-        llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr);
+        // issue D6 / §9.1 / §9.2: a record element sequence dedups by its
+        // synthesized structural equality (mirroring Set<record>), not an ICmp
+        // on the aggregate. recordTypeOfRef is non-null only for an
+        // equality-bearing record element type.
+        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr, elemRec);
         auto* distFn = declareC("bz_lazy_distinct", ptrTy(), {ptrTy(), ptrTy()});
         return builder_.CreateCall(distFn, {src, eqTramp}, "linq.distinct");
     }
