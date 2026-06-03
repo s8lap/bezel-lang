@@ -1,0 +1,630 @@
+#include "parser/Parser.hpp"
+
+#include <algorithm>
+#include <string_view>
+
+namespace bezel {
+
+namespace {
+
+// Issue #135: span-stamping wrappers.
+template <typename NodePtr>
+NodePtr stampSpan(NodePtr node, const SourceLocation& start,
+                  const SourceLocation& end) {
+    if (node && node->span.begin.line == 0) {
+        node->span.begin = start;
+        node->span.end = end;
+    }
+    return node;
+}
+
+} // namespace
+
+
+ast::CaseArm Parser::parseCaseStmtArm() {
+    ast::CaseArm arm;
+    arm.pattern = parsePattern();
+    if (consumeKeyword("when")) {
+        arm.guard = parseExpression();
+    }
+    if (!consumePunctuator("=>")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected '=>' after case-arm pattern");
+    }
+    // ArmBody in statement position: `do … end` block OR a single Statement
+    // (whose terminating `;` ends the arm body per the §A.7 ArmBody note).
+    arm.bodyKind = ast::CaseArmBodyKind::Block;
+    if (consumeKeyword("do")) {
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (s) {
+                arm.stmts.push_back(std::move(s));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected 'end' to close 'do' arm body");
+        }
+    } else {
+        // Single Statement. The Statement consumes its own `;`. After
+        // returning, the outer loop expects `,` or `end`.
+        auto s = parseStatement();
+        if (s) arm.stmts.push_back(std::move(s));
+    }
+    return arm;
+}
+
+std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
+    advance(); // past `case`
+    auto cs = std::make_unique<ast::CaseStmt>();
+    // Same scrutinee restriction as parseCaseExpr (stop before relational
+    // operators so relop patterns like `>=90` can appear in arm position).
+    {
+        SourceLocation start = current_.location;
+        cs->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
+    }
+    cs->arms.push_back(parseCaseStmtArm());
+    while (consumePunctuator(",")) {
+        if (isKeyword("end")) break;
+        cs->arms.push_back(parseCaseStmtArm());
+    }
+    if (!consumeKeyword("end")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected 'end' to close case statement");
+    }
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after 'end' of case statement");
+    }
+    return std::unique_ptr<ast::Stmt>(cs.release());
+}
+
+std::unique_ptr<ast::Stmt> Parser::parseStatement() {
+    SourceLocation start = current_.location;
+    return stampSpan(parseStatementImpl(), start, current_.location);
+}
+
+std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
+    // §A.6 Statement dispatch. Slice 11 covers LocalDecl, ReturnStmt, and
+    // the expression-led shapes (AssignmentStmt vs ExpressionStmt, decided
+    // after parsing the leading expression).
+
+    // A.6 LocalConstDecl (slice 53):
+    //   "const" Identifier (":" Type)? ":=" ConstExpr ";"
+    if (isKeyword("const")) {
+        advance(); // past `const`
+        auto lc = std::make_unique<ast::LocalConstDecl>();
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected name in local const declaration");
+        } else {
+            lc->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            lc->type = parseType();
+        }
+        if (!consumePunctuator(":=")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "local const requires an initializer ':=' (A.6 LocalConstDecl)");
+        }
+        lc->value = parseExpression();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after local const declaration");
+        }
+        return std::unique_ptr<ast::Stmt>(lc.release());
+    }
+
+    // LocalDecl (A.6): `var Identifier (":" Type)? (":=" Expression)? ";"`,
+    // `using var ...`, or the async `await using var ...` form. The async
+    // form is detected by one-token lookahead on the leading `await` —
+    // without it, `await` would otherwise begin a unary-expression
+    // ExpressionStmt.
+    const bool awaitUsing =
+        isKeyword("await") &&
+        peekNext().kind == TokenKind::Keyword &&
+        peekNext().text == "using";
+    if (isKeyword("var") || isKeyword("using") || awaitUsing) {
+        auto decl = std::make_unique<ast::LocalDecl>();
+        if (awaitUsing) {
+            decl->isUsing = true;
+            decl->isAwaitUsing = true;
+            advance(); // past `await`
+            consumeKeyword("using"); // confirmed by lookahead
+            if (!consumeKeyword("var")) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected 'var' after 'await using'");
+            }
+        } else if (consumeKeyword("using")) {
+            decl->isUsing = true;
+            if (!consumeKeyword("var")) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected 'var' after 'using'");
+            }
+        } else {
+            advance(); // past `var`
+        }
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected local-variable name");
+        } else {
+            decl->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            decl->type = parseType();
+        }
+        if (consumePunctuator(":=")) {
+            decl->initializer = parseExpression();
+        } else if (decl->isUsing) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                decl->isAwaitUsing
+                    ? "`await using var` requires an initializer "
+                      "(A.6 LocalDecl)"
+                    : "`using var` requires an initializer (A.6 LocalDecl)");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after local declaration");
+        }
+        return std::unique_ptr<ast::Stmt>(decl.release());
+    }
+
+    // CaseStmt (A.6). Statement-position `case` admits Statement-form and
+    // `do … end` ArmBodies, unlike the Expression-position CaseExpr. We
+    // intercept before the expression fallthrough so the `;` terminator and
+    // the richer body forms work correctly.
+    if (isKeyword("case")) {
+        return parseCaseStmt();
+    }
+
+    // IfStmt (A.6).
+    if (isKeyword("if")) {
+        advance(); // past `if`
+        auto stmt = std::make_unique<ast::IfStmt>();
+        stmt->ifBranch.condition = parseExpression();
+        if (!consumeKeyword("then")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'then' after 'if' condition");
+        }
+        while (!isKeyword("elif") && !isKeyword("else") &&
+               !isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto inner = parseStatement();
+            if (inner) {
+                stmt->ifBranch.body.push_back(std::move(inner));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        while (consumeKeyword("elif")) {
+            ast::IfStmt::Branch elif;
+            elif.condition = parseExpression();
+            if (!consumeKeyword("then")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'then' after 'elif' condition");
+            }
+            while (!isKeyword("elif") && !isKeyword("else") &&
+                   !isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto inner = parseStatement();
+                if (inner) {
+                    elif.body.push_back(std::move(inner));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+            stmt->elifBranches.push_back(std::move(elif));
+        }
+        if (consumeKeyword("else")) {
+            stmt->hasElse = true;
+            while (!isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto inner = parseStatement();
+                if (inner) {
+                    stmt->elseBody.push_back(std::move(inner));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'if' statement");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'if'");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
+    // WhileStmt (A.6): `"while" Expression "do" Statement* "end" ";"`.
+    if (isKeyword("while")) {
+        advance();
+        auto stmt = std::make_unique<ast::WhileStmt>();
+        stmt->condition = parseExpression();
+        if (!consumeKeyword("do")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'do' to begin 'while' body");
+        }
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto inner = parseStatement();
+            if (inner) {
+                stmt->body.push_back(std::move(inner));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'while' statement");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'while'");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
+    // TryStmt (A.6). Slice 22 covers the binding catch arm only —
+    // `catch var Identifier : Type => Statement` — plus optional finally.
+    if (isKeyword("try")) {
+        advance(); // past `try`
+        auto stmt = std::make_unique<ast::TryStmt>();
+        while (!isKeyword("catch") && !isKeyword("finally") &&
+               !isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (s) {
+                stmt->body.push_back(std::move(s));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        // §A.6: CatchBlock ::= "catch" CatchArm ("," CatchArm)* ","?
+        // One "catch" keyword followed by one or more comma-separated arms.
+        // Also support multiple "catch" keywords (one per arm) as alias.
+        if (consumeKeyword("catch")) {
+            // Parse one arm: CatchPattern ("when" Guard)? "=>" ArmBody
+            auto parseCatchArm = [&]() {
+                ast::CatchArm arm;
+                if (consumeKeyword("var")) {
+                    arm.hasBinding = true;
+                    if (current_.kind != TokenKind::Identifier) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected exception-binding name");
+                    } else {
+                        arm.varName = current_.text;
+                        advance();
+                    }
+                    if (!consumePunctuator(":")) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected ':' after catch binding name");
+                    }
+                } else if (current_.kind == TokenKind::Identifier &&
+                           peekAt(1).kind == TokenKind::Punctuator &&
+                           peekAt(1).text == ":") {
+                    // `catch name: Type` without `var` — accepted silently.
+                    arm.hasBinding = true;
+                    arm.varName = current_.text;
+                    advance(); // past name
+                    advance(); // past ":"
+                }
+                arm.types.push_back(parseType());
+                // Within the pattern, "," joins additional exception types.
+                // Stop if the next token starts an arm (is `var`/`when`/`=>`).
+                // Peek ahead: `,` followed by `var` → arm separator, not type.
+                while (isPunctuator(",") && !isKeyword("when")) {
+                    // Peek past the comma.
+                    const auto& afterComma = peekAt(1);
+                    // If comma is followed by `var`, another binding pattern starts.
+                    if (afterComma.kind == TokenKind::Keyword &&
+                        afterComma.text == "var") break;
+                    // If comma is followed by end/finally, it's a trailing comma.
+                    if (afterComma.kind == TokenKind::Keyword &&
+                        (afterComma.text == "end" || afterComma.text == "finally")) break;
+                    advance(); // consume ","
+                    arm.types.push_back(parseType());
+                }
+                if (consumeKeyword("when")) {
+                    arm.guard = parseExpression();
+                }
+                if (!consumePunctuator("=>")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected '=>' after catch pattern");
+                }
+                arm.body = parseStatement();
+                stmt->catches.push_back(std::move(arm));
+            };
+            parseCatchArm();
+            // Additional arms: comma-separated inline OR repeated `catch`
+            // keywords (possibly after a comma). Handle both styles:
+            //   Style A (spec): `catch Arm1, Arm2 end;`
+            //   Style B (alias): `catch Arm1;, catch Arm2; end;`
+            while (true) {
+                bool hadComma = consumePunctuator(",");
+                if (isKeyword("end") || isKeyword("finally") ||
+                    current_.kind == TokenKind::EndOfFile) break;
+                if (consumeKeyword("catch")) {
+                    // Style B: next arm starts with `catch` keyword.
+                    parseCatchArm();
+                } else if (hadComma && (isKeyword("var") ||
+                           current_.kind == TokenKind::Identifier)) {
+                    // Style A: inline next arm (no `catch` keyword).
+                    parseCatchArm();
+                } else {
+                    // No more arms.
+                    break;
+                }
+            }
+        }
+        if (consumeKeyword("finally")) {
+            stmt->hasFinally = true;
+            while (!isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto s = parseStatement();
+                if (s) {
+                    stmt->finallyBody.push_back(std::move(s));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'try' statement");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'try'");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
+    // ForStmt (A.6). Synchronous `for var ... in EXPR do ... end ;` and the
+    // async `await for var ... in EXPR (with EXPR)? do ... end ;` form
+    // (slice 35). The async form is detected by one-token lookahead on the
+    // leading `await`.
+    const bool awaitFor =
+        isKeyword("await") &&
+        peekNext().kind == TokenKind::Keyword &&
+        peekNext().text == "for";
+    if (isKeyword("for") || awaitFor) {
+        auto stmt = std::make_unique<ast::ForStmt>();
+        if (awaitFor) {
+            stmt->isAwait = true;
+            advance(); // past `await`
+        }
+        advance(); // past `for`
+        if (!consumeKeyword("var")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'var' after 'for'");
+        }
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected loop variable name");
+        } else {
+            stmt->varName = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            stmt->varType = parseType();
+        }
+        if (!consumeKeyword("in")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'in' in for statement");
+        }
+        // Disable the postfix `with` suffix here so the for-stmt sees its
+        // own `with EXPR` cancellation-token clause rather than letting the
+        // expression parser consume it as a WithExpr (slice 50).
+        const bool prevDisable = disableWithSuffix_;
+        disableWithSuffix_ = true;
+        stmt->iterable = parseExpression();
+        disableWithSuffix_ = prevDisable;
+        // Optional `with EXPR` cancellation-token clause — async form only
+        // (§30.7). Sema rejects it on the sync form.
+        if (consumeKeyword("with")) {
+            if (!stmt->isAwait) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "'with' clause is only valid on 'await for' (§30.7)");
+            }
+            stmt->withExpr = parseExpression();
+        }
+        if (!consumeKeyword("do")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'do' to begin 'for' body");
+        }
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto inner = parseStatement();
+            if (inner) {
+                stmt->body.push_back(std::move(inner));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'for' statement");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'for'");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
+    // DoEndBlock (A.6) — plain statement-sequencing block, no value.
+    if (isKeyword("do")) {
+        advance();
+        auto stmt = std::make_unique<ast::DoEndBlock>();
+        while (!isKeyword("end") &&
+               current_.kind != TokenKind::EndOfFile) {
+            auto inner = parseStatement();
+            if (inner) {
+                stmt->body.push_back(std::move(inner));
+            } else if (current_.kind != TokenKind::EndOfFile) {
+                advance();
+            }
+        }
+        if (!consumeKeyword("end")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected 'end' to close 'do' block");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'end' of 'do' block");
+        }
+        return std::unique_ptr<ast::Stmt>(stmt.release());
+    }
+
+    if (consumeKeyword("break")) {
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'break'");
+        }
+        return std::unique_ptr<ast::Stmt>(
+            std::make_unique<ast::BreakStmt>().release());
+    }
+    if (consumeKeyword("continue")) {
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after 'continue'");
+        }
+        return std::unique_ptr<ast::Stmt>(
+            std::make_unique<ast::ContinueStmt>().release());
+    }
+
+    // YieldStmt (A.6): `yield return Expression ";"` or `yield break ";"`.
+    if (isKeyword("yield")) {
+        advance();
+        auto y = std::make_unique<ast::YieldStmt>();
+        if (consumeKeyword("break")) {
+            y->isBreak = true;
+        } else if (consumeKeyword("return")) {
+            y->value = parseExpression();
+        } else {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected 'return' or 'break' after 'yield'");
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after yield statement");
+        }
+        return std::unique_ptr<ast::Stmt>(y.release());
+    }
+
+    // ReturnStmt: `return Expression? ";"`.
+    if (isKeyword("return")) {
+        advance();
+        auto ret = std::make_unique<ast::ReturnStmt>();
+        if (!isPunctuator(";")) {
+            ret->value = parseExpression();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after return statement");
+        }
+        return std::unique_ptr<ast::Stmt>(ret.release());
+    }
+
+    // ThrowStmt (A.6): `throw Expression? ";"`.
+    if (isKeyword("throw")) {
+        advance();
+        auto th = std::make_unique<ast::ThrowStmt>();
+        if (!isPunctuator(";")) {
+            th->value = parseExpression();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after throw statement");
+        }
+        return std::unique_ptr<ast::Stmt>(th.release());
+    }
+
+    // Otherwise parse an expression and decide between IncrementStmt (`++`/
+    // `--`), DiscardStmt (LHS is identifier `_` and the op is `:=`),
+    // AssignmentStmt (other assignment ops), and ExpressionStmt (fallback).
+    auto lhs = parseExpression();
+
+    if (current_.kind == TokenKind::Punctuator &&
+        (current_.text == "++" || current_.text == "--")) {
+        auto inc = std::make_unique<ast::IncrementStmt>();
+        inc->target = std::move(lhs);
+        inc->op = current_.text;
+        advance();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after increment/decrement statement");
+        }
+        return std::unique_ptr<ast::Stmt>(inc.release());
+    }
+
+    if (current_.kind == TokenKind::Punctuator &&
+        (current_.text == ":="  || current_.text == "+="  ||
+         current_.text == "-="  || current_.text == "*="  ||
+         current_.text == "/="  || current_.text == "&="  ||
+         current_.text == "|="  || current_.text == "^="  ||
+         current_.text == "<<=" || current_.text == ">>=" ||
+         current_.text == "??=")) {
+        // Discard form: LHS is the bare `_` identifier and the op is `:=`.
+        if (current_.text == ":=") {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(lhs.get())) {
+                if (id->name == "_") {
+                    advance(); // past `:=`
+                    auto d = std::make_unique<ast::DiscardStmt>();
+                    d->value = parseExpression();
+                    if (!consumePunctuator(";")) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected ';' after discard statement");
+                    }
+                    return std::unique_ptr<ast::Stmt>(d.release());
+                }
+            }
+        }
+        auto a = std::make_unique<ast::AssignmentStmt>();
+        a->target = std::move(lhs);
+        a->op = current_.text;
+        advance();
+        a->value = parseExpression();
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after assignment");
+        }
+        return std::unique_ptr<ast::Stmt>(a.release());
+    }
+
+    // If the expression is null (e.g. a keyword token where an expression
+    // was expected) and no `;` follows, return nullptr to allow the body-
+    // parsing loop to advance past the problematic token. Returning a non-
+    // null ExpressionStmt with null expr and no progress causes an infinite
+    // loop in statement-list parsers.
+    if (!lhs && !isPunctuator(";")) return nullptr;
+    auto es = std::make_unique<ast::ExpressionStmt>();
+    es->expr = std::move(lhs);
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+                            "expected ';' after expression statement");
+    }
+    return std::unique_ptr<ast::Stmt>(es.release());
+}
+
+} // namespace bezel

@@ -85,6 +85,9 @@ add_library(bezel_core STATIC
     src/support/Diagnostic.cpp
     src/lexer/Lexer.cpp
     src/parser/Parser.cpp
+    src/parser/Parser_Decls.cpp
+    src/parser/Parser_Stmts.cpp
+    src/parser/Parser_Exprs.cpp
     src/sema/TypeChecker.cpp
     src/sema/SymbolCollection.cpp
     src/sema/TypeResolution.cpp

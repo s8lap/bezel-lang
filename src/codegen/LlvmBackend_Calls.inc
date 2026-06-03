@@ -1,0 +1,3562 @@
+llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
+                               int fd) {
+    // Declare POSIX write(2): ssize_t write(int, const void*, size_t)
+    auto* writeFn = module_->getFunction("write");
+    if (!writeFn) {
+        auto* ft = llvm::FunctionType::get(i64(), {i32(), ptrTy(), i64()},
+                                           false);
+        writeFn = llvm::Function::Create(
+            ft, llvm::Function::ExternalLinkage, "write", module_.get());
+    }
+    llvm::Value* data = loadStringData(strPtr);
+    llvm::Value* len  = loadStringLen(strPtr);
+    builder_.CreateCall(writeFn,
+                        {builder_.getInt32(fd), data, len});
+    if (newline) {
+        // Write a newline byte.
+        llvm::Constant* nlData = llvm::ConstantDataArray::getString(
+            llvm_, "\n", /*AddNull=*/false);
+        auto* nlGV = new llvm::GlobalVariable(
+            *module_, nlData->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, nlData, ".bz.nl");
+        builder_.CreateCall(writeFn,
+                            {builder_.getInt32(fd), nlGV,
+                             builder_.getInt64(1)});
+    }
+    return nullptr;  // unit (void)
+}
+
+
+llvm::Value* Emitter::emitConsoleReadLine() {
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    const unsigned BUFSZ = 4096;
+    llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, BUFSZ));
+    llvm::Value* bufPtr = builder_.CreateGEP(
+        llvm::ArrayType::get(i8Ty, BUFSZ), buf,
+        {builder_.getInt64(0), builder_.getInt64(0)});
+    // fgets(bufPtr, BUFSZ, stdin)
+    auto* fgetsFn = module_->getFunction("fgets");
+    if (!fgetsFn) {
+        auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i32(), ptrTy()}, false);
+        fgetsFn = llvm::Function::Create(
+            ft, llvm::Function::ExternalLinkage, "fgets", module_.get());
+    }
+    // stdin global (FILE*)
+    auto* stdinGV = module_->getGlobalVariable("stdin");
+    if (!stdinGV) {
+        stdinGV = new llvm::GlobalVariable(
+            *module_, ptrTy(), false,
+            llvm::GlobalValue::ExternalLinkage, nullptr, "stdin");
+    }
+    llvm::Value* stdinVal = builder_.CreateLoad(ptrTy(), stdinGV, "stdin");
+    llvm::Value* fgRet = builder_.CreateCall(
+        fgetsFn, {bufPtr, builder_.getInt32(BUFSZ), stdinVal}, "fgets.ret");
+    auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+    llvm::Value* isEOF = builder_.CreateICmpEQ(fgRet, nullPtr, "rl.eof");
+    auto* eofBB = llvm::BasicBlock::Create(llvm_, "rl.eof",  currentFn_);
+    auto* okBB  = llvm::BasicBlock::Create(llvm_, "rl.ok",   currentFn_);
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "rl.end",  currentFn_);
+    builder_.CreateCondBr(isEOF, eofBB, okBB);
+    builder_.SetInsertPoint(eofBB);
+    builder_.CreateBr(endBB);
+    // OK: compute length, strip trailing '\n'.
+    builder_.SetInsertPoint(okBB);
+    auto* strlenFn = module_->getFunction("strlen");
+    if (!strlenFn) {
+        auto* ft2 = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+        strlenFn = llvm::Function::Create(
+            ft2, llvm::Function::ExternalLinkage, "strlen", module_.get());
+    }
+    llvm::Value* rawLen = builder_.CreateCall(strlenFn, {bufPtr}, "rawlen");
+    llvm::Value* hasBytes = builder_.CreateICmpSGT(rawLen, builder_.getInt64(0));
+    auto* stripBB = llvm::BasicBlock::Create(llvm_, "rl.strip", currentFn_);
+    auto* afterBB = llvm::BasicBlock::Create(llvm_, "rl.after", currentFn_);
+    builder_.CreateCondBr(hasBytes, stripBB, afterBB);
+    builder_.SetInsertPoint(stripBB);
+    llvm::Value* lastIdx = builder_.CreateSub(rawLen, builder_.getInt64(1));
+    llvm::Value* lastPtr = builder_.CreateGEP(i8Ty, bufPtr, lastIdx);
+    llvm::Value* lastByte = builder_.CreateLoad(i8Ty, lastPtr);
+    llvm::Value* isNL = builder_.CreateICmpEQ(lastByte, llvm::ConstantInt::get(i8Ty, '\n'));
+    auto* nlBB = llvm::BasicBlock::Create(llvm_, "rl.nl", currentFn_);
+    builder_.CreateCondBr(isNL, nlBB, afterBB);
+    builder_.SetInsertPoint(nlBB);
+    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), lastPtr);
+    builder_.CreateBr(afterBB);
+    builder_.SetInsertPoint(afterBB);
+    // Final length after stripping.
+    llvm::Value* finalLen = builder_.CreateCall(strlenFn, {bufPtr}, "finalLen");
+    // Heap-copy the data.
+    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+    llvm::Value* dataSz = builder_.CreateAdd(finalLen, builder_.getInt64(1));
+    llvm::Value* dataCopy = builder_.CreateCall(mallocFn, {dataSz}, "rl.data");
+    builder_.CreateCall(memcpyFn, {dataCopy, bufPtr, finalLen});
+    llvm::Value* endData = builder_.CreateGEP(i8Ty, dataCopy, finalLen);
+    builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), endData);
+    uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+    llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rl.obj");
+    builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
+    builder_.CreateStore(finalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+    builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+        builder_.CreateStructGEP(stringType(), strObj, 2));
+    auto* okEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+    // Merge.
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(ptrTy(), 2, "rl.result");
+    phi->addIncoming(nullPtr, eofBB);
+    phi->addIncoming(strObj, okEnd);
+    return phi;
+}
+
+
+bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
+    if (!call.callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return false;
+
+    // Detect Console.Error.Write/WriteLine — stderr output (fd=2).
+    int stdfd = 1;  // default: stdout
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id) {
+        // Try Console.Error.Write/WriteLine: target is MemberAccess "Console.Error"
+        auto* innerMA = dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get());
+        if (!innerMA || !innerMA->target) return false;
+        auto* innerID = dynamic_cast<const ast::IdentifierExpr*>(innerMA->target.get());
+        if (!innerID || innerID->name != "Console") return false;
+        if (innerMA->member == "Error" || innerMA->member == "Out") {
+            stdfd = (innerMA->member == "Error") ? 2 : 1;
+            id = nullptr;  // mark as Error/Out path
+        } else return false;
+    } else if (id->name != "Console") return false;
+
+    bool isWriteLine = (ma->member == "WriteLine");
+    bool isWrite = (ma->member == "Write");
+    if (!isWrite && !isWriteLine) return false;
+
+    // Console.WriteLine() with no args → just print a newline.
+    if (call.args.empty() && isWriteLine) {
+        auto* writeFn = module_->getFunction("write");
+        if (!writeFn) {
+            auto* ft = llvm::FunctionType::get(i64(), {i32(), ptrTy(), i64()}, false);
+            writeFn = llvm::Function::Create(
+                ft, llvm::Function::ExternalLinkage, "write", module_.get());
+        }
+        llvm::Constant* nlData = llvm::ConstantDataArray::getString(
+            llvm_, "\n", false);
+        unsigned id2 = stringLiteralIdx_++;
+        auto* nlGV = new llvm::GlobalVariable(
+            *module_, nlData->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, nlData,
+            ".bz.console.nl." + std::to_string(id2));
+        builder_.CreateCall(writeFn, {builder_.getInt32(stdfd), nlGV, builder_.getInt64(1)});
+        return true;
+    }
+    if (call.args.size() != 1 || !call.args[0].value) return false;
+
+    // Evaluate the argument. If it's a string, use directly; if it's a
+    // primitive, convert via emitPrimitiveToString first.
+    llvm::Value* arg = lowerExpr(*call.args[0].value);
+    if (!arg) return false;
+    auto* argTy = ctx_.exprType(*call.args[0].value);
+    llvm::Value* strPtr = arg;
+    if (argTy) {
+        if (argTy->kind == sema::TypeRef::Kind::Primitive &&
+            argTy->primitive != sema::PrimitiveType::String) {
+            strPtr = emitPrimitiveToString(arg, argTy->primitive);
+        } else if (argTy->kind == sema::TypeRef::Kind::Named &&
+                   argTy->declaration) {
+            // Named type (class/record) — call ToString() via virtual
+            // dispatch if the type has a ToString method, else fall back
+            // to a type-name placeholder string.
+            auto* ts = argTy->declaration;
+            // Find a 'ToString()' method walking the inheritance chain.
+            // ToString() may be declared on a base class (e.g. Shape)
+            // and inherited by the concrete type (Circle).
+            sema::MethodSymbol* toStr = nullptr;
+            for (auto* cur = ts; cur && !toStr;) {
+                for (auto* sym : cur->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                    if (ms && ms->name == "ToString" && ms->params.empty()) {
+                        toStr = ms;
+                        break;
+                    }
+                }
+                // Walk to first base class.
+                sema::TypeSymbol* next = nullptr;
+                for (auto* b : cur->baseTypes)
+                    if (b && b->kind == ast::TypeDeclKind::Class) {
+                        next = b; break;
+                    }
+                cur = next;
+            }
+            if (toStr) {
+                // Emit the method call (virtual if overriding, static otherwise).
+                std::vector<llvm::Value*> args{arg};
+                strPtr = emitMethodCall(toStr, args, false);
+            } else {
+                // No ToString override — use type name as placeholder string.
+                strPtr = lowerStringLiteral(
+                    std::string("\"") + std::string(ts->name) + "\"",
+                    false);
+            }
+        }
+    }
+    if (!strPtr) return false;
+    emitConsoleWrite(strPtr, isWriteLine, stdfd);
+    return true;
+}
+
+
+int64_t Emitter::collectionElemSize(const sema::TypeRef* collTy) {
+    if (!collTy || collTy->genericArgs.empty() || !collTy->genericArgs[0])
+        return 8;
+    llvm::Type* et = lowerTypeRef(collTy->genericArgs[0]);
+    if (!et) return 8;
+    if (et->isIntegerTy(32) || et->isFloatTy()) return 4;
+    if (et->isIntegerTy(1) || et->isIntegerTy(8)) return 1;
+    if (et->isIntegerTy(16)) return 2;
+    return 8;  // ptr, i64, double
+}
+
+
+bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    auto n = rt->astNode->name->parts[0];
+    return n == "Array" || n == "OwnedArray" ||
+           n == "Stack" || n == "OwnedStack" ||
+           n == "Queue" || n == "OwnedQueue" ||
+           n == "Set" || n == "OwnedSet" ||
+           n == "LinkedList" || n == "OwnedLinkedList";
+}
+
+
+bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    auto n = rt->astNode->name->parts[0];
+    return n == "Dictionary" || n == "OwnedDictionary";
+}
+
+
+llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+
+    auto* recvTy = ctx_.exprType(*ma->target);
+    bool isArr  = isCollectionTypeName(recvTy);
+    bool isDict = isDictTypeName(recvTy);
+    // Check for StringBuilder
+    bool isStrBld = (recvTy && recvTy->astNode && recvTy->astNode->name &&
+                     !recvTy->astNode->name->parts.empty() &&
+                     recvTy->astNode->name->parts[0] == "StringBuilder");
+    if (!isArr && !isDict && !isStrBld) return nullptr;
+
+    llvm::Value* recv = lowerExpr(*ma->target);
+    if (!recv) return nullptr;
+
+    // -----------------------------------------------------------------------
+    // Array / Stack / Queue / Set / LinkedList methods
+    // -----------------------------------------------------------------------
+    if (isArr) {
+        int64_t esz = collectionElemSize(recvTy);
+
+        // per §5 LINQ: closure struct { ptr fn, ptr env }; call as fn(env, elem).
+        auto callClosure = [&](llvm::Value* closure,
+                               llvm::Value* elem,
+                               llvm::Type* retTy) -> llvm::Value* {
+            llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
+            llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure,
+                                                      {builder_.getInt32(1)});
+            llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+            auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy(), elem->getType()},
+                                                 false);
+            return builder_.CreateCall(fnTy, fnPtr, {envPtr, elem}, "cl.ret");
+        };
+
+        // Get element LLVM type from generic arg (default i32).
+        auto getElemTy = [&]() -> llvm::Type* {
+            if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                if (auto* et = lowerTypeRef(recvTy->genericArgs[0])) return et;
+            return i32();
+        };
+
+        // Lower the lambda argument with expectedFunctionType_ set so unannotated
+        // lambda params get the right LLVM type (e.g. string elem → ptr, not i32).
+        // retTypeRef: the TypeRef for the lambda's return type (bool/unit/etc).
+        auto lowerLinqLambda = [&](const ast::Expr* argExpr,
+                                   sema::TypeRef* retTypeRef) -> llvm::Value* {
+            sema::TypeRef* elemTypeRef = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            // Build a synthetic Function TypeRef: (elemType) -> retType.
+            auto* funcRef = ctx_.makeTypeRef();
+            funcRef->kind = sema::TypeRef::Kind::Function;
+            funcRef->funcReturn = retTypeRef;
+            if (elemTypeRef) {
+                sema::TypeRef::FuncParam fp;
+                fp.type = elemTypeRef;
+                funcRef->funcParams.push_back(std::move(fp));
+            }
+            const sema::TypeRef* savedExpected = expectedFunctionType_;
+            expectedFunctionType_ = funcRef;
+            llvm::Value* v = lowerExpr(*argExpr);
+            expectedFunctionType_ = savedExpected;
+            return v;
+        };
+
+        // per §5 LINQ: .Any(pred: (T)->bool): bool
+        if (m == "Any" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "any.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "any.b", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "any.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "any.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, endBB, nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "any.r");
+            phi->addIncoming(builder_.getFalse(), condBB);
+            phi->addIncoming(builder_.getTrue(), bodyBB);
+            return phi;
+        }
+
+        // per §5 LINQ: .All(pred: (T)->bool): bool
+        if (m == "All" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "all.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "all.b", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "all.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "all.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, nextBB, endBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "all.r");
+            phi->addIncoming(builder_.getTrue(), condBB);
+            phi->addIncoming(builder_.getFalse(), bodyBB);
+            return phi;
+        }
+
+        // per §5 LINQ: .ForEach(fn: (T)->())
+        if (m == "ForEach" && call.args.size() == 1 && call.args[0].value) {
+            auto* unitRef = ctx_.makeTypeRef();
+            unitRef->kind = sema::TypeRef::Kind::Unit;
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), unitRef);
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "fe.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "fe.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "fe.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            callClosure(closure, el, llvm::Type::getVoidTy(llvm_));
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+
+        // per §5 LINQ: .Count(pred: (T)->bool): int
+        if (m == "Count" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            auto* cntSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            builder_.CreateStore(builder_.getInt32(0), cntSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "cnt.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cnt.b", currentFn_);
+            auto* incrBB = llvm::BasicBlock::Create(llvm_, "cnt.i", currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "cnt.n", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "cnt.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, incrBB, nextBB);
+            builder_.SetInsertPoint(incrBB);
+            llvm::Value* c = builder_.CreateLoad(i32(), cntSlot);
+            builder_.CreateStore(builder_.CreateAdd(c, builder_.getInt32(1)), cntSlot);
+            builder_.CreateBr(nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return builder_.CreateLoad(i32(), cntSlot, "cnt.r");
+        }
+
+        // per §5 LINQ: .Select(fn: (T)->U): Array<U>
+        if (m == "Select" && call.args.size() == 1 && call.args[0].value) {
+            // Determine output element type from the lambda's return type.
+            sema::TypeRef* retSemaType = nullptr;
+            llvm::Type* retElemTy = i32();  // default
+            if (auto* lamTy = ctx_.exprType(*call.args[0].value)) {
+                if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                    retSemaType = lamTy->funcReturn;
+                    retElemTy = lowerTypeRef(retSemaType);
+                }
+            }
+            int64_t retEsz = 8;
+            if (retElemTy) {
+                if (retElemTy->isIntegerTy(32) || retElemTy->isFloatTy()) retEsz = 4;
+                else if (retElemTy->isIntegerTy(1) || retElemTy->isIntegerTy(8)) retEsz = 1;
+                else if (retElemTy->isIntegerTy(16)) retEsz = 2;
+                else retEsz = 8;
+            }
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* result = builder_.CreateCall(allocFn,
+                {builder_.getInt64(retEsz), builder_.getInt64(16)});
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "sel.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sel.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sel.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* mapped = callClosure(closure, el, retElemTy ? retElemTy
+                                                                      : i32());
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            auto* mapSlot = entryAlloca(mapped->getType());
+            builder_.CreateStore(mapped, mapSlot);
+            builder_.CreateCall(addFn, {result, mapSlot, builder_.getInt64(retEsz)});
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return result;
+        }
+
+        // per §5 LINQ: .Where(pred: (T)->bool): Array<T>
+        if (m == "Where" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* result = builder_.CreateCall(allocFn,
+                {builder_.getInt64(esz), builder_.getInt64(16)});
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "whr.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "whr.b", currentFn_);
+            auto* addBB  = llvm::BasicBlock::Create(llvm_, "whr.a", currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "whr.n", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "whr.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, addBB, nextBB);
+            builder_.SetInsertPoint(addBB);
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+            builder_.CreateBr(nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return result;
+        }
+
+        // .Length: int / .Count: int
+        if ((m == "Length" || m == "Count") && call.args.empty()) {
+            auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len64 = builder_.CreateCall(fn, {recv});
+            return builder_.CreateTrunc(len64, i32(), "arr.len");
+        }
+        // per §5 LINQ: .Sum(fn: (T)->int): int  /  .Sum(): int (for Array<int>)
+        if (m == "Sum") {
+            llvm::Type* elemTy = getElemTy();
+            sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+            llvm::Value* closure = call.args.empty() ? nullptr
+                : lowerLinqLambda(call.args[0].value.get(), retTyRef);
+            if (!call.args.empty() && !closure) return nullptr;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            auto* accSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            builder_.CreateStore(builder_.getInt32(0), accSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "sum.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sum.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sum.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* val = closure ? callClosure(closure, el, i32()) : el;
+            // Widen to i32 if needed
+            if (val->getType() != i32()) val = builder_.CreateTrunc(val, i32());
+            llvm::Value* acc = builder_.CreateLoad(i32(), accSlot);
+            builder_.CreateStore(builder_.CreateAdd(acc, val), accSlot);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return builder_.CreateLoad(i32(), accSlot, "sum.r");
+        }
+        // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
+        if ((m == "Min" || m == "Max") &&
+            (call.args.empty() || call.args.size() == 1)) {
+            bool isMax = (m == "Max");
+            llvm::Type* elemTy = getElemTy();
+            sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+            llvm::Value* closure = call.args.empty() ? nullptr
+                : lowerLinqLambda(call.args[0].value.get(), retTyRef);
+            if (!call.args.empty() && !closure) return nullptr;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot  = entryAlloca(i64());
+            auto* accSlot  = entryAlloca(i32());
+            auto* initSlot = entryAlloca(i1());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            builder_.CreateStore(builder_.getInt32(0), accSlot);
+            builder_.CreateStore(builder_.getFalse(), initSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "mm.c",  currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mm.b",  currentFn_);
+            auto* updBB  = llvm::BasicBlock::Create(llvm_, "mm.u",  currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "mm.n",  currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "mm.e",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* val = closure ? callClosure(closure, el, i32()) : el;
+            if (val->getType() != i32()) val = builder_.CreateTrunc(val, i32());
+            llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
+            llvm::Value* acc = builder_.CreateLoad(i32(), accSlot);
+            llvm::Value* cmp = isMax ? builder_.CreateICmpSGT(val, acc)
+                                     : builder_.CreateICmpSLT(val, acc);
+            builder_.CreateCondBr(builder_.CreateOr(builder_.CreateNot(inited), cmp),
+                                  updBB, nextBB);
+            builder_.SetInsertPoint(updBB);
+            builder_.CreateStore(val, accSlot);
+            builder_.CreateStore(builder_.getTrue(), initSlot);
+            builder_.CreateBr(nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return builder_.CreateLoad(i32(), accSlot, "mm.r");
+        }
+        // per §5 LINQ: .First(pred: (T)->bool): T  (throws if empty/not found)
+        if (m == "First" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* resultSlot = entryAlloca(elemTy);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "fst.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "fst.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "fst.f", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "fst.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "fst.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, foundBB, nextBB);
+            builder_.SetInsertPoint(foundBB);
+            builder_.CreateStore(el, resultSlot);
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return builder_.CreateLoad(elemTy, resultSlot, "fst.r");
+        }
+        // per §5 LINQ: .Skip(n: int): Array<T> — return elements from index n onward
+        if (m == "Skip" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* nV = lowerExpr(*call.args[0].value);
+            if (!nV) return nullptr;
+            llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
+                : builder_.CreateSExt(nV, i64(), "sk.n");
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            // startIdx = max(0, min(n, len))
+            llvm::Value* clampedN = builder_.CreateSelect(
+                builder_.CreateICmpSLT(n64, builder_.getInt64(0)), builder_.getInt64(0),
+                builder_.CreateSelect(builder_.CreateICmpSGT(n64, len), len, n64));
+            auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* result = builder_.CreateCall(allocFn2,
+                {builder_.getInt64(esz), builder_.getInt64(16)});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(clampedN, idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "sk.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sk.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sk.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return result;
+        }
+        // per §5 LINQ: .Take(n: int): Array<T> — return first n elements
+        if (m == "Take" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* nV = lowerExpr(*call.args[0].value);
+            if (!nV) return nullptr;
+            llvm::Value* n64 = nV->getType()->isIntegerTy(64) ? nV
+                : builder_.CreateSExt(nV, i64(), "tk.n");
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            llvm::Value* endIdx = builder_.CreateSelect(
+                builder_.CreateICmpSLT(n64, builder_.getInt64(0)), builder_.getInt64(0),
+                builder_.CreateSelect(builder_.CreateICmpSGT(n64, len), len, n64));
+            auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* result = builder_.CreateCall(allocFn2,
+                {builder_.getInt64(esz), builder_.getInt64(16)});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "tk.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "tk.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "tk.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, endIdx), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return result;
+        }
+        // per §3: .Sort() — in-place ascending sort for int arrays.
+        // Uses bz_array_sort with a built-in i32 comparator thunk.
+        if (m == "Sort" && call.args.empty()) {
+            // Choose comparator based on element type: int → bz$intcmp, string → bz$strcmp.
+            llvm::Type* elemTy2 = getElemTy();
+            bool isStringElem = elemTy2 == ptrTy();
+            llvm::Function* cmpFn = nullptr;
+            if (isStringElem) {
+                // String comparator: load two ptr elements, call strcmp on their data.
+                auto* cmpName2 = "bz$strcmp";
+                cmpFn = module_->getFunction(cmpName2);
+                if (!cmpFn) {
+                    auto* cmpTy2 = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    cmpFn = llvm::Function::Create(cmpTy2, llvm::Function::InternalLinkage,
+                                                    cmpName2, module_.get());
+                    auto* bb2 = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+                    llvm::IRBuilder<> cmpB2(bb2);
+                    // Each argument is a ptr* (pointer to bz.string*).
+                    // Load the bz.string* from each slot, then load data pointer.
+                    llvm::Value* aSlot = &*cmpFn->arg_begin();
+                    llvm::Value* bSlot = &*std::next(cmpFn->arg_begin());
+                    llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
+                    llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
+                    // Load data pointer (field 0) from bz.string struct
+                    llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
+                        cmpB2.CreateStructGEP(stringType(), aStr, 0));
+                    llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
+                        cmpB2.CreateStructGEP(stringType(), bStr, 0));
+                    // Call strcmp
+                    auto* strcmpFn2 = module_->getFunction("strcmp");
+                    if (!strcmpFn2) {
+                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                        strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
+                                                           "strcmp", module_.get());
+                    }
+                    cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                }
+            } else {
+                // Integer comparator
+                auto* cmpName = "bz$intcmp";
+                cmpFn = module_->getFunction(cmpName);
+                if (!cmpFn) {
+                    auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    cmpFn = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
+                                                   cmpName, module_.get());
+                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+                    llvm::IRBuilder<> cmpB(bb);
+                    llvm::Value* a = &*cmpFn->arg_begin();
+                    llvm::Value* b = &*std::next(cmpFn->arg_begin());
+                    llvm::Value* av = cmpB.CreateLoad(i32(), a);
+                    llvm::Value* bv = cmpB.CreateLoad(i32(), b);
+                    cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                }
+            }
+            auto* sortFn = declareC("bz_array_sort", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(sortFn, {recv, builder_.getInt64(esz), cmpFn});
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+        // per §3: .Reverse() — in-place reverse.
+        if (m == "Reverse" && call.args.empty()) {
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "rev.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rev.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "rev.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* i = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* half = builder_.CreateSDiv(len, builder_.getInt64(2));
+            builder_.CreateCondBr(builder_.CreateICmpSLT(i, half), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* j = builder_.CreateSub(builder_.CreateSub(len, i), builder_.getInt64(1));
+            llvm::Value* pa = builder_.CreateCall(ptrFn, {recv, i, builder_.getInt64(esz)});
+            llvm::Value* pb = builder_.CreateCall(ptrFn, {recv, j, builder_.getInt64(esz)});
+            // Swap: temp = *pa; *pa = *pb; *pb = temp
+            llvm::Value* ta = builder_.CreateLoad(elemTy, pa);
+            llvm::Value* tb = builder_.CreateLoad(elemTy, pb);
+            builder_.CreateStore(tb, pa);
+            builder_.CreateStore(ta, pb);
+            builder_.CreateStore(builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+        // per §5 LINQ: .OrderBy(key: (T)->int): Array<T> — stable sort by int key (asc).
+        // Implemented as selection sort on a copy using the key closure.
+        if ((m == "OrderBy" || m == "OrderByDescending") &&
+            call.args.size() == 1 && call.args[0].value) {
+            bool desc = (m == "OrderByDescending");
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            // Copy source into result array.
+            auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* result = builder_.CreateCall(allocFn2,
+                {builder_.getInt64(esz), len});
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            {
+                auto* idxS = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxS);
+                auto* cBB = llvm::BasicBlock::Create(llvm_, "ob.cc", currentFn_);
+                auto* bBB = llvm::BasicBlock::Create(llvm_, "ob.cb", currentFn_);
+                auto* eBB = llvm::BasicBlock::Create(llvm_, "ob.ce", currentFn_);
+                builder_.CreateBr(cBB);
+                builder_.SetInsertPoint(cBB);
+                llvm::Value* ci = builder_.CreateLoad(i64(), idxS);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(ci, len), bBB, eBB);
+                builder_.SetInsertPoint(bBB);
+                llvm::Value* ep2 = builder_.CreateCall(ptrFn, {recv, ci, builder_.getInt64(esz)});
+                builder_.CreateCall(addFn, {result, ep2, builder_.getInt64(esz)});
+                builder_.CreateStore(builder_.CreateAdd(ci, builder_.getInt64(1)), idxS);
+                builder_.CreateBr(cBB);
+                builder_.SetInsertPoint(eBB);
+            }
+            // Insertion sort on result using the key closure.
+            auto* iSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(1), iSlot);
+            auto* isortCond = llvm::BasicBlock::Create(llvm_, "ob.ic", currentFn_);
+            auto* isortBody = llvm::BasicBlock::Create(llvm_, "ob.ib", currentFn_);
+            auto* isortEnd  = llvm::BasicBlock::Create(llvm_, "ob.ie", currentFn_);
+            builder_.CreateBr(isortCond);
+            builder_.SetInsertPoint(isortCond);
+            llvm::Value* oi = builder_.CreateLoad(i64(), iSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(oi, len), isortBody, isortEnd);
+            builder_.SetInsertPoint(isortBody);
+            // key_i = closure(result[oi]); elem_i = result[oi]
+            llvm::Value* piPtr = builder_.CreateCall(ptrFn, {result, oi, builder_.getInt64(esz)});
+            llvm::Value* elem_i = builder_.CreateLoad(elemTy, piPtr);
+            llvm::Value* key_i  = callClosure(closure, elem_i, i32());
+            // Store key and elem temporaries
+            auto* keySlot = entryAlloca(i32());
+            auto* elemSlot = entryAlloca(elemTy);
+            builder_.CreateStore(key_i, keySlot);
+            builder_.CreateStore(elem_i, elemSlot);
+            // j = oi - 1; while j >= 0 && key(result[j]) > key_i: shift right
+            auto* jSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.CreateSub(oi, builder_.getInt64(1)), jSlot);
+            auto* wCond = llvm::BasicBlock::Create(llvm_, "ob.wc", currentFn_);
+            auto* wBody = llvm::BasicBlock::Create(llvm_, "ob.wb", currentFn_);
+            auto* wEnd  = llvm::BasicBlock::Create(llvm_, "ob.we", currentFn_);
+            auto* wKeyBB = llvm::BasicBlock::Create(llvm_, "ob.wk", currentFn_);
+            builder_.CreateBr(wCond);
+            builder_.SetInsertPoint(wCond);
+            llvm::Value* oj = builder_.CreateLoad(i64(), jSlot);
+            llvm::Value* jValid = builder_.CreateICmpSGE(oj, builder_.getInt64(0));
+            builder_.CreateCondBr(jValid, wKeyBB, wEnd);
+            builder_.SetInsertPoint(wKeyBB);
+            llvm::Value* pjPtr = builder_.CreateCall(ptrFn, {result, oj, builder_.getInt64(esz)});
+            llvm::Value* elem_j = builder_.CreateLoad(elemTy, pjPtr);
+            llvm::Value* key_j  = callClosure(closure, elem_j, i32());
+            llvm::Value* needShift = desc
+                ? builder_.CreateICmpSLT(key_j, builder_.CreateLoad(i32(), keySlot))
+                : builder_.CreateICmpSGT(key_j, builder_.CreateLoad(i32(), keySlot));
+            builder_.CreateCondBr(needShift, wBody, wEnd);
+            builder_.SetInsertPoint(wBody);
+            // result[j+1] = result[j]
+            llvm::Value* pj1Ptr = builder_.CreateCall(ptrFn, {result,
+                builder_.CreateAdd(oj, builder_.getInt64(1)), builder_.getInt64(esz)});
+            builder_.CreateStore(elem_j, pj1Ptr);
+            builder_.CreateStore(builder_.CreateSub(oj, builder_.getInt64(1)), jSlot);
+            builder_.CreateBr(wCond);
+            builder_.SetInsertPoint(wEnd);
+            // result[j+1] = elem_i
+            llvm::Value* ojEnd = builder_.CreateLoad(i64(), jSlot);
+            llvm::Value* pInsert = builder_.CreateCall(ptrFn, {result,
+                builder_.CreateAdd(ojEnd, builder_.getInt64(1)), builder_.getInt64(esz)});
+            builder_.CreateStore(builder_.CreateLoad(elemTy, elemSlot), pInsert);
+            builder_.CreateStore(builder_.CreateAdd(oi, builder_.getInt64(1)), iSlot);
+            builder_.CreateBr(isortCond);
+            builder_.SetInsertPoint(isortEnd);
+            return result;
+        }
+        // per §3: .IndexOf(item): int — index of first match, -1 if not found
+        if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* target = lowerExpr(*call.args[0].value);
+            if (!target) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "iof.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iof.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "iof.f", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "iof.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "iof.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* eq;
+            if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
+                eq = emitStringEq(el, target);
+            else {
+                llvm::Value* elN = el, *tN = target;
+                if (el->getType() != target->getType() &&
+                    el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
+                    unsigned ew = el->getType()->getIntegerBitWidth();
+                    unsigned tw = target->getType()->getIntegerBitWidth();
+                    llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
+                    elN = builder_.CreateSExt(el, wide);
+                    tN = builder_.CreateSExt(target, wide);
+                }
+                eq = builder_.CreateICmpEQ(elN, tN);
+            }
+            builder_.CreateCondBr(eq, foundBB, nextBB);
+            builder_.SetInsertPoint(foundBB);
+            llvm::Value* result64 = idx;
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phiIdx = builder_.CreatePHI(i64(), 2, "iof.r");
+            phiIdx->addIncoming(result64, foundBB);
+            phiIdx->addIncoming(builder_.getInt64(-1), condBB);
+            return builder_.CreateTrunc(phiIdx, i32(), "iof.i32");
+        }
+        // per §5 LINQ: .Distinct(): Array<T> — remove duplicates (order preserved)
+        if (m == "Distinct" && call.args.empty()) {
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* allocFn2 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* result = builder_.CreateCall(allocFn2,
+                {builder_.getInt64(esz), builder_.getInt64(16)});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "dst.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dst.b", currentFn_);
+            auto* addBB  = llvm::BasicBlock::Create(llvm_, "dst.a", currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "dst.n", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "dst.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            // Check if el already in result — use Contains logic inline
+            auto* resLenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* resLen = builder_.CreateCall(resLenFn, {result});
+            auto* idxSlot2 = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot2);
+            auto* chkCond = llvm::BasicBlock::Create(llvm_, "dst.cc", currentFn_);
+            auto* chkBody = llvm::BasicBlock::Create(llvm_, "dst.cb", currentFn_);
+            auto* chkEnd  = llvm::BasicBlock::Create(llvm_, "dst.ce", currentFn_);
+            builder_.CreateBr(chkCond);
+            builder_.SetInsertPoint(chkCond);
+            llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot2);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx2, resLen), chkBody, chkEnd);
+            builder_.SetInsertPoint(chkBody);
+            llvm::Value* ep2 = builder_.CreateCall(ptrFn, {result, idx2, builder_.getInt64(esz)});
+            llvm::Value* el2 = builder_.CreateLoad(elemTy, ep2);
+            llvm::Value* eq;
+            if (el->getType()->isPointerTy() && el2->getType()->isPointerTy())
+                eq = emitStringEq(el, el2);
+            else
+                eq = builder_.CreateICmpEQ(el, el2);
+            builder_.CreateCondBr(eq, chkEnd, [&]{ // found dup → exit check
+                builder_.CreateStore(builder_.CreateAdd(idx2, builder_.getInt64(1)), idxSlot2);
+                return chkCond;
+            }());
+            builder_.SetInsertPoint(chkEnd);
+            // If idx2 == resLen → not found → add; else → dup → skip
+            llvm::Value* idx2End = builder_.CreateLoad(i64(), idxSlot2);
+            llvm::Value* notDup = builder_.CreateICmpEQ(idx2End, resLen);
+            builder_.CreateCondBr(notDup, addBB, nextBB);
+            builder_.SetInsertPoint(addBB);
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(addFn, {result, ep, builder_.getInt64(esz)});
+            builder_.CreateBr(nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return result;
+        }
+        // .Add(v) / .Push(v) / .Enqueue(v)
+        if ((m == "Add" || m == "Push" || m == "Enqueue") &&
+            call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* v = lowerExpr(*call.args[0].value);
+            if (!v) return nullptr;
+            // Store elem to stack alloca, pass pointer to runtime
+            llvm::AllocaInst* slot = entryAlloca(v->getType());
+            builder_.CreateStore(v, slot);
+            auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)});
+            return llvm::ConstantInt::get(i32(), 0);  // unit/void result
+        }
+        // .Get(i): T / .Peek(): T (top/front element)
+        if ((m == "Get" || m == "Peek") &&
+            (call.args.size() == 1 || call.args.empty())) {
+            llvm::Value* idx = call.args.empty()
+                ? nullptr : lowerExpr(*call.args[0].value);
+            if (!call.args.empty() && !idx) return nullptr;
+            if (call.args.empty()) {
+                // Peek: last element (Stack) or first (Queue)
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                idx = builder_.CreateSub(len, builder_.getInt64(1));
+            } else {
+                idx = builder_.CreateSExt(idx, i64());
+            }
+            // Determine return type from generic arg
+            llvm::Type* retTy = i32();
+            if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                retTy = lowerTypeRef(recvTy->genericArgs[0]);
+            llvm::AllocaInst* out = entryAlloca(retTy);
+            auto* fn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, idx, out, builder_.getInt64(esz)});
+            return builder_.CreateLoad(retTy, out, "arr.elem");
+        }
+        // .Set(i, v)
+        if (m == "Set" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* idx = lowerExpr(*call.args[0].value);
+            llvm::Value* v   = lowerExpr(*call.args[1].value);
+            if (!idx || !v) return nullptr;
+            idx = builder_.CreateSExt(idx, i64());
+            llvm::AllocaInst* slot = entryAlloca(v->getType());
+            builder_.CreateStore(v, slot);
+            auto* fn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz)});
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+        // .RemoveAt(i) / .Pop(): T / .Dequeue(): T
+        if (m == "RemoveAt" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* idx = lowerExpr(*call.args[0].value);
+            if (!idx) return nullptr;
+            idx = builder_.CreateSExt(idx, i64());
+            auto* fn = declareC("bz_array_remove_at", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), i64(), i64()});
+            builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz)});
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+        if ((m == "Pop" || m == "Dequeue") && call.args.empty()) {
+            // Get last (Pop) or first (Dequeue) element, then remove it
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            llvm::Value* idx = m == "Pop"
+                ? builder_.CreateSub(len, builder_.getInt64(1))
+                : builder_.getInt64(0);
+            llvm::Type* retTy = i32();
+            if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                retTy = lowerTypeRef(recvTy->genericArgs[0]);
+            llvm::AllocaInst* out = entryAlloca(retTy);
+            auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
+            auto* remFn = declareC("bz_array_remove_at", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), i64()});
+            builder_.CreateCall(remFn, {recv, idx, builder_.getInt64(esz)});
+            return builder_.CreateLoad(retTy, out, "arr.pop");
+        }
+        // .Clear()
+        if (m == "Clear" && call.args.empty()) {
+            auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy()});
+            builder_.CreateCall(fn, {recv});
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+        // .IsEmpty(): bool
+        if (m == "IsEmpty" && call.args.empty()) {
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            return builder_.CreateICmpEQ(len, builder_.getInt64(0), "arr.empty");
+        }
+        // per §3: .AddRange(other: Array<T>) — append all elements from another array
+        if (m == "AddRange" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* other = lowerExpr(*call.args[0].value);
+            if (!other) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* otherLen = builder_.CreateCall(lenFn, {other});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "ar.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ar.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ar.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, otherLen), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {other, idx, builder_.getInt64(esz)});
+            auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(addFn, {recv, ep, builder_.getInt64(esz)});
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+        // per §3: .Contains(item: T): bool (for int/value types only)
+        if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* target = lowerExpr(*call.args[0].value);
+            if (!target) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "con.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "con.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "con.f", currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "con.n", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "con.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            // Compare: for integers use icmp eq; for pointers use string eq
+            llvm::Value* eq;
+            if (el->getType()->isPointerTy() && target->getType()->isPointerTy()) {
+                eq = emitStringEq(el, target);  // string comparison
+            } else {
+                llvm::Value* elNorm = el, *tNorm = target;
+                if (el->getType() != target->getType()) {
+                    if (el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
+                        unsigned ew = el->getType()->getIntegerBitWidth();
+                        unsigned tw = target->getType()->getIntegerBitWidth();
+                        llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
+                        elNorm = builder_.CreateSExt(el, wide);
+                        tNorm = builder_.CreateSExt(target, wide);
+                    }
+                }
+                eq = builder_.CreateICmpEQ(elNorm, tNorm);
+            }
+            builder_.CreateCondBr(eq, foundBB, nextBB);
+            builder_.SetInsertPoint(foundBB);
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phiCon = builder_.CreatePHI(i1(), 2, "con.r");
+            phiCon->addIncoming(builder_.getTrue(), foundBB);
+            phiCon->addIncoming(builder_.getFalse(), condBB);
+            return phiCon;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dictionary<string, V> methods (string-key variant)
+    // -----------------------------------------------------------------------
+    if (isDict) {
+        // Helper: extract string data/len from bz.string ptr
+        auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
+            llvm::Value* data = loadStringData(s);
+            llvm::Value* len  = loadStringLen(s);
+            return {data, len};
+        };
+
+        // .Count: int
+        if (m == "Count" && call.args.empty()) {
+            auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
+            llvm::Value* c = builder_.CreateCall(fn, {recv});
+            return builder_.CreateTrunc(c, i32());
+        }
+        // .ContainsKey(k): bool
+        if (m == "ContainsKey" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            if (!k) return nullptr;
+            auto [kd, kl] = strDataLen(k);
+            auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
+            return builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
+        }
+        // .Add(k, v) / .Set(k, v)
+        if ((m == "Add" || m == "Set") && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            llvm::Value* v = lowerExpr(*call.args[1].value);
+            if (!k || !v) return nullptr;
+            auto [kd, kl] = strDataLen(k);
+            // Encode value as void* for storage. For pointer types: store
+            // directly. For integer/float types: widen to i64 and use
+            // inttoptr so each stored value is self-contained (avoids
+            // aliasing from a shared stack alloca across loop iterations).
+            llvm::Value* vPtr = v;
+            if (!v->getType()->isPointerTy()) {
+                llvm::Value* asI64 = v;
+                if (v->getType()->isFloatingPointTy()) {
+                    // Bitcast float/double to same-size int
+                    if (v->getType()->isDoubleTy())
+                        asI64 = builder_.CreateBitCast(v, i64());
+                    else
+                        asI64 = builder_.CreateZExt(
+                            builder_.CreateBitCast(v, i32()), i64());
+                } else if (!v->getType()->isIntegerTy(64)) {
+                    asI64 = builder_.CreateZExt(v, i64());
+                }
+                vPtr = builder_.CreateIntToPtr(asI64, ptrTy());
+            }
+            auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+        // .Remove(k): bool
+        if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            if (!k) return nullptr;
+            auto [kd, kl] = strDataLen(k);
+            auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
+            return builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
+        }
+        // .TryGetValue(k, out v): bool
+        // (Note: the out-var slot is pre-created by ensureOutVarSlots)
+        if (m == "TryGetValue" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            if (!k) return nullptr;
+            auto [kd, kl] = strDataLen(k);
+            // Get the address of the out parameter
+            llvm::Type* outTy = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
+            if (!outAddr) return nullptr;
+            // bz_dict_try_get_str writes the stored void* into *tmpSlot.
+            // For pointer values: the void* IS the string/object pointer.
+            // For integer/float values: the void* encodes the value via
+            // inttoptr (mirroring the Add encoding above). Decode via ptrtoint.
+            auto* tmpSlot = entryAlloca(ptrTy());
+            auto* fn = declareC("bz_dict_try_get_str", i1(),
+                                {ptrTy(), ptrTy(), i64(), ptrTy()});
+            llvm::Value* found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+            llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
+            if (outTy && !outTy->isPointerTy()) {
+                // Decode: ptrtoint → truncate/bitcast to target type
+                llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
+                llvm::Value* decoded = asI64;
+                if (outTy->isFloatingPointTy()) {
+                    if (outTy->isDoubleTy())
+                        decoded = builder_.CreateBitCast(asI64, outTy);
+                    else {
+                        llvm::Value* trunc = builder_.CreateTrunc(asI64, i32());
+                        decoded = builder_.CreateBitCast(trunc, outTy);
+                    }
+                } else if (!outTy->isIntegerTy(64)) {
+                    decoded = builder_.CreateTrunc(asI64, outTy);
+                }
+                builder_.CreateStore(decoded, outAddr);
+            } else {
+                builder_.CreateStore(valPtr, outAddr);
+            }
+            return found;
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // StringBuilder — bz_array_t of string pointers (parts list).
+    // Append adds a string part; ToString concatenates all parts.
+    // ---------------------------------------------------------------------------
+    if (isStrBld) {
+        constexpr int64_t SB_ESZ = 8;  // pointer-sized elements (string ptrs)
+
+        // Helper: coerce value to string
+        auto toStr = [&](llvm::Value* v, const ast::Expr* expr) -> llvm::Value* {
+            if (!v) return nullptr;
+            auto* rt = expr ? ctx_.exprType(*expr) : nullptr;
+            if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                rt->primitive != sema::PrimitiveType::String)
+                return emitPrimitiveToString(v, rt->primitive);
+            if (v->getType()->isPointerTy()) return v;
+            // Fallback: format as integer
+            llvm::Value* iv = v->getType()->isIntegerTy(64)
+                ? v : builder_.CreateSExt(v, i64());
+            return emitPrimitiveToString(iv, sema::PrimitiveType::Long);
+        };
+
+        if ((m == "Append" || m == "AppendLine") && !call.args.empty()) {
+            llvm::Value* s = nullptr;
+            if (call.args[0].value) {
+                s = toStr(lowerExpr(*call.args[0].value), call.args[0].value.get());
+            }
+            if (s) {
+                llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                builder_.CreateStore(s, slot);
+                auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(fn, {recv, slot, builder_.getInt64(SB_ESZ)});
+            }
+            if (m == "AppendLine") {
+                llvm::Value* nl = lowerStringLiteral("\"\n\"", false);
+                llvm::AllocaInst* nlSlot = entryAlloca(ptrTy());
+                builder_.CreateStore(nl, nlSlot);
+                auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(fn, {recv, nlSlot, builder_.getInt64(SB_ESZ)});
+            }
+            return recv;  // allow chaining
+        }
+        if (m == "AppendLine" && call.args.empty()) {
+            llvm::Value* nl = lowerStringLiteral("\"\n\"", false);
+            llvm::AllocaInst* nlSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(nl, nlSlot);
+            auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, nlSlot, builder_.getInt64(SB_ESZ)});
+            return recv;
+        }
+        if (m == "Clear" && call.args.empty()) {
+            auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {recv});
+            return recv;
+        }
+        if (m == "Length" || m == "Count") {
+            // Sum of lengths of all string parts
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* nParts = builder_.CreateCall(lenFn, {recv});
+            auto* sumSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), sumSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "sb.len.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sb.len.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sb.len.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, nParts), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* ep = builder_.CreateCall(ptrAtFn, {recv, idx2, builder_.getInt64(SB_ESZ)});
+            llvm::Value* part = builder_.CreateLoad(ptrTy(), ep);
+            llvm::Value* plen = loadStringLen(part);
+            llvm::Value* curSum = builder_.CreateLoad(i64(), sumSlot);
+            builder_.CreateStore(builder_.CreateAdd(curSum, plen), sumSlot);
+            builder_.CreateStore(builder_.CreateAdd(idx2, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            llvm::Value* total = builder_.CreateLoad(i64(), sumSlot);
+            return builder_.CreateTrunc(total, i32());
+        }
+        if (m == "ToString" && call.args.empty()) {
+            // Use the runtime helper to concatenate all string parts.
+            auto* outDataSlot = entryAlloca(ptrTy());
+            auto* outLenSlot  = entryAlloca(i64());
+            auto* fn = declareC("bz_strbuilder_to_string",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, outDataSlot, outLenSlot});
+            llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
+            llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
+            // Build a bz.string object from the malloc'd buffer.
+            auto* sobj = builder_.CreateCall(
+                callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+            builder_.CreateStore(data,
+                builder_.CreateStructGEP(stringType(), sobj, 0));
+            builder_.CreateStore(len,
+                builder_.CreateStructGEP(stringType(), sobj, 1));
+            builder_.CreateStore(builder_.getInt8(1),
+                builder_.CreateStructGEP(stringType(), sobj, 2));
+            return sobj;
+        }
+    }
+
+    return nullptr;  // not a collection call
+}
+
+
+llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id) return nullptr;
+    const auto cls = id->name;
+    const auto& m = ma->member;
+
+    // §2.3 Environment class methods.
+    if (cls == "Environment") {
+        // Environment.Exit(code: int) — terminate the process.
+        if (m == "Exit" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* code = lowerExpr(*call.args[0].value);
+            if (!code) return nullptr;
+            // Declare exit(3): void exit(int)
+            auto* exitFn = module_->getFunction("exit");
+            if (!exitFn) {
+                auto* ft = llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {i32()}, false);
+                exitFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "exit", module_.get());
+                exitFn->addFnAttr(llvm::Attribute::NoReturn);
+            }
+            // Truncate to i32 if needed.
+            if (!code->getType()->isIntegerTy(32))
+                code = builder_.CreateTrunc(code, i32());
+            builder_.CreateCall(exitFn, {code});
+            // Create an unreachable block after the noreturn call.
+            builder_.CreateUnreachable();
+            auto* deadBB = llvm::BasicBlock::Create(llvm_, "exit.dead", currentFn_);
+            builder_.SetInsertPoint(deadBB);
+            return llvm::ConstantInt::get(i32(), 0);  // nominal value, never reached
+        }
+        // Environment.GetEnvironmentVariable(name): string? — getenv
+        if (m == "GetEnvironmentVariable" && call.args.size() == 1 &&
+            call.args[0].value) {
+            llvm::Value* nameStr = lowerExpr(*call.args[0].value);
+            if (!nameStr) return nullptr;
+            llvm::Value* nameData = loadStringData(nameStr);
+            auto* getenvFn = module_->getFunction("getenv");
+            if (!getenvFn) {
+                auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+                getenvFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "getenv", module_.get());
+            }
+            llvm::Value* rawPtr = builder_.CreateCall(getenvFn, {nameData}, "getenv.ret");
+            // null → return null (string?). Non-null: wrap in bz_string.
+            auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+            llvm::Value* isNull = builder_.CreateICmpEQ(rawPtr, nullPtr);
+            auto* nullBB = llvm::BasicBlock::Create(llvm_, "env.null", currentFn_);
+            auto* okBB   = llvm::BasicBlock::Create(llvm_, "env.ok",   currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "env.end",  currentFn_);
+            auto* entBB  = builder_.GetInsertBlock();
+            builder_.CreateCondBr(isNull, endBB, okBB);
+            builder_.SetInsertPoint(okBB);
+            // strlen of the result.
+            auto* strlenFn = module_->getFunction("strlen");
+            if (!strlenFn) {
+                auto* ft2 = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                strlenFn = llvm::Function::Create(ft2, llvm::Function::ExternalLinkage, "strlen", module_.get());
+            }
+            llvm::Value* rawLen = builder_.CreateCall(strlenFn, {rawPtr});
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* dataSz = builder_.CreateAdd(rawLen, builder_.getInt64(1));
+            llvm::Value* dataCopy = builder_.CreateCall(mallocFn, {dataSz});
+            builder_.CreateCall(memcpyFn, {dataCopy, rawPtr, rawLen});
+            llvm::Value* end = builder_.CreateGEP(i8Ty, dataCopy, rawLen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), end);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)});
+            builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
+            builder_.CreateStore(rawLen, builder_.CreateStructGEP(stringType(), strObj, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                builder_.CreateStructGEP(stringType(), strObj, 2));
+            auto* okEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(ptrTy(), 2, "env.result");
+            phi->addIncoming(nullPtr, entBB);
+            phi->addIncoming(strObj, okEnd);
+            return phi;
+        }
+    }
+
+    if (cls == "Convert") {
+        if (call.args.size() == 1 && call.args[0].value) {
+            // Convert.ToInt32(s: string): int — atoi / strtol
+            if (m == "ToInt32") {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                auto* argTy = ctx_.exprType(*call.args[0].value);
+                // If it's already an int, return as-is.
+                if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+                    argTy->primitive == sema::PrimitiveType::Int)
+                    return arg;
+                // For string: call atoi(data_ptr)
+                llvm::Value* strPtr = arg;
+                llvm::Value* data = loadStringData(strPtr);
+                auto* atoiFn = module_->getFunction("atoi");
+                if (!atoiFn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+                    atoiFn = llvm::Function::Create(
+                        ft, llvm::Function::ExternalLinkage, "atoi", module_.get());
+                }
+                return builder_.CreateCall(atoiFn, {data}, "atoi.ret");
+            }
+            // Convert.ToInt64(s: string): long — atoll
+            if (m == "ToInt64") {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                llvm::Value* data = loadStringData(arg);
+                auto* atolFn = module_->getFunction("atoll");
+                if (!atolFn) {
+                    auto* ft = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                    atolFn = llvm::Function::Create(
+                        ft, llvm::Function::ExternalLinkage, "atoll", module_.get());
+                }
+                return builder_.CreateCall(atolFn, {data}, "atoll.ret");
+            }
+            // Convert.ToDouble(s: string): double — atof
+            if (m == "ToDouble") {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                llvm::Value* data = loadStringData(arg);
+                auto* atofFn = module_->getFunction("atof");
+                if (!atofFn) {
+                    auto* ft = llvm::FunctionType::get(
+                        llvm::Type::getDoubleTy(llvm_), {ptrTy()}, false);
+                    atofFn = llvm::Function::Create(
+                        ft, llvm::Function::ExternalLinkage, "atof", module_.get());
+                }
+                return builder_.CreateCall(atofFn, {data}, "atof.ret");
+            }
+            // Convert.ToBoolean(s: string): bool — "true"/"1" → true
+            if (m == "ToBoolean") {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                llvm::Value* data = loadStringData(arg);
+                auto* strcmpFn = module_->getFunction("strcasecmp");
+                if (!strcmpFn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    strcmpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "strcasecmp", module_.get());
+                }
+                llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
+                unsigned tid = stringLiteralIdx_++;
+                auto* trueGV = new llvm::GlobalVariable(*module_, trueStr->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, trueStr, ".bz.bool.true." + std::to_string(tid));
+                llvm::Value* cmpTrue = builder_.CreateICmpEQ(
+                    builder_.CreateCall(strcmpFn, {data, trueGV}), builder_.getInt32(0));
+                llvm::Constant* oneStr = llvm::ConstantDataArray::getString(llvm_, "1", true);
+                auto* oneGV = new llvm::GlobalVariable(*module_, oneStr->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, oneStr, ".bz.bool.one." + std::to_string(tid));
+                llvm::Value* cmpOne = builder_.CreateICmpEQ(
+                    builder_.CreateCall(strcmpFn, {data, oneGV}), builder_.getInt32(0));
+                return builder_.CreateOr(cmpTrue, cmpOne, "tobool");
+            }
+            // Convert.ToString(n: int): string — alias for n.ToString()
+            if (m == "ToString") {
+                llvm::Value* arg = lowerExpr(*call.args[0].value);
+                if (!arg) return nullptr;
+                auto* argTy = ctx_.exprType(*call.args[0].value);
+                if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive)
+                    return emitPrimitiveToString(arg, argTy->primitive);
+            }
+        }
+        // Convert.ToString(n, radix: int): string — radix-based conversion.
+        if (m == "ToString" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            llvm::Value* radix = lowerExpr(*call.args[1].value);
+            if (!arg || !radix) return nullptr;
+            // Widen to i32.
+            if (!arg->getType()->isIntegerTy(32))
+                arg = builder_.CreateSExt(arg, i32());
+            // Select format based on radix (constant check).
+            const char* fmt = "%d";
+            if (auto* cr = llvm::dyn_cast<llvm::ConstantInt>(radix)) {
+                uint64_t r = cr->getZExtValue();
+                if (r == 16) fmt = "%x";
+                else if (r == 8) fmt = "%o";
+                else if (r == 2) fmt = nullptr;  // handle below
+            }
+            if (fmt) {
+                // Use snprintf with the chosen format.
+                llvm::Constant* fmtData = llvm::ConstantDataArray::getString(llvm_, fmt, true);
+                unsigned fid = stringLiteralIdx_++;
+                auto* fmtGV = new llvm::GlobalVariable(*module_, fmtData->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, fmtData, ".bz.rfmt." + std::to_string(fid));
+                fmtGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                auto* snpFn = module_->getFunction("snprintf");
+                if (!snpFn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), i64(), ptrTy()}, true);
+                    snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
+                }
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, 64));
+                llvm::Value* bufPtr = builder_.CreateGEP(llvm::ArrayType::get(i8Ty, 64), buf, {builder_.getInt64(0), builder_.getInt64(0)});
+                llvm::Value* written = builder_.CreateCall(snpFn, {bufPtr, builder_.getInt64(64), fmtGV, arg}, "snp.ret");
+                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+                llvm::Value* len64 = builder_.CreateSExt(written, i64());
+                llvm::Value* dataSz = builder_.CreateAdd(len64, builder_.getInt64(1));
+                llvm::Value* dataCopy = builder_.CreateCall(mallocFn, {dataSz}, "rd.data");
+                builder_.CreateCall(memcpyFn, {dataCopy, bufPtr, len64});
+                llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCopy, len64);
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+                uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+                llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rd.obj");
+                builder_.CreateStore(dataCopy, builder_.CreateStructGEP(stringType(), strObj, 0));
+                builder_.CreateStore(len64, builder_.CreateStructGEP(stringType(), strObj, 1));
+                builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
+                    builder_.CreateStructGEP(stringType(), strObj, 2));
+                return strObj;
+            }
+            // Binary (radix=2): emit a runtime bit-scan loop.
+            // Builds digits MSB-first into a 33-byte stack buffer.
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* buf2 = entryAlloca(llvm::ArrayType::get(i8Ty, 33));
+            llvm::Value* b2Ptr = builder_.CreateGEP(
+                llvm::ArrayType::get(i8Ty, 33), buf2,
+                {builder_.getInt64(0), builder_.getInt64(0)});
+            // For n=0: just write "0"
+            llvm::Value* isZero = builder_.CreateICmpEQ(arg, builder_.getInt32(0));
+            auto* zeroBB = llvm::BasicBlock::Create(llvm_, "bn.zero", currentFn_);
+            auto* nonBB  = llvm::BasicBlock::Create(llvm_, "bn.nonz", currentFn_);
+            auto* binBB  = llvm::BasicBlock::Create(llvm_, "bn.end",  currentFn_);
+            auto* entBN  = builder_.GetInsertBlock();
+            builder_.CreateCondBr(isZero, zeroBB, nonBB);
+            // Zero: write "0\0"
+            builder_.SetInsertPoint(zeroBB);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, '0'), b2Ptr);
+            llvm::Value* z1 = builder_.CreateGEP(i8Ty, b2Ptr, builder_.getInt64(1));
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), z1);
+            llvm::Value* zlen = builder_.getInt64(1);
+            auto* zeroBBEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(binBB);
+            // Non-zero: find highest set bit, then emit each bit MSB-first.
+            builder_.SetInsertPoint(nonBB);
+            auto* posS = entryAlloca(i32());
+            auto* lenS = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt32(0), lenS);
+            // Find bit width: highest set bit position.
+            // Use while loop: find highest bit.
+            auto* tmp = entryAlloca(i32());
+            builder_.CreateStore(arg, tmp);
+            auto* bitPos = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(31), bitPos);
+            // Scan from MSB to find the first 1 bit.
+            auto* fhBB = llvm::BasicBlock::Create(llvm_, "bn.fh", currentFn_);
+            auto* fhBodyBB = llvm::BasicBlock::Create(llvm_, "bn.fhb", currentFn_);
+            auto* fhEndBB  = llvm::BasicBlock::Create(llvm_, "bn.fhe", currentFn_);
+            builder_.CreateBr(fhBB);
+            builder_.SetInsertPoint(fhBB);
+            llvm::Value* bp = builder_.CreateLoad(i32(), bitPos);
+            llvm::Value* bv = builder_.CreateLoad(i32(), tmp);
+            llvm::Value* bit = builder_.CreateLShr(bv, bp);
+            llvm::Value* isOne = builder_.CreateICmpEQ(
+                builder_.CreateAnd(bit, builder_.getInt32(1)), builder_.getInt32(1));
+            llvm::Value* bpGe0 = builder_.CreateICmpSGT(bp, builder_.getInt32(0));
+            builder_.CreateCondBr(builder_.CreateAnd(bpGe0, builder_.CreateNot(isOne)),
+                fhBodyBB, fhEndBB);
+            builder_.SetInsertPoint(fhBodyBB);
+            builder_.CreateStore(builder_.CreateSub(bp, builder_.getInt32(1)), bitPos);
+            builder_.CreateBr(fhBB);
+            builder_.SetInsertPoint(fhEndBB);
+            // Now emit bits from bitPos down to 0.
+            auto* emBP = entryAlloca(i32());
+            auto* emLen = entryAlloca(i64());
+            llvm::Value* startBP = builder_.CreateLoad(i32(), bitPos);
+            builder_.CreateStore(startBP, emBP);
+            builder_.CreateStore(builder_.getInt64(0), emLen);
+            auto* emCBB = llvm::BasicBlock::Create(llvm_, "bn.ec", currentFn_);
+            auto* emBBB = llvm::BasicBlock::Create(llvm_, "bn.eb", currentFn_);
+            auto* emEBB = llvm::BasicBlock::Create(llvm_, "bn.ee", currentFn_);
+            builder_.CreateBr(emCBB);
+            builder_.SetInsertPoint(emCBB);
+            llvm::Value* ep = builder_.CreateLoad(i32(), emBP);
+            builder_.CreateCondBr(builder_.CreateICmpSGE(ep, builder_.getInt32(0)), emBBB, emEBB);
+            builder_.SetInsertPoint(emBBB);
+            llvm::Value* epB = builder_.CreateLoad(i32(), emBP);
+            llvm::Value* lenV = builder_.CreateLoad(i64(), emLen);
+            llvm::Value* bArg = builder_.CreateLoad(i32(), tmp);
+            llvm::Value* d = builder_.CreateAnd(builder_.CreateLShr(bArg, epB), builder_.getInt32(1));
+            llvm::Value* ch = builder_.CreateAdd(builder_.CreateTrunc(d, i8Ty),
+                llvm::ConstantInt::get(i8Ty, '0'));
+            llvm::Value* dp = builder_.CreateGEP(i8Ty, b2Ptr, lenV);
+            builder_.CreateStore(ch, dp);
+            builder_.CreateStore(builder_.CreateAdd(lenV, builder_.getInt64(1)), emLen);
+            builder_.CreateStore(builder_.CreateSub(epB, builder_.getInt32(1)), emBP);
+            builder_.CreateBr(emCBB);
+            builder_.SetInsertPoint(emEBB);
+            llvm::Value* nlen = builder_.CreateLoad(i64(), emLen);
+            // Null-terminate.
+            llvm::Value* np2 = builder_.CreateGEP(i8Ty, b2Ptr, nlen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np2);
+            auto* nonBBEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(binBB);
+            // Merge and create bz_string.
+            builder_.SetInsertPoint(binBB);
+            auto* phiLen = builder_.CreatePHI(i64(), 2, "bn.len");
+            phiLen->addIncoming(zlen, zeroBBEnd);
+            phiLen->addIncoming(nlen, nonBBEnd);
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            llvm::Value* dataSz2 = builder_.CreateAdd(phiLen, builder_.getInt64(1));
+            llvm::Value* dataCopy2 = builder_.CreateCall(mallocFn, {dataSz2}, "bn.data");
+            builder_.CreateCall(memcpyFn, {dataCopy2, b2Ptr, phiLen});
+            llvm::Value* nulPtr2 = builder_.CreateGEP(i8Ty, dataCopy2, phiLen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr2);
+            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* strObj2 = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "bn.obj");
+            builder_.CreateStore(dataCopy2, builder_.CreateStructGEP(stringType(), strObj2, 0));
+            builder_.CreateStore(phiLen, builder_.CreateStructGEP(stringType(), strObj2, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                builder_.CreateStructGEP(stringType(), strObj2, 2));
+            return strObj2;
+        }
+    }
+
+    // §9.6: string.Join(separator, items: Array<string>): string
+    if ((cls == "string" || cls == "String") && m == "Join" &&
+        call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+        llvm::Value* sep = lowerExpr(*call.args[0].value);
+        llvm::Value* arr = lowerExpr(*call.args[1].value);
+        if (!sep || !arr) return nullptr;
+        // Emit inline join: iterate parts, concat sep+part (skip sep before first)
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        llvm::Value* len = builder_.CreateCall(lenFn, {arr});
+        // Compute total output length
+        auto* totSlot = entryAlloca(i64());
+        auto* idxSlot = entryAlloca(i64());
+        builder_.CreateStore(builder_.getInt64(0), totSlot);
+        builder_.CreateStore(builder_.getInt64(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "jn.lc", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "jn.lb", currentFn_);
+        auto* doneL  = llvm::BasicBlock::Create(llvm_, "jn.ld", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, doneL);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* ep = builder_.CreateCall(ptrFn, {arr, idx, builder_.getInt64(8)});
+        llvm::Value* elem = builder_.CreateLoad(ptrTy(), ep);
+        llvm::Value* elen = loadStringLen(elem);
+        llvm::Value* tot = builder_.CreateLoad(i64(), totSlot);
+        // Add sep length for all except first element
+        llvm::Value* notFirst = builder_.CreateICmpSGT(idx, builder_.getInt64(0));
+        llvm::Value* sepLen = loadStringLen(sep);
+        llvm::Value* addSep = builder_.CreateSelect(notFirst, sepLen, builder_.getInt64(0));
+        builder_.CreateStore(builder_.CreateAdd(tot, builder_.CreateAdd(elen, addSep)), totSlot);
+        builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(doneL);
+        // Allocate output buffer and fill
+        llvm::Value* total = builder_.CreateLoad(i64(), totSlot);
+        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+        llvm::Value* outBuf = builder_.CreateCall(mallocFn, {
+            builder_.CreateAdd(total, builder_.getInt64(1))});
+        auto* offSlot = entryAlloca(i64());
+        auto* idx2Slot = entryAlloca(i64());
+        builder_.CreateStore(builder_.getInt64(0), offSlot);
+        builder_.CreateStore(builder_.getInt64(0), idx2Slot);
+        auto* condBB2 = llvm::BasicBlock::Create(llvm_, "jn.wc", currentFn_);
+        auto* bodyBB2 = llvm::BasicBlock::Create(llvm_, "jn.wb", currentFn_);
+        auto* doneL2  = llvm::BasicBlock::Create(llvm_, "jn.wd", currentFn_);
+        builder_.CreateBr(condBB2);
+        builder_.SetInsertPoint(condBB2);
+        llvm::Value* idx2 = builder_.CreateLoad(i64(), idx2Slot);
+        builder_.CreateCondBr(builder_.CreateICmpSLT(idx2, len), bodyBB2, doneL2);
+        builder_.SetInsertPoint(bodyBB2);
+        llvm::Value* off = builder_.CreateLoad(i64(), offSlot);
+        // Copy separator if not first
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* notFirst2 = builder_.CreateICmpSGT(idx2, builder_.getInt64(0));
+        auto* sepCopyBB = llvm::BasicBlock::Create(llvm_, "jn.sc", currentFn_);
+        auto* partBB = llvm::BasicBlock::Create(llvm_, "jn.pc", currentFn_);
+        builder_.CreateCondBr(notFirst2, sepCopyBB, partBB);
+        builder_.SetInsertPoint(sepCopyBB);
+        llvm::Value* sepData = loadStringData(sep);
+        llvm::Value* sepLen2 = loadStringLen(sep);
+        llvm::Value* dstSep = builder_.CreateGEP(i8Ty, outBuf, off);
+        builder_.CreateCall(memcpyFn, {dstSep, sepData, sepLen2});
+        llvm::Value* off2 = builder_.CreateAdd(off, sepLen2);
+        builder_.CreateBr(partBB);
+        builder_.SetInsertPoint(partBB);
+        auto* phi = builder_.CreatePHI(i64(), 2);
+        phi->addIncoming(off, bodyBB2);   // no-sep path (false branch from bodyBB2)
+        phi->addIncoming(off2, sepCopyBB); // sep-copied path
+        // Actually need the right predecessor — rebuild using simpler pattern
+        // Copy element
+        llvm::Value* ep2 = builder_.CreateCall(ptrFn, {arr, idx2, builder_.getInt64(8)});
+        llvm::Value* elem2 = builder_.CreateLoad(ptrTy(), ep2);
+        llvm::Value* edata = loadStringData(elem2);
+        llvm::Value* elen2 = loadStringLen(elem2);
+        llvm::Value* dstElem = builder_.CreateGEP(i8Ty, outBuf, phi);
+        builder_.CreateCall(memcpyFn, {dstElem, edata, elen2});
+        llvm::Value* newOff = builder_.CreateAdd(phi, elen2);
+        builder_.CreateStore(newOff, offSlot);
+        builder_.CreateStore(builder_.CreateAdd(idx2, builder_.getInt64(1)), idx2Slot);
+        builder_.CreateBr(condBB2);
+        builder_.SetInsertPoint(doneL2);
+        // NUL terminate
+        llvm::Value* finalOff = builder_.CreateLoad(i64(), offSlot);
+        llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, outBuf, finalOff);
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+        // Wrap in bz.string
+        auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+        uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
+        llvm::Value* strObj = builder_.CreateCall(callocFn2,
+            {builder_.getInt64(1), builder_.getInt64(strSz)});
+        builder_.CreateStore(outBuf, builder_.CreateStructGEP(stringType(), strObj, 0));
+        builder_.CreateStore(total, builder_.CreateStructGEP(stringType(), strObj, 1));
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+            builder_.CreateStructGEP(stringType(), strObj, 2));
+        return strObj;
+    }
+
+    if (cls == "Math") {
+        if (call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            if (m == "Abs") {
+                if (arg->getType()->isFloatingPointTy()) {
+                    // Abs for float/double — use fabs intrinsic.
+                    auto* fabsFn = llvm::Intrinsic::getOrInsertDeclaration(
+                        module_.get(), llvm::Intrinsic::fabs,
+                        {arg->getType()});
+                    return builder_.CreateCall(fabsFn, {arg}, "abs.result");
+                }
+                // Abs for int — select(n<0, -n, n)
+                llvm::Value* neg = builder_.CreateNeg(arg, "abs.neg");
+                llvm::Value* isNeg = builder_.CreateICmpSLT(
+                    arg, llvm::ConstantInt::get(arg->getType(), 0));
+                return builder_.CreateSelect(isNeg, neg, arg, "abs.result");
+            }
+            if (m == "Sign") {
+                // Sign: -1 if n<0, 0 if n==0, 1 if n>0.
+                auto* zero = llvm::ConstantInt::get(arg->getType(), 0);
+                llvm::Value* isNeg = builder_.CreateICmpSLT(arg, zero, "sgn.neg");
+                llvm::Value* isPos = builder_.CreateICmpSGT(arg, zero, "sgn.pos");
+                llvm::Value* one = llvm::ConstantInt::get(arg->getType(), 1);
+                llvm::Value* negOne = llvm::ConstantInt::getSigned(arg->getType(), -1);
+                llvm::Value* s1 = builder_.CreateSelect(isPos, one, zero, "sgn.1");
+                return builder_.CreateSelect(isNeg, negOne, s1, "sgn.result");
+            }
+            // Math.IsNaN(x): bool — NaN is not equal to itself.
+            if (m == "IsNaN") {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!arg->getType()->isDoubleTy())
+                    arg = builder_.CreateSIToFP(arg, dbl);
+                return builder_.CreateFCmpUNO(arg, arg, "isnan");
+            }
+            // Math.IsInfinity(x): bool — compare with +/-infinity.
+            if (m == "IsInfinity") {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!arg->getType()->isDoubleTy())
+                    arg = builder_.CreateSIToFP(arg, dbl);
+                auto* posInf = llvm::ConstantFP::getInfinity(dbl, false);
+                auto* negInf = llvm::ConstantFP::getInfinity(dbl, true);
+                llvm::Value* isPosInf = builder_.CreateFCmpOEQ(arg, posInf);
+                llvm::Value* isNegInf = builder_.CreateFCmpOEQ(arg, negInf);
+                return builder_.CreateOr(isPosInf, isNegInf, "isinf");
+            }
+            // Math.IsFinite(x): bool — not NaN and not infinity.
+            if (m == "IsFinite") {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!arg->getType()->isDoubleTy())
+                    arg = builder_.CreateSIToFP(arg, dbl);
+                llvm::Value* isNaN = builder_.CreateFCmpUNO(arg, arg);
+                auto* posInf = llvm::ConstantFP::getInfinity(dbl, false);
+                auto* negInf = llvm::ConstantFP::getInfinity(dbl, true);
+                llvm::Value* isInf = builder_.CreateOr(
+                    builder_.CreateFCmpOEQ(arg, posInf),
+                    builder_.CreateFCmpOEQ(arg, negInf));
+                return builder_.CreateNot(builder_.CreateOr(isNaN, isInf), "isfinite");
+            }
+            if (m == "Cbrt") {
+                // Math.Cbrt(x): double — cube root via libc cbrt().
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!arg->getType()->isDoubleTy())
+                    arg = builder_.CreateSIToFP(arg, dbl);
+                auto* cbrtFn = module_->getFunction("cbrt");
+                if (!cbrtFn) {
+                    auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
+                    cbrtFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "cbrt", module_.get());
+                }
+                return builder_.CreateCall(cbrtFn, {arg}, "cbrt.result");
+            }
+            if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round" || m == "Truncate") {
+                // Use llvm intrinsics for common math ops.
+                llvm::Intrinsic::ID iid =
+                    m == "Sqrt"     ? llvm::Intrinsic::sqrt :
+                    m == "Floor"    ? llvm::Intrinsic::floor :
+                    m == "Ceiling"  ? llvm::Intrinsic::ceil :
+                    m == "Truncate" ? llvm::Intrinsic::trunc :
+                                      llvm::Intrinsic::round;
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!arg->getType()->isDoubleTy())
+                    arg = builder_.CreateSIToFP(arg, dbl);
+                auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), iid, {dbl});
+                return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
+            }
+        }
+        if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            llvm::Value* a = lowerExpr(*call.args[0].value);
+            llvm::Value* b = lowerExpr(*call.args[1].value);
+            if (!a || !b) return nullptr;
+            if (m == "Min") {
+                // Handle int or double operands.
+                if (a->getType()->isIntegerTy()) {
+                    llvm::Value* cmp = builder_.CreateICmpSLT(a, b);
+                    return builder_.CreateSelect(cmp, a, b, "min.result");
+                } else {
+                    // float/double: use llvm.minnum intrinsic
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                    if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                    auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::minnum, {dbl});
+                    return builder_.CreateCall(fn, {a, b}, "fmin.result");
+                }
+            }
+            if (m == "Max") {
+                if (a->getType()->isIntegerTy()) {
+                    llvm::Value* cmp = builder_.CreateICmpSGT(a, b);
+                    return builder_.CreateSelect(cmp, a, b, "max.result");
+                } else {
+                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                    if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                    if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                    auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::maxnum, {dbl});
+                    return builder_.CreateCall(fn, {a, b}, "fmax.result");
+                }
+            }
+            // Math.Pow(b, e): double — libc pow()
+            if (m == "Pow") {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                auto* powFn = module_->getFunction("pow");
+                if (!powFn) {
+                    auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
+                    powFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "pow", module_.get());
+                }
+                return builder_.CreateCall(powFn, {a, b}, "pow.result");
+            }
+        }
+        // Math.PI, Math.E — named constants.
+        if (call.args.empty()) {
+            auto* dbl = llvm::Type::getDoubleTy(llvm_);
+            if (m == "PI") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
+            if (m == "E")  return llvm::ConstantFP::get(dbl, 2.71828182845904523536);
+        }
+        // Math.Log(x), Math.Log2(x), Math.Log10(x)
+        // Math.Clamp(value, min, max): clamp value to [min, max].
+        if (m == "Clamp" && call.args.size() == 3 &&
+            call.args[0].value && call.args[1].value && call.args[2].value) {
+            llvm::Value* val = lowerExpr(*call.args[0].value);
+            llvm::Value* lo  = lowerExpr(*call.args[1].value);
+            llvm::Value* hi  = lowerExpr(*call.args[2].value);
+            if (!val || !lo || !hi) return nullptr;
+            if (val->getType()->isIntegerTy()) {
+                llvm::Value* clamped = builder_.CreateSelect(
+                    builder_.CreateICmpSLT(val, lo), lo, val);
+                return builder_.CreateSelect(
+                    builder_.CreateICmpSGT(clamped, hi), hi, clamped, "clamp.result");
+            } else {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!val->getType()->isDoubleTy()) val = builder_.CreateSIToFP(val, dbl);
+                if (!lo->getType()->isDoubleTy())  lo  = builder_.CreateSIToFP(lo, dbl);
+                if (!hi->getType()->isDoubleTy())  hi  = builder_.CreateSIToFP(hi, dbl);
+                llvm::Value* clamped = builder_.CreateSelect(
+                    builder_.CreateFCmpOLT(val, lo), lo, val);
+                return builder_.CreateSelect(
+                    builder_.CreateFCmpOGT(clamped, hi), hi, clamped, "clamp.f.result");
+            }
+        }
+        if (call.args.size() == 1 && call.args[0].value && (m == "Log" || m == "Log2" || m == "Log10")) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            auto* dbl = llvm::Type::getDoubleTy(llvm_);
+            if (!arg->getType()->isDoubleTy()) arg = builder_.CreateSIToFP(arg, dbl);
+            const char* cname = m == "Log2" ? "log2" : m == "Log10" ? "log10" : "log";
+            auto* logFn = module_->getFunction(cname);
+            if (!logFn) {
+                auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
+                logFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, cname, module_.get());
+            }
+            return builder_.CreateCall(logFn, {arg}, std::string(m) + ".result");
+        }
+        // §6.1/§6.3: Trig functions — 1-arg via libc.
+        if (call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            auto* dbl = llvm::Type::getDoubleTy(llvm_);
+            if (!arg->getType()->isDoubleTy()) arg = builder_.CreateSIToFP(arg, dbl);
+            const char* fn1 = m == "Sin" ? "sin" : m == "Cos" ? "cos" :
+                m == "Tan" ? "tan" : m == "Asin" ? "asin" : m == "Acos" ? "acos" :
+                m == "Atan" ? "atan" : m == "Exp" ? "exp" :
+                m == "Sinh" ? "sinh" : m == "Cosh" ? "cosh" : m == "Tanh" ? "tanh" : nullptr;
+            if (fn1) {
+                auto* fn = module_->getFunction(fn1);
+                if (!fn) {
+                    auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
+                    fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fn1, module_.get());
+                }
+                return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
+            }
+        }
+        // §6.1: Math.Fmod, IEEERemainder, Atan2, Hypot — 2-arg via libc.
+        if (call.args.size() == 2 && call.args[0].value && call.args[1].value &&
+            (m == "Fmod" || m == "IEEERemainder" || m == "Atan2" || m == "Hypot")) {
+            llvm::Value* a = lowerExpr(*call.args[0].value);
+            llvm::Value* b = lowerExpr(*call.args[1].value);
+            if (!a || !b) return nullptr;
+            auto* dbl = llvm::Type::getDoubleTy(llvm_);
+            if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+            if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+            const char* fn2 = m == "Fmod" ? "fmod" : m == "IEEERemainder" ? "remainder" :
+                               m == "Atan2" ? "atan2" : "hypot";
+            auto* fn = module_->getFunction(fn2);
+            if (!fn) {
+                auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
+                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fn2, module_.get());
+            }
+            return builder_.CreateCall(fn, {a, b}, std::string(m) + ".result");
+        }
+    }
+
+    // §2.x: Random class — pseudorandom numbers via libc rand()/srand().
+    if (cls == "Random") {
+        auto* randFn = module_->getFunction("rand");
+        if (!randFn) {
+            auto* ft = llvm::FunctionType::get(i32(), {}, false);
+            randFn = llvm::Function::Create(
+                ft, llvm::Function::ExternalLinkage, "rand", module_.get());
+        }
+        // Helper: make non-negative.
+        auto absRand = [&](llvm::Value* v) -> llvm::Value* {
+            llvm::Value* isNeg = builder_.CreateICmpSLT(
+                v, llvm::ConstantInt::get(i32(), 0));
+            return builder_.CreateSelect(isNeg, builder_.CreateNeg(v), v);
+        };
+        if (m == "Next" && call.args.empty())
+            return builder_.CreateCall(randFn, {}, "rand.ret");
+        if (m == "Next" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* maxV = lowerExpr(*call.args[0].value);
+            if (!maxV) return nullptr;
+            return builder_.CreateSRem(
+                absRand(builder_.CreateCall(randFn, {}, "rand.r")),
+                maxV, "rand.mod");
+        }
+        if (m == "Next" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* minV = lowerExpr(*call.args[0].value);
+            llvm::Value* maxV = lowerExpr(*call.args[1].value);
+            if (!minV || !maxV) return nullptr;
+            llvm::Value* range = builder_.CreateSub(maxV, minV);
+            return builder_.CreateAdd(
+                builder_.CreateSRem(
+                    absRand(builder_.CreateCall(randFn, {}, "rand.r")),
+                    range),
+                minV, "rand.result");
+        }
+        if (m == "NextDouble" && call.args.empty()) {
+            auto* dbl = llvm::Type::getDoubleTy(llvm_);
+            llvm::Value* r = absRand(builder_.CreateCall(randFn, {}, "rand.r"));
+            return builder_.CreateFDiv(
+                builder_.CreateSIToFP(r, dbl),
+                llvm::ConstantFP::get(dbl, 2147483648.0), "rand.dbl");
+        }
+        if (m == "Seed" && call.args.size() == 1 && call.args[0].value) {
+            auto* srandFn = module_->getFunction("srand");
+            if (!srandFn) {
+                auto* ft = llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {i32()}, false);
+                srandFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "srand", module_.get());
+            }
+            llvm::Value* seed = lowerExpr(*call.args[0].value);
+            if (!seed) return nullptr;
+            if (!seed->getType()->isIntegerTy(32))
+                seed = builder_.CreateTrunc(seed, i32());
+            builder_.CreateCall(srandFn, {seed});
+            return nullptr;  // unit
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // §2.5 DateTime — static members and methods via bz_datetime_* runtime.
+    // ---------------------------------------------------------------------------
+    if (cls == "DateTime") {
+        if (m == "Now" && call.args.empty()) {
+            auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
+            return builder_.CreateCall(fn, {}, "dt.now");
+        }
+        if (m == "UtcNow" && call.args.empty()) {
+            auto* fn = declareC("bz_datetime_utcnow_ticks", i64(), {});
+            return builder_.CreateCall(fn, {}, "dt.utcnow");
+        }
+        // DateTime.FromTicks(ticks: long): long (identity)
+        if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
+            return lowerExpr(*call.args[0].value);
+        }
+    }
+    if (cls == "TimeSpan") {
+        // TimeSpan.FromSeconds(n): long  (n * 10_000_000L)
+        if (m == "FromSeconds" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* v = lowerExpr(*call.args[0].value);
+            if (!v) return nullptr;
+            if (!v->getType()->isIntegerTy(64)) v = builder_.CreateSExt(v, i64());
+            return builder_.CreateMul(v, builder_.getInt64(10000000LL), "ts.sec");
+        }
+        if (m == "FromMilliseconds" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* v = lowerExpr(*call.args[0].value);
+            if (!v) return nullptr;
+            if (!v->getType()->isIntegerTy(64)) v = builder_.CreateSExt(v, i64());
+            return builder_.CreateMul(v, builder_.getInt64(10000LL), "ts.ms");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // §7 System.IO — File, Directory, Path static methods via bz_* runtime.
+    // ---------------------------------------------------------------------------
+    auto loadBzString = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
+        return {loadStringData(s), loadStringLen(s)};
+    };
+    auto strToPath = [&](llvm::Value* s) -> llvm::Value* {
+        // Convert bz.string to C NUL-terminated string via snprintf
+        llvm::Value* data = loadStringData(s);
+        llvm::Value* len64 = loadStringLen(s);
+        // Create a temp buffer of len+1 bytes
+        llvm::Value* bufLen = builder_.CreateAdd(len64, builder_.getInt64(1));
+        auto* fn = declareC("malloc", ptrTy(), {i64()});
+        llvm::Value* buf = builder_.CreateCall(fn, {bufLen});
+        auto* mcpFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+        builder_.CreateCall(mcpFn, {buf, data, len64});
+        // NUL-terminate
+        llvm::Value* nul = builder_.CreateGEP(
+            llvm::Type::getInt8Ty(llvm_), buf, len64);
+        builder_.CreateStore(builder_.getInt8(0), nul);
+        return buf;
+    };
+    auto ptrToStr = [&](llvm::Value* ptr, llvm::Value* lenVal) -> llvm::Value* {
+        // Build a bz.string from a malloc'd C string (ptr, len, width=1).
+        auto* sobj = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+        builder_.CreateStore(ptr,
+            builder_.CreateStructGEP(stringType(), sobj, 0));
+        builder_.CreateStore(lenVal,
+            builder_.CreateStructGEP(stringType(), sobj, 1));
+        builder_.CreateStore(builder_.getInt8(1),
+            builder_.CreateStructGEP(stringType(), sobj, 2));
+        return sobj;
+    };
+
+    if (cls == "File") {
+        if (m == "Exists" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            llvm::Value* path = strToPath(s);
+            auto* fn = declareC("bz_file_exists", i1(), {ptrTy()});
+            return builder_.CreateCall(fn, {path});
+        }
+        if (m == "Delete" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            auto* fn = declareC("bz_file_delete", i1(), {ptrTy()});
+            return builder_.CreateCall(fn, {strToPath(s)});
+        }
+        if (m == "ReadAllText" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            auto* outSlot = entryAlloca(ptrTy());
+            auto* lenSlot = entryAlloca(i64());
+            auto* fn = declareC("bz_file_read_all_text", i32(),
+                                {ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {strToPath(s), outSlot, lenSlot});
+            llvm::Value* ptr = builder_.CreateLoad(ptrTy(), outSlot);
+            llvm::Value* len = builder_.CreateLoad(i64(), lenSlot);
+            return ptrToStr(ptr, len);
+        }
+        if (m == "ReadAllLines" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            auto* fn = declareC("bz_file_read_all_lines", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(fn, {strToPath(s)}, "lines.arr");
+        }
+        if (m == "WriteAllText" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* path = lowerExpr(*call.args[0].value);
+            llvm::Value* text = lowerExpr(*call.args[1].value);
+            if (!path || !text) return nullptr;
+            auto [td, tl] = loadBzString(text);
+            auto* fn = declareC("bz_file_write_all_text", i32(),
+                                {ptrTy(), ptrTy(), i64()});
+            return builder_.CreateCall(fn, {strToPath(path), td, tl});
+        }
+        if (m == "AppendAllText" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* path = lowerExpr(*call.args[0].value);
+            llvm::Value* text = lowerExpr(*call.args[1].value);
+            if (!path || !text) return nullptr;
+            auto [td, tl] = loadBzString(text);
+            auto* fn = declareC("bz_file_append_all_text", i32(),
+                                {ptrTy(), ptrTy(), i64()});
+            return builder_.CreateCall(fn, {strToPath(path), td, tl});
+        }
+    }
+    if (cls == "Directory") {
+        if (m == "Exists" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            auto* fn = declareC("bz_dir_exists", i1(), {ptrTy()});
+            return builder_.CreateCall(fn, {strToPath(s)});
+        }
+        if (m == "CreateDirectory" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            auto* fn = declareC("bz_dir_create", i32(), {ptrTy()});
+            return builder_.CreateCall(fn, {strToPath(s)});
+        }
+        if (m == "Delete" && call.args.size() >= 1 && call.args[0].value) {
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            // Second arg: recursive (bool), default false
+            llvm::Value* recursive = builder_.getFalse();
+            if (call.args.size() >= 2 && call.args[1].value) {
+                llvm::Value* r = lowerExpr(*call.args[1].value);
+                if (r) recursive = r;
+            }
+            auto* fn = declareC("bz_dir_delete", i32(), {ptrTy(), i1()});
+            return builder_.CreateCall(fn, {strToPath(s), recursive});
+        }
+    }
+    // §7: Directory.GetFiles / GetDirectories — return Array<string>
+    // bz_dir_get_files returns char** with count via int64_t*.
+    // We convert to a bz_array_t of bz.string objects.
+    if (cls == "Directory") {
+        auto makeFilesList = [&](const char* fnName) -> llvm::Value* {
+            if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            auto* cntSlotG = entryAlloca(i64());
+            auto* getFilesFn = declareC(fnName, ptrTy(), {ptrTy(), ptrTy()});
+            // Returns char** (array of NUL-terminated paths)
+            llvm::Value* rawArr = builder_.CreateCall(getFilesFn,
+                {strToPath(s), cntSlotG});
+            llvm::Value* cnt = builder_.CreateLoad(i64(), cntSlotG);
+            auto* allocFn3 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* result = builder_.CreateCall(allocFn3,
+                {builder_.getInt64(8), cnt});
+            auto* addFn3 = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), i64()});
+            auto* strlenFn3 = declareC("strlen", i64(), {ptrTy()});
+            auto* mallocFn3 = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn3 = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            auto* callocFn4 = declareC("calloc", ptrTy(), {i64(), i64()});
+            auto* i8Ty3 = llvm::Type::getInt8Ty(llvm_);
+            uint64_t strSz3 = module_->getDataLayout().getTypeAllocSize(stringType());
+            auto* idxSlotG = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlotG);
+            auto* cG = llvm::BasicBlock::Create(llvm_, "gf.c", currentFn_);
+            auto* bG = llvm::BasicBlock::Create(llvm_, "gf.b", currentFn_);
+            auto* eG = llvm::BasicBlock::Create(llvm_, "gf.e", currentFn_);
+            builder_.CreateBr(cG);
+            builder_.SetInsertPoint(cG);
+            llvm::Value* iG = builder_.CreateLoad(i64(), idxSlotG);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(iG, cnt), bG, eG);
+            builder_.SetInsertPoint(bG);
+            llvm::Value* pG = builder_.CreateGEP(ptrTy(), rawArr, iG);
+            llvm::Value* cstrG = builder_.CreateLoad(ptrTy(), pG);
+            llvm::Value* lenG = builder_.CreateCall(strlenFn3, {cstrG});
+            llvm::Value* dataSzG = builder_.CreateAdd(lenG, builder_.getInt64(1));
+            llvm::Value* dataCpG = builder_.CreateCall(mallocFn3, {dataSzG});
+            builder_.CreateCall(memcpyFn3, {dataCpG, cstrG, lenG});
+            llvm::Value* nulPtrG = builder_.CreateGEP(i8Ty3, dataCpG, lenG);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty3, 0), nulPtrG);
+            llvm::Value* strObjG = builder_.CreateCall(callocFn4,
+                {builder_.getInt64(1), builder_.getInt64(strSz3)});
+            builder_.CreateStore(dataCpG, builder_.CreateStructGEP(stringType(), strObjG, 0));
+            builder_.CreateStore(lenG, builder_.CreateStructGEP(stringType(), strObjG, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty3, 1),
+                builder_.CreateStructGEP(stringType(), strObjG, 2));
+            auto* slotG = entryAlloca(ptrTy());
+            builder_.CreateStore(strObjG, slotG);
+            builder_.CreateCall(addFn3, {result, slotG, builder_.getInt64(8)});
+            builder_.CreateStore(builder_.CreateAdd(iG, builder_.getInt64(1)), idxSlotG);
+            builder_.CreateBr(cG);
+            builder_.SetInsertPoint(eG);
+            return result;
+        };
+        if (m == "GetFiles") return makeFilesList("bz_dir_get_files");
+        if (m == "GetDirectories") return makeFilesList("bz_dir_get_dirs");
+    }
+    if (cls == "Path") {
+        auto make1arg = [&](const char* fnName) -> llvm::Value* {
+            if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+            llvm::Value* s = lowerExpr(*call.args[0].value);
+            if (!s) return nullptr;
+            llvm::Value* p = strToPath(s);
+            auto* fn = declareC(fnName, ptrTy(), {ptrTy()});
+            llvm::Value* result = builder_.CreateCall(fn, {p});
+            // result is a malloc'd C string; compute its length via strlen
+            auto* strl = declareC("strlen", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(strl, {result});
+            return ptrToStr(result, len);
+        };
+        if (m == "GetFileName") return make1arg("bz_path_filename");
+        if (m == "GetExtension") return make1arg("bz_path_extension");
+        if (m == "GetFileNameWithoutExtension") return make1arg("bz_path_stem");
+        if (m == "GetDirectoryName") return make1arg("bz_path_dirname");
+        if (m == "GetFullPath") return make1arg("bz_path_absolute");
+        if (m == "Combine" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* a = lowerExpr(*call.args[0].value);
+            llvm::Value* b = lowerExpr(*call.args[1].value);
+            if (!a || !b) return nullptr;
+            auto* fn = declareC("bz_path_combine", ptrTy(), {ptrTy(), ptrTy()});
+            llvm::Value* result = builder_.CreateCall(fn, {strToPath(a), strToPath(b)});
+            auto* strl = declareC("strlen", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(strl, {result});
+            return ptrToStr(result, len);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // §2.6 Random — instance methods via bz_random_* runtime.
+    // (Static Random.Next etc. are handled via the bare class above.)
+    // ---------------------------------------------------------------------------
+    // Random instance methods: `rng.Next(...)` where rng is a variable.
+    // The `id` check above resolved `cls = "rng"` (the variable name), not
+    // a class name. Instead check the receiver's sema type.
+    {  // always enter this block (was wrongly guarded by `!id`)
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    !recvTy->declaration && recvTy->astNode &&
+                    recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
+                    recvTy->astNode->name->parts[0] == "Random") {
+                    llvm::Value* rng = lowerExpr(*ma2->target);
+                    if (!rng) return nullptr;
+                    const auto& mname = ma2->member;
+                    if (mname == "Next" && call.args.empty()) {
+                        auto* fn = declareC("bz_random_next_int", i32(),
+                                            {ptrTy(), i32(), i32()});
+                        return builder_.CreateCall(fn,
+                            {rng, builder_.getInt32(0),
+                             builder_.getInt32(2147483647)});
+                    }
+                    if (mname == "Next" && call.args.size() == 1 && call.args[0].value) {
+                        llvm::Value* hi = lowerExpr(*call.args[0].value);
+                        auto* fn = declareC("bz_random_next_int", i32(),
+                                            {ptrTy(), i32(), i32()});
+                        return builder_.CreateCall(fn,
+                            {rng, builder_.getInt32(0), hi});
+                    }
+                    if (mname == "Next" && call.args.size() == 2 &&
+                        call.args[0].value && call.args[1].value) {
+                        llvm::Value* lo = lowerExpr(*call.args[0].value);
+                        llvm::Value* hi = lowerExpr(*call.args[1].value);
+                        auto* fn = declareC("bz_random_next_int", i32(),
+                                            {ptrTy(), i32(), i32()});
+                        return builder_.CreateCall(fn, {rng, lo, hi});
+                    }
+                    if (mname == "NextDouble" && call.args.empty()) {
+                        auto* fn = declareC("bz_random_next_double",
+                                            llvm::Type::getDoubleTy(llvm_), {ptrTy()});
+                        return builder_.CreateCall(fn, {rng});
+                    }
+                }
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+
+llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id) return nullptr;
+    sema::PrimitiveType pt = sema::primitiveFromName(id->name);
+    if (pt == sema::PrimitiveType::None) return nullptr;
+    const auto& m = ma->member;
+    using P = sema::PrimitiveType;
+
+    // §5: char static classification methods — char.IsDigit(c), etc.
+    if (pt == P::Char && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* arg = lowerExpr(*call.args[0].value);
+        if (!arg) return nullptr;
+        // Widen to i32 for libc functions if needed.
+        if (!arg->getType()->isIntegerTy(32))
+            arg = builder_.CreateSExt(arg, i32());
+        // Map Bezel method names to libc functions.
+        const char* fnName = nullptr;
+        if (m == "IsDigit") fnName = "isdigit";
+        else if (m == "IsLetter") fnName = "isalpha";
+        else if (m == "IsLetterOrDigit") fnName = "isalnum";
+        else if (m == "IsWhiteSpace") fnName = "isspace";
+        else if (m == "IsUpper") fnName = "isupper";
+        else if (m == "IsLower") fnName = "islower";
+        else if (m == "IsPunctuation") fnName = "ispunct";
+        if (fnName) {
+            auto* fn = module_->getFunction(fnName);
+            if (!fn) {
+                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fnName, module_.get());
+            }
+            llvm::Value* res = builder_.CreateCall(fn, {arg}, std::string(fnName) + ".res");
+            return builder_.CreateICmpNE(res, builder_.getInt32(0), std::string(fnName) + ".bool");
+        }
+        if (m == "ToUpper") {
+            auto* fn = module_->getFunction("toupper");
+            if (!fn) {
+                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "toupper", module_.get());
+            }
+            return builder_.CreateCall(fn, {arg}, "toupper.result");
+        }
+        if (m == "ToLower") {
+            auto* fn = module_->getFunction("tolower");
+            if (!fn) {
+                auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+                fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "tolower", module_.get());
+            }
+            return builder_.CreateCall(fn, {arg}, "tolower.result");
+        }
+        // char.ToString(c): string — convert char code point to string.
+        // Uses the same path as c.ToString() for a char value.
+        if (m == "ToString") {
+            return emitPrimitiveToString(arg, sema::PrimitiveType::Char);
+        }
+    }
+
+    // string.From(char): string — one-character string from a char code point.
+    // string.From(c) is equivalent to char.ToString(c).
+    if (pt == P::String && m == "From" &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* arg = lowerExpr(*call.args[0].value);
+        if (!arg) return nullptr;
+        // Normalize to i32 if needed.
+        if (!arg->getType()->isIntegerTy(32))
+            arg = builder_.CreateSExt(arg, i32());
+        return emitPrimitiveToString(arg, P::Char);
+    }
+
+    // string.IsNullOrEmpty(s): bool — true if s is null or length 0.
+    if (pt == P::String && m == "IsNullOrEmpty" &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* arg = lowerExpr(*call.args[0].value);
+        if (!arg) return nullptr;
+        // null → true
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            arg, llvm::ConstantPointerNull::get(ptrTy()), "ine.null");
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "ine.null", currentFn_);
+        auto* checkBB= llvm::BasicBlock::Create(llvm_, "ine.check", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "ine.end",   currentFn_);
+        auto* entBB  = builder_.GetInsertBlock();
+        builder_.CreateCondBr(isNull, endBB, checkBB);
+        builder_.SetInsertPoint(checkBB);
+        llvm::Value* len = loadStringLen(arg);
+        llvm::Value* empty = builder_.CreateICmpEQ(len, builder_.getInt64(0), "ine.empty");
+        auto* chkEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "ine.result");
+        phi->addIncoming(builder_.getTrue(), entBB);
+        phi->addIncoming(empty, chkEnd);
+        return phi;
+    }
+    // string.IsNullOrWhiteSpace(s): bool — null, empty, or all whitespace.
+    if (pt == P::String && m == "IsNullOrWhiteSpace" &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* arg = lowerExpr(*call.args[0].value);
+        if (!arg) return nullptr;
+        auto* isspaceFn = module_->getFunction("isspace");
+        if (!isspaceFn) {
+            auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
+            isspaceFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "isspace", module_.get());
+        }
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            arg, llvm::ConstantPointerNull::get(ptrTy()), "inws.null");
+        auto* entBB = builder_.GetInsertBlock();
+        auto* chkBB = llvm::BasicBlock::Create(llvm_, "inws.chk", currentFn_);
+        auto* loopBB = llvm::BasicBlock::Create(llvm_, "inws.loop", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "inws.body", currentFn_);
+        auto* nonwsBB = llvm::BasicBlock::Create(llvm_, "inws.nonws", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "inws.end",  currentFn_);
+        builder_.CreateCondBr(isNull, endBB, chkBB);
+        builder_.SetInsertPoint(chkBB);
+        llvm::Value* len = loadStringLen(arg);
+        llvm::Value* data = loadStringData(arg);
+        auto* idxS = entryAlloca(i64());
+        builder_.CreateStore(builder_.getInt64(0), idxS);
+        builder_.CreateBr(loopBB);
+        builder_.SetInsertPoint(loopBB);
+        llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
+        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        // For now: only check width=1 chars (ASCII whitespace check).
+        llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
+        llvm::Value* cp = loadCodePoint(arg, idxB);
+        llvm::Value* isSp = builder_.CreateCall(isspaceFn, {cp});
+        llvm::Value* isSpBool = builder_.CreateICmpNE(isSp, builder_.getInt32(0));
+        auto* incBB = llvm::BasicBlock::Create(llvm_, "inws.inc", currentFn_);
+        builder_.CreateCondBr(isSpBool, incBB, nonwsBB);
+        builder_.SetInsertPoint(incBB);
+        builder_.CreateStore(builder_.CreateAdd(idxB, builder_.getInt64(1)), idxS);
+        builder_.CreateBr(loopBB);
+        builder_.SetInsertPoint(nonwsBB);
+        builder_.CreateBr(endBB);
+        auto* nonwsEnd = builder_.GetInsertBlock();
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "inws.result");
+        phi->addIncoming(builder_.getTrue(), entBB);   // null → true
+        phi->addIncoming(builder_.getTrue(), loopBB);  // all whitespace → true
+        phi->addIncoming(builder_.getFalse(), nonwsEnd);// found non-WS → false
+        return phi;
+    }
+    // string.Empty → empty string literal.
+    if (pt == P::String && m == "Empty" && call.args.empty()) {
+        return lowerStringLiteral("\"\"", false);
+    }
+    // §9.6: string.Compare(a, b): int — ordinal comparison; returns
+    // negative/0/positive like memcmp.
+    if (pt == P::String && m == "Compare" &&
+        call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+        llvm::Value* a = lowerExpr(*call.args[0].value);
+        llvm::Value* b = lowerExpr(*call.args[1].value);
+        if (!a || !b) return nullptr;
+        return emitStringOrdCmp(a, b);
+    }
+
+    // double.TryParse / float.TryParse(s, out result): bool — stdlib §5.2
+    if (m == "TryParse" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value &&
+        (pt == P::Double || pt == P::Float)) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        llvm::Value* strData = loadStringData(strVal);
+        llvm::Type* et = nullptr;
+        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+        if (!outAddr) return nullptr;
+        // strtod(data, &endptr)
+        auto* strtodFn = declareC("strtod",
+            llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
+        auto* endSlot = entryAlloca(ptrTy());
+        llvm::Value* valD = builder_.CreateCall(
+            strtodFn, {strData, endSlot}, "tryp.d");
+        llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlot);
+        llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "tryp.adv");
+        auto* i8Ty3 = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* endCh = builder_.CreateLoad(i8Ty3, endPtr, "tryp.end");
+        llvm::Value* atNul = builder_.CreateICmpEQ(
+            endCh, llvm::ConstantInt::get(i8Ty3, 0), "tryp.nul");
+        llvm::Value* ok = builder_.CreateAnd(advanced, atNul, "tryp.ok");
+        if (pt == P::Float) {
+            builder_.CreateStore(
+                builder_.CreateFPTrunc(valD, llvm::Type::getFloatTy(llvm_)), outAddr);
+        } else {
+            builder_.CreateStore(valD, outAddr);
+        }
+        return ok;
+    }
+
+    // int.TryParse(s, out result): bool — stdlib §5.2
+    // Returns true and sets result if s is a valid integer; false and sets
+    // result to 0 otherwise.
+    if (m == "TryParse" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value &&
+        (pt == P::Int || pt == P::Long)) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        llvm::Value* strData = loadStringData(strVal);
+        // Get address of the out parameter.
+        llvm::Type* et = nullptr;
+        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+        if (!outAddr) return nullptr;
+        // strtol(data, &endptr, 10) for validation.
+        auto* strtolFn = declareC("strtol", i64(), {ptrTy(), ptrTy(), i32()});
+        auto* endSlot = entryAlloca(ptrTy());
+        llvm::Value* val64 = builder_.CreateCall(
+            strtolFn, {strData, endSlot, builder_.getInt32(10)}, "tryp.val");
+        llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlot);
+        // ok = (endPtr != strData) && (*endPtr == '\0')
+        llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "tryp.adv");
+        auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* endCh = builder_.CreateLoad(i8Ty2, endPtr, "tryp.end");
+        llvm::Value* atNul = builder_.CreateICmpEQ(
+            endCh, llvm::ConstantInt::get(i8Ty2, 0), "tryp.nul");
+        llvm::Value* ok = builder_.CreateAnd(advanced, atNul, "tryp.ok");
+        // Store result.
+        if (pt == P::Long) {
+            builder_.CreateStore(val64, outAddr);
+        } else {
+            builder_.CreateStore(builder_.CreateTrunc(val64, i32()), outAddr);
+        }
+        return ok;
+    }
+
+    // int.Parse(s) / long.Parse(s) / double.Parse(s) etc.
+    if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* arg = lowerExpr(*call.args[0].value);
+        if (!arg) return nullptr;
+        // If the argument is a string, use atoi/atoll/atof.
+        auto* argTy = ctx_.exprType(*call.args[0].value);
+        if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+            argTy->primitive == P::String) {
+            llvm::Value* data = loadStringData(arg);
+            if (pt == P::Int || pt == P::UInt || pt == P::Short ||
+                pt == P::UShort || pt == P::Byte || pt == P::SByte) {
+                auto* atoiFn = module_->getFunction("atoi");
+                if (!atoiFn) {
+                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+                    atoiFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atoi", module_.get());
+                }
+                llvm::Value* r = builder_.CreateCall(atoiFn, {data});
+                // Narrow if needed.
+                if (pt != P::Int && pt != P::UInt) r = builder_.CreateTrunc(r, lowerPrimitive(pt));
+                return r;
+            }
+            if (pt == P::Long || pt == P::ULong) {
+                auto* atollFn = module_->getFunction("atoll");
+                if (!atollFn) {
+                    auto* ft = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                    atollFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atoll", module_.get());
+                }
+                return builder_.CreateCall(atollFn, {data});
+            }
+            if (pt == P::Double || pt == P::Float) {
+                auto* atofFn = module_->getFunction("atof");
+                if (!atofFn) {
+                    auto* ft = llvm::FunctionType::get(llvm::Type::getDoubleTy(llvm_), {ptrTy()}, false);
+                    atofFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "atof", module_.get());
+                }
+                llvm::Value* d = builder_.CreateCall(atofFn, {data});
+                if (pt == P::Float) d = builder_.CreateFPTrunc(d, llvm::Type::getFloatTy(llvm_));
+                return d;
+            }
+        }
+        // If already the right type, just return it.
+        return arg;
+    }
+    return nullptr;
+}
+
+
+void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
+    // Try to resolve the called method so we know its parameter types.
+    // For primitive static calls (int.TryParse, double.TryParse, etc.)
+    // we can read the callee primitive type from the member access.
+    sema::PrimitiveType callPrimTy = sema::PrimitiveType::None;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+        if (ma->target) {
+            if (auto* rt = ctx_.exprType(*ma->target)) {
+                if (rt->kind == sema::TypeRef::Kind::Primitive)
+                    callPrimTy = rt->primitive;
+            }
+            // Also check type name for static access (e.g. IdentifierExpr("double"))
+            if (callPrimTy == sema::PrimitiveType::None) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+                    callPrimTy = sema::primitiveFromName(id->name);
+                }
+            }
+        }
+    }
+    // Look up regular method params via callee symbol.
+    sema::MethodSymbol* ms = nullptr;
+    if (auto* calleeSym = ctx_.exprSymbol(*call.callee))
+        ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
+
+    std::size_t pos = 0;
+    for (const auto& a : call.args) {
+        if (a.modifier != "out var" || !a.value) { pos++; continue; }
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+        if (!id) { pos++; continue; }
+        // Skip if slot already created.
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (loc && loc->decl && locals_.count(loc->decl)) { pos++; continue; }
+        if (locals_.count(id)) { pos++; continue; }
+        // Determine slot type:
+        // 1. From the sema-resolved method parameter at position `pos`.
+        // 2. From the callee primitive type (for double/float TryParse).
+        // 3. Default to i32.
+        llvm::Type* slotTy = i32();
+        if (ms) {
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (md && pos < md->params.size() && md->params[pos].type) {
+                sema::TypeRef* pt = ctx_.resolvedType(*md->params[pos].type);
+                if (pt) slotTy = lowerTypeRef(pt);
+            }
+        } else if (callPrimTy != sema::PrimitiveType::None) {
+            using P = sema::PrimitiveType;
+            // For TryParse, the out result is the same primitive type.
+            if (callPrimTy == P::Double) slotTy = llvm::Type::getDoubleTy(llvm_);
+            else if (callPrimTy == P::Float) slotTy = llvm::Type::getFloatTy(llvm_);
+            else if (callPrimTy == P::Long || callPrimTy == P::ULong) slotTy = i64();
+            else slotTy = i32();
+        } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            // §3: collection instance calls (e.g. dict.TryGetValue).
+            // Infer out-param type from the collection's generic args.
+            if (ma->target) {
+                auto* recvTy = ctx_.exprType(*ma->target);
+                const auto& m = ma->member;
+                if (isDictTypeName(recvTy) && m == "TryGetValue" &&
+                    recvTy->genericArgs.size() >= 2 && recvTy->genericArgs[1]) {
+                    // Value type = second generic arg of Dictionary<K,V>
+                    slotTy = lowerTypeRef(recvTy->genericArgs[1]);
+                }
+            }
+        }
+        llvm::AllocaInst* slot = entryAlloca(slotTy);
+        locals_[id] = slot;
+        if (loc && loc->decl) locals_[loc->decl] = slot;
+        pos++;
+    }
+}
+
+
+llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    // Pre-create out var slots so lvalueAddr can find them in all paths.
+    ensureOutVarSlots(call);
+    // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
+    if (tryLowerConsoleCall(call)) return nullptr;  // unit result
+    // Console.ReadLine() → string? / Console.ReadKey() → char
+    if (call.args.empty() && call.callee) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma->target) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+                    if (id->name == "Console") {
+                        if (ma->member == "ReadLine") return emitConsoleReadLine();
+                        if (ma->member == "ReadKey") {
+                            // getchar() → char (i32)
+                            auto* gcFn = module_->getFunction("getchar");
+                            if (!gcFn) {
+                                auto* ft = llvm::FunctionType::get(i32(), {}, false);
+                                gcFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "getchar", module_.get());
+                            }
+                            return builder_.CreateCall(gcFn, {}, "readkey");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // §3.4: primitive type static methods: int.Parse(s), double.Parse(s), etc.
+    if (auto* v = tryLowerPrimitiveStaticCall(call)) return v;
+    // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
+    if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
+    // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
+    if (auto* v = tryLowerBuiltinClassCall(call)) return v;
+    // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
+    // primitive type name (no resolved symbol) converts its argument.
+    if (auto* cid =
+            dynamic_cast<const ast::IdentifierExpr*>(call.callee.get())) {
+        if (!ctx_.exprSymbol(*call.callee)) {
+            sema::PrimitiveType pt = sema::primitiveFromName(cid->name);
+            if (pt != sema::PrimitiveType::None)
+                return lowerConversion(pt, call);
+        }
+    }
+    sema::Symbol* calleeSym = ctx_.exprSymbol(*call.callee);
+    // CG44: an enum cast `E(i)` (§5.4) — the callee is an enum type
+    // name. An enum is represented by its underlying integer (i32), so
+    // the argument, width-adjusted to i32, is the enum value.
+    if (auto* ets = dynamic_cast<sema::TypeSymbol*>(calleeSym)) {
+        if (ets->kind == ast::TypeDeclKind::Enum)
+            return lowerEnumCast(call);
+        // §9.5: records are constructed with `new Record(...)` (handled in
+        // lowerNew), not call-style `Record(...)`. A bare call on a record
+        // type name is not construction and is rejected in sema.
+    }
+    // CG26: a call to an extern (FFI) function — direct C-ABI call to
+    // the external declaration. (Native functions don't set the
+    // exception global, so no post-call unwind check is needed.)
+    if (auto* xd = dynamic_cast<sema::ExternDeclSymbol*>(calleeSym)) {
+        auto it = externFns_.find(xd);
+        if (it == externFns_.end()) return nullptr;
+        std::vector<llvm::Value*> args;
+        for (const auto& a : call.args) {
+            if (!a.value) return nullptr;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return nullptr;
+            args.push_back(v);
+        }
+        if (args.size() != it->second->arg_size()) return nullptr;
+        return builder_.CreateCall(it->second, args);
+    }
+    // CG60: call through a function-typed parameter or local (lambda
+    // value). Lambda values are heap-allocated closure structs
+    // { ptr fn, ptr env }. The function's actual type includes an env_ptr
+    // as first arg: (ptr env, user_params...) -> ret.
+    auto emitClosureCall = [&](llvm::Value* closurePtr,
+                               const sema::TypeRef* rt) -> llvm::Value* {
+        if (!closurePtr || !rt ||
+            rt->kind != sema::TypeRef::Kind::Function)
+            return nullptr;
+        // Load fn_ptr from closure[0].
+        llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
+        // Load env_ptr from closure[1].
+        llvm::Value* envSlot = builder_.CreateGEP(
+            ptrTy(), closurePtr, {builder_.getInt32(1)});
+        llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot);
+        // Build call args first so we can reconcile types.
+        std::vector<llvm::Value*> args;
+        args.push_back(envPtr);  // env_ptr first
+        for (const auto& a : call.args) {
+            if (!a.value) return nullptr;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return nullptr;
+            args.push_back(v);
+        }
+        // Build function type: (ptr env, user_params...) -> ret.
+        // Use the actual argument LLVM types where the declared type resolves
+        // to i32 (unresolved generic param T) — e.g. (T)->T with T=string
+        // needs ptr->ptr, not i32->i32.
+        llvm::Type* retTy = rt->funcReturn
+                                ? lowerTypeRef(rt->funcReturn)
+                                : llvm::Type::getVoidTy(llvm_);
+        // CG-generic: if return type is i32 (unresolved generic param C),
+        // try to resolve via the callee's localGenericSubst_.  This handles
+        // the case of a generic method returning a function type (B)->C where
+        // C is a type parameter — the local variable's stored substitution
+        // maps C to the concrete type (e.g. f64 for Curried<…,double>).
+        if (retTy == i32() && rt->funcReturn) {
+            auto* fr = rt->funcReturn;
+            if (fr->kind == sema::TypeRef::Kind::Named && !fr->declaration &&
+                fr->astNode && fr->astNode->name &&
+                fr->astNode->name->parts.size() == 1) {
+                std::string_view paramName = fr->astNode->name->parts[0];
+                // Look up in the callee's localGenericSubst_.
+                sema::Symbol* calleeSym2 = ctx_.exprSymbol(*call.callee);
+                const ast::Node* decl = nullptr;
+                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(calleeSym2))
+                    decl = loc->decl;
+                if (decl) {
+                    auto lit = localGenericSubst_.find(decl);
+                    if (lit != localGenericSubst_.end()) {
+                        auto sit = lit->second.find(paramName);
+                        if (sit != lit->second.end() && sit->second != i32())
+                            retTy = sit->second;
+                    }
+                }
+                // Also try current genericSubst_.
+                if (retTy == i32()) {
+                    auto sit = genericSubst_.find(paramName);
+                    if (sit != genericSubst_.end() && sit->second != i32())
+                        retTy = sit->second;
+                }
+            }
+        }
+        std::vector<llvm::Type*> allArgTys;
+        allArgTys.push_back(ptrTy());  // env
+        // Resolve callee's generic substitution for param/return types.
+        // When the closure is a local variable from a generic method call,
+        // its localGenericSubst_ has the concrete type mapping.
+        const std::unordered_map<std::string_view, llvm::Type*>* calleeSubst = nullptr;
+        {
+            sema::Symbol* calleeSym3 = ctx_.exprSymbol(*call.callee);
+            const ast::Node* decl3 = nullptr;
+            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(calleeSym3))
+                decl3 = loc->decl;
+            if (decl3) {
+                auto lit = localGenericSubst_.find(decl3);
+                if (lit != localGenericSubst_.end())
+                    calleeSubst = &lit->second;
+            }
+        }
+        for (std::size_t pi = 0; pi < rt->funcParams.size(); ++pi) {
+            llvm::Type* declared =
+                rt->funcParams[pi].type ? lowerTypeRef(rt->funcParams[pi].type) : i32();
+            // CG-generic: if declared resolved to i32 (unresolved generic T):
+            // 1. Try callee's localGenericSubst_ to resolve the generic param name.
+            // 2. If still i32, upgrade to ptr if the actual arg is a pointer.
+            if (declared == i32() && rt->funcParams[pi].type) {
+                auto* fp = rt->funcParams[pi].type;
+                if (fp->kind == sema::TypeRef::Kind::Named && !fp->declaration &&
+                    fp->astNode && fp->astNode->name &&
+                    fp->astNode->name->parts.size() == 1 && calleeSubst) {
+                    auto sit = calleeSubst->find(fp->astNode->name->parts[0]);
+                    if (sit != calleeSubst->end() && sit->second != i32())
+                        declared = sit->second;
+                }
+            }
+            std::size_t ai = pi + 1;  // +1 for env_ptr
+            if (declared == i32() && ai < args.size() &&
+                args[ai]->getType()->isPointerTy())
+                declared = args[ai]->getType();
+            allArgTys.push_back(declared);
+        }
+        // Coerce args to match declared param types (e.g. f64 → i32 for
+        // an untyped lambda param used with a double argument — ideally the
+        // caller annotates the lambda, but we convert rather than crash).
+        for (std::size_t ai = 1; ai < args.size(); ++ai) {
+            llvm::Type* declTy = (ai < allArgTys.size()) ? allArgTys[ai] : nullptr;
+            if (!declTy || args[ai]->getType() == declTy) continue;
+            if (declTy->isIntegerTy() && args[ai]->getType()->isFloatingPointTy())
+                args[ai] = builder_.CreateFPToSI(args[ai], declTy);
+            else if (declTy->isFloatingPointTy() && args[ai]->getType()->isIntegerTy())
+                args[ai] = builder_.CreateSIToFP(args[ai], declTy);
+            else if (declTy->isIntegerTy() && args[ai]->getType()->isIntegerTy()) {
+                unsigned db = declTy->getIntegerBitWidth();
+                unsigned sb = args[ai]->getType()->getIntegerBitWidth();
+                if (db > sb) args[ai] = builder_.CreateSExt(args[ai], declTy);
+                else args[ai] = builder_.CreateTrunc(args[ai], declTy);
+            }
+        }
+        // Similarly fix up the return type if it's an unresolved generic.
+        // ONLY upgrade if funcReturn is an unresolved generic (Named with no decl)
+        // AND its type parameter name matches at least one of the param type
+        // parameter names — this ensures '(T)->T' upgrades but '(S)->A' does not
+        // (different type params mean S=string doesn't imply A=string).
+        if (retTy == i32() && !args.empty() &&
+            rt->funcReturn &&
+            rt->funcReturn->kind == sema::TypeRef::Kind::Named &&
+            !rt->funcReturn->declaration &&
+            rt->funcReturn->astNode && rt->funcReturn->astNode->name &&
+            rt->funcReturn->astNode->name->parts.size() == 1) {
+            std::string_view retParamName = rt->funcReturn->astNode->name->parts[0];
+            // Check if any param has the same type parameter name.
+            bool retMatchesParam = false;
+            for (const auto& fp : rt->funcParams) {
+                if (!fp.type) continue;
+                if (fp.type->kind == sema::TypeRef::Kind::Named &&
+                    !fp.type->declaration && fp.type->astNode &&
+                    fp.type->astNode->name &&
+                    fp.type->astNode->name->parts.size() == 1 &&
+                    fp.type->astNode->name->parts[0] == retParamName) {
+                    retMatchesParam = true; break;
+                }
+            }
+            if (retMatchesParam) {
+                // If all non-env params are ptr, the return is also ptr.
+                bool anyPtr = false;
+                for (std::size_t ai = 1; ai < args.size(); ++ai)
+                    if (args[ai]->getType()->isPointerTy()) { anyPtr = true; break; }
+                if (anyPtr && allArgTys.size() > 1) {
+                    bool allPtrs = true;
+                    for (std::size_t ti = 1; ti < allArgTys.size(); ++ti)
+                        if (!allArgTys[ti]->isPointerTy()) { allPtrs = false; break; }
+                    if (allPtrs) retTy = ptrTy();
+                }
+            }
+        }
+        auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
+        if (args.size() != allArgTys.size()) return nullptr;
+        return builder_.CreateCall(fnTy, fnPtr, args);
+    };
+    if (auto* par = dynamic_cast<sema::ParameterSymbol*>(calleeSym)) {
+        sema::TypeRef* rt = par->declType
+                                ? ctx_.resolvedType(*par->declType)
+                                : nullptr;
+        if (rt && rt->kind == sema::TypeRef::Kind::Function) {
+            llvm::Value* closurePtr = nullptr;
+            auto pit = paramSlots_.find(par);
+            if (pit != paramSlots_.end())
+                closurePtr = builder_.CreateLoad(ptrTy(), pit->second);
+            return emitClosureCall(closurePtr, rt);
+        }
+    }
+    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(calleeSym)) {
+        sema::TypeRef* rt = loc->declType;
+        if (rt && rt->kind == sema::TypeRef::Kind::Function) {
+            llvm::Value* closurePtr = nullptr;
+            if (loc->decl) {
+                auto lit = locals_.find(loc->decl);
+                if (lit != locals_.end())
+                    closurePtr = builder_.CreateLoad(ptrTy(), lit->second);
+            }
+            return emitClosureCall(closurePtr, rt);
+        }
+    }
+    // CG60: call through a function-typed field or auto-property —
+    // `obj._callback()` where `_callback: () -> int`. The FieldSymbol has
+    // a declared type (from the FieldDecl); if it's a Function TypeRef,
+    // lower the field access as a closure pointer and dispatch.
+    if (auto* fs = dynamic_cast<sema::FieldSymbol*>(calleeSym)) {
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (fd && fd->type) {
+            sema::TypeRef* rt = ctx_.resolvedType(*fd->type);
+            if (rt && rt->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* closurePtr = lowerExpr(*call.callee);
+                return emitClosureCall(closurePtr, rt);
+            }
+        }
+    }
+    // CG60: call through an indexed array element of function type —
+    // `handlers[i]()` where handlers: [N](T) -> R. The IndexExpr has
+    // no resolved symbol (calleeSym = null), so we lower the IndexExpr
+    // directly and use its exprType to drive emitClosureCall.
+    if (!calleeSym) {
+        sema::TypeRef* calleeTy = ctx_.exprType(*call.callee);
+        if (calleeTy && calleeTy->kind == sema::TypeRef::Kind::Function) {
+            llvm::Value* closurePtr = lowerExpr(*call.callee);
+            return emitClosureCall(closurePtr, calleeTy);
+        }
+    }
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
+    if (!ms) {
+        // CG13/CG18: explicit `obj.Dispose()` call where Dispose is a
+        // compiler-generated method (no MethodSymbol in sema). Emit a
+        // dynamic vtable dispatch to the object's Dispose function (slot 1).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "Dispose" && ma->target) {
+                llvm::Value* recv = lowerExpr(*ma->target);
+                if (recv && recv->getType()->isPointerTy()) {
+                    // §3: collection types use bz_array_free / bz_dict_free.
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (isCollectionTypeName(recvTy)) {
+                        auto* fn = declareC("bz_array_free",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                        builder_.CreateCall(fn, {recv,
+                            llvm::ConstantPointerNull::get(ptrTy())});
+                    } else if (isDictTypeName(recvTy)) {
+                        auto* fn = declareC("bz_dict_free",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                        builder_.CreateCall(fn, {recv,
+                            llvm::ConstantPointerNull::get(ptrTy())});
+                    } else {
+                        emitDynamicDispose(recv);
+                    }
+                    return nullptr;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    std::vector<llvm::Value*> args;
+    bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
+    if (!isStaticMethod(ms)) {
+        // Receiver: the member-access target, else the current `this`.
+        llvm::Value* recv = nullptr;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma->target.get())) {
+                if (tid->name == "base") baseQualified = true;
+            }
+            recv = ma->target ? lowerExpr(*ma->target) : nullptr;
+        } else {
+            recv = currentThis_;
+        }
+        if (!recv) return nullptr;
+        // CG29: a record method receives `this` as a pointer to the record
+        // value; if the receiver is a struct value (the usual case), spill
+        // it to a stack slot and pass its address.
+        if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Record &&
+            !recv->getType()->isPointerTy()) {
+            llvm::Value* tmp = entryAlloca(recordStruct(ms->parent));
+            builder_.CreateStore(recv, tmp);
+            recv = tmp;
+        }
+        args.push_back(recv);
+    }
+    // §22.4/§22.7: place arguments into parameter order (named by name,
+    // positional by position, omitted parameters defaulted).
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (!buildOrderedArgs(md->params, call.args, args)) return nullptr;
+    } else {
+        for (const auto& a : call.args) {
+            if (!a.value) return nullptr;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return nullptr;
+            args.push_back(v);
+        }
+    }
+
+    // CG-generic: before calling the method, if the receiver's exprType
+    // has generic args and the parent TypeSymbol has genericParams,
+    // set up the substitution for the method body specialization.
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    if (!isStaticMethod(ms) && ms->parent && !args.empty()) {
+        // Find the receiver expression to get its type.
+        const ast::Expr* recvExpr = nullptr;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get()))
+            recvExpr = ma->target.get();
+        if (recvExpr) {
+            sema::TypeRef* recvTy = ctx_.exprType(*recvExpr);
+            if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                recvTy->declaration == ms->parent &&
+                !recvTy->genericArgs.empty()) {
+                auto* td = dynamic_cast<const ast::TypeDecl*>(
+                    ms->parent->decl);
+                if (td && td->genericParams.size() ==
+                          recvTy->genericArgs.size()) {
+                    // Resolve generic args using the OUTER substitution so
+                    // that `Pair<T>` in `Pair<string>` context resolves T→ptr.
+                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+                    for (std::size_t gi = 0;
+                         gi < td->genericParams.size(); ++gi) {
+                        llvm::Type* concrTy = lowerTypeRef(recvTy->genericArgs[gi]);
+                        std::string_view pname = td->genericParams[gi].name;
+                        newSubst[pname] = concrTy;
+                        newSema[pname] = recvTy->genericArgs[gi];
+                    }
+                    // Check if any resolved arg is still i32 (unresolved generic
+                    // fallback). If so, try the localGenericSubst_ for the receiver.
+                    bool hasUnresolved = false;
+                    for (auto& [name, ty] : newSubst)
+                        if (ty == i32()) { hasUnresolved = true; break; }
+                    if (hasUnresolved) {
+                        // Try looking up the local's stored substitution.
+                        sema::Symbol* recvSym = ctx_.exprSymbol(*recvExpr);
+                        const ast::Node* recvDecl = nullptr;
+                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(recvSym))
+                            recvDecl = loc->decl;
+                        if (recvDecl) {
+                            auto lit = localGenericSubst_.find(recvDecl);
+                            if (lit != localGenericSubst_.end())
+                                newSubst = lit->second;  // use stored concrete subst
+                        }
+                    }
+                    genericSubst_ = std::move(newSubst);
+                    genericSubstSemaTy_ = std::move(newSema);
+                }
+            }
+        }
+    }
+    llvm::Value* result = emitMethodCall(ms, args, baseQualified);
+    // Record the concrete subst that was active during this call so that
+    // lowerLocalDecl can associate it with the result's local variable.
+    if (!genericSubst_.empty()) {
+        lastCallGenericSubst_ = genericSubst_;
+    } else {
+        // Even if genericSubst_ is empty (non-generic caller), try to
+        // derive the subst from the method's return type so that
+        // 'var primes := CreatePrimes(...)' correctly associates
+        // the Gen<int> substitution rather than inheriting stale
+        // lastCallGenericSubst_ from prior generic method calls.
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            if (md->returnType) {
+                sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+                if (retTy && retTy->kind == sema::TypeRef::Kind::Named &&
+                    retTy->declaration && !retTy->genericArgs.empty()) {
+                    auto* td = dynamic_cast<const ast::TypeDecl*>(
+                        retTy->declaration->decl);
+                    if (td && td->genericParams.size() ==
+                              retTy->genericArgs.size()) {
+                        std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                        for (std::size_t gi = 0;
+                             gi < td->genericParams.size(); ++gi) {
+                            llvm::Type* concrTy =
+                                lowerTypeRef(retTy->genericArgs[gi]);
+                            newSubst[td->genericParams[gi].name] = concrTy;
+                        }
+                        if (!newSubst.empty())
+                            lastCallGenericSubst_ = std::move(newSubst);
+                    }
+                }
+            }
+        }
+    }
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    return result;
+}
+
+
+llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
+                            std::vector<llvm::Value*>& args,
+                            bool baseQualified) {
+    bool canDispatch = !baseQualified && !isStaticMethod(ms);
+    unsigned dispatchSlot = 0;
+    if (canDispatch) {
+        auto ifIt = ifaceMethodSlot_.find(ms);
+        if (ifIt != ifaceMethodSlot_.end()) {
+            dispatchSlot = ifIt->second;
+        } else {
+            auto slotIt = vtableSlot_.find(ms);
+            if (slotIt != vtableSlot_.end()) dispatchSlot = slotIt->second;
+            else canDispatch = false;
+        }
+    }
+    if (canDispatch) {
+        // CG-generic: if there is an active type-parameter substitution
+        // and this method has generic params/return, use inline emission
+        // rather than vtable dispatch — the vtable function was compiled
+        // with i32-placeholder types and calling it with concrete types
+        // (e.g. ptr for string) will mis-type the call or crash.
+        if (!genericSubst_.empty()) {
+            llvm::FunctionType* fnTy = methodFnType(ms);
+            if (fnTy) {
+                bool needsInline = false;
+                // Check return type for generic placeholder (i32 from lowerType fallback).
+                auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                if (md && md->returnType) {
+                    sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+                    if (retTy && lowerTypeRef(retTy) != fnTy->getReturnType())
+                        needsInline = true;
+                }
+                // Check param types.
+                if (!needsInline) {
+                    for (std::size_t ai = 0; ai < args.size(); ++ai)
+                        if (args[ai]->getType() != fnTy->getParamType(ai))
+                            { needsInline = true; break; }
+                }
+                if (needsInline) {
+                    llvm::Value* r = emitInlineGenericMethod(ms, args);
+                    if (r != nullptr || diverged_) {
+                        emitPendingCheck();
+                        return r;
+                    }
+                }
+            }
+        }
+        llvm::FunctionType* fnTy = methodFnType(ms);
+        if (!fnTy || args.size() != fnTy->getNumParams()) return nullptr;
+        llvm::Value* recv = args[0];
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+        llvm::Value* slotPtr = builder_.CreateGEP(
+            ptrTy(), vptr, {builder_.getInt32(dispatchSlot)});
+        llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+        llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
+        emitPendingCheck();  // CG20: a callee may have thrown
+        return r;
+    }
+
+    // Non-virtual (or base-qualified) → direct call to the function.
+    auto it = methodFns_.find(ms);
+    if (it == methodFns_.end()) return nullptr;
+    llvm::Function* callee = it->second;
+    if (args.size() != callee->arg_size()) return nullptr;
+    // CG-generic: if the generic substitution is active and the method
+    // is on a class that has generic parameters, we must specialize the
+    // call — even for methods with non-generic param/return types (like
+    // `Size(): int`), because the struct layout changes when generic field
+    // types (e.g. [5]T) are substituted with concrete types (e.g. [5]ptr).
+    if (!genericSubst_.empty() && !isStaticMethod(ms)) {
+        // Check if the method's parent class has generic params (i.e., is a
+        // generic class that has been instantiated with the current subst).
+        bool parentIsGeneric = false;
+        if (ms->parent && ms->parent->decl) {
+            auto* td = dynamic_cast<const ast::TypeDecl*>(ms->parent->decl);
+            if (td && !td->genericParams.empty()) parentIsGeneric = true;
+        }
+        if (parentIsGeneric) {
+            llvm::Value* r = emitInlineGenericMethod(ms, args);
+            if (r != nullptr || diverged_) {
+                emitPendingCheck();
+                return r;
+            }
+        }
+    }
+    // CG-generic: if the generic substitution is active and the method
+    // function has type-mismatched args (generic T→i32 vs concrete f64),
+    // emit a specialized inline wrapper rather than calling the compiled
+    // generic function. This handles generic methods like `Get(): T`.
+    if (!genericSubst_.empty()) {
+        bool typesMismatch = false;
+        auto* callFnTy = callee->getFunctionType();
+        for (std::size_t ai = 0; ai < args.size(); ++ai)
+            if (args[ai]->getType() != callFnTy->getParamType(ai))
+                { typesMismatch = true; break; }
+        if (!typesMismatch && ms->decl) {
+            // Also check return type — if the method returns a generic
+            // param (i32 fallback) but we need a concrete type.
+            llvm::Type* declRetTy = callFnTy->getReturnType();
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (md && md->returnType) {
+                sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+                llvm::Type* concrRetTy = retTy
+                    ? lowerTypeRef(retTy) : declRetTy;
+                if (concrRetTy != declRetTy) typesMismatch = true;
+            }
+        }
+        if (typesMismatch) {
+            // Inline the method body with the current generic substitution.
+            llvm::Value* r = emitInlineGenericMethod(ms, args);
+            if (r != nullptr || diverged_) {
+                emitPendingCheck();
+                return r;
+            }
+        }
+    }
+    llvm::Value* r = builder_.CreateCall(callee, args);
+    emitPendingCheck();  // CG20: a callee may have thrown
+    return r;
+}
+
+
+llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
+                                       std::vector<llvm::Value*>& args,
+                                       const CallableInfo& ci) {
+    // Build the substitution key for caching.
+    std::vector<llvm::Type*> substKey;
+    for (auto& [name, ty] : genericSubst_) substKey.push_back(ty);
+
+    auto cacheKey = std::make_pair(ms, substKey);
+    auto cit = specializedMethods_.find(cacheKey);
+    if (cit != specializedMethods_.end()) {
+        // Already compiled — just call it.
+        llvm::Function* fn = cit->second;
+        if (args.size() != fn->arg_size()) return nullptr;
+        llvm::Value* r = builder_.CreateCall(fn, args);
+        emitPendingCheck();
+        return r;
+    }
+
+    // Build the function type with concrete arg/ret types.
+    std::vector<llvm::Type*> paramTys;
+    for (auto* a : args) paramTys.push_back(a->getType());
+    // Return type: apply genericSubst_ to the declared return type.
+    llvm::Type* retTy = llvm::Type::getVoidTy(llvm_);
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (md && md->returnType) {
+        sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+        if (rt) retTy = lowerTypeRef(rt);
+    }
+    auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+
+    // Create the specialized function.
+    std::string fname = std::string(ms->parent ? ms->parent->name : "")
+                        + "$" + std::string(ms->name) + "$spec";
+    llvm::Function* specFn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage, fname, module_.get());
+    specializedMethods_[cacheKey] = specFn;
+
+    // Emit the body into the specialized function.
+    llvm::BasicBlock* savedInsert = builder_.GetInsertBlock();
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRef = refParams_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+    auto savedLoop = loopStack_;
+    auto savedDispose = disposeStack_;
+    llvm::Function* savedFn = currentFn_;
+
+    currentFn_ = specFn;
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", specFn);
+    builder_.SetInsertPoint(entryBB);
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    propagateBB_ = nullptr;
+    unwindTarget_ = nullptr;
+    currentCaughtExc_ = nullptr;
+    unwindScopeDepth_ = 0;
+    diverged_ = false;
+    loopStack_.clear(); finallyStack_.clear();
+    disposeStack_.clear();
+
+    // Bind `this` and params.
+    auto argIt = specFn->arg_begin();
+    std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
+    if (!isStaticMethod(ms)) {
+        currentThis_ = &*argIt++;
+    } else {
+        currentThis_ = nullptr;
+    }
+    auto* md2 = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    for (std::size_t pi = 0; pi < ms->params.size(); ++pi, ++argIt) {
+        sema::Symbol* psym = ms->params[pi];
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
+        // CG50: ref/out params are passed as pointers; register in refParams_
+        // so reads/writes go through the pointer (same as non-spec methods).
+        if (ps && isByRefMod(ps->modifier)) {
+            llvm::Type* elemTy = ps->declType ? lowerType(ps->declType) : i32();
+            refParams_[psym] = {&*argIt, elemTy};
+        } else {
+            auto* slot = entryAlloca(argIt->getType());
+            builder_.CreateStore(&*argIt, slot);
+            paramSlots_[psym] = slot;
+        }
+    }
+
+    // Emit block body.
+    bool terminated = ci.stmts && lowerScopedBlock(*ci.stmts);
+    if (!terminated) emitImplicitReturn(specFn);
+
+    // Restore outer state.
+    builder_.SetInsertPoint(savedInsert);
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRef);
+    propagateBB_ = savedProp;
+    unwindTarget_ = savedUnwind;
+    currentCaughtExc_ = savedCaught;
+    unwindScopeDepth_ = savedUnwindDepth;
+    diverged_ = savedDiverged;
+    loopStack_ = std::move(savedLoop);
+    disposeStack_ = std::move(savedDispose);
+
+    // Call the specialized function.
+    if (args.size() != specFn->arg_size()) return nullptr;
+    llvm::Value* r = builder_.CreateCall(specFn, args);
+    emitPendingCheck();
+    return r;
+}
+
+
+llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
+                                      std::vector<llvm::Value*>& args) {
+    CallableInfo ci;
+    if (!callableInfo(ms, ci)) return nullptr;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return nullptr;
+
+    // Save state.
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+
+    // Bind this and params.
+    currentThis_ = (!args.empty() && !isStaticMethod(ms))
+                    ? args[0] : nullptr;
+    locals_.clear();
+    paramSlots_.clear();
+    propagateBB_ = nullptr;
+    currentCaughtExc_ = nullptr;
+    unwindScopeDepth_ = 0;
+    diverged_ = false;
+    // Bind user params (skip leading `this`).
+    std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
+    for (std::size_t pi = 0; pi < ms->params.size() &&
+         pi + paramStart < args.size(); ++pi) {
+        auto* slot = entryAlloca(args[pi + paramStart]->getType());
+        builder_.CreateStore(args[pi + paramStart], slot);
+        paramSlots_[ms->params[pi]] = slot;
+    }
+
+    // Emit the body.
+    llvm::Value* result = nullptr;
+    if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
+        result = lowerExpr(*ci.exprBody);
+    } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
+        // Block body: compile a specialized function and call it.
+        // Inlining block bodies is problematic because `return` generates
+        // `ret` in the outer function. Instead, monomorphize: compile a
+        // concrete version of the function with the active substitution.
+        result = emitGenericSpecialization(ms, args, ci);
+    }
+
+    // Restore state.
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParams);
+    propagateBB_ = savedProp;
+    unwindTarget_ = savedUnwind;
+    currentCaughtExc_ = savedCaught;
+    unwindScopeDepth_ = savedUnwindDepth;
+    diverged_ = savedDiverged;
+
+    return result;
+}
+
+
+llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
+                               const ast::NullCondMemberExpr& nm) {
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+    if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;
+    llvm::FunctionType* fnTy = methodFnType(ms);
+    if (!fnTy) return nullptr;
+    llvm::Type* retTy = fnTy->getReturnType();
+    bool refResult = retTy->isPointerTy();
+    if (!retTy->isVoidTy() && !refResult)
+        return nullptr;  // value-typed result deferred
+    llvm::Value* recv = lowerExpr(*nm.target);
+    if (!recv || !recv->getType()->isPointerTy()) return nullptr;
+
+    auto* entryBB = builder_.GetInsertBlock();
+    auto* callBB =
+        llvm::BasicBlock::Create(llvm_, "nullcall.do", currentFn_);
+    auto* endBB =
+        llvm::BasicBlock::Create(llvm_, "nullcall.end", currentFn_);
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        recv, llvm::ConstantPointerNull::get(ptrTy()));
+    builder_.CreateCondBr(isNull, endBB, callBB);
+
+    builder_.SetInsertPoint(callBB);
+    std::vector<llvm::Value*> args;
+    args.push_back(recv);
+    for (const auto& a : call.args) {
+        if (!a.value) return nullptr;
+        llvm::Value* v = lowerExpr(*a.value);
+        if (!v) return nullptr;
+        args.push_back(v);
+    }
+    llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false);
+    if (!r && refResult) return nullptr;
+    auto* callEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+
+    builder_.SetInsertPoint(endBB);
+    if (!refResult) return nullptr;  // void: result discarded by caller
+    auto* phi = builder_.CreatePHI(ptrTy(), 2);
+    phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), entryBB);
+    phi->addIncoming(r, callEnd);
+    return phi;
+}
+
+
+llvm::FunctionType* Emitter::methodFnType(const sema::MethodSymbol* ms) {
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return nullptr;
+    llvm::Type* retTy = lowerType(md->returnType.get());
+    std::vector<llvm::Type*> paramTys;
+    if (!isStaticMethod(const_cast<sema::MethodSymbol*>(ms)))
+        paramTys.push_back(ptrTy());
+    for (const auto& p : md->params)
+        paramTys.push_back(isByRefMod(p.modifier)
+                               ? ptrTy()  // CG50: ref/out by reference
+                               : lowerType(p.type.get()));
+    return llvm::FunctionType::get(retTy, paramTys, /*isVarArg=*/false);
+}
+
+
+bool Emitter::isStringExprType(const ast::Expr& e) {
+    auto* rt = ctx_.exprType(e);
+    return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+           rt->primitive == sema::PrimitiveType::String;
+}
+
