@@ -211,7 +211,8 @@ set(BEZEL_TEST_SOURCES
     ownership/owned_field_da_test.cpp
     ownership/owned_return_test.cpp
     ownership/call_arg_move_test.cpp
-    ownership/assignment_consumes_test.cpp)
+    ownership/assignment_consumes_test.cpp
+    ownership/cfg_dataflow_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

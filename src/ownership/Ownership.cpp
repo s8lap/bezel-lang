@@ -1,11 +1,14 @@
 #include "ownership/Ownership.hpp"
 #include "ownership/Ownership_impl.hpp"
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "ast/Node.hpp"
+#include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
@@ -19,6 +22,10 @@ namespace bezel::ownership {
 
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms) {
+    // Seed the dataflow entry state with `owned` / `out owned` parameters
+    // (slice O10): each enters the method in the Owned state and must
+    // reach a discharge point on every normal-exit path (§28.8).
+    BlockState entry;
     if (paramSyms) {
         for (sema::Symbol* sym : *paramSyms) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
@@ -29,13 +36,19 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 lo.state = OwnershipState::Owned;
                 lo.implicitDischarge = false;
                 lo.obligationOrigin = ps->decl;
-                states_[sym] = lo;
+                entry[sym] = lo;
             }
         }
     }
-    for (const auto& s : body) {
-        if (s) visitStmt(*s);
-    }
+    // Slice O3a: run the analysis as a forward dataflow over the body's
+    // CFG. `treatTryAsOpaque=true` keeps `try` a single statement so the
+    // structured `visitStmt` walk handles it (preserving O11-simple); the
+    // straight-line / if-else / loop flow is driven by the CFG. The
+    // returned state is the meet of everything reaching the CFG exit and
+    // is what the end-of-method checks below examine (in place of the old
+    // single-pass `states_`).
+    auto cfg = flow::buildCFG(body, /*treatTryAsOpaque=*/true);
+    BlockState endState = runDataflow(*cfg, entry);
     // Slice O11 (simple): if the body's last statement is an
     // unconditional terminator that does not reach scope exit on
     // any normal path (throw or — for a method whose return type
@@ -44,21 +57,18 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // try/finally during stack unwinding. Skip the undischarged
     // check in that case.
     //
-    // The check is necessarily approximate without a CFG: we only
-    // honor it for the lexically-last statement being a ThrowStmt.
-    // A throw inside an if-branch doesn't suppress the check (the
-    // other branches still normally exit). Future ownership CFG
-    // refactor sharpens this to "every normal-exit path ends in
-    // throw/return".
+    // O3a keeps this approximation byte-for-byte: the gate is still the
+    // lexically-last statement being a ThrowStmt. A throw inside an
+    // if-branch doesn't suppress the check (the other branches still
+    // normally exit). O11-real (a later step) sharpens this to "every
+    // normal-exit path ends in throw/return" using the CFG exception
+    // edges that O3a deliberately does not yet consult.
     // Scope-exit: every plain `var` owned local must have been
     // discharged. `using var` locals carry implicit discharge.
-    // O11 (simple) suppresses *this* check when the body's last
-    // statement is throw — exception unwinding's implicit
-    // try/finally handles the discharge. The field-move check
-    // below is NOT suppressed: the enclosing object survives the
-    // throw and its field invariant must still hold.
+    // The field-move check below is NOT suppressed: the enclosing object
+    // survives the throw and its field invariant must still hold.
     if (!bodyEndsInThrow(body)) {
-        for (const auto& [sym, st] : states_) {
+        for (const auto& [sym, st] : endState) {
             if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
                 ctx_.diagnostics().report(
                     Severity::Error,
@@ -97,6 +107,229 @@ bool MethodOwnership::bodyEndsInThrow(
         return dynamic_cast<const ast::ThrowStmt*>(it->get()) != nullptr;
     }
     return false;
+}
+
+namespace {
+
+// An edge identified by its endpoints, used to flag CFG back-edges so the
+// O3a forward pass walks each loop body exactly once (the old syntactic
+// walker did the same; a real loop fixpoint is O3b).
+struct Edge {
+    const flow::CFGBlock* from;
+    const flow::CFGBlock* to;
+    bool operator==(const Edge& o) const {
+        return from == o.from && to == o.to;
+    }
+};
+struct EdgeHash {
+    std::size_t operator()(const Edge& e) const {
+        return std::hash<const void*>()(e.from) * 31u +
+               std::hash<const void*>()(e.to);
+    }
+};
+
+// Classify back-edges via a DFS gray/black colouring: an edge to a node
+// still on the recursion stack (gray) is a back-edge. Reducible (i.e.
+// structured) CFGs have exactly the loop back-edges so classified.
+void collectBackEdges(const flow::CFGBlock* b,
+                      std::unordered_set<const flow::CFGBlock*>& gray,
+                      std::unordered_set<const flow::CFGBlock*>& black,
+                      std::unordered_set<Edge, EdgeHash>& backEdges) {
+    gray.insert(b);
+    for (const flow::CFGBlock* s : b->succs) {
+        if (gray.count(s)) {
+            backEdges.insert({b, s});
+        } else if (!black.count(s)) {
+            collectBackEdges(s, gray, black, backEdges);
+        }
+    }
+    gray.erase(b);
+    black.insert(b);
+}
+
+// True if the edge from `pred` to `block` is a loop header's skip / exit
+// edge (header → succs[1], i.e. into the loop's after-block).
+bool isLoopSkipEdge(const flow::CFGBlock* pred, const flow::CFGBlock* block) {
+    return pred->isLoopHeader && pred->succs.size() >= 2 &&
+           pred->succs[1] == block;
+}
+
+// Reverse-postorder over the CFG, skipping back-edges so loops are not
+// revisited, AND re-routing each loop's skip edge (header → after-block)
+// to flow from the loop body's back-edge sources instead. The re-route
+// matters only for ORDERING: it forces a loop's after-block to be visited
+// after the loop body's fall-through end, so the forward pass can feed the
+// after-block the body-end (single-pass) state — reproducing the old
+// syntactic walker, which continued past a loop carrying the body-end
+// state of one pass (zero-trip leak detection is deferred to O3b). The
+// result is an order in which every block's data-predecessors precede it.
+void reversePostorder(const flow::CFGBlock* b,
+                      const std::unordered_set<Edge, EdgeHash>& backEdges,
+                      std::unordered_set<const flow::CFGBlock*>& seen,
+                      std::vector<const flow::CFGBlock*>& post) {
+    seen.insert(b);
+    std::vector<const flow::CFGBlock*> next;
+    for (const flow::CFGBlock* s : b->succs) {
+        if (backEdges.count({b, s})) continue;
+        if (b->isLoopHeader && isLoopSkipEdge(b, s)) {
+            // Don't descend to the after-block via the skip edge here;
+            // it is ordered via the body's back-edge sources below.
+            continue;
+        }
+        next.push_back(s);
+    }
+    // If this block is a loop body's back-edge source, also order the
+    // enclosing loop's after-block right after it.
+    for (const flow::CFGBlock* s : b->succs) {
+        if (!backEdges.count({b, s})) continue;
+        if (!s->isLoopHeader) continue;
+        if (s->succs.size() >= 2) next.push_back(s->succs[1]); // after-block
+    }
+    for (const flow::CFGBlock* s : next) {
+        if (!seen.count(s)) {
+            reversePostorder(s, backEdges, seen, post);
+        }
+    }
+    post.push_back(b);
+}
+
+} // namespace
+
+BlockState MethodOwnership::runDataflow(
+    const flow::CFG& cfg, const BlockState& entry) {
+    // Identify back-edges, then a reverse-postorder that respects every
+    // forward (non-back) edge.
+    std::unordered_set<Edge, EdgeHash> backEdges;
+    {
+        std::unordered_set<const flow::CFGBlock*> gray, black;
+        collectBackEdges(cfg.entry(), gray, black, backEdges);
+    }
+    std::vector<const flow::CFGBlock*> post;
+    std::vector<const flow::CFGBlock*> stragglers;
+    {
+        std::unordered_set<const flow::CFGBlock*> seen;
+        reversePostorder(cfg.entry(), backEdges, seen, post);
+        // Safety net: an after-block whose loop body never falls through
+        // (always returns/breaks) is not reached via the body's back-edge
+        // re-route above. Collect any such still-unseen blocks in
+        // allocation order; they are appended at the end of the final
+        // order so they process after everything reachable (their entry
+        // meet then falls back to the loop header's exit — zero-trip).
+        for (const auto& bp : cfg.blocks()) {
+            if (!seen.count(bp.get())) {
+                seen.insert(bp.get());
+                stragglers.push_back(bp.get());
+            }
+        }
+    }
+    std::reverse(post.begin(), post.end()); // postorder → reverse-postorder
+    for (const flow::CFGBlock* s : stragglers) post.push_back(s);
+
+    std::unordered_map<const flow::CFGBlock*, BlockState> exitState;
+    std::unordered_set<const flow::CFGBlock*> evaluated;
+
+    for (const flow::CFGBlock* b : post) {
+        // Entry state = §28.3 meet over evaluated, non-back-edge,
+        // non-loop-skip predecessors' exit states.
+        BlockState in;
+        bool haveIn = false;
+        if (b == cfg.entry()) {
+            in = entry;
+            haveIn = true;
+        }
+        // The merge diagnostic location: for an if/elif/else merge the
+        // CFG records the originating IfStmt so the §28.3 branch-join
+        // clash lands at the if's span, exactly as the old walker did.
+        SourceLocation joinLoc =
+            b->sourceStmt ? b->sourceStmt->span.begin : SourceLocation{};
+        // A loop after-block is fed synthetic continuations (the old walker
+        // never merged loop continuations — it walked the body once into
+        // one shared state), so meets into it must not emit a clash
+        // diagnostic. Only a real if/elif/else merge emits.
+        bool isLoopAfter = false;
+        for (const flow::CFGBlock* p : b->preds) {
+            if (isLoopSkipEdge(p, b)) { isLoopAfter = true; break; }
+        }
+        for (const flow::CFGBlock* p : b->preds) {
+            if (backEdges.count({p, b})) continue;
+            if (!evaluated.count(p)) continue;
+            // Loop-skip edge (header → after-block): the old syntactic
+            // walker continued past a loop carrying the *body-end* state
+            // of a single pass — it walked the body once and never merged
+            // a zero-trip skip path. Reproduce that: the after-block
+            // inherits the meet of the header's back-edge predecessors
+            // (the loop body's fall-through ends), not the header's own
+            // pre-loop / zero-trip state. When the body has no fall-
+            // through back-edge (it always returns/breaks), fall back to
+            // the header's exit. A real fixpoint + zero-trip leak check
+            // is O3b.
+            std::vector<const flow::CFGBlock*> sources;
+            if (isLoopSkipEdge(p, b)) {
+                for (const flow::CFGBlock* bp : p->preds) {
+                    if (backEdges.count({bp, p}) && evaluated.count(bp)) {
+                        sources.push_back(bp);
+                    }
+                }
+                if (sources.empty()) sources.push_back(p);
+            } else {
+                sources.push_back(p);
+            }
+            for (const flow::CFGBlock* src : sources) {
+                const BlockState& pe = exitState[src];
+                if (!haveIn) {
+                    in = pe;
+                    haveIn = true;
+                } else {
+                    joinInto(in, pe, joinLoc, /*emitClash=*/!isLoopAfter);
+                }
+            }
+        }
+        // Process the block's straight-line statements through the
+        // existing transfer functions.
+        states_ = std::move(in);
+        processBlock(*b);
+        exitState[b] = states_;
+        evaluated.insert(b);
+    }
+
+    // End-of-method state = the (silent) meet of every path reaching the
+    // CFG exit. Silent because the old walker never met at exit; emitting
+    // an owned/borrowed clash there would be a new diagnostic (forbidden
+    // in O3a).
+    BlockState endState;
+    bool haveEnd = false;
+    for (const flow::CFGBlock* p : cfg.exit()->preds) {
+        if (backEdges.count({p, cfg.exit()})) continue;
+        if (!evaluated.count(p)) continue;
+        const BlockState& pe = exitState[p];
+        if (!haveEnd) {
+            endState = pe;
+            haveEnd = true;
+        } else {
+            joinInto(endState, pe, SourceLocation{}, /*emitClash=*/false);
+        }
+    }
+    if (!haveEnd) {
+        // No path reaches exit (e.g. an empty body whose entry edges
+        // straight to exit was still evaluated above; this branch covers
+        // the degenerate case of an unreachable exit). Fall back to the
+        // entry-block exit state if present.
+        auto it = exitState.find(cfg.entry());
+        if (it != exitState.end()) endState = it->second;
+    }
+    return endState;
+}
+
+void MethodOwnership::processBlock(const flow::CFGBlock& block) {
+    // Each CFG block (with try treated opaquely) holds only straight-line
+    // statements plus opaque TryStmt / break / continue / return / throw.
+    // The existing per-statement transfer functions handle them; the
+    // if/while/for/do branches inside visitStmt are never reached from a
+    // block's statement list (the CFG already extracted that control flow)
+    // but remain in use for the structured walk inside an opaque try body.
+    for (const ast::Stmt* s : block.stmts) {
+        if (s) visitStmt(*s);
+    }
 }
 
 void MethodOwnership::visitStmt(const ast::Stmt& s) {

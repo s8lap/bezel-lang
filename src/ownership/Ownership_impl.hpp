@@ -17,14 +17,38 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 
 namespace bezel::ownership {
 
-// Per-method ownership analyzer (slice O1). Walks statements linearly
-// and tracks each LocalDecl's ownership state via its LocalSymbol.
+// Per-method ownership analyzer.
+//
+// Slice O3a: the analysis runs as a forward dataflow over the method
+// body's control-flow graph (`bezel::flow::CFG`) rather than the
+// original syntactic statement walker. The per-statement transfer
+// functions (handleLocalDecl / handleDischarge / handleAssignment /
+// handleReturn and the move/dispose/read helpers in Ownership_Checks.cpp)
+// are unchanged; the driver feeds each CFG basic block's straight-line
+// statement sequence through them, and merges predecessor exit states at
+// block entry using the §28.3 asymmetric meet (`joinInto`). This is a
+// behavior-preserving refactor — it reproduces the previous walker's
+// diagnostics exactly:
+//
+//   - if/elif/else joins flow through real CFG merge blocks (the merge
+//     carries the originating `IfStmt` so the clash diagnostic lands at
+//     the if's span, as before);
+//   - loops are still walked a single time with zero-trip-path semantics
+//     matching the old walker (back-edges and the loop-skip edge are
+//     excluded from the meet — a real fixpoint is deferred to O3b);
+//   - try/catch/finally is emitted opaquely into the CFG (one statement)
+//     and walked by the existing structured `visitStmt` recursion, so the
+//     O11-simple "throw is lexically last" suppression is unchanged
+//     (real per-exception-edge discharge is deferred to O11-real).
+using BlockState = std::unordered_map<sema::Symbol*, LocalOwnership>;
+
 class MethodOwnership {
 public:
     MethodOwnership(sema::SemaContext& ctx) : ctx_(ctx) {}
@@ -116,10 +140,28 @@ private:
     // obligation), but mismatched owned-vs-borrowed is rejected (the
     // spec's "silently demoting an owned obligation to a borrowed state
     // at the join would leak the resource"). Mutates `into` in place.
+    //
+    // `emitClash` controls whether the owned-vs-borrowed mismatch reports
+    // a diagnostic. It is true for the CFG merge-block meet (reproducing
+    // the old branch-join diagnostic) and false for the synthetic meet at
+    // the function exit used only to derive the end-of-method
+    // undischarged-owned state (the old walker never met at exit, so
+    // emitting there would introduce a new diagnostic — O3a forbids that).
     void joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>& into,
                   const std::unordered_map<sema::Symbol*,
                                            LocalOwnership>& other,
-                  SourceLocation joinLoc);
+                  SourceLocation joinLoc, bool emitClash = true);
+
+    // Slice O3a CFG driver: run the forward dataflow over `cfg`, seeding
+    // the entry block with `entry`. Returns the meet of all states
+    // reaching the CFG exit (used as the end-of-method state for the
+    // undischarged-owned check). Diagnostics for reads/moves/disposals
+    // and branch-join clashes are emitted during the walk.
+    BlockState runDataflow(const flow::CFG& cfg, const BlockState& entry);
+
+    // Process one CFG block's straight-line statements, mutating
+    // `states_` (which the caller has set to the block's entry state).
+    void processBlock(const flow::CFGBlock& block);
 
     sema::LocalSymbol* findLocalSymbol(const ast::LocalDecl& ld);
 

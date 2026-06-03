@@ -391,7 +391,7 @@ const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
 void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>& into,
               const std::unordered_map<sema::Symbol*,
                                        LocalOwnership>& other,
-              SourceLocation joinLoc) {
+              SourceLocation joinLoc, bool emitClash) {
     for (auto& [sym, st] : into) {
         auto it = other.find(sym);
         if (it == other.end()) continue;
@@ -410,13 +410,18 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             (st.state == OwnershipState::Borrowed &&
              o.state == OwnershipState::Owned);
         if (ownedBorrowedClash) {
-            ctx_.diagnostics().report(
-                Severity::Error, joinLoc,
-                std::string("branch ownership conflict for `") +
-                std::string(sym->name) +
-                "`: one branch produced an owned value, the other a "
-                "borrowed value (§28.3 — equalize the branches before "
-                "the merge per the two Patterns)");
+            // `emitClash` is false for the synthetic function-exit meet —
+            // see the declaration in Ownership_impl.hpp. The old walker
+            // never met at exit; emitting there would add a diagnostic.
+            if (emitClash) {
+                ctx_.diagnostics().report(
+                    Severity::Error, joinLoc,
+                    std::string("branch ownership conflict for `") +
+                    std::string(sym->name) +
+                    "`: one branch produced an owned value, the other a "
+                    "borrowed value (§28.3 — equalize the branches before "
+                    "the merge per the two Patterns)");
+            }
             st.state = OwnershipState::Poisoned;
             continue;
         }
