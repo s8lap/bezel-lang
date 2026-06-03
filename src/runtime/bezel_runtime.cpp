@@ -1242,8 +1242,13 @@ extern "C" int64_t bz_event_add(void* srcp, void* closure) {
     if (!s) return 0;
     if (s->count >= s->capacity) {
         int64_t nc = s->capacity < 4 ? 4 : s->capacity * 2;
-        s->handlers = (bz_event_handler_t*)realloc(
-            s->handlers, (size_t)nc * sizeof(bz_event_handler_t));
+        // Capture the realloc result: on failure the original block is still
+        // valid and must not be overwritten with NULL (would leak it and then
+        // NULL-deref on the writes below).
+        void* tmp = realloc(s->handlers,
+                            (size_t)nc * sizeof(bz_event_handler_t));
+        if (!tmp) return 0;
+        s->handlers = (bz_event_handler_t*)tmp;
         s->capacity = nc;
     }
     int64_t tok = s->next_token++;
@@ -1396,4 +1401,55 @@ void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len)
     buf[off] = '\0';
     *out_data = buf;
     *out_len = off;
+}
+
+// per §32.5/§32.6: re-encode a bz_string's code points to a fresh,
+// null-terminated UTF-8 buffer for the CString FFI boundary.
+//
+// The internal storage is raw code points at the string's width (1/2/4 bytes
+// each); for width>1 those bytes contain interior zeros that truncate a C
+// `char*`. Width 1 holds Latin-1 code points (0x00..0xFF) — bytes 0x80..0xFF
+// are NOT valid UTF-8 either, so we re-encode every width uniformly rather than
+// only width>1, which keeps the conversion correct for all inputs (width-1
+// pure-ASCII strings still produce the identical bytes). The caller (the
+// width-1 marshalling fast path in codegen) may still pass the raw data
+// pointer for pure-ASCII strings; this helper handles the general case.
+extern "C" char* bz_string_to_utf8z(const void* strp) {
+    if (!strp) {
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len;
+    if (n < 0) n = 0;
+    // Worst case: every code point is U+10FFFF → 4 UTF-8 bytes; +1 for NUL.
+    size_t cap = (size_t)n * 4 + 1;
+    char* out = (char*)malloc(cap);
+    if (!out) return nullptr;
+    size_t off = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp;
+        if (s->width == 1)      cp = ((const uint8_t*)s->data)[i];
+        else if (s->width == 2) cp = ((const uint16_t*)s->data)[i];
+        else                    cp = ((const uint32_t*)s->data)[i];
+        // UTF-8 encode one code point.
+        if (cp <= 0x7F) {
+            out[off++] = (char)cp;
+        } else if (cp <= 0x7FF) {
+            out[off++] = (char)(0xC0 | (cp >> 6));
+            out[off++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp <= 0xFFFF) {
+            out[off++] = (char)(0xE0 | (cp >> 12));
+            out[off++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[off++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            out[off++] = (char)(0xF0 | (cp >> 18));
+            out[off++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[off++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[off++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    out[off] = '\0';
+    return out;
 }

@@ -1873,6 +1873,36 @@ const sema::TypeRef* Emitter::recordMemberType(const sema::Symbol* m) {
 llvm::Value* Emitter::emitValueToString(llvm::Value* val,
                                         const sema::TypeRef* fieldTy) {
     using K = sema::TypeRef::Kind;
+    // per §8.3/§9.1: a NULLABLE REFERENCE field (string?, Object?, nullable
+    // class/interface) is a plain `ptr` with a real null. A null field renders
+    // as the literal "null" — the same rendering null interpolation uses
+    // (LlvmBackend_Exprs.cpp) — instead of dereferencing it (bug A). A non-null
+    // field formats by its normal rule below.
+    if (isNullableRefTy(fieldTy) && val->getType()->isPointerTy()) {
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            val, llvm::ConstantPointerNull::get(ptrTy()), "ts.null");
+        auto* liveBB = llvm::BasicBlock::Create(llvm_, "ts.live", currentFn_);
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "ts.nullstr", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "ts.end", currentFn_);
+        builder_.CreateCondBr(isNull, nullBB, liveBB);
+        // Non-null: format by the field's non-nullable form.
+        builder_.SetInsertPoint(liveBB);
+        sema::TypeRef liveTy = *fieldTy;
+        liveTy.nullable = false;
+        llvm::Value* liveStr = emitValueToString(val, &liveTy);
+        auto* liveEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        // Null: the literal "null".
+        builder_.SetInsertPoint(nullBB);
+        llvm::Value* nullStr = lowerStringLiteral("\"null\"", false);
+        auto* nullEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(ptrTy(), 2, "ts.nullable");
+        phi->addIncoming(liveStr, liveEnd);
+        phi->addIncoming(nullStr, nullEnd);
+        return phi;
+    }
     if (fieldTy && fieldTy->kind == K::Primitive) {
         // §9.1: strings are formatted by their own ToString — which for
         // string is identity (§9.6); the value is the bz_string itself.
@@ -1967,6 +1997,40 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
         fieldTy->declaration->kind == ast::TypeDeclKind::Record &&
         val->getType()->isStructTy())
         return emitRecordHashCode(val, fieldTy->declaration);
+    // per §8.3/§9.1: a NULLABLE REFERENCE field (string?, Object?, nullable
+    // class/interface) is a plain `ptr` with a real null. A null field hashes
+    // to a fixed sentinel (0) rather than dereferencing it (bug A); a non-null
+    // field hashes by its normal rule below.
+    if (isNullableRefTy(fieldTy) && val->getType()->isPointerTy()) {
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            val, llvm::ConstantPointerNull::get(ptrTy()), "h.null");
+        auto* hashBB = llvm::BasicBlock::Create(llvm_, "h.live", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "h.end", currentFn_);
+        auto* entryBB = builder_.GetInsertBlock();
+        builder_.CreateCondBr(isNull, endBB, hashBB);
+        builder_.SetInsertPoint(hashBB);
+        // Recurse with the non-nullable form: a string hashes by content, a
+        // reference by identity (its pointer bits truncated to i32).
+        bool isStr = fieldTy->kind == K::Primitive &&
+                     fieldTy->primitive == sema::PrimitiveType::String;
+        llvm::Value* live;
+        if (isStr) {
+            sema::TypeRef strTy;
+            strTy.kind = K::Primitive;
+            strTy.primitive = sema::PrimitiveType::String;
+            live = emitValueHashCode(val, &strTy);
+        } else {
+            live = builder_.CreatePtrToInt(val, i64(), "h.refbits");
+            live = builder_.CreateTrunc(live, i32(), "h.ref32");
+        }
+        auto* hashEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i32(), 2, "h.nullable");
+        phi->addIncoming(builder_.getInt32(0), entryBB);   // null → sentinel 0
+        phi->addIncoming(live, hashEnd);
+        return phi;
+    }
     bool isString = fieldTy && fieldTy->kind == K::Primitive &&
                     fieldTy->primitive == sema::PrimitiveType::String;
     if (isString || (!fieldTy && val->getType()->isPointerTy())) {

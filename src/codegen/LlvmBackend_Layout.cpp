@@ -156,6 +156,24 @@ bool Emitter::isNullablePrimTy(const sema::TypeRef* rt) {
 }
 
 
+// per §8.3/§9.1: a nullable reference type lowers to a plain `ptr` whose null
+// is a real null pointer (no hasValue tag). The synthesized value-semantics
+// members must null-guard a field of such a type before dereferencing it.
+bool Emitter::isNullableRefTy(const sema::TypeRef* rt) {
+    if (!rt || !rt->nullable) return false;
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    // string? and Object? are reference primitives that lower to ptr.
+    if (rt->kind == K::Primitive)
+        return rt->primitive == P::String || rt->primitive == P::Object;
+    // Nullable class/interface field (a named class or interface type).
+    if (rt->kind == K::Named && rt->declaration)
+        return rt->declaration->kind == ast::TypeDeclKind::Class ||
+               rt->declaration->kind == ast::TypeDeclKind::Interface;
+    return false;
+}
+
+
 llvm::StructType* Emitter::nullablePrimStructTy(sema::PrimitiveType pt) {
     return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), lowerPrimitive(pt)});
 }
@@ -784,6 +802,38 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
 llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
                                         const sema::TypeRef* fieldTy) {
     using K = sema::TypeRef::Kind;
+    // per §8.3/§9.1: a NULLABLE REFERENCE field (string?, Object?, nullable
+    // class/interface) lowers to a plain `ptr` whose null is a real null
+    // pointer. Equality is: both-null → equal; exactly-one-null → not-equal;
+    // neither-null → the type's normal comparison (content for string,
+    // identity for refs). Guard the one-null case BEFORE any loadStringLen /
+    // content compare so a null field can't be dereferenced (bug A).
+    if (isNullableRefTy(fieldTy) && l->getType()->isPointerTy() &&
+        r->getType()->isPointerTy()) {
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* lNull = builder_.CreateICmpEQ(l, nullP, "eq.lnull");
+        llvm::Value* rNull = builder_.CreateICmpEQ(r, nullP, "eq.rnull");
+        llvm::Value* bothNull = builder_.CreateAnd(lNull, rNull, "eq.bothnull");
+        llvm::Value* eitherNull = builder_.CreateOr(lNull, rNull, "eq.eithernull");
+        auto* cmpBB  = llvm::BasicBlock::Create(llvm_, "eq.cmp", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "eq.end", currentFn_);
+        auto* entryBB = builder_.GetInsertBlock();
+        // If either is null, skip the content compare; result = bothNull.
+        builder_.CreateCondBr(eitherNull, endBB, cmpBB);
+        builder_.SetInsertPoint(cmpBB);
+        bool isStr = fieldTy->kind == K::Primitive &&
+                     fieldTy->primitive == sema::PrimitiveType::String;
+        // Both non-null: string → content equality; ref → identity.
+        llvm::Value* cmp = isStr ? emitStringEq(l, r)
+                                 : builder_.CreateICmpEQ(l, r, "eq.refid");
+        auto* cmpEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "eq.nullable");
+        phi->addIncoming(bothNull, entryBB);
+        phi->addIncoming(cmp, cmpEnd);
+        return phi;
+    }
     // String field: content equality (§4.6), not pointer identity. per §8.3
     bool isString = fieldTy && fieldTy->kind == K::Primitive &&
                     fieldTy->primitive == sema::PrimitiveType::String;

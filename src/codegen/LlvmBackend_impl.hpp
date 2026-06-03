@@ -618,6 +618,13 @@ private:
     // Excludes reference-like primitives (String, Char, Object) and None.
     // These are the types represented as tagged {i8, primTy} structs.
     bool isNullablePrimTy(const sema::TypeRef* rt);
+    // per §8.3/§9.1: is rt a NULLABLE REFERENCE type — one that lowers to a
+    // plain `ptr` whose null is a real null pointer? Covers `string?`,
+    // `Object?`, and nullable class/interface fields. (Nullable VALUE
+    // primitives go through isNullablePrimTy and carry an explicit hasValue
+    // tag instead; they never null-deref.) The synthesized value-semantics
+    // members must guard a load of such a field with a null check.
+    bool isNullableRefTy(const sema::TypeRef* rt);
     // {i8 hasValue, primType value}  — i8 instead of i1 avoids x86 JIT ABI issues
     // (LLVM can't emit physreg-copy for i1 in struct return/param contexts).
     llvm::Type* nullablePrimHasValTy() { return llvm::Type::getInt8Ty(llvm_); }
