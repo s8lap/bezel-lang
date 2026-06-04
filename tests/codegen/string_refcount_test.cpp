@@ -346,6 +346,119 @@ const char* kAliasShared =
     "  end Main; "
     "end C;";
 
+// --- FINDING [1] (§28.9 / §28.3): a +1 string captured by a lambda THROUGH a
+// safe-read sub-position must NOT be released at scope end. The closure's heap
+// env block borrows (aliases) the captured string and outlives the producing
+// scope (§28.9: the closure value is runtime-managed, its captured borrow's
+// lifetime tracked separately; §28.3 classifies a capture as a borrow). Before
+// the fix the escape walker re-applied safe-read suppression inside the lambda
+// body, judged `msg` non-escaping, and armed a scope-end release — a
+// use-after-free (ASan: heap-buffer-overflow in bz_string_release on the freed
+// env cell). The fix makes ANY captured-local read inside a lambda an escape, so
+// the value is conservatively LEFT leaked (leak-over-UAF). These run for value +
+// no-corruption: the deliberate leak is tolerated; the cardinal point is that
+// ASan reports NO memory-safety error.
+
+// FINDING [1] C1: captured string read as a method receiver `msg.Length`.
+const char* kCaptureStringMethodReceiver =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var msg: string := \"hello\" + \"world\"; "
+    "    var f := () => msg.Length; "
+    "    var r := f(); "
+    "    return r; "                  // "helloworld".Length => 10
+    "  end Main; "
+    "end C;";
+
+// FINDING [1] C2: captured string read as a concat operand `(msg + \"!\").Length`.
+const char* kCaptureStringConcatOperand =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var msg: string := \"hello\" + \"world\"; "
+    "    var f := () => (msg + \"!\").Length; "
+    "    var r := f(); "
+    "    return r; "                  // "helloworld!".Length => 11
+    "  end Main; "
+    "end C;";
+
+// FINDING [1] C3: captured string read in an interpolation hole `$\"[{msg}]\"`.
+const char* kCaptureStringInterpolation =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var msg: string := \"hello\" + \"world\"; "
+    "    var f := () => $\"[{msg}]\".Length; "
+    "    var r := f(); "              // "[helloworld]".Length => 12
+    "    return r; "
+    "  end Main; "
+    "end C;";
+
+// FINDING [1] C4 CONTROL: a bare-identifier capture `() => msg` was ALREADY
+// correctly classified as an escape (and leaked) before the fix — included so
+// the suite documents both the regression case and the already-correct one.
+const char* kCaptureStringBareIdent =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var msg: string := \"hello\" + \"world\"; "
+    "    var f := () => msg; "
+    "    var r := f().Length; "       // "helloworld".Length => 10
+    "    return r; "
+    "  end Main; "
+    "end C;";
+
+// --- FINDING [2] (§4.6 / §28.9): intermediate accumulators from chained `+` and
+// multi-part interpolation are now released after the next step consumes them.
+// These are LSan-clean: the intermediates never escape and are pure codegen
+// temporaries that are reclaimed. A long loop proves steady-state (no growth).
+
+// FINDING [2] M3: chained concat — the inner "ab" intermediate is released after
+// the outer concat consumes it; the final non-escaping local is released at
+// scope end. Looped 200k times for steady-state.
+const char* kChainedConcatSteadyState =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var total: int := 0; var i: int := 0; "
+    "    while i < 200000 do "
+    "      var s: string := \"aa\" + \"bb\" + \"cc\" + \"dd\"; "
+    "      total := total + s.Length; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 1600000 then return 0; end; "
+    "    return 1; "
+    "  end Main; "
+    "end C;";
+
+// FINDING [2] M1: multi-part interpolation with a string-typed hole — every
+// accumulator is released; the part value (a borrow of the named local) is not.
+// Looped 200k times for steady-state LSan-clean reclaim.
+const char* kInterpolationSteadyState =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var name: string := \"wor\" + \"ld\"; "
+    "    var total: int := 0; var i: int := 0; "
+    "    while i < 200000 do "
+    "      var s: string := $\"hello {name} bye\"; "
+    "      total := total + s.Length; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total > 0 then return 0; end; "
+    "    return 1; "
+    "  end Main; "
+    "end C;";
+
+// FINDING [2] (cardinal-risk guard): a chained-concat result that is
+// subsequently USED — re-concatenated, compared, and returned — must be clean
+// (releasing an intermediate too early would be exactly the FINDING [1] UAF). A
+// non-escaping result is fully reclaimed (LSan-clean).
+const char* kChainedConcatResultReused =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var a: string := \"x\" + \"y\" + \"z\"; "   // a = "xyz"
+    "    var b: string := a + a; "                   // b = "xyzxyz"
+    "    if b = \"xyzxyz\" then return 0; end; "
+    "    return 1; "
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // --- LSan-clean tests (the reclaim: leaked before, clean after) ----------
@@ -389,4 +502,52 @@ BEZEL_TEST(codegen_string_refcount_422, alias_shared_freed_once_no_double_free_2
     // never free it twice. (It is freed zero times here — a tolerated leak —
     // but crucially NOT twice; ASan would abort on a double-free.)
     expectValueAndNoCorruption(kAliasShared, 6);
+}
+
+// --- FINDING [1] (§28.9 / §28.3): captured-string UAF — was a heap-buffer-
+// overflow in bz_string_release before the fix; now a tolerated leak (value +
+// no-corruption). The cardinal assertion is NO memory-safety error under ASan.
+
+BEZEL_TEST(codegen_string_refcount_422, capture_via_method_receiver_no_uaf_28_9) {
+    // C1: () => msg.Length — captured read in a safe-read (method-receiver)
+    // sub-position inside the lambda. UAF before fix; clean (leaked) after.
+    expectValueAndNoCorruption(kCaptureStringMethodReceiver, 10);
+}
+
+BEZEL_TEST(codegen_string_refcount_422, capture_via_concat_operand_no_uaf_28_9) {
+    // C2: () => (msg + "!").Length — captured read in a concat-operand position.
+    expectValueAndNoCorruption(kCaptureStringConcatOperand, 11);
+}
+
+BEZEL_TEST(codegen_string_refcount_422, capture_via_interpolation_no_uaf_28_9) {
+    // C3: () => $"[{msg}]".Length — captured read in an interpolation hole.
+    expectValueAndNoCorruption(kCaptureStringInterpolation, 12);
+}
+
+BEZEL_TEST(codegen_string_refcount_422, capture_bare_ident_control_no_uaf_28_9) {
+    // C4 CONTROL: () => msg — a bare-identifier capture, already classified as an
+    // escape before the fix; documents the already-correct case.
+    expectValueAndNoCorruption(kCaptureStringBareIdent, 10);
+}
+
+// --- FINDING [2] (§4.6 / §28.9): chained-concat / interpolation accumulator
+// intermediates are now reclaimed (LSan-clean), including in long loops.
+
+BEZEL_TEST(codegen_string_refcount_422, chained_concat_steady_state_reclaimed_4_6) {
+    // M3 scaled: the per-iteration intermediate accumulators are released → no
+    // growth. Leaked unboundedly before the fix.
+    expectValueAndLeakFree(kChainedConcatSteadyState, 0);
+}
+
+BEZEL_TEST(codegen_string_refcount_422, interpolation_steady_state_reclaimed_4_6) {
+    // M1 scaled: multi-part interpolation with a string-typed hole — every
+    // accumulator reclaimed; the part borrow is correctly left untouched.
+    expectValueAndLeakFree(kInterpolationSteadyState, 0);
+}
+
+BEZEL_TEST(codegen_string_refcount_422, chained_concat_result_reused_clean_no_uaf_4_6) {
+    // The cardinal-risk guard for FINDING [2]: a chained-concat result that is
+    // re-concatenated and compared must be clean — releasing an intermediate too
+    // early would reintroduce the FINDING [1] UAF. LSan-clean (no leak, no DF).
+    expectValueAndLeakFree(kChainedConcatResultReused, 0);
 }

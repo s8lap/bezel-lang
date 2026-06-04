@@ -2200,6 +2200,17 @@ struct StringEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
     bool escaped = false;
+    // FINDING [1] / §28.9 / §28.3: true while walking inside a lambda body. A
+    // closure's heap env block captures (borrows) the target local and outlives
+    // the producing scope (§28.9: the closure value itself is runtime-managed,
+    // "the captured borrow's lifetime is tracked separately"). So once inside a
+    // lambda body, ANY read of the captured outer local is an ESCAPE regardless
+    // of its safe-read sub-position (method receiver, concat operand,
+    // interpolation part, `is`/`as` operand): the env still aliases it after the
+    // scope ends, so a scope-end release would free a value the closure holds
+    // (use-after-free). The lambda's OWN params/locals are distinct LocalDecls
+    // and never match `target`, so they are unaffected.
+    bool inLambda = false;
 
     bool isTargetIdent(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -2212,7 +2223,9 @@ struct StringEscapeWalker {
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-            if (isTargetIdent(id) && !safeRead) escaped = true;
+            // FINDING [1]: inside a lambda body, a captured-local read always
+            // escapes — the env outlives the scope (safe-read does not apply).
+            if (isTargetIdent(id) && (!safeRead || inLambda)) escaped = true;
             return;
         }
         // Concat / comparison: both operands are non-consuming reads.
@@ -2303,9 +2316,17 @@ struct StringEscapeWalker {
             return;
         }
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
-            // A lambda may capture the local and outlive its scope — escape.
+            // FINDING [1] / §28.9 / §28.3: a lambda captures the local into its
+            // heap env, which outlives the producing scope. Walk the body with
+            // inLambda set so EVERY read of the captured target — even in a
+            // safe-read sub-position (`cap.Length`, `cap + "!"`, `$"[{cap}]"`,
+            // `cap is T`) — is flagged as an escape, preventing a scope-end
+            // release that would free a value the env still aliases (UAF).
+            bool savedInLambda = inLambda;
+            inLambda = true;
             if (lam->exprBody) expr(lam->exprBody.get(), /*safeRead=*/false);
             for (auto& s : lam->stmts) stmt(s.get());
+            inLambda = savedInLambda;
             return;
         }
         if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
@@ -2490,6 +2511,12 @@ struct ClosureEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
     bool escaped = false;
+    // FINDING [1] / §28.9 / §28.3: true while walking inside a lambda body. A
+    // captured closure local read inside a nested lambda is held by that
+    // lambda's env, which outlives the producing scope, so it must be an ESCAPE
+    // even in an otherwise-safe-read position (a call CALLEE `cap()` or a
+    // reference-equality operand). See the String walker for the full rationale.
+    bool inLambda = false;
 
     bool isTargetIdent(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -2502,7 +2529,9 @@ struct ClosureEscapeWalker {
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-            if (isTargetIdent(id) && !safeRead) escaped = true;
+            // FINDING [1]: inside a lambda body, a captured-local read always
+            // escapes — the env outlives the scope (safe-read does not apply).
+            if (isTargetIdent(id) && (!safeRead || inLambda)) escaped = true;
             return;
         }
         // Reference equality `f = g` / `f <> g` (§27.7.1): both operands are
@@ -2586,9 +2615,16 @@ struct ClosureEscapeWalker {
             return;
         }
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
-            // A lambda may capture the local and outlive its scope — escape.
+            // FINDING [1] / §28.9 / §28.3: a lambda captures the local into its
+            // heap env, which outlives the scope. Walk the body with inLambda
+            // set so EVERY read of the captured target — even a call callee
+            // `cap()` or a reference-equality operand — is flagged as an escape,
+            // preventing a scope-end release of a value the env still aliases.
+            bool savedInLambda = inLambda;
+            inLambda = true;
             if (lam->exprBody) expr(lam->exprBody.get(), /*safeRead=*/false);
             for (auto& s : lam->stmts) stmt(s.get());
+            inLambda = savedInLambda;
             return;
         }
         if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
@@ -2838,6 +2874,12 @@ struct BoxEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
     bool escaped = false;
+    // FINDING [1] / §28.9 / §28.3: true while walking inside a lambda body. A
+    // captured boxed-Object local read inside a lambda is held by the lambda's
+    // env, which outlives the producing scope, so it must be an ESCAPE even in
+    // an otherwise-safe-read position (`cap is T` / `cap as T` / `cap = null`).
+    // See the String walker for the full rationale.
+    bool inLambda = false;
 
     bool isTargetIdent(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -2850,7 +2892,9 @@ struct BoxEscapeWalker {
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-            if (isTargetIdent(id) && !safeRead) escaped = true;
+            // FINDING [1]: inside a lambda body, a captured-local read always
+            // escapes — the env outlives the scope (safe-read does not apply).
+            if (isTargetIdent(id) && (!safeRead || inLambda)) escaped = true;
             return;
         }
         // `o is T` / `o as T`: the operand is a non-consuming read (`is` walks
@@ -2953,8 +2997,16 @@ struct BoxEscapeWalker {
             return;
         }
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // FINDING [1] / §28.9 / §28.3: a lambda captures the local into its
+            // heap env, which outlives the scope. Walk the body with inLambda
+            // set so EVERY read of the captured target — even `cap is T` /
+            // `cap as T` / `cap = null` — is flagged as an escape, preventing a
+            // scope-end release of a value the env still aliases.
+            bool savedInLambda = inLambda;
+            inLambda = true;
             if (lam->exprBody) expr(lam->exprBody.get(), /*safeRead=*/false);
             for (auto& s : lam->stmts) stmt(s.get());
+            inLambda = savedInLambda;
             return;
         }
         if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {

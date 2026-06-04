@@ -392,6 +392,46 @@ const char* kBoxPassedAsArg =
     "  end Main; "
     "end C;";
 
+// --- FINDING [1] (§28.9 / §28.3): a +1 box wrapper captured by a lambda THROUGH
+// a safe-read sub-position (an `is`/`as` operand) must NOT be released at scope
+// end. The closure's heap env borrows (aliases) the captured box and outlives
+// the producing scope (§28.9: boxed values are runtime-managed; §28.3
+// classifies a capture as a borrow). Before the fix the escape walker re-applied
+// the `is`/`as`-operand safe-read suppression inside the lambda body, judged `o`
+// non-escaping, and armed a scope-end bz_box_release — a use-after-free (ASan:
+// heap-buffer-overflow in bz_box_release on the freed env cell). The fix makes
+// ANY captured-local read inside a lambda an escape, so `o` is conservatively
+// LEFT leaked (leak-over-UAF). Value + no-corruption.
+
+// FINDING [1] E1: captured box read as an `is` operand inside the lambda.
+// NB: the return value must NOT be 1 — ASan's default error exit code is 1, so a
+// UAF-abort would be indistinguishable from a clean exit 1 under the
+// no-corruption harness (which does not override exitcode). 7 disambiguates.
+const char* kCaptureBoxIsOperand =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var o: Object := 5; "
+    "    var f := () => (o is int); "
+    "    var b := f(); "
+    "    if b then return 7; end; "    // o is int => true => 7
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// FINDING [1] E1 CONTROL: a bare-identifier box capture `() => o` — already
+// classified as an escape before the fix; documents the already-correct case.
+// Returns 7 for the same ASan-exit-code disambiguation reason as above.
+const char* kCaptureBoxBareIdent =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var o: Object := 5; "
+    "    var f := () => o; "          // outer lambda forwards o
+    "    var got: Object := f(); "
+    "    if got is int then return 7; end; "  // 7
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // --- LSan-clean tests (the reclaim: leaked before, clean after) ----------
@@ -443,4 +483,21 @@ BEZEL_TEST(codegen_box_refcount_422, box_alias_shared_freed_once_no_double_free_
 
 BEZEL_TEST(codegen_box_refcount_422, box_passed_as_arg_no_uaf_28_9) {
     expectValueAndNoCorruption(kBoxPassedAsArg, 9);
+}
+
+// --- FINDING [1] (§28.9 / §28.3): captured-box UAF — was a heap-buffer-overflow
+// in bz_box_release before the fix; now a tolerated leak (value + no-corruption).
+// The cardinal assertion is NO memory-safety error under ASan.
+
+BEZEL_TEST(codegen_box_refcount_422, capture_box_is_operand_no_uaf_28_9) {
+    // E1: () => (o is int) — a captured box read in an `is`-operand safe-read
+    // position inside the lambda. UAF in bz_box_release before fix; clean
+    // (leaked) after — the env borrows the captured box, so it must not be freed.
+    expectValueAndNoCorruption(kCaptureBoxIsOperand, 7);
+}
+
+BEZEL_TEST(codegen_box_refcount_422, capture_box_bare_ident_control_no_uaf_28_9) {
+    // E1 CONTROL: () => o — a bare-identifier box capture, already an escape
+    // before the fix; documents the already-correct case.
+    expectValueAndNoCorruption(kCaptureBoxBareIdent, 7);
 }

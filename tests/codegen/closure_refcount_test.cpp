@@ -413,6 +413,41 @@ const char* kMethodRefChurnSteadyState =
     "  end Main; "
     "end C;";
 
+// --- FINDING [1] (§28.9 / §28.3): a +1 closure cell captured by an OUTER lambda
+// THROUGH a safe-read sub-position (a call-callee `() => g()`) must NOT be
+// released at scope end. The outer closure's env borrows (aliases) the captured
+// cell and outlives the producing scope (§28.9: the closure value is
+// runtime-managed; §28.3 classifies a capture as a borrow). Before the fix the
+// escape walker re-applied call-callee safe-read suppression inside the lambda
+// body, judged `g` non-escaping, and armed a scope-end bz_closure_release — a
+// use-after-free (ASan: heap-buffer-overflow in bz_closure_release on the freed
+// env cell). The fix makes ANY captured-local read inside a lambda an escape, so
+// `g` is conservatively LEFT leaked (leak-over-UAF). Value + no-corruption.
+
+// FINDING [1] D1: captured closure invoked inside the outer lambda `() => g()`.
+const char* kCaptureClosureCalled =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var g: () -> int := () => 7; "
+    "    var f: () -> int := () => g(); "
+    "    var r := f(); "             // g() => 7
+    "    return r; "
+    "  end Main; "
+    "end C;";
+
+// FINDING [1] D1 CONTROL: a bare-identifier closure capture `() => g` — already
+// classified as an escape before the fix (forwarded onward). Documents the
+// already-correct case. The outer lambda returns g, which the caller invokes.
+const char* kCaptureClosureBareIdent =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var g: () -> int := () => 7; "
+    "    var f := () => g; "         // outer lambda forwards g (inferred type)
+    "    var inner := f(); "
+    "    return inner(); "           // g() => 7
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // --- LSan-clean tests (the reclaim: leaked before, clean after) ----------
@@ -475,4 +510,21 @@ BEZEL_TEST(codegen_closure_refcount_422, aliased_closure_freed_once_no_double_fr
     // zero times here — a tolerated leak — but crucially NOT twice; ASan would
     // abort on a double-free.)
     expectValueAndNoCorruption(kAliasedClosureSharedFreedOnce, 22);
+}
+
+// --- FINDING [1] (§28.9 / §28.3): captured-closure UAF — was a heap-buffer-
+// overflow in bz_closure_release before the fix; now a tolerated leak (value +
+// no-corruption). The cardinal assertion is NO memory-safety error under ASan.
+
+BEZEL_TEST(codegen_closure_refcount_422, capture_closure_called_no_uaf_28_9) {
+    // D1: () => g() — a captured closure invoked (call-callee safe-read) inside
+    // an outer lambda. UAF in bz_closure_release before fix; clean (leaked)
+    // after — the env borrows the captured cell, so it must not be released.
+    expectValueAndNoCorruption(kCaptureClosureCalled, 7);
+}
+
+BEZEL_TEST(codegen_closure_refcount_422, capture_closure_bare_ident_control_no_uaf_28_9) {
+    // D1 CONTROL: () => g — a bare-identifier closure capture, already an escape
+    // before the fix; documents the already-correct case.
+    expectValueAndNoCorruption(kCaptureClosureBareIdent, 7);
 }
