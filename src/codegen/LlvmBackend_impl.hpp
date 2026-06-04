@@ -1207,16 +1207,36 @@ private:
 
     // §28.2 / §28.4: dispatch an object's PUBLIC idempotent Dispose through its
     // vtable (slot 1) — runs the destructor + owned fields + base chain at most
-    // once. Does NOT free the block. `obj` must be non-null. Used both as the
-    // dispatch primitive and directly by explicit `obj.Dispose()` (which only
-    // needs the run-once dispatch, never the reclaim).
+    // once. Does NOT free the block. `obj` must be non-null. Used as the dispatch
+    // primitive, and by explicit `obj.Dispose()` on a receiver this scope does
+    // NOT own (a temporary/borrow) where reclaiming could double-free (#415).
     void emitDynamicDispose(llvm::Value* obj);
 
     // #380 / §28: dispatch the idempotent Dispose AND reclaim the heap block —
     // for an auto-dispose site that owns the slot/field and is the last dispose
     // of the object (using-var scope-end, owned-field auto-dispose, exception
-    // unwind, caught-exception normal-exit free). free(null) is a no-op.
+    // unwind, caught-exception normal-exit free), and (since #415) for an
+    // explicit `obj.Dispose()` whose receiver is a slot/field this scope owns and
+    // can null to block a second reclaim. free(null) is a no-op.
     void emitDisposeAndReclaim(llvm::Value* obj);
+
+    // #415 / §28.2 / §28.4: for an explicit `receiver.Dispose()` on a class/
+    // interface instance, return the addressable slot/field this scope OWNS and
+    // may null to block a second reclaim — i.e. when reclaiming the block at the
+    // explicit site is safe (the slot is the sole other reclaim path, which the
+    // null then suppresses). Returns the slot address (via lvalueAddr, so boxed/
+    // captured locals and owned fields resolve correctly) for:
+    //   - an identifier naming a `using var` local (scope owns it);
+    //   - an identifier naming a plain `var` owned local (owned by structure —
+    //     init is `new C(...)` or an `owned T` return; same test the §28.3
+    //     unwind-disposal registration uses);
+    //   - an identifier naming an `owned` parameter (§28.8);
+    //   - a member access `obj.f` where `f` is an `owned` reference field (§28.5).
+    // Returns nullptr for a temporary, a borrow, or a non-owned field — there
+    // reclaiming could double-free with the value's real owner, so the caller
+    // stays dispatch-only (#415 conservative fallback).
+    llvm::Value* explicitDisposeOwnedReceiverSlot(const ast::Expr& receiver,
+                                                  llvm::Type*& slotTy);
 
     // #362 / stdlib §4.5: a module-level `void(void*)` thunk that runs an
     // owning collection element's destructor via dynamic dispatch (vtable
