@@ -60,8 +60,13 @@ BEZEL_TEST(own_read, move_out_of_using_var_diagnosed) {
 }
 
 BEZEL_TEST(own_read, normal_use_before_dispose_clean) {
+    // A normal read of `x` before disposing it is clean. (Originally this read
+    // `x.Length`, but `T` has no `Length` member; issue #414 now diagnoses
+    // unknown members on a fully-resolved user type, so the read must name a
+    // real member. `x.ToString()` is the universal §8.1 Object member — a valid
+    // read that exercises the same use-before-dispose ownership path.)
     auto r = parseAndCheckOwnership(wrap(
-        "var x := new T(); _ := x.Length; x.Dispose();"));
+        "var x := new T(); _ := x.ToString(); x.Dispose();"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

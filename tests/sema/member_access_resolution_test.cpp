@@ -173,11 +173,12 @@ BEZEL_TEST(sema_member, this_property_resolves_to_property_symbol) {
     }
 }
 
-BEZEL_TEST(sema_member, unresolved_member_on_this_silently_unset) {
-    // Slice 3d does not diagnose unresolved members (the lookup is
-    // intentionally conservative — base-type/inherited and extension-
-    // member dispatch arrive in later slices). The MemberAccessExpr
-    // simply lacks an exprSymbol; later passes can still proceed.
+BEZEL_TEST(sema_member, unresolved_member_on_this_unset_and_diagnosed) {
+    // issue #414: an unknown member on a fully-resolved user type (here the
+    // current class `C`) is now a compile error — it leaves no resolved
+    // exprSymbol AND emits a diagnostic, so codegen never lowers a null
+    // callee. (The detailed message/scope is asserted in
+    // unknown_member_test.cpp; this guards the resolution-side state.)
     auto r = parseSemaAll(
         "module M; "
         "class C "
@@ -188,6 +189,7 @@ BEZEL_TEST(sema_member, unresolved_member_on_this_silently_unset) {
     if (ma) {
         BEZEL_EXPECT_TRUE(r.ctx->exprSymbol(*ma) == nullptr);
     }
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(sema_member, qualified_field_access_resolves) {

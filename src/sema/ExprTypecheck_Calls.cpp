@@ -1816,7 +1816,53 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             else if (m == "Equals")
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         }
-        // Slice 3d intentionally does NOT diagnose unknown members.
+        // issue #414 (§8.1, §11.3, §12.1): diagnose a genuinely-unknown member.
+        // Left undiagnosed, an unresolved member produces no resolved symbol and
+        // codegen lowers a null callee → a silent garbage/zero result. We turn
+        // it into a compile error — but ONLY when sema can be CERTAIN the member
+        // is absent, i.e. the receiver is a fully-resolved USER type whose member
+        // set is known-complete. That is a `class`/`record`/`enum` whose
+        // TypeSymbol carries a non-null `decl` (a user TypeDecl). Everything else
+        // stays permissive, because builtin/intrinsic member resolution is
+        // incomplete and a blanket rejection would falsely reject valid code:
+        //
+        //   - Builtin/intrinsic classes (Console, Math, Convert, Random, …) and
+        //     the builtin collection / string / Task types have a null `decl`
+        //     and no MemberSymbols; their members are dispatched by name in
+        //     codegen, not via sema symbols. (Reached via the `!targetType->decl`
+        //     branch above; we never get here for them with a non-null decl.)
+        //   - Interfaces: default/inherited interface-member resolution is not
+        //     complete here, so an interface-typed receiver is not known-complete.
+        //   - The universal `Object` members (§8.1) — `GetType`, `Equals`,
+        //     `GetHashCode`, `ToString`, `ReferenceEquals` — and `Dispose`
+        //     (§8.7, on every non-static class) exist on EVERY type without a
+        //     user MemberSymbol (codegen synthesizes them), so they must never be
+        //     rejected here.
+        //   - `Object`-typed and generic-parameter (`T`) receivers never reach
+        //     this branch: their TypeRef has no non-null `declaration`, so
+        //     `targetType` is null and the function returned earlier.
+        //
+        // When the receiver was flow-narrowed (§12.7, issue #413), `targetType`
+        // is already the narrowed type, so a member declared only on the narrowed
+        // type resolves and is not rejected.
+        bool knownCompleteUserType =
+            targetType->decl != nullptr &&
+            (targetType->kind == ast::TypeDeclKind::Class ||
+             targetType->kind == ast::TypeDeclKind::Record ||
+             targetType->kind == ast::TypeDeclKind::Enum);
+        // §8.1 / §8.7: universal members present on every type without a
+        // MemberSymbol — never diagnose these as missing.
+        const auto& mm = ma.member;
+        bool isUniversalObjectMember =
+            mm == "ToString" || mm == "Equals" || mm == "GetHashCode" ||
+            mm == "GetType" || mm == "ReferenceEquals" || mm == "Dispose";
+        if (knownCompleteUserType && !isUniversalObjectMember) {
+            ctx_.diagnostics().report(
+                Severity::Error, ma.span.begin,
+                std::string("no member `") + std::string(ma.member) +
+                    "` on type `" + std::string(targetType->name) +
+                    "` (§11.3, §12.1)");
+        }
         return;
     }
     // Slice S8: visibility check. A `private` member is accessible

@@ -136,6 +136,7 @@ set(BEZEL_TEST_SOURCES
     sema/extern_ffi_type_test.cpp
     sema/entry_point_test.cpp
     sema/flow_narrowing_test.cpp
+    sema/unknown_member_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     flow/cfg_suspend_test.cpp
