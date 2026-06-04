@@ -380,14 +380,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         {recv, llvm::ConstantPointerNull::get(ptrTy())});
                     return llvm::ConstantInt::get(i32(), 0);  // unit result
                 }
-                // per §4.10 (#351): set-algebra ops whose `other` argument is a
-                // dict-backed Set of the SAME element type are wired by
-                // enumerating the other table's elements (bz_dict_keys_gen, #370)
-                // and folding them into / against self via the generic entry
-                // points. UnionWith / ExceptWith mutate only self while iterating
-                // `other` (no mutate-while-iterate hazard). IsSubsetOf /
-                // IsSupersetOf are pure membership queries.
+                // per §4.10 (#351/#389): set-algebra ops over a dict-backed Set.
+                // The helper snapshots `other`'s elements — either via the same-
+                // typed Set's key table (bz_dict_keys_gen, #370) or, for a non-Set
+                // IEnumerable<T> `other` (e.g. an Array<T> source), via the lazy
+                // enumerator (#326) — then folds the snapshot into/against self in
+                // the runtime (bz_set_algebra_gen). IntersectWith (#389) is now
+                // included: it snapshots self's own keys before removing, so there
+                // is no mutate-while-iterate hazard.
                 if ((m == "UnionWith" || m == "ExceptWith" ||
+                     m == "IntersectWith" ||
                      m == "IsSubsetOf" || m == "IsSupersetOf") &&
                     call.args.size() == 1 && call.args[0].value) {
                     // `elemTy` here is the self element's TypeRef (the binding
@@ -395,7 +397,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     if (llvm::Value* res = tryLowerSetAlgebra(
                             m, recv, *call.args[0].value, elemTy, elemIsRecord))
                         return res;
-                    // other not a same-typed dict-backed Set → defer (fall out).
+                    // other element type mismatched self → defer (fall out).
                 }
                 return nullptr;  // remaining ops scoped out for dict-backed sets
             }
@@ -4248,102 +4250,88 @@ llvm::Function* Emitter::buildRecordEqTrampoline(const sema::TypeSymbol* rec) {
 //
 // `*byteSize` receives the stored key/element byte count (the LLVM alloc size
 // of the key type: 8 for a string pointer, 4 for an int, sizeof(record), …).
-// stdlib §4.10 (#351): lower a dict-backed Set's set-algebra op against another
-// dict-backed Set of the same element type, by snapshotting one table's
-// elements (bz_dict_keys_gen, #370) and folding them into/against the other via
-// the generic entry points. Returns nullptr (caller defers) when `otherExpr` is
-// not a same-typed dict-backed Set — e.g. an array-typed IEnumerable<T> source,
-// which would need a different enumerator and is out of this slice's scope.
+// stdlib §4.10 (#351/#389): lower a dict-backed Set's set-algebra op. `other` is
+// snapshotted into a malloc'd array of element-byte-blob pointers (the shape
+// bz_dict_keys_gen produces), then folded into/against self by the runtime
+// (bz_set_algebra_gen, which frees the snapshot). Two snapshot sources:
+//   * a same-typed dict-backed Set `other` → bz_dict_keys_gen on its table (#370)
+//   * a non-Set IEnumerable<T> `other` (e.g. an Array<T> source) → enumerate via
+//     the lazy enumerator (#326) and collect each element via
+//     bz_set_collect_enumerator.
+// Either way the element type must match self's (same LLVM type + record-ness) so
+// the snapshot bytes are layout-compatible with self's keys. Returns nullptr
+// (caller defers) only on an element-type mismatch.
 llvm::Value* Emitter::tryLowerSetAlgebra(std::string_view method,
                                          llvm::Value* selfTbl,
                                          const ast::Expr& otherExpr,
                                          const sema::TypeRef* selfElemRef,
                                          bool elemIsRecord) {
-    // `other` must be a Set/OwnedSet whose element routes through the generic
-    // table with the same element type as self (same LLVM type / record-ness).
+    if (!selfElemRef) return nullptr;
     auto* otherTy = ctx_.exprType(otherExpr);
-    if (!otherTy || !otherTy->astNode || !otherTy->astNode->name ||
-        otherTy->astNode->name->parts.empty() || otherTy->declaration)
-        return nullptr;
-    auto on = otherTy->astNode->name->parts[0];
-    if (on != "Set" && on != "OwnedSet") return nullptr;
+
+    // Determine `other`'s element type and whether it is a same-typed dict-backed
+    // Set (whose key table we can snapshot directly) or some other IEnumerable<T>.
+    bool otherIsSet = otherTy && otherTy->astNode && otherTy->astNode->name &&
+                      !otherTy->astNode->name->parts.empty() &&
+                      !otherTy->declaration &&
+                      (otherTy->astNode->name->parts[0] == "Set" ||
+                       otherTy->astNode->name->parts[0] == "OwnedSet") &&
+                      genericBackingType(otherTy, 0, /*isSet=*/true, nullptr);
+
     const sema::TypeRef* otherElem =
-        genericBackingType(otherTy, 0, /*isSet=*/true, nullptr);
-    if (!otherElem || !selfElemRef) return nullptr;
+        (otherTy && !otherTy->genericArgs.empty()) ? otherTy->genericArgs[0]
+                                                    : nullptr;
+    if (!otherElem) return nullptr;
     if (lowerTypeRef(otherElem) != lowerTypeRef(selfElemRef))
-        return nullptr;  // element mismatch
-    if ((recordTypeOfRef(otherElem) != nullptr) != elemIsRecord) return nullptr;
+        return nullptr;  // element LLVM-type mismatch → defer
+    if ((recordTypeOfRef(otherElem) != nullptr) != elemIsRecord)
+        return nullptr;  // record-ness mismatch → defer
 
-    llvm::Value* otherTbl = lowerExpr(otherExpr);
-    if (!otherTbl) return nullptr;
-
-    // IsSubsetOf enumerates SELF and tests membership in OTHER; the other three
-    // enumerate OTHER. Choose the table to snapshot and the table to query.
-    bool enumSelf = (method == "IsSubsetOf");
-    llvm::Value* srcTbl = enumSelf ? selfTbl : otherTbl;
-    llvm::Value* qryTbl = enumSelf ? otherTbl : selfTbl;
-
+    // Build the snapshot (keys: void**, n: i64) of `other`'s elements.
     auto* keysOutSlot = entryAlloca(ptrTy());
     auto* cntSlot     = entryAlloca(i64());
-    auto* keysFn = declareC("bz_dict_keys_gen", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), ptrTy()});
-    builder_.CreateCall(keysFn, {srcTbl, keysOutSlot, cntSlot});
+    if (otherIsSet) {
+        llvm::Value* otherTbl = lowerExpr(otherExpr);
+        if (!otherTbl) return nullptr;
+        auto* keysFn = declareC("bz_dict_keys_gen", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(keysFn, {otherTbl, keysOutSlot, cntSlot});
+    } else {
+        // Non-Set IEnumerable<T>: drain the lazy enumerator into the snapshot.
+        // The enumerator's per-element byte stride (collectionElemSize) must
+        // equal self's key_size, so the snapshot bytes are layout-compatible
+        // with self's keys; they agree for primitives/enums/strings and for
+        // records that fit the array stride. If they differ — a record wider
+        // than the array's element stride, an independent Array<T>-storage
+        // limitation — defer rather than read past the enumerator's buffer.
+        uint64_t ksz = 0;
+        genericBackingType(otherTy, 0, /*isSet=*/true, &ksz);  // self.key_size
+        if ((int64_t)ksz != collectionElemSize(otherTy)) return nullptr;
+        sema::TypeRef* enumElemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(otherExpr, enumElemRef);
+        if (!lazy) return nullptr;
+        auto* collectFn = declareC("bz_set_collect_enumerator",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), ptrTy()});
+        builder_.CreateCall(collectFn,
+            {lazy, builder_.getInt64((int64_t)ksz), keysOutSlot, cntSlot});
+    }
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);  // void**
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
-    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
-    bool isQuery = (method == "IsSubsetOf" || method == "IsSupersetOf");
-    // For the membership queries, accumulate "all present so far" in a slot.
-    llvm::AllocaInst* allSlot = nullptr;
-    if (isQuery) {
-        allSlot = entryAlloca(i1());
-        builder_.CreateStore(builder_.getTrue(), allSlot);
-    }
-
-    auto* idxSlot = entryAlloca(i64());
-    builder_.CreateStore(builder_.getInt64(0), idxSlot);
-    auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.cond", currentFn_);
-    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sa.body", currentFn_);
-    auto* incBB  = llvm::BasicBlock::Create(llvm_, "sa.inc",  currentFn_);
-    auto* endBB  = llvm::BasicBlock::Create(llvm_, "sa.end",  currentFn_);
-    builder_.CreateBr(condBB);
-
-    builder_.SetInsertPoint(condBB);
-    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
-
-    builder_.SetInsertPoint(bodyBB);
-    llvm::Value* keyPtrPtr = builder_.CreateGEP(ptrTy(), keysArr, idx);
-    llvm::Value* keyPtr    = builder_.CreateLoad(ptrTy(), keyPtrPtr);  // void* bytes
-    llvm::Value* sentinel = builder_.CreateIntToPtr(builder_.getInt64(1), ptrTy());
-    if (method == "UnionWith") {
-        auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(fn, {qryTbl, keyPtr, sentinel});
-    } else if (method == "ExceptWith") {
-        auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
-        builder_.CreateCall(fn, {qryTbl, keyPtr});
-    } else {  // IsSubsetOf / IsSupersetOf — test membership in qryTbl
-        auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
-        llvm::Value* has = builder_.CreateCall(fn, {qryTbl, keyPtr});
-        llvm::Value* prev = builder_.CreateLoad(i1(), allSlot);
-        builder_.CreateStore(builder_.CreateAnd(prev, has), allSlot);
-    }
-    builder_.CreateBr(incBB);
-
-    builder_.SetInsertPoint(incBB);
-    llvm::Value* idxI = builder_.CreateLoad(i64(), idxSlot);
-    llvm::Value* kpp2 = builder_.CreateGEP(ptrTy(), keysArr, idxI);
-    llvm::Value* kp2  = builder_.CreateLoad(ptrTy(), kpp2);
-    builder_.CreateCall(freeFn, {kp2});                 // free this key's copy
-    builder_.CreateStore(builder_.CreateAdd(idxI, builder_.getInt64(1)), idxSlot);
-    builder_.CreateBr(condBB);
-
-    builder_.SetInsertPoint(endBB);
-    builder_.CreateCall(freeFn, {keysArr});             // free the snapshot array
+    // Map the method to the runtime op code and fold.
+    int32_t op = method == "UnionWith"     ? 0
+               : method == "ExceptWith"    ? 1
+               : method == "IntersectWith" ? 2
+               : method == "IsSubsetOf"    ? 3
+               : /* IsSupersetOf */          4;
+    bool isQuery = (op == 3 || op == 4);
+    auto* foldFn = declareC("bz_set_algebra_gen", i32(),
+                            {ptrTy(), ptrTy(), i64(), i32()});
+    llvm::Value* r = builder_.CreateCall(foldFn,
+        {selfTbl, keysArr, cnt, builder_.getInt32(op)}, "set.algebra");
     if (isQuery)
-        return builder_.CreateLoad(i1(), allSlot, "set.algebra.r");
-    return llvm::ConstantInt::get(i32(), 0);            // unit result for mutators
+        return builder_.CreateTrunc(r, i1(), "set.algebra.r");
+    return llvm::ConstantInt::get(i32(), 0);  // unit result for mutators
 }
 
 const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
@@ -4538,9 +4526,26 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
         elemRef = recvTy->genericArgs[0];
         return recv;
     }
-    // Concrete collection (Array<T> family): wrap it as a lazy ARRAY source.
+    // issue #389 / stdlib §5 / §4.10: a dict-backed Set<T> is IEnumerable<T>
+    // (Set: ICollection<T>: IEnumerable<T>) but its backing pointer is a
+    // bz_dict_t*, not a bz_array_t* — wrap it via the Set lazy source, which
+    // snapshots the element keys. Only the generic dict-backed Sets (record /
+    // primitive / enum / string elements) need this; a plain class-element
+    // OwnedSet is array-backed and takes the ARRAY path below.
     elemRef = (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
                                                        : nullptr;
+    if (recvTy && recvTy->astNode && recvTy->astNode->name &&
+        !recvTy->astNode->name->parts.empty() &&
+        (recvTy->astNode->name->parts[0] == "Set" ||
+         recvTy->astNode->name->parts[0] == "OwnedSet")) {
+        uint64_t ksz = 0;
+        if (genericBackingType(recvTy, 0, /*isSet=*/true, &ksz)) {
+            auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
+            return builder_.CreateCall(setFn,
+                {recv, builder_.getInt64((int64_t)ksz)}, "lazy.set");
+        }
+    }
+    // Concrete collection (Array<T> family): wrap it as a lazy ARRAY source.
     int64_t esz = collectionElemSize(recvTy);
     auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
     return builder_.CreateCall(wrapFn, {recv, builder_.getInt64(esz)}, "lazy.src");

@@ -526,6 +526,61 @@ void bz_dict_keys_gen(void* dp, void*** keys_out, int64_t* n_out) {
     if (n_out)    *n_out    = j;
 }
 
+// issue #389 / stdlib §4.10: fold a snapshot of `other`'s elements into/against
+// a dict-backed Set `self`. See the header for the `op` codes and the snapshot
+// contract. Frees the snapshot before returning. UnionWith/ExceptWith iterate
+// the snapshot and mutate self (no mutate-while-iterate hazard — the snapshot is
+// a private copy). IntersectWith and the subset/superset queries first build a
+// temporary membership table from the snapshot using self's own hash/eq/key_size
+// (so equality follows T's contract, §8.3), then compare; IntersectWith also
+// snapshots self's keys before removing, so it never mutates a table it iterates.
+int32_t bz_set_algebra_gen(void* selfp, void** keys, int64_t n, int32_t op) {
+    auto* self = (bz_dict_t*)selfp;
+    int32_t result = 0;
+    if (!self || self->key_size <= 0) { /* fall through to free */ }
+    else if (op == 0) {                 // UnionWith
+        for (int64_t i = 0; i < n; i++)
+            bz_dict_set_gen(self, keys[i], (void*)1);
+    } else if (op == 1) {               // ExceptWith
+        for (int64_t i = 0; i < n; i++)
+            bz_dict_remove_gen(self, keys[i]);
+    } else {                            // IntersectWith / IsSubsetOf / IsSupersetOf
+        // Build a temp membership set from the snapshot, keyed like self.
+        auto* other = (bz_dict_t*)bz_dict_alloc_generic(
+            self->key_size, self->hash_fn, self->eq_fn);
+        for (int64_t i = 0; i < n; i++)
+            bz_dict_set_gen(other, keys[i], (void*)1);
+        if (op == 2) {                  // IntersectWith: keep self ∩ other
+            // Snapshot self's keys first, then remove every key not in `other`.
+            void** selfKeys = nullptr; int64_t sn = 0;
+            bz_dict_keys_gen(self, &selfKeys, &sn);
+            for (int64_t i = 0; i < sn; i++) {
+                if (!bz_dict_contains_gen(other, selfKeys[i]))
+                    bz_dict_remove_gen(self, selfKeys[i]);
+                free(selfKeys[i]);
+            }
+            free(selfKeys);
+        } else if (op == 3) {           // IsSubsetOf: every self element in other
+            result = 1;
+            void** selfKeys = nullptr; int64_t sn = 0;
+            bz_dict_keys_gen(self, &selfKeys, &sn);
+            for (int64_t i = 0; i < sn; i++) {
+                if (!bz_dict_contains_gen(other, selfKeys[i])) result = 0;
+                free(selfKeys[i]);
+            }
+            free(selfKeys);
+        } else if (op == 4) {           // IsSupersetOf: every other element in self
+            result = 1;
+            for (int64_t i = 0; i < n; i++)
+                if (!bz_dict_contains_gen(self, keys[i])) result = 0;
+        }
+        bz_dict_free(other, nullptr);   // sentinel values: nothing to dispose
+    }
+    for (int64_t i = 0; i < n; i++) free(keys[i]);
+    free(keys);
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // Random
 // ---------------------------------------------------------------------------
@@ -1103,6 +1158,7 @@ enum bz_lazy_kind {
     BZ_LAZY_SKIP,     // skip first `n` elements
     BZ_LAZY_DISTINCT, // de-duplicate (raw-byte equality, order preserved)
     BZ_LAZY_ORDERBY,  // materialize-on-first-MoveNext: sorted snapshot
+    BZ_LAZY_SET,      // dict-backed Set<T> source: owned key snapshot by index
 };
 
 struct bz_lazy_t {
@@ -1173,6 +1229,25 @@ static bz_lazy_t* bz_lazy_new(int32_t kind, int64_t esz) {
 extern "C" void* bz_lazy_from_array(void* arr, int64_t esz) {
     auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
     e->arr = arr;
+    return e;
+}
+
+// issue #389 / stdlib §5 / §4.10: a dict-backed Set<T> as a lazy source. Snapshot
+// the set's element keys (bz_dict_keys_gen returns malloc'd esz-byte blobs) into
+// a fresh owned bz_array_t iterated by index, then free the snapshot pointers.
+// The array is stored in `sorted` so bz_lazy_dispose frees it (the set itself is
+// not owned by the enumerator). Set elements are value-semantic, so copying the
+// raw key bytes into the snapshot array is the correct (and only) representation.
+extern "C" void* bz_lazy_from_set(void* set, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_SET, esz);
+    e->sorted = bz_array_alloc(esz, 8);
+    void** keys = nullptr; int64_t n = 0;
+    bz_dict_keys_gen(set, &keys, &n);
+    for (int64_t i = 0; i < n; i++) {
+        bz_array_add(e->sorted, keys[i], esz);
+        free(keys[i]);
+    }
+    free(keys);
     return e;
 }
 
@@ -1332,6 +1407,14 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
         e->idx++;
         return 1;
     }
+    case BZ_LAZY_SET: {
+        // issue #389: iterate the owned key snapshot (built in bz_lazy_from_set).
+        auto* arr = (bz_array_t*)e->sorted;
+        if (e->idx >= arr->count) return 0;
+        memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
+        e->idx++;
+        return 1;
+    }
     }
     return 0;
 }
@@ -1348,6 +1431,33 @@ extern "C" void* bz_lazy_to_array(void* lazy, int64_t esz) {
         bz_array_add(arr, ((cur_t)vt[3])(e), esz);
     bz_lazy_dispose(e);
     return arr;
+}
+
+// issue #389 / stdlib §4.10: drain a lazy enumerator into the bz_dict_keys_gen
+// snapshot shape — a malloc'd array of `n` pointers, each a malloc'd esz-byte
+// copy of one element. Used to feed a non-Set IEnumerable<T> `other` into
+// bz_set_algebra_gen. Disposes the drained enumerator. First materialize into a
+// growable array (count unknown up front), then repackage as pointer-per-element.
+extern "C" void bz_set_collect_enumerator(void* lazy, int64_t esz,
+                                          void*** keys_out, int64_t* n_out) {
+    auto* e = (bz_lazy_t*)lazy;
+    auto* tmp = (bz_array_t*)bz_array_alloc(esz, 8);
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    while (((mn_t)vt[2])(e))
+        bz_array_add(tmp, ((cur_t)vt[3])(e), esz);
+    bz_lazy_dispose(e);
+    int64_t n = tmp->count;
+    auto** keys = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
+    for (int64_t i = 0; i < n; i++) {
+        void* kc = malloc((size_t)esz);
+        memcpy(kc, (char*)tmp->data + i * esz, (size_t)esz);
+        keys[i] = kc;
+    }
+    bz_array_free(tmp, nullptr);
+    if (keys_out) *keys_out = keys; else free(keys);
+    if (n_out)    *n_out    = n;
 }
 
 // ---------------------------------------------------------------------------

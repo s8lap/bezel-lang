@@ -148,6 +148,31 @@ void  bz_dict_clear(void* d, void (*dispose_val)(void*));
 // are the record's value bytes.
 void bz_dict_keys_gen(void* d, void*** keys_out, int64_t* n_out);
 
+// issue #389 / stdlib §4.10: fold a key snapshot of `other` into/against a
+// dict-backed Set `self` (generic-key table). `keys` is a malloc'd array of `n`
+// pointers, each a malloc'd copy of one element's `self->key_size` bytes — the
+// same shape bz_dict_keys_gen produces, or that bz_set_collect_enumerator
+// builds from a non-Set IEnumerable<T> (#326). `op` selects the operation:
+//   0 UnionWith     — set every key into self (idempotent by content)
+//   1 ExceptWith    — remove every key from self
+//   2 IntersectWith — keep only self keys present in the snapshot (mutate-free:
+//                     a temp membership set is built from the snapshot, then
+//                     self's own keys are snapshotted and the absent ones removed)
+//   3 IsSubsetOf    — true iff every self element is in the snapshot
+//   4 IsSupersetOf  — true iff every snapshot element is in self
+// The function FREES each `keys[i]` and `keys` before returning. The return is
+// 1/0 for the query ops (3,4) and 0 for the mutators (0,1,2). The dict-backed
+// Set holds value-semantic elements (records/primitives/enums/strings), so no
+// element disposal is performed — the removed keys are just freed.
+int32_t bz_set_algebra_gen(void* self, void** keys, int64_t n, int32_t op);
+
+// issue #389 / stdlib §5: wrap a dict-backed Set<T> (§4.10) as a lazy LINQ
+// source (Set is IEnumerable<T> via ICollection<T>, §4.3). Snapshots the set's
+// element keys (bz_dict_keys_gen) into an owned buffer iterated by index; the
+// snapshot is freed when the enumerator is disposed. `elem_size` is the stored
+// element byte count (the set's key_size). Mirrors bz_lazy_from_array.
+void* bz_lazy_from_set(void* set, int64_t elem_size);
+
 // ---------------------------------------------------------------------------
 // Random number generator
 // ---------------------------------------------------------------------------
@@ -295,6 +320,14 @@ void* bz_lazy_distinct(void* up, void* eqfn);                        // eqfn: i3
 void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
                       int32_t descending);                           // keyfn: i64(closure, elem)
 void* bz_lazy_to_array(void* lazy, int64_t elem_size);
+
+// issue #389 / stdlib §4.10: drain a lazy enumerator (a non-Set IEnumerable<T>
+// `other` of a set-algebra call) into the key-snapshot shape bz_dict_keys_gen
+// produces: `*keys_out` is a malloc'd array of `n` pointers, each a malloc'd copy
+// of one element's `elem_size` bytes. Disposes the drained enumerator. The
+// snapshot is consumed (and freed) by bz_set_algebra_gen.
+void bz_set_collect_enumerator(void* lazy, int64_t elem_size,
+                               void*** keys_out, int64_t* n_out);
 
 // ---------------------------------------------------------------------------
 // Events (language spec §24). The backing object of an `event` declaration is
