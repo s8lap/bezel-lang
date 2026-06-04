@@ -250,6 +250,8 @@ set(BEZEL_TEST_SOURCES
     codegen/is_narrow_receiver_test.cpp
     codegen/null_narrow_member_test.cpp
 
+    module/module_metadata_test.cpp
+
     runtime/event_subscription_test.cpp
 
     ownership/linear_owned_test.cpp
