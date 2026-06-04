@@ -74,6 +74,12 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                         markMovedByName(id->name, id->span.begin);
                     ++pos; continue;
                 }
+                if (exprIsOwnedFieldRead(*a.value)) {
+                    // §28.3 / §28.8.1 (#398): `owned obj.f` of a bare owned-
+                    // field read is a borrow (only `move obj.f` is owned).
+                    checkOwnedArgSource(*a.value, a.value->span.begin);
+                    ++pos; continue;
+                }
             }
             // §28.8 implicit transfer: bare id to `owned` formal param.
             if (a.modifier.empty() && cd && pos < cd->params.size() &&
@@ -83,6 +89,12 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     // §28.8 (#395): reject a borrow flowing into the owned formal.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
                         markMovedByName(id->name, id->span.begin);
+                    ++pos; continue;
+                }
+                if (exprIsOwnedFieldRead(*a.value)) {
+                    // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
+                    // into an owned ctor param is a borrow, not a transfer.
+                    checkOwnedArgSource(*a.value, a.value->span.begin);
                     ++pos; continue;
                 }
             }
@@ -118,6 +130,12 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                     markMovedByName(id->name, id->span.begin);
                 ++pos; continue;
             }
+            if (exprIsOwnedFieldRead(*a.value)) {
+                // §28.3 / §28.8.1 (#398): `owned obj.f` of a bare owned-field
+                // read is a borrow (only `move obj.f` is owned).
+                checkOwnedArgSource(*a.value, a.value->span.begin);
+                ++pos; continue;
+            }
         }
         // §28.8 implicit ownership transfer: a bare identifier passed
         // to an `owned` formal parameter transfers ownership without
@@ -142,6 +160,12 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                     // formal; otherwise record the implicit move.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
                         markMovedByName(id->name, id->span.begin);
+                    ++pos; continue;
+                }
+                if (exprIsOwnedFieldRead(*a.value)) {
+                    // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
+                    // implicitly into an owned sink is a borrow, not a transfer.
+                    checkOwnedArgSource(*a.value, a.value->span.begin);
                     ++pos; continue;
                 }
                 // `move id` to an owned formal: `move b` of a borrow is not an
@@ -197,6 +221,12 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
                         markMovedByName(id->name, id->span.begin);
                     consumed = true;
+                } else if (exprIsOwnedFieldRead(*a.value)) {
+                    // §28.3 / §28.8.1 (#398): `owned obj.f` on a bare owned-
+                    // field read is still a borrow (only `move obj.f` reads the
+                    // field as owned). Report; there is no local to mark.
+                    checkOwnedArgSource(*a.value, a.value->span.begin);
+                    consumed = true;
                 }
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
                            a.value.get())) {
@@ -242,6 +272,12 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // formal; otherwise record the implicit move.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
                         markMovedByName(id->name, id->span.begin);
+                    consumed = true;
+                } else if (exprIsOwnedFieldRead(*a.value)) {
+                    // §28.3 / §28.8.1 (#398): a bare owned-field read implicitly
+                    // flowing into an owned sink is a borrow, not an owned
+                    // transfer (only `move obj.f` is owned). Reject.
+                    checkOwnedArgSource(*a.value, a.value->span.begin);
                     consumed = true;
                 }
             }
@@ -313,6 +349,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
                         markMovedByName(id->name, id->span.begin);
                     consumed = true;
+                } else if (exprIsOwnedFieldRead(*a.value)) {
+                    // §28.3 / §28.8.1 (#398): `owned obj.f` of a bare owned-
+                    // field read is a borrow (only `move obj.f` is owned).
+                    checkOwnedArgSource(*a.value, a.value->span.begin);
+                    consumed = true;
                 }
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
                 if (un->op == "move") {
@@ -332,6 +373,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // §28.8 (#395): reject a borrow flowing into the owned formal.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
                         markMovedByName(id->name, id->span.begin);
+                    consumed = true;
+                } else if (exprIsOwnedFieldRead(*a.value)) {
+                    // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
+                    // into an owned ctor param is a borrow, not a transfer.
+                    checkOwnedArgSource(*a.value, a.value->span.begin);
                     consumed = true;
                 }
             }
@@ -1471,6 +1517,27 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
     return false;
 }
 
+// §28.3 (issue #398): is `e` a read of an `owned` field? See the header.
+bool MethodOwnership::exprIsOwnedFieldRead(const ast::Expr& e) const {
+    auto isOwnedField = [](sema::Symbol* sym) -> bool {
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+        if (!fs) return false;
+        for (std::string_view m : fs->modifiers)
+            if (m == "owned") return true;
+        return false;
+    };
+    // Explicit member access `obj.f` — sema attaches the member's FieldSymbol
+    // to the MemberAccessExpr (ExprTypecheck). // per §28.3
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return isOwnedField(ctx_.exprSymbol(e));
+    // Bare identifier resolving to an owned field of the declaring class
+    // (implicit `this`). A method-scope local/parameter is not a FieldSymbol,
+    // so this only matches a genuine field read. // per §28.3
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e))
+        return isOwnedField(ctx_.exprSymbol(e));
+    return false;
+}
+
 // §28.8 owned-sink check (issue #395). See the header for the full contract.
 bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     const ast::Expr* e = &argValue;
@@ -1478,9 +1545,23 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // than the bare `b`. (`move this.f` / `move coll[i]` unwrap to a member /
     // index expression, NOT a bare identifier, so they fall through to the
     // "cannot classify → not a borrow" tail and are correctly accepted.)
+    bool unwrappedMove = false;
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
-        if (un->op == "move" && un->operand) e = un->operand.get();
+        if (un->op == "move" && un->operand) {
+            e = un->operand.get();
+            unwrappedMove = true;
+        }
     }
+    // §28.3 / §28.8.1 (issue #398): a *bare* read of an `owned` field — no
+    // enclosing `move` — is Borrowed ("Field access `obj.f` where `f` is
+    // `owned` | Borrowed (source: `obj`)"), so flowing it into an owned sink is
+    // the double-dispose hazard (the sink and the field's owner both dispose
+    // the value). `move obj.f` IS the legal owned producer (§28.8.1: "the only
+    // way to read an owned field's value as an owned value"), so the `move`
+    // form is excluded here. This is checked before the bare-identifier path
+    // below so an implicit-`this` owned-field identifier is classified as a
+    // field read, not mistaken for a local/parameter. // per §28.3, §28.8.1
+    if (!unwrappedMove && exprIsOwnedFieldRead(*e)) return true;
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
     if (!id) return false;  // new / call / member / index / literal: not flagged
     // A tracked local: only the Borrowed state is the owned-sink hazard. Owned
