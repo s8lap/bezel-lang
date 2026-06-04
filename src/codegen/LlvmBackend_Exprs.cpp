@@ -1802,6 +1802,20 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             return emitMethodCall(opm, args, /*baseQualified=*/false);
         }
     }
+    // issue #409 / §28.8.1 / §28.11: `move coll[i]` is the slot-take form on an
+    // owning collection. Unlike `move local` / `move x.f` (a pure compile-time
+    // ownership transfer whose runtime value is the operand unchanged), the
+    // collection slot must be left moved-from so the collection's later Dispose
+    // does not re-free the element the new owner now owns. Handle it here, before
+    // the generic operand lowering, so the slot read + null happen exactly once
+    // (and the index/key expression is evaluated only once). For a borrowing
+    // collection (where sema rejects `move`) the helper returns null and we fall
+    // through to the ordinary read, which does NOT null the slot.
+    if (un.op == "move")
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(un.operand.get()))
+            if (llvm::Value* moved = lowerMoveFromCollectionSlot(*ix))
+                return moved;
+
     llvm::Value* v = lowerExpr(*un.operand);
     if (!v) return nullptr;
     const auto& op = un.op;

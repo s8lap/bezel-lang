@@ -806,6 +806,14 @@ private:
     // built-in heap collection (the caller falls through to other paths).
     llvm::Value* lowerCollectionIndexerGet(const ast::IndexExpr& ix);
 
+    // issue #409 / language spec §28.8.1 / §28.11: lower `move coll[i]` (the
+    // slot-take) on an OWNING heap collection (OwnedArray / OwnedDictionary).
+    // Reads the element out as owned AND leaves the slot moved-from (null) so the
+    // collection's later element-disposer skips it — no #409 double-free. Returns
+    // null if `ix` is not an owning-collection slot (caller falls through to the
+    // borrowing-read lowering, which does NOT null the slot).
+    llvm::Value* lowerMoveFromCollectionSlot(const ast::IndexExpr& ix);
+
     // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer setter
     // `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwnedArray /
     // OwnedDictionary) the displaced slot/value is disposed exactly once before
