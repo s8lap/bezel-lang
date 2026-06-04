@@ -158,6 +158,7 @@ set(BEZEL_TEST_SOURCES
     codegen/virtual_dispatch_test.cpp
     codegen/abstract_dynamic_dispose_test.cpp
     codegen/type_test_test.cpp
+    codegen/value_boxing_test.cpp
     codegen/object_downcast_test.cpp
     codegen/exceptions_test.cpp
     codegen/exception_dispose_test.cpp

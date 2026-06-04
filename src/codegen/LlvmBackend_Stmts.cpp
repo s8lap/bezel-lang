@@ -59,6 +59,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (!addr) return false;
             llvm::Value* rhs = lowerExpr(*as->value);
             if (!rhs) return false;
+            // §8.6: a value-typed RHS assigned to an Object/interface lvalue is
+            // boxed (so a later is/as/dispatch on the target sees a box). Keyed
+            // off the target's static type; a no-op for reference RHS (#399).
+            if (as->op == ":=")
+                rhs = boxForTarget(rhs, ctx_.exprType(*as->target),
+                                   as->value.get());
             // §5.1: an int assigned to a wider numeric slot (e.g. `d := n;`
             // with `d: double`, `n: int`) is implicitly widened. Materialize
             // the conversion sema admitted so the slot receives the value, not
@@ -163,6 +169,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // returned value reflects pre-disposal state.
         llvm::Value* v = rs->value ? lowerExpr(*rs->value) : nullptr;
         if (diverged_) return true;  // CG40: the value expression threw
+        // §8.6: box a value-typed `return expr` whose declared return type is
+        // Object/interface, so the caller's is/as/virtual dispatch sees a box.
+        if (v && rs->value && currentReturnTypeNode_)
+            v = boxForTarget(v, ctx_.resolvedType(*currentReturnTypeNode_),
+                             rs->value.get());
         // §28.3 ownership transfer: if the return expression is a bare
         // `using var` local, exclude it from disposal — ownership moves
         // to the caller.  Without this, the local would be freed before

@@ -656,6 +656,12 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                     }
                 }
             }
+            // §8.6: a value-typed argument bound to an Object/interface
+            // parameter is boxed, so a later `is`/`as` or virtual dispatch on
+            // that parameter (which lowers to a descriptor walk through the
+            // object's first word) sees a real box rather than the raw value
+            // bytes. boxForTarget is a no-op for reference arguments (#399).
+            v = boxForTarget(v, formalTy, a.value.get());
         }
         ordered[idx] = v;
     }
