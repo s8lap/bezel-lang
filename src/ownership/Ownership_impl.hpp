@@ -435,6 +435,20 @@ private:
     // the borrow as consumed). // per §28.8
     bool checkOwnedArgSource(const ast::Expr& argValue, SourceLocation loc);
 
+    // §28.3 / §28.8 (issue #407): an owned-sink argument that is NOT a bare
+    // identifier and NOT a bare owned-field read — those two forms have
+    // dedicated handling at each call site that also records the move when the
+    // source is a legal owned value. This catch-all covers the remaining class-
+    // typed borrow forms a non-`move`d argument can take: an indexer-get
+    // `coll[i]` (§28.3 / §28.11), a non-`owned` field read `obj.f` (§28.3), and
+    // `this` (§28.3 / #403). None is ever a legal owned producer in bare form,
+    // so there is nothing to mark moved-from; reports via `checkOwnedArgSource`
+    // and returns true when it reported (the caller then treats the arg as
+    // consumed). A `move`-wrapped argument is a legal owned producer and is NOT
+    // reported (`ownedArgSourceIsBorrow` unwraps the `move` and returns false).
+    // // per §28.3, §28.8, §28.11
+    bool checkOwnedArgOtherBorrow(const ast::Expr& argValue);
+
     // §28.11 indexer-set (issue #395): true when `target` is `coll[i]` on an
     // owning collection whose `set(owned)` indexer requires an owned RHS. Per
     // §28.11 "Indexer set `coll[i] := value` requires `value` to be owned."

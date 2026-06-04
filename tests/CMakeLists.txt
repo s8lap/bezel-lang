@@ -252,6 +252,7 @@ set(BEZEL_TEST_SOURCES
     ownership/out_owned_discharge_test.cpp
     ownership/owned_sink_test.cpp
     ownership/owned_field_sink_test.cpp
+    ownership/owned_sink_sources_test.cpp
     ownership/owned_field_assign_test.cpp
     ownership/catch_owned_sink_test.cpp
     ownership/throw_owned_arg_test.cpp)

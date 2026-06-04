@@ -80,6 +80,11 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     checkOwnedArgSource(*a.value, a.value->span.begin);
                     ++pos; continue;
                 }
+                if (checkOwnedArgOtherBorrow(*a.value)) {
+                    // §28.3 / §28.11 (#407): `owned coll[i]` / `owned obj.f` is a
+                    // borrow (bare `this` was handled by the identifier branch).
+                    ++pos; continue;
+                }
             }
             // §28.8 implicit transfer: bare id to `owned` formal param.
             if (a.modifier.empty() && cd && pos < cd->params.size() &&
@@ -95,6 +100,13 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
                     // into an owned ctor param is a borrow, not a transfer.
                     checkOwnedArgSource(*a.value, a.value->span.begin);
+                    ++pos; continue;
+                }
+                if (checkOwnedArgOtherBorrow(*a.value)) {
+                    // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` flowing
+                    // into an owned ctor param is a borrow, not a transfer — the
+                    // double-dispose hazard (findings 18, 20). (Bare `this` was
+                    // handled by the identifier branch above.)
                     ++pos; continue;
                 }
             }
@@ -136,6 +148,12 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                 checkOwnedArgSource(*a.value, a.value->span.begin);
                 ++pos; continue;
             }
+            if (checkOwnedArgOtherBorrow(*a.value)) {
+                // §28.3 / §28.11 (#407): `owned coll[i]` / `owned obj.f` is a
+                // borrow under an explicit `owned` arg (bare `this` was handled
+                // by the identifier branch above).
+                ++pos; continue;
+            }
         }
         // §28.8 implicit ownership transfer: a bare identifier passed
         // to an `owned` formal parameter transfers ownership without
@@ -166,6 +184,12 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                     // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
                     // implicitly into an owned sink is a borrow, not a transfer.
                     checkOwnedArgSource(*a.value, a.value->span.begin);
+                    ++pos; continue;
+                }
+                if (checkOwnedArgOtherBorrow(*a.value)) {
+                    // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` flowing
+                    // implicitly into the owned sink is a borrow (bare `this` was
+                    // handled by the identifier branch above).
                     ++pos; continue;
                 }
                 // `move id` to an owned formal: `move b` of a borrow is not an
@@ -240,6 +264,12 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // field as owned). Report; there is no local to mark.
                     checkOwnedArgSource(*a.value, a.value->span.begin);
                     consumed = true;
+                } else if (checkOwnedArgOtherBorrow(*a.value)) {
+                    // §28.3 / §28.11 (#407): `owned coll[i]` / `owned obj.f` is a
+                    // borrow under an explicit `owned` arg modifier — still
+                    // rejected (only `move`/`new`/owned-call). (Bare `this` was
+                    // handled by the identifier branch above.)
+                    consumed = true;
                 }
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
                            a.value.get())) {
@@ -291,6 +321,12 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // flowing into an owned sink is a borrow, not an owned
                     // transfer (only `move obj.f` is owned). Reject.
                     checkOwnedArgSource(*a.value, a.value->span.begin);
+                    consumed = true;
+                } else if (checkOwnedArgOtherBorrow(*a.value)) {
+                    // §28.3 / §28.11 (#407): a bare `coll[i]` indexer-get or a
+                    // non-`owned` field read `obj.f` flowing into the owned sink
+                    // is a borrow (it would be double-disposed). Bare `this`
+                    // (#403) is handled by the identifier branch above.
                     consumed = true;
                 }
             }
@@ -367,6 +403,10 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // field read is a borrow (only `move obj.f` is owned).
                     checkOwnedArgSource(*a.value, a.value->span.begin);
                     consumed = true;
+                } else if (checkOwnedArgOtherBorrow(*a.value)) {
+                    // §28.3 / §28.11 (#407): `owned coll[i]` / `owned obj.f` is a
+                    // borrow (bare `this` was handled by the identifier branch).
+                    consumed = true;
                 }
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
                 if (un->op == "move") {
@@ -391,6 +431,12 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
                     // into an owned ctor param is a borrow, not a transfer.
                     checkOwnedArgSource(*a.value, a.value->span.begin);
+                    consumed = true;
+                } else if (checkOwnedArgOtherBorrow(*a.value)) {
+                    // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` flowing
+                    // into an owned ctor param is a borrow, not a transfer — the
+                    // double-dispose hazard (findings 18, 20). (Bare `this` was
+                    // handled by the identifier branch above.)
                     consumed = true;
                 }
             }
@@ -1596,8 +1642,51 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // below so an implicit-`this` owned-field identifier is classified as a
     // field read, not mistaken for a local/parameter. // per §28.3, §28.8.1
     if (!unwrappedMove && exprIsOwnedFieldRead(*e)) return true;
+    // §28.3 / §28.8.1 / §28.11 (issue #407): a *bare* indexer-get `coll[i]` —
+    // no enclosing `move` — is Borrowed ("Indexer access `coll[i]` | Borrowed
+    // (source: `coll`)", §28.3 producers; for owning collections §28.11 states
+    // the indexer-get "produces a borrow of the slot's value"). Flowing it into
+    // an owned sink double-disposes: the slot's owner (the collection) and the
+    // sink both dispose the value. `move coll[i]` IS the legal owned producer
+    // (§28.8.1 / §28.11) — it arrives wrapped in `move` and was unwrapped above,
+    // so `unwrappedMove` is true and this branch is correctly skipped. The
+    // type gate excludes a value-typed slot (no ownership to double-dispose);
+    // `isBorrowableType` is conservative (unknown → borrowable), and no legal
+    // owned producer is a bare IndexExpr, so flagging an untyped one is sound.
+    // // per §28.3, §28.8.1, §28.11
+    if (!unwrappedMove && dynamic_cast<const ast::IndexExpr*>(e)) {
+        return isBorrowableType(ctx_.exprType(*e));
+    }
+    // §28.3 (issue #407): a *bare* read of ANY class-typed field `obj.f` — owned
+    // OR non-owned — is Borrowed ("Field access `obj.f` where `f` is not `owned`
+    // | Borrowed (source: `obj`)", and likewise for the `owned` case handled by
+    // `exprIsOwnedFieldRead` above). §28.3 borrow-lifetime rules forbid assigning
+    // any borrow to a field and §28.8 forbids passing one where an owned value is
+    // required; the non-`owned`-field read was previously missed (only the owned-
+    // field form was classified). `move obj.f` is owned only for an `owned` field
+    // (§28.8.1); a non-`owned` field has no `move` form, so the `unwrappedMove`
+    // guard merely keeps a stray `move obj.f` of an owned field on its own
+    // (already-flagged) path. The type gate excludes value-typed fields. The
+    // bare-identifier implicit-`this` field read is handled by the identifier
+    // path below via its resolved FieldSymbol. // per §28.3, §28.8
+    if (!unwrappedMove) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            if (sema::Symbol* msym = ctx_.exprSymbol(*ma)) {
+                if (dynamic_cast<sema::FieldSymbol*>(msym))
+                    return isBorrowableType(ctx_.exprType(*e));
+            }
+        }
+    }
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
-    if (!id) return false;  // new / call / member / index / literal: not flagged
+    if (!id) return false;  // new / call / other member / literal: not flagged
+    // §28.3 (issue #403): a bare `this` is Borrowed ("`this` | Borrowed (source:
+    // caller)"). A class can never transfer ownership of itself, so `this` is
+    // never a legal owned producer; handing it to an owned sink lets the sink
+    // dispose the live receiver (the caller still owns it) — a double-dispose.
+    // `this` carries no resolved Symbol (sema leaves it unresolved), so the
+    // ParameterSymbol/state branches below never see it; recognize it by name.
+    // // per §28.3, §28.8
+    if (id->name == "this") return true;
     // A tracked local: only the Borrowed state is the owned-sink hazard. Owned
     // (the legal transfer) and the error-producing states (MovedFrom/Disposed/
     // Uninitialized — diagnosed by their own checks) are NOT flagged here.
@@ -1630,9 +1719,17 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
         return ps->modifier != "owned" && ps->modifier != "out owned";
     }
-    // `this`, fields, or anything else we cannot positively classify as a
-    // borrow: conservatively NOT flagged, so a valid transfer is never
-    // over-rejected. // per §28.8
+    // §28.3 (issue #407): a bare identifier resolving to a class-typed field of
+    // the declaring class (implicit `this`) is a field read `this.f`, Borrowed
+    // per §28.3 ("Field access `obj.f` where `f` is not `owned` | Borrowed"; the
+    // `owned`-field case was already handled by `exprIsOwnedFieldRead` above).
+    // Same hazard as the explicit `obj.f` MemberAccessExpr form. The type gate
+    // excludes value-typed fields. // per §28.3, §28.8
+    if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+        return isBorrowableType(ctx_.exprType(*id));
+    }
+    // Anything else we cannot positively classify as a borrow: conservatively
+    // NOT flagged, so a valid transfer is never over-rejected. // per §28.8
     return false;
 }
 
@@ -1646,6 +1743,25 @@ bool MethodOwnership::checkOwnedArgSource(const ast::Expr& argValue,
         "borrow is owned elsewhere (§28.8 — transfer an owned value with "
         "`move`, `new`, or a call returning `owned T`)");
     return true;
+}
+
+// §28.3 / §28.8 (issue #407): owned-sink catch-all. See the header.
+bool MethodOwnership::checkOwnedArgOtherBorrow(const ast::Expr& argValue) {
+    // A bare identifier (including bare `this`) and a bare owned-field read are
+    // handled by the caller's dedicated branches; only the *other* class-typed
+    // borrow forms — `coll[i]` (§28.3 / §28.11) and a field read `obj.f`
+    // (§28.3) — are routed here. Restrict to those two AST shapes so a `move`-
+    // wrapped or owned-producer argument the caller already handled is never
+    // re-examined; `checkOwnedArgSource` then applies the full classifier
+    // (which also re-checks the type gate and the move-unwrap). // per §28.3
+    const ast::Expr* e = &argValue;
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        if (un->op == "move") return false;  // legal owned producer (§28.8.1)
+    }
+    if (!dynamic_cast<const ast::IndexExpr*>(e) &&
+        !dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return false;
+    return checkOwnedArgSource(argValue, argValue.span.begin);
 }
 
 // §28.3 / §28.5 / §28.8 (issue #402): is the assignment target an `owned`
