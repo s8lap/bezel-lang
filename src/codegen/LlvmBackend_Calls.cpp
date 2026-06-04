@@ -164,10 +164,23 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     if (!arg) return false;
     auto* argTy = ctx_.exprType(*call.args[0].value);
     llvm::Value* strPtr = arg;
+    // issue #421: a NUMERIC/char primitive conversion (emitPrimitiveToString's
+    // snprintf path) heap-allocates BOTH the bz_string object and its data
+    // buffer solely to feed this write; nothing else references it, so it must
+    // be freed after the write or it leaks (~26 bytes/call for `WriteLine(7)`).
+    // The bool path returns a constant-global string (not heap) and the named-
+    // type ToString()/placeholder paths may return a retained/constant string,
+    // so only the numeric/char conversion sets this.
+    bool freeTransient = false;
+    auto isFreeablePrim = [](sema::PrimitiveType p) {
+        return p != sema::PrimitiveType::String &&
+               p != sema::PrimitiveType::Bool;  // bool → constant globals
+    };
     if (argTy) {
         if (argTy->kind == sema::TypeRef::Kind::Primitive &&
             argTy->primitive != sema::PrimitiveType::String) {
             strPtr = emitPrimitiveToString(arg, argTy->primitive);
+            freeTransient = isFreeablePrim(argTy->primitive);
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
                    argTy->declaration) {
             // Named type (class/record) — call ToString() via virtual
@@ -221,8 +234,10 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     if (strPtr == arg && arg->getType() && !arg->getType()->isPointerTy()) {
         if (arg->getType()->isDoubleTy() || arg->getType()->isFloatTy()) {
             strPtr = emitPrimitiveToString(arg, sema::PrimitiveType::Double);
+            freeTransient = true;  // numeric snprintf path heap-allocates
         } else if (arg->getType()->isIntegerTy(1)) {
             strPtr = emitPrimitiveToString(arg, sema::PrimitiveType::Bool);
+            // bool → constant globals, nothing to free.
         } else if (arg->getType()->isIntegerTy()) {
             // Widen to i64 so the %lld snprintf path receives the full value
             // (matches the interpolation path's sign-extension to i64).
@@ -230,10 +245,17 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                 ? arg
                 : builder_.CreateSExt(arg, i64());
             strPtr = emitPrimitiveToString(iv, sema::PrimitiveType::Long);
+            freeTransient = true;  // numeric snprintf path heap-allocates
         }
     }
     if (!strPtr) return false;
     emitConsoleWrite(strPtr, isWriteLine, stdfd);
+    // issue #421: free the write-only transient (its data buffer first, then
+    // the bz_string object). Done AFTER the write, which only reads the string.
+    if (freeTransient) {
+        builder_.CreateCall(freeFn(), {loadStringData(strPtr)});
+        builder_.CreateCall(freeFn(), {strPtr});
+    }
     return true;
 }
 
@@ -3758,6 +3780,9 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     }
 
     std::vector<llvm::Value*> args;
+    // issue #421 / #410: source expression per arg (index-aligned with `args`)
+    // so emitMethodCall can recover each argument's signedness when widening.
+    std::vector<const ast::Expr*> argExprs;
     bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
     if (!isStaticMethod(ms)) {
         // Receiver: the member-access target, else the current `this`.
@@ -3783,17 +3808,20 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             recv = tmp;
         }
         args.push_back(recv);
+        argExprs.push_back(nullptr);  // receiver has no widening signedness
     }
     // §22.4/§22.7: place arguments into parameter order (named by name,
     // positional by position, omitted parameters defaulted).
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        if (!buildOrderedArgs(md->params, call.args, args)) return nullptr;
+        if (!buildOrderedArgs(md->params, call.args, args, &argExprs))
+            return nullptr;
     } else {
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) return nullptr;
             args.push_back(v);
+            argExprs.push_back(a.value.get());
         }
     }
 
@@ -3921,7 +3949,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
-    llvm::Value* result = emitMethodCall(ms, args, baseQualified);
+    llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
     // Record the concrete subst that was active during this call so that
     // lowerLocalDecl can associate it with the result's local variable.
     if (!genericSubst_.empty()) {
@@ -3963,7 +3991,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
 
 llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             std::vector<llvm::Value*>& args,
-                            bool baseQualified) {
+                            bool baseQualified,
+                            const std::vector<const ast::Expr*>* argExprs) {
+    // issue #421 / #410: is the argument at index `ai` an unsigned source?
+    // Defaults to false (signed) when no source expression is known for the
+    // slot (e.g. the receiver) or no argExprs vector was supplied.
+    auto argUnsigned = [&](std::size_t ai) -> bool {
+        if (!argExprs || ai >= argExprs->size() || !(*argExprs)[ai])
+            return false;
+        return isUnsignedTargetExpr(*(*argExprs)[ai]);
+    };
     bool canDispatch = !baseQualified && !isStaticMethod(ms);
     unsigned dispatchSlot = 0;
     if (canDispatch) {
@@ -4013,9 +4050,11 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         // §5.1 / §22.6: widen each argument to its declared parameter type
         // when sema admitted an implicit numeric conversion (e.g. an int
         // argument bound to a double parameter). Otherwise the i32 reaches an
-        // f64 parameter as raw bits (issue #408 / finding [17]).
+        // f64 parameter as raw bits (issue #408 / finding [17]). An unsigned
+        // source widens via UIToFP/ZExt (issue #421 / #410).
         for (std::size_t ai = 0; ai < args.size(); ++ai)
-            args[ai] = coerceNumericToType(args[ai], fnTy->getParamType(ai));
+            args[ai] = coerceNumericToType(args[ai], fnTy->getParamType(ai),
+                                           argUnsigned(ai));
         llvm::Value* recv = args[0];
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
         llvm::Value* slotPtr = builder_.CreateGEP(
@@ -4093,7 +4132,8 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         auto* callFnTy = callee->getFunctionType();
         for (std::size_t ai = 0;
              ai < args.size() && ai < callFnTy->getNumParams(); ++ai)
-            args[ai] = coerceNumericToType(args[ai], callFnTy->getParamType(ai));
+            args[ai] = coerceNumericToType(args[ai], callFnTy->getParamType(ai),
+                                           argUnsigned(ai));
     }
     llvm::Value* r = builder_.CreateCall(callee, args);
     emitPendingCheck();  // CG20: a callee may have thrown
@@ -4303,14 +4343,17 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
 
     builder_.SetInsertPoint(callBB);
     std::vector<llvm::Value*> args;
+    std::vector<const ast::Expr*> argExprs;
     args.push_back(recv);
+    argExprs.push_back(nullptr);  // receiver has no widening signedness
     for (const auto& a : call.args) {
         if (!a.value) return nullptr;
         llvm::Value* v = lowerExpr(*a.value);
         if (!v) return nullptr;
         args.push_back(v);
+        argExprs.push_back(a.value.get());
     }
-    llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false);
+    llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs);
     if (!r && refResult) return nullptr;
     auto* callEnd = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);

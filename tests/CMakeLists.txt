@@ -154,6 +154,7 @@ set(BEZEL_TEST_SOURCES
     codegen/free_on_dispose_test.cpp
     codegen/explicit_dispose_reclaim_test.cpp
     codegen/undisposed_leak_test.cpp
+    codegen/console_write_leak_test.cpp
     codegen/owned_field_disposal_test.cpp
     codegen/owned_collection_disposal_test.cpp
     codegen/inherited_fields_test.cpp

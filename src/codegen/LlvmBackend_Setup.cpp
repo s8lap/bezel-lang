@@ -1437,8 +1437,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // the FP slot and every read reinterprets them (issue #408 / finding [15]:
     // an `anyext from i32` f64 load that the backend cannot select, or a
     // subnormal value). The slot is then sized to the converted value's type.
+    // issue #421 / #410: thread the initializer's signedness so an unsigned
+    // source (e.g. `var d: double := someUint`) widens via UIToFP/ZExt instead
+    // of the signed default — otherwise a large uint would read as negative.
     if (v && declaredTy)
-        v = coerceNumericToType(v, declaredTy);
+        v = coerceNumericToType(v, declaredTy,
+                                init && isUnsignedTargetExpr(*init));
     llvm::Type* slotTy = v ? v->getType() : (declaredTy ? declaredTy : i32());
     // Prefer the declared type when the value's type is less specific —
     // e.g. `var arr: [N]T := null` produces a ptr null literal but the
