@@ -1728,6 +1728,46 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv});
             return recv;
         }
+        // §3.1: Insert(index: int, value: string): StringBuilder — flatten,
+        // insert, reset to one part (runtime helper). Returns this for chaining.
+        if (m == "Insert" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* idx = lowerExpr(*call.args[0].value);
+            llvm::Value* val = lowerExpr(*call.args[1].value);
+            if (!idx || !val) return nullptr;
+            llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
+                ? idx : builder_.CreateSExt(idx, i64());
+            auto* fn = declareC("bz_sb_insert", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(fn, {recv, idx64, val});
+            return recv;
+        }
+        // §3.1: Remove(startIndex: int, length: int): StringBuilder.
+        if (m == "Remove" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* start = lowerExpr(*call.args[0].value);
+            llvm::Value* len   = lowerExpr(*call.args[1].value);
+            if (!start || !len) return nullptr;
+            llvm::Value* start64 = start->getType()->isIntegerTy(64)
+                ? start : builder_.CreateSExt(start, i64());
+            llvm::Value* len64 = len->getType()->isIntegerTy(64)
+                ? len : builder_.CreateSExt(len, i64());
+            auto* fn = declareC("bz_sb_remove", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), i64(), i64()});
+            builder_.CreateCall(fn, {recv, start64, len64});
+            return recv;
+        }
+        // §3.1: Replace(oldValue: string, newValue: string): StringBuilder.
+        if (m == "Replace" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* oldV = lowerExpr(*call.args[0].value);
+            llvm::Value* newV = lowerExpr(*call.args[1].value);
+            if (!oldV || !newV) return nullptr;
+            auto* fn = declareC("bz_sb_replace", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, oldV, newV});
+            return recv;
+        }
         if (m == "Length" || m == "Count") {
             // Sum of lengths of all string parts
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -2938,6 +2978,58 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* b = lowerExpr(*call.args[1].value);
         if (!a || !b) return nullptr;
         return emitStringOrdCmp(a, b);
+    }
+    // §9.6: string.Compare(a, b, ignoreCase: bool): int — ordinal comparison,
+    // optionally ASCII case-folded. Routed through the runtime helper so the
+    // case-folding logic lives in one testable place.
+    if (pt == P::String && m == "Compare" && call.args.size() == 3 &&
+        call.args[0].value && call.args[1].value && call.args[2].value) {
+        llvm::Value* a = lowerExpr(*call.args[0].value);
+        llvm::Value* b = lowerExpr(*call.args[1].value);
+        llvm::Value* ic = lowerExpr(*call.args[2].value);
+        if (!a || !b || !ic) return nullptr;
+        llvm::Value* ic32 = ic->getType()->isIntegerTy(32)
+            ? ic : builder_.CreateZExt(ic, i32());
+        auto* fn = declareC("bz_string_compare", i32(),
+                            {ptrTy(), i64(), ptrTy(), i64(), i32()});
+        return builder_.CreateCall(
+            fn, {loadStringData(a), loadStringLen(a),
+                 loadStringData(b), loadStringLen(b), ic32}, "str.cmp.ci");
+    }
+    // §9.6 (static): string.Repeat(c: char, count: int): string — a `count`-long
+    // string of the single code point `c`. Width-1 byte mode (ASCII fast path).
+    if (pt == P::String && m == "Repeat" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* ch  = lowerExpr(*call.args[0].value);
+        llvm::Value* cnt = lowerExpr(*call.args[1].value);
+        if (!ch || !cnt) return nullptr;
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* count64 = cnt->getType()->isIntegerTy(64)
+            ? cnt : builder_.CreateSExt(cnt, i64());
+        // Clamp negative counts to 0 (an empty string).
+        llvm::Value* neg = builder_.CreateICmpSLT(count64, builder_.getInt64(0));
+        count64 = builder_.CreateSelect(neg, builder_.getInt64(0), count64);
+        llvm::Value* chI8 = builder_.CreateTrunc(
+            ch->getType()->isIntegerTy(32) ? ch
+                : builder_.CreateSExt(ch, i32()), i32());  // keep i32 for memset
+        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+        auto* memsetFn = declareC("memset", ptrTy(), {ptrTy(), i32(), i64()});
+        llvm::Value* dataSz = builder_.CreateAdd(count64, builder_.getInt64(1));
+        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "rep.data");
+        builder_.CreateCall(memsetFn, {newData, chI8, count64});
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0),
+            builder_.CreateGEP(i8Ty, newData, count64));  // NUL terminator
+        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+        llvm::Value* strObj = builder_.CreateCall(
+            mallocFn, {builder_.getInt64(strBytes)}, "rep.obj");
+        builder_.CreateStore(newData,
+            builder_.CreateStructGEP(stringType(), strObj, 0));
+        builder_.CreateStore(count64,
+            builder_.CreateStructGEP(stringType(), strObj, 1));
+        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+            builder_.CreateStructGEP(stringType(), strObj, 2));
+        initStringRc(strObj);  // #422: producer's reference, rc := 1
+        return strObj;
     }
 
     // double.TryParse / float.TryParse(s, out result): bool — stdlib §5.2

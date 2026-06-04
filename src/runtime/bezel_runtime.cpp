@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 
@@ -1839,6 +1840,63 @@ void* bz_string_split(const char* s, int64_t s_len,
     return arr;
 }
 
+// per §9.6 Compare(a, b, ignoreCase): ordinal comparison, optionally folding
+// ASCII case. Lexicographic over min(len) bytes; equal prefixes break on length.
+int32_t bz_string_compare(const char* a, int64_t a_len,
+                          const char* b, int64_t b_len, int32_t ignore_case) {
+    if (!a) a_len = 0;
+    if (!b) b_len = 0;
+    int64_t n = a_len < b_len ? a_len : b_len;
+    for (int64_t i = 0; i < n; ++i) {
+        int ca = (unsigned char)a[i];
+        int cb = (unsigned char)b[i];
+        if (ignore_case) { ca = tolower(ca); cb = tolower(cb); }
+        if (ca != cb) return ca < cb ? -1 : 1;
+    }
+    if (a_len == b_len) return 0;
+    return a_len < b_len ? -1 : 1;
+}
+
+// per §9.6 Split(separators: Array<char>): split on any of `nsep` single-code-
+// point separators. Width-1 (byte) mode, matching bz_string_split. Each emitted
+// segment is a fresh +1 bz.string; the result array is owned by the caller.
+static void bz__split_emit(void* arr, const char* s, int64_t start, int64_t end) {
+    int64_t partLen = end - start;
+    char* part = (char*)malloc((size_t)(partLen + 1));
+    memcpy(part, s + start, (size_t)partLen);
+    part[partLen] = '\0';
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &part, sizeof(void*));
+    memcpy(strObj + 8, &partLen, sizeof(int64_t));
+    strObj[16] = 1;
+    bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
+    bz_array_add(arr, &strObj, 8);
+}
+
+void* bz_string_split_anychar(const char* s, int64_t s_len,
+                              const int32_t* seps, int64_t nsep) {
+    void* arr = bz_array_alloc(8, 8);
+    // No separators (or empty set): the whole string is the single segment,
+    // mirroring bz_string_split's empty-delimiter behaviour.
+    if (nsep <= 0) {
+        bz__split_emit(arr, s, 0, s_len);
+        return arr;
+    }
+    int64_t start = 0;
+    for (int64_t i = 0; i < s_len; ++i) {
+        bool isSep = false;
+        for (int64_t k = 0; k < nsep; ++k) {
+            if ((int32_t)(uint8_t)s[i] == seps[k]) { isSep = true; break; }
+        }
+        if (isSep) {
+            bz__split_emit(arr, s, start, i);
+            start = i + 1;
+        }
+    }
+    bz__split_emit(arr, s, start, s_len);  // trailing segment (possibly empty)
+    return arr;
+}
+
 void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || arr->count == 0) {
@@ -1867,6 +1925,101 @@ void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len)
     buf[off] = '\0';
     *out_data = buf;
     *out_len = off;
+}
+
+// ---------------------------------------------------------------------------
+// StringBuilder mutators (§3.1). Strategy: flatten the parts to one byte buffer,
+// apply the operation, and reset the parts array to a single fresh +1 part. The
+// builder does not own its parts (Append/Clear never release them), so resetting
+// the count and overwriting slot 0 cannot double-free; old part headers are left
+// as the existing tolerated leak. Width-1 (byte) mode, matching Append/ToString.
+
+// Replace the entire parts list with one freshly-allocated +1 string holding
+// `data[0..len)` (which `bz_sb_set_*` then owns by transferring it in). Resets
+// the array's count to 0 and adds the single new part.
+static void bz_sb_reset_to(bz_array_t* arr, char* data, int64_t len) {
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &data, sizeof(void*));
+    memcpy(strObj + 8, &len, sizeof(int64_t));
+    strObj[16] = 1;                                  // width = 1 (byte mode)
+    bz_string_init_rc(strObj);                       // #422: producer ref, rc := 1
+    arr->count = 0;                                  // drop old parts (not freed)
+    bz_array_add(arr, &strObj, 8);
+}
+
+void bz_sb_insert(void* parts_arr, int64_t index, const void* value) {
+    auto* arr = (bz_array_t*)parts_arr;
+    if (!arr || !value) return;
+    char* flat; int64_t flen;
+    bz_strbuilder_to_string(parts_arr, &flat, &flen);  // current content
+    if (index < 0 || index > flen) { free(flat); return; }  // no-op on OOB
+    auto* v = (bz_string_struct*)value;
+    int64_t vbytes = v->len * v->width;
+    int64_t total = flen + vbytes;
+    char* buf = (char*)malloc((size_t)(total + 1));
+    memcpy(buf, flat, (size_t)index);                  // prefix
+    memcpy(buf + index, v->data, (size_t)vbytes);      // inserted value
+    memcpy(buf + index + vbytes, flat + index,
+           (size_t)(flen - index));                    // suffix
+    buf[total] = '\0';
+    free(flat);
+    bz_sb_reset_to(arr, buf, total);
+}
+
+void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length) {
+    auto* arr = (bz_array_t*)parts_arr;
+    if (!arr) return;
+    char* flat; int64_t flen;
+    bz_strbuilder_to_string(parts_arr, &flat, &flen);
+    // §3.1 / §9.6 Remove: start and length must denote a valid range; an
+    // out-of-range request is a no-op here (the SB is unchanged).
+    if (length < 0 || start_index < 0 || start_index + length > flen) {
+        free(flat);
+        return;
+    }
+    int64_t total = flen - length;
+    char* buf = (char*)malloc((size_t)(total + 1));
+    memcpy(buf, flat, (size_t)start_index);            // prefix
+    memcpy(buf + start_index, flat + start_index + length,
+           (size_t)(flen - start_index - length));     // suffix
+    buf[total] = '\0';
+    free(flat);
+    bz_sb_reset_to(arr, buf, total);
+}
+
+void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value) {
+    auto* arr = (bz_array_t*)parts_arr;
+    if (!arr || !old_value || !new_value) return;
+    auto* ov = (bz_string_struct*)old_value;
+    auto* nv = (bz_string_struct*)new_value;
+    int64_t obytes = ov->len * ov->width;
+    if (obytes <= 0) return;                            // empty oldValue: no-op
+    char* flat; int64_t flen;
+    bz_strbuilder_to_string(parts_arr, &flat, &flen);
+    int64_t nbytes = nv->len * nv->width;
+    // First pass: count occurrences to size the result exactly.
+    int64_t occ = 0;
+    for (int64_t i = 0; i + obytes <= flen;) {
+        if (memcmp(flat + i, ov->data, (size_t)obytes) == 0) { occ++; i += obytes; }
+        else i++;
+    }
+    if (occ == 0) { free(flat); return; }              // nothing to do
+    int64_t total = flen + occ * (nbytes - obytes);
+    char* buf = (char*)malloc((size_t)(total + 1));
+    int64_t off = 0;
+    for (int64_t i = 0; i < flen;) {
+        if (i + obytes <= flen &&
+            memcmp(flat + i, ov->data, (size_t)obytes) == 0) {
+            memcpy(buf + off, nv->data, (size_t)nbytes);
+            off += nbytes;
+            i += obytes;
+        } else {
+            buf[off++] = flat[i++];
+        }
+    }
+    buf[total] = '\0';
+    free(flat);
+    bz_sb_reset_to(arr, buf, total);
 }
 
 // per §32.5/§32.6: re-encode a bz_string's code points to a fresh,
