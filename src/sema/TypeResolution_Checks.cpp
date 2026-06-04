@@ -129,6 +129,27 @@ void Resolver::checkAsyncModifiers() {
     }
 }
 
+namespace {
+
+// §30.1 / §30.6 / §30.7: the admitted return types for an `async` callable.
+// `Task` / `Task<T>` / `OwnedTask<T>` cover the value/borrow/owned result
+// patterns (§30.5); the six async-iterator interfaces (§30.7) cover async
+// `yield`. A bare single-identifier Named type (no nullable, no namespace
+// qualifier) whose head is one of these names is admitted; the generic arity
+// is the resolver's separate concern. Anything else (a value type, a sync
+// `IEnumerable<T>`, a plain class, or no declared return type) is rejected.
+bool isAdmittedAsyncReturnType(const ast::Type* rt) {
+    if (!rt) return false;                              // no return type → unit
+    if (rt->kind != ast::TypeKind::Named || rt->nullable) return false;
+    if (!rt->name || rt->name->parts.size() != 1) return false;
+    std::string_view head = rt->name->parts.front();
+    return head == "Task" || head == "OwnedTask" ||
+           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
+           head == "OwnedAsyncEnumerable" || head == "OwnedAsyncEnumerator";
+}
+
+}  // namespace
+
 void Resolver::checkTypeAsyncModifiers(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* ms = dynamic_cast<MethodSymbol*>(m);
@@ -140,6 +161,23 @@ void Resolver::checkTypeAsyncModifiers(TypeSymbol* t) {
                 "` may not be both `async` and `abstract`; declare a "
                 "`Task` / `Task<T>` return type without `async` "
                 "(§12.6)");
+        }
+        // §30.1: an `async` method's declared return type must be one of the
+        // admitted async forms (`Task` / `Task<T>` / `OwnedTask<T>`, or an
+        // async-iterator interface, §30.7). A non-async return type — including
+        // a missing one (the implicit unit return) — is a compile error. The
+        // `async abstract` combination is already diagnosed above; we still run
+        // the return-type check on it so the more specific cause is also named.
+        if (hasMod(ms, "async")) {
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (md && !isAdmittedAsyncReturnType(md->returnType.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("`async` method `") + std::string(ms->name) +
+                    "` must declare a `Task`, `Task<T>`, or `OwnedTask<T>` "
+                    "return type (or an async-iterator interface), not a "
+                    "non-async return type (§30.1)");
+            }
         }
     }
 }

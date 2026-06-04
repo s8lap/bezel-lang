@@ -107,6 +107,14 @@ private:
     // for the §22.8 rule that initializers may not observe instance
     // state (`this`, `base`, instance members).
     bool inFieldInitializer_ = false;
+    // async-readiness 3b (§30.2 / Appendix C.6): true while walking the body
+    // of an `async` method or `async` lambda — the contexts where `await` is
+    // valid. Reset to false across every lambda boundary (a non-async lambda
+    // nested in an async method is itself a synchronous context) and set from
+    // the lambda's `isAsync` flag. Static field initializers and static
+    // constructors are never async, so an `await` there is rejected by this
+    // gate without special-casing (Appendix C.6).
+    bool inAsyncContext_ = false;
 
     // per §24.3: when about to visit an event-handler lambda argument
     // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this
@@ -164,6 +172,13 @@ private:
     // produce a value? No ascription → no (unit). An ascription that
     // resolves to the unit type → no. Anything else → yes.
     bool returnsValue(const ast::Type* rt);
+
+    // async-readiness 3b (§30.1): compute the return-FORM context and the
+    // result-assignability type for an `async` method's body by peeling the
+    // task wrapper. `Task` → VoidMethod (no result); `Task<T>` / `OwnedTask<T>`
+    // → ValueMethod with result type T; everything else → VoidMethod.
+    void asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
+                               TypeRef*& outType);
 
     // Slice S21 (§21.7) return-statement form rules:
     //  - constructor / destructor: `return expression;` is an error.
