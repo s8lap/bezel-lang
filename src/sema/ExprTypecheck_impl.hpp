@@ -326,6 +326,49 @@ private:
                                   const ast::Expr* target,
                                   TypeSymbol* parent);
 
+    // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
+    // type-argument inference. A generic method whose type parameter appears
+    // ONLY in the return type (`Create<T>(): T`) cannot have T inferred from
+    // arguments, and Bezel has no call-site type-argument syntax (§A.7
+    // PrimarySuffix has no `<...>` form), so T must be solved from the call
+    // site's *target* type — the same "target type" the spec already uses for
+    // collection literals (§15.4) and the `new()` shorthand (§17.7).
+    //
+    // If `ce` resolves to a generic method with one or more type parameters
+    // left unbound by its arguments, this unifies the method's declared return
+    // type against `target` to solve them. On success it re-types the CallExpr
+    // to the substituted return type and returns true; on failure (no
+    // applicable generic method, the params are already bound by arguments, or
+    // the return type does not unify with `target`) it returns false and
+    // leaves the call's type untouched. `target` may be null, in which case
+    // the routine only reports whether the call *needs* inference (via
+    // `outNeedsInfer`) without solving anything — the caller uses that to emit
+    // the "cannot infer" diagnostic in a no-target context (§15.4 / §17.7:
+    // inference is not available for `var` without annotation).
+    bool inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
+                                   bool* outNeedsInfer);
+
+    // Recursive unification of a declared return TypeRef against a concrete
+    // target TypeRef, binding any type-parameter names in `paramNames` into
+    // `solved`. Returns false on a structural mismatch that prevents solving.
+    bool unifyReturnAgainstTarget(
+        const TypeRef* declared, const TypeRef* target,
+        const std::unordered_set<std::string_view>& paramNames,
+        std::unordered_map<std::string_view, TypeRef*>& solved);
+
+    // Build the substituted form of a declared return TypeRef, replacing each
+    // type-parameter name in `solved` with its concrete TypeRef. Returns
+    // `declared` unchanged when nothing applies.
+    TypeRef* substituteReturnType(
+        TypeRef* declared,
+        const std::unordered_map<std::string_view, TypeRef*>& solved);
+
+    // per §14.1 + §A.7 (issue #391): emit the "cannot infer the type argument"
+    // diagnostic when `ce` calls a generic method whose return-only type
+    // parameter cannot be solved because the call sits in a no-target context
+    // (a bare expression/discard statement, or a `var` without annotation).
+    void reportNoTargetInferenceIfNeeded(const ast::CallExpr& ce);
+
     // §24.3: the event visibility fence. Outside the declaring class, an
     // event member's static type is `IEvent<T>` / `IAsyncEvent<T>`, which
     // exposes only `Subscribe`. The producer-side operations `Raise` /

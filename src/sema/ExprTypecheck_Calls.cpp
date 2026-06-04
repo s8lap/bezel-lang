@@ -1127,6 +1127,216 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
     return declared;
 }
 
+// issue #391 helper: collect the subset of `paramNames` that the declared
+// return TypeRef syntactically references (a bare declaration-less Named whose
+// single name part is the parameter name), recursing into generic arguments.
+static void collectReturnParamNames(
+    const TypeRef* t,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_set<std::string_view>& out) {
+    if (!t) return;
+    if (t->kind == TypeRef::Kind::Named && !t->declaration && t->astNode &&
+        t->astNode->name && t->astNode->name->parts.size() == 1 &&
+        paramNames.count(t->astNode->name->parts[0]))
+        out.insert(t->astNode->name->parts[0]);
+    for (auto* ga : t->genericArgs)
+        collectReturnParamNames(ga, paramNames, out);
+}
+
+// per §14.1/§14.2 + §A.7 (issue #391) — see the header comment on this
+// helper. Recursively unify a declared return TypeRef against the concrete
+// target, binding type-parameter names into `solved`.
+bool ExprTC::unifyReturnAgainstTarget(
+    const TypeRef* declared, const TypeRef* target,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_map<std::string_view, TypeRef*>& solved) {
+    if (!declared || !target) return false;
+    // A bare type-parameter reference resolves to a Named TypeRef with no
+    // declaration whose single name part is the parameter name (the parameter
+    // is an in-scope name with a null symbol; TypeResolution leaves it
+    // declaration-less). Binding it solves the parameter.
+    if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
+        declared->astNode && declared->astNode->name &&
+        declared->astNode->name->parts.size() == 1) {
+        std::string_view nm = declared->astNode->name->parts[0];
+        if (paramNames.count(nm)) {
+            // `: T?` against a target T binds T to the target's non-nullable
+            // form, mirroring how `T?` is the nullable companion of T (§14.2).
+            TypeRef* bound = const_cast<TypeRef*>(target);
+            if (declared->nullable && target->nullable) {
+                TypeRef* nn = ctx_.makeTypeRef(*target);
+                nn->nullable = false;
+                bound = nn;
+            }
+            auto it = solved.find(nm);
+            if (it != solved.end()) {
+                // Already bound elsewhere — only consistent if it agrees.
+                return it->second && bound &&
+                       it->second->declaration == bound->declaration &&
+                       it->second->primitive == bound->primitive &&
+                       it->second->kind == bound->kind;
+            }
+            solved[nm] = bound;
+            return true;
+        }
+        // A non-parameter declaration-less Named (e.g. a stdlib built-in) that
+        // carries no parameter: treat as opaque, succeed without solving.
+        return true;
+    }
+    // A constructed generic return type (`Box<T>`) unifies structurally
+    // against a same-shaped target (`Box<Widget>`): same declaration and arg
+    // count, recurse pairwise so the nested T is solved from the target's arg.
+    if (declared->kind == TypeRef::Kind::Named && declared->declaration &&
+        target->kind == TypeRef::Kind::Named &&
+        declared->declaration == target->declaration &&
+        declared->genericArgs.size() == target->genericArgs.size()) {
+        for (std::size_t i = 0; i < declared->genericArgs.size(); ++i) {
+            if (!unifyReturnAgainstTarget(declared->genericArgs[i],
+                                          target->genericArgs[i], paramNames,
+                                          solved))
+                return false;
+        }
+        return true;
+    }
+    // No type parameter is involved (concrete vs concrete) — nothing to solve;
+    // succeed so a return type that is partly concrete does not block the
+    // parameter-bearing parts from solving above.
+    return true;
+}
+
+// per §14.1 (issue #391) — see the header comment. Rebuild a declared return
+// TypeRef with each solved type-parameter name replaced by its concrete
+// TypeRef.
+TypeRef* ExprTC::substituteReturnType(
+    TypeRef* declared,
+    const std::unordered_map<std::string_view, TypeRef*>& solved) {
+    if (!declared) return declared;
+    // Bare parameter → its solved concrete type (carrying a `T?` annotation
+    // through to the substituted type's nullable form).
+    if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
+        declared->astNode && declared->astNode->name &&
+        declared->astNode->name->parts.size() == 1) {
+        auto it = solved.find(declared->astNode->name->parts[0]);
+        if (it != solved.end() && it->second) {
+            TypeRef* sub = it->second;
+            if (declared->nullable && !sub->nullable) {
+                TypeRef* nn = ctx_.makeTypeRef(*sub);
+                nn->nullable = true;
+                return nn;
+            }
+            return sub;
+        }
+        return declared;
+    }
+    // Constructed generic → substitute each generic argument in place.
+    if (declared->kind == TypeRef::Kind::Named && declared->declaration &&
+        !declared->genericArgs.empty()) {
+        bool changed = false;
+        std::vector<TypeRef*> newArgs;
+        newArgs.reserve(declared->genericArgs.size());
+        for (auto* ga : declared->genericArgs) {
+            TypeRef* sub = substituteReturnType(ga, solved);
+            if (sub != ga) changed = true;
+            newArgs.push_back(sub);
+        }
+        if (!changed) return declared;
+        TypeRef* result = ctx_.makeTypeRef(*declared);
+        result->genericArgs = std::move(newArgs);
+        return result;
+    }
+    return declared;
+}
+
+// per §14.1/§14.2 + §A.7 (issue #391) — see the header comment. Solve a
+// generic method's return-only type parameters from the call's target type.
+bool ExprTC::inferReturnTargetTypeArgs(const ast::CallExpr& ce, TypeRef* target,
+                                       bool* outNeedsInfer) {
+    if (outNeedsInfer) *outNeedsInfer = false;
+    if (!ce.callee) return false;
+    // The callee must resolve to a generic method (its own `<T>` params).
+    auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce.callee));
+    if (!ms) return false;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || md->genericParams.empty() || !md->returnType) return false;
+
+    // Determine which type parameters are already bound by an argument: a
+    // value parameter whose declared type is exactly the bare parameter name
+    // (mirrors codegen's argument-inference loop and §14.1). These never need
+    // a target — the argument solves them.
+    std::unordered_set<std::string_view> paramNames;
+    for (const auto& gp : md->genericParams) paramNames.insert(gp.name);
+    std::unordered_set<std::string_view> boundByArg;
+    for (const auto& p : md->params) {
+        const ast::Type* pt = p.type.get();
+        if (pt && pt->kind == ast::TypeKind::Named && pt->name &&
+            pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0]))
+            boundByArg.insert(pt->name->parts[0]);
+    }
+
+    // The unbound parameters are those a target must solve. If every parameter
+    // is bound by an argument, this is the ordinary argument-inferred case and
+    // the return-target path does not apply.
+    std::unordered_set<std::string_view> unbound;
+    for (const auto& gp : md->genericParams)
+        if (!boundByArg.count(gp.name)) unbound.insert(gp.name);
+    if (unbound.empty()) return false;
+
+    // The declared return type must actually mention an unbound parameter for
+    // a target to be able to solve it; otherwise inference is neither possible
+    // nor needed (e.g. an unbound parameter used only in a `where`-clause type
+    // bound is out of scope here — deferred).
+    TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+    if (!retTy) return false;
+    std::unordered_set<std::string_view> mentioned;
+    collectReturnParamNames(retTy, unbound, mentioned);
+    if (mentioned.empty()) return false;
+
+    // At this point the call genuinely needs a target to resolve. Report that
+    // to the caller so the no-target context can diagnose.
+    if (outNeedsInfer) *outNeedsInfer = true;
+    if (!target) return false;
+
+    // Solve the unbound parameters by unifying the declared return type
+    // against the target type.
+    std::unordered_map<std::string_view, TypeRef*> solved;
+    if (!unifyReturnAgainstTarget(retTy, target, unbound, solved))
+        return false;
+    // Require every unbound parameter the return type references to be solved.
+    for (auto nm : mentioned)
+        if (!solved.count(nm)) return false;
+
+    // Re-type the call to the substituted return type (§14.1). Codegen
+    // monomorphizes generic-method calls by re-deriving the substitution at
+    // the call site; see the issue note about the codegen-side consumption of
+    // a return-target-inferred argument.
+    TypeRef* substituted = substituteReturnType(retTy, solved);
+    if (substituted) ctx_.setExprType(&ce, substituted);
+    return true;
+}
+
+// per §14.1 + §A.7 (issue #391) — see the header comment. Diagnose a
+// return-only generic call in a no-target context.
+void ExprTC::reportNoTargetInferenceIfNeeded(const ast::CallExpr& ce) {
+    bool needsInfer = false;
+    // Pass a null target: the routine then only reports whether the call needs
+    // a target to resolve, without solving or re-typing anything.
+    inferReturnTargetTypeArgs(ce, /*target=*/nullptr, &needsInfer);
+    if (!needsInfer) return;
+    std::string methodName;
+    if (auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce.callee)))
+        methodName = std::string(ms->name);
+    std::string what = methodName.empty()
+                           ? std::string("this generic method's call")
+                           : ("`" + methodName + "`'s call");
+    ctx_.diagnostics().report(
+        Severity::Error, ce.span.begin,
+        "cannot infer the type argument of " + what +
+            " from its arguments; it appears only in the return type, so a "
+            "target type is required — assign the result to a typed local "
+            "(`var x: T := ...`) or return it from a method with a declared "
+            "return type (§14.1, §A.7)");
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // per §24.3: the event visibility fence. When the access target resolves
     // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
