@@ -169,6 +169,7 @@ set(BEZEL_TEST_SOURCES
     codegen/float_test.cpp
     codegen/enum_test.cpp
     codegen/nullable_enum_test.cpp
+    codegen/nullable_record_test.cpp
     codegen/ffi_test.cpp
     codegen/case_expr_test.cpp
     codegen/finally_test.cpp

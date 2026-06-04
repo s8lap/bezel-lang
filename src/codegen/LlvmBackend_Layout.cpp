@@ -177,6 +177,20 @@ bool Emitter::isNullableEnumTy(const sema::TypeRef* rt) {
 }
 
 
+// per §7.2 / §8.6 / issue #416: a NULLABLE RECORD (a nullable Named TypeRef
+// whose declaration is a record) is a value type that lacked a null
+// representation — a non-nullable record lowers to a bare by-value struct
+// (§9.4), so `record?` stayed the bare struct and `null` collided with a real
+// value. It now lowers, like the value primitives and enums, to the tagged
+// {i8 hasValue; <record payload>} struct, so null is representable and distinct
+// from every record value (lowerTypeRef / nullableValueStructTy below).
+bool Emitter::isNullableRecordTy(const sema::TypeRef* rt) {
+    return rt && rt->nullable &&
+           rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Record;
+}
+
+
 // per §8.3/§9.1: a nullable reference type lowers to a plain `ptr` whose null
 // is a real null pointer (no hasValue tag). The synthesized value-semantics
 // members must null-guard a field of such a type before dereferencing it.
@@ -432,6 +446,23 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
 }
 
 
+// The tagged struct for a nullable value type (prim, enum, or record). For an
+// enum the value slot is the underlying integer (i32 — CG44); for a record
+// (§9.4 / issue #416) it is the bare record struct (recordStruct); for a value
+// primitive it is the primitive's LLVM type. Defined here (not inline in the
+// header) because the record case needs recordStruct.
+llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
+    if (isNullableEnumTy(rt))
+        return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), i32()});
+    // per §7.2 / §8.6 / issue #416: a nullable record's payload is the bare
+    // record struct, so the tag distinguishes null from any record value.
+    if (isNullableRecordTy(rt))
+        return llvm::StructType::get(
+            llvm_, {nullablePrimHasValTy(), recordStruct(rt->declaration)});
+    return nullablePrimStructTy(rt->primitive);
+}
+
+
 llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!te.operand || !te.testType) return nullptr;
     llvm::Value* obj = lowerExpr(*te.operand);
@@ -472,12 +503,12 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (te.op == "as") {
         // §17.4: `x as T` for a VALUE-type target unboxes — load the value
         // bytes out of the box `{ vtable*, value-bytes }` (offset = one word).
-        // For a value primitive the result is `T?` (a tagged {hasValue, value}
-        // struct). For a record the result is the unboxed bare record struct
-        // (the tagged nullable-record representation is deferred — finding 11).
-        // A reference-type target keeps the #399 behavior (the pointer IS the
-        // value). The payload load is guarded by `isA` so a failed cast (or a
-        // null operand) never dereferences the box.
+        // For a value primitive OR a record (issue #416) the result is `T?` (a
+        // tagged {hasValue, value} struct — non-null on a compatible unbox, null
+        // otherwise per §8.6 "Unboxing reverses the process"). A reference-type
+        // target keeps the #399 behavior (the pointer IS the value). The payload
+        // load is guarded by `isA` so a failed cast (or a null operand) never
+        // dereferences the box.
         if (isBoxableValueType(rt)) {
             llvm::Type* valTy = lowerTypeRef(rt);
             auto* loadBB = llvm::BasicBlock::Create(llvm_, "unbox.load",
@@ -495,9 +526,17 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             builder_.CreateBr(contBB);
 
             builder_.SetInsertPoint(contBB);
-            if (rt->kind == sema::TypeRef::Kind::Primitive) {
-                // §8.6: a value primitive unboxes to a non-null T? on success,
-                // null on failure.
+            if (rt->kind == sema::TypeRef::Kind::Primitive ||
+                isNullableRecordTy(rt) ||
+                (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+                 rt->declaration->kind == ast::TypeDeclKind::Record)) {
+                // §8.6 / §17.4 (issue #416): a value primitive or record unboxes
+                // to a non-null T? on a compatible cast, a null T? otherwise. The
+                // result is the tagged {hasValue, payload} struct: hasValue=1 +
+                // the loaded payload on success, the zero struct on failure. For
+                // a record the payload is the bare record struct; for a primitive
+                // it is the scalar. `rt` is the (non-nullable) target type, so
+                // build the nullable form's tagged struct.
                 sema::TypeRef tmp = *rt;
                 tmp.nullable = true;
                 auto* nst = nullableValueStructTy(&tmp);
@@ -513,9 +552,9 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                     llvm::UndefValue::get(nst), hvPhi, {0u});
                 return builder_.CreateInsertValue(res, valPhi, {1u});
             }
-            // Record (aggregate) value type: the unboxed bare struct on success;
-            // a zeroed struct on a failed cast (a record null-sentinel is
-            // deferred — finding 11; success-path round-trip is the fix here).
+            // Other boxable value kinds (enum) — unboxed bare value on success;
+            // zeroed on a failed cast (the nullable-enum tag form via `as` is a
+            // separate item).
             auto* recPhi = builder_.CreatePHI(valTy, 2);
             recPhi->addIncoming(loaded, loadBB);
             recPhi->addIncoming(llvm::Constant::getNullValue(valTy), preBB);
@@ -1250,12 +1289,30 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
     //  - a temporary record value (e.g. a freshly returned record) → spill
     //    it to a stack slot and GEP that.
     if (ms->parent->kind == ast::TypeDeclKind::Record) {
+        // §7.2 / §7.4 / issue #416: when the target is a NULLABLE record
+        // (`b: Box?`, member-accessed after `if b <> null`), its storage is the
+        // tagged {i8 hasValue; <record payload>} struct, not the bare record
+        // struct. Sema permits this access (the §7.4 narrowing keeps the
+        // declared type, which is still `Box?` at codegen); the payload lives at
+        // tag-struct index 1, so GEP into the payload first and then the field.
+        // A failed runtime null (hasValue=0) is the caller's `!`/narrowing
+        // responsibility — fieldAddr just locates the field address.
+        bool nullableRecordTarget = false;
+        if (sema::TypeRef* tt = ctx_.exprType(*ma.target))
+            nullableRecordTarget = isNullableRecordTy(tt);
         // CG29: prefer lvalue address so writes go to the original
         // memory (e.g. grid[2].Cells[x] := v must update grid[2],
         // not a stack copy). Fall back to lowerExpr for temporaries
         // (e.g. a freshly returned record value).
         llvm::Value* base = nullptr;
         llvm::Type* baseTy = nullptr;
+        // The struct the base pointer points at: the bare record struct, or the
+        // tagged nullable-record struct when the target is a `record?`.
+        llvm::StructType* baseStruct =
+            nullableRecordTarget
+                ? llvm::StructType::get(llvm_,
+                      {nullablePrimHasValTy(), st})
+                : st;
         if (llvm::AllocaInst* slot = localSlot(*ma.target)) {
             // §27.5: a captured record local lives in its shared cell.
             llvm::Type* ety = nullptr;
@@ -1268,11 +1325,16 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                 if (obj->getType()->isPointerTy()) {
                     base = obj;
                 } else {
-                    llvm::Value* tmp = entryAlloca(st);
+                    llvm::Value* tmp = entryAlloca(obj->getType());
                     builder_.CreateStore(obj, tmp);
                     base = tmp;
                 }
             }
+        }
+        if (nullableRecordTarget) {
+            // Step into the payload (tag-struct index 1) to reach the bare
+            // record struct, then GEP the field on it below.
+            base = builder_.CreateStructGEP(baseStruct, base, 1, "nr.payload");
         }
         elemTy = st->getElementType(idxIt->second);
         return builder_.CreateStructGEP(st, base, idxIt->second);

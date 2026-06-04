@@ -543,6 +543,61 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // method `?.` are deferred.
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (!nm->target) return nullptr;
+        // §7.5 / issue #416: `b?.V` on a NULLABLE RECORD. The target lowers to
+        // the tagged {i8 hasValue; <record payload>} struct, not a pointer, so
+        // the reference-member path below is bypassed. If hasValue is false the
+        // result is null; otherwise extract the payload field and lift it to the
+        // (always-nullable) result type of §7.5 — a value-typed field wraps into
+        // its tagged `T?`, a reference-typed field stays a (possibly-null) ptr.
+        if (auto* tt = ctx_.exprType(*nm->target)) {
+            if (isNullableRecordTy(tt)) {
+                llvm::Value* nv = lowerExpr(*nm->target);
+                if (!nv || !nv->getType()->isStructTy()) return nullptr;
+                auto* ms = storageMemberOf(ctx_.exprSymbol(e));
+                if (!ms || !ms->parent) return nullptr;
+                auto idxIt = fieldIndex_.find(ms);
+                if (idxIt == fieldIndex_.end()) return nullptr;
+                llvm::Value* hasVal = nullablePrimHasValue(nv);       // i1
+                llvm::Value* payload = nullablePrimValue(nv);         // record
+                llvm::Value* fieldVal =
+                    builder_.CreateExtractValue(payload, {idxIt->second});
+                // Lift the field value to the §7.5 (always-nullable) result. Sema
+                // does not record a TypeRef for the `?.` node, so derive the form
+                // from the field's own type: a reference-typed field is a nullable
+                // ptr (null when the receiver is null); a field that is ALREADY a
+                // nullable value (the tagged struct) passes through unwrapped but
+                // forced null when the receiver is null; any other value-typed
+                // field wraps into its tagged {i8 hasValue; field value} `T?`.
+                const sema::TypeRef* fieldTy = recordMemberType(ms);
+                if (fieldVal->getType()->isPointerTy()) {
+                    // Reference-typed field → null when the receiver is null,
+                    // else the field pointer.
+                    return builder_.CreateSelect(
+                        hasVal, fieldVal,
+                        llvm::ConstantPointerNull::get(ptrTy()));
+                }
+                if (fieldTy && isNullableValueTy(fieldTy) &&
+                    fieldVal->getType()->isStructTy()) {
+                    // Field already nullable: AND its own hasValue with the
+                    // receiver's so a null receiver yields null.
+                    llvm::Value* innerHas = nullablePrimHasValue(fieldVal);
+                    llvm::Value* combined = builder_.CreateAnd(hasVal, innerHas);
+                    return builder_.CreateInsertValue(
+                        fieldVal,
+                        builder_.CreateZExt(combined, nullablePrimHasValTy()),
+                        {0u});
+                }
+                // Value-typed (non-nullable) field → tagged {hasValue, fieldVal},
+                // with the receiver's run-time hasValue tag.
+                auto* nst = llvm::StructType::get(
+                    llvm_, {nullablePrimHasValTy(), fieldVal->getType()});
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst),
+                    builder_.CreateZExt(hasVal, nullablePrimHasValTy()), {0u});
+                res = builder_.CreateInsertValue(res, fieldVal, {1u});
+                return res;
+            }
+        }
         llvm::Value* obj = lowerExpr(*nm->target);
         if (!obj || !obj->getType()->isPointerTy()) return nullptr;
         auto* ms = storageMemberOf(ctx_.exprSymbol(e));
@@ -1543,6 +1598,29 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         llvm::Value* eq = emitInlineArrayEquality(
             l, r, llvm::cast<llvm::ArrayType>(l->getType()), elemTy);
         return op == "=" ? eq : builder_.CreateNot(eq);
+    }
+    // §8.4 / issue #416: BOTH sides are nullable value types (the tagged
+    // {i8 hasValue; T value} struct) — e.g. `record? = record?`, `int? = int?`,
+    // `enum? = enum?`. Route to emitValueEquality's nullable-value branch, which
+    // applies the null-safe `=` (both-null → equal; one-null → not-equal;
+    // neither-null → inner T equality). This must precede the bare struct path
+    // below: a nullable RECORD now lowers to the tagged struct too, so without
+    // this it would reach emitStructEquality with the wrong (tag) shape.
+    if ((op == "=" || op == "<>") && l->getType()->isStructTy() &&
+        l->getType() == r->getType()) {
+        const sema::TypeRef* nvTy = nullptr;
+        for (const ast::Expr* side : {bin.left.get(), bin.right.get()}) {
+            if (!side) continue;
+            if (auto* t = ctx_.exprType(*side))
+                if (isNullableValueTy(t) &&
+                    l->getType() == nullableValueStructTy(t)) {
+                    nvTy = t; break;
+                }
+        }
+        if (nvTy) {
+            llvm::Value* eq = emitValueEquality(l, r, nvTy);
+            return op == "=" ? eq : builder_.CreateNot(eq);
+        }
     }
     // CG29b (§8.3): records compare structurally — dispatch before the
     // scalar integer path (ICmp doesn't accept struct operands). Recover the
