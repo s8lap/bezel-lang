@@ -493,6 +493,13 @@ private:
 
     void typeUnary(const ast::UnaryExpr& ue);
 
+    // §28.8.1 / §28.11 (issue #423): if `operand` is `coll[i]` whose receiver
+    // `coll` has an INTERFACE static type, return the interface type name;
+    // otherwise the empty string. `move coll[i]` is admitted only on the
+    // enumerated concrete owning receivers (§28.11) — an interface is not one of
+    // them — so a non-empty result is rejected by `typeUnary`'s `move` branch.
+    std::string moveThroughInterfaceSlotName(const ast::Expr& operand) const;
+
     void visitChildren(const ast::Expr& e);
 };
 
