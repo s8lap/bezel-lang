@@ -197,6 +197,7 @@ set(BEZEL_TEST_SOURCES
     codegen/conversion_test.cpp
     codegen/numeric_conversion_test.cpp
     codegen/move_expr_test.cpp
+    codegen/move_collection_slot_test.cpp
     codegen/default_args_test.cpp
     codegen/named_args_test.cpp
     codegen/overload_test.cpp

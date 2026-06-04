@@ -119,6 +119,131 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
 }
 
 
+// issue #409 / language spec §28.8.1 / §28.11: lower `move coll[i]` (the
+// slot-take form) on an OWNING heap collection (OwnedArray / OwnedDictionary).
+// The element is read out as an owned value AND the slot is left in moved-from
+// state — for these runtime-backed collections a moved-from slot is a NULL slot.
+// The collection's element-disposer (bz_array_free / bz_dict_free) already skips
+// null slots, so nulling here prevents the collection's later Dispose from
+// re-freeing the element that the new owner now owns (the #409 double-free).
+//
+// Mirrors lowerCollectionIndexerGet for the read, then issues a NON-disposing
+// slot store of null (the value was moved out, not displaced — there is nothing
+// to dispose at the slot, per §28.11's "indexer setter on a moved-from slot").
+// Returns nullptr if `ix` is not an owning-collection slot, so callers fall
+// through to the ordinary borrowing-read lowering (a borrow does not null the
+// slot — §28.11). The index/key expression is evaluated exactly once.
+llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
+    if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
+        return nullptr;
+    auto* recvTy = ctx_.exprType(*ix.target);
+    bool isArr  = isCollectionTypeName(recvTy);
+    bool isDict = isDictTypeName(recvTy);
+    if (!isArr && !isDict) return nullptr;
+
+    // --- OwnedArray<T> slot-move (§28.11; admitted only on owning arrays) ----
+    if (isArr) {
+        // Only an OWNING array's slot carries ownership to transfer; a borrowing
+        // Array<T> slot is a borrow and `move arr[i]` is rejected by sema. Guard
+        // on the disposer so a non-owning array (defensively) never nulls a slot.
+        if (!owningCollectionElemDisposer(recvTy)) return nullptr;
+        llvm::Value* recv = lowerExpr(*ix.target);
+        if (!recv) return nullptr;
+        llvm::Value* idx = lowerExpr(*ix.indices[0].value);   // evaluate once
+        if (!idx) return nullptr;
+        idx = idx->getType()->isIntegerTy(64) ? idx
+            : builder_.CreateSExt(idx, i64());
+        // §31.2 / §28.11: out-of-range raises before any slot is moved-from.
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+        llvm::Value* oor = builder_.CreateICmpUGE(idx, len, "mv.oor");
+        emitGuardThrow(oor, "IndexOutOfRangeException");
+        int64_t esz = collectionElemSize(recvTy);
+        llvm::Type* retTy = ptrTy();
+        if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+            if (auto* et = lowerTypeRef(recvTy->genericArgs[0])) retTy = et;
+        // Read the owned element out of the slot.
+        llvm::AllocaInst* out = entryAlloca(retTy);
+        auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
+        llvm::Value* moved = builder_.CreateLoad(retTy, out, "mv.elem");
+        // Leave the slot moved-from (null). NON-disposing set: the element was
+        // taken out, not displaced — there is no previous value to dispose
+        // (§28.11 "indexer setter on a moved-from slot").
+        llvm::AllocaInst* nullSlot = entryAlloca(retTy);
+        builder_.CreateStore(llvm::Constant::getNullValue(retTy), nullSlot);
+        auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(setFn,
+                            {recv, idx, nullSlot, builder_.getInt64(esz)});
+        return moved;
+    }
+
+    // --- OwnedDictionary<K,V> slot-move (§28.11 / §4.9) ---------------------
+    // Only an owning dictionary's value carries ownership; a borrowing
+    // Dictionary<K,V> value is a borrow and `move dict[key]` is rejected by
+    // sema. The owned thing is the VALUE (genericArgs[1]).
+    bool owningDict =
+        recvTy && recvTy->astNode && recvTy->astNode->name &&
+        !recvTy->astNode->name->parts.empty() &&
+        recvTy->astNode->name->parts[0] == "OwnedDictionary" &&
+        collectionElemIsClass(recvTy, 1);
+    if (!owningDict) return nullptr;
+    llvm::Value* recv = lowerExpr(*ix.target);
+    if (!recv) return nullptr;
+    const sema::TypeRef* keyTy =
+        genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
+    bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+    // An owning dictionary owns class-typed VALUES, so the stored void* is the
+    // owned object pointer; no scalar/record decode is needed (collectionElemIsClass
+    // on the value already gated this path).
+
+    llvm::Value* k = lowerExpr(*ix.indices[0].value);     // evaluate once
+    if (!k) return nullptr;
+    auto* tmpSlot = entryAlloca(ptrTy());
+    llvm::Value* found;
+    llvm::Value* keyPtr = nullptr;     // generic-key path needs it again to null
+    llvm::Value* kd = nullptr;         // string-key path needs it again to null
+    llvm::Value* kl = nullptr;
+    if (keyTy) {
+        keyPtr = k;
+        if (!(keyIsRecord && k->getType()->isPointerTy())) {
+            llvm::AllocaInst* slot = entryAlloca(k->getType());
+            builder_.CreateStore(k, slot);
+            keyPtr = slot;
+        }
+        auto* fn = declareC("bz_dict_try_get_gen", i1(),
+                            {ptrTy(), ptrTy(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, keyPtr, tmpSlot});
+    } else {
+        kd = loadStringData(k);
+        kl = loadStringLen(k);
+        auto* fn = declareC("bz_dict_try_get_str", i1(),
+                            {ptrTy(), ptrTy(), i64(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+    }
+    // §4.8/§4.9: a `move` of an absent key raises, same as the indexer get.
+    emitGuardThrow(builder_.CreateNot(found), "KeyNotFoundException");
+    // The stored void* is the owned value pointer (a class object).
+    llvm::Value* moved = builder_.CreateLoad(ptrTy(), tmpSlot, "mv.val");
+    // Leave the slot moved-from: store null under the existing key via the
+    // NON-disposing setter (the value was taken out, not displaced — §28.11).
+    // bz_dict_free skips null values, so the dict's Dispose won't re-free it.
+    llvm::Value* nullV = llvm::ConstantPointerNull::get(ptrTy());
+    if (keyTy) {
+        auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, keyPtr, nullV});
+    } else {
+        auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), i64(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, nullV});
+    }
+    return moved;   // owned class object pointer, taken out of the slot
+}
+
+
 // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer setter
 // `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwnedArray /
 // OwnedDictionary) the displaced slot/value is disposed exactly once before the
