@@ -47,6 +47,19 @@ private:
     std::unique_ptr<Scope> moduleScope_;
     Scope* currentScope_ = nullptr;
     TypeSymbol* currentType_ = nullptr;
+
+    // §12.7 flow narrowing. When `if x is T` (or the else branch of
+    // `if x is not T`) narrows a simple variable `x` to `T`, an entry maps the
+    // variable's resolved symbol (a LocalSymbol or ParameterSymbol) to the
+    // narrowed TypeRef for the duration of the controlled block. An
+    // IdentifierExpr that resolves to a narrowed symbol takes the narrowed type
+    // in place of its declared one, so member access on it resolves against `T`
+    // (`resolveMemberAccess` reads the target's exprType first). The map is
+    // saved/restored around each controlled block so narrowing never leaks past
+    // it; a reassignment of `x` inside the block drops its entry from that point
+    // (re-widening to the declared type).
+    std::unordered_map<Symbol*, TypeRef*> narrowings_;
+
     // Slice S6: in-progress method static-ness, so visitExpr's
     // IdentifierExpr handling can diagnose `this`/`base` in static
     // member bodies.
@@ -186,6 +199,22 @@ private:
     Symbol* lookupMember(TypeSymbol* type, std::string_view name);
 
     Symbol* lookupName(std::string_view name);
+
+    // §12.7: collect the flow-narrowings that an `if`/`elif` condition
+    // establishes for one branch. `forTrueBranch` selects the controlled
+    // (then) block (`x is T` narrows there; `x is not T` does not) versus the
+    // `else` branch (`x is not T` narrows there; `x is T` does not). Each
+    // narrowing maps the tested variable's resolved symbol to the test type's
+    // resolved TypeRef. `and`-joined tests contribute all their narrowings to
+    // the true branch (§12.7). The condition must already have been visited so
+    // operand symbols and the test type are resolved. Entries are written into
+    // `narrowings_`; the caller saves/restores the map for block scoping.
+    void collectNarrowings(const ast::Expr* cond, bool forTrueBranch);
+
+    // §12.7 helper: if `cond` is a `<simple var> is T` / `is not T` test that
+    // narrows in the requested branch, record the narrowing for the variable's
+    // symbol. Returns true iff a narrowing was applied.
+    bool narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch);
 
     void visitTopDecl(const ast::TopDecl& d);
 

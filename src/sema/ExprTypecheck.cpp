@@ -419,6 +419,70 @@ Symbol* ExprTC::lookupName(std::string_view name) {
     return nullptr;
 }
 
+// §12.7: a single `<simple var> is T` / `is not T` type-test contributes a
+// narrowing to one branch. `x is T` narrows the true branch; `x is not T`
+// narrows the else branch (the spec: in the true branch of `is not T` the
+// value could be many non-T types, so no narrowing). Returns true iff an entry
+// was written into narrowings_.
+bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
+    auto* te = dynamic_cast<const ast::TypeTestExpr*>(cond);
+    if (!te) return false;
+    // Only the type-class tests `is` / `is not` narrow here. (The
+    // nullability tests `is null` / `is not null` change nullability, not the
+    // type-class declaration; they are deferred — see collectNarrowings.)
+    bool narrowsThis;
+    if (te->op == "is") narrowsThis = forTrueBranch;       // true branch
+    else if (te->op == "is not") narrowsThis = !forTrueBranch;  // else branch
+    else return false;                                     // `as` etc.
+    if (!narrowsThis) return false;
+    // The tested expression must be a SIMPLE VARIABLE (§12.7). We narrow
+    // locals and parameters — the unambiguous "simple variable" case. (A bare
+    // field is a `this.f` access whose narrowing would need cross-object
+    // invalidation tracking we don't have; deferred — see collectNarrowings.)
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(te->operand.get());
+    if (!id || id->name == "this" || id->name == "base") return false;
+    Symbol* sym = lookupName(id->name);
+    if (!sym) return false;
+    if (!dynamic_cast<LocalSymbol*>(sym) &&
+        !dynamic_cast<ParameterSymbol*>(sym))
+        return false;
+    // The narrowed type is the test type. It must resolve to a Named type with
+    // a declaration so member lookup can run against it. The narrowed form is
+    // non-nullable (a successful `is T` means the value is a non-null T).
+    if (!te->testType) return false;
+    TypeRef* tt = ctx_.resolvedType(*te->testType);
+    if (!tt || tt->kind != TypeRef::Kind::Named || !tt->declaration)
+        return false;
+    TypeRef* narrowed = tt;
+    if (tt->nullable) {
+        narrowed = ctx_.makeTypeRef(*tt);
+        narrowed->nullable = false;
+    }
+    narrowings_[sym] = narrowed;
+    return true;
+}
+
+// §12.7: collect every flow-narrowing an `if`/`elif` condition establishes for
+// one branch into narrowings_. A single type test narrows per
+// narrowFromTypeTest; `and`-joined tests (`x is T and y is S`) contribute all
+// their narrowings to the combined true branch. The caller has already visited
+// the condition (so operand symbols and test types are resolved) and is
+// responsible for save/restore of narrowings_ around the branch body.
+void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
+    if (!cond) return;
+    if (narrowFromTypeTest(cond, forTrueBranch)) return;
+    // `and`-joined tests: both sides narrow throughout the combined true
+    // branch (§12.7). This does not extend to `or` (where neither side is
+    // guaranteed) nor to the else branch of an `and` (De Morgan would make it
+    // an `or` of negations — no single narrowing holds); those are deferred.
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(cond)) {
+        if (be->op == "and" && forTrueBranch) {
+            collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
+            collectNarrowings(be->right.get(), /*forTrueBranch=*/true);
+        }
+    }
+}
+
 void ExprTC::visitTopDecl(const ast::TopDecl& d) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&d)) {
         TypeSymbol* tsym = nullptr;
@@ -478,6 +542,11 @@ void ExprTC::runMethodBody(
     }
     Scope* save = currentScope_;
     currentScope_ = &methodScope;
+    // §12.7: flow narrowings are method-local — start each body with none.
+    // (The if-statement walk save/restores the map per controlled block, so
+    // this is normally already empty; clearing makes the boundary explicit and
+    // robust to symbol reuse across methods.)
+    narrowings_.clear();
     for (const auto& p : params) {
         if (p.defaultValue) visitExpr(*p.defaultValue);
     }
@@ -821,6 +890,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 reportNoTargetInferenceIfNeeded(*exCall);
         }
     } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // §12.7: "Reassignment within the controlled block invalidates the
+        // narrowing." If the assignment target is the narrowed variable, drop
+        // its narrowing from this point so the rest of the block re-widens it to
+        // its declared type (this also makes the assignability check below use
+        // the declared target type, not the narrowed one). The map is restored
+        // when the block ends. Only a bare-identifier target can match a
+        // narrowed simple variable.
+        if (as->target) {
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                if (tid->name != "this" && tid->name != "base") {
+                    if (Symbol* tsym = lookupName(tid->name))
+                        narrowings_.erase(tsym);
+                }
+            }
+        }
         if (as->target) visitExpr(*as->target);
         // per §24.4: `event += handler` / `event -= handler` — type the
         // handler lambda's param as the event payload `T` (these forms desugar
@@ -883,21 +968,39 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 "catch arm body (§31.5)");
         }
     } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        // §12.7 flow narrowing. Each branch body is walked with the narrowings
+        // its guards establish, restored afterward so they never leak past the
+        // controlled block. The `if`/`elif` bodies see their own condition's
+        // true-branch narrowings; the `else` body sees the else-branch
+        // narrowings of every preceding condition (each one was false). The map
+        // is saved/restored around each body for scoping (and a reassignment
+        // inside a body drops the affected entry — see AssignmentStmt below).
+        auto savedNarrowings = narrowings_;
         if (ifs->ifBranch.condition) {
             visitExpr(*ifs->ifBranch.condition);
             checkConditionIsBool(*ifs->ifBranch.condition, "if");
         }
+        collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/true);
         for (const auto& bs : ifs->ifBranch.body) {
             if (bs) visitStmt(*bs);
         }
+        narrowings_ = savedNarrowings;
         for (const auto& el : ifs->elifBranches) {
             if (el.condition) {
                 visitExpr(*el.condition);
                 checkConditionIsBool(*el.condition, "elif");
             }
+            collectNarrowings(el.condition.get(), /*forTrueBranch=*/true);
             for (const auto& bs : el.body) if (bs) visitStmt(*bs);
+            narrowings_ = savedNarrowings;
         }
+        // The else body: all preceding guards were false, so each contributes
+        // its else-branch narrowing (`x is not T` narrows x to T here).
+        collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/false);
+        for (const auto& el : ifs->elifBranches)
+            collectNarrowings(el.condition.get(), /*forTrueBranch=*/false);
         for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
+        narrowings_ = savedNarrowings;
     } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         if (ws->condition) {
             visitExpr(*ws->condition);

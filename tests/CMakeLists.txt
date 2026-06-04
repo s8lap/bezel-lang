@@ -132,6 +132,7 @@ set(BEZEL_TEST_SOURCES
     sema/generic_return_inference_test.cpp
     sema/extern_ffi_type_test.cpp
     sema/entry_point_test.cpp
+    sema/flow_narrowing_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     codegen/jit_smoke_test.cpp
@@ -230,6 +231,7 @@ set(BEZEL_TEST_SOURCES
     codegen/owned_dict_disposal_test.cpp
     codegen/collection_indexer_test.cpp
     codegen/dict_record_value_indexer_test.cpp
+    codegen/is_narrow_receiver_test.cpp
 
     runtime/event_subscription_test.cpp
 
