@@ -37,6 +37,16 @@ void bz_array_get(void* arr, int64_t idx, void* out, int64_t elem_size);
 // Overwrite the element at `idx` with the elem_size bytes at `elem`.
 void bz_array_set(void* arr, int64_t idx, const void* elem, int64_t elem_size);
 
+// issue #388 / stdlib §4.5: the OwnedArray<T> indexer setter — dispose the
+// (non-null) class-typed element currently at `idx` via `dispose_elem`, then
+// overwrite the slot with the elem_size bytes at `elem`. The element is treated
+// as a pointer-sized object reference (owning collections constrain
+// `where T: class`). `dispose_elem` is null-safe per element. The slot is read
+// BEFORE the store so the displaced owner is disposed exactly once, then the new
+// owner replaces it. Used by OwnedArray<T>'s `set(owned)` indexer (§4.5).
+void bz_array_set_disposing(void* arr, int64_t idx, const void* elem,
+                            int64_t elem_size, void (*dispose_elem)(void*));
+
 // Remove the element at `idx`, shifting subsequent elements down.
 void bz_array_remove_at(void* arr, int64_t idx, int64_t elem_size);
 
@@ -92,6 +102,13 @@ void*   bz_dict_alloc(void);
 void    bz_dict_free(void* d, void (*dispose_val)(void*));
 bool    bz_dict_try_get_str(void* d, const char* k, int64_t k_len, void** out);
 void    bz_dict_set_str(void* d, const char* k, int64_t k_len, void* val);
+
+// issue #388 / stdlib §4.9: the OwnedDictionary<string,V> indexer setter —
+// if the key is already present, dispose the value currently stored under it via
+// `dispose_val` (null-safe) before storing the new (owned) value; on a fresh key
+// it just inserts. Used by OwnedDictionary<K,V>'s `set(owned)` indexer.
+void    bz_dict_set_str_disposing(void* d, const char* k, int64_t k_len,
+                                  void* val, void (*dispose_val)(void*));
 bool    bz_dict_remove_str(void* d, const char* k, int64_t k_len);
 bool    bz_dict_contains_str(void* d, const char* k, int64_t k_len);
 int64_t bz_dict_count(void* d);
@@ -107,6 +124,12 @@ void* bz_dict_alloc_generic(int64_t key_size,
                              bool     (*eq)(const void* a, const void* b));
 bool  bz_dict_try_get_gen(void* d, const void* key, void** out);
 void  bz_dict_set_gen(void* d, const void* key, void* val);
+
+// issue #388 / stdlib §4.9: generic-key counterpart to bz_dict_set_str_disposing
+// — dispose the value currently stored under `key` (null-safe) before storing
+// the new (owned) value; on a fresh key it just inserts.
+void  bz_dict_set_gen_disposing(void* d, const void* key, void* val,
+                                void (*dispose_val)(void*));
 bool  bz_dict_remove_gen(void* d, const void* key);
 bool  bz_dict_contains_gen(void* d, const void* key);
 

@@ -35,6 +35,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Value* rhsOnce = lowerExpr(*as->value);
                     if (!rhsOnce) return false;
                     if (lowerIndexerSet(*ix, rhsOnce)) return false;
+                    // issue #388 / stdlib §4.4-§4.9: heap-collection indexer
+                    // setter `a[i] := v` / `dict[key] := v` (the OWNING
+                    // variants dispose the displaced owner, §4.5 / §4.9).
+                    if (lowerCollectionIndexerSet(*ix, rhsOnce)) return false;
                     // Not an indexer property — fall through to plain array
                     // assignment using the already-computed RHS.
                     llvm::Type* elemTy2 = nullptr;

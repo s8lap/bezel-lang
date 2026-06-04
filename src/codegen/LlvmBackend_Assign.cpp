@@ -12,6 +12,242 @@ const sema::PropertySymbol* Emitter::findIndexer(
 }
 
 
+// issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer read `a[i]` /
+// `dict[key]` against the runtime backing. Mirrors the `.Get(i)` (§4.5) and
+// `.TryGetValue` (§4.8) lowering in LlvmBackend_Calls.cpp.
+llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
+    if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
+        return nullptr;
+    auto* recvTy = ctx_.exprType(*ix.target);
+    bool isArr  = isCollectionTypeName(recvTy);
+    bool isDict = isDictTypeName(recvTy);
+    if (!isArr && !isDict) return nullptr;
+    llvm::Value* recv = lowerExpr(*ix.target);
+    if (!recv) return nullptr;
+
+    // --- Array<T> / OwnedArray<T> indexer get (§4.4 / §4.5) ----------------
+    // `a[i]` reads the slot at i (the getter borrows for class T, copies for
+    // value T). The element type is genericArgs[0]; bounds-check against Count.
+    if (isArr) {
+        llvm::Value* idx = lowerExpr(*ix.indices[0].value);
+        if (!idx) return nullptr;
+        idx = idx->getType()->isIntegerTy(64) ? idx
+            : builder_.CreateSExt(idx, i64());
+        // §31.2: out-of-range raises IndexOutOfRangeException.
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+        llvm::Value* oor = builder_.CreateICmpUGE(idx, len, "ix.oor");
+        emitGuardThrow(oor, "IndexOutOfRangeException");
+        int64_t esz = collectionElemSize(recvTy);
+        llvm::Type* retTy = i32();
+        if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+            if (auto* et = lowerTypeRef(recvTy->genericArgs[0])) retTy = et;
+        llvm::AllocaInst* out = entryAlloca(retTy);
+        auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
+        return builder_.CreateLoad(retTy, out, "ix.elem");
+    }
+
+    // --- Dictionary<K,V> / OwnedDictionary<K,V> indexer get (§4.8 / §4.9) --
+    // `dict[key]` returns the stored value; an absent key raises
+    // KeyNotFoundException (§4.8). Mirrors the TryGetValue decode path.
+    const sema::TypeRef* keyTy =
+        genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
+    bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+    const sema::TypeRef* valTy =
+        (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
+                                                   : nullptr;
+    const sema::TypeSymbol* valRec =
+        (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
+         valTy->declaration &&
+         valTy->declaration->kind == ast::TypeDeclKind::Record)
+            ? valTy->declaration : nullptr;
+    // A record (aggregate) value is heap-boxed in the dict and needs the
+    // null-guarded box-load decode that TryGetValue performs (LlvmBackend_Calls
+    // .cpp). The indexer-get's throw-on-absent guard means the box is non-null
+    // here, but the full record round-trip through the indexer is DEFERRED (see
+    // report): bail so the read falls through unchanged rather than mis-decode.
+    if (valRec) return nullptr;
+    llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : ptrTy();
+    if (!valLlvm) valLlvm = ptrTy();
+
+    llvm::Value* k = lowerExpr(*ix.indices[0].value);
+    if (!k) return nullptr;
+    auto* tmpSlot = entryAlloca(ptrTy());
+    llvm::Value* found;
+    if (keyTy) {
+        // spill the key value to a slot (record keys arrive as an address).
+        llvm::Value* keyPtr = k;
+        if (!(keyIsRecord && k->getType()->isPointerTy())) {
+            llvm::AllocaInst* slot = entryAlloca(k->getType());
+            builder_.CreateStore(k, slot);
+            keyPtr = slot;
+        }
+        auto* fn = declareC("bz_dict_try_get_gen", i1(),
+                            {ptrTy(), ptrTy(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, keyPtr, tmpSlot});
+    } else {
+        llvm::Value* kd = loadStringData(k);
+        llvm::Value* kl = loadStringLen(k);
+        auto* fn = declareC("bz_dict_try_get_str", i1(),
+                            {ptrTy(), ptrTy(), i64(), ptrTy()});
+        found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+    }
+    // §4.8: absent key → KeyNotFoundException.
+    emitGuardThrow(builder_.CreateNot(found), "KeyNotFoundException");
+    // Decode the stored void* into the value type (mirror TryGetValue). Record
+    // (aggregate) values are bailed above; the remaining cases are scalars
+    // (decoded from the inttoptr'd slot) and object/string pointers.
+    llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
+    if (!valLlvm->isPointerTy()) {
+        llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
+        if (valLlvm->isDoubleTy())
+            return builder_.CreateBitCast(asI64, valLlvm);
+        if (valLlvm->isFloatTy())
+            return builder_.CreateBitCast(builder_.CreateTrunc(asI64, i32()),
+                                          valLlvm);
+        if (valLlvm->isIntegerTy(64)) return asI64;
+        return builder_.CreateTrunc(asI64, valLlvm);
+    }
+    return valPtr;  // pointer value (string / object)
+}
+
+
+// issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer setter
+// `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwnedArray /
+// OwnedDictionary) the displaced slot/value is disposed exactly once before the
+// new owner is stored (§4.5 / §4.9). Mirrors `.Set(i, v)` (§4.5) and the dict
+// `.Add(k, v)` lowering. `val` is the already-lowered RHS.
+bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
+                                        llvm::Value* val) {
+    if (!ix.target || ix.indices.empty() || !ix.indices[0].value || !val)
+        return false;
+    auto* recvTy = ctx_.exprType(*ix.target);
+    bool isArr  = isCollectionTypeName(recvTy);
+    bool isDict = isDictTypeName(recvTy);
+    if (!isArr && !isDict) return false;
+    llvm::Value* recv = lowerExpr(*ix.target);
+    if (!recv) return false;
+
+    // --- Array<T> / OwnedArray<T> indexer set (§4.4 / §4.5) ----------------
+    if (isArr) {
+        llvm::Value* idx = lowerExpr(*ix.indices[0].value);
+        if (!idx) return false;
+        idx = idx->getType()->isIntegerTy(64) ? idx
+            : builder_.CreateSExt(idx, i64());
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+        llvm::Value* oor = builder_.CreateICmpUGE(idx, len, "ix.oor");
+        emitGuardThrow(oor, "IndexOutOfRangeException");
+        int64_t esz = collectionElemSize(recvTy);
+        llvm::AllocaInst* slot = entryAlloca(val->getType());
+        builder_.CreateStore(val, slot);
+        // §4.5: an OWNING array's set(owned) disposes the displaced element
+        // (a class object reference) before storing the new owner; a borrowing
+        // Array<T> set just overwrites (§4.4 — no slot ownership).
+        if (llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy)) {
+            auto* fn = declareC("bz_array_set_disposing",
+                llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
+                                     elemDisp});
+            return true;
+        }
+        auto* fn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz)});
+        return true;
+    }
+
+    // --- Dictionary<K,V> / OwnedDictionary<K,V> indexer set (§4.8 / §4.9) --
+    // `dict[key] := v` is insert-or-replace. For an OWNING dictionary the
+    // previous value under an existing key is disposed before the new owner is
+    // stored (§4.9); a borrowing Dictionary<K,V> just overwrites (§4.8).
+    const sema::TypeRef* keyTy =
+        genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
+    bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+    const sema::TypeRef* valTy =
+        (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
+                                                   : nullptr;
+    const sema::TypeSymbol* valRec =
+        (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
+         valTy->declaration &&
+         valTy->declaration->kind == ast::TypeDeclKind::Record)
+            ? valTy->declaration : nullptr;
+    // A record (aggregate) value round-trip through the indexer is DEFERRED
+    // (see the get-side note): bail so `dict[key] := <record>` falls through
+    // unchanged rather than store a value the deferred get cannot read back.
+    if (valRec) return false;
+
+    // Encode the value as the stored void* (mirror the dict Add path). Record
+    // (aggregate) values are bailed above; the remaining cases are object/string
+    // pointers (stored directly) and scalars (widened to a slot and inttoptr'd).
+    auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
+        if (v->getType()->isPointerTy()) return v;
+        llvm::Value* asI64 = v;
+        if (v->getType()->isFloatingPointTy()) {
+            if (v->getType()->isDoubleTy())
+                asI64 = builder_.CreateBitCast(v, i64());
+            else
+                asI64 = builder_.CreateZExt(
+                    builder_.CreateBitCast(v, i32()), i64());
+        } else if (!v->getType()->isIntegerTy(64)) {
+            asI64 = builder_.CreateZExt(v, i64());
+        }
+        return builder_.CreateIntToPtr(asI64, ptrTy());
+    };
+
+    llvm::Value* k = lowerExpr(*ix.indices[0].value);
+    if (!k) return false;
+    llvm::Value* vPtr = encodeValue(val);
+    // §4.9: an OWNING dictionary (OwnedDictionary<K,V> where V: class) disposes
+    // the displaced value before storing the new owner. Unlike owning ARRAYS
+    // (whose owned element is genericArgs[0]), an owning dictionary's owned thing
+    // is its VALUE = genericArgs[1]; owningCollectionElemDisposer keys on idx 0,
+    // so compute the value-disposer here. The shared elementDisposerThunk
+    // disposes+frees any class object via its own vtable, so it applies as-is.
+    bool owningDict =
+        recvTy && recvTy->astNode && recvTy->astNode->name &&
+        !recvTy->astNode->name->parts.empty() &&
+        recvTy->astNode->name->parts[0] == "OwnedDictionary" &&
+        collectionElemIsClass(recvTy, 1);
+    llvm::Function* valDisp = owningDict ? elementDisposerThunk() : nullptr;
+    if (keyTy) {
+        llvm::Value* keyPtr = k;
+        if (!(keyIsRecord && k->getType()->isPointerTy())) {
+            llvm::AllocaInst* slot = entryAlloca(k->getType());
+            builder_.CreateStore(k, slot);
+            keyPtr = slot;
+        }
+        if (valDisp) {
+            auto* fn = declareC("bz_dict_set_gen_disposing",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy(),
+                                               ptrTy()});
+            builder_.CreateCall(fn, {recv, keyPtr, vPtr, valDisp});
+        } else {
+            auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, keyPtr, vPtr});
+        }
+        return true;
+    }
+    llvm::Value* kd = loadStringData(k);
+    llvm::Value* kl = loadStringLen(k);
+    if (valDisp) {
+        auto* fn = declareC("bz_dict_set_str_disposing",
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, vPtr, valDisp});
+    } else {
+        auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), i64(), ptrTy()});
+        builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+    }
+    return true;
+}
+
+
 llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
