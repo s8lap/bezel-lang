@@ -10,6 +10,7 @@
 #include "codegen/CodeGen.hpp"
 #include "codegen/LlvmBackend.hpp"
 #include "lexer/Lexer.hpp"
+#include "module/ModuleMetadataBuilder.hpp"
 #include "ownership/Ownership.hpp"
 #include "ownership/OwnershipChecker.hpp"
 #include "parser/Parser.hpp"
@@ -114,6 +115,13 @@ CompileResult Driver::compileFile(const std::string& path,
         if (!outputPath.empty() && !diagnostics.hasErrors()) {
             llvm::LLVMContext llvmCtx;
             auto module = codegen::emitModule(*unit, semaCtx, llvmCtx);
+            // §2.6 step 4: embed the module's public-interface metadata in a
+            // dedicated `.bezel.meta` object section so downstream `import`
+            // resolution (§2.5) can read this module's interface without its
+            // sources. Single call into the builder/emit helper (#328 inc 2).
+            if (module) {
+                bezel::module::embedModuleMetadata(*module, semaCtx);
+            }
             std::string objectPath = outputPath + ".o";
             std::string err;
             if (!module || !codegen::emitObjectFile(*module, objectPath, err)) {

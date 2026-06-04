@@ -113,6 +113,7 @@ add_library(bezel_core STATIC
     src/codegen/LlvmBackend_Exprs.cpp
     src/codegen/LlvmBackend_Calls.cpp
     src/module/ModuleMetadata.cpp
+    src/module/ModuleMetadataBuilder.cpp
     src/driver/Driver.cpp)
 target_include_directories(bezel_core PUBLIC src)
 # LLVM headers as SYSTEM so their warnings don't trip our -Wall/-Werror.
