@@ -129,6 +129,7 @@ set(BEZEL_TEST_SOURCES
     sema/event_visibility_test.cpp
     sema/definite_return_test.cpp
     sema/generic_constraints_test.cpp
+    sema/generic_return_inference_test.cpp
     sema/extern_ffi_type_test.cpp
     sema/entry_point_test.cpp
     flow/cfg_basic_test.cpp
@@ -215,6 +216,7 @@ set(BEZEL_TEST_SOURCES
     codegen/closure_capture_test.cpp
     codegen/generic_test.cpp
     codegen/generic_mono_test.cpp
+    codegen/generic_return_inference_test.cpp
     codegen/collection_test.cpp
     codegen/record_key_test.cpp
     codegen/collection_keys_test.cpp

@@ -705,6 +705,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // Either may be null (plain `var x;` with no init).
             if (ld->type) {
                 lsym->declType = ctx_.resolvedType(*ld->type);
+                // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
+                // type-argument inference. When the initializer is a call to a
+                // generic method whose type parameter appears only in the
+                // return type (`Create<T>(): T`), the typed local declaration
+                // supplies the target that solves T. This re-types the call to
+                // the substituted return type before the assignability check.
+                if (auto* initCall = dynamic_cast<const ast::CallExpr*>(
+                        ld->initializer.get())) {
+                    if (lsym->declType)
+                        inferReturnTargetTypeArgs(*initCall, lsym->declType,
+                                                  /*outNeedsInfer=*/nullptr);
+                }
                 // Slice T1: when an explicit ascription and an
                 // initializer are both present and both primitive,
                 // check primitive assignability (§5.1).
@@ -739,6 +751,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             } else if (ld->initializer) {
                 lsym->declType = ctx_.exprType(*ld->initializer);
+                // per §14.1 + §A.7 (issue #391): a `var x := Generic.Create();`
+                // without a type annotation gives the call no target, so a
+                // return-only type parameter cannot be solved. Per §15.4 /
+                // §17.7 the spec withholds target inference from `var` without
+                // annotation; diagnose rather than silently leaving T unsolved.
+                if (auto* initCall = dynamic_cast<const ast::CallExpr*>(
+                        ld->initializer.get())) {
+                    reportNoTargetInferenceIfNeeded(*initCall);
+                }
             }
             currentScope_->names[ld->name] = lsym;
         }
@@ -770,6 +791,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
     } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         if (rs->value) visitExpr(*rs->value);
         checkReturnForm(*rs);
+        // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
+        // type-argument inference. `return Generic.Create();` in a method with
+        // a declared return type supplies that return type as the target that
+        // solves a return-only type parameter (§15.4 / §17.7 recognize the
+        // enclosing return type as a target when the method has one).
+        if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
+            currentReturnType_) {
+            if (auto* retCall = dynamic_cast<const ast::CallExpr*>(
+                    rs->value.get())) {
+                inferReturnTargetTypeArgs(*retCall, currentReturnType_,
+                                          /*outNeedsInfer=*/nullptr);
+            }
+        }
         // Slice T3: a returned value must be primitive-assignable to
         // the callable's return type.
         if (rs->value && returnCtx_ == ReturnCtx::ValueMethod) {
@@ -779,6 +813,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         if (es->expr) visitExpr(*es->expr);
+        // per §14.1 + §A.7 (issue #391): a bare expression statement discards
+        // the result, so a return-only type parameter has no target. Diagnose.
+        if (es->expr) {
+            if (auto* exCall =
+                    dynamic_cast<const ast::CallExpr*>(es->expr.get()))
+                reportNoTargetInferenceIfNeeded(*exCall);
+        }
     } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         if (as->target) visitExpr(*as->target);
         // per §24.4: `event += handler` / `event -= handler` — type the
@@ -823,6 +864,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
     } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) visitExpr(*ds->value);
+        // per §14.1 + §A.7 (issue #391): `_ := Generic.Create();` discards the
+        // result, so a return-only type parameter has no target. Diagnose.
+        if (ds->value) {
+            if (auto* dCall =
+                    dynamic_cast<const ast::CallExpr*>(ds->value.get()))
+                reportNoTargetInferenceIfNeeded(*dCall);
+        }
     } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
         if (ts->value) {
             visitExpr(*ts->value);
