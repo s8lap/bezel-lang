@@ -203,6 +203,16 @@ private:
         // borrowing collection or value elements — only the backing is freed).
         bool collection = false;
         llvm::Value* collectionElemDisposer = nullptr;
+        // #394 / stdlib §4.9: a `using var` bound to a hash-backed dictionary
+        // (Dictionary<K,V>/OwnedDictionary<K,V>). At scope end it is freed via
+        // bz_dict_free. `dictValueDisposer` is the per-VALUE dispose callback for
+        // an OwnedDictionary whose value type V is a class (null for a borrowing
+        // Dictionary or a value-typed V — only the backing table is freed).
+        // OwnedDictionary owns its VALUES only; keys are value-like and are not
+        // disposed (stdlib §4.9: "Owns its values; keys are value-like"; keys are
+        // freed by bz_dict_free's own free(e.key)).
+        bool dict = false;
+        llvm::Value* dictValueDisposer = nullptr;
         // #383 / §28: a `using var` that owns a class/interface object but
         // whose concrete class is not statically known here (an interface-
         // typed slot, or a call/`move` initializer). Disposed via DYNAMIC
@@ -1131,6 +1141,15 @@ private:
     // disposal obligation and returns null (only the backing is freed).
     llvm::Function* owningCollectionElemDisposer(const sema::TypeRef* collTy);
 
+    // #394 / stdlib §4.9: if `dictTy` is an OwnedDictionary<K,V> whose VALUE
+    // type (genericArgs[1]) is a class, return the element-disposer thunk (so
+    // freeing the dictionary at scope end cascades disposal into each surviving
+    // value); otherwise null. A borrowing Dictionary, or a value-typed V, has no
+    // value-disposal obligation and returns null (only the backing table and the
+    // malloc'd key bytes are freed). Keys are never disposed (§4.9: keys are
+    // value-like; the dictionary owns its values only).
+    llvm::Function* owningDictValueDisposer(const sema::TypeRef* dictTy);
+
     // #362 / stdlib §4.5: is genericArgs[idx] of `collTy` a class type (whose
     // runtime objects carry a vtable with a Dispose at slot 1)?
     bool collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx = 0);
@@ -1399,6 +1418,11 @@ private:
     // type, then `new` initializer type, then inferred initializer type), or
     // null if the local is not a heap collection.
     const sema::TypeRef* collectionTypeOfLocal(const ast::LocalDecl* ld);
+
+    // #394 / stdlib §4.9: the resolved Dictionary/OwnedDictionary TypeRef of a
+    // local (declared type, then `new` initializer type, then inferred
+    // initializer type), or null if the local is not a hash-backed dictionary.
+    const sema::TypeRef* dictTypeOfLocal(const ast::LocalDecl* ld);
 
     // CG13: lower a block as a disposal scope. Pushes a fresh scope; on
     // normal fall-through, disposes its `using var`s in reverse and pops.

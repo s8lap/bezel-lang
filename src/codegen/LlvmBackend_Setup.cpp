@@ -929,6 +929,24 @@ llvm::Function* Emitter::owningCollectionElemDisposer(
 }
 
 
+llvm::Function* Emitter::owningDictValueDisposer(const sema::TypeRef* dictTy) {
+    // #394 / stdlib §4.9: only an OwnedDictionary<K,V> with a CLASS value type
+    // owns its values and must dispose each surviving one at scope end. A
+    // borrowing Dictionary<K,V> (and any value-typed V) returns null — only the
+    // backing table and its key bytes are freed. The owned thing is the VALUE
+    // (genericArgs[1]), not the key (§4.9: "Owns its values; keys are
+    // value-like"); the shared elementDisposerThunk disposes+frees any class
+    // object via its own vtable (slot 1), so it applies to the stored value
+    // pointer exactly as it does to an OwnedArray element.
+    if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
+        dictTy->astNode->name->parts.empty())
+        return nullptr;
+    if (dictTy->astNode->name->parts[0] != "OwnedDictionary") return nullptr;
+    if (!collectionElemIsClass(dictTy, 1)) return nullptr;
+    return elementDisposerThunk();
+}
+
+
 void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
     for (const sema::TypeSymbol* base : ts->baseTypes) {
         if (!base || base->kind != ast::TypeDeclKind::Class) continue;
@@ -1392,8 +1410,21 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             disposeStack_.back().push_back(d);
             return;
         }
-        // Dict/Set disposal is not wired in this slice; leave as-is (the
-        // pre-existing behaviour) to avoid changing other test outcomes.
+    }
+    // #394 / stdlib §4.9: a `using var` bound to a hash-backed dictionary
+    // (Dictionary<K,V>/OwnedDictionary<K,V>). Dicts are excluded from
+    // isCollectionTypeName (they free via bz_dict_free, not bz_array_free), so
+    // they get their own disposal kind here. For an OwnedDictionary with a class
+    // VALUE type the disposal cascades into each surviving value (the #394 leak
+    // fixed here); a borrowing Dictionary (or a value-typed V) frees only the
+    // backing table and its key bytes. Keys are never disposed (§4.9: keys are
+    // value-like; the dictionary owns its values only).
+    if (const sema::TypeRef* dictTy = dictTypeOfLocal(ld)) {
+        Disposal d{it->second, nullptr};
+        d.dict = true;
+        d.dictValueDisposer = owningDictValueDisposer(dictTy);
+        disposeStack_.back().push_back(d);
+        return;
     }
 
     const sema::TypeSymbol* cls = classOfLocal(ld);
@@ -1511,6 +1542,29 @@ const sema::TypeRef* Emitter::collectionTypeOfLocal(const ast::LocalDecl* ld) {
 }
 
 
+const sema::TypeRef* Emitter::dictTypeOfLocal(const ast::LocalDecl* ld) {
+    // #394: recover a local's resolved Dictionary/OwnedDictionary TypeRef (with
+    // generic args). Mirrors collectionTypeOfLocal but recognizes the dict
+    // family (which isCollectionTypeName deliberately excludes — dicts are
+    // hash-backed and freed via bz_dict_free, not bz_array_free).
+    if (ld->type) {
+        if (auto* rt = ctx_.resolvedType(*ld->type))
+            if (isDictTypeName(rt)) return rt;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+        if (ne->type) {
+            if (auto* rt = ctx_.resolvedType(*ne->type))
+                if (isDictTypeName(rt)) return rt;
+        }
+    }
+    if (ld->initializer) {
+        if (auto* rt = ctx_.exprType(*ld->initializer))
+            if (isDictTypeName(rt)) return rt;
+    }
+    return nullptr;
+}
+
+
 const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
     if (ld->type) {
         if (auto* rt = ctx_.resolvedType(*ld->type)) {
@@ -1583,6 +1637,27 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {arr, disp});
+            continue;
+        }
+        // #394 / stdlib §4.9: a `using var` hash-backed dictionary. Free the
+        // backing table (and its malloc'd key bytes) via bz_dict_free; for an
+        // OwnedDictionary with a class VALUE type the value-disposer thunk
+        // cascades disposal into each surviving (non-null) value exactly once
+        // (bz_dict_free iterates the live entries; the thunk null-checks). A
+        // value DISPLACED earlier by the indexer setter (#388) was already
+        // removed from the table and disposed there, so it is not re-disposed
+        // here — no double-free. bz_dict_free is null-safe.
+        if (it->dict) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* tbl = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* disp = it->dictValueDisposer
+                ? llvm::cast<llvm::Value>(it->dictValueDisposer)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_dict_free",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {tbl, disp});
             continue;
         }
         // #383 / §28: a `using var` owning a class/interface object whose

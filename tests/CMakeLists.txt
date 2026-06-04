@@ -221,6 +221,7 @@ set(BEZEL_TEST_SOURCES
     codegen/linq_test.cpp
     codegen/event_test.cpp
     codegen/owned_collection_ops_test.cpp
+    codegen/owned_dict_disposal_test.cpp
     codegen/collection_indexer_test.cpp
 
     runtime/event_subscription_test.cpp
