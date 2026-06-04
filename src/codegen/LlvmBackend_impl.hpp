@@ -228,14 +228,21 @@ private:
         // borrowing collection or value elements — only the backing is freed).
         bool collection = false;
         llvm::Value* collectionElemDisposer = nullptr;
-        // #394 / stdlib §4.9: a `using var` bound to a hash-backed dictionary
-        // (Dictionary<K,V>/OwnedDictionary<K,V>). At scope end it is freed via
-        // bz_dict_free. `dictValueDisposer` is the per-VALUE dispose callback for
-        // an OwnedDictionary whose value type V is a class (null for a borrowing
-        // Dictionary or a value-typed V — only the backing table is freed).
-        // OwnedDictionary owns its VALUES only; keys are value-like and are not
-        // disposed (stdlib §4.9: "Owns its values; keys are value-like"; keys are
-        // freed by bz_dict_free's own free(e.key)).
+        // #394 / stdlib §4.9 + #401 / stdlib §4.8: a `using var` bound to a
+        // hash-backed dictionary (Dictionary<K,V>/OwnedDictionary<K,V>). At scope
+        // end it is freed via bz_dict_free. `dictValueDisposer` is the per-VALUE
+        // callback passed to bz_dict_free; it is one of exactly two mutually
+        // exclusive things (or null):
+        //   * #394: an OwnedDictionary<K,V> with a CLASS value type → the
+        //     owning-class value-disposer (dispose + free the object via its
+        //     vtable). OwnedDictionary owns its VALUES only.
+        //   * #401: a BORROWING Dictionary<K,V> with a RECORD value type → the
+        //     value-box-free thunk (plain `free` of the heap box; a record is a
+        //     value type, §3.2 / §9, so there is nothing to dispose — only the
+        //     box storage to reclaim).
+        // It is null for a borrowing Dictionary with a scalar/string value (no
+        // box is stored). Keys are never disposed (stdlib §4.9: "Owns its values;
+        // keys are value-like"; keys are freed by bz_dict_free's own free(e.key)).
         bool dict = false;
         llvm::Value* dictValueDisposer = nullptr;
         // #383 / §28: a `using var` that owns a class/interface object but
@@ -276,6 +283,9 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
     // #362 / stdlib §4.5: the cached per-element dispose thunk (built lazily).
     llvm::Function* elementDisposerThunk_ = nullptr;
+    // #401 / stdlib §4.8: the cached value-box-free thunk (built lazily) for a
+    // borrowing Dictionary<K, record>'s heap-boxed record values.
+    llvm::Function* valueBoxFreeThunk_ = nullptr;
 
     // CG21c (§31.2): when a `return`/`break`/`continue` exits a `try`-with-
     // `finally` block, the finally body must run before the actual jump.
@@ -1333,6 +1343,27 @@ private:
     // malloc'd key bytes are freed). Keys are never disposed (§4.9: keys are
     // value-like; the dictionary owns its values only).
     llvm::Function* owningDictValueDisposer(const sema::TypeRef* dictTy);
+
+    // #401 / stdlib §4.8 + language spec §3.2 / §9: a standalone `void(void*)`
+    // thunk that just `free`s the pointer (null-safe), with NO destructor /
+    // dispatch. A record value in a (borrowing) Dictionary<K, record> is too
+    // wide for the scalar slot encoding, so the runtime heap-BOXES it; that box
+    // is the dict's OWN storage (a record is a value type — §3.2 / §9 — so there
+    // is nothing to dispose inside it, only memory to free). Used as the
+    // `dispose_val` callback for bz_dict_free / the disposing setters when the
+    // value is a boxed record. Built once per module and cached.
+    llvm::Function* valueBoxFreeThunk();
+
+    // #401 / stdlib §4.8: if `dictTy` is a BORROWING Dictionary<K,V> whose value
+    // type V is a record (and therefore heap-boxed, see the encode in
+    // LlvmBackend_{Calls,Assign}.cpp), return the value-box-free thunk so the
+    // dict's disposal reclaims each surviving value box; otherwise null. This is
+    // strictly the value-BOX-free case: an OwnedDictionary<K, class> instead
+    // routes through owningDictValueDisposer (#394, dispose+free a class object
+    // via its vtable), and a scalar/string-valued borrowing Dictionary stores no
+    // box (nothing extra to free). The two are mutually exclusive, so the
+    // value box is never freed twice.
+    llvm::Function* dictValueBoxFreer(const sema::TypeRef* dictTy);
 
     // #362 / stdlib §4.5: is genericArgs[idx] of `collTy` a class type (whose
     // runtime objects carry a vtable with a Dispose at slot 1)?
