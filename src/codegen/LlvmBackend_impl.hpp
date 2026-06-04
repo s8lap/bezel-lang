@@ -251,6 +251,11 @@ private:
     // CG20: the exception value caught by the enclosing catch arm, so a
     // bare `throw;` can re-raise it (the global was cleared on arm entry).
     llvm::Value* currentCaughtExc_ = nullptr;
+    // #387 / §31.1: the name the enclosing catch arm binds the caught
+    // exception to ("" for a bare-type arm with no binding). Used to decide
+    // whether a `throw <newExpr>` leaving the arm provably cannot reference
+    // the caught exception (see emitThrowValue / exprReferencesName).
+    std::string_view currentCaughtName_;
     // CG40: set true by lowering a `throw` expression (§31.2) — the
     // expression diverges (branches to the unwind target), leaving the
     // current block terminated. Phi-building consumers (conditional, `??`)
@@ -1005,7 +1010,29 @@ private:
     // exception when `excVal` is null and one is in flight): store it to
     // the exception global, dispose the unwound using-vars, and branch to
     // the unwind target. Leaves the current block terminated.
-    void emitThrowValue(llvm::Value* excVal);
+    //
+    // #387 / §31.1: `excAst` is the AST of the thrown expression (the
+    // operand of the `throw`), used only when this `throw` leaves a catch
+    // arm by constructing a NEW exception. A caught exception is a borrow
+    // whose lifetime is the arm body; constructing a new exception never
+    // transfers ownership of the caught one (the spec forbids assigning the
+    // borrow to an owned field or otherwise retaining it). So when the new
+    // exception's expression provably cannot reference the caught binding,
+    // the caught object must be freed at the throw (its lifetime is ending
+    // and nothing retains it). When it MIGHT reference it, codegen keeps the
+    // status quo — the caught object stays in flight (a residual single-object
+    // leak) rather than risk a use-after-free on a possibly-wrapped reference.
+    // `excAst` is null for callers that cannot supply it (the expression-
+    // position `throw`); those conservatively never free (no UAF).
+    void emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst = nullptr);
+
+    // #387 / §31.1: does `e` syntactically reference an identifier named
+    // `name` anywhere in its subtree? Fail-safe: an expression shape this
+    // walker does not recurse into returns `true` ("might reference"), so an
+    // unrecognized form never causes the caught exception to be freed — the
+    // conservative direction (a leak, never a use-after-free). Used to decide
+    // whether a `throw <newExpr>` from a catch arm can free the caught object.
+    bool exprReferencesName(const ast::Expr& e, std::string_view name) const;
 
     // CG22: if `cond` (i1, true = error) holds, throw `name`; otherwise
     // continue. Splits the current block.

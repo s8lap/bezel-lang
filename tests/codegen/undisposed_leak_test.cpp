@@ -74,11 +74,15 @@ std::string runtimeSourcePath() {
 
 // LeakSanitizer verification. Lowers `source` to an object file (full front-end
 // incl. ownership/definite-assignment), links against an ASan-instrumented
-// runtime, runs under LSan. Returns:
-//   0  — clean: no leak, no use-after-free, no double-free (the #383 fix).
+// runtime, runs under LSan. With `detectLeaks` (the default) the run reports a
+// leak as a sanitizer failure; with `detectLeaks=false` only the memory-safety
+// checks (use-after-free, double-free, heap overflow) remain active — used to
+// assert that a path which intentionally leaves one object in flight (the #387
+// wrapped/referenced case) still has NO double-free / use-after-free. Returns:
+//   0  — clean (no problem of the kinds being detected).
 //   1  — sanitizer reported a problem: test failure.
 //  -1  — toolchain unavailable / build step failed: SKIP (not a failure).
-int runUnderLeakSanitizer(const std::string& source) {
+int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
     if (std::system("clang++ --version > /dev/null 2>&1") != 0) return -1;
 
     static int counter = 0;
@@ -122,7 +126,9 @@ int runUnderLeakSanitizer(const std::string& source) {
                           " > /dev/null 2>&1";
     if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
     std::string runCmd =
-        "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
+        std::string("ASAN_OPTIONS=detect_leaks=") +
+        (detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
+        " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
     if (status == -1) return -1;
@@ -137,6 +143,20 @@ void expectDisposedAndLeakFree(const std::string& source, int expectedExitCode) 
     int lsan = runUnderLeakSanitizer(source);
     if (lsan == -1) return;       // toolchain unavailable: skip the LSan leg
     BEZEL_EXPECT_EQ(lsan, 0);     // 0 == LSan clean (no leak, no UAF/DF)
+}
+
+// #387 / §31.1: assert the destructor-count (always) and, with leak detection
+// OFF, that there is NO double-free / use-after-free. Used for the wrapped/
+// referenced re-raise case, which intentionally leaves the caught exception in
+// flight (a residual single-object leak that is explicitly acceptable) — the
+// soundness property to guard is that the conservatively-not-freed object is
+// never double-freed and never used after free.
+void expectNoUseAfterFreeOrDoubleFree(const std::string& source,
+                                      int expectedExitCode) {
+    BEZEL_EXPECT_EQ(run(source), expectedExitCode);
+    int asan = runUnderLeakSanitizer(source, /*detectLeaks=*/false);
+    if (asan == -1) return;       // toolchain unavailable: skip the ASan leg
+    BEZEL_EXPECT_EQ(asan, 0);     // 0 == no UAF / no double-free / no overflow
 }
 
 // --- Gap 1: interface-typed using var (§28). ------------------------------
@@ -267,6 +287,85 @@ const char* kRethrowChain =
     "  end Main; "
     "end R;";
 
+// --- #387: throw <newExpr> from a catch arm (§31.1 exception ownership). ---
+//
+// §31.1: a caught exception is a BORROW whose lifetime is the arm body; the
+// spec forbids retaining it (assigning to an owned field, returning as owned,
+// capturing). So constructing a NEW exception in the arm never transfers
+// ownership of the caught one. Two paths, both verified:
+//
+//   Case A — the new exception's expression provably does NOT reference the
+//   caught binding (`throw new Wrap()`): the caught object's lifetime is ending
+//   with nothing retaining it, so it is freed at the throw. Here the caught
+//   Inner owns a Res whose destructor runs exactly once → Res._n is 1, read by
+//   the OUTER handler that catches the re-raised Wrap. Before #387 it leaked
+//   (Res._n was 0). The LSan leg confirms no residual leak (and no double-free).
+const char* kThrowNewUnref_FreesCaught =
+    "module M; class Res "
+    "  public static _n: int := 0; "
+    "  destructor _n := _n + 1; end destructor; "
+    "end Res; "
+    "class Inner "
+    "  private owned _r: Res; "
+    "  public constructor() this._r := new Res(); end constructor; "
+    "end Inner; "
+    "class Wrap end Wrap; "
+    "class R public static method Main(): int "
+    "  try "
+    "    try throw new Inner(); "
+    "    catch var e: Inner => throw new Wrap(); end; "
+    "  catch Wrap => return Res._n; end; "
+    "  return -1; "
+    "end Main; end R;";
+
+//   A bare-type arm (no binding) cannot name the caught exception, so a
+//   `throw new Wrap()` from it always frees the caught object — same expected
+//   result (Res._n == 1) via a different (no-binding) arm shape.
+const char* kThrowNewBareTypeArm_FreesCaught =
+    "module M; class Res "
+    "  public static _n: int := 0; "
+    "  destructor _n := _n + 1; end destructor; "
+    "end Res; "
+    "class Inner "
+    "  private owned _r: Res; "
+    "  public constructor() this._r := new Res(); end constructor; "
+    "end Inner; "
+    "class Wrap end Wrap; "
+    "class R public static method Main(): int "
+    "  try "
+    "    try throw new Inner(); "
+    "    catch Inner => throw new Wrap(); end; "
+    "  catch Wrap => return Res._n; end; "
+    "  return -1; "
+    "end Main; end R;";
+
+//   Case B — the new exception's expression DOES reference the caught binding
+//   (`throw new Wrap(e)`, e passed as a constructor arg): codegen conservatively
+//   does NOT free the caught object (it might be referenced by the new one), so
+//   the caught Inner stays in flight. Its Res destructor does NOT run before the
+//   outer handler reads the count → Res._n is 0. This is the accepted residual
+//   single-object leak; the safety property (asserted under ASan with leak
+//   detection off) is NO double-free and NO use-after-free.
+const char* kThrowNewRef_KeepsCaught =
+    "module M; class Res "
+    "  public static _n: int := 0; "
+    "  destructor _n := _n + 1; end destructor; "
+    "end Res; "
+    "class Inner "
+    "  private owned _r: Res; "
+    "  public constructor() this._r := new Res(); end constructor; "
+    "end Inner; "
+    "class Wrap "
+    "  public constructor(c: Inner) (); end constructor; "
+    "end Wrap; "
+    "class R public static method Main(): int "
+    "  try "
+    "    try throw new Inner(); "
+    "    catch var e: Inner => throw new Wrap(e); end; "
+    "  catch Wrap => return Res._n; end; "
+    "  return -1; "
+    "end Main; end R;";
+
 }  // namespace
 
 // ---- Gap 1 ---------------------------------------------------------------
@@ -316,4 +415,27 @@ BEZEL_TEST(codegen_undisposed_383, bare_rethrow_chain_freed_once_31_2_4) {
     // One exception through three handlers; freed exactly once at the last,
     // never on a re-raise edge (the LSan leg would flag a double-free).
     expectDisposedAndLeakFree(kRethrowChain, 0);
+}
+
+// ---- #387: throw <newExpr> from a catch arm (§31.1) ----------------------
+
+BEZEL_TEST(codegen_throw_new_from_catch_387, unreferenced_new_frees_caught_31_1) {
+    // §31.1: `throw new Wrap()` (does not reference the caught `e`) — the caught
+    // Inner is freed at the throw, so its owned Res destructor runs once
+    // (Res._n == 1). LSan leg: no residual leak, no double-free.
+    expectDisposedAndLeakFree(kThrowNewUnref_FreesCaught, 1);
+}
+
+BEZEL_TEST(codegen_throw_new_from_catch_387, bare_type_arm_new_frees_caught_31_1) {
+    // §31.1: a no-binding arm cannot reference the caught exception, so
+    // `throw new Wrap()` from it always frees the caught Inner (Res._n == 1).
+    expectDisposedAndLeakFree(kThrowNewBareTypeArm_FreesCaught, 1);
+}
+
+BEZEL_TEST(codegen_throw_new_from_catch_387, referenced_new_keeps_caught_no_uaf_31_1) {
+    // §31.1: `throw new Wrap(e)` passes the caught `e` into the new exception.
+    // Codegen conservatively does NOT free the caught Inner (it might be
+    // referenced), so Res._n == 0 — the accepted residual single-object leak.
+    // The safety property (ASan, leak detection off): no double-free, no UAF.
+    expectNoUseAfterFreeOrDoubleFree(kThrowNewRef_KeepsCaught, 0);
 }

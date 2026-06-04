@@ -573,8 +573,95 @@ void Emitter::emitThrowBuiltin(const char* name) {
 }
 
 
-void Emitter::emitThrowValue(llvm::Value* excVal) {
+bool Emitter::exprReferencesName(const ast::Expr& e,
+                                 std::string_view name) const {
+    if (name.empty()) return false;
+    // Leaves that obviously cannot name a local.
+    if (dynamic_cast<const ast::IntLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::FloatLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::CharLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::StringLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::VerbatimStringExpr*>(&e) ||
+        dynamic_cast<const ast::BoolLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::NullLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::UnitExpr*>(&e) ||
+        dynamic_cast<const ast::TypeOfExpr*>(&e) ||
+        dynamic_cast<const ast::DefaultExpr*>(&e))
+        return false;
+    // `nameof(X)` names a symbol but does not read it at runtime; even if X is
+    // the caught binding, no live reference to the object is produced — but to
+    // stay conservative (and because it is a rare arm-body shape), treat any
+    // textual match as a reference: NameOfExpr falls through to the fail-safe.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        return id->name == name;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return ma->target && exprReferencesName(*ma->target, name);
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e))
+        return nm->target && exprReferencesName(*nm->target, name);
+    if (auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(&e))
+        return bang->operand && exprReferencesName(*bang->operand, name);
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
+        return un->operand && exprReferencesName(*un->operand, name);
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e))
+        return tt->operand && exprReferencesName(*tt->operand, name);
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e))
+        return th->operand && exprReferencesName(*th->operand, name);
+    if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e))
+        return (bin->left  && exprReferencesName(*bin->left,  name)) ||
+               (bin->right && exprReferencesName(*bin->right, name));
+    if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(&e))
+        return (cond->thenValue && exprReferencesName(*cond->thenValue, name)) ||
+               (cond->condition && exprReferencesName(*cond->condition, name)) ||
+               (cond->elseValue && exprReferencesName(*cond->elseValue, name));
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e))
+        return (rg->lo   && exprReferencesName(*rg->lo,   name)) ||
+               (rg->hi   && exprReferencesName(*rg->hi,   name)) ||
+               (rg->step && exprReferencesName(*rg->step, name));
+    auto argsRef = [&](const std::vector<ast::CallArgument>& args) {
+        for (const auto& a : args)
+            if (a.value && exprReferencesName(*a.value, name)) return true;
+        return false;
+    };
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
+        return argsRef(ne->args);
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(&e))
+        return (call->callee && exprReferencesName(*call->callee, name)) ||
+               argsRef(call->args);
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
+        return (nc->callee && exprReferencesName(*nc->callee, name)) ||
+               argsRef(nc->args);
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+        return (ix->target && exprReferencesName(*ix->target, name)) ||
+               argsRef(ix->indices);
+    // Any expression shape not handled above (interpolated string, `with`,
+    // collection literal, lambda, case, …) conservatively counts as "might
+    // reference": the caught exception is then NOT freed, accepting the
+    // residual leak rather than risking a use-after-free.
+    return true;
+}
+
+
+void Emitter::emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst) {
     if (excVal) {
+        // #387 / §31.1: a `throw <newExpr>` leaving a catch arm. The caught
+        // exception is a borrow whose lifetime is the arm body; the spec
+        // forbids it being retained (assigned to an owned field, returned as
+        // owned, captured). Constructing a new exception therefore never
+        // transfers ownership of the caught one — so when the thrown
+        // expression provably cannot reference the caught binding, the caught
+        // object's lifetime is ending with nothing retaining it and it must be
+        // freed here (else it leaks; #387). When it MIGHT reference it (it is
+        // passed into the new exception, directly or transitively), we keep the
+        // status quo and do NOT free — the caught object stays in flight,
+        // accepting a single-object leak rather than risking a use-after-free
+        // on a possibly-wrapped reference. Bare `throw;` (excVal == the caught
+        // object) and re-throw of the same value never free it (it is going
+        // back in flight). `excAst` is null for the expression-position throw,
+        // which then conservatively never frees.
+        if (currentCaughtExc_ && excVal != currentCaughtExc_ && excAst &&
+            !exprReferencesName(*excAst, currentCaughtName_)) {
+            emitDynamicDispose(currentCaughtExc_);
+        }
         builder_.CreateStore(excVal, excGlobal());
     } else if (currentCaughtExc_) {
         // Bare `throw` re-raises the arm's caught exception (the global
@@ -617,6 +704,7 @@ void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
     propagateBB_ = nullptr;
     unwindTarget_ = nullptr;
     currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
     bool terminated = false;
@@ -868,6 +956,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     propagateBB_ = nullptr;
     unwindTarget_ = nullptr;
     currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
@@ -913,6 +1002,7 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     propagateBB_ = nullptr;
     unwindTarget_ = nullptr;
     currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
     if (!lowerScopedBlock(cd->body)) builder_.CreateRetVoid();
@@ -932,6 +1022,7 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     propagateBB_ = nullptr;
     unwindTarget_ = nullptr;
     currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
     bindParameters(fn, /*hasThis=*/true, &cs->params);

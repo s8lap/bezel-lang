@@ -266,7 +266,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     // one already in flight) and branch to the unwind target.
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
         llvm::Value* e = th->value ? lowerExpr(*th->value) : nullptr;
-        emitThrowValue(e);
+        // #387 / §31.1: pass the thrown expression's AST so emitThrowValue can
+        // free the caught exception when this `throw <newExpr>` leaving a catch
+        // arm provably does not reference it.
+        emitThrowValue(e, th->value.get());
         return true;
     }
     // CG20: try / catch.
@@ -425,7 +428,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         builder_.CreateStore(
             llvm::ConstantPointerNull::get(ptrTy()), excGlobal());
         llvm::Value* savedCaught = currentCaughtExc_;
+        std::string_view savedCaughtName = currentCaughtName_;
         currentCaughtExc_ = exc;
+        // #387 / §31.1: the name (if any) this arm binds the caught exception
+        // to, so a `throw <newExpr>` from the body can tell whether the new
+        // exception's expression references the caught object. A bare-type arm
+        // ("" name) can never reference it → such throws always free it.
+        currentCaughtName_ = arm.hasBinding ? arm.varName : std::string_view{};
         // #383 / §31.1: ownership of the exception transfers to the runtime,
         // which disposes it after the matching catch arm completes. Register
         // the caught object as a `caughtException` disposal in a dedicated
@@ -459,6 +468,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         if (!armTerm) emitDisposals(disposeStack_.back());
         disposeStack_.pop_back();
         currentCaughtExc_ = savedCaught;
+        currentCaughtName_ = savedCaughtName;
         if (!armTerm) builder_.CreateBr(normalExit);
 
         builder_.SetInsertPoint(nextBB);
