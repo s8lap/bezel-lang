@@ -56,6 +56,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
         // Start with the empty string and concat each part.
         llvm::Value* acc = lowerStringLiteral("\"\"", false);  // ""
+        // FINDING [2] / §4.6 / §28.9: each step `acc := emitStringConcat(acc,pv)`
+        // mallocs a fresh +1 result and the PREVIOUS accumulator becomes an
+        // anonymous, single-owner intermediate with no scope-end release armed
+        // for it (the named-local release path only covers LocalDecl nodes), so
+        // it would leak — unboundedly in a loop. appendPart releases the prior
+        // accumulator AFTER the new one is produced (it has been consumed by the
+        // concat — no UAF, no double-free). The very first accumulator is the
+        // `""` literal (sentinel rc → release is a no-op). The FINAL accumulator
+        // is returned and is never released here (it flows to the target and
+        // follows normal placement/escape rules). The part value `pv` is NOT
+        // released here: it may be a borrow (a string-typed part is a shared
+        // reference to a named local/field per §28.9).
+        auto appendPart = [&](llvm::Value* pv) {
+            llvm::Value* prev = acc;
+            acc = emitStringConcat(acc, pv);
+            emitStringRelease(prev);
+        };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
             if (!part.literal.empty()) {
@@ -97,7 +114,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     pv = emitWithFormatSpec(ev, part.formatSpec,
                                             ctx_.exprType(*part.expr));
                     if (pv) {
-                        acc = emitStringConcat(acc, pv);
+                        appendPart(pv);
                         continue;
                     }
                 }
@@ -232,7 +249,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                 }
             }
-            if (pv) acc = emitStringConcat(acc, pv);
+            if (pv) appendPart(pv);
         }
         return acc;
     }
@@ -1478,11 +1495,31 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (op == "=") return emitStringEq(l, r);
             return builder_.CreateNot(emitStringEq(l, r));
         }
+        // FINDING [2] / §4.6 / §28.9: release a concat OPERAND that is itself a
+        // fresh +1 string intermediate this codegen produced — i.e. a nested
+        // string `+` or interpolation (`isPlusOneStringProducer`), so its
+        // lowered value has no named-local owner and no scope-end release armed
+        // for it (the named-local release path only covers LocalDecl nodes). For
+        // a chained concat `a+b+c` the inner `a+b` result is consumed by the
+        // outer concat and would otherwise leak. The release runs only AFTER
+        // emitStringConcat has produced the result (its fresh +1 copy), so the
+        // intermediate is fully consumed first — no UAF, no double-free. A plain
+        // identifier / member / call operand is NOT a +1 producer here, so a
+        // borrowed value (named local, field, call result) is never released.
+        auto releaseConcatIntermediate = [&](const ast::Expr* operandExpr,
+                                             llvm::Value* operandVal) {
+            if (operandExpr && isPlusOneStringProducer(operandExpr))
+                emitStringRelease(operandVal);
+        };
         // §4.6: string concat when at least one side is a known string and
         // both operands are ptr-typed (handles e.g. string.From(ch) + s where
         // the From(ch) result may not be sema-annotated as string yet).
-        if ((lIsStr || rIsStr) && lIsPtr && rIsPtr && !eitherNull && op == "+")
-            return emitStringConcat(l, r);
+        if ((lIsStr || rIsStr) && lIsPtr && rIsPtr && !eitherNull && op == "+") {
+            llvm::Value* res = emitStringConcat(l, r);
+            releaseConcatIntermediate(bin.left.get(), l);
+            releaseConcatIntermediate(bin.right.get(), r);
+            return res;
+        }
         if (lIsStr && !eitherNull) {
             if (op == "=") return emitStringEq(l, r);
             if (op == "<>") return builder_.CreateNot(emitStringEq(l, r));
@@ -1511,7 +1548,16 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     else if (r->getType()->isFloatTy())
                         rStr = emitPrimitiveToString(r, P::Float);
                 }
-                return emitStringConcat(l, rStr);
+                llvm::Value* res = emitStringConcat(l, rStr);
+                // FINDING [2]: release the left operand if it is a fresh +1
+                // string intermediate (a nested `+`/interpolation). Also release
+                // a freshly-converted right operand (emitPrimitiveToString
+                // allocates a +1 temporary distinct from the original `r`); when
+                // no conversion happened `rStr == r` is a borrow and is left
+                // alone. Both run after the concat result is produced.
+                releaseConcatIntermediate(bin.left.get(), l);
+                if (rStr != r) emitStringRelease(rStr);
+                return res;
             }
             // CG27b (§4.6): ordinal comparison operators.
             if (op == "<" || op == ">" || op == "<=" || op == ">=") {
@@ -1529,7 +1575,13 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (lt && lt->kind == sema::TypeRef::Kind::Primitive &&
                 lt->primitive != sema::PrimitiveType::String) {
                 llvm::Value* lStr = emitPrimitiveToString(l, lt->primitive);
-                return emitStringConcat(lStr, r);
+                llvm::Value* res = emitStringConcat(lStr, r);
+                // FINDING [2]: lStr is a fresh +1 conversion temporary; release
+                // it (consumed by the concat). Release the right operand too if
+                // it is a fresh +1 string intermediate. Both after the result.
+                emitStringRelease(lStr);
+                releaseConcatIntermediate(bin.right.get(), r);
+                return res;
             }
         }
     }
