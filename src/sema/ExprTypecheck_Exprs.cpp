@@ -709,6 +709,44 @@ MethodSymbol* ExprTC::findUnaryOperator(const ast::UnaryExpr& ue) {
     return nullptr;
 }
 
+// §28.8.1 / §28.11 (issue #423): classify the receiver of a `move coll[i]`.
+// `move coll[i]` is admitted only on the enumerated CONCRETE owning receivers
+// (§28.11: `OwnedArray<T>`, `OwnedDictionary<K, V>`, class-typed `OwnedBuffer<T>`,
+// class-typed `Span<T>`, and the owning inline arrays). An INTERFACE-typed
+// receiver is not among them — the interface owns no storage, so there is no
+// statically-known slot to leave in moved-from state; codegen's
+// `lowerMoveFromCollectionSlot` recognizes only the concrete owning collections
+// and would mishandle the moved-out element (a double-free at runtime). Return
+// the interface's type name when the receiver is interface-typed, else "".
+std::string
+ExprTC::moveThroughInterfaceSlotName(const ast::Expr& operand) const {
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(&operand);
+    if (!ix || !ix->target) return {};
+    const TypeRef* tt = ctx_.exprType(*ix->target);
+    if (!tt || tt->kind != TypeRef::Kind::Named) return {};
+    // A user-declared `interface` resolves to a Named TypeRef whose declaration
+    // is an interface TypeDecl (§11.2). Its name is the diagnostic subject.
+    if (tt->declaration) {
+        if (tt->declaration->kind == ast::TypeDeclKind::Interface)
+            return std::string(tt->declaration->name);
+        return {};
+    }
+    // The built-in collection interfaces resolve to a Named TypeRef with a NULL
+    // declaration (TypeResolution_Names) carrying the name on the AST node. The
+    // only built-in interfaces that declare an int-indexer — the sole shape a
+    // `move coll[i]` can take among built-ins — are the list interfaces
+    // `IReadOnlyList<T>`, `IList<T>`, and `IOwnedList<T>` (stdlib §4.1–§4.2);
+    // every other built-in interface has no indexer, so `coll[i]` would not
+    // typecheck on it. (`Array`/`OwnedArray`/`OwnedDictionary`/… are concrete
+    // CLASSES, not interfaces, and are correctly NOT matched here.)
+    if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty()) {
+        std::string_view cn = tt->astNode->name->parts[0];
+        if (cn == "IReadOnlyList" || cn == "IList" || cn == "IOwnedList")
+            return std::string(cn);
+    }
+    return {};
+}
+
 void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     const auto& op = ue.op;
     // §25: a user-defined unary operator overload.
@@ -723,6 +761,28 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     if (op == "not") {
         ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;
+    }
+    // §28.8.1 / §28.11 (issue #423): `move coll[i]` is admitted only on the
+    // enumerated CONCRETE owning receivers (§28.11). A `move` through an
+    // INTERFACE-typed indexer slot (`IOwnedList<T>`, `IList<T>`,
+    // `IReadOnlyList<T>`, or a user interface exposing an indexer) is rejected:
+    // the interface owns no storage, so there is no slot to leave in moved-from
+    // state, and codegen would mishandle the moved-out element (a double-free at
+    // runtime). The diagnostic still falls through to set the result type so a
+    // downstream consumer of the move result does not cascade unrelated errors.
+    if (op == "move" && ue.operand) {
+        std::string iface = moveThroughInterfaceSlotName(*ue.operand);
+        if (!iface.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                std::string("`move` is not admitted through an interface-typed "
+                            "indexer slot: `") + iface +
+                "` is an interface and owns no storage, so there is no slot to "
+                "take ownership of (§28.8.1 / §28.11 — `move coll[i]` is "
+                "admitted only on concrete owning collections: `OwnedArray<T>`, "
+                "`OwnedDictionary<K, V>`, class-typed `OwnedBuffer<T>` / "
+                "`Span<T>`, and owning inline arrays)");
+        }
     }
     // `move x` (§28.3) keeps the operand's type — the result is the
     // same value with ownership transferred. Without the type, member
