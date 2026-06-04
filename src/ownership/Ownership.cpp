@@ -679,6 +679,15 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // recordMovesIn so a `move`d source is no longer Owned and the transfer
     // form is correctly not flagged.
     checkBorrowStoreEscape(as);
+    // §28.11 (#395): an owning-collection `set(owned)` indexer assignment
+    // `coll[i] := value` requires `value` to be owned — "Indexer set
+    // `coll[i] := value` requires `value` to be owned." A borrow handed to the
+    // owned slot would be disposed by the slot (and by its real owner): a
+    // double-dispose. Run after recordMovesIn so a `move`d-owned RHS has
+    // already transferred and is correctly NOT seen as a borrow.
+    if (indexerSetterTakesOwned(*as.target)) {
+        checkOwnedArgSource(*as.value, as.value->span.begin);
+    }
     if (const auto* id =
             dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
         // §28.9 / §9.7 indirect-escape tracking: recompute the borrow source

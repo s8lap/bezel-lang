@@ -362,6 +362,52 @@ private:
     void markDisposedByName(std::string_view name, SourceLocation loc);
 
     void markMovedByName(std::string_view name, SourceLocation loc);
+
+    // §28.8 owned-sink check (issue #395): true when `argValue` — an
+    // argument destined for an `owned` parameter, or the RHS of an
+    // owning-collection `set(owned)` indexer assignment — denotes a *borrow*
+    // rather than an owned value. Passing a borrow into an `owned` sink lets
+    // the sink dispose a value it does not own (a double-dispose with the
+    // value's real owner), so it must be rejected.
+    //
+    // Only the bare-identifier borrow forms are flagged: a tracked local
+    // currently in the Borrowed state, or a bare identifier resolving to a
+    // non-`owned` parameter (a borrowed parameter, whose source is the
+    // caller's frame). A leading `move` is unwrapped first — `move b` of a
+    // borrow is no more an owned value than the bare `b`. Every owned-value
+    // form (`new T(...)`, a call returning `owned T`, a `move` of an owned
+    // local / owned field / owned slot, a bare owned local) is NOT flagged,
+    // so legal §28.8 transfers are never over-rejected. Anything the analysis
+    // cannot classify (e.g. `this`, an unresolved symbol) is conservatively
+    // treated as NOT a borrow, so it is never falsely rejected. // per §28.8
+    bool ownedArgSourceIsBorrow(const ast::Expr& argValue);
+
+    // §28.8: report the owned-sink violation for `argValue` (at `loc`) when
+    // `ownedArgSourceIsBorrow` holds. Returns true when it reported (the
+    // caller then skips the bogus `markMovedByName` that would silently treat
+    // the borrow as consumed). // per §28.8
+    bool checkOwnedArgSource(const ast::Expr& argValue, SourceLocation loc);
+
+    // §28.11 indexer-set (issue #395): true when `target` is `coll[i]` on an
+    // owning collection whose `set(owned)` indexer requires an owned RHS. Per
+    // §28.11 "Indexer set `coll[i] := value` requires `value` to be owned."
+    // Recognizes a user indexer `PropertyDecl` whose set accessor is declared
+    // `set(owned)`, and the built-in owning collections `OwnedArray<T>` /
+    // `OwnedDictionary<K, V>` (stdlib §4.5 / §4.9), whose indexer setter takes
+    // owned by definition. // per §28.11
+    bool indexerSetterTakesOwned(const ast::Expr& target);
+
+    // §28.8 built-in owned-sink methods (issue #395): true when `callee` is a
+    // member access `coll.M` whose receiver `coll` has a *built-in* owning-
+    // collection type (which sema resolves to a Named TypeRef with a null
+    // declaration, so the user-declaration path in recordMovesInArgs /
+    // handleDischarge cannot see the `owned` formal) AND `M` is one of that
+    // family's owned-taking methods at argument index `argPos` (stdlib §4.5 /
+    // §4.7 / §4.9: `Add` / `Insert` / `AddRange` / `AddFirst` / `AddLast` /
+    // `AddBefore` / `AddAfter` / `Push` / `Enqueue`). Gating on the built-in
+    // receiver type means it never mis-fires on a user method of the same name
+    // (those go through the precise declaration-based path). // per §28.8
+    bool builtinOwnedSinkArg(const ast::Expr* callee, std::size_t argPos);
 };
 
 } // namespace bezel::ownership

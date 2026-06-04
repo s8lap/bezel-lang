@@ -69,7 +69,9 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             if (!a.value) { ++pos; continue; }
             if (a.modifier == "owned") {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                    markMovedByName(id->name, id->span.begin);
+                    // §28.8 (#395): the consumed value must be owned, not a borrow.
+                    if (!checkOwnedArgSource(*a.value, id->span.begin))
+                        markMovedByName(id->name, id->span.begin);
                     ++pos; continue;
                 }
             }
@@ -78,7 +80,9 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 (cd->params[pos].modifier == "owned" ||
                  cd->params[pos].modifier == "out owned")) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                    markMovedByName(id->name, id->span.begin);
+                    // §28.8 (#395): reject a borrow flowing into the owned formal.
+                    if (!checkOwnedArgSource(*a.value, id->span.begin))
+                        markMovedByName(id->name, id->span.begin);
                     ++pos; continue;
                 }
             }
@@ -109,24 +113,48 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         if (a.modifier == "owned") {
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                     a.value.get())) {
-                markMovedByName(id->name, id->span.begin);
+                // §28.8 (#395): the consumed value must be owned, not a borrow.
+                if (!checkOwnedArgSource(*a.value, id->span.begin))
+                    markMovedByName(id->name, id->span.begin);
                 ++pos; continue;
             }
         }
         // §28.8 implicit ownership transfer: a bare identifier passed
         // to an `owned` formal parameter transfers ownership without
-        // an explicit `owned` or `move` at the call site.
+        // an explicit `owned` or `move` at the call site. The owned-sink
+        // formal is either a user-declared `owned` param or a built-in
+        // owning-collection method whose owned arg sits at this position
+        // (#395: built-in collection methods have no AST declaration).
         {
             const std::vector<ast::Param>* params = nullptr;
             if (calleeMethod)  params = &calleeMethod->params;
             if (calleeCtor)    params = &calleeCtor->params;
-            if (params && pos < params->size() &&
+            const bool userOwned =
+                params && pos < params->size() &&
                 ((*params)[pos].modifier == "owned" ||
-                 (*params)[pos].modifier == "out owned")) {
+                 (*params)[pos].modifier == "out owned");
+            const bool ownedSink =
+                userOwned || builtinOwnedSinkArg(callee, pos);
+            if (ownedSink) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         a.value.get())) {
-                    markMovedByName(id->name, id->span.begin);
+                    // §28.8 (#395): reject a borrow flowing into the owned
+                    // formal; otherwise record the implicit move.
+                    if (!checkOwnedArgSource(*a.value, id->span.begin))
+                        markMovedByName(id->name, id->span.begin);
                     ++pos; continue;
+                }
+                // `move id` to an owned formal: `move b` of a borrow is not an
+                // owned value (§28.8/#395). When the source is owned, fall
+                // through to recordMovesIn, which records the legitimate move.
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                        a.value.get())) {
+                    if (un->op == "move" &&
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            un->operand.get()) &&
+                        checkOwnedArgSource(*a.value, un->span.begin)) {
+                        ++pos; continue;  // reported; skip the bogus move
+                    }
                 }
             }
         }
@@ -163,7 +191,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             if (a.modifier == "owned") {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         a.value.get())) {
-                    markMovedByName(id->name, id->span.begin);
+                    // §28.8 (#395): an `owned`-modified arg must be owned, not
+                    // a borrow. On violation, report and skip the bogus move;
+                    // either way the arg is handled (do not re-read it below).
+                    if (!checkOwnedArgSource(*a.value, id->span.begin))
+                        markMovedByName(id->name, id->span.begin);
                     consumed = true;
                 }
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
@@ -171,7 +203,10 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 if (un->op == "move") {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                             un->operand.get())) {
-                        markMovedByName(id->name, id->span.begin);
+                        // §28.8 (#395): `move b` of a borrow is not an owned
+                        // value — reject rather than silently consuming it.
+                        if (!checkOwnedArgSource(*a.value, id->span.begin))
+                            markMovedByName(id->name, id->span.begin);
                         consumed = true;
                     } else if (auto* ma =
                                    dynamic_cast<const ast::MemberAccessExpr*>(
@@ -189,12 +224,24 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     }
                 }
             }
-            // §28.8 implicit transfer: bare id to an `owned` formal param.
-            if (!consumed && a.modifier.empty() &&
-                isImplicitOwned(call->args, pos, call->callee.get())) {
+            // §28.8 implicit transfer: an arg flowing into an owned formal —
+            // a user-declared `owned` param (isImplicitOwned) or a built-in
+            // owning-collection owned-sink method (#395, builtinOwnedSinkArg,
+            // which has no AST declaration for isImplicitOwned to read).
+            const bool ownedSink =
+                isImplicitOwned(call->args, pos, call->callee.get()) ||
+                builtinOwnedSinkArg(call->callee.get(), pos);
+            // (A `move id` argument — `coll.Add(move b)` — was already handled
+            // by the `move` arm above, which checks the source for every call;
+            // it reaches here already consumed. The bare-id form is handled
+            // here.)
+            if (!consumed && a.modifier.empty() && ownedSink) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         a.value.get())) {
-                    markMovedByName(id->name, id->span.begin);
+                    // §28.8 (#395): reject a borrow flowing into the owned
+                    // formal; otherwise record the implicit move.
+                    if (!checkOwnedArgSource(*a.value, id->span.begin))
+                        markMovedByName(id->name, id->span.begin);
                     consumed = true;
                 }
             }
@@ -262,13 +309,17 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             bool consumed = false;
             if (a.modifier == "owned") {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                    markMovedByName(id->name, id->span.begin);
+                    // §28.8 (#395): an `owned`-modified arg must be owned.
+                    if (!checkOwnedArgSource(*a.value, id->span.begin))
+                        markMovedByName(id->name, id->span.begin);
                     consumed = true;
                 }
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
                 if (un->op == "move") {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get())) {
-                        markMovedByName(id->name, id->span.begin);
+                        // §28.8 (#395): `move b` of a borrow is not an owned value.
+                        if (!checkOwnedArgSource(*a.value, id->span.begin))
+                            markMovedByName(id->name, id->span.begin);
                         consumed = true;
                     }
                 }
@@ -278,7 +329,9 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 (cd->params[pos].modifier == "owned" ||
                  cd->params[pos].modifier == "out owned")) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
-                    markMovedByName(id->name, id->span.begin);
+                    // §28.8 (#395): reject a borrow flowing into the owned formal.
+                    if (!checkOwnedArgSource(*a.value, id->span.begin))
+                        markMovedByName(id->name, id->span.begin);
                     consumed = true;
                 }
             }
@@ -1346,6 +1399,120 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         return;
     }
     st->state = OwnershipState::MovedFrom;
+}
+
+// §28.11 indexer-set owned check (issue #395). See the header for the contract.
+bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(&target);
+    if (!ix || !ix->target) return false;
+    const sema::TypeRef* tt = ctx_.exprType(*ix->target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named) return false;
+    // Built-in owning collections: their indexer setter takes owned by
+    // definition (stdlib §4.5 / §4.9). They resolve to a Named TypeRef with a
+    // null declaration carrying the class name on the AST node.
+    if (!tt->declaration) {
+        if (tt->astNode && tt->astNode->name &&
+            !tt->astNode->name->parts.empty()) {
+            std::string_view cn = tt->astNode->name->parts[0];
+            return cn == "OwnedArray" || cn == "OwnedDictionary";
+        }
+        return false;
+    }
+    // User-declared type: find an indexer property whose set accessor is
+    // declared `set(owned)`. Arity-match the index argument count so an
+    // overloaded indexer set is identified precisely.
+    const std::size_t nIdx = ix->indices.size();
+    for (sema::Symbol* m : tt->declaration->members) {
+        const auto* pd = dynamic_cast<const ast::PropertyDecl*>(m ? m->decl
+                                                                  : nullptr);
+        if (!pd || !pd->isIndexer) continue;
+        if (pd->indexerParams.size() != nIdx) continue;
+        for (const auto& acc : pd->accessors) {
+            if (acc.isSet && acc.setterParamMod == "owned") return true;
+        }
+    }
+    return false;
+}
+
+// §28.8 built-in owned-sink methods (issue #395). See the header for the
+// contract. The owned-argument *index* differs per method, so the table maps
+// (collection family, method name) → owned-arg position.
+bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
+                                          std::size_t argPos) {
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+    // Built-in collections resolve to a Named TypeRef with a null declaration
+    // and carry the class name on the AST node. A user type (non-null
+    // declaration) is handled by the precise declaration-based path instead.
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return false;
+    if (!tt->astNode || !tt->astNode->name ||
+        tt->astNode->name->parts.empty())
+        return false;
+    const std::string_view cn = tt->astNode->name->parts[0];
+    const bool isOwning =
+        cn == "OwnedArray" || cn == "OwnedDictionary" ||
+        cn == "OwnedSet" || cn == "OwnedStack" || cn == "OwnedQueue" ||
+        cn == "OwnedLinkedList";
+    if (!isOwning) return false;
+    const std::string_view m = ma->member;
+    // The owned argument's position per stdlib §4.5 / §4.7 / §4.9.
+    if ((m == "Add" || m == "AddFirst" || m == "AddLast" || m == "Push" ||
+         m == "Enqueue" || m == "AddRange") &&
+        cn != "OwnedDictionary")
+        return argPos == 0;                       // owned item is arg 0
+    if (m == "Add" && cn == "OwnedDictionary")
+        return argPos == 1;                       // Add(key, owned value)
+    if (m == "Insert")
+        return argPos == 1;                       // Insert(index, owned item)
+    if (m == "AddBefore" || m == "AddAfter")
+        return argPos == 1;                       // Add*(node, owned item)
+    return false;
+}
+
+// §28.8 owned-sink check (issue #395). See the header for the full contract.
+bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
+    const ast::Expr* e = &argValue;
+    // Unwrap a leading `move`: `move b` of a borrow is no more an owned value
+    // than the bare `b`. (`move this.f` / `move coll[i]` unwrap to a member /
+    // index expression, NOT a bare identifier, so they fall through to the
+    // "cannot classify → not a borrow" tail and are correctly accepted.)
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        if (un->op == "move" && un->operand) e = un->operand.get();
+    }
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (!id) return false;  // new / call / member / index / literal: not flagged
+    // A tracked local: only the Borrowed state is the owned-sink hazard. Owned
+    // (the legal transfer) and the error-producing states (MovedFrom/Disposed/
+    // Uninitialized — diagnosed by their own checks) are NOT flagged here.
+    if (auto* st = lookupState(id->name)) {
+        return st->state == OwnershipState::Borrowed;
+    }
+    // Not a tracked local. A bare identifier resolving to a non-`owned`
+    // parameter is a borrowed parameter (source: the caller's frame, §28.3
+    // producers "Parameter `p` (no modifier) | Borrowed (source: caller)") —
+    // handing it to an `owned` sink is the double-dispose hazard.
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        return ps->modifier != "owned" && ps->modifier != "out owned";
+    }
+    // `this`, fields, or anything else we cannot positively classify as a
+    // borrow: conservatively NOT flagged, so a valid transfer is never
+    // over-rejected. // per §28.8
+    return false;
+}
+
+bool MethodOwnership::checkOwnedArgSource(const ast::Expr& argValue,
+                                          SourceLocation loc) {
+    if (!ownedArgSourceIsBorrow(argValue)) return false;
+    report(
+        Severity::Error, loc,
+        "a borrow cannot be passed where an `owned` value is required: "
+        "an `owned` sink takes responsibility for disposing the value, but a "
+        "borrow is owned elsewhere (§28.8 — transfer an owned value with "
+        "`move`, `new`, or a call returning `owned T`)");
+    return true;
 }
 
 } // namespace bezel::ownership
