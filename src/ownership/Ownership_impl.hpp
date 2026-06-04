@@ -370,17 +370,33 @@ private:
     // the sink dispose a value it does not own (a double-dispose with the
     // value's real owner), so it must be rejected.
     //
-    // Only the bare-identifier borrow forms are flagged: a tracked local
-    // currently in the Borrowed state, or a bare identifier resolving to a
-    // non-`owned` parameter (a borrowed parameter, whose source is the
-    // caller's frame). A leading `move` is unwrapped first — `move b` of a
-    // borrow is no more an owned value than the bare `b`. Every owned-value
-    // form (`new T(...)`, a call returning `owned T`, a `move` of an owned
-    // local / owned field / owned slot, a bare owned local) is NOT flagged,
-    // so legal §28.8 transfers are never over-rejected. Anything the analysis
-    // cannot classify (e.g. `this`, an unresolved symbol) is conservatively
-    // treated as NOT a borrow, so it is never falsely rejected. // per §28.8
+    // The borrow forms flagged are: a tracked local currently in the Borrowed
+    // state; a bare identifier resolving to a non-`owned` parameter (a borrowed
+    // parameter, whose source is the caller's frame); and a *bare* read of an
+    // `owned` field — `obj.f` / a bare `f` resolving to an owned field — which
+    // §28.3 classifies as Borrowed (source: `obj`), the only owned-field read
+    // that yields an owned value being `move obj.f` (§28.8.1). A leading `move`
+    // is unwrapped first — `move b` of a borrow is no more an owned value than
+    // the bare `b`, while `move obj.f` IS the legal owned producer (§28.3 /
+    // §28.8.1) and so is NOT flagged: the owned-field branch only fires when no
+    // enclosing `move` wrapped the read (issue #398). Every owned-value form
+    // (`new T(...)`, a call returning `owned T`, a `move` of an owned local /
+    // owned field / owned slot, a bare owned local) is NOT flagged, so legal
+    // §28.8 transfers are never over-rejected. Anything the analysis cannot
+    // classify (e.g. `this`, an unresolved symbol, a non-`owned` field) is
+    // conservatively treated as NOT a borrow, so it is never falsely rejected.
+    // // per §28.8, §28.3, §28.8.1
     bool ownedArgSourceIsBorrow(const ast::Expr& argValue);
+
+    // §28.3 (issue #398): true when `e` is a read of an `owned` field — either
+    // an explicit member access `obj.f` whose member resolves to an owned
+    // FieldSymbol, or a bare identifier resolving to an owned field of the
+    // declaring class (implicit `this`). A bare such read is Borrowed per the
+    // §28.3 producers table ("Field access `obj.f` where `f` is `owned` |
+    // Borrowed (source: `obj`)"); only `move obj.f` reads it as an owned value
+    // (§28.8.1). Used by `ownedArgSourceIsBorrow` to reject a bare owned-field
+    // read flowing into an owned sink. // per §28.3, §28.8.1
+    bool exprIsOwnedFieldRead(const ast::Expr& e) const;
 
     // §28.8: report the owned-sink violation for `argValue` (at `loc`) when
     // `ownedArgSourceIsBorrow` holds. Returns true when it reported (the
