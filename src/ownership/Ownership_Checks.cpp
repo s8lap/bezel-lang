@@ -205,6 +205,19 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
 }
 
 void MethodOwnership::handleDischarge(const ast::Expr& e) {
+    // §31.1 / §28.8 / §17.12 (issue #406): a `throw` in EXPRESSION position
+    // (`x ?? throw new Wrap(b)`, `case ... => throw new Wrap(b)`) is a
+    // `ThrowExpr` wrapping its operand, whereas a statement-level `throw` is a
+    // `ThrowStmt` whose value is the operand directly. Both consume the operand
+    // as an owned value transferred to the runtime's exception machinery, so the
+    // operand's `new`/call arguments must be walked through the same owned-
+    // argument check (§28.8 transfer) as in any other operand position. Recurse
+    // into the operand; a bare re-raise `throw` (null operand, §31.2.4) carries
+    // nothing to check. // per §31.1, §28.8, §17.12
+    if (auto* te = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (te->operand) handleDischarge(*te->operand);
+        return;
+    }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (call->callee) checkRead(*call->callee, /*selfTarget=*/true);
         // Slice O14 + §28.8: argument-mode handling.

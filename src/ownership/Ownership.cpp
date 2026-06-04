@@ -522,6 +522,25 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         if (rs->value) handleReturn(*rs->value);
         return;
     }
+    // §31.1 / §28.8 (issue #406): the operand of a `throw` is an ordinary
+    // expression evaluated to an owned value that the throw then consumes
+    // (§31.1: "`new SomeException(...)` produces an owned class instance that
+    // the `throw` statement immediately consumes"). A thrown `new`/call must
+    // therefore have its arguments walked through the same owned-argument check
+    // (§28.8 transfer) as a `new`/call in any other operand position — a borrow
+    // passed to an `owned` constructor/method parameter is a double-free
+    // whether or not the `new`/call is the throw operand. `handleDischarge` is
+    // the shared arg walker used by expression-statement / decl / assignment
+    // operands; routing the thrown value through it closes the throw-operand
+    // sink that previously skipped the check. A bare re-throw `throw e;` of a
+    // borrow (the in-flight exception, §31.2.4) is a bare identifier, not a
+    // `new`/call, so it falls through to `checkRead` and is correctly NOT
+    // treated as an owned sink — the throw transfers it back to the runtime,
+    // which §31.1 explicitly permits. // per §31.1, §28.8
+    if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (th->value) handleDischarge(*th->value);
+        return;
+    }
     // Slice O4: if-then-else handling with branch-join semantics
     // per §28.3. Each branch is walked with a snapshot of the
     // pre-branch state; the post-branch states are joined into the
