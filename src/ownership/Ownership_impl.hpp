@@ -64,6 +64,24 @@ public:
 private:
     sema::SemaContext& ctx_;
     std::unordered_map<sema::Symbol*, LocalOwnership> states_;
+    // Issue #392 / §31.1: the set of catch-bound exception variables in this
+    // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
+    // the in-flight exception whose lifetime is the arm body: it may be passed
+    // to other methods (a borrow for the call's duration) and read, but may
+    // NOT be assigned to an `owned` field, returned as `owned`, or captured by
+    // a closure that may outlive the arm — the exception instance cannot
+    // escape the arm that caught it (the bare re-throw `throw;` is the one
+    // allowed exception). The binding is never declared via a `LocalDecl`, so
+    // it lives in this set rather than in `states_`; it carries no discharge
+    // obligation (the runtime owns and disposes the exception), so seeding it
+    // into `states_` as Owned would mis-fire the end-of-method undischarged
+    // check. The escape machinery consults this set via `isCatchBorrow` /
+    // `isEscapeBoundLocal` to treat an escape of the binding (or of a local
+    // that re-borrows it) exactly as it treats an escape of an owned scope-
+    // bound local. Populated at the start of run() by scanning this method's
+    // catch arms; symbols are unique per arm, so the set is path-insensitive
+    // (a catch binding only appears within its own arm body). // per §31.1
+    std::unordered_set<sema::Symbol*> catchBorrows_;
     // Slice O8: per-method tracker for `move this.field` — the field's
     // name maps to its moved-from state. fieldMoveLoc_ stores the
     // move-site location for diagnostics.
@@ -251,6 +269,38 @@ private:
     // so plain-parameter borrows are correctly not treated as escapes — see
     // the §9.7 param-borrow control.)
     bool isOwnedTrackedLocal(sema::Symbol* sym) const;
+
+    // Issue #392 / §31.1: true when `sym` is a catch-bound exception variable
+    // of this method. A catch binding is a borrow of the in-flight exception
+    // whose lifetime is the arm body; like an owned scope-bound local, the
+    // borrow may not escape the arm.
+    bool isCatchBorrow(sema::Symbol* sym) const;
+
+    // True when `sym` is a scope-bound local whose borrow may NOT escape this
+    // method body: either an owned scope-bound local (`isOwnedTrackedLocal`)
+    // or a catch-bound exception variable (`isCatchBorrow`). The escape checks
+    // use this in place of `isOwnedTrackedLocal` so the catch binding's borrow
+    // is rejected on every channel that already rejects an owned local's
+    // borrow (store-to-field, out/ref param, multi-hop alias, closure
+    // capture). // per §28.3, §31.1
+    bool isEscapeBoundLocal(sema::Symbol* sym) const;
+
+    // Populate `catchBorrows_` by scanning every catch arm in `body`
+    // (recursively, including nested try/if/while/for/do bodies) for a binding
+    // pattern (`var ex: T`), resolving the bound LocalSymbol via the arm body
+    // node it anchors on. Called once at the start of run(). // per §31.1
+    void collectCatchBorrows(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void collectCatchBorrowsStmt(const ast::Stmt& s);
+
+    // Issue #392 / §31.1: a returned bare catch-binding identifier
+    // (`return ex;`) lets the in-flight exception instance escape the arm
+    // whose body the runtime disposes it after — a use-after-free. Diagnoses
+    // that direct form. Indirect returns through a holder local
+    // (`var b := ex; return b;`) and returned closures capturing `ex` are
+    // handled by the existing escape machinery, which `collectCatchBorrows` /
+    // `isEscapeBoundLocal` extend to recognize the catch binding as a source.
+    void checkCatchBorrowEscapesOnReturn(const ast::Expr& e);
 
     // §9.7: true when `rt` is a record type that holds at least one
     // borrow-carrying field of a non-runtime-managed type (a class/
