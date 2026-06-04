@@ -308,6 +308,20 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "Subscription")
                     return ptrTy();
             }
+            // #405 / §31.1 / §31.4: a built-in exception type (Exception or a
+            // §31.4 subtype) has no user TypeDecl but IS a reference type — a
+            // heap-allocated object (vtable + message). It must lower to a
+            // pointer; without this it fell through to the i32 value default,
+            // truncating the exception pointer wherever a built-in exception was
+            // a field / local / parameter / return (so an owned field/local of
+            // built-in-exception type stored a clobbered half-pointer that the
+            // §28.4 / §28.10 auto-dispose then freed at the wrong address).
+            if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty() &&
+                builtinVtable_.find(
+                    std::string(rt->astNode->name->parts.back())) !=
+                    builtinVtable_.end())
+                return ptrTy();
             if (rt->declaration &&
                 (rt->declaration->kind == ast::TypeDeclKind::Class ||
                  rt->declaration->kind == ast::TypeDeclKind::Interface)) {

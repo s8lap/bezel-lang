@@ -105,11 +105,17 @@ public:
         // CG8: build every class's instance layout first (so field
         // access and `new` see field indices). CG6: declare all static
         // method functions, then emit bodies.
+        // #405 / §31.4: build the built-in exception vtables/descriptors BEFORE
+        // declareStructs — class layout (lowerTypeRef) consults builtinVtable_ to
+        // lower a built-in-exception-typed field to a pointer (it is a reference
+        // type, §31.1), so the set must already be populated. setupBuiltin
+        // Exceptions only creates module globals + the shared no-op dispose; it
+        // depends on nothing declared later.
+        setupBuiltinExceptions();  // CG22
         declareStructs();
         declareStatics();
         declareFunctions();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
-        setupBuiltinExceptions();  // CG22
         setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
         computeEnumValues();  // CG30
         declareExterns();  // CG26
@@ -1083,6 +1089,39 @@ private:
         return tt->declaration == nullptr;  // built-ins have no TypeSymbol
     }
 
+    // #405 / §31.4: precise recognizer — `tt` resolves to one of the language-
+    // built-in exception types (it has a built-in vtable from
+    // setupBuiltinExceptions). Unlike isBuiltinExceptionType this checks the
+    // type NAME against the built-in exception set, so it does not match other
+    // declaration-less Named types (collections, primitives). Used by the
+    // owned-field / using-var auto-dispose paths to recognize a builtin
+    // exception held as an owned field/local (§28.5 / §28.10): such an object is
+    // an ordinary owned heap class instance (§31.1) and must be disposed +
+    // reclaimed when the owning slot's lifetime ends.
+    bool isBuiltinExceptionTypeRef(const sema::TypeRef* tt) const {
+        if (!tt || tt->kind != sema::TypeRef::Kind::Named) return false;
+        if (tt->declaration != nullptr) return false;  // built-ins have none
+        // The type NAME comes from the AST node (a TypeRef carries no name of
+        // its own); match it against the built-in exception vtable set.
+        const ast::Type* ty = tt->astNode;
+        if (!ty || !ty->name || ty->name->parts.empty()) return false;
+        return builtinVtable_.find(
+                   std::string(ty->name->parts.back())) != builtinVtable_.end();
+    }
+
+    // #405 / §28.5: an `owned` field whose type is a BUILTIN exception (e.g.
+    // `private owned _e: Exception?;` or a builtin subtype). Built-in exceptions
+    // have no user TypeSymbol, so isOwnedReferenceField (which requires a
+    // class/interface declaration) does not match them; they are nevertheless
+    // ordinary owned heap class instances (§31.1) and the enclosing object's
+    // Dispose must dispatch their (no-op) vtable Dispose and reclaim their block.
+    bool isOwnedBuiltinExceptionField(const sema::FieldSymbol* fs) {
+        if (!hasOwnedModifier(fs)) return false;
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return false;
+        return isBuiltinExceptionTypeRef(ctx_.resolvedType(*fd->type));
+    }
+
     // CG22: construct + throw a built-in exception by name, then unwind.
     void emitThrowBuiltin(const char* name);
 
@@ -1604,6 +1643,13 @@ private:
     // Returns true → register for dynamic disposal. The disposal dispatches
     // through the object's own vtable, so the concrete class is unneeded.
     bool usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld);
+
+    // #405 / §28.10 / §31.1: a `using var` whose value is a BUILTIN exception
+    // object (Exception or a §31.4 subtype). Built-in exceptions have no user
+    // TypeSymbol, so classOfLocal / usingVarOwnsClassObjectDynamically miss them;
+    // they are nevertheless owned heap class instances and must be disposed +
+    // reclaimed at scope end (dynamic dispatch through the object's vtable).
+    bool usingVarOwnsBuiltinException(const ast::LocalDecl* ld);
 
     // #383 / §28.8.1: a `using var u := move x.f;` takes the owned field's
     // value (a class object) and discharges it at scope end. Returns true if
