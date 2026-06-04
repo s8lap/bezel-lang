@@ -369,8 +369,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         builder_.CreateCall(fn, {recv}),
                         builder_.getInt64(0), "set.empty");
                 }
-                // .Clear() — recreate via remove-all is unavailable; not wired.
-                return nullptr;  // other ops scoped out for dict-backed sets
+                // per §4.10 (#351): .Clear() empties the backing table. The
+                // table stays allocated for reuse; Count is 0 afterward. A
+                // dict-backed Set's value slots are non-owned sentinels, so no
+                // value disposal is needed (null dispose_val).
+                if (m == "Clear" && call.args.empty()) {
+                    auto* fn = declareC("bz_dict_clear",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                    builder_.CreateCall(fn,
+                        {recv, llvm::ConstantPointerNull::get(ptrTy())});
+                    return llvm::ConstantInt::get(i32(), 0);  // unit result
+                }
+                // per §4.10 (#351): set-algebra ops whose `other` argument is a
+                // dict-backed Set of the SAME element type are wired by
+                // enumerating the other table's elements (bz_dict_keys_gen, #370)
+                // and folding them into / against self via the generic entry
+                // points. UnionWith / ExceptWith mutate only self while iterating
+                // `other` (no mutate-while-iterate hazard). IsSubsetOf /
+                // IsSupersetOf are pure membership queries.
+                if ((m == "UnionWith" || m == "ExceptWith" ||
+                     m == "IsSubsetOf" || m == "IsSupersetOf") &&
+                    call.args.size() == 1 && call.args[0].value) {
+                    // `elemTy` here is the self element's TypeRef (the binding
+                    // from genericBackingType above); the helper lowers it.
+                    if (llvm::Value* res = tryLowerSetAlgebra(
+                            m, recv, *call.args[0].value, elemTy, elemIsRecord))
+                        return res;
+                    // other not a same-typed dict-backed Set → defer (fall out).
+                }
+                return nullptr;  // remaining ops scoped out for dict-backed sets
             }
         }
 
@@ -875,6 +902,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)});
             return llvm::ConstantInt::get(i32(), 0);  // unit/void result
         }
+        // per §4.5: .Insert(index, item) — insert at index, shifting up. For an
+        // OwnedArray<T> the item is `owned` (already moved in by the caller);
+        // there is no element to dispose (a fresh slot is created, not a
+        // replacement), so insertion is the same op for owning and borrowing
+        // arrays — the runtime just shifts and stores the element bytes.
+        if (m == "Insert" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* idx = lowerExpr(*call.args[0].value);
+            llvm::Value* v   = lowerExpr(*call.args[1].value);
+            if (!idx || !v) return nullptr;
+            idx = builder_.CreateSExt(idx, i64());
+            llvm::AllocaInst* slot = entryAlloca(v->getType());
+            builder_.CreateStore(v, slot);
+            auto* fn = declareC("bz_array_insert_at", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz)});
+            return llvm::ConstantInt::get(i32(), 0);  // unit/void result
+        }
         // .Get(i): T / .Peek(): T (top/front element)
         if ((m == "Get" || m == "Peek") &&
             (call.args.size() == 1 || call.args.empty())) {
@@ -933,6 +978,79 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 {ptrTy(), i64(), i64()});
             builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz)});
             return llvm::ConstantInt::get(i32(), 0);
+        }
+        // per §4.5: .Remove(item): bool — find the first matching element and
+        // remove it; returns whether one was found. For an OwnedArray<T> the
+        // matched (class) element is DISPOSED (and freed) via the element
+        // disposer, mirroring RemoveAt; for a borrowing Array<T> the slot is
+        // just removed. Match semantics: a class element compares by REFERENCE
+        // identity (the §25.2 default Equals for classes — a user-defined
+        // Equals/operator= override is not yet invoked here; see report); a
+        // string element compares by content (§4.6); a value element by ==.
+        if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* target = lowerExpr(*call.args[0].value);
+            if (!target) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            bool elemIsClass = collectionElemIsClass(recvTy, 0);
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "rmi.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "rmi.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "rmi.f", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "rmi.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "rmi.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* eq;
+            if (elemIsClass && el->getType()->isPointerTy() &&
+                target->getType()->isPointerTy()) {
+                eq = builder_.CreateICmpEQ(el, target);  // §25.2 reference identity
+            } else if (el->getType()->isPointerTy() &&
+                       target->getType()->isPointerTy()) {
+                eq = emitStringEq(el, target);           // §4.6 string content
+            } else {
+                llvm::Value* elN = el, *tN = target;
+                if (el->getType() != target->getType() &&
+                    el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
+                    unsigned ew = el->getType()->getIntegerBitWidth();
+                    unsigned tw = target->getType()->getIntegerBitWidth();
+                    llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
+                    elN = builder_.CreateSExt(el, wide);
+                    tN = builder_.CreateSExt(target, wide);
+                }
+                eq = builder_.CreateICmpEQ(elN, tN);
+            }
+            builder_.CreateCondBr(eq, foundBB, nextBB);
+            builder_.SetInsertPoint(foundBB);
+            // Remove (and, for an owning array, dispose) the matched slot.
+            if (llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy)) {
+                auto* fn = declareC("bz_array_remove_at_disposing",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), i64(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz),
+                                         elemDisp});
+            } else {
+                auto* fn = declareC("bz_array_remove_at",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), i64()});
+                builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz)});
+            }
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "rmi.r");
+            phi->addIncoming(builder_.getTrue(), foundBB);
+            phi->addIncoming(builder_.getFalse(), condBB);
+            return phi;
         }
         if ((m == "Pop" || m == "Dequeue") && call.args.empty()) {
             // Get last (Pop) or first (Dequeue) element, then remove it
@@ -4015,6 +4133,104 @@ llvm::Function* Emitter::buildRecordEqTrampoline(const sema::TypeSymbol* rec) {
 //
 // `*byteSize` receives the stored key/element byte count (the LLVM alloc size
 // of the key type: 8 for a string pointer, 4 for an int, sizeof(record), …).
+// stdlib §4.10 (#351): lower a dict-backed Set's set-algebra op against another
+// dict-backed Set of the same element type, by snapshotting one table's
+// elements (bz_dict_keys_gen, #370) and folding them into/against the other via
+// the generic entry points. Returns nullptr (caller defers) when `otherExpr` is
+// not a same-typed dict-backed Set — e.g. an array-typed IEnumerable<T> source,
+// which would need a different enumerator and is out of this slice's scope.
+llvm::Value* Emitter::tryLowerSetAlgebra(std::string_view method,
+                                         llvm::Value* selfTbl,
+                                         const ast::Expr& otherExpr,
+                                         const sema::TypeRef* selfElemRef,
+                                         bool elemIsRecord) {
+    // `other` must be a Set/OwnedSet whose element routes through the generic
+    // table with the same element type as self (same LLVM type / record-ness).
+    auto* otherTy = ctx_.exprType(otherExpr);
+    if (!otherTy || !otherTy->astNode || !otherTy->astNode->name ||
+        otherTy->astNode->name->parts.empty() || otherTy->declaration)
+        return nullptr;
+    auto on = otherTy->astNode->name->parts[0];
+    if (on != "Set" && on != "OwnedSet") return nullptr;
+    const sema::TypeRef* otherElem =
+        genericBackingType(otherTy, 0, /*isSet=*/true, nullptr);
+    if (!otherElem || !selfElemRef) return nullptr;
+    if (lowerTypeRef(otherElem) != lowerTypeRef(selfElemRef))
+        return nullptr;  // element mismatch
+    if ((recordTypeOfRef(otherElem) != nullptr) != elemIsRecord) return nullptr;
+
+    llvm::Value* otherTbl = lowerExpr(otherExpr);
+    if (!otherTbl) return nullptr;
+
+    // IsSubsetOf enumerates SELF and tests membership in OTHER; the other three
+    // enumerate OTHER. Choose the table to snapshot and the table to query.
+    bool enumSelf = (method == "IsSubsetOf");
+    llvm::Value* srcTbl = enumSelf ? selfTbl : otherTbl;
+    llvm::Value* qryTbl = enumSelf ? otherTbl : selfTbl;
+
+    auto* keysOutSlot = entryAlloca(ptrTy());
+    auto* cntSlot     = entryAlloca(i64());
+    auto* keysFn = declareC("bz_dict_keys_gen", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), ptrTy()});
+    builder_.CreateCall(keysFn, {srcTbl, keysOutSlot, cntSlot});
+    llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);  // void**
+    llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+
+    bool isQuery = (method == "IsSubsetOf" || method == "IsSupersetOf");
+    // For the membership queries, accumulate "all present so far" in a slot.
+    llvm::AllocaInst* allSlot = nullptr;
+    if (isQuery) {
+        allSlot = entryAlloca(i1());
+        builder_.CreateStore(builder_.getTrue(), allSlot);
+    }
+
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sa.body", currentFn_);
+    auto* incBB  = llvm::BasicBlock::Create(llvm_, "sa.inc",  currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "sa.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* keyPtrPtr = builder_.CreateGEP(ptrTy(), keysArr, idx);
+    llvm::Value* keyPtr    = builder_.CreateLoad(ptrTy(), keyPtrPtr);  // void* bytes
+    llvm::Value* sentinel = builder_.CreateIntToPtr(builder_.getInt64(1), ptrTy());
+    if (method == "UnionWith") {
+        auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {qryTbl, keyPtr, sentinel});
+    } else if (method == "ExceptWith") {
+        auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {qryTbl, keyPtr});
+    } else {  // IsSubsetOf / IsSupersetOf — test membership in qryTbl
+        auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
+        llvm::Value* has = builder_.CreateCall(fn, {qryTbl, keyPtr});
+        llvm::Value* prev = builder_.CreateLoad(i1(), allSlot);
+        builder_.CreateStore(builder_.CreateAnd(prev, has), allSlot);
+    }
+    builder_.CreateBr(incBB);
+
+    builder_.SetInsertPoint(incBB);
+    llvm::Value* idxI = builder_.CreateLoad(i64(), idxSlot);
+    llvm::Value* kpp2 = builder_.CreateGEP(ptrTy(), keysArr, idxI);
+    llvm::Value* kp2  = builder_.CreateLoad(ptrTy(), kpp2);
+    builder_.CreateCall(freeFn, {kp2});                 // free this key's copy
+    builder_.CreateStore(builder_.CreateAdd(idxI, builder_.getInt64(1)), idxSlot);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    builder_.CreateCall(freeFn, {keysArr});             // free the snapshot array
+    if (isQuery)
+        return builder_.CreateLoad(i1(), allSlot, "set.algebra.r");
+    return llvm::ConstantInt::get(i32(), 0);            // unit result for mutators
+}
+
 const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
                                                  unsigned idx, bool isSet,
                                                  uint64_t* byteSize) {

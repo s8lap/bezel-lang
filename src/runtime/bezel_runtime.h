@@ -40,6 +40,13 @@ void bz_array_set(void* arr, int64_t idx, const void* elem, int64_t elem_size);
 // Remove the element at `idx`, shifting subsequent elements down.
 void bz_array_remove_at(void* arr, int64_t idx, int64_t elem_size);
 
+// stdlib §4.5: insert one element (elem_size bytes) at `idx`, shifting the
+// existing element at `idx` and all subsequent elements up by one. Grows
+// capacity as needed. `idx` is clamped to [0, count] (idx == count appends).
+// Used by OwnedArray<T>.Insert(index, item) and Array<T>.Insert.
+void bz_array_insert_at(void* arr, int64_t idx, const void* elem,
+                        int64_t elem_size);
+
 // Set length to 0 (does NOT call dispose_elem; caller is responsible).
 void bz_array_clear(void* arr);
 
@@ -102,6 +109,12 @@ bool  bz_dict_try_get_gen(void* d, const void* key, void** out);
 void  bz_dict_set_gen(void* d, const void* key, void* val);
 bool  bz_dict_remove_gen(void* d, const void* key);
 bool  bz_dict_contains_gen(void* d, const void* key);
+
+// stdlib §4.10 / §4.8: empty a hash table in place (keeps it allocated). Frees
+// each key copy and, if `dispose_val` is non-null, disposes each value; zeroes
+// all buckets and resets count. Used by Set<T>.Clear() and the generic-table
+// Dictionary.Clear(). Dict-backed Set values are sentinels → pass null.
+void  bz_dict_clear(void* d, void (*dispose_val)(void*));
 
 // Enumerate all generic-key entries (issue #370). `*keys_out` is a malloc'd
 // array of `n` pointers; each points to a malloc'd copy of the key's raw bytes

@@ -218,6 +218,7 @@ set(BEZEL_TEST_SOURCES
     codegen/collection_keys_test.cpp
     codegen/linq_test.cpp
     codegen/event_test.cpp
+    codegen/owned_collection_ops_test.cpp
 
     runtime/event_subscription_test.cpp
 
