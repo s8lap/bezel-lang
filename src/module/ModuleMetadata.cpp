@@ -128,6 +128,7 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashBool(h, m.returnOwned);
     hashBool(h, m.hasEnumValue);
     hashU64(h, static_cast<std::uint64_t>(m.enumValue));
+    hashStr(h, m.valueText);  // §22.12 const value (issue #328 FINDING [3] BUG A)
 }
 
 } // namespace
@@ -206,7 +207,8 @@ bool MetaMember::operator==(const MetaMember& o) const {
            modifiers == o.modifiers && type == o.type &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
-           hasEnumValue == o.hasEnumValue && enumValue == o.enumValue;
+           hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
+           valueText == o.valueText;
 }
 
 bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
@@ -316,6 +318,10 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     emitType(w, m.type);
     for (const MetaGenericParam& g : m.genericParams) emitGeneric(w, g);
     for (const MetaParam& p : m.params) emitParam(w, p);
+    // §22.12 const value (schema v2, issue #328 FINDING [3] BUG A): a trailing
+    // REC_STRING after the params. A v1 reader skips it (skip-unknown); a v2
+    // reader reads it tolerantly and an absent record yields "" (a v1 blob).
+    emitString(w, m.valueText);
     w.ExitBlock();
 }
 
@@ -554,8 +560,13 @@ bool enterSubblock(Reader& r, unsigned wantId) {
 
 // Consume to the END_BLOCK of the current subblock, skipping anything left
 // (unknown trailing records / subblocks). Leaves the cursor just past the
-// END_BLOCK. Returns false on error.
-bool finishBlock(Reader& r) {
+// END_BLOCK. Returns false on error. When `captureString` is non-null, the
+// FIRST trailing REC_STRING encountered before END_BLOCK is read into it (the
+// rest are still skipped); this is how the schema-v2 MEMBER_BLOCK reads the
+// optional trailing §22.12 const `valueText` TOLERANTLY: a v1 blob has no such
+// trailing record, so `*captureString` is left untouched (empty) and the block
+// finishes exactly as before (issue #328 FINDING [3] BUG A).
+bool finishBlockImpl(Reader& r, std::string* captureString) {
     while (true) {
         unsigned id = 0;
         Next n = nextEntry(r, id);
@@ -565,6 +576,20 @@ bool finishBlock(Reader& r) {
             return true;
         }
         if (n == Next::Record) {
+            if (captureString != nullptr) {
+                // Read this record; if it is a REC_STRING, capture it once.
+                llvm::SmallVector<std::uint64_t, 32> vals;
+                auto got = r.cursor.readRecord(id, vals);
+                if (!got) { llvm::consumeError(got.takeError()); return false; }
+                if (got.get() == REC_STRING) {
+                    captureString->clear();
+                    captureString->reserve(vals.size());
+                    for (std::uint64_t v : vals)
+                        captureString->push_back(static_cast<char>(v & 0xFF));
+                    captureString = nullptr;  // capture only the first string
+                }
+                continue;
+            }
             auto sk = r.cursor.skipRecord(id);
             if (!sk) { llvm::consumeError(sk.takeError()); return false; }
             continue;
@@ -576,6 +601,8 @@ bool finishBlock(Reader& r) {
         return false;
     }
 }
+
+bool finishBlock(Reader& r) { return finishBlockImpl(r, /*captureString=*/nullptr); }
 
 bool readType(Reader& r, MetaType& t); // fwd
 
@@ -666,7 +693,9 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     for (std::uint64_t i = 0; i < nParams; ++i) {
         if (!readParam(r, m.params[i])) return false;
     }
-    return finishBlock(r);
+    // §22.12 const value (schema v2): the optional trailing REC_STRING. Read it
+    // tolerantly — a v1 blob has none, so `m.valueText` stays empty.
+    return finishBlockImpl(r, &m.valueText);
 }
 
 bool readMember(Reader& r, MetaMember& m) {

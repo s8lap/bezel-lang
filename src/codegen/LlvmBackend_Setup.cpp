@@ -131,8 +131,77 @@ llvm::Value* Emitter::constMemberValue(const ast::Expr& e) {
     auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(ctx_.exprSymbol(e));
     if (!cs) return nullptr;
     auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
-    if (!cd || !cd->value) return nullptr;
-    return lowerExpr(*cd->value);
+    if (cd && cd->value) return lowerExpr(*cd->value);
+    // §22.12 (issue #328 FINDING [3] BUG A): an IMPORTED const has no AST decl —
+    // its compile-time value was carried textually in the dependency metadata.
+    // A class-level const initializer "must be a compile-time-constant
+    // expression" (§22.12), so the library emitted NO storage symbol for it; we
+    // FOLD the value here rather than load it from a (non-existent) global.
+    if (!cd) return importedConstValue(e, cs);
+    return nullptr;
+}
+
+llvm::Value* Emitter::importedConstValue(const ast::Expr& e,
+                                         sema::ConstMemberSymbol* cs) {
+    const std::string* text = ctx_.importedConstValue(cs);
+    if (!text || text->empty()) return nullptr;
+    // The const's primitive type drives how the textual value is parsed and what
+    // LLVM constant is emitted. Prefer the read site's resolved type, then the
+    // imported member's recorded type (§22.12 / issue #328 inc 3 side table).
+    const sema::TypeRef* rt = ctx_.exprType(e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Primitive)
+        rt = ctx_.importedMemberType(cs);
+    sema::PrimitiveType prim =
+        (rt && rt->kind == sema::TypeRef::Kind::Primitive)
+            ? rt->primitive
+            : sema::PrimitiveType::Int;
+    switch (prim) {
+        case sema::PrimitiveType::Bool:
+            return llvm::ConstantInt::get(i1(), *text == "true" ? 1 : 0);
+        case sema::PrimitiveType::Char:
+            return llvm::ConstantInt::get(
+                i32(), static_cast<std::uint64_t>(parseCharLiteral(*text)),
+                /*isSigned=*/false);
+        case sema::PrimitiveType::Float:
+        case sema::PrimitiveType::Double: {
+            std::string digits;
+            for (char c : *text) {
+                if (c == '_' || c == 'f' || c == 'F' || c == 'd' || c == 'D')
+                    continue;
+                digits.push_back(c);
+            }
+            double v = digits.empty() ? 0.0 : std::strtod(digits.c_str(), nullptr);
+            if (prim == sema::PrimitiveType::Float)
+                return llvm::ConstantFP::get(llvm::Type::getFloatTy(llvm_),
+                                             static_cast<float>(v));
+            return llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), v);
+        }
+        case sema::PrimitiveType::String:
+            // A string-literal const value is rendered with its surrounding
+            // quotes by renderConstExpr; lowerStringLiteralConst takes the inner
+            // text, so strip the delimiters when present.
+            if (text->size() >= 2 && text->front() == '"' && text->back() == '"')
+                return lowerStringLiteralConst(
+                    std::string_view(*text).substr(1, text->size() - 2), false);
+            return lowerStringLiteralConst(*text, false);
+        default:
+            // All integer primitives (§4): width comes from the const's type.
+            break;
+    }
+    // Only fold an actual integer LITERAL. §22.12 permits a const initializer to
+    // reference another const/enum, which the metadata renders BY NAME (not as a
+    // digit string); folding that as an integer would silently produce 0.
+    // Decline instead (CLAUDE.md decline-with-reasons): returning null leaves
+    // the read unlowered — a loud failure — rather than an unsound value. The
+    // repro and the common case are literal consts, which are covered.
+    const char c0 = text->empty() ? '\0' : text->front();
+    if (!((c0 >= '0' && c0 <= '9') || c0 == '+' || c0 == '-')) return nullptr;
+    llvm::Type* ty = rt && rt->kind == sema::TypeRef::Kind::Primitive
+                         ? lowerPrimitive(rt->primitive)
+                         : i32();
+    return llvm::ConstantInt::get(
+        ty, static_cast<std::uint64_t>(parseIntLiteral(*text)),
+        /*isSigned=*/true);
 }
 
 
@@ -143,10 +212,38 @@ void Emitter::declareStatics() {
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         llvm::Type* ty = fd ? lowerType(fd->type.get()) : i32();
         std::string cls = fs->parent ? std::string(fs->parent->name) : "";
+        // §2.5 / §2.6 step 4 (issue #328 FINDING [3] BUG B): a static field's
+        // storage global is part of the module's exported, externally-linkable
+        // surface — an importer references it by its mangled name. Emit it with
+        // EXTERNAL linkage so the symbol is global (not module-local `d`), so a
+        // cross-module read binds to THIS definition at link time. The
+        // definition (with its initializer) lives in the exporting module only.
         auto* gv = new llvm::GlobalVariable(
             *module_, ty, /*isConstant=*/false,
-            llvm::GlobalValue::InternalLinkage,
+            llvm::GlobalValue::ExternalLinkage,
             constInitFor(fd, ty),
+            "bz$" + cls + "$" + std::string(fs->name));
+        staticGlobals_[fs] = gv;
+    }
+
+    // §2.5 / §2.6 step 4 (issue #328 FINDING [3] BUG B): declare each IMPORTED
+    // static field as an EXTERNAL global (declaration, no initializer) bound to
+    // the dependency's exact mangled name (`bz$<Class>$<field>`, matching the
+    // exporter above), so a cross-module read LOADS from the linked definition
+    // rather than a fresh zero copy. This is the storage analogue of
+    // declareImportedFunctions for methods; like it, it engages only when
+    // imports were loaded, leaving the single-module path untouched.
+    if (!ctx_.hasImports()) return;
+    for (sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+        if (!fs || !isStaticField(fs) || staticGlobals_.count(fs)) continue;
+        sema::TypeRef* tr = ctx_.importedMemberType(fs);
+        llvm::Type* ty = tr ? lowerTypeRef(tr) : i32();
+        std::string cls = fs->parent ? std::string(fs->parent->name) : "";
+        auto* gv = new llvm::GlobalVariable(
+            *module_, ty, /*isConstant=*/false,
+            llvm::GlobalValue::ExternalLinkage,
+            /*Initializer=*/nullptr,  // external declaration: no definition here
             "bz$" + cls + "$" + std::string(fs->name));
         staticGlobals_[fs] = gv;
     }

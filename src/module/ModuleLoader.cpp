@@ -261,9 +261,15 @@ struct Loader {
                 c->name = ctx.internString(mm.name);
                 c->visibility = fromMetaVisibility(mm.visibility);
                 c->modifiers = intern(mm.modifiers);
+                c->isStatic = true;  // §22.12: a class-level const is static
                 c->parent = &parent;
                 c->scope = parent.memberScope;
                 fieldTypes_[c] = convert(mm.type);
+                // §22.12 (issue #328 FINDING [3] BUG A): carry the const's
+                // compile-time value so codegen folds it at the read site (the
+                // library emits no storage symbol for a const). Recorded only
+                // when the builder rendered a value (non-empty).
+                if (!mm.valueText.empty()) constValues_[c] = mm.valueText;
                 return c;
             }
             case MetaMemberKind::EnumConstant: {
@@ -288,6 +294,8 @@ struct Loader {
     std::unordered_map<sema::MethodSymbol*, sema::TypeRef*> returnTypes_;
     std::unordered_map<sema::MethodSymbol*, bool> returnOwned_;
     std::unordered_map<const sema::MemberSymbol*, sema::TypeRef*> fieldTypes_;
+    // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
+    std::unordered_map<const sema::MemberSymbol*, std::string> constValues_;
 };
 
 }  // namespace
@@ -339,6 +347,10 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
         ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);
     for (auto& [m, ty] : loader.fieldTypes_)
         ctx.setImportedMemberType(m, ty);
+    // §22.12 (issue #328 FINDING [3] BUG A): publish imported const values so
+    // codegen can fold an imported `const` read without a storage symbol.
+    for (auto& [m, val] : loader.constValues_)
+        ctx.setImportedConstValue(m, val);
 
     return true;
 }

@@ -47,7 +47,16 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // optional record codes, new trailing fields read via skip) do NOT require a
 // bump. A bump is reserved for changes that would make an old reader
 // MISINTERPRET an existing field.
-inline constexpr std::uint32_t kSchemaVersion = 1;
+//
+// v2 (issue #328 FINDING [3] BUG A): MetaMember carries `valueText`, the
+// compile-time-constant value of a class-level `const` (§22.12), so a
+// cross-module importer folds the value at the read site. It is emitted as a
+// trailing REC_STRING in the MEMBER_BLOCK; a v2 reader reads it tolerantly
+// (absent → empty), so a v2 reader still reads a v1 blob. The bump exists
+// because a hypothetical v1 reader given a v2 blob would not expect the trailing
+// record — but a v1 reader rejects a v2 blob anyway (version > its
+// kSchemaVersion), per the read-older / skip-unknown rule.
+inline constexpr std::uint32_t kSchemaVersion = 2;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
@@ -185,6 +194,15 @@ struct MetaMember {
     std::vector<std::string> modifiers; // "static","abstract","virtual",
                                         // "override","sealed","async","readonly"
     MetaType type;                    // field/property/const type; method return
+
+    // Const (§22.12): the member's compile-time-constant value, textual. A
+    // class-level `const` initializer "must be a compile-time-constant
+    // expression" (spec §22.12), so a cross-module importer can FOLD this value
+    // at every read site without referring to any storage symbol — the library
+    // emits no global for a const (issue #328 FINDING [3] BUG A). Empty for
+    // non-const members and for a const whose initializer renderConstExpr could
+    // not render (the importer then falls back to no value, as before the fix).
+    std::string valueText;            // §22.12 const value, textual
 
     // Method / Constructor / Indexer:
     std::vector<MetaGenericParam> genericParams; // §14 (methods only)

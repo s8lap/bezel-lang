@@ -227,6 +227,19 @@ public:
         return it == importedMemberTypes_.end() ? nullptr : it->second;
     }
 
+    // §22.12 (issue #328 FINDING [3] BUG A): an imported class-level `const` has
+    // no storage symbol in the library — a const initializer is a compile-time
+    // constant expression, so the library emits no global. The loader records
+    // the const's textual value here, keyed by the imported ConstMemberSymbol;
+    // codegen folds it at the cross-module read site. Absent → no folded value.
+    void setImportedConstValue(const Symbol* m, std::string_view text) {
+        importedConstValues_[m] = std::string(text);
+    }
+    const std::string* importedConstValue(const Symbol* m) const {
+        auto it = importedConstValues_.find(m);
+        return it == importedConstValues_.end() ? nullptr : &it->second;
+    }
+
 private:
     DiagnosticEngine& diagnostics_;
     std::vector<std::unique_ptr<Symbol>> symbols_;
@@ -248,6 +261,8 @@ private:
     std::unordered_map<const Symbol*, TypeRef*> importedReturnTypes_;
     std::unordered_set<const Symbol*> importedReturnOwned_;
     std::unordered_map<const Symbol*, TypeRef*> importedMemberTypes_;
+    // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
+    std::unordered_map<const Symbol*, std::string> importedConstValues_;
     ModuleSymbol* module_ = nullptr;
     // Scope IDs are assigned in DFS order. `kModuleScope` (=1) is the
     // initial module scope; everything nested gets a fresh ID > 1.

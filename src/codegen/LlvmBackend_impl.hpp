@@ -1187,6 +1187,14 @@ private:
     // value (a compile-time constant). Covers bare `X` and `Type.X`.
     llvm::Value* constMemberValue(const ast::Expr& e);
 
+    // §22.12 (issue #328 FINDING [3] BUG A): fold an IMPORTED const's value at
+    // the read site. An imported const has no AST decl and no storage symbol —
+    // a const initializer is a compile-time constant (§22.12), so the value was
+    // carried textually in the dependency metadata and is materialized here as
+    // an LLVM constant of the const's type. Null if no value was recorded.
+    llvm::Value* importedConstValue(const ast::Expr& e,
+                                    sema::ConstMemberSymbol* cs);
+
     void declareStatics();
 
     // The constant initializer for a static field, or zero if absent or

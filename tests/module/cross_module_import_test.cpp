@@ -286,4 +286,97 @@ BEZEL_TEST(cross_module_import, a_imports_b_native_build_spec_2_6) {
     BEZEL_EXPECT_EQ(code, 42);
 }
 
+// §2.5 / §2.6 + §22.12 (issue #328 FINDING [3] BUG A): a DIRECT read of an
+// imported static `const` must observe the library's value. A §22.12 const
+// initializer "must be a compile-time-constant expression", so the library
+// emits NO storage symbol for it; the importer FOLDS the value (carried in the
+// dependency metadata) at the read site. Before the fix this returned
+// non-deterministic garbage (an uninitialized read); after, it returns 7.
+BEZEL_TEST(cross_module_import, imported_const_read_spec_22_12) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_inc3_const_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module ConstLib; "
+        "public class Lib "
+        "  public static const K: int := 7; "
+        "end Lib;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import ConstLib; "
+        "public class Program "
+        "  public static method Main(): int => Lib.K; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 7);
+}
+
+// §2.5 / §2.6 + §22.12 (issue #328 FINDING [3] BUG B): a DIRECT read of an
+// imported static FIELD must observe the EXPORTER's value. The exporter emits
+// the field's storage as an EXTERNAL global (mangled `bz$<Class>$<field>`); the
+// importer references it as an external (no fresh definition), so the read loads
+// the linked definition. Before the fix this returned 0 (the importer bound to a
+// fresh zero-initialized local copy); after, it returns the field's initial 99.
+BEZEL_TEST(cross_module_import, imported_static_field_read_spec_22_12) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_inc3_field_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    // §22.12: a class-level `static` field with an initializer. The static
+    // initializer runs in the EXPORTING module (the importer references only the
+    // storage symbol), so the initialized value crosses the boundary.
+    writeSource(aSrc.path,
+        "module FieldLib; "
+        "public class Lib "
+        "  public static Counter: int := 99; "
+        "end Lib;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import FieldLib; "
+        "public class Program "
+        "  public static method Main(): int => Lib.Counter; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 99);
+}
+
 }  // namespace bezel::module
