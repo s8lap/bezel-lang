@@ -216,8 +216,13 @@ void expectValueAndNoCorruption(const std::string& source, int expectedExitCode)
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
     if (std::system(linkCmd.c_str()) != 0) { cleanup(); return; }
+    // exitcode=99: a DISTINCT ASan failure code so a UAF/double-free can never
+    // be confused with the program legitimately returning expectedExitCode
+    // (ASan's default error exitcode is 1, masking a UAF in any test that
+    // expects 1). No test expects 99.
     std::string runCmd =
-        "ASAN_OPTIONS=detect_leaks=0 " + exe + " > /dev/null 2>&1";
+        "ASAN_OPTIONS=detect_leaks=0:exitcode=99:abort_on_error=0 " + exe +
+        " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
     if (status == -1) return;
