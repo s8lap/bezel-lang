@@ -225,6 +225,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_test.cpp
     codegen/generic_mono_test.cpp
     codegen/generic_return_inference_test.cpp
+    codegen/generic_collection_return_test.cpp
     codegen/collection_test.cpp
     codegen/record_key_test.cpp
     codegen/collection_keys_test.cpp

@@ -206,6 +206,32 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             }
         }
     }
+    // issue #420: fall back on the lowered VALUE's LLVM type when the sema
+    // argument type did not drive a string conversion above. Some spec-valid
+    // primitive-typed argument expressions are not annotated with a Primitive
+    // sema TypeRef — notably the built-in heap-collection `Count`/`Length`
+    // property read (stdlib §4.4), which sema leaves untyped but codegen
+    // lowers to a runtime bz_array_len/bz_dict_count `int` (`a.Count` in
+    // `Console.WriteLine(a.Count)`). Without this, `strPtr` stayed the raw i32
+    // and emitConsoleWrite GEP'd it as a `bz_string*`, producing IR the X86
+    // backend cannot select ("Cannot emit physreg copy instruction"). Mirror
+    // the string-interpolation fallback (emitWithFormatSpec): convert an
+    // integer/float value to its decimal string. A pointer-typed value is
+    // already a string object and is left as-is.
+    if (strPtr == arg && arg->getType() && !arg->getType()->isPointerTy()) {
+        if (arg->getType()->isDoubleTy() || arg->getType()->isFloatTy()) {
+            strPtr = emitPrimitiveToString(arg, sema::PrimitiveType::Double);
+        } else if (arg->getType()->isIntegerTy(1)) {
+            strPtr = emitPrimitiveToString(arg, sema::PrimitiveType::Bool);
+        } else if (arg->getType()->isIntegerTy()) {
+            // Widen to i64 so the %lld snprintf path receives the full value
+            // (matches the interpolation path's sign-extension to i64).
+            llvm::Value* iv = arg->getType()->isIntegerTy(64)
+                ? arg
+                : builder_.CreateSExt(arg, i64());
+            strPtr = emitPrimitiveToString(iv, sema::PrimitiveType::Long);
+        }
+    }
     if (!strPtr) return false;
     emitConsoleWrite(strPtr, isWriteLine, stdfd);
     return true;

@@ -236,18 +236,32 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
         case sema::TypeRef::Kind::Primitive:
             return lowerPrimitive(rt->primitive);
         case sema::TypeRef::Kind::Named:
-            // CG-generic: a Named type with null declaration is a generic
+            // CG-generic: a Named type with null declaration may be a generic
             // type parameter (e.g. T in Box<T>). If there's an active
-            // substitution, resolve via the param's name in the ast::Type.
-            if (!rt->declaration && !genericSubst_.empty()) {
-                if (rt->astNode && rt->astNode->name &&
-                    rt->astNode->name->parts.size() == 1) {
-                    auto sit = genericSubst_.find(
-                        rt->astNode->name->parts[0]);
-                    if (sit != genericSubst_.end())
-                        return sit->second;
-                }
-                return i32();  // unresolved generic param → i32 fallback
+            // substitution and the single-part name is a bound parameter,
+            // resolve to its concrete type.
+            //
+            // issue #420: only RETURN here when the name actually resolves to a
+            // bound parameter — fall through otherwise so the builtin / FFI /
+            // declaration checks below run. Previously this returned i32() for
+            // ANY no-declaration Named type while a substitution was active,
+            // which clobbered the heap-collection (Array<T>/OwnedArray<T>/…),
+            // dictionary, and FFI (IntPtr/CString/…) lowerings to i32 inside a
+            // monomorphized generic body. For a generic method returning
+            // `owned Array<T>` (§14.1, lowered by emitGenericSpecialization),
+            // the specialized function was then typed to return i32; the bare
+            // bz_array_t* pointer was truncated to 32 bits on the return and
+            // re-extended on the caller-side store, so the §28.3 using-var
+            // scope-end disposal loaded a corrupt pointer and crashed in
+            // bz_array_free. A bare unresolved type parameter (`T` with no
+            // substitution) still reaches the value-kind i32 fallback at the
+            // end of this switch, so that behavior is unchanged.
+            if (!rt->declaration && !genericSubst_.empty() &&
+                rt->astNode && rt->astNode->name &&
+                rt->astNode->name->parts.size() == 1) {
+                auto sit = genericSubst_.find(rt->astNode->name->parts[0]);
+                if (sit != genericSubst_.end())
+                    return sit->second;
             }
             // §32.5 / §32.7 / stdlib §10: FFI-boundary types. IntPtr and
             // UIntPtr are pointer-sized integers — on the host target that is
