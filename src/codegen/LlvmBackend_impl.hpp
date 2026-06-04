@@ -1369,6 +1369,26 @@ private:
     // runtime objects carry a vtable with a Dispose at slot 1)?
     bool collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx = 0);
 
+    // issue #400 / §25.2: find a user-declared `Equals` override on a CLASS type
+    // (walking the base-class chain). `Object.Equals` is a compiler intrinsic
+    // with no MethodSymbol in user members, so the absence of a result means the
+    // type keeps the §8.3 reference-identity default. Returns null for a class
+    // that does not override `Equals`. The match is by name + single parameter
+    // (the `Equals(Object?)` shape), the only `Equals` the spec lets a class
+    // declare (§8.4: classes customize equality by overriding `Equals`).
+    sema::MethodSymbol* classEqualsOverride(const sema::TypeSymbol* cls);
+
+    // issue #400 / §25.2: compute the equality `Array<T>`/`OwnedArray<T>`'s
+    // .Remove(item) uses to match `el` against `target`, dispatched
+    // by the element's static Bezel type `elemTy`. A class with a user `Equals`
+    // override → a (null-guarded) virtual `el.Equals(target)` call (§8.4); a
+    // class without one → reference identity (§8.3); a record → structural
+    // equality (§8.3, emitStructEquality); a string → content (§4.6); a value
+    // type → `==`. `el` and `target` are both pure borrows (no consumption).
+    llvm::Value* emitRemoveElementEquality(llvm::Value* el, llvm::Value* target,
+                                           const sema::TypeRef* elemTy,
+                                           bool elemIsClass);
+
     // §28.4 step 3: chain to the base class's Dispose. baseTypes[0] is
     // conventionally the base class when it resolves to one.
     void emitBaseDisposeChain(const sema::TypeSymbol* ts);

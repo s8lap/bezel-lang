@@ -159,6 +159,7 @@ set(BEZEL_TEST_SOURCES
     codegen/console_write_leak_test.cpp
     codegen/owned_field_disposal_test.cpp
     codegen/owned_collection_disposal_test.cpp
+    codegen/remove_equals_test.cpp
     codegen/inherited_fields_test.cpp
     codegen/ctor_chaining_test.cpp
     codegen/virtual_dispatch_test.cpp
