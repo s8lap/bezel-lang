@@ -70,8 +70,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // the conversion sema admitted so the slot receives the value, not
             // the source type's raw bits (issue #408). No-op when the rhs type
             // already matches or no §5.1 numeric widening applies.
+            // issue #421 / #410: thread the RHS signedness so an unsigned source
+            // (`d := someUint` with `d: double`) widens via UIToFP/ZExt, not the
+            // signed default — otherwise a large uint would store as negative.
             if (elemTy)
-                rhs = coerceNumericToType(rhs, elemTy);
+                rhs = coerceNumericToType(rhs, elemTy,
+                                          isUnsignedTargetExpr(*as->value));
             // CG-nullable: if target slot is a nullable-prim struct and
             // rhs is a plain primitive, wrap it (or fix null literal).
             if (elemTy && llvm::isa<llvm::StructType>(elemTy)) {

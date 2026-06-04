@@ -729,8 +729,12 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 
 bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       const std::vector<ast::CallArgument>& args,
-                      std::vector<llvm::Value*>& out) {
+                      std::vector<llvm::Value*>& out,
+                      std::vector<const ast::Expr*>* outExprs) {
     std::vector<llvm::Value*> ordered(params.size(), nullptr);
+    // issue #421 / #410: parallel source expression per parameter position, so
+    // the caller can recover each argument's signedness for numeric widening.
+    std::vector<const ast::Expr*> orderedExprs(params.size(), nullptr);
     std::size_t pos = 0;
     for (const auto& a : args) {
         if (!a.value) return false;
@@ -789,6 +793,7 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             v = boxForTarget(v, formalTy, a.value.get());
         }
         ordered[idx] = v;
+        orderedExprs[idx] = a.value.get();
     }
     // §22.5: a default-value expression may reference an EARLIER parameter
     // (e.g. `M(a, b := a + 1)`). At the call site the earlier parameters are
@@ -834,8 +839,12 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             ordered[j] = lowerExpr(*dv);
             paramSlots_ = std::move(savedParams);
             if (!ordered[j]) return false;
+            // A defaulted parameter has no call-site argument expression;
+            // record the default's own expression so its signedness is honored.
+            orderedExprs[j] = dv;
         }
         out.push_back(ordered[j]);
+        if (outExprs) outExprs->push_back(orderedExprs[j]);
     }
     return true;
 }

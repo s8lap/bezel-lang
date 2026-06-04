@@ -1590,6 +1590,41 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // issue #421/#420 (stdlib §4.4/§4.10/§4.11): the built-in heap
+        // collections (Array/Stack/Queue/Set/LinkedList/Dictionary and their
+        // Owned variants) carry no user TypeSymbol — their TypeRef is a Named
+        // ref with a null `declaration`. The ordinary member-lookup path below
+        // never types a PROPERTY read on them, so `a.Count` (no parens) was
+        // left untyped and codegen had to infer `int` from the lowered LLVM
+        // value (#420's tryLowerConsoleCall workaround). Type these built-in
+        // collection properties directly: `Count` is `int` for every collection
+        // (ICollection<T>.Count, stdlib §4.3); `Capacity` is `int` for the two
+        // array types that declare it (Array<T>/OwnedArray<T>, stdlib §4.4).
+        if (ma.target && (ma.member == "Count" || ma.member == "Capacity")) {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isBuiltinColl =
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty();
+                std::string_view cn = isBuiltinColl
+                    ? std::string_view(tt->astNode->name->parts[0])
+                    : std::string_view();
+                bool hasCount =
+                    cn == "Array" || cn == "OwnedArray" ||
+                    cn == "Stack" || cn == "OwnedStack" ||
+                    cn == "Queue" || cn == "OwnedQueue" ||
+                    cn == "Set" || cn == "OwnedSet" ||
+                    cn == "LinkedList" || cn == "OwnedLinkedList" ||
+                    cn == "Dictionary" || cn == "OwnedDictionary";
+                bool hasCapacity = cn == "Array" || cn == "OwnedArray";
+                bool ok = ma.member == "Count" ? hasCount : hasCapacity;
+                if (ok) {
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+            }
+        }
         // CG27a (§4.6): handle known intrinsic string members directly —
         // string has no user TypeSymbol in the symbol table.
         if (ma.target) {

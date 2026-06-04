@@ -235,3 +235,70 @@ BEZEL_TEST(sema_member, member_on_local_resolves) {
         BEZEL_EXPECT_TRUE(dynamic_cast<FieldSymbol*>(sym) != nullptr);
     }
 }
+
+// ---------------------------------------------------------------------------
+// issue #421/#420 (stdlib §4.3/§4.4): a PROPERTY read of `Count`/`Capacity` on
+// a built-in heap collection is typed `int`. These collections carry no user
+// TypeSymbol, so before the fix the property read had no attached Primitive
+// type and codegen had to infer `int` from the lowered LLVM value (#420's
+// workaround). The access is an expression-bodied method's body, so
+// firstMemberAccess returns the `a.Count` / `a.Capacity` MemberAccessExpr.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(sema_member, array_count_property_typed_int_4_3) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method GetCount(a: Array<int>): int => a.Count; "
+        "end C;");
+    auto* ma = firstMemberAccess(r);
+    BEZEL_EXPECT_TRUE(ma != nullptr);
+    if (ma) {
+        auto* t = r.ctx->exprType(*ma);
+        BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int);
+    }
+}
+
+BEZEL_TEST(sema_member, array_capacity_property_typed_int_4_4) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method GetCap(a: Array<int>): int => a.Capacity; "
+        "end C;");
+    auto* ma = firstMemberAccess(r);
+    BEZEL_EXPECT_TRUE(ma != nullptr);
+    if (ma) {
+        auto* t = r.ctx->exprType(*ma);
+        BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int);
+    }
+}
+
+// stdlib §4.10/§4.11: Count is typed int on the other built-in collections too
+// (Stack/Queue/Set/LinkedList and Dictionary). Capacity is NOT a member of
+// these (only Array<T>/OwnedArray<T> declare it), so this guards only Count.
+BEZEL_TEST(sema_member, stack_count_property_typed_int_4_10) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method GetCount(s: Stack<int>): int => s.Count; "
+        "end C;");
+    auto* ma = firstMemberAccess(r);
+    BEZEL_EXPECT_TRUE(ma != nullptr);
+    if (ma) {
+        auto* t = r.ctx->exprType(*ma);
+        BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int);
+    }
+}
+
+BEZEL_TEST(sema_member, dictionary_count_property_typed_int_4_8) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method GetCount(d: Dictionary<int, int>): int => d.Count; "
+        "end C;");
+    auto* ma = firstMemberAccess(r);
+    BEZEL_EXPECT_TRUE(ma != nullptr);
+    if (ma) {
+        auto* t = r.ctx->exprType(*ma);
+        BEZEL_EXPECT_TRUE(t && t->primitive == PrimitiveType::Int);
+    }
+}

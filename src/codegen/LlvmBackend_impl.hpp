@@ -64,6 +64,20 @@ inline std::int64_t parseIntLiteral(std::string_view text) {
         digits.push_back(c);
     }
     if (digits.empty()) return 0;
+    // §4.2 / A.1: the trailing IntSuffix (`U`, `UL`, `LU`, case-insensitive)
+    // marks an unsigned literal. A `ulong` value above long.MaxValue (e.g.
+    // 18000000000000000000uL) overflows signed strtoll, which saturates to
+    // long.MaxValue and loses the value. Parse such literals with the unsigned
+    // strtoull so the full 64-bit value is preserved; the caller stores the
+    // returned bit pattern into an i64 LLVM constant (issue #421).
+    bool isUnsigned = false;
+    for (std::size_t s = i; s < text.size(); ++s) {
+        char c = text[s];
+        if (c == 'u' || c == 'U') { isUnsigned = true; break; }
+    }
+    if (isUnsigned)
+        return static_cast<std::int64_t>(
+            std::strtoull(digits.c_str(), nullptr, base));
     return static_cast<std::int64_t>(std::strtoll(digits.c_str(), nullptr, base));
 }
 
@@ -1989,10 +2003,14 @@ private:
     // §22.4/§22.7: lower the call arguments into parameter order, honoring
     // named arguments and default values. Provided arguments are evaluated
     // in source order; defaults afterward in parameter order. Appends to
-    // `out`; returns false if an argument can't be placed.
+    // `out`; returns false if an argument can't be placed. When `outExprs` is
+    // non-null, appends the source expression for each emitted argument in the
+    // same order (a defaulted parameter contributes nullptr) — used to recover
+    // each argument's signedness for numeric widening (issue #421 / #410).
     bool buildOrderedArgs(const std::vector<ast::Param>& params,
                           const std::vector<ast::CallArgument>& args,
-                          std::vector<llvm::Value*>& out);
+                          std::vector<llvm::Value*>& out,
+                          std::vector<const ast::Expr*>* outExprs = nullptr);
 
     // CG29 (§9): build a record value from positional arguments — used by
     // `new Record(a, b, …)` (the spec construction form, §9.5). Positional
@@ -2206,9 +2224,15 @@ private:
     // (no concrete function) since the slot is filled by the runtime class.
     // A `base.M()` call (baseQualified) bypasses dispatch (§12.3), as do
     // non-virtual non-interface methods.
+    // `argExprs`, when non-null, holds the source expression for each entry of
+    // `args` (index-aligned, including a nullptr receiver slot for instance
+    // methods) — used to recover each argument's signedness so an unsigned
+    // source widens via UIToFP/ZExt at the parameter boundary (issue #421/#410).
     llvm::Value* emitMethodCall(sema::MethodSymbol* ms,
                                 std::vector<llvm::Value*>& args,
-                                bool baseQualified);
+                                bool baseQualified,
+                                const std::vector<const ast::Expr*>* argExprs
+                                    = nullptr);
 
     // CG-generic: compile a specialized version of a block-body method with
     // the current genericSubst_ applied to all types.  The specialized

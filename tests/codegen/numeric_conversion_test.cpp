@@ -283,3 +283,56 @@ BEZEL_TEST(codegen_numeric_conv, positive_int_init_double_field_value) {
         "  return int(p.d * 10.0); "  // 50
         "end Main; end C;"), 50);
 }
+
+// ===========================================================================
+// §5.1 — unsigned-source widening at the remaining store sites (issue #421,
+// deferred from #410). The field-initializer site already threaded source
+// signedness; #421 extends the same to the LOCAL declaration, plain
+// ASSIGNMENT, and method-ARGUMENT binding sites. Before #421 each used the
+// signed-default 2-arg coerceNumericToType wrapper, so a high-bit-set uint
+// widened via SIToFP/SExt — reading negative instead of its true magnitude.
+//
+// A uint of 3_000_000_000 (> int.MaxValue) widened to a double:
+//   * UIToFP (correct): +3e9   * SIToFP (old bug): ≈ −1.29e9
+// ===========================================================================
+
+// Local declaration site (LlvmBackend_Setup): `var d: double := someUint`.
+BEZEL_TEST(codegen_numeric_conv, uint_init_double_local_uitofp_421) {
+    BEZEL_EXPECT_EQ(run(
+        "var u: uint := 3000000000u; var d: double := u; "
+        "return (1 if d > 2000000000.0 else 0);"), 1);  // +3e9 > 2e9 → 1
+}
+
+// Local declaration site, widen uint → long (ZExt, not SExt).
+BEZEL_TEST(codegen_numeric_conv, uint_init_long_local_zext_421) {
+    BEZEL_EXPECT_EQ(run(
+        "var u: uint := 3000000000u; var n: long := u; "
+        "return (1 if n > 2000000000L else 0);"), 1);  // +3e9 > 2e9 → 1
+}
+
+// Plain assignment site (LlvmBackend_Stmts): `d := someUint`.
+BEZEL_TEST(codegen_numeric_conv, uint_assigned_to_double_local_uitofp_421) {
+    BEZEL_EXPECT_EQ(run(
+        "var u: uint := 3000000000u; var d := 0.0; d := u; "
+        "return (1 if d > 2000000000.0 else 0);"), 1);  // +3e9 > 2e9 → 1
+}
+
+// Method-argument binding site (LlvmBackend_Calls): a uint argument bound to a
+// double parameter widens via UIToFP. Use(u) returns u; positive +3e9 > 2e9.
+BEZEL_TEST(codegen_numeric_conv, uint_arg_to_double_param_uitofp_421) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; class C "
+        "public static method Use(x: double): double => x; "
+        "public static method Main(): int "
+        "  var u: uint := 3000000000u; var r := Use(u); "
+        "  return (1 if r > 2000000000.0 else 0); "  // +3e9 > 2e9 → 1
+        "end Main; end C;"), 1);
+}
+
+// Regression at the new sites: a SIGNED negative source must still sign-extend
+// (the unsigned refinement must not flip a signed value).
+BEZEL_TEST(codegen_numeric_conv, negative_int_assigned_to_double_local_sitofp_421) {
+    BEZEL_EXPECT_EQ(run(
+        "var n: int := -7; var d := 0.0; d := n; "
+        "return (1 if d < 0.0 else 0);"), 1);  // −7.0 < 0 → 1
+}
