@@ -20,14 +20,27 @@ namespace bezel::test {
 // Single result of running the lex+parse pipeline on a source string. The
 // diagnostic engine is held by value so the test can inspect it after the
 // parser is gone.
+//
+// The AST's identifier/literal fields are `std::string_view`s into the lexed
+// source buffer (see ast::Node.hpp), so that buffer must outlive `sourceFile`.
+// Callers commonly pass a temporary `std::string` (e.g. concatenated test
+// fixtures) to `parseAll`, whose lifetime ends at the end of the call
+// expression — leaving every view dangling. To avoid that heap-use-after-free
+// (issue #419), `ParseResult` owns the source: `parseAll` copies the caller's
+// source into `source` and lexes against that owned copy. The copy lives in a
+// `unique_ptr<std::string>` so its heap address is stable across the
+// return-by-value (and any later move) of `ParseResult`, keeping every view
+// valid for as long as the AST it points into.
 struct ParseResult {
+    std::unique_ptr<std::string> source;
     std::unique_ptr<ast::SourceFile> sourceFile;
     DiagnosticEngine diagnostics;
 };
 
 inline ParseResult parseAll(std::string_view source) {
     ParseResult result;
-    Lexer lexer(source, result.diagnostics);
+    result.source = std::make_unique<std::string>(source);
+    Lexer lexer(*result.source, result.diagnostics);
     Parser parser(lexer, result.diagnostics);
     result.sourceFile = parser.parseCompilationUnit();
     return result;
