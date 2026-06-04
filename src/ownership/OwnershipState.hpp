@@ -52,6 +52,27 @@ struct LocalOwnership {
     const ast::Node* obligationOrigin = nullptr;
     // True for `using var` — discharge is implicit at scope exit.
     bool implicitDischarge = false;
+
+    // Async-readiness 3c: SuspendLocal annotation (§30.5 / §30.9). True when
+    // this owned local's live range crosses at least one `await` suspend
+    // point in an async method — i.e. it is still live when the method
+    // suspends. A suspend-local must be stored in the state-machine frame and
+    // disposed on EVERY completion path: normal return, fault/exception,
+    // abandonment, and cancellation (§30.5 task lifecycle; §30.9 fault). The
+    // model deliberately keeps this as a flag on LocalOwnership rather than a
+    // new OwnershipState lattice value: the disposal obligations of a
+    // suspend-local are identical to an ordinary owned local's (the lattice is
+    // unchanged), and the "disposed on every completion path" property is
+    // modelled by the synthetic completion edges (CFGBlock::completionSuccs)
+    // that give the abandonment/cancellation exits the same frame-disposal
+    // treatment as the §28.3 exception-path discharge. This flag is the
+    // recorded classification the future async-codegen milestone consumes to
+    // decide which locals live in the heap-allocated frame vs the activation
+    // record; for the ownership pass it is informational (the diagnostics flow
+    // from the unchanged lattice + the synthetic/exception completion edges).
+    // An activation-local (live range does NOT cross an await) leaves this
+    // false and behaves exactly as a synchronous owned local. // per §30.5
+    bool suspendLocal = false;
 };
 
 // Spelled state for diagnostics + tests.

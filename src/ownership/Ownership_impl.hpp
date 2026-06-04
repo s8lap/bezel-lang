@@ -58,12 +58,23 @@ public:
     // ParameterSymbols — `owned` params are introduced as Owned locals
     // at method entry per §28.8 and must reach a discharge point on
     // every normal-exit path (same rule as `var x := producer-of-owned;`).
+    //
+    // Async-readiness 3c: `isAsync` is true when the enclosing method/lambda
+    // is declared `async`. It gates the additive at-await-site Pattern A / B
+    // checks (§30.5) and the across-suspend SuspendLocal annotation — all of
+    // which fire ONLY on async bodies, so a non-async body's diagnostics are
+    // byte-for-byte unchanged. // per §30.5, §30.1
     void run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
-             const std::vector<sema::Symbol*>* paramSyms = nullptr);
+             const std::vector<sema::Symbol*>* paramSyms = nullptr,
+             bool isAsync = false);
 
 private:
     sema::SemaContext& ctx_;
     std::unordered_map<sema::Symbol*, LocalOwnership> states_;
+    // Async-readiness 3c: true while analysing an `async` method/lambda body.
+    // Gates the at-await-site Pattern A/B checks and the SuspendLocal
+    // annotation so they never affect a synchronous body. // per §30.5
+    bool isAsync_ = false;
     // Issue #392 / §31.1: the set of catch-bound exception variables in this
     // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
     // the in-flight exception whose lifetime is the arm body: it may be passed
@@ -469,6 +480,114 @@ private:
     // receiver type means it never mis-fires on a user method of the same name
     // (those go through the precise declaration-based path). // per §28.8
     bool builtinOwnedSinkArg(const ast::Expr* callee, std::size_t argPos);
+
+    // -- Async-readiness 3c: at-await-site Pattern A / B enforcement -----------
+    //
+    // §30.5 "Consumer-side rules". For `await <task>` the obligations are fixed
+    // by the task's STATIC return type, which 3b's await typing makes readable:
+    // the await UnaryExpr's operand carries the resolved `Task`/`Task<T>`/
+    // `OwnedTask<T>` TypeRef. These checks run as a single syntactic walk over
+    // the async body (driven from `run()`), independent of the CFG dataflow, so
+    // each await is examined once and no diagnostic is duplicated. They are
+    // gated on `isAsync_`, so a synchronous body never reaches them. // per §30.5
+
+    enum class AwaitTaskKind {
+        NotTask,    // operand not a Task-family type (e.g. async-iterator await,
+                    //   or an untyped operand) — no site rule applies here
+        UnitTask,   // `await Task` — no result value, no ownership obligation
+        PatternA,   // `await Task<T>` for CLASS T — borrow; needs owning location
+        PatternB,   // `await OwnedTask<T>` for class T — ownership transfers;
+                    //   needs an owned-consuming context
+        ValueResult,// `await Task<T>` for non-class T — no obligation crosses
+    };
+
+    // Classify the await by its operand's resolved task type (§30.3 / §30.5).
+    AwaitTaskKind awaitTaskKind(const ast::UnaryExpr& await) const;
+
+    // §30.5 Pattern A: true when `taskExpr` (the await's operand) occupies a
+    // syntactically-visible OWNING location whose lifetime bounds the borrowed
+    // result — a reference to a `using var`/`await using var`-bound local of
+    // `Task<T>`, an `owned` parameter, an `owned` field of `this`, an
+    // owning-collection indexer slot, or a borrowing-iteration variable. The
+    // list mirrors §30.5's admitted positions; anything else (a bare producer
+    // call, an arbitrary expression) is NOT an owning location. // per §30.5
+    bool awaitOperandIsOwningLocation(const ast::Expr& taskExpr);
+
+    // Drive the at-await-site checks over the body. For each statement, decide
+    // which awaits sit in an owned-consuming context (Pattern B) — passed via
+    // `consumingAwaits` collected by `collectOwnedConsumingAwaits` — then walk
+    // every await in the statement and diagnose: a Pattern A await whose
+    // operand is not an owning location, and a Pattern B await not in an
+    // owned-consuming context. // per §30.5
+    void checkAwaitSites(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void checkAwaitSitesStmt(
+        const ast::Stmt& s,
+        const std::unordered_set<const ast::UnaryExpr*>& consumingAwaits);
+    void checkAwaitSitesExpr(
+        const ast::Expr& e,
+        const std::unordered_set<const ast::UnaryExpr*>& consumingAwaits);
+
+    // §30.5 owned-consuming contexts: collect into `out` every `await`
+    // UnaryExpr that appears as the IMMEDIATE value of an owned-consuming
+    // position — a LocalDecl `:= await` RHS (using/plain/await-using var), an
+    // assignment-to-owned-location `target := await` RHS, an `owned` argument
+    // `M(await)` / `coll.Add(await)`, an `owned`/`OwnedTask` `return await`,
+    // and an owned `yield return await`. A Pattern B await NOT in this set is
+    // dropped without discharge and is diagnosed. // per §30.5
+    void collectOwnedConsumingAwaits(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::unordered_set<const ast::UnaryExpr*>& out);
+    void collectOwnedConsumingAwaitsStmt(
+        const ast::Stmt& s, std::unordered_set<const ast::UnaryExpr*>& out);
+    // §30.5: record awaits passed as `owned` arguments (a call's `owned`
+    // formal, or a built-in owning-collection owned-sink method) — those are
+    // owned-consuming positions. Recurses into the expression. // per §30.5
+    void collectOwnedConsumingInExpr(
+        const ast::Expr& e, std::unordered_set<const ast::UnaryExpr*>& out);
+
+    // The await UnaryExpr at the root of `e` when `e` is exactly `await X`
+    // (the immediate-value form an owned-consuming position admits), else null.
+    static const ast::UnaryExpr* awaitRoot(const ast::Expr& e);
+
+    // -- Async-readiness 3c: SuspendLocal annotation + completion edges --------
+    //
+    // §30.5 / §30.9. Classify each owned local as suspend-local (live range
+    // crosses an await) vs activation-local, recording the result on its
+    // LocalOwnership.suspendLocal. Adds synthetic completion edges from each
+    // await-bearing CFG block to the exit so the abandonment/cancellation
+    // exits give a suspend-local the same frame-disposal treatment as the
+    // §28.3 exception-path discharge. See the rationale block in Ownership.cpp.
+    // // per §30.5, §30.9, §30.8
+    void annotateSuspendLocals(const flow::CFG& cfg);
+    void addCompletionEdges(flow::CFG& cfg);
+
+    // Async-readiness 3c: the set of LocalDecls whose owned local is a
+    // suspend-local candidate (declared at/before an await in CFG order; the
+    // conservative over-approximation `annotateSuspendLocals` computes). Read
+    // by handleLocalDecl to set LocalOwnership.suspendLocal when the local is
+    // created. Empty for a synchronous body (annotateSuspendLocals is not
+    // called) and for an async body with no await. // per §30.5
+    std::unordered_set<const ast::Node*> suspendLocalDecls_;
+
+    // Async-readiness 3c (§30.5 line ~6068): the set of `await` UnaryExprs that
+    // appear directly as the value of a `return` statement. A Pattern A
+    // `return await Producer()` is an explicitly-admitted owning position even
+    // though `Producer()` is a bare call — the producer's task is owned by the
+    // enclosing state machine and the borrow flows into the outer Pattern A
+    // task's result slot. Populated by collectOwnedConsumingAwaitsStmt's
+    // ReturnStmt branch (alongside the owned-consuming set) and consulted by
+    // the Pattern A site check. // per §30.5
+    std::unordered_set<const ast::UnaryExpr*> returnPositionAwaits_;
+
+    // Async-readiness 3c (§30.5 line ~6110): the Pattern B await is
+    // owned-consuming WITH RESPECT TO ITS OPERAND — awaiting an owned task
+    // local consumes that local. When the await's operand is a bare owned
+    // task local, mark it consumed (Disposed) so a straight-line SECOND await
+    // of the same bound local is a read-after-consume (the statically-
+    // detectable slice of the §30.4 single-consumer rule). Called from the
+    // discharge/decl transfer functions on each await operand. // per §30.5
+    void recordAwaitOperandConsume(const ast::Expr& awaitOperand,
+                                   SourceLocation loc);
 };
 
 } // namespace bezel::ownership
