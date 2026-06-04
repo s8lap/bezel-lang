@@ -1878,3 +1878,70 @@ extern "C" void bz_closure_release(void* c) {
     free(env);
     free(c);
 }
+
+// ---------------------------------------------------------------------------
+// Boxed value-type reference counting (§8.6 / §28.9, issue #422 boxes
+// increment).
+//
+// When a VALUE type (record/enum/primitive/nullable value) is used where
+// `Object` (or an interface it implements) is expected, codegen BOXES it
+// (§8.6): a heap wrapper holds the value. Per §28.9 boxed value types are
+// RUNTIME-MANAGED — "exempt from manual disposal," their memory reclaimed
+// automatically. Codegen lowers each box to a cell laid out as
+//   { void* vtable (off 0), int64_t rc (off 8), value-bytes (off 16) }.
+// The vtable word at offset 0 is the boxable type's box vtable (its first slot
+// is the type descriptor, so `is`/`as`/interface dispatch recognize the box
+// uniformly with a class instance). The rc sits at the FIXED offset 8 — between
+// the vtable word and the payload — so ONE runtime offset serves EVERY box no
+// matter the boxed value's size; codegen's payload accessors advance past TWO
+// words (offset 16). boxValue initializes rc to 1 (the producer's reference).
+//
+// LEAF with respect to ownership. The boxed value is a VALUE type
+// (record/enum/primitive/nullable value): it owns no heap sub-objects that need
+// disposing (records/enums/primitives are leaves; a record's only reference
+// fields are runtime-managed, §9.7). So release frees ONLY the box wrapper —
+// like a string. Acyclic reference counting is therefore sound.
+//
+// SAFETY — never handed a class instance. A class instance coerced to `Object`
+// (the #399 reference path) keeps its bare pointer: boxValue is NOT invoked, no
+// box wrapper exists, and codegen never marks such a local box-release-eligible
+// (its initializer has a REFERENCE static type, not a boxable value type). So
+// bz_box_release is only ever called on a genuine box cell. It does NOT inspect
+// the vtable or attempt to tell a box from a class instance at runtime — the
+// box-vs-class distinction is resolved at the codegen producer site (the static
+// type of the initializer), exactly as bz_string_release / bz_closure_release
+// are only emitted for locals codegen knows hold a producer's +1 reference. A
+// class instance's bytes ({ vtable, i8 disposed-flag@1, fields }) are therefore
+// never read as an rc and never freed here.
+//
+// The count is a plain (non-atomic) int64 today; this becomes an atomic
+// fetch-add/sub when async (boxes shared across threads) lands.
+//
+// null is a no-op for both (a null T? boxes to a null Object reference, §8.6).
+
+// Byte offset of the rc field inside the box cell (after the vtable word).
+static const int64_t BZ_BOX_RC_OFFSET = 8;
+
+extern "C" void bz_box_retain(void* b) {
+    if (!b) return;
+    int64_t rc;
+    memcpy(&rc, (uint8_t*)b + BZ_BOX_RC_OFFSET, sizeof(int64_t));
+    rc += 1;
+    memcpy((uint8_t*)b + BZ_BOX_RC_OFFSET, &rc, sizeof(int64_t));
+}
+
+extern "C" void bz_box_release(void* b) {
+    if (!b) return;
+    int64_t rc;
+    memcpy(&rc, (uint8_t*)b + BZ_BOX_RC_OFFSET, sizeof(int64_t));
+    rc -= 1;
+    if (rc > 0) {
+        memcpy((uint8_t*)b + BZ_BOX_RC_OFFSET, &rc, sizeof(int64_t));
+        return;
+    }
+    // Last reference gone: free the box wrapper. The boxed value is a value type
+    // (a leaf — no owned sub-objects), so nothing else is freed; the single
+    // calloc'd cell is released exactly once. The box was proven non-escaping by
+    // codegen, so no other reference exists — no UAF, no double-free.
+    free(b);
+}
