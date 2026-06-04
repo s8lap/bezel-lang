@@ -295,6 +295,11 @@ private:
 
     void checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms);
 
+    // §2.2 / §2.5 / §2.6 step 3 (issue #328 inc 3): type-check a call to an
+    // IMPORTED method (no ast::MethodDecl) against its reconstructed
+    // ParameterSymbol signature — argument count + per-argument assignability.
+    void checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms);
+
     // §22.5 argument-to-parameter binding. Maps a call's argument list
     // (positional, then named) onto a parameter list:
     //   - positional arguments fill parameters in order;

@@ -45,6 +45,33 @@ void Resolver::run(const ast::SourceFile& src) {
             }
         }
     }
+    // §2.2 imports (issue #328 inc 3): make the public names of each imported
+    // module visible in this file. For every `import X;` whose module X was
+    // loaded into the context (a dependency artifact the driver passed), expose
+    // X's exported top-level types by simple name in module scope, so a
+    // reference to one resolves to the imported TypeSymbol. A local declaration
+    // of the same name takes precedence (it was inserted above); imports never
+    // shadow a local type (§2.2: imports make names *visible*, locals win).
+    // Only engaged when imports were actually loaded — the no-import path is
+    // byte-for-byte unchanged.
+    if (ctx_.hasImports()) {
+        for (const auto& imp : src.imports) {
+            if (!imp || !imp->name) continue;
+            std::string dotted;
+            for (std::size_t i = 0; i < imp->name->parts.size(); ++i) {
+                if (i != 0) dotted += '.';
+                dotted += std::string(imp->name->parts[i]);
+            }
+            const std::vector<TypeSymbol*>* exported =
+                ctx_.importedTypesOf(dotted);
+            if (!exported) continue;
+            for (TypeSymbol* t : *exported) {
+                if (t->name.empty()) continue;
+                // Local declarations win (do not overwrite an existing entry).
+                moduleScope.names.emplace(t->name, t);
+            }
+        }
+    }
     for (const auto& decl : src.topDecls) {
         if (!decl) continue;
         resolveTopDecl(*decl, &moduleScope);

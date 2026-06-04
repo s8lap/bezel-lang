@@ -16,7 +16,17 @@ constexpr const char* kVersion =
     "bezelc 0.0.0 (scaffold; no compilation implemented yet)";
 
 void printUsage(std::ostream& out) {
-    out << "usage: bezelc [--version] [--help] [-o <output>] <source-file>\n";
+    out << "usage: bezelc [--version] [--help] [-c] [-o <output>] "
+           "[--import <artifact>]... <source-file>\n"
+           "  -c                 compile to a native object (a library, §2.4) "
+           "with embedded\n"
+           "                     interface metadata; do not link, no `Main` "
+           "required\n"
+           "  --import <artifact> a dependency artifact (object/exe) whose "
+           "`.bezel.meta`\n"
+           "                     is loaded for `import` resolution (§2.5); its "
+           "object is\n"
+           "                     also linked into the executable\n";
 }
 
 // Default executable name from the source path: drop the directory and the
@@ -44,6 +54,12 @@ int main(int argc, char** argv) {
 
     std::string inputPath;
     std::string outputPath;
+    // §2.4 / §2.5 (issue #328 inc 3): `-c` emits a library object; `--import`
+    // names a dependency artifact whose interface is loaded and whose object is
+    // linked. A dependency's metadata and object live in the same artifact, so
+    // one path fills both Dependency fields.
+    bool compileObjectOnly = false;
+    std::vector<bezel::Dependency> deps;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "--version") {
@@ -60,6 +76,22 @@ int main(int argc, char** argv) {
                 return 2;
             }
             outputPath = args[++i];
+            continue;
+        }
+        if (arg == "-c") {
+            compileObjectOnly = true;
+            continue;
+        }
+        if (arg == "--import") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "bezelc: error: --import requires an argument\n";
+                return 2;
+            }
+            const std::string artifact = args[++i];
+            bezel::Dependency dep;
+            dep.metadataPath = artifact;
+            dep.objectPath = artifact;
+            deps.push_back(std::move(dep));
             continue;
         }
         if (!arg.empty() && arg.front() == '-') {
@@ -82,6 +114,8 @@ int main(int argc, char** argv) {
 
     bezel::Driver driver;
     const bezel::CompileResult result =
-        driver.compileFile(inputPath, outputPath);
+        compileObjectOnly
+            ? driver.compileObject(inputPath, outputPath, deps)
+            : driver.compileFile(inputPath, outputPath, deps);
     return result.success ? 0 : 1;
 }

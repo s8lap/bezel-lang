@@ -418,6 +418,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             auto* unit = ctx_.makeTypeRef();
             unit->kind = TypeRef::Kind::Unit;
             ctx_.setExprType(&ce, unit);
+        } else if (!md && ctx_.isImported(ms)) {
+            // §2.2 / §2.5 (issue #328 inc 3): an imported method has no
+            // ast::MethodDecl; its resolved return type was stashed by the
+            // loader keyed on the symbol. Use it so the call expression types
+            // correctly against the imported signature.
+            if (TypeRef* rt = ctx_.importedReturnType(ms))
+                ctx_.setExprType(&ce, rt);
         }
     } else if (auto* xd = dynamic_cast<ExternDeclSymbol*>(calleeSym)) {
         // §32: a call to an extern method takes its declared return type.
@@ -698,6 +705,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
 
 void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    // §2.2 / §2.5 (issue #328 inc 3): an imported method has no ast::MethodDecl;
+    // type-check the call against the imported signature (§2.6 step 3) using the
+    // reconstructed ParameterSymbol list. Only the single-overload, all-positional
+    // case is checked here (cross-module overload selection is deferred); a named
+    // or modifier argument is left to the deferred path rather than misreported.
+    if (!md && ctx_.isImported(ms)) {
+        checkImportedCallArity(ce, ms);
+        return;
+    }
     if (!md || !ms->parent) return;
     // §22.5 named-argument binding is now performed by checkArgsAgainstParams,
     // so a named-arg call is checked here too (no bail).
@@ -712,6 +728,37 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
                            std::string("call to `") +
                            std::string(ms->name) + "`");
+}
+
+// §2.2 / §2.5 / §2.6 step 3 (issue #328 inc 3): type-check a call to an imported
+// method against its reconstructed signature. The imported method carries no
+// ast::Param list; its parameters are ParameterSymbols whose resolved types ride
+// `resolvedDeclType`. Checks the all-positional, single-overload case: argument
+// count (§22.5) and per-argument assignability (§5.1). A named/modifier argument
+// is conservatively skipped (cross-module overload + by-ref binding deferred).
+void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
+    for (const auto& a : ce.args)
+        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return;
+    const std::size_t nparams = ms->params.size();
+    const std::string desc =
+        std::string("call to `") + std::string(ms->name) + "`";
+    if (ce.args.size() != nparams) {
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            desc + " supplies " + std::to_string(ce.args.size()) +
+                " argument(s) but the parameter list has " +
+                std::to_string(nparams) + " (§22.5)");
+        return;
+    }
+    for (std::size_t j = 0; j < nparams; ++j) {
+        auto* p = dynamic_cast<ParameterSymbol*>(ms->params[j]);
+        if (!p || !p->resolvedDeclType) continue;
+        const ast::CallArgument& a = ce.args[j];
+        if (!a.value) continue;
+        checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
+                        a.value->span.begin,
+                        desc + ": argument " + std::to_string(j + 1));
+    }
 }
 
 // §22.5 argument-to-parameter binding. See header for the contract.
@@ -1901,6 +1948,21 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     }
     ctx_.setExprSymbol(&ma, member);
+    // §2.2 / §2.5 (issue #328 inc 3): an imported field/const member has no
+    // ast::FieldDecl/ConstDecl, so its resolved type rides the loader's
+    // symbol-keyed side table. Attach it for `obj.Field` access typing.
+    if (ctx_.isImported(member)) {
+        if (dynamic_cast<FieldSymbol*>(member) ||
+            dynamic_cast<ConstMemberSymbol*>(member)) {
+            if (TypeRef* rt = ctx_.importedMemberType(member))
+                ctx_.setExprType(&ma,
+                    substituteMemberType(rt, ma.target.get(),
+                                         dynamic_cast<MemberSymbol*>(member)
+                                             ? dynamic_cast<MemberSymbol*>(member)->parent
+                                             : nullptr));
+        }
+        return;
+    }
     // Attach the member's type for field / property access. Methods
     // and constructors are deferred to the call-resolution slice.
     if (auto* fs = dynamic_cast<FieldSymbol*>(member)) {
