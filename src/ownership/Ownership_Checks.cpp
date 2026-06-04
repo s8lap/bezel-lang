@@ -1152,9 +1152,9 @@ void MethodOwnership::checkCatchBorrowEscapesOnReturn(const ast::Expr& e) {
         "value and return that, or re-raise with `throw;`)");
 }
 
-void MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
-    if (as.op != ":=") return;
-    if (!as.target || !as.value) return;
+bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
+    if (as.op != ":=") return false;
+    if (!as.target || !as.value) return false;
 
     // Identify the kind of escaping destination, and the diagnostic flavour.
     // Two destinations outlive a method-scope local:
@@ -1181,7 +1181,27 @@ void MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
                 dest = Dest::OutParam;
         }
     }
-    if (dest == Dest::None) return;
+    if (dest == Dest::None) return false;
+
+    // §28.3 / §28.8 (issue #402): a BARE read of an owned LOCAL stored into an
+    // OWNED field is a move-on-read into an owned slot ("Reading an owned local
+    // x in a position that requires an owned value … transfers ownership out of
+    // x"), NOT a borrow store. This is the one case where checkBorrowStoreEscape
+    // would otherwise wrongly flag a legal owned-field transfer (the RHS aliases
+    // the owned local that is itself being moved). Restrict the skip to a bare
+    // identifier directly resolving to an Owned-state tracked local: a re-borrow
+    // alias (`var b := r; f.x := b;`) is Borrowed-state — still a borrow store,
+    // still flagged below — and a catch-bound exception borrow is not in
+    // `states_` at all, so the §31.1 store-into-owned-field diagnosis is
+    // untouched. handleOwnedFieldAssignment records the move for the legal
+    // transfer. // per §28.3, §28.8
+    if (dest == Dest::Field && targetIsOwnedField(*as.target)) {
+        if (const auto* rid =
+                dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
+            if (const LocalOwnership* rst = lookupState(rid->name))
+                if (rst->state == OwnershipState::Owned) return false;
+        }
+    }
 
     // The RHS must borrow an owned scope-bound LOCAL (the value that dies at
     // this scope's end). recordMovesIn has already run in handleAssignment, so
@@ -1189,7 +1209,7 @@ void MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     // as a live borrow source — `box.f := move r;` / `o := move r;` transfers,
     // it does not store a borrow.
     sema::Symbol* src = ownedLocalBorrowSource(*as.value);
-    if (!src) return;
+    if (!src) return false;
 
     // §31.1 (issue #392): the borrow source is a catch-bound exception
     // variable. A caught exception's lifetime is the catch arm body; storing
@@ -1221,7 +1241,7 @@ void MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
                 "(§31.1; copy the data you need out of it into an owned value "
                 "instead)");
         }
-        return;
+        return true;
     }
 
     if (dest == Dest::Field) {
@@ -1246,6 +1266,7 @@ void MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
             "with `move` for an `out owned` parameter, or return/keep the "
             "source in a longer-lived scope)");
     }
+    return true;
 }
 
 const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
@@ -1594,6 +1615,68 @@ bool MethodOwnership::checkOwnedArgSource(const ast::Expr& argValue,
         "borrow is owned elsewhere (§28.8 — transfer an owned value with "
         "`move`, `new`, or a call returning `owned T`)");
     return true;
+}
+
+// §28.3 / §28.5 / §28.8 (issue #402): is the assignment target an `owned`
+// field? `exprIsOwnedFieldRead` recognizes both `this.f` / `obj.f` (a
+// MemberAccessExpr whose symbol is an `owned` FieldSymbol) and a bare implicit-
+// `this` owned-field identifier. A property setter is not a FieldSymbol, so a
+// property target is correctly excluded — only true storage fields can be
+// `owned` (§28.5). // per §28.3, §28.5
+bool MethodOwnership::targetIsOwnedField(const ast::Expr& target) const {
+    return exprIsOwnedFieldRead(target);
+}
+
+// §28.3 / §28.5 / §28.8 (issue #402): an owned-field assignment. See the header
+// for the full contract.
+void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
+                                                 bool borrowAlreadyFlagged) {
+    if (!as.value) return;
+    // The RHS must be an OWNED value (§28.3 producers). `ownedArgSourceIsBorrow`
+    // is the same borrow classifier the owned-parameter / owned-sink checks
+    // (#395 / #398) use: it returns true for a bare borrow parameter, a
+    // Borrowed-state local, and a bare (un-`move`d) owned-field read — every
+    // borrow form a class-typed RHS can take. A borrow stored into the owned
+    // field would be double-disposed (the field's owner AND the borrow's real
+    // owner both dispose it). #386's checkBorrowStoreEscape already diagnoses
+    // the *owned-scope-bound-local* borrow store into any field; skip those so
+    // the same store is not reported twice. // per §28.3, §28.5, §28.8
+    if (ownedArgSourceIsBorrow(*as.value)) {
+        if (!borrowAlreadyFlagged) {
+            report(
+                Severity::Error, as.value->span.begin,
+                "a borrow cannot be stored into an `owned` field: the field's "
+                "owner disposes the value when the object is disposed, but a "
+                "borrow is owned elsewhere and its real owner disposes it too — "
+                "a double-free (§28.3 / §28.5 / §28.8 — store an owned value "
+                "with `new`, `move`, an owned-returning call, or a consumed "
+                "`owned` parameter)");
+        }
+        return;
+    }
+    // The RHS is a legal owned value — record the ownership transfer INTO the
+    // field. `move x` / `move obj.f` / `f(owned z)` / `new T(owned z)` side-
+    // effects were already recorded by recordMovesIn in handleAssignment; here
+    // only the BARE-identifier case remains (`this.f := x;`, no explicit
+    // `move`), which §28.3 treats as a move-on-read because the field is an
+    // owned slot ("Reading an owned local x in a position that requires an
+    // owned value … transfers ownership out of x"). // per §28.3, §28.8
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(as.value.get());
+    if (!id) return;
+    auto* st = lookupState(id->name);
+    if (!st) return;
+    if (st->state != OwnershipState::Owned) return;
+    // A bare owned-PARAMETER read discharges the parameter (the §28.8
+    // `_resource := resource;` ownership-transfer pattern: the caller
+    // relinquished ownership and the field now holds it). A bare owned-LOCAL
+    // read moves out of the local, leaving it moved-from (markMovedByName also
+    // correctly rejects moving out of a `using var`, which is scope-bound).
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        markDisposedByName(id->name, id->span.begin);
+    } else {
+        markMovedByName(id->name, id->span.begin);
+    }
 }
 
 } // namespace bezel::ownership

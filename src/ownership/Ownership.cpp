@@ -677,8 +677,23 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // into a field of an object, or writing it through an out/ref parameter,
     // lets the borrow outlive the local (use-after-dispose). Run AFTER
     // recordMovesIn so a `move`d source is no longer Owned and the transfer
-    // form is correctly not flagged.
-    checkBorrowStoreEscape(as);
+    // form is correctly not flagged. checkBorrowStoreEscape itself skips the
+    // legal bare-owned-LOCAL transfer into an OWNED field (a move-on-read per
+    // §28.3, not a borrow store); it still catches catch-bound-exception borrows
+    // (§31.1) and re-borrows of owned locals stored into any field. Its result
+    // feeds the #402 owned-field check below so the same store is not reported
+    // by both. // per §28.3, §31.1
+    bool flagged386 = checkBorrowStoreEscape(as);
+    // §28.3 / §28.5 / §28.8 (issue #402): an `owned` FIELD is an owned storage
+    // location and may only receive an OWNED value. A BORROW RHS is the
+    // double-free hazard (the field's owner and the borrow's real owner both
+    // dispose the value); a legal OWNED RHS records the ownership transfer INTO
+    // the field (move-out of a bare owned local, discharge of a consumed owned
+    // parameter). Runs after checkBorrowStoreEscape so #386's owned-local-borrow
+    // and §31.1 catch-borrow diagnoses are not duplicated. // per §28.3, §28.5
+    if (targetIsOwnedField(*as.target)) {
+        handleOwnedFieldAssignment(as, flagged386);
+    }
     // §28.11 (#395): an owning-collection `set(owned)` indexer assignment
     // `coll[i] := value` requires `value` to be owned — "Indexer set
     // `coll[i] := value` requires `value` to be owned." A borrow handed to the
