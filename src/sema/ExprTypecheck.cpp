@@ -191,6 +191,38 @@ bool ExprTC::returnsValue(const ast::Type* rt) {
     return true;
 }
 
+// async-readiness 3b (§30.1): map an `async` method's declared return type to
+// the return-FORM context and the result-assignability type used inside its
+// body. The task wrapper is peeled: `Task` is a void-method context (no
+// result), `Task<T>` / `OwnedTask<T>` are value-method contexts whose result
+// type is the element T. Anything else (no return type, a non-async type, or
+// an async-iterator interface) is left as a void context — the dedicated async
+// return-type diagnostic (§30.1, in TypeResolution) already names a non-async
+// return type, and an async-iterator method is exempt from the value-return
+// check via the `isIteratorMethod` path.
+void ExprTC::asyncReturnCtxAndType(const ast::Type* rt, ReturnCtx& outCtx,
+                                   TypeRef*& outType) {
+    outCtx = ReturnCtx::VoidMethod;
+    outType = nullptr;
+    if (!rt) return;
+    TypeRef* r = ctx_.resolvedType(*rt);
+    if (!r || r->kind != TypeRef::Kind::Named || !r->astNode ||
+        !r->astNode->name || r->astNode->name->parts.size() != 1) {
+        return;
+    }
+    std::string_view head = r->astNode->name->parts.front();
+    if (head == "Task" && r->genericArgs.empty()) {
+        // `Task` — no result value; void-method form rules.
+        return;
+    }
+    if ((head == "Task" || head == "OwnedTask") && !r->genericArgs.empty()) {
+        // `Task<T>` / `OwnedTask<T>` — value-method form rules; the body
+        // returns the element type T.
+        outCtx = ReturnCtx::ValueMethod;
+        outType = r->genericArgs.front();
+    }
+}
+
 // Slice S21 (§21.7) return-statement form rules:
 //  - constructor / destructor: `return expression;` is an error.
 //  - value-returning method: bare `return;` is an error.
@@ -669,10 +701,38 @@ void ExprTC::visitMember(const ast::Member& m) {
         inStaticMember_ = isStatic;
         ReturnCtx saveRet = returnCtx_;
         TypeRef* saveRetTy = currentReturnType_;
-        returnCtx_ = returnsValue(md->returnType.get())
-            ? ReturnCtx::ValueMethod : ReturnCtx::VoidMethod;
-        currentReturnType_ = md->returnType
-            ? ctx_.resolvedType(*md->returnType) : nullptr;
+        // async-readiness 3b (§30.2): an `async` method body is an async
+        // context, where `await` is valid.
+        bool saveAsync = inAsyncContext_;
+        inAsyncContext_ = false;
+        for (auto mod : md->modifiers) {
+            if (mod == "async") { inAsyncContext_ = true; break; }
+        }
+        // async-readiness 3b (§30.1): an async method's return-FORM rules and
+        // the type a `return EXPR;` is checked against are driven by the
+        // task's *result* type, not the task wrapper itself:
+        //   async ...: Task          -> behaves like a void method — bare
+        //                               `return;` is allowed, and falling off
+        //                               the end is `return;`; `return EXPR;`
+        //                               is rejected (the task has no result).
+        //   async ...: Task<T> /
+        //              OwnedTask<T>  -> behaves like a value method — must
+        //                               `return EXPR;` on every path, with
+        //                               EXPR assignable to the element type T.
+        //   async ...: IAsyncEnumerable<T> / ... (async iterator) -> an
+        //                               iterator method (it uses `yield`);
+        //                               exempt from the value-return check
+        //                               via `isIteratorMethod` below, exactly
+        //                               like a synchronous iterator (§29.3).
+        if (inAsyncContext_) {
+            asyncReturnCtxAndType(md->returnType.get(), returnCtx_,
+                                  currentReturnType_);
+        } else {
+            returnCtx_ = returnsValue(md->returnType.get())
+                ? ReturnCtx::ValueMethod : ReturnCtx::VoidMethod;
+            currentReturnType_ = md->returnType
+                ? ctx_.resolvedType(*md->returnType) : nullptr;
+        }
         runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));
         // Slice DR1 (§21.7): a value-returning method with a block
         // body must return (or otherwise abruptly exit) on every
@@ -691,6 +751,7 @@ void ExprTC::visitMember(const ast::Member& m) {
         }
         currentReturnType_ = saveRetTy;
         returnCtx_ = saveRet;
+        inAsyncContext_ = saveAsync;
         inStaticMember_ = save;
     } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts =

@@ -732,8 +732,63 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         if (ot) ctx_.setExprType(&ue, ot);
         return;
     }
-    // `await` — result-type rule is deeper (Task<T> -> T); not typed
-    // here.
+    // `await` — async-readiness 3b (§30.2 / §30.3 / §30.5).
+    if (op == "await") {
+        // §30.2 / Appendix C.6: `await` is valid only inside an `async`
+        // method, an `async` lambda, or the synchronous prefix of `await for`
+        // (the latter is itself only reachable inside an async context). A
+        // static field initializer / static constructor is never async, so an
+        // `await` there is caught by this same gate.
+        if (!inAsyncContext_) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                "`await` is valid only inside an `async` method or `async` "
+                "lambda (§30.2)");
+            // Fall through and still produce the result type so downstream
+            // typing of the awaited value doesn't cascade unrelated errors.
+        }
+        // Result type (§30.3 / §30.5):
+        //   await Task          -> unit  (no result value)
+        //   await Task<T>       -> T     (Pattern A: a borrow the task owns;
+        //                                  the borrow/ownership at the await
+        //                                  site is the ownership pass's job —
+        //                                  3b produces the element type T)
+        //   await OwnedTask<T>  -> T     (Pattern B: ownership transfers; the
+        //                                  result type is the element type T;
+        //                                  `owned`-ness is tracked by the
+        //                                  ownership pass, not by TypeRef)
+        // Awaiting any other task shape (async-iterator MoveNextAsync, etc.)
+        // is typed elsewhere — see the deferral note below.
+        TypeRef* ot = ue.operand ? ctx_.exprType(*ue.operand) : nullptr;
+        if (ot && ot->kind == TypeRef::Kind::Named && !ot->nullable &&
+            ot->astNode && ot->astNode->name &&
+            ot->astNode->name->parts.size() == 1) {
+            std::string_view head = ot->astNode->name->parts.front();
+            if (head == "Task") {
+                if (ot->genericArgs.empty()) {
+                    // `await Task` → unit (no result value).
+                    auto* unit = ctx_.makeTypeRef();
+                    unit->kind = TypeRef::Kind::Unit;
+                    ctx_.setExprType(&ue, unit);
+                } else if (ot->genericArgs.front()) {
+                    // `await Task<T>` → T (Pattern A; element type).
+                    ctx_.setExprType(&ue, ot->genericArgs.front());
+                }
+            } else if (head == "OwnedTask" && !ot->genericArgs.empty() &&
+                       ot->genericArgs.front()) {
+                // `await OwnedTask<T>` → T (Pattern B; element type).
+                ctx_.setExprType(&ue, ot->genericArgs.front());
+            }
+            // NOTE (deferred, §30.7): the result typing specific to async
+            // iteration — `await for` desugaring's `MoveNextAsync()` / the
+            // owned-yield `GetOwnedAsyncEnumerator` path — is deeper than this
+            // increment (it depends on the for-loop iteration-variable typing
+            // and the IAsyncEnumerator<T> interface members) and is left to
+            // the async-iterator typing milestone. 3b scopes the await result
+            // rule to the Task / Task<T> / OwnedTask<T> forms above.
+        }
+        return;
+    }
 }
 
 void ExprTC::visitChildren(const ast::Expr& e) {
@@ -878,6 +933,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         TypeRef* saveRetTy = currentReturnType_;
         int saveLoop = loopDepth_;
         int saveCatch = catchDepth_;
+        // async-readiness 3b (§30.2 / §30.6): the lambda is its own async
+        // boundary — `await` inside it is valid iff the lambda is `async`,
+        // regardless of the enclosing method's async-ness.
+        bool saveAsync = inAsyncContext_;
+        inAsyncContext_ = lam->isAsync;
         currentScope_ = &lamScope;
         returnCtx_ = ReturnCtx::None;
         currentReturnType_ = nullptr;
@@ -888,6 +948,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         currentScope_ = saveScope;
         returnCtx_ = saveRet;
         currentReturnType_ = saveRetTy;
+        inAsyncContext_ = saveAsync;
         loopDepth_ = saveLoop;
         catchDepth_ = saveCatch;
         // §A.7: set the lambda's exprType to a Function TypeRef so
