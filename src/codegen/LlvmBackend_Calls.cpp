@@ -1562,6 +1562,34 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* c = builder_.CreateCall(fn, {recv});
             return builder_.CreateTrunc(c, i32());
         }
+        // §4.8 / §4.9: .Clear() — empty the table in place (it stays allocated;
+        // Count is 0 afterward). The value-disposal obligation mirrors the
+        // scope-end Dispose exactly (bz_dict_free in LlvmBackend_Setup.cpp):
+        //   * OwnedDictionary<K, class>  → dispose+free every surviving value via
+        //     its own vtable (owningDictValueDisposer): "Clear(); // disposes
+        //     every value" (§4.9). Each value is disposed EXACTLY ONCE — a value
+        //     displaced earlier by the indexer setter (#388) was already removed
+        //     and disposed, so it is not in the table here (no double-free).
+        //   * borrowing Dictionary<K, record> → free each value's heap box
+        //     (dictValueBoxFreer; the box is value-storage, nothing to dispose
+        //     inside — §4.8 Dictionary borrows, it does not own values).
+        //   * everything else (scalar/string value, borrowing class value) → no
+        //     value disposal (a borrowing Dictionary owns nothing; §4.8). The
+        //     runtime always frees each key's byte copy regardless.
+        // bz_dict_clear handles BOTH the string-key and generic-key tables (it
+        // frees e.key — a strndup'd copy in string mode, a malloc'd byte copy in
+        // generic mode — for every live entry).
+        if (m == "Clear" && call.args.empty()) {
+            llvm::Function* disp = owningDictValueDisposer(recvTy);
+            if (!disp) disp = dictValueBoxFreer(recvTy);
+            llvm::Value* dispV = disp
+                ? llvm::cast<llvm::Value>(disp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_dict_clear", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, dispV});
+            return llvm::ConstantInt::get(i32(), 0);  // unit result
+        }
         // .ContainsKey(k) / .Contains(k) (alias, §4.8): bool
         if ((m == "ContainsKey" || m == "Contains") &&
             call.args.size() == 1 && call.args[0].value) {
