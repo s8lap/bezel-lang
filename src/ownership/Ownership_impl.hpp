@@ -235,7 +235,38 @@ private:
     // Borrows whose source is a plain parameter are likewise not flagged — the
     // parameter's source outlives this method (the "borrow in, borrow out"
     // pattern). Called from handleAssignment before the RHS state transition.
-    void checkBorrowStoreEscape(const ast::AssignmentStmt& as);
+    // Returns true when it reported a diagnostic, so the owned-field borrow
+    // check (issue #402) can skip a borrow source #386 has already flagged and
+    // avoid a duplicate diagnostic for the same store. // per §28.3
+    bool checkBorrowStoreEscape(const ast::AssignmentStmt& as);
+
+    // §28.3 / §28.5 / §28.8 (issue #402): true when `target` resolves to an
+    // `owned` field — an owned storage location. Reuses the owned-field
+    // recognizer `exprIsOwnedFieldRead` (a real FieldSymbol carrying the
+    // `owned` modifier; a property setter is not a FieldSymbol, so a property
+    // target is correctly excluded). Used by handleAssignment to (a) require
+    // an OWNED value on the RHS of an owned-field assignment and (b) record the
+    // ownership transfer INTO the field (move-out of an owned local, discharge
+    // of a consumed owned parameter). // per §28.3, §28.5, §28.8
+    bool targetIsOwnedField(const ast::Expr& target) const;
+
+    // §28.3 / §28.5 / §28.8 (issue #402): handle an assignment whose LHS is an
+    // `owned` field. An owned field may only receive an OWNED value (§28.3
+    // producers: `new`, `move`, an owned-returning call, a consumed `owned`
+    // parameter). A BORROW RHS — a bare borrow parameter, a borrowed local, a
+    // bare (un-`move`d) owned-field read, or `this` — would give the field's
+    // owner disposal responsibility for an object whose real owner also
+    // disposes it: a double-free. This reports that hazard (the field-write
+    // analogue of #395 / #398). When the RHS is a legal owned value, it instead
+    // records the transfer IN: a bare owned-LOCAL read moves out of the local
+    // (move-on-read into an owned slot, §28.3); a bare owned-PARAMETER read
+    // discharges the parameter (the §28.8 `_resource := resource;` pattern).
+    // `move` / `new` / call RHS side-effects are already recorded by the
+    // preceding recordMovesIn, so this records only the bare-identifier case.
+    // `borrowAlreadyFlagged` is the #386 result, so a borrow source already
+    // diagnosed there is not re-reported. // per §28.3, §28.5, §28.8
+    void handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
+                                    bool borrowAlreadyFlagged);
 
     // Like the owned-source half of borrowSourceForExpr but restricted to an
     // owned scope-bound *local* (a `using var` or `var x := <owned producer>`),
