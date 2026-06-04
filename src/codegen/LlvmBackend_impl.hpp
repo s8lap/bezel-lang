@@ -1866,6 +1866,22 @@ private:
 
     llvm::Value* lowerCall(const ast::CallExpr& call);
 
+    // per §14.1/§14.2 + §26.5 (issue #391): bind a generic method's
+    // return-only type parameter at the call site. `declRet` is the method's
+    // *declared* return TypeRef (e.g. the bare `T`, or a constructed `Box<T>`);
+    // `resultTy` is the concrete return type sema solved from the call's target
+    // and recorded on the call's exprType (e.g. `Widget`, or `Box<Widget>`).
+    // Unifies the two structurally, adding each still-unbound parameter in
+    // `genericParams` to `subst`/`semaTy` and setting `added` when it binds
+    // anything. Used by lowerCall so `new T()` in the monomorphized body
+    // constructs the real type instead of falling to the i32 placeholder.
+    void unifyMethodReturnTypeArg(
+        const sema::TypeRef* declRet, const sema::TypeRef* resultTy,
+        const std::vector<ast::GenericParam>& genericParams,
+        std::unordered_map<std::string_view, llvm::Type*>& subst,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& semaTy,
+        bool& added);
+
     // per §24: events. `eventSourcePtr` lowers an event-access expression
     // (a bare `Clicked` implicit-`this` identifier, or `obj.Clicked` /
     // `this.Clicked` member access whose symbol is an EventSymbol) to the

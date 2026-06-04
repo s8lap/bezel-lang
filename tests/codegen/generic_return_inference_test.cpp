@@ -8,25 +8,22 @@
 // "target type" concept from §15.4 / §17.7).
 //
 // These tests run the full pipeline (parse → sema → lower → JIT) and assert
-// the facts that hold end-to-end after the sema change:
+// the facts that hold end-to-end:
 //
 //   * the no-target form is rejected at sema, so the program does not run; and
-//   * the typed-local and return forms type-check and produce a runnable image
-//     (the sema re-typing does not break lowering).
+//   * the typed-local and return forms type-check, lower, AND construct the
+//     inferred T — the inferred type's constructor runs exactly once per call.
 //
-// CODEGEN FOLLOW-UP (NOT YET LANDED). Observing the *constructor* of the
-// inferred T run — the strongest end-to-end proof that the right T is chosen —
-// is blocked on a codegen change that this milestone intentionally does not
-// make (the codegen lanes own LlvmBackend_*). Codegen monomorphizes a generic
-// method call by re-deriving its type-parameter substitution from the argument
-// types in lowerCall (LlvmBackend_Calls.cpp); a return-only parameter is bound
-// by no argument, so `genericSubst_` never receives T and `new T()` in the body
-// constructs nothing (the bare `T` lowers to the i32 fallback). To pick up a
-// return-target-inferred argument, lowerCall must derive the unbound parameter
-// from the call's target/result type (e.g. `ctx_.exprType(call)`) and prime
-// `genericSubst_` before emitting the body. The asserts below are therefore
-// scoped to what sema alone makes observable; the disabled-by-comment line in
-// `typed_local_runs` records the value the codegen follow-up must produce.
+// CODEGEN (issue #391, completed). lowerCall now consumes the return-target-
+// inferred type argument: sema re-types the call to the concrete return type
+// and records it on the call's exprType; lowerCall unifies the method's
+// *declared* return TypeRef against that concrete type to recover the unbound
+// method type parameter and primes `genericSubst_`/`genericSubstSemaTy_` before
+// emitting the body, so `new T()` constructs the real type instead of falling
+// to the i32 placeholder (LlvmBackend_Calls.cpp::unifyMethodReturnTypeArg).
+// Before this codegen change the typed-local program below SEGFAULTED at run
+// time (`new T()` constructed nothing); the constructor-observing asserts are
+// the load-bearing regression check that the right T is now chosen.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -48,41 +45,57 @@ const char* kFactory =
     "end Factory; ";
 }  // namespace
 
-// §14.1 / §15.4: a typed-local target solves the return-only T and the program
-// type-checks and lowers to a runnable image (sema's re-typing of the call to
-// the concrete `Widget` does not break codegen).
-BEZEL_TEST(generic_return_inference_391, typed_local_compiles_and_runs) {
+// §14.1 / §15.4: a typed-local target solves the return-only T, and codegen
+// constructs the inferred `Widget` — its constructor runs exactly once, so
+// `Widget._n == 1`. (LOAD-BEARING: before the lowerCall fix this program
+// SEGFAULTED, because `new T()` lowered `T` to the i32 placeholder and
+// constructed nothing.)
+BEZEL_TEST(generic_return_inference_391, typed_local_constructs_inferred_type) {
     std::string prog = std::string(kFactory) +
         "class C public static method Main(): int "
-        "  var w: Widget := Factory.Create(); "
-        "  using var ww := w; "
-        "  return 0; "
+        "  using var w: Widget := Factory.Create(); "
+        "  return Widget._n; "
         "end Main; end C;";
     auto r = runJit(prog);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
-    // CODEGEN FOLLOW-UP: once lowerCall derives T from the target, the inferred
-    // Widget constructor must run exactly once. Re-targeting this program at
-    // `return Widget._n;` should then yield 1 (it currently yields 0 because
-    // `new T()` constructs nothing — see the file header).
+    BEZEL_EXPECT_EQ(r.exitCode, 1);  // Widget's constructor ran exactly once
 }
 
-// §15.4 / §17.7: the return form supplies the enclosing return type as target;
-// the program type-checks and lowers.
-BEZEL_TEST(generic_return_inference_391, return_target_compiles_and_runs) {
+// §14.1 / §15.4: two return-target-inferred calls each construct a fresh
+// `Widget`, so the static counter reaches 2. Guards against the inferred T
+// being bound once and leaking (or never being re-derived per call).
+BEZEL_TEST(generic_return_inference_391, two_calls_construct_twice) {
+    std::string prog = std::string(kFactory) +
+        "class C public static method Main(): int "
+        "  using var a: Widget := Factory.Create(); "
+        "  using var b: Widget := Factory.Create(); "
+        "  return Widget._n; "
+        "end Main; end C;";
+    auto r = runJit(prog);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 2);  // two distinct Widgets constructed
+}
+
+// §15.4 / §17.7: the `return Factory.Create();` form supplies the enclosing
+// declared return type (`Widget`) as the target; codegen constructs the
+// inferred `Widget` in the called helper, so its constructor runs once.
+BEZEL_TEST(generic_return_inference_391, return_target_constructs_inferred_type) {
     std::string prog = std::string(kFactory) +
         "class C "
-        "  public static method GetWidget(): Widget "
+        "  public static method GetWidget(): owned Widget "
         "    return Factory.Create(); "
         "  end GetWidget; "
         "  public static method Main(): int "
         "    using var w := GetWidget(); "
-        "    return 0; "
+        "    return Widget._n; "
         "  end Main; "
         "end C;";
     auto r = runJit(prog);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);  // GetWidget's inferred Widget constructed
 }
 
 // §15.4 / §17.7 / §A.7: a `var` without annotation gives the call no target.
