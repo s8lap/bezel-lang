@@ -252,6 +252,7 @@ set(BEZEL_TEST_SOURCES
     codegen/null_narrow_member_test.cpp
 
     module/module_metadata_test.cpp
+    module/module_metadata_builder_test.cpp
 
     runtime/event_subscription_test.cpp
 
