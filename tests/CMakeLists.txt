@@ -137,6 +137,7 @@ set(BEZEL_TEST_SOURCES
     sema/flow_narrowing_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
+    flow/cfg_suspend_test.cpp
     codegen/jit_smoke_test.cpp
     codegen/int_literal_test.cpp
     codegen/int_arithmetic_test.cpp

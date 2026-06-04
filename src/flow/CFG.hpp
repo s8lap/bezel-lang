@@ -36,6 +36,20 @@
 //   - Lambda bodies + accessor bodies (F3).
 //   - `case` statement-body dispatch (F2 — once exception edges are in,
 //     the case has a similar branching shape).
+//
+// Async-readiness 3a — await suspend-site marker
+// ----------------------------------------------
+//
+// Realising the "the await is just a Suspend node decoration" note above
+// (line 24-25): this slice adds a purely ADDITIVE per-block record of the
+// `await` suspend sites within each block (`CFGBlock::awaitSites`, populated
+// via `CFG::recordAwaitSite`). Per §30, an async method "suspends and resumes
+// at each `await`"; this marks where those suspensions are so a later
+// async-ownership pass can find them. The marker mirrors the F2 exception-edge
+// machinery (`exceptionSuccs` / `addExceptionEdge` / `isExceptionEdge`): it is
+// metadata only — no edges change, no block kinds change, no existing
+// traversal is affected. The CFG is NOT yet split into await-bounded blocks
+// (that is the codegen state-machine milestone, slice 3c).
 
 #include <cstddef>
 #include <cstdint>
@@ -111,6 +125,37 @@ struct CFGBlock {
     // block (and for the function exit, where an uncaught exception unwinds
     // the whole method, so *all* in-scope owned locals are disposed).
     const ast::TryStmt* tryForDispatch = nullptr;
+
+    // Async-readiness 3a: the set of `await` suspend sites that occur within
+    // this block. Per §30, the compiler "transforms an async method's body
+    // into a state machine that suspends and resumes at each `await`" (§30
+    // intro), and §30.1/§30.2 describe the method *suspending* at each await.
+    // A suspend point is therefore a *position within a block* (an `await`
+    // is mid-expression — §17.1 makes it a unary-precedence prefix operator),
+    // not a block boundary. For slice 3a it is sufficient to record, per
+    // block, the set of await-bearing AST nodes it contains, so a later
+    // async-ownership pass can find every suspend point and slice 3c can
+    // split/annotate the block around each. This deliberately does NOT
+    // restructure the CFG into await-split blocks — that is the codegen
+    // milestone. See the file-header note: "await-for shares this CFG — the
+    // await is just a Suspend node decoration" (CFG.hpp:24-25).
+    //
+    // What is recorded as an await site:
+    //   - an explicit `await` UnaryExpr (§30.2): the UnaryExpr node whose
+    //     `op == "await"` reachable from a statement appended to this block;
+    //   - an `await using var` LocalDecl (§28.12): the implicit await of the
+    //     scope-end `DisposeAsync()` — recorded as the LocalDecl node, since
+    //     no UnaryExpr exists for the implicit await (the initializer's own
+    //     explicit awaits, if any, are recorded as their UnaryExpr nodes too);
+    //   - an `await for` ForStmt (§30.7): the implicit per-iteration await of
+    //     `MoveNextAsync()` — recorded as the ForStmt node on the loop's
+    //     header (Branch) block, which the desugaring re-evaluates each pass.
+    //
+    // Purely ADDITIVE: this field is only populated by CFG construction and
+    // only read by future async-aware code. `succs` (normal) and
+    // `exceptionSuccs` (exceptional) and every existing traversal are
+    // unchanged. Empty for every block in a body with no `await`.
+    std::unordered_set<const ast::Node*> awaitSites;
 };
 
 class CFG {
@@ -145,6 +190,22 @@ public:
     // True when the (from → to) edge was created as an exception edge.
     static bool isExceptionEdge(const CFGBlock* from, const CFGBlock* to) {
         return from->exceptionSuccs.count(to) != 0;
+    }
+
+    // Async-readiness 3a: record that the given await-bearing AST node is a
+    // suspend site located within `block` (§30). Purely additive — it adds
+    // `node` to `block->awaitSites` and touches nothing else (no edges, no
+    // block kinds). Mirrors the exception-edge machinery: just as
+    // `addExceptionEdge` tags a control transfer for a later analysis,
+    // `recordAwaitSite` tags a suspend position for the future async-ownership
+    // pass. Idempotent (set insertion); ignores a null node defensively.
+    void recordAwaitSite(CFGBlock* block, const ast::Node* node) {
+        if (node) block->awaitSites.insert(node);
+    }
+
+    // True when `block` holds at least one recorded await suspend site.
+    static bool hasAwaitSites(const CFGBlock* block) {
+        return !block->awaitSites.empty();
     }
 
 private:
