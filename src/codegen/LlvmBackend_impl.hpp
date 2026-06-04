@@ -1167,6 +1167,11 @@ private:
     // CG9: instance methods take an extra leading `this` pointer.
     void declareFunctions();
 
+    // §2.5 (issue #328 inc 3): create an EXTERNAL `llvm::Function` (declare, not
+    // define) for every imported method, so a cross-module call links against
+    // the dependency's object. Only called when ctx_.hasImports().
+    void declareImportedFunctions();
+
     // CG17: assign vtable slots for a class, base-first. Slot 0 is Dispose
     // (handled at emit time); virtual methods take slots 1+. An override
     // reuses the base method's slot (matched by name — overloaded virtuals

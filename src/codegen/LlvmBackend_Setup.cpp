@@ -335,6 +335,49 @@ void Emitter::declareFunctions() {
             "bz$" + std::string(ts->name) + "$DisposeCore", module_.get());
         disposerCoreFns_[ts] = coreFn;
     }
+
+    // §2.5 / §2.6 step 4 (issue #328 inc 3): declare each IMPORTED method as an
+    // EXTERNAL function (declare, not define) so a cross-module call resolves
+    // against the dependency's object at link time. The mangled name matches
+    // ModuleMetadataBuilder's emitter (functionName: `bz$<Class>$<method>`), so
+    // B's call to A.f binds to A's emitted symbol. Imported symbols live in the
+    // SemaContext's IMPORTED list (not `ctx_.symbols()`), so the loops above —
+    // which both declare AND emit bodies — never touched them; this is the only
+    // codegen path that engages imports, and only when imports were loaded.
+    if (ctx_.hasImports()) declareImportedFunctions();
+}
+
+// §2.5 (issue #328 inc 3): see the call site in declareFunctions(). One external
+// `llvm::Function` per imported method, registered in methodFns_ so the call
+// path (directCall) finds it. The body-emit loop iterates methodFns_ but
+// emitFunctionBody early-returns for an imported method (callableInfo fails: no
+// ast::MethodDecl), so no body is ever emitted for an external.
+void Emitter::declareImportedFunctions() {
+    for (sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+        if (!ms || methodFns_.count(ms)) continue;
+        // Reconstruct the function type from the imported signature. Static
+        // methods take no implicit receiver; instance methods take a `this`
+        // pointer as the leading parameter (matching declareFunctions above).
+        sema::TypeRef* retRef = ctx_.importedReturnType(ms);
+        llvm::Type* retTy = retRef ? lowerTypeRef(retRef)
+                                   : llvm::Type::getVoidTy(llvm_);
+        std::vector<llvm::Type*> paramTys;
+        if (!isStaticMethod(ms)) paramTys.push_back(ptrTy());
+        for (sema::Symbol* p : ms->params) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
+            sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
+            paramTys.push_back(isByRefMod(ps ? ps->modifier : std::string_view())
+                                   ? ptrTy()
+                                   : (pt ? lowerTypeRef(pt) : i32()));
+        }
+        auto* fnType = llvm::FunctionType::get(retTy, paramTys,
+                                               /*isVarArg=*/false);
+        auto* fn = llvm::Function::Create(
+            fnType, llvm::Function::ExternalLinkage, functionName(ms),
+            module_.get());
+        methodFns_[ms] = fn;
+    }
 }
 
 

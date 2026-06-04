@@ -38,6 +38,28 @@ void ExprTC::run(const ast::SourceFile& src) {
             }
         }
     }
+    // §2.2 imports (issue #328 inc 3): expose each imported module's exported
+    // top-level types by simple name, so a bare identifier naming an imported
+    // type (e.g. `Calc` in `Calc.Add(...)`) resolves to the imported TypeSymbol
+    // and the static-member-access path can find its method. Mirrors the
+    // type-resolution pass's import gating (a local declaration wins). Engaged
+    // only when dependencies were loaded — the single-module path is unchanged.
+    if (ctx_.hasImports()) {
+        for (const auto& imp : src.imports) {
+            if (!imp || !imp->name) continue;
+            std::string dotted;
+            for (std::size_t i = 0; i < imp->name->parts.size(); ++i) {
+                if (i != 0) dotted += '.';
+                dotted += std::string(imp->name->parts[i]);
+            }
+            if (const std::vector<TypeSymbol*>* exported =
+                    ctx_.importedTypesOf(dotted)) {
+                for (TypeSymbol* t : *exported)
+                    if (!t->name.empty())
+                        moduleScope_->names.emplace(t->name, t);
+            }
+        }
+    }
     for (const auto& decl : src.topDecls) {
         if (!decl) continue;
         visitTopDecl(*decl);

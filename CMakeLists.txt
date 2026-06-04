@@ -60,7 +60,10 @@ message(STATUS "Bezel: using LLVM ${LLVM_PACKAGE_VERSION} (cmake dir ${LLVM_DIR}
 # and the native target (with its codegen/asm-printer) for JIT execution and
 # eventual object emission.
 llvm_map_components_to_libnames(BEZEL_LLVM_LIBS
-    core orcjit native nativecodegen target codegen mc)
+    core orcjit native nativecodegen target codegen mc
+    # object: the cross-module import loader (§2.5, issue #328 inc 3) reads a
+    # dependency's embedded `.bezel.meta` section via the LLVM Object API.
+    object)
 # LLVM_DEFINITIONS is a space-separated flag string (e.g. -D_GNU_SOURCE …);
 # pass it as options, not as compile-definitions (which would re-prefix -D).
 separate_arguments(BEZEL_LLVM_DEFS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
@@ -114,6 +117,7 @@ add_library(bezel_core STATIC
     src/codegen/LlvmBackend_Calls.cpp
     src/module/ModuleMetadata.cpp
     src/module/ModuleMetadataBuilder.cpp
+    src/module/ModuleLoader.cpp
     src/driver/Driver.cpp)
 target_include_directories(bezel_core PUBLIC src)
 # LLVM headers as SYSTEM so their warnings don't trip our -Wall/-Werror.

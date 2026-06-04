@@ -4,12 +4,14 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 #include <cstdlib>
 
 #include "codegen/CodeGen.hpp"
 #include "codegen/LlvmBackend.hpp"
 #include "lexer/Lexer.hpp"
+#include "module/ModuleLoader.hpp"
 #include "module/ModuleMetadataBuilder.hpp"
 #include "ownership/Ownership.hpp"
 #include "ownership/OwnershipChecker.hpp"
@@ -42,12 +44,17 @@ bool readFile(const std::string& path, std::string& out) {
     return true;
 }
 
-// Link a native object into an executable using clang (the project's
-// toolchain). Returns true on success.
+// Link a native object (plus any §2.5 dependency objects) into an executable
+// using clang (the project's toolchain). Returns true on success. The
+// dependency objects supply the definitions of the imported symbols the
+// importer's object references as externals (issue #328 inc 3).
 bool linkExecutable(const std::string& objectPath,
-                    const std::string& exePath) {
+                    const std::string& exePath,
+                    const std::vector<std::string>& extraObjects = {}) {
     // Link with libc, libm, libpthread, and the Bezel runtime library.
-    std::string cmd = "clang " + objectPath + " -o " + exePath + " -lm -lpthread";
+    std::string cmd = "clang " + objectPath;
+    for (const std::string& obj : extraObjects) cmd += " " + obj;
+    cmd += " -o " + exePath + " -lm -lpthread";
 #ifdef BEZEL_RUNTIME_LIB_PATH
     // Static-link the Bezel runtime (path injected at compile time by CMake).
     cmd += " ";
@@ -61,6 +68,13 @@ bool linkExecutable(const std::string& objectPath,
 
 CompileResult Driver::compileFile(const std::string& path,
                                   const std::string& outputPath) {
+    // The no-dependency call is single-module compilation, unchanged.
+    return compileFile(path, outputPath, /*deps=*/{});
+}
+
+CompileResult Driver::compileFile(const std::string& path,
+                                  const std::string& outputPath,
+                                  const std::vector<Dependency>& deps) {
     std::string source;
     if (!readFile(path, source)) {
         std::cerr << "bezelc: error: cannot open '" << path << "'\n";
@@ -81,6 +95,22 @@ CompileResult Driver::compileFile(const std::string& path,
         // the AST via side-tables on SemaContext.
         sema::SemaContext semaCtx(diagnostics);
         sema::collectSymbols(*unit, semaCtx);
+        // §2.5 / §2.6 step 2 (issue #328 inc 3): load each dependency's
+        // public-interface metadata into the cross-module symbol table BEFORE
+        // type resolution, so the importer's `import`s and cross-module
+        // references bind (§2.2) and type-check (§2.6 step 3) against the
+        // imported signatures. Symbol collection runs first (it establishes
+        // THIS module's symbols); the loader adds imported types as a separate,
+        // import-gated set. With no dependencies this loop is a no-op and the
+        // pipeline is byte-for-byte the single-module path.
+        for (const Dependency& dep : deps) {
+            if (dep.metadataPath.empty()) continue;
+            if (!bezel::module::loadDependency(dep.metadataPath, semaCtx)) {
+                std::cerr << "bezelc: error: cannot load module metadata from '"
+                          << dep.metadataPath << "'\n";
+                return CompileResult{false, 1};
+            }
+        }
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
         // Definite-assignment runs after expression typecheck so it
@@ -128,12 +158,83 @@ CompileResult Driver::compileFile(const std::string& path,
                 std::cerr << "bezelc: codegen error: " << err << "\n";
                 return CompileResult{false, diagnostics.errorCount() + 1};
             }
-            if (!linkExecutable(objectPath, outputPath)) {
+            // §2.6 step 4: link the importer's object together with each
+            // dependency's object, so the external references the importer's
+            // object holds (issue #328 inc 3) resolve against the dependency's
+            // emitted symbols.
+            std::vector<std::string> depObjects;
+            for (const Dependency& dep : deps)
+                if (!dep.objectPath.empty())
+                    depObjects.push_back(dep.objectPath);
+            if (!linkExecutable(objectPath, outputPath, depObjects)) {
                 std::cerr << "bezelc: link error\n";
                 std::remove(objectPath.c_str());
                 return CompileResult{false, diagnostics.errorCount() + 1};
             }
             std::remove(objectPath.c_str());
+        }
+    }
+
+    for (const Diagnostic& diag : diagnostics.diagnostics()) {
+        std::cerr << path << ":" << diag.location.line << ":"
+                  << diag.location.column << ": " << diag.message << "\n";
+    }
+
+    CompileResult result;
+    result.errorCount = diagnostics.errorCount();
+    result.success = !diagnostics.hasErrors();
+    return result;
+}
+
+CompileResult Driver::compileObject(const std::string& path,
+                                    const std::string& objectPath,
+                                    const std::vector<Dependency>& deps) {
+    std::string source;
+    if (!readFile(path, source)) {
+        std::cerr << "bezelc: error: cannot open '" << path << "'\n";
+        return CompileResult{false, 1};
+    }
+
+    DiagnosticEngine diagnostics;
+    Lexer lexer(source, diagnostics);
+    Parser parser(lexer, diagnostics);
+    auto unit = parser.parseCompilationUnit();
+
+    if (unit) {
+        sema::SemaContext semaCtx(diagnostics);
+        sema::collectSymbols(*unit, semaCtx);
+        // §2.5: a library may itself import dependencies (acyclic).
+        for (const Dependency& dep : deps) {
+            if (dep.metadataPath.empty()) continue;
+            if (!bezel::module::loadDependency(dep.metadataPath, semaCtx)) {
+                std::cerr << "bezelc: error: cannot load module metadata from '"
+                          << dep.metadataPath << "'\n";
+                return CompileResult{false, 1};
+            }
+        }
+        sema::resolveTypes(*unit, semaCtx);
+        sema::typecheckExpressions(*unit, semaCtx);
+        sema::checkDefiniteAssignment(*unit, semaCtx);
+        ownership::checkOwnership(*unit, semaCtx);
+
+        TypeChecker typeChecker(diagnostics);
+        typeChecker.check(*unit);
+        OwnershipChecker ownershipChecker(diagnostics);
+        ownershipChecker.check(*unit);
+
+        // §33.6: a library has no `Main` requirement — the entry-point check is
+        // intentionally NOT run here (that is the executable path's concern).
+        if (!diagnostics.hasErrors()) {
+            llvm::LLVMContext llvmCtx;
+            auto module = codegen::emitModule(*unit, semaCtx, llvmCtx);
+            // §2.6 step 4: embed the public-interface metadata so an importer's
+            // loader can read this object's interface (issue #328 inc 1/2/3).
+            if (module) bezel::module::embedModuleMetadata(*module, semaCtx);
+            std::string err;
+            if (!module || !codegen::emitObjectFile(*module, objectPath, err)) {
+                std::cerr << "bezelc: codegen error: " << err << "\n";
+                return CompileResult{false, diagnostics.errorCount() + 1};
+            }
         }
     }
 

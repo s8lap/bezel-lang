@@ -13,7 +13,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -124,6 +127,106 @@ public:
         return it == lambdaParams_.end() ? nullptr : &it->second;
     }
 
+    // --- Cross-module imports (§2.2 / §2.5, issue #328 increment 3) ---------
+    //
+    // A dependency's `.bezel.meta` is loaded (ModuleLoader) into THIS context,
+    // reconstructing its exported public interface as TypeSymbol*/MemberSymbol*
+    // and resolved TypeRef*. Those imported symbols are owned here in a list
+    // SEPARATE from `symbols_`, so codegen — which iterates `symbols()` to
+    // declare and EMIT bodies for the local module's declarations — never
+    // tries to emit a body for an imported (externally-defined) symbol. Codegen
+    // declares imported callables as `external` on demand (see importedTypes()).
+    //
+    // The registry is keyed by §2.1 dotted module name so a file's `import X;`
+    // (§2.2) can expose exactly the named module's exported types. An imported
+    // TypeSymbol carries its normal `kind`/members so name resolution and
+    // type-checking treat it like any other type; the `imported_` set records
+    // that it is externally defined.
+
+    // Allocate-and-own an imported symbol (kept out of `symbols_`).
+    template <typename S, typename... Args>
+    S* makeImportedSymbol(Args&&... args) {
+        auto owned = std::make_unique<S>(std::forward<Args>(args)...);
+        S* raw = owned.get();
+        importedSymbols_.push_back(std::move(owned));
+        imported_.insert(raw);
+        return raw;
+    }
+
+    // Allocate-and-own a TypeRef used by an imported signature (kept out of the
+    // local `typeRefs_` lifetime concerns; same owner semantics as makeTypeRef).
+    template <typename... Args>
+    TypeRef* makeImportedTypeRef(Args&&... args) {
+        auto owned = std::make_unique<TypeRef>(std::forward<Args>(args)...);
+        TypeRef* raw = owned.get();
+        importedTypeRefs_.push_back(std::move(owned));
+        return raw;
+    }
+
+    // Register an imported, exported top-level TypeSymbol under its module's
+    // §2.1 dotted name. One module may export many types.
+    void registerImportedType(const std::string& moduleName, TypeSymbol* t) {
+        importedByModule_[moduleName].push_back(t);
+    }
+
+    // The exported types of a loaded module, or null if the module was never
+    // loaded. Used by name resolution to expose `import X;` targets.
+    const std::vector<TypeSymbol*>* importedTypesOf(
+        const std::string& moduleName) const {
+        auto it = importedByModule_.find(moduleName);
+        return it == importedByModule_.end() ? nullptr : &it->second;
+    }
+
+    // Every imported symbol (across all loaded modules), in load order. Codegen
+    // walks this to emit external declarations for imported callables.
+    std::vector<Symbol*> importedSymbols() const {
+        std::vector<Symbol*> out;
+        out.reserve(importedSymbols_.size());
+        for (const auto& s : importedSymbols_) out.push_back(s.get());
+        return out;
+    }
+
+    // True once at least one dependency module has been loaded — lets the local
+    // (non-import) path stay byte-for-byte unchanged when there are no imports.
+    bool hasImports() const { return !importedByModule_.empty(); }
+
+    // Is `s` an imported (externally-defined) symbol? Codegen consults this to
+    // emit an external declaration rather than a definition.
+    bool isImported(const Symbol* s) const {
+        return imported_.count(const_cast<Symbol*>(s)) != 0;
+    }
+
+    // Intern a string so a Symbol's string_view `name` (which does not own its
+    // bytes) can point at storage that lives for the whole compilation. Used by
+    // the loader, whose source ModuleMetadata is a transient by-value blob.
+    std::string_view internString(const std::string& s) {
+        internedStrings_.push_back(std::make_unique<std::string>(s));
+        return *internedStrings_.back();
+    }
+
+    // An imported method/field's resolved type cannot ride the ast::Type-keyed
+    // `resolvedTypes_` side table (an imported symbol has no ast::Type node), so
+    // the loader records it keyed by the symbol. Codegen / overload resolution
+    // read it via the accessors. (`returnOwned` mirrors §28 `owned T` returns.)
+    void setImportedReturnType(const Symbol* m, TypeRef* t, bool returnOwned) {
+        importedReturnTypes_[m] = t;
+        if (returnOwned) importedReturnOwned_.insert(m);
+    }
+    TypeRef* importedReturnType(const Symbol* m) const {
+        auto it = importedReturnTypes_.find(m);
+        return it == importedReturnTypes_.end() ? nullptr : it->second;
+    }
+    bool importedReturnOwned(const Symbol* m) const {
+        return importedReturnOwned_.count(m) != 0;
+    }
+    void setImportedMemberType(const Symbol* m, TypeRef* t) {
+        importedMemberTypes_[m] = t;
+    }
+    TypeRef* importedMemberType(const Symbol* m) const {
+        auto it = importedMemberTypes_.find(m);
+        return it == importedMemberTypes_.end() ? nullptr : it->second;
+    }
+
 private:
     DiagnosticEngine& diagnostics_;
     std::vector<std::unique_ptr<Symbol>> symbols_;
@@ -134,6 +237,17 @@ private:
     std::unordered_map<const ast::LambdaExpr*, std::vector<Symbol*>> lambdaParams_;
     // Cache for the common primitive TypeRefs. Key is `(p << 1) | nullable`.
     std::unordered_map<std::uint32_t, TypeRef*> primitiveCache_;
+    // §2.5 imports (issue #328 inc 3): owned imported symbols + their TypeRefs,
+    // kept separate from `symbols_`/`typeRefs_` (see the import block above),
+    // plus the module-name → exported-type registry and the imported-symbol set.
+    std::vector<std::unique_ptr<Symbol>> importedSymbols_;
+    std::vector<std::unique_ptr<TypeRef>> importedTypeRefs_;
+    std::unordered_map<std::string, std::vector<TypeSymbol*>> importedByModule_;
+    std::unordered_set<Symbol*> imported_;
+    std::vector<std::unique_ptr<std::string>> internedStrings_;
+    std::unordered_map<const Symbol*, TypeRef*> importedReturnTypes_;
+    std::unordered_set<const Symbol*> importedReturnOwned_;
+    std::unordered_map<const Symbol*, TypeRef*> importedMemberTypes_;
     ModuleSymbol* module_ = nullptr;
     // Scope IDs are assigned in DFS order. `kModuleScope` (=1) is the
     // initial module scope; everything nested gets a fresh ID > 1.
