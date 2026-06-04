@@ -390,6 +390,22 @@ void bz_string_retain(void* s);
 void bz_string_release(void* s);
 
 // ---------------------------------------------------------------------------
+// Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
+// increment). Function-typed values (lambda closures, capturing or not, and
+// method references) are runtime-managed (§28.9): the heap-allocated closure
+// object backing the value is reclaimed automatically. The cell is laid out
+// { void* fn, void* env, int64 rc } (rc at offset 16, total 24 bytes); every
+// producer (lowerLambda, makeMethodThunk) initializes rc to 1. retain
+// increments; release decrements and, at zero, frees the env block (if any)
+// then the cell. A closure owns NEITHER its captures (they are borrows per
+// §28.9 / §28.3) nor the boxed cells backing them, so release frees only the
+// cell + its env block — never a captured value (which the original owned
+// location disposes exactly once). null is a no-op. Non-atomic for now; becomes
+// atomic when async lands.
+void bz_closure_retain(void* c);
+void bz_closure_release(void* c);
+
+// ---------------------------------------------------------------------------
 // Split a string by a delimiter: returns bz_array_t* of bz.string* (heap alloc'd).
 // Caller disposes result array. All pointers point into separately malloc'd strings.
 void* bz_string_split(const char* s, int64_t s_len,

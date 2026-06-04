@@ -1164,9 +1164,14 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // end (mirrors collectUnwindIneligible; consulted in lowerLocalDecl).
     stringReleaseEligible_.clear();
     stringReleaseEligibleFn_ = fn;
+    // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
+    // released at scope end (mirrors stringReleaseEligible_).
+    closureReleaseEligible_.clear();
+    closureReleaseEligibleFn_ = fn;
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectUnwindIneligible(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
+        collectClosureReleaseEligible(*ci.stmts);
     }
 
     bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
@@ -1612,6 +1617,24 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         !disposeStack_.empty()) {
         Disposal d{slot, nullptr};
         d.stringRelease = true;
+        disposeStack_.back().push_back(d);
+    }
+    // #422 / §27.5 / §28.9: if this `var` closure (function-typed) local was
+    // proven non-escaping and initialized by a codegen +1 producer (a lambda
+    // expression or a method reference), register a scope-end
+    // bz_closure_release of its single producer reference. The slot holds
+    // exactly that one reference (the cell `v` just stored, at rc=1); no other
+    // reference exists (proven by the escape walk), so releasing it at scope end
+    // frees the cell + its env block exactly once — no UAF, no double-free, and
+    // (per §28.9) no captured value is touched (captures are borrows). Gated on
+    // currentFn_ matching the analyzed function (a lambda/thunk body lowered
+    // mid-function is not analyzed → its closure locals just leak, never
+    // double-freed).
+    if (v && currentFn_ == closureReleaseEligibleFn_ &&
+        closureReleaseEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.closureRelease = true;
         disposeStack_.back().push_back(d);
     }
 }
@@ -2331,6 +2354,333 @@ struct StringEscapeWalker {
 }  // namespace
 
 
+// #422 / §27.5 / §28.9: is `init` a codegen-internal +1 closure producer?
+// A LambdaExpr, or a method reference used as a VALUE (a bare IdentifierExpr or
+// a MemberAccessExpr whose resolved symbol is a MethodSymbol, where the static
+// type of the expression is a function type — i.e. the method is referenced, not
+// called). Both lower to a fresh calloc'd rc=1 closure cell (lowerLambda /
+// makeMethodThunk) that codegen owns end-to-end, so binding the result to a
+// local consumes its single reference. A closure-returning CALL is deliberately
+// NOT included: the callee may hand back a function value WITHOUT a fresh +1
+// (e.g. returning a closure stored in a field, or a method-reference parameter),
+// so caller-side release of a call result could free a value the callee still
+// references (UAF). Restricting to lambda/method-reference producers keeps the
+// producer/consumer balance entirely inside codegen.
+bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
+    if (!init) return false;
+    if (dynamic_cast<const ast::LambdaExpr*>(init)) return true;
+    // A method reference used as a VALUE: a bare IdentifierExpr (a static method
+    // of the current type) or a MemberAccessExpr `T.M` / `obj.M` whose resolved
+    // symbol is a MethodSymbol — the exact shape codegen lowers to a fresh +1
+    // closure cell via makeMethodThunk (LlvmBackend_Exprs.cpp:1204/1214,
+    // LlvmBackend_Layout.cpp makeMethodThunk). A method *call* is a distinct
+    // CallExpr node (never an IdentifierExpr / MemberAccessExpr), so this cannot
+    // misfire on a call. (Sema defers a method reference's Function type to the
+    // call-resolution slice — ExprTypecheck_Calls.cpp:1904 leaves exprType unset
+    // for a bare reference — so we key off the symbol kind, which sema DOES set,
+    // matching codegen exactly.) A property/field reference has a
+    // Property/Field symbol, not a MethodSymbol, so it is not treated as a
+    // closure-cell producer here (it lowers differently) and stays leaked —
+    // safe.
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*init))) {
+        // A bare IdentifierExpr method reference is lowered to a cell ONLY for a
+        // static method (Exprs.cpp:1204 gates on isStaticMethod); an instance
+        // `obj.M` member access is lowered to a cell for either (Exprs.cpp:1214).
+        // Match those gates exactly so eligibility never arms a release for an
+        // init that did not actually produce a +1 cell.
+        if (dynamic_cast<const ast::MemberAccessExpr*>(init)) return true;
+        if (dynamic_cast<const ast::IdentifierExpr*>(init) && isStaticMethod(ms))
+            return true;
+    }
+    return false;
+}
+
+namespace {
+// #422 / §27.5 / §28.9: a strict, conservative walk that decides whether a
+// SPECIFIC closure (function-typed) `var` local ever escapes its scope. A
+// closure local is "escaped" if its identifier appears anywhere except a
+// non-consuming READ position. For a function value the only non-consuming reads
+// are: the CALLEE of a direct call `f(...)` (invocation borrows the value for
+// the call; it neither retains nor frees it), and a reference-equality operand
+// `f = g` / `f <> g` (§27.7.1). Every other position — a call ARGUMENT (the
+// callee may store the function value in a field that outlives the call, since
+// function-typed fields are permitted and runtime-managed), an
+// assignment/return/throw/yield/discard operand, a binding to another local, a
+// `new`/`with`/collection element, a lambda capture, a `move`, a `for ... in f`
+// iterable, etc. — is an ESCAPE. The walk OVER-approximates escape: any
+// construct it does not explicitly recognize as a safe read leaves the local
+// escaped (→ no release → leak, the safe direction). Only a local that NEVER
+// escapes is released at scope end, where releasing its single producer
+// reference is provably free of UAF (no other reference exists) and of
+// double-free (once per scope exit). Captures are not touched on release
+// (they are borrows, §28.9), so there is no double-dispose of a capture either.
+//
+// `safeRead`: true when a bare identifier in the current expression position is
+// a non-consuming read; false when it would escape.
+struct ClosureEscapeWalker {
+    const sema::SemaContext& ctx;
+    const void* target;   // the LocalDecl node we are testing
+    bool escaped = false;
+
+    bool isTargetIdent(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
+        return loc && loc->decl &&
+               static_cast<const void*>(loc->decl) == target;
+    }
+
+    void expr(const ast::Expr* e, bool safeRead) {
+        if (!e || escaped) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (isTargetIdent(id) && !safeRead) escaped = true;
+            return;
+        }
+        // Reference equality `f = g` / `f <> g` (§27.7.1): both operands are
+        // non-consuming reads. (Any other binary op on a function value is not
+        // valid, but a contained occurrence is still treated as a read here —
+        // harmless, since the only ops the grammar admits on function values are
+        // `=`/`<>`.)
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get(), /*safeRead=*/true);
+            expr(b->right.get(), /*safeRead=*/true);
+            return;
+        }
+        // Call: the callee `f(...)` is a non-consuming read (invocation); every
+        // ARGUMENT escapes (the callee may store the function value).
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get(), /*safeRead=*/true);
+            for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            // `f?(...)` null-conditional call (§27.7): callee is a read.
+            expr(c->callee.get(), /*safeRead=*/true);
+            for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        // `f!` forwards f onward — inherit the parent position.
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get(), safeRead);
+            return;
+        }
+        // Conditional: condition is a read; each branch forwards the value on to
+        // the parent position, so inherit `safeRead`.
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get(), /*safeRead=*/true);
+            expr(c->thenValue.get(), safeRead);
+            expr(c->elseValue.get(), safeRead);
+            return;
+        }
+        // `f is T` reads only.
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get(), /*safeRead=*/true);
+            return;
+        }
+        // Member access / indexing / interpolation do not apply to a function
+        // value; treat any contained occurrence conservatively as an ESCAPE
+        // (safeRead=false) rather than recognize a safe read that cannot occur.
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(m->target.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get(), /*safeRead=*/false);
+            for (auto& a : ix->indices) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        // Everything that can carry the value to a longer-lived location is an
+        // ESCAPE for any contained occurrence: new/with/collection literal/
+        // lambda/case/unary(`move`)/throw-expr. Recurse with safeRead=false.
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get(), /*safeRead=*/false); return;
+        }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(th->operand.get(), /*safeRead=*/false); return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get(), /*safeRead=*/false);
+            for (auto& a : w->assigns) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get(), /*safeRead=*/false);
+            for (auto& k : cl->keys) expr(k.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // A lambda may capture the local and outlive its scope — escape.
+            if (lam->exprBody) expr(lam->exprBody.get(), /*safeRead=*/false);
+            for (auto& s : lam->stmts) stmt(s.get());
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get(), /*safeRead=*/false);
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get(), /*safeRead=*/false);
+                expr(arm.exprBody.get(), /*safeRead=*/false);
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return;
+        }
+        // Range endpoints read only (a function value cannot be a range bound,
+        // but recurse defensively as reads).
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get(), /*safeRead=*/true);
+            expr(r->hi.get(), /*safeRead=*/true);
+            expr(r->step.get(), /*safeRead=*/true);
+            return;
+        }
+        // Leaf literals contain no identifiers — nothing to do. An unrecognized
+        // composite the grammar can produce is one of the cases above.
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s || escaped) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // Binding the target into ANOTHER local escapes it (the new local
+            // may itself be returned/stored).
+            expr(ld->initializer.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            // A discarded expression (e.g. `f(args);` — the call callee is a
+            // safe read, the args escape; decided by expr()).
+            expr(es->expr.get(), /*safeRead=*/false); return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // Reassigning the local itself → escape (overwrite handling is out of
+            // this increment). The RHS escapes.
+            if (isTargetIdent(as->target.get())) { escaped = true; return; }
+            expr(as->target.get(), /*safeRead=*/false);
+            expr(as->value.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            if (isTargetIdent(inc->target.get())) { escaped = true; return; }
+            expr(inc->target.get(), /*safeRead=*/false); return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get(), /*safeRead=*/true);
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get(), /*safeRead=*/true);
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get(), /*safeRead=*/true);
+            for (auto& b : ws->body) stmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            // `for var x in f do ... end` — iterating a function value is not
+            // valid, but be conservative: an escape.
+            expr(fs->iterable.get(), /*safeRead=*/false);
+            expr(fs->withExpr.get(), /*safeRead=*/false);
+            for (auto& b : fs->body) stmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get(), /*safeRead=*/true);
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get(), /*safeRead=*/false);
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get(), /*safeRead=*/false);
+                expr(arm.exprBody.get(), /*safeRead=*/false);
+                for (auto& a : arm.stmts) stmt(a.get());
+            }
+            return;
+        }
+        // BreakStmt / ContinueStmt: no sub-expressions. The enumeration mirrors
+        // the complete set walked by UnwindIneligibleWalker / StringEscapeWalker.
+    }
+};
+}  // namespace
+
+
+void Emitter::collectClosureReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    closureReleaseEligible_.clear();
+    // Find every `var` (non-using) closure LocalDecl whose initializer is a
+    // codegen-internal +1 producer (a lambda / method reference), then run the
+    // escape walk for each. A decl survives as eligible iff the walk proves it
+    // never escapes. (Function-typed locals never appear in `using var` — §28.9
+    // — but the isUsing guard mirrors the string path defensively.)
+    std::vector<const ast::LocalDecl*> candidates;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (!ld->isUsing && isPlusOneClosureProducer(ld->initializer.get()))
+                candidates.push_back(ld);
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    for (const ast::LocalDecl* ld : candidates) {
+        ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            closureReleaseEligible_.insert(static_cast<const void*>(ld));
+    }
+}
+
+
 void Emitter::collectStringReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     stringReleaseEligible_.clear();
@@ -2562,6 +2912,20 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (it->stringRelease) {
             llvm::Value* s = builder_.CreateLoad(ptrTy(), it->slot, "str.rel");
             emitStringRelease(s);
+            continue;
+        }
+        // #422 / §27.5 / §28.9: a provably-non-escaping `var` closure
+        // (function-typed) local. Release its single (producer) reference at
+        // scope end — on BOTH the normal and unwind exit (the reference dies
+        // either way; a given exit goes one way only, so this runs exactly once
+        // per scope exit). The local was proven non-escaping, so nothing else
+        // holds the cell pointer: bz_closure_release frees the cell + its env
+        // block exactly once (no UAF, no double-free of the cell). Captured
+        // values are borrows (§28.9), so the env's CONTENTS are not freed — no
+        // double-dispose of a capture. bz_closure_release is null-safe.
+        if (it->closureRelease) {
+            llvm::Value* c = builder_.CreateLoad(ptrTy(), it->slot, "cl.rel");
+            emitClosureRelease(c);
             continue;
         }
         // #383 / §31.1: the caught exception object. On a normal handled exit

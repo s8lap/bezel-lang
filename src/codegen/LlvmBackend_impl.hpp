@@ -283,6 +283,21 @@ private:
         // (no UAF) and it runs once per exit (no double-free). `slot` holds the
         // string pointer; the class/collection/dict fields are unused.
         bool stringRelease = false;
+        // #422 / §27.5 / §28.9: a `var` closure (function-typed) local that
+        // PROVABLY does not escape its scope (a non-escape walk found every use
+        // is a non-consuming read) and was initialized once by a
+        // codegen-internal +1 producer (a lambda expression or a method
+        // reference — never a call result, so no return-handoff ambiguity). The
+        // local holds exactly the producer's single reference; at scope end
+        // (normal OR unwind) we bz_closure_release it, freeing the heap cell +
+        // its env block exactly once. The closure owns neither its captures nor
+        // the boxed cells backing them (they are borrows, §28.9), so the release
+        // frees only the cell + env — no captured value is disposed, no
+        // double-free of a capture. No other reference to the cell exists
+        // (proven non-escaping), so there is no dangler (no UAF) and it runs
+        // once per exit (no double-free of the cell). `slot` holds the closure
+        // pointer; the class/collection/dict fields are unused.
+        bool closureRelease = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -416,6 +431,8 @@ private:
     // Literals are materialized as private global constants; concatenation
     // allocates via malloc/memcpy. All string variables are ptr-typed (§4.6).
     llvm::StructType* stringStructTy_ = nullptr;
+    // #422 / §27.5 / §28.9: the closure-cell type { ptr fn, ptr env, i64 rc }.
+    llvm::StructType* closureCellTy_ = nullptr;
     unsigned stringLiteralIdx_ = 0;
 
     // CG8: per-class instance layout (struct of instance fields) and each
@@ -609,6 +626,48 @@ private:
         auto* fn = declareC("bz_string_release",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {s});
+    }
+
+    // #422 / §27.5 / §28.9: the closure-cell heap layout — { ptr fn, ptr env,
+    // i64 rc } = 24 bytes. fn (off 0) and env (off 8) keep the offsets the
+    // existing closure-call sites use (fn at offset 0, env at GEP index 1); rc
+    // (field index 2, off 16) is appended after env so neither moves. Every
+    // closure-cell producer (lowerLambda, makeMethodThunk) calloc's this size
+    // and stores rc := 1.
+    llvm::StructType* closureCellType() {
+        if (!closureCellTy_)
+            closureCellTy_ = llvm::StructType::create(
+                llvm_, {ptrTy(), ptrTy(), i64()}, "bz.closure");
+        return closureCellTy_;
+    }
+
+    // #422: store rc := 1 into a freshly calloc'd closure cell (field index 2).
+    // The producer holds the first reference (§28.9 runtime-managed lifetime).
+    void initClosureRc(llvm::Value* cellObj) {
+        builder_.CreateStore(
+            llvm::ConstantInt::get(i64(), 1),
+            builder_.CreateStructGEP(closureCellType(), cellObj, 2));
+    }
+
+    // #422: emit a call to bz_closure_retain(c) — increments rc (no-op on null).
+    // Used when a closure is copied into a longer-lived location (not armed in
+    // this increment; provided for the symmetric retain-on-copy when it lands).
+    void emitClosureRetain(llvm::Value* c) {
+        if (!c) return;
+        auto* fn = declareC("bz_closure_retain",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {c});
+    }
+
+    // #422: emit a call to bz_closure_release(c) — decrements rc and, at zero,
+    // frees the env block then the cell (no-op on null). Captured values are
+    // borrows (§28.9), so this frees ONLY the cell + env, never a capture. Used
+    // at scope-end release of a non-escaping closure local.
+    void emitClosureRelease(llvm::Value* c) {
+        if (!c) return;
+        auto* fn = declareC("bz_closure_release",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {c});
     }
 
     // Load the data pointer (field 0) from a bz_string pointer.
@@ -1757,6 +1816,34 @@ private:
     // ambiguity, unlike a string-returning call). Used both to gate release
     // eligibility and to release intermediate concat operands.
     bool isPlusOneStringProducer(const ast::Expr* init) const;
+
+    // #422 / §27.5 / §28.9: the set of `var` closure (function-typed) LocalDecl
+    // nodes PROVABLY eligible for scope-end bz_closure_release — initialized
+    // once by a codegen-internal +1 producer (a lambda expression or a method
+    // reference) and never escaping their scope (a conservative whole-body walk
+    // found every use is a non-consuming read). Computed once per body by
+    // collectClosureReleaseEligible and consulted in lowerLocalDecl. Membership
+    // is the ONLY thing that arms a release; absence ⇒ the closure leaks (the
+    // pre-existing, safe behavior).
+    std::unordered_set<const void*> closureReleaseEligible_;
+    // The function for which closureReleaseEligible_ was computed (mirrors
+    // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
+    // inherits no eligibility, so its closure locals just leak (never
+    // double-freed).
+    llvm::Function* closureReleaseEligibleFn_ = nullptr;
+    // Compute closureReleaseEligible_ for a block body (see the .cpp).
+    void collectClosureReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // True if `init` is a codegen-internal +1 closure producer: a LambdaExpr, or
+    // a bare/qualified method reference (an IdentifierExpr / MemberAccessExpr
+    // whose symbol is a MethodSymbol, used as a value rather than called). These
+    // lower to a fresh calloc'd rc=1 closure cell that codegen fully controls —
+    // so binding the result to a local CONSUMES that single reference (no
+    // caller/callee handoff ambiguity, unlike a closure-returning call). Only
+    // the static type being a function type qualifies (guards against a method
+    // *call*, which is not a value-producing reference). Used to gate release
+    // eligibility.
+    bool isPlusOneClosureProducer(const ast::Expr* init) const;
 
     // §28.3: populate unwindIneligible_ from a method/ctor body. A tracked owned
     // local/param becomes ineligible if it appears in a value-consuming position

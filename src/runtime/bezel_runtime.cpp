@@ -1812,3 +1812,69 @@ extern "C" void bz_string_release(void* s) {
     free(data);
     free(s);
 }
+
+// ---------------------------------------------------------------------------
+// Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
+// increment).
+//
+// Function-typed values (lambda closures — capturing or not — and method
+// references) are RUNTIME-MANAGED (§28.9): "Runtime management governs the
+// function value itself — the heap-allocated closure object that backs the
+// function value." Codegen lowers each such value to a heap cell laid out as
+//   { void* fn (off 0), void* env (off 8), int64_t rc (off 16) } = 24 bytes.
+// `fn` is the function/thunk pointer; `env` is null (non-capturing / static
+// method reference) or points at a separately-allocated env block holding the
+// capture pointers. The rc was appended AFTER env so fn (off 0) and env (off 8)
+// keep their offsets: every codegen call site loads fn at offset 0 and env at
+// GEP index 1, both unmoved.
+//
+// LEAF with respect to ownership. Per §28.9, a closure does NOT own the values
+// it captures: "Capturing an owned class-typed local does NOT transfer
+// ownership into the closure ... The original `using var` (or other owned
+// location) retains the disposal obligation." The §28.3 capture table likewise
+// classifies every closure capture as a BORROW. So a closure cell holds only
+// borrows; freeing it must free ONLY the cell and its env block — never a
+// captured value's storage. (The env block holds the capture pointers; freeing
+// the block does not touch the pointees, which are the enclosing frame's shared
+// cells / the `using var`'s object, disposed exactly once by their owner.)
+// Acyclic reference counting is therefore sound: no owning edge out of a closure
+// means no cycle to leak and no captured destructor to run on free.
+//
+// The count is a plain (non-atomic) int64 today; this becomes an atomic
+// fetch-add/sub when async (closures shared across threads) lands.
+//
+// null is a no-op for both (a nullable `((...) -> ...)?` slot may hold null).
+
+// Byte offset of the rc field inside the closure cell (after fn + env).
+static const int64_t BZ_CLOSURE_RC_OFFSET = 16;
+// Byte offset of the env pointer inside the closure cell (after fn).
+static const int64_t BZ_CLOSURE_ENV_OFFSET = 8;
+
+extern "C" void bz_closure_retain(void* c) {
+    if (!c) return;
+    int64_t rc;
+    memcpy(&rc, (uint8_t*)c + BZ_CLOSURE_RC_OFFSET, sizeof(int64_t));
+    rc += 1;
+    memcpy((uint8_t*)c + BZ_CLOSURE_RC_OFFSET, &rc, sizeof(int64_t));
+}
+
+extern "C" void bz_closure_release(void* c) {
+    if (!c) return;
+    int64_t rc;
+    memcpy(&rc, (uint8_t*)c + BZ_CLOSURE_RC_OFFSET, sizeof(int64_t));
+    rc -= 1;
+    if (rc > 0) {
+        memcpy((uint8_t*)c + BZ_CLOSURE_RC_OFFSET, &rc, sizeof(int64_t));
+        return;
+    }
+    // Last reference gone: free the env block (if any), then the cell. The env
+    // block is uniquely owned by this cell (each lowerLambda / makeMethodThunk
+    // allocates a fresh env for the one cell it builds), so freeing it here is a
+    // single free, no dangler. The env's CONTENTS (capture pointers) are NOT
+    // touched — they are borrows the closure does not own (§28.9). free(NULL) is
+    // safe (a non-capturing closure carries a null env).
+    void* env;
+    memcpy(&env, (uint8_t*)c + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
+    free(env);
+    free(c);
+}
