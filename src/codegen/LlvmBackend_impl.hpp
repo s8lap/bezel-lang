@@ -737,20 +737,32 @@ private:
     // enum analogue of isNullablePrimTy; the two are unified by
     // isNullableValueTy below.
     bool isNullableEnumTy(const sema::TypeRef* rt);
-    // A nullable VALUE type — either a value primitive (isNullablePrimTy) or an
-    // enum (isNullableEnumTy). Both lower to the tagged {i8 hasValue; T value}
-    // struct; the only difference is T (the primitive's LLVM type vs i32). All
+    // per §7.2 / §8.6 / issue #416: is rt a NULLABLE RECORD (a nullable Named
+    // TypeRef whose declaration is a record)? A non-nullable record lowers to a
+    // bare by-value struct (§9.4) with NO null representation, so `record?` would
+    // also stay the bare struct and `null` would be indistinguishable from a
+    // value — routing `record? <> null` through emitStructEquality (ExtractValue
+    // on the `null` operand) and aborting the backend (LLVM checkGEPType). It now
+    // lowers, like the value primitives and enums, to a tagged struct
+    // {i8 hasValue; <record payload>} so `null` is representable. This predicate
+    // is the record analogue of isNullablePrimTy/isNullableEnumTy; the three are
+    // unified by isNullableValueTy below. Defined in LlvmBackend_Layout.cpp
+    // (needs the record-declaration kind check, like isNullableEnumTy).
+    bool isNullableRecordTy(const sema::TypeRef* rt);
+    // A nullable VALUE type — a value primitive (isNullablePrimTy), an enum
+    // (isNullableEnumTy), or a record (isNullableRecordTy). All lower to the
+    // tagged {i8 hasValue; T value} struct; the only difference is T (the
+    // primitive's LLVM type, i32 for an enum, or the bare record struct). All
     // null/wrap/value-semantics sites key off this combined predicate.
     bool isNullableValueTy(const sema::TypeRef* rt) {
-        return isNullablePrimTy(rt) || isNullableEnumTy(rt);
+        return isNullablePrimTy(rt) || isNullableEnumTy(rt) ||
+               isNullableRecordTy(rt);
     }
-    // The tagged struct for a nullable value type (prim or enum). For an enum
-    // the value slot is the underlying integer (i32 — CG44).
-    llvm::StructType* nullableValueStructTy(const sema::TypeRef* rt) {
-        if (isNullableEnumTy(rt))
-            return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), i32()});
-        return nullablePrimStructTy(rt->primitive);
-    }
+    // The tagged struct for a nullable value type (prim, enum, or record). For
+    // an enum the value slot is the underlying integer (i32 — CG44); for a record
+    // (§9.4 / issue #416) it is the bare record struct (recordStruct). Defined in
+    // LlvmBackend_Layout.cpp where recordStruct is available.
+    llvm::StructType* nullableValueStructTy(const sema::TypeRef* rt);
     // Constant null for a nullable value type: {i8 0, T 0}.
     llvm::Constant* nullableValueNull(const sema::TypeRef* rt) {
         return llvm::ConstantAggregateZero::get(nullableValueStructTy(rt));
