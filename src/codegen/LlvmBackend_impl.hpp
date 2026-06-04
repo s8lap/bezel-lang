@@ -298,6 +298,23 @@ private:
         // once per exit (no double-free of the cell). `slot` holds the closure
         // pointer; the class/collection/dict fields are unused.
         bool closureRelease = false;
+        // #422 / §8.6 / §28.9: a `var` Object/interface local holding a BOXED
+        // VALUE that PROVABLY does not escape its scope (a non-escape walk found
+        // every use is a non-consuming read — `is`/`as`/`= null`/`<> null`) and
+        // was initialized once by a codegen-internal +1 BOX producer (an
+        // initializer whose static type is a boxable value type, so boxValue
+        // itself allocated the wrapper). The local holds exactly the producer's
+        // single reference; at scope end (normal OR unwind) we bz_box_release it,
+        // freeing the box wrapper exactly once. The boxed value is a value-type
+        // leaf (no owned sub-objects), so the release frees only the wrapper. A
+        // class instance coerced to Object is NEVER a box producer (its
+        // initializer has a reference static type → boxValue is not called), so
+        // this release is never emitted for a class instance — no double-free of
+        // an owned object, no corruption of the class model. No other reference
+        // to the box exists (proven non-escaping), so there is no dangler (no
+        // UAF) and it runs once per exit (no double-free). `slot` holds the box
+        // pointer; the class/collection/dict fields are unused.
+        bool boxRelease = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -668,6 +685,30 @@ private:
         auto* fn = declareC("bz_closure_release",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {c});
+    }
+
+    // #422 / §8.6 / §28.9: emit a call to bz_box_retain(b) — increments the box
+    // wrapper's rc (no-op on null). Provided for the symmetric retain-on-copy
+    // when it lands; not armed in this increment.
+    void emitBoxRetain(llvm::Value* b) {
+        if (!b) return;
+        auto* fn = declareC("bz_box_retain",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {b});
+    }
+
+    // #422 / §8.6 / §28.9: emit a call to bz_box_release(b) — decrements the box
+    // wrapper's rc and, at zero, frees the wrapper (no-op on null). The boxed
+    // value is a value-type leaf (no owned sub-objects), so this frees ONLY the
+    // wrapper. Emitted ONLY for a `var` Object/interface local codegen itself
+    // boxed (a boxable-value initializer) and proved non-escaping — never for a
+    // class instance coerced to Object (which keeps its bare pointer and never
+    // becomes a box). Used at scope-end release of such a local.
+    void emitBoxRelease(llvm::Value* b) {
+        if (!b) return;
+        auto* fn = declareC("bz_box_release",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {b});
     }
 
     // Load the data pointer (field 0) from a bz_string pointer.
@@ -1844,6 +1885,38 @@ private:
     // *call*, which is not a value-producing reference). Used to gate release
     // eligibility.
     bool isPlusOneClosureProducer(const ast::Expr* init) const;
+
+    // #422 / §8.6 / §28.9: the set of `var` Object/interface LocalDecl nodes
+    // PROVABLY eligible for scope-end bz_box_release — declared with an
+    // Object/interface type, initialized once by a codegen-internal +1 BOX
+    // producer (an initializer whose static type is a boxable VALUE type, so
+    // boxValue itself allocated the wrapper), and never escaping their scope (a
+    // conservative whole-body walk found every use is a non-consuming read —
+    // `is`/`as`/`= null`). Computed once per body by collectBoxReleaseEligible
+    // and consulted in lowerLocalDecl. Membership is the ONLY thing that arms a
+    // release; absence ⇒ the box leaks (the pre-existing, safe behavior). A class
+    // instance coerced to Object has a REFERENCE initializer (not a boxable
+    // value), so it is never a producer here — it is never released by this path,
+    // which is what keeps the class-instance model uncorrupted.
+    std::unordered_set<const void*> boxReleaseEligible_;
+    // The function for which boxReleaseEligible_ was computed (mirrors
+    // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
+    // inherits no eligibility, so its boxed-value locals just leak (never
+    // double-freed).
+    llvm::Function* boxReleaseEligibleFn_ = nullptr;
+    // Compute boxReleaseEligible_ for a block body (see the .cpp).
+    void collectBoxReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // True if local `ld` is a codegen-internal +1 box producer: its declared
+    // type is Object or an interface AND its initializer's static type is a
+    // boxable VALUE type (record/enum/primitive/nullable value). boxForTarget
+    // then allocates a fresh rc=1 box wrapper that codegen fully controls — so
+    // binding the result to the local CONSUMES that single reference. A reference
+    // initializer (a class instance coerced to Object — the #399 path) is NOT a
+    // box producer: boxForTarget is a no-op and no wrapper exists. Used to gate
+    // release eligibility. (Not const: it consults the boxable-value predicates,
+    // which are non-const Emitter members.)
+    bool isPlusOneBoxProducer(const ast::LocalDecl* ld);
 
     // §28.3: populate unwindIneligible_ from a method/ctor body. A tracked owned
     // local/param becomes ineligible if it appears in a value-consuming position

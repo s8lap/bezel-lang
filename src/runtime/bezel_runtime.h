@@ -406,6 +406,34 @@ void bz_closure_retain(void* c);
 void bz_closure_release(void* c);
 
 // ---------------------------------------------------------------------------
+// Boxed value-type reference counting (§8.6 / §28.9, issue #422 boxes
+// increment). When a value type (record/enum/primitive/nullable value) is used
+// where `Object` (or an interface it implements) is expected, it is BOXED: a
+// heap wrapper holds the value. Boxed value types are runtime-managed (§28.9):
+// the wrapper is reclaimed automatically. The box cell is laid out
+//   { void* vtable (off 0), int64 rc (off 8), value-bytes (off 16) }.
+// The rc sits at a FIXED offset 8 (between the vtable word and the payload) so a
+// single runtime offset works for EVERY box regardless of the boxed value's
+// size; codegen advances past TWO words to reach the payload (boxValue store,
+// the `as` unbox load, and the interface-dispatch box thunk). Every producer
+// (boxValue) initializes rc to 1 (the producer's reference). retain increments;
+// release decrements and, at zero, frees the box cell. A boxed value is a VALUE
+// type — it owns no sub-objects (records/enums/primitives are leaves), so
+// release frees ONLY the wrapper, like a string. null is a no-op (a null T?
+// boxes to a null Object reference per §8.6). Non-atomic for now; becomes atomic
+// when async lands.
+//
+// SAFETY — these helpers are NEVER handed a class instance. Codegen emits a
+// release ONLY for a `var` Object/interface local whose declaration initializer
+// has a boxable VALUE static type (a local boxValue itself produced); a class
+// instance coerced to Object (a REFERENCE initializer) is left as its bare
+// pointer and is never release-eligible. So `rc at offset 8` never aliases a
+// class instance's bytes ({ vtable, i8 disposed-flag, fields }) — the box-vs-
+// class distinction is resolved at the producer site, mirroring strings/closures.
+void bz_box_retain(void* b);
+void bz_box_release(void* b);
+
+// ---------------------------------------------------------------------------
 // Split a string by a delimiter: returns bz_array_t* of bz.string* (heap alloc'd).
 // Caller disposes result array. All pointers point into separately malloc'd strings.
 void* bz_string_split(const char* s, int64_t s_len,

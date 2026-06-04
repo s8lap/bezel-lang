@@ -160,6 +160,7 @@ set(BEZEL_TEST_SOURCES
     codegen/console_write_leak_test.cpp
     codegen/string_refcount_test.cpp
     codegen/closure_refcount_test.cpp
+    codegen/box_refcount_test.cpp
     codegen/owned_field_disposal_test.cpp
     codegen/owned_collection_disposal_test.cpp
     codegen/remove_equals_test.cpp

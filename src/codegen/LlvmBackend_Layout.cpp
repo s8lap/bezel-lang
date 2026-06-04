@@ -530,7 +530,8 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         return builder_.CreateXor(isA, builder_.getInt1(true));
     if (te.op == "as") {
         // §17.4: `x as T` for a VALUE-type target unboxes — load the value
-        // bytes out of the box `{ vtable*, value-bytes }` (offset = one word).
+        // bytes out of the box `{ vtable*, rc, value-bytes }` (payload at two
+        // words in — past the vtable word and the #422 rc word, BZ_BOX_RC_OFFSET).
         // For a value primitive OR a record (issue #416) the result is `T?` (a
         // tagged {hasValue, value} struct — non-null on a compatible unbox, null
         // otherwise per §8.6 "Unboxing reverses the process"). A reference-type
@@ -547,9 +548,10 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             builder_.CreateCondBr(isA, loadBB, contBB);
 
             builder_.SetInsertPoint(loadBB);
-            // value-bytes live after the leading vtable word.
+            // value-bytes live two words in: past the vtable word and the #422
+            // rc word (boxValue lays out { vtable*, i64 rc, payload }).
             llvm::Value* payload = builder_.CreateGEP(
-                ptrTy(), obj, {builder_.getInt32(1)}, "unbox.ptr");
+                ptrTy(), obj, {builder_.getInt32(2)}, "unbox.ptr");
             llvm::Value* loaded = builder_.CreateLoad(valTy, payload, "unbox");
             builder_.CreateBr(contBB);
 
@@ -642,13 +644,19 @@ llvm::Value* Emitter::emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc
 
 
 // §8.6: box an already-lowered value `value` (static type `srcTy`) into a heap
-// wrapper `{ boxVtable*, value-bytes }` and return the box pointer. The leading
-// vtable word lets `emitIsA` and virtual dispatch recognize the box uniformly
-// with a class instance. A nullable value type whose source is null boxes to a
-// null Object reference (§8.6 Nullable value-type boxing). Boxed values are
-// runtime-managed (§28.9): the heap block is intentionally leaked — the spec
-// imposes no disposal obligation on a box, and a free here would risk a
-// double-free since `as` is non-destructive and a box may be aliased.
+// wrapper `{ boxVtable*, i64 rc, value-bytes }` and return the box pointer. The
+// leading vtable word lets `emitIsA` and virtual dispatch recognize the box
+// uniformly with a class instance; the #422 rc word (offset 8, BZ_BOX_RC_OFFSET)
+// is the producer's reference (initialized to 1). The payload follows at offset
+// 16 (two words in) — every payload accessor (the `as` unbox load above, the
+// interface-dispatch box thunk in setupBoxDescriptors) advances two words. A
+// nullable value type whose source is null boxes to a null Object reference
+// (§8.6 Nullable value-type boxing). Boxed values are runtime-managed (§28.9):
+// this is a codegen-internal +1 PRODUCER. The box is released at scope end by a
+// conservative, escape-proven placement (lowerLocalDecl + emitDisposals) so that
+// only a box codegen knows is uniquely held is freed — never a class instance
+// (a class coerced to Object keeps its bare pointer and never reaches boxValue),
+// and an escaping box is conservatively LEFT leaked rather than double-freed.
 llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
     if (!value || !srcTy) return value;
     // A nullable value type: strip the wrapper (§8.6). null → null Object;
@@ -671,17 +679,26 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
         payloadTy = payload->getType();
     }
 
-    // The box struct { vtable*, payload }. Use calloc so any tail padding is
-    // zeroed (deterministic box bytes).
-    auto* boxTy = llvm::StructType::get(llvm_, {ptrTy(), payloadTy});
+    // The box struct { vtable*, i64 rc, payload }. The rc word (#422) sits at a
+    // FIXED offset 8 between the vtable word and the payload, so bz_box_release's
+    // single runtime offset works for every box regardless of payload size; the
+    // payload then lives two words in. Use calloc so any tail padding is zeroed
+    // (deterministic box bytes).
+    auto* boxTy = llvm::StructType::get(llvm_, {ptrTy(), i64(), payloadTy});
     uint64_t sz = module_->getDataLayout().getTypeAllocSize(boxTy);
     auto emitBox = [&]() -> llvm::Value* {
         llvm::Value* box = builder_.CreateCall(
             callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sz)});
         builder_.CreateStore(vt, box);  // vtable* at offset 0
+        // #422 / §28.9: the producer's reference — rc := 1 at offset 8 (the box
+        // is a +1 producer, released at scope end when proven non-escaping).
+        llvm::Value* rcPtr = builder_.CreateGEP(
+            i64(), box, {builder_.getInt32(1)}, "box.rcptr");
+        builder_.CreateStore(builder_.getInt64(1), rcPtr);
+        // value bytes after the vtable + rc words (offset 16, two words in).
         llvm::Value* pptr = builder_.CreateGEP(
-            ptrTy(), box, {builder_.getInt32(1)}, "box.valptr");
-        builder_.CreateStore(payload, pptr);  // value bytes after the word
+            ptrTy(), box, {builder_.getInt32(2)}, "box.valptr");
+        builder_.CreateStore(payload, pptr);
         return box;
     };
 
