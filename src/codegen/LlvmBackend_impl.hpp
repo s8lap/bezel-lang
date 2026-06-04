@@ -1620,6 +1620,15 @@ private:
     llvm::Value* emitStructEquality(llvm::Value* l, llvm::Value* r,
                                     llvm::StructType* st,
                                     const sema::TypeSymbol* rec = nullptr);
+    // §8.3 (equality table) / §15.1.2: element-by-element value equality of two
+    // inline-array `[N]T` values. `at` is the LLVM `[N x elem]` type; `elemTy`
+    // is the element's declared Bezel type (so string elements compare by
+    // content, record elements recurse via emitStructEquality, nested inline
+    // arrays recurse). Parallels emitStructEquality. `elemTy` may be null, in
+    // which case comparison falls back to the LLVM element shape.
+    llvm::Value* emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
+                                         llvm::ArrayType* at,
+                                         const sema::TypeRef* elemTy = nullptr);
     // §8.3 / §9.1: compare a single field/element value of static type
     // `fieldTy`. Strings compare by content (§4.6), nested records recurse,
     // primitives/enums/class references compare by value/identity. Used by

@@ -897,6 +897,14 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
                     fieldTy->primitive == sema::PrimitiveType::String;
     if (isString && l->getType()->isPointerTy() && r->getType()->isPointerTy())
         return emitStringEq(l, r);
+    // Inline-array element (§15.1.2): an `[N]T` element value lowers to an LLVM
+    // ArrayType; recurse element-by-element under the array's own element type
+    // (so e.g. a nested `[M]string` slot content-compares its strings). per §8.3
+    if (fieldTy && fieldTy->kind == K::InlineArray &&
+        l->getType()->isArrayTy()) {
+        if (auto* nestedArr = llvm::dyn_cast<llvm::ArrayType>(l->getType()))
+            return emitInlineArrayEquality(l, r, nestedArr, fieldTy->arrayElement);
+    }
     // Nested record (§9.1 transitivity): recurse with its own type so that
     // record's string fields are likewise compared by content.
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
@@ -915,6 +923,11 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
     // is purely defensive.
     if (auto* nested = llvm::dyn_cast<llvm::StructType>(l->getType()))
         return emitStructEquality(l, r, nested);
+    // Inline-array shape with no declared element type (defensive): recurse
+    // element-wise so an aggregate operand never reaches the scalar ICmp below
+    // (which rejects array operands). per §15.1.2
+    if (auto* arr = llvm::dyn_cast<llvm::ArrayType>(l->getType()))
+        return emitInlineArrayEquality(l, r, arr);
     if (l->getType()->isFloatingPointTy())
         return builder_.CreateFCmpOEQ(l, r);
     return builder_.CreateICmpEQ(l, r);
@@ -949,6 +962,29 @@ llvm::Value* Emitter::emitStructEquality(llvm::Value* l, llvm::Value* r,
         llvm::Value* li = builder_.CreateExtractValue(l, {i});
         llvm::Value* ri = builder_.CreateExtractValue(r, {i});
         acc = builder_.CreateAnd(acc, emitValueEquality(li, ri, nullptr));
+    }
+    return acc;
+}
+
+llvm::Value* Emitter::emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
+                                llvm::ArrayType* at,
+                                const sema::TypeRef* elemTy) {
+    // §8.3 (equality table) / §15.1.2: "Two inline-array values of the same
+    // type are equal iff their elements are pairwise equal under the element
+    // type's equality. Inline arrays follow record-equality discipline:
+    // structural equality grounded in element equality, with no special cases."
+    // Parallels emitStructEquality: extract each slot and AND the element-wise
+    // comparisons. The slot count is fixed at compile time (N is constant per
+    // §15.1.2), so an unrolled compare matches the record-equality machinery.
+    // Each element is compared via its declared Bezel type (emitValueEquality):
+    // string slots compare by content (§4.6), record slots recurse via
+    // emitStructEquality, nested inline arrays recurse, primitives/enums use
+    // ICmp and floats use FCmp.
+    llvm::Value* acc = builder_.getInt1(true);
+    for (unsigned i = 0; i < at->getNumElements(); ++i) {
+        llvm::Value* li = builder_.CreateExtractValue(l, {i});
+        llvm::Value* ri = builder_.CreateExtractValue(r, {i});
+        acc = builder_.CreateAnd(acc, emitValueEquality(li, ri, elemTy));
     }
     return acc;
 }

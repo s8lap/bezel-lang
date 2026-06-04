@@ -1523,6 +1523,27 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         if (op == ">>") return uns ? builder_.CreateLShr(l, r)
                                    : builder_.CreateAShr(l, r);
     }
+    // §8.3 (equality table) / §15.1.2: inline arrays `[N]T` compare
+    // element-by-element value equality — dispatch before the scalar integer
+    // path (ICmp doesn't accept aggregate/array operands). An inline array
+    // lowers to an LLVM ArrayType, not a StructType, so the record branch below
+    // does not catch it. Recover the array's element type from either operand so
+    // per-element comparison knows the Bezel element type (string elements
+    // compare by content, record elements recurse — per §15.1.2).
+    if ((op == "=" || op == "<>") && l->getType()->isArrayTy()) {
+        const sema::TypeRef* elemTy = nullptr;
+        for (const ast::Expr* side : {bin.left.get(), bin.right.get()}) {
+            if (!side) continue;
+            if (auto* t = ctx_.exprType(*side))
+                if (t->kind == sema::TypeRef::Kind::InlineArray &&
+                    t->arrayElement) {
+                    elemTy = t->arrayElement; break;
+                }
+        }
+        llvm::Value* eq = emitInlineArrayEquality(
+            l, r, llvm::cast<llvm::ArrayType>(l->getType()), elemTy);
+        return op == "=" ? eq : builder_.CreateNot(eq);
+    }
     // CG29b (§8.3): records compare structurally — dispatch before the
     // scalar integer path (ICmp doesn't accept struct operands). Recover the
     // record's declared type from either operand so per-field comparison knows
