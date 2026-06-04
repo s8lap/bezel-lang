@@ -817,6 +817,14 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         if (fieldIndex_.find(fs) == fieldIndex_.end()) continue;
         if (isOwnedReferenceField(fs)) {
             owned.push_back({fs, nullptr});
+        } else if (isOwnedBuiltinExceptionField(fs)) {
+            // #405 / §28.5 / §31.1: an `owned` field of BUILTIN exception type.
+            // It has no user TypeSymbol (so isOwnedReferenceField rejects it),
+            // but it is an ordinary owned heap class instance and is disposed
+            // through the same dynamic-dispatch path as a class field below
+            // (vtable slot 1 is the shared no-op bz$exDispose; the block is
+            // reclaimed, the runtime-managed message string is not freed).
+            owned.push_back({fs, nullptr});
         } else if (const sema::TypeRef* ct = ownedCollectionFieldType(fs)) {
             owned.push_back({fs, ct});
         }
@@ -1576,6 +1584,22 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         disposeStack_.back().push_back({it->second, cls});
         return;
     }
+    // #405 / §28.10 / §31.1: a `using var` whose type is a BUILTIN exception
+    // (e.g. `using var e := new InvalidOperationException("x");`). Built-in
+    // exceptions have no user TypeSymbol, so classOfLocal returns null and the
+    // branch above misses them; they are nevertheless ordinary owned heap class
+    // instances and must be disposed + reclaimed at scope end. Dispose
+    // dynamically through the object's own vtable (slot 1 = no-op bz$exDispose;
+    // the 16-byte block is reclaimed, the runtime-managed message string is
+    // not). The value is never an in-flight exception here: a `using var` forbids
+    // the move that a `throw` would require (§28.10), so this slot and the
+    // exception-machinery free can never alias (no double-free).
+    if (usingVarOwnsBuiltinException(ld)) {
+        Disposal d{it->second, nullptr};
+        d.dynamicDispose = true;
+        disposeStack_.back().push_back(d);
+        return;
+    }
     // #383 / §28.8.1: `using var u := move x.f;` — the using var now owns the
     // moved-out class object and discharges it at scope end (dynamically; the
     // concrete class is the field's runtime type). Skipped inside a destructor
@@ -1993,6 +2017,25 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
             }
         }
     }
+    return false;
+}
+
+
+bool Emitter::usingVarOwnsBuiltinException(const ast::LocalDecl* ld) {
+    // #405 / §28.10 / §31.1: the `using var` owns a BUILTIN exception object
+    // (Exception or a §31.4 subtype). Recognize it from the declared type, a
+    // `new <builtin-exception>(...)` initializer, or the initializer's resolved
+    // type. A built-in exception is an owned heap class instance; its block must
+    // be reclaimed at scope end (dispatch is dynamic, vtable slot 1).
+    if (ld->type && isBuiltinExceptionTypeRef(ctx_.resolvedType(*ld->type)))
+        return true;
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+        if (ne->type && isBuiltinExceptionTypeRef(ctx_.resolvedType(*ne->type)))
+            return true;
+    }
+    if (ld->initializer &&
+        isBuiltinExceptionTypeRef(ctx_.exprType(*ld->initializer)))
+        return true;
     return false;
 }
 
