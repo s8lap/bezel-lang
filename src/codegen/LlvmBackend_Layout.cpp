@@ -16,6 +16,14 @@ llvm::Type* Emitter::lowerPrimitive(sema::PrimitiveType p) {
                                        return i32();
         // CG27a (§4.6): string is a reference type — pointer to bz_string.
         case P::String:                return ptrTy();
+        // §8.1: Object is the universal reference root — every reference type
+        // reaches it via its heap representation, so an Object-typed value is a
+        // heap pointer (like string above), not a scalar. Lowering it to a
+        // pointer is what lets a type test (§12.7/§17.4) on an Object/Object?
+        // operand load its vtable and compare descriptors; without this the
+        // operand was an i32 and the type test's ICmp against a null pointer
+        // aborted the compiler (#399).
+        case P::Object:                return ptrTy();
         default:                       return i32();
     }
 }
