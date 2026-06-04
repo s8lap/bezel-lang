@@ -240,7 +240,8 @@ set(BEZEL_TEST_SOURCES
     ownership/cfg_dataflow_test.cpp
     ownership/loop_fixpoint_test.cpp
     ownership/escape_closure_record_test.cpp
-    ownership/escape_deeper_test.cpp)
+    ownership/escape_deeper_test.cpp
+    ownership/out_owned_discharge_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE

@@ -683,6 +683,28 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         sema::Symbol* src = borrowSourceForExpr(*as.value);
         for (auto& [sym, st] : states_) {
             if (sym->name != id->name) continue;
+            // §22.3 + §28.8: assigning an owned value to an `out owned`
+            // parameter transfers ownership OUT through the out-location to
+            // the caller, who becomes responsible for discharging it. The
+            // assignment is therefore a discharge point on the callee side —
+            // both for the RHS's owned obligation (a fresh `new` / owned-
+            // returning call, or a `move`d local whose move-from `recordMovesIn`
+            // above already recorded) and for the `out owned` parameter's own
+            // seeded obligation (run() seeds `out owned` params as Owned). We
+            // mark the parameter Disposed (discharged), mirroring a `return`
+            // under an `owned` return type: the value is now the caller's
+            // responsibility and must not be re-flagged as undischarged at
+            // method exit (the over-rejection of issue #390). Definite
+            // assignment of the `out` parameter on every path (§7.9) is a
+            // separate concern not handled here.
+            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                if (ps->modifier == "out owned") {
+                    st.state = OwnershipState::Disposed;
+                    st.obligationOrigin = &as;
+                    st.source.reset();
+                    return;
+                }
+            }
             st.state = producerState(*as.value);
             st.obligationOrigin = &as;
             if (src && src != sym) {
