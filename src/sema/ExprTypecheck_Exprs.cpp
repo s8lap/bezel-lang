@@ -395,12 +395,22 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 //     indexer `[i: int]: T` result is T = genericArgs[0].
                 //   * Dictionary<K,V> / OwnedDictionary<K,V> (§4.8 / §4.9): the
                 //     indexer `[key: K]: V` result is V = genericArgs[1].
+                //   * issue #401 / §4.1 / §4.2: the int-indexed list INTERFACES
+                //     IReadOnlyList<T> (get-only), IList<T> (get/set borrowing),
+                //     and IOwnedList<T> (get/owned-set) each declare an indexer
+                //     `[i: int]: T`; the element type is T = genericArgs[0], the
+                //     same position as Array<T>. (No collection interface
+                //     declares a key-indexer, so dictionaries are concrete-only.)
                 else if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
                          tt->astNode && tt->astNode->name &&
                          !tt->astNode->name->parts.empty()) {
                     std::string_view cn = tt->astNode->name->parts[0];
                     bool isArrLike =
-                        cn == "Array" || cn == "OwnedArray";
+                        cn == "Array" || cn == "OwnedArray" ||
+                        // issue #401: list interfaces are array-backed; their
+                        // indexer result type is the element T = genericArgs[0].
+                        cn == "IReadOnlyList" || cn == "IList" ||
+                        cn == "IOwnedList";
                     bool isDict =
                         cn == "Dictionary" || cn == "OwnedDictionary";
                     if (isArrLike && !tt->genericArgs.empty() &&

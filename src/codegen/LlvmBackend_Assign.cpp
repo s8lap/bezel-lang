@@ -19,13 +19,17 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
     auto* recvTy = ctx_.exprType(*ix.target);
-    bool isArr  = isCollectionTypeName(recvTy);
+    // issue #401 / §4.1-§4.3: a list-INTERFACE receiver (IReadOnlyList<T> /
+    // IList<T> / IOwnedList<T>) is array-backed; its runtime pointer is the same
+    // bz_array_t* as the concrete Array<T>/OwnedArray<T>, and its element type is
+    // genericArgs[0] (same as the array path), so it takes the `isArr` get path.
+    bool isArr  = isCollectionTypeName(recvTy) || isListInterfaceName(recvTy);
     bool isDict = isDictTypeName(recvTy);
     if (!isArr && !isDict) return nullptr;
     llvm::Value* recv = lowerExpr(*ix.target);
     if (!recv) return nullptr;
 
-    // --- Array<T> / OwnedArray<T> indexer get (§4.4 / §4.5) ----------------
+    // --- Array<T> / OwnedArray<T> indexer get (§4.4 / §4.5; #401 §4.1-§4.3) --
     // `a[i]` reads the slot at i (the getter borrows for class T, copies for
     // value T). The element type is genericArgs[0]; bounds-check against Count.
     if (isArr) {
@@ -254,13 +258,20 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value || !val)
         return false;
     auto* recvTy = ctx_.exprType(*ix.target);
-    bool isArr  = isCollectionTypeName(recvTy);
+    // issue #401 / §4.1-§4.3: a list-INTERFACE receiver is array-backed (same
+    // bz_array_t* as the concrete array), so it takes the `isArr` set path. The
+    // OWNING interface IOwnedList<T> (§4.2) carries the disposing-setter
+    // semantics; IList<T> (§4.1, borrowing) and IReadOnlyList<T> (get-only) do
+    // not. IReadOnlyList<T> declares no setter, so it never reaches this set.
+    bool listIfaceOwning = false;
+    bool isListIface = isListInterfaceName(recvTy, &listIfaceOwning);
+    bool isArr  = isCollectionTypeName(recvTy) || isListIface;
     bool isDict = isDictTypeName(recvTy);
     if (!isArr && !isDict) return false;
     llvm::Value* recv = lowerExpr(*ix.target);
     if (!recv) return false;
 
-    // --- Array<T> / OwnedArray<T> indexer set (§4.4 / §4.5) ----------------
+    // --- Array<T> / OwnedArray<T> indexer set (§4.4 / §4.5; #401 §4.1-§4.3) --
     if (isArr) {
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
         if (!idx) return false;
@@ -273,10 +284,16 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         int64_t esz = collectionElemSize(recvTy);
         llvm::AllocaInst* slot = entryAlloca(val->getType());
         builder_.CreateStore(val, slot);
-        // §4.5: an OWNING array's set(owned) disposes the displaced element
-        // (a class object reference) before storing the new owner; a borrowing
-        // Array<T> set just overwrites (§4.4 — no slot ownership).
-        if (llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy)) {
+        // §4.5 / §4.2: an OWNING array's set(owned) — whether reached through the
+        // concrete OwnedArray<T> or through an IOwnedList<T> view (#401) —
+        // disposes the displaced class element before storing the new owner; a
+        // borrowing Array<T> / IList<T> set just overwrites (no slot ownership).
+        // owningCollectionElemDisposer keys on the concrete "Owned…" name, so it
+        // misses IOwnedList<T>; supply the shared class-element disposer for the
+        // owning-interface case (T: class is guaranteed by §4.2's constraint).
+        llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy);
+        if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
+        if (elemDisp) {
             auto* fn = declareC("bz_array_set_disposing",
                 llvm::Type::getVoidTy(llvm_),
                 {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});

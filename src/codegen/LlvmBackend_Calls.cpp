@@ -296,6 +296,26 @@ bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
 }
 
 
+// issue #401 / stdlib §4.1 / §4.2 / §4.3: the int-indexed list interfaces.
+// IReadOnlyList<T> (get-only, §4.1) is the shared read-only view of BOTH the
+// borrowing array (Array<T>: IList<T>, §4.4) and the owning array (OwnedArray<T>:
+// IOwnedList<T>, §4.5). All three are array-backed at runtime, so an interface-
+// typed receiver carries the same bz_array_t* as the concrete collection and the
+// indexer get/set lower through the identical bz_array_* runtime. IOwnedList<T>
+// is the only owning-set (disposing) one; IReadOnlyList<T> / IList<T> are
+// borrowing — IReadOnlyList<T> is read-only so its setter branch never runs.
+bool Emitter::isListInterfaceName(const sema::TypeRef* rt, bool* outOwning) {
+    if (outOwning) *outOwning = false;
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    auto n = rt->astNode->name->parts[0];
+    if (n == "IOwnedList") { if (outOwning) *outOwning = true; return true; }
+    return n == "IReadOnlyList" || n == "IList";
+}
+
+
 // issue #343 / §4.8: a Dictionary<K,V> key (idx=0) or Set<T> element (idx=0)
 // is a "record key" when the generic arg resolves to a record TypeSymbol that
 // actually carries synthesized GetHashCode/Equals (positional records, or

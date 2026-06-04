@@ -2077,6 +2077,17 @@ private:
 
     static bool isDictTypeName(const sema::TypeRef* rt);
 
+    // issue #401 / stdlib §4.1 / §4.2: is `rt` one of the int-indexed list
+    // INTERFACES (IReadOnlyList<T>, IList<T>, IOwnedList<T>)? These are the only
+    // collection interfaces that declare an indexer, and the only implementers
+    // are the array-backed Array<T> (IList) / OwnedArray<T> (IOwnedList) — so an
+    // interface-typed receiver holds the same bz_array_t* and lowers through the
+    // same runtime as the concrete array path. `outOwning` (optional) is set to
+    // true for IOwnedList<T> (the owning-set, disposing variant) and false for
+    // the borrowing/read-only interfaces.
+    static bool isListInterfaceName(const sema::TypeRef* rt,
+                                    bool* outOwning = nullptr);
+
     // issue #343 / §4.8: if the type's key generic arg (genericArgs[idx]) is a
     // record (a value type with synthesized GetHashCode/Equals), return its
     // TypeSymbol; otherwise null (string/int keys use the existing fast paths).
