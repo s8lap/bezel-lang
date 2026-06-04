@@ -2137,11 +2137,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     diverged_ = savedDiverged;
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
-    // --- Build the closure struct { fn_ptr, env_ptr } ---
-    // Allocate a heap closure object: { ptr fn, ptr env }.
-    // Size = 2 pointers = 2 * sizeof(ptr).
+    // --- Build the closure struct { fn_ptr, env_ptr, rc } ---
+    // #422 / §27.5 / §28.9: allocate a heap closure cell { ptr fn, ptr env,
+    // i64 rc } (24 bytes). The rc is appended after env so fn (off 0) and env
+    // (off 8) keep their offsets; getTypeAllocSize is the single source of truth
+    // for the size so the rc store never overflows.
+    uint64_t cellSz =
+        module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
-        callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
+        callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)cellSz)});
     // Store fn_ptr at offset 0.
     builder_.CreateStore(fn, closureObj);
     // Allocate and fill the env struct (if there are captures).
@@ -2167,6 +2171,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     llvm::Value* envSlot = builder_.CreateGEP(
         ptrTy(), closureObj, {builder_.getInt32(1)});
     builder_.CreateStore(envAlloc, envSlot);
+    initClosureRc(closureObj);  // #422: producer's reference, rc := 1
     return closureObj;
 }
 

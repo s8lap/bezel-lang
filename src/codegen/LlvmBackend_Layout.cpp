@@ -1037,9 +1037,17 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     diverged_ = savedDiverged;
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
-    // Build closure struct { thunk_ptr, env_ptr }.
+    // Build closure cell { thunk_ptr, env_ptr, rc }.
+    // #422 / §27.6 / §28.9: a method reference is a runtime-managed function
+    // value backed by the same 24-byte closure cell as a lambda (rc appended
+    // after env). The env is null for a static method, or an 8-byte block
+    // holding the receiver pointer for an instance method (a BORROW of the
+    // receiver, §28.3 — the cell does not own it). bz_closure_release frees the
+    // cell + env block, never the receiver.
+    uint64_t cellSz =
+        module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
-        callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
+        callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)cellSz)});
     builder_.CreateStore(thunk, closureObj);
     // For instance methods: store a copy of the receiver in env.
     llvm::Value* envObj = llvm::ConstantPointerNull::get(ptrTy());
@@ -1051,6 +1059,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     builder_.CreateStore(
         envObj,
         builder_.CreateGEP(ptrTy(), closureObj, {builder_.getInt32(1)}));
+    initClosureRc(closureObj);  // #422: producer's reference, rc := 1
     return closureObj;
 }
 
