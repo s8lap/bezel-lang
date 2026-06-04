@@ -156,6 +156,30 @@ struct CFGBlock {
     // `exceptionSuccs` (exceptional) and every existing traversal are
     // unchanged. Empty for every block in a body with no `await`.
     std::unordered_set<const ast::Node*> awaitSites;
+
+    // Async-readiness 3c: synthetic *completion* edges. An async method's
+    // state machine has completion exits BEYOND the synchronous ones: besides
+    // normal return and fault/exception (the latter already modelled by
+    // `exceptionSuccs`), the task can be **abandoned** (dropped without being
+    // awaited to completion — §30.5 "Disposing an unconsumed `OwnedTask<T>`")
+    // or **cancelled** (§30.8 — observed at an `await` as
+    // `OperationCanceledException`). On those completion edges the state-
+    // machine frame disposes every owned local stored in it (every
+    // *suspend-local* — one live across an `await`), exactly as the implicit
+    // try/finally disposes owned locals on an exception edge. This set tags a
+    // (from → to) transfer as such a synthetic completion edge so the async
+    // ownership analysis treats a suspend-local as discharged along it (the
+    // §30.5 frame-disposal view) rather than reporting it as leaked.
+    //
+    // The edge is "synthetic" because abandonment/cancellation are not
+    // statements in the body; the async ownership pass adds an edge from each
+    // await-bearing block to the function exit to represent "the task could
+    // complete here via abandonment/cancellation, and the frame disposes its
+    // suspend-locals." Mirrors `exceptionSuccs` / `addExceptionEdge`: metadata
+    // only — it is added to `succs`/`preds` as a real transfer but tagged so
+    // an analysis can give it the frame-disposal treatment. Empty for every
+    // block in a non-async body and for blocks with no await sites.
+    std::unordered_set<const CFGBlock*> completionSuccs;
 };
 
 class CFG {
@@ -206,6 +230,28 @@ public:
     // True when `block` holds at least one recorded await suspend site.
     static bool hasAwaitSites(const CFGBlock* block) {
         return !block->awaitSites.empty();
+    }
+
+    // Async-readiness 3c: add a synthetic *completion* edge from `from` to
+    // `to` (typically the function exit). Like `addExceptionEdge` it is a real
+    // control transfer in `succs`/`preds`, additionally tagged in
+    // `from->completionSuccs` so an analysis can apply the §30.5 state-machine
+    // frame-disposal treatment to a suspend-local along it (abandonment /
+    // cancellation completion of the task). Idempotent for the tag; the
+    // succ/pred lists may gain a duplicate edge to a target that is already a
+    // normal successor, which the analysis tolerates (set membership marks
+    // only the synthetic one). The CFG builder does NOT add these — the async
+    // ownership pass adds them after deciding which blocks bear awaits.
+    void addCompletionEdge(CFGBlock* from, CFGBlock* to) {
+        from->succs.push_back(to);
+        to->preds.push_back(from);
+        from->completionSuccs.insert(to);
+    }
+
+    // True when the (from → to) edge was created as a synthetic completion
+    // edge (abandonment / cancellation; §30.5 / §30.8).
+    static bool isCompletionEdge(const CFGBlock* from, const CFGBlock* to) {
+        return from->completionSuccs.count(to) != 0;
     }
 
 private:

@@ -367,6 +367,19 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 }
             }
         }
+        // Async-readiness 3c (§30.5 line ~6110): a Pattern B `await <bound
+        // owned task local>` consumes its operand task local. Record the
+        // consume before the generic read so a straight-line second await of
+        // the same local is a read-after-consume (the diagnostic is emitted by
+        // recordAwaitOperandConsume, not by the read). This handles the
+        // bare-statement and nested-expression await positions; the
+        // owned-consuming binding positions are handled at the binding site
+        // (handleLocalDecl / handleAssignment / handleReturn). // per §30.5
+        if (isAsync_ && un->op == "await" && un->operand &&
+            awaitTaskKind(*un) == AwaitTaskKind::PatternB) {
+            recordAwaitOperandConsume(*un->operand, un->span.begin);
+            return;  // operand was the task local; consume is its handling
+        }
         // Other unary ops — sub-expression is a regular read.
         if (un->operand) checkRead(*un->operand, /*selfTarget=*/false);
         return;
@@ -1823,6 +1836,639 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
         markDisposedByName(id->name, id->span.begin);
     } else {
         markMovedByName(id->name, id->span.begin);
+    }
+}
+
+// ===========================================================================
+// Async-readiness 3c: across-suspend ownership + Pattern A/B at the await site
+// ===========================================================================
+//
+// THE MODEL (recorded decision; see issue #425 "async-ownership model (3c)"):
+//
+//   An owned local in an async method is classified suspend-local (its live
+//   range crosses at least one `await`) or activation-local (it does not). A
+//   suspend-local lives in the heap-allocated state-machine frame and must be
+//   disposed on EVERY completion path: normal return, fault/exception,
+//   abandonment (the Task dropped without being awaited to completion — §30.5
+//   "Disposing an unconsumed `OwnedTask<T>`"), and cancellation (§30.8,
+//   observed at an await as `OperationCanceledException` — §30.9).
+//
+//   This is represented by:
+//     (a) a SuspendLocal ANNOTATION on the owned local's LocalOwnership
+//         (the `suspendLocal` flag), computed by live-range-across-await; and
+//     (b) SYNTHETIC COMPLETION EDGES in the CFG (CFGBlock::completionSuccs),
+//         added from each await-bearing block to the function exit, which the
+//         dataflow gives the SAME frame-disposal treatment it already gives
+//         the §28.3 exception-path edges — a still-owned suspend-local on a
+//         completion edge is dropped from the meet (the frame disposed it),
+//         not reported as a leak.
+//
+//   The lattice (OwnershipState) is DELIBERATELY UNCHANGED. A suspend-local's
+//   static disposal obligations are identical to an ordinary owned local's —
+//   it must be discharged on the normal path (the existing §28.3 check) and is
+//   auto-disposed by the frame on the abandonment/cancellation/exception
+//   completion edges (the existing exception-path-discharge machinery, now
+//   also fed the synthetic completion edges). Adding a new lattice value
+//   (e.g. `SuspendOwned`) was the alternative considered and REJECTED: it
+//   would force every join/meet, every transfer function, and every existing
+//   diagnostic to learn about the new state for no behavioural gain — the
+//   "disposed on every completion path" property is already expressible as
+//   "discharged on the normal path + discharged on each completion edge,"
+//   which the annotation (for codegen's benefit) + synthetic edges (for the
+//   analysis) capture without disturbing the proven lattice. Keeping the
+//   lattice fixed is also what makes this increment ADDITIVE: a synchronous
+//   body sees neither the annotation nor the synthetic edges.
+//
+//   The annotation is the contract the async-codegen milestone implements
+//   against (which locals go in the frame; which completion paths dispose
+//   them). For the ownership pass itself it is informational — the
+//   diagnostics flow from the unchanged lattice plus the completion edges.
+
+MethodOwnership::AwaitTaskKind
+MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
+    if (!await.operand) return AwaitTaskKind::NotTask;
+    // 3b attached the operand's resolved task type. A `Task` / `Task<T>` /
+    // `OwnedTask<T>` is a Named TypeRef whose single-part name head is the
+    // task class. // per §30.3
+    const sema::TypeRef* ot = ctx_.exprType(*await.operand);
+    if (!ot || ot->kind != sema::TypeRef::Kind::Named || ot->nullable)
+        return AwaitTaskKind::NotTask;
+    if (!ot->astNode || !ot->astNode->name ||
+        ot->astNode->name->parts.size() != 1)
+        return AwaitTaskKind::NotTask;
+    std::string_view head = ot->astNode->name->parts.front();
+    // True when the result type argument T is a CLASS — the gate that selects
+    // Pattern A/B over the no-obligation value/string/runtime-managed forms
+    // (§30.5 producer-side rules). A null declaration (built-in / generic
+    // argument) is conservatively treated as NOT a class, so the site rule is
+    // not over-applied to an instantiation the pass cannot resolve. // per §30.5
+    auto resultIsClass = [&]() -> bool {
+        if (ot->genericArgs.empty() || !ot->genericArgs.front()) return false;
+        const sema::TypeRef* arg = ot->genericArgs.front();
+        if (arg->kind != sema::TypeRef::Kind::Named || !arg->declaration)
+            return false;
+        return arg->declaration->kind == ast::TypeDeclKind::Class;
+    };
+    if (head == "Task") {
+        if (ot->genericArgs.empty()) return AwaitTaskKind::UnitTask;
+        return resultIsClass() ? AwaitTaskKind::PatternA
+                               : AwaitTaskKind::ValueResult;
+    }
+    if (head == "OwnedTask") {
+        // `OwnedTask<T>` is a compile error for non-class T (sema §14.4); when
+        // it reaches here for class T it is Pattern B.
+        return resultIsClass() ? AwaitTaskKind::PatternB
+                               : AwaitTaskKind::NotTask;
+    }
+    return AwaitTaskKind::NotTask;
+}
+
+bool MethodOwnership::awaitOperandIsOwningLocation(
+    const ast::Expr& taskExpr) {
+    // §30.5 Pattern A admitted owning locations. Classified by the operand's
+    // DECLARATION (not by the transient dataflow state) so the result is
+    // stable regardless of where in the analysis it is queried:
+    //
+    //   - a `using var`/`await using var`-bound local of `Task<T>` — the
+    //     canonical form (LocalSymbol::isUsing). Its scope-end disposal bounds
+    //     the borrow the await produces.
+    //   - an `owned`/`out owned` parameter (its lifetime spans the body); a
+    //     plain BORROW parameter is admitted too — its source is the caller's
+    //     frame, which outlives the body, so the borrow cannot dangle.
+    //   - a for-loop iteration variable `for var task in tasks` (a LocalSymbol
+    //     whose declaration is NOT a `using` LocalDecl and not the producer-
+    //     bound plain `var`): the loop var borrows from the iterated
+    //     collection, which bounds it.
+    //   - an `owned` field of `this` (exprIsOwnedFieldRead).
+    //   - an owning-collection indexer slot `coll[i]` (indexerSetterTakesOwned).
+    //
+    // A plain `var t := <producer>()` (a non-`using` LocalDecl with an
+    // initializer) is NOT an owning location — it is the bare-producer form the
+    // rule rejects, just expressed through one binding; the borrow it would
+    // yield has no bounded source. // per §30.5
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&taskExpr)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            // Any parameter (owned, out-owned, or plain borrow) is an owning
+            // location: its storage outlives the body. // per §30.5
+            return true;
+        }
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            if (ls->isUsing) return true;  // `using var` task local
+            // A for-loop iteration variable's LocalSymbol declaration is not a
+            // `LocalDecl` (it is introduced by the ForStmt); admit it. A plain
+            // `var t := producer()` is a LocalDecl WITH an initializer — NOT an
+            // owning location.
+            const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+            if (!ld) return true;            // iteration variable (or similar)
+            if (!ld->initializer) return true;  // `var t: Task<T>;` slot, owned by scope
+            return false;                    // plain producer-bound `var`
+        }
+        // Not a local/parameter (e.g. a bare field) — owned-field read?
+        return exprIsOwnedFieldRead(taskExpr);
+    }
+    // `obj.f` owned-field read, or `this.f`.
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&taskExpr)) {
+        return exprIsOwnedFieldRead(taskExpr);
+    }
+    // `coll[i]` on an owning collection.
+    if (dynamic_cast<const ast::IndexExpr*>(&taskExpr)) {
+        return indexerSetterTakesOwned(taskExpr);
+    }
+    // Anything else — a bare producer call, an arbitrary expression — is NOT
+    // a syntactically-visible owning location. // per §30.5
+    return false;
+}
+
+const ast::UnaryExpr* MethodOwnership::awaitRoot(const ast::Expr& e) {
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e))
+        if (ue->op == "await") return ue;
+    return nullptr;
+}
+
+void MethodOwnership::collectOwnedConsumingAwaits(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    std::unordered_set<const ast::UnaryExpr*>& out) {
+    for (const auto& s : body)
+        if (s) collectOwnedConsumingAwaitsStmt(*s, out);
+}
+
+void MethodOwnership::collectOwnedConsumingAwaitsStmt(
+    const ast::Stmt& s, std::unordered_set<const ast::UnaryExpr*>& out) {
+    // §30.5 owned-consuming contexts where a Pattern B `await` is the
+    // IMMEDIATE value. Recurse into nested blocks so awaits in branches/loops
+    // are classified too.
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        // `using var x := await ...`, `await using var x := await ...`, and
+        // plain `var x := await ...` are all owned-consuming (§30.5: a
+        // `using var`/`await using var` RHS, and `var x := <owned>` which
+        // introduces an owned local). // per §30.5
+        if (ld->initializer)
+            if (auto* a = awaitRoot(*ld->initializer)) out.insert(a);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // `target := await ...` is owned-consuming when the target is an owned
+        // storage location — a local (re-assigned owned local), an `owned`
+        // field, or an owning-collection slot. We admit a plain local target
+        // (parallels `var x := <owned>`) and the owned-field / owned-slot
+        // targets the §28.3/§28.11 rules already treat as owned sinks.
+        // // per §30.5, §28.3, §28.11
+        if (as->op == ":=" && as->value) {
+            if (auto* a = awaitRoot(*as->value)) {
+                bool ownedTarget =
+                    as->target &&
+                    (dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) ||
+                     targetIsOwnedField(*as->target) ||
+                     indexerSetterTakesOwned(*as->target));
+                if (ownedTarget) out.insert(a);
+            }
+        }
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        // `return await ...` — owned-consuming when the method's return type
+        // carries ownership (an `owned T` / `OwnedTask<T>` return). The
+        // enclosing method is the one being analysed; an async method whose
+        // result is Pattern B forwards the owned result (§30.5 line ~6143).
+        // We admit `return await ...` unconditionally: a `return` of an owned
+        // value is an owned-consuming position by definition, and a Pattern A
+        // `return await Producer()` is also explicitly admitted (§30.5 line
+        // ~6068) — recorded in returnPositionAwaits_ so the Pattern A site
+        // check admits the bare-producer operand in that one position.
+        // // per §30.5
+        if (rs->value)
+            if (auto* a = awaitRoot(*rs->value)) {
+                out.insert(a);
+                returnPositionAwaits_.insert(a);
+            }
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        // `yield return await ...` in an owned-yielding iterator (§30.5 line
+        // ~6106). Admitted as an owned-consuming position. // per §30.5
+        if (ys->value)
+            if (auto* a = awaitRoot(*ys->value)) out.insert(a);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        // `coll.Add(await ...)` / `M(await ...)` where the formal is `owned`:
+        // the `await` is an argument bound to an owned parameter — an
+        // owned-consuming position (§30.5). Recognise the owned-argument shape.
+        if (es->expr) collectOwnedConsumingInExpr(*es->expr, out);
+        return;
+    }
+    // Recurse into control-flow blocks.
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        collectOwnedConsumingAwaits(ifs->ifBranch.body, out);
+        for (const auto& el : ifs->elifBranches)
+            collectOwnedConsumingAwaits(el.body, out);
+        collectOwnedConsumingAwaits(ifs->elseBody, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        collectOwnedConsumingAwaits(ws->body, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        collectOwnedConsumingAwaits(fs->body, out);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        collectOwnedConsumingAwaits(dob->body, out);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        collectOwnedConsumingAwaits(ts->body, out);
+        for (const auto& arm : ts->catches)
+            if (arm.body) collectOwnedConsumingAwaitsStmt(*arm.body, out);
+        collectOwnedConsumingAwaits(ts->finallyBody, out);
+        return;
+    }
+}
+
+// §30.5: an `await` passed as an `owned` argument is in an owned-consuming
+// context. Walk a call expression's arguments and record any await bound to
+// an `owned` formal (user `owned` param or a built-in owning-collection
+// owned-sink method). Recurse into the callee/receiver so a chained call's
+// inner await is examined too. // per §30.5
+void MethodOwnership::collectOwnedConsumingInExpr(
+    const ast::Expr& e, std::unordered_set<const ast::UnaryExpr*>& out) {
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        std::size_t pos = 0;
+        for (const auto& a : call->args) {
+            if (a.value) {
+                if (auto* aw = awaitRoot(*a.value)) {
+                    const bool ownedSink =
+                        a.modifier == "owned" ||
+                        isImplicitOwned(call->args, pos, call->callee.get()) ||
+                        builtinOwnedSinkArg(call->callee.get(), pos);
+                    if (ownedSink) out.insert(aw);
+                }
+                collectOwnedConsumingInExpr(*a.value, out);
+            }
+            ++pos;
+        }
+        if (call->callee) collectOwnedConsumingInExpr(*call->callee, out);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        // `new T(owned await ...)` — a ctor `owned` param argument.
+        const ast::ConstructorDecl* cd = nullptr;
+        if (ne->type) {
+            if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                if (rt->declaration) {
+                    std::size_t nArgs = ne->args.size();
+                    for (sema::Symbol* m : rt->declaration->members) {
+                        if (auto* cs =
+                                dynamic_cast<sema::ConstructorSymbol*>(m)) {
+                            auto* d = dynamic_cast<const ast::ConstructorDecl*>(
+                                cs->decl);
+                            if (d && d->params.size() == nArgs) { cd = d; break; }
+                        }
+                    }
+                }
+            }
+        }
+        std::size_t pos = 0;
+        for (const auto& a : ne->args) {
+            if (a.value) {
+                if (auto* aw = awaitRoot(*a.value)) {
+                    bool ownedSink = a.modifier == "owned" ||
+                        (cd && pos < cd->params.size() &&
+                         (cd->params[pos].modifier == "owned" ||
+                          cd->params[pos].modifier == "out owned"));
+                    if (ownedSink) out.insert(aw);
+                }
+                collectOwnedConsumingInExpr(*a.value, out);
+            }
+            ++pos;
+        }
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) collectOwnedConsumingInExpr(*ma->target, out);
+        return;
+    }
+}
+
+void MethodOwnership::checkAwaitSites(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::unordered_set<const ast::UnaryExpr*> consuming;
+    returnPositionAwaits_.clear();
+    collectOwnedConsumingAwaits(body, consuming);  // also fills returnPositionAwaits_
+    for (const auto& s : body)
+        if (s) checkAwaitSitesStmt(*s, consuming);
+}
+
+void MethodOwnership::checkAwaitSitesStmt(
+    const ast::Stmt& s,
+    const std::unordered_set<const ast::UnaryExpr*>& consuming) {
+    // Walk every statement's expressions for awaits, and recurse into nested
+    // blocks. Mirrors the structural recursion the other whole-body walks use.
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) checkAwaitSitesExpr(*ld->initializer, consuming);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) checkAwaitSitesExpr(*es->expr, consuming);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) checkAwaitSitesExpr(*ds->value, consuming);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->value) checkAwaitSitesExpr(*as->value, consuming);
+        if (as->target) checkAwaitSitesExpr(*as->target, consuming);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) checkAwaitSitesExpr(*rs->value, consuming);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (th->value) checkAwaitSitesExpr(*th->value, consuming);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) checkAwaitSitesExpr(*ys->value, consuming);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            checkAwaitSitesExpr(*ifs->ifBranch.condition, consuming);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) checkAwaitSitesStmt(*bs, consuming);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) checkAwaitSitesExpr(*el.condition, consuming);
+            for (const auto& bs : el.body)
+                if (bs) checkAwaitSitesStmt(*bs, consuming);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) checkAwaitSitesStmt(*bs, consuming);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) checkAwaitSitesExpr(*ws->condition, consuming);
+        for (const auto& bs : ws->body)
+            if (bs) checkAwaitSitesStmt(*bs, consuming);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) checkAwaitSitesExpr(*fs->iterable, consuming);
+        for (const auto& bs : fs->body)
+            if (bs) checkAwaitSitesStmt(*bs, consuming);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body)
+            if (bs) checkAwaitSitesStmt(*bs, consuming);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : ts->body)
+            if (bs) checkAwaitSitesStmt(*bs, consuming);
+        for (const auto& arm : ts->catches)
+            if (arm.body) checkAwaitSitesStmt(*arm.body, consuming);
+        for (const auto& bs : ts->finallyBody)
+            if (bs) checkAwaitSitesStmt(*bs, consuming);
+        return;
+    }
+}
+
+void MethodOwnership::checkAwaitSitesExpr(
+    const ast::Expr& e,
+    const std::unordered_set<const ast::UnaryExpr*>& consuming) {
+    // Diagnose this await (if it is one), then recurse into sub-expressions so
+    // a nested await (`Process(await t)`, `a + await t`) is examined too.
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->op == "await") {
+            AwaitTaskKind k = awaitTaskKind(*ue);
+            if (k == AwaitTaskKind::PatternA) {
+                // §30.5: the awaited `Task<T>` (class T) must be in an owning
+                // location — OR the await is a `return await Producer()`, the
+                // one admitted bare-producer Pattern A position (§30.5 line
+                // ~6068, recorded in returnPositionAwaits_). // per §30.5
+                if (returnPositionAwaits_.count(ue) == 0 &&
+                    (!ue->operand ||
+                     !awaitOperandIsOwningLocation(*ue->operand))) {
+                    report(
+                        Severity::Error, ue->span.begin,
+                        "awaiting a class-typed `Task<T>` (Pattern A) requires "
+                        "the awaited task to occupy a syntactically-visible "
+                        "owning location — a `using var`-bound task local, an "
+                        "`owned` parameter, an `owned` field, or an owning-"
+                        "collection slot — so the borrowed result has a source "
+                        "(§30.5; bind the producer first: `using var t := "
+                        "Producer(); var r := await t;`)");
+                }
+            } else if (k == AwaitTaskKind::PatternB) {
+                // §30.5: the awaited `OwnedTask<T>` must be in an owned-
+                // consuming context, else its transferred result is dropped.
+                // // per §30.5
+                if (consuming.count(ue) == 0) {
+                    report(
+                        Severity::Error, ue->span.begin,
+                        "awaiting an `OwnedTask<T>` (Pattern B) must appear in "
+                        "an owned-consuming context — a `using var`/`var` "
+                        "binding, an `owned` argument, an owned-field/owned-slot "
+                        "assignment, or an owned `return` — otherwise the "
+                        "ownership-transferring result is dropped without "
+                        "disposal (§30.5; the canonical form is `using var x := "
+                        "await ...`)");
+                }
+            }
+            // UnitTask / ValueResult / NotTask carry no obligation at the site.
+        }
+        if (ue->operand) checkAwaitSitesExpr(*ue->operand, consuming);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) checkAwaitSitesExpr(*be->left, consuming);
+        if (be->right) checkAwaitSitesExpr(*be->right, consuming);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) checkAwaitSitesExpr(*ma->target, consuming);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) checkAwaitSitesExpr(*nm->target, consuming);
+        return;
+    }
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (call->callee) checkAwaitSitesExpr(*call->callee, consuming);
+        for (const auto& a : call->args)
+            if (a.value) checkAwaitSitesExpr(*a.value, consuming);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) checkAwaitSitesExpr(*nc->callee, consuming);
+        for (const auto& a : nc->args)
+            if (a.value) checkAwaitSitesExpr(*a.value, consuming);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) checkAwaitSitesExpr(*ix->target, consuming);
+        for (const auto& a : ix->indices)
+            if (a.value) checkAwaitSitesExpr(*a.value, consuming);
+        return;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (bg->operand) checkAwaitSitesExpr(*bg->operand, consuming);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) checkAwaitSitesExpr(*a.value, consuming);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) checkAwaitSitesExpr(*cd->condition, consuming);
+        if (cd->thenValue) checkAwaitSitesExpr(*cd->thenValue, consuming);
+        if (cd->elseValue) checkAwaitSitesExpr(*cd->elseValue, consuming);
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (te->operand) checkAwaitSitesExpr(*te->operand, consuming);
+        return;
+    }
+    // A LambdaExpr is its own async scope (§30.6) — its awaits are checked when
+    // its body is analysed, not here. Other leaf expressions hold no awaits.
+}
+
+void MethodOwnership::recordAwaitOperandConsume(
+    const ast::Expr& awaitOperand, SourceLocation loc) {
+    // §30.5 line ~6110: the Pattern B await is owned-consuming with respect to
+    // its operand. When the operand is a bare owned task LOCAL, the await
+    // consumes (disposes) it. Marking it Disposed makes a straight-line SECOND
+    // `await t` of the same bound local a read of a consumed value — the
+    // statically-detectable slice of the §30.4 single-consumer rule. Only the
+    // bare-identifier owned-local form is handled (an owned PARAMETER or a
+    // producer-call operand has no single local to spend a second time in
+    // straight-line code; the general aliased / cross-method second await is
+    // not statically preventable per Appendix C.6). // per §30.5, §30.4
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&awaitOperand);
+    if (!id) return;
+    LocalOwnership* st = lookupState(id->name);
+    if (!st) return;
+    if (st->state == OwnershipState::Disposed ||
+        st->state == OwnershipState::MovedFrom) {
+        // The task local was already consumed by an earlier await — this is the
+        // double-consume. // per §30.5, §30.4
+        report(
+            Severity::Error, loc,
+            std::string("`OwnedTask<T>` `") + std::string(id->name) +
+            "` was already awaited (consumed) — an `OwnedTask<T>` is "
+            "single-consumer; awaiting it again moves out an already-moved "
+            "result (§30.5 / §30.4)");
+        st->state = OwnershipState::Poisoned;
+        return;
+    }
+    // Mark the owned task local consumed by the await's implicit disposal
+    // (§30.5: the implicit task-disposal IS the discharge). A `using var` task
+    // local goes to Disposed without complaint (markDisposedByName tolerates
+    // the using-var implicit-discharge state); a plain owned local likewise.
+    if (st->state == OwnershipState::Owned)
+        st->state = OwnershipState::Disposed;
+}
+
+void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {
+    // §30.5 / §30.9: an owned local is a suspend-local when its live range
+    // crosses an `await`. The CFG (3a) records, per block, the await sites it
+    // contains (`awaitSites`). A precise live-range computation is the codegen
+    // milestone's concern; for the annotation it is sufficient — and sound for
+    // the "store in the frame / dispose on every completion path" decision — to
+    // mark every owned local whose DECLARATION lexically precedes an await and
+    // whose discharge does not precede that await within the same block. Since
+    // the annotation is informational for the ownership pass (the diagnostics
+    // flow from the lattice + completion edges), we use a conservative
+    // syntactic approximation: a local declared before any await-bearing block
+    // (in CFG order) is a candidate suspend-local. The flag is set on the
+    // declaration's LocalOwnership as it is created in handleLocalDecl; here we
+    // pre-seed the set of locals that are "in scope at some await" for that
+    // handler to consult. Kept deliberately simple: over-marking a local as a
+    // suspend-local is safe (it only over-includes a local in the frame), and
+    // the precise liveness is the codegen milestone's contract.
+    //
+    // Implementation: collect every LocalDecl that textually appears before an
+    // await in the body's statement stream, by walking blocks and noting,
+    // once any await has been seen, that subsequently-encountered locals are
+    // NOT suspend-locals for an EARLIER await but locals seen before remain.
+    // We mark on the actual LocalOwnership lazily in the dataflow; to keep this
+    // additive and avoid threading state, we record the declaring nodes in a
+    // member set the handler reads. (No behaviour depends on it beyond the
+    // annotation, so the approximation does not affect diagnostics.)
+    suspendLocalDecls_.clear();
+    bool sawAwait = false;
+    // Walk blocks in allocation order; a LocalDecl encountered before the first
+    // await-bearing position is potentially live across it. We collect decls in
+    // the prefix up to (and including the block of) each await. The simplest
+    // sound over-approximation: any local whose decl is in a block at or before
+    // an await-bearing block is a suspend-local candidate.
+    // First pass: find whether the body has any await at all.
+    for (const auto& bp : cfg.blocks())
+        if (flow::CFG::hasAwaitSites(bp.get())) { sawAwait = true; break; }
+    if (!sawAwait) return;  // no suspend points → no suspend-locals
+    // Collect, per block, the LocalDecls it declares; then for each await-
+    // bearing block, every local declared in a block that can reach it is a
+    // suspend-local candidate. Using "declared in allocation order before the
+    // last await block" as the over-approximation keeps this simple and sound.
+    std::size_t lastAwaitIdx = 0, idx = 0;
+    std::vector<const flow::CFGBlock*> order;
+    for (const auto& bp : cfg.blocks()) order.push_back(bp.get());
+    for (idx = 0; idx < order.size(); ++idx)
+        if (flow::CFG::hasAwaitSites(order[idx])) lastAwaitIdx = idx;
+    for (idx = 0; idx <= lastAwaitIdx && idx < order.size(); ++idx) {
+        for (const ast::Stmt* st : order[idx]->stmts) {
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(st))
+                suspendLocalDecls_.insert(ld);
+        }
+    }
+}
+
+void MethodOwnership::addCompletionEdges(flow::CFG& cfg) {
+    // §30.5 / §30.8 / §30.9: from each await-bearing block, the task can
+    // complete via abandonment or cancellation, on which the state-machine
+    // frame disposes its suspend-locals. Represent that with a synthetic
+    // completion edge from the await-bearing block to the function exit, so the
+    // dataflow gives a still-owned suspend-local arriving on that edge the same
+    // frame-disposal treatment as the §28.3 exception-path edges (dropped from
+    // the meet, not reported as a leak).
+    //
+    // The edge is added ONLY from an await-bearing block that does NOT already
+    // reach the exit by a normal (fall-off / return) edge. Rationale: a block
+    // that already has a normal edge to exit has its NORMAL-completion path
+    // analysed there, which is the strictest obligation — the author must
+    // discharge owned locals on it. The abandonment/cancellation completion at
+    // such a terminal block is subsumed (the frame would dispose whatever is
+    // live, but the normal path already requires it). Adding a *parallel*
+    // completion edge to exit there would create two same-target edges of
+    // different kinds, which the set-membership edge-kind predicate cannot tell
+    // apart — it would mis-classify the normal edge as a discharge edge and
+    // MASK a real normal-path leak. So the synthetic edge is added only where
+    // it is meaningful and unambiguous: an await block whose control flows
+    // ONWARD (into later blocks), where the completion edge represents "the
+    // task could be abandoned/cancelled at this await before reaching the later
+    // disposal," and contributes a pure-discharge (subset) state to the exit
+    // meet. There it changes no leak diagnostic (the onward normal path still
+    // governs), but it materialises the abandonment/cancellation exit in the
+    // CFG as the recorded model the async-codegen milestone consumes.
+    // // per §30.5, §30.8, §30.9
+    flow::CFGBlock* exit = cfg.exit();
+    auto hasNormalEdgeToExit = [&](const flow::CFGBlock* b) {
+        for (const flow::CFGBlock* s : b->succs)
+            if (s == exit && !flow::CFG::isExceptionEdge(b, exit) &&
+                !flow::CFG::isCompletionEdge(b, exit))
+                return true;
+        return false;
+    };
+    for (const auto& bp : cfg.blocks()) {
+        flow::CFGBlock* b = bp.get();
+        if (b == exit) continue;
+        if (flow::CFG::hasAwaitSites(b) && !hasNormalEdgeToExit(b))
+            cfg.addCompletionEdge(b, exit);
     }
 }
 

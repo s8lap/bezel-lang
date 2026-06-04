@@ -21,7 +21,8 @@ namespace bezel::ownership {
 // checkOwnership entry point and its supporting free functions.
 
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
-         const std::vector<sema::Symbol*>* paramSyms) {
+         const std::vector<sema::Symbol*>* paramSyms, bool isAsync) {
+    isAsync_ = isAsync;
     // Issue #392 / §31.1: collect this method's catch-bound exception
     // variables before the dataflow runs. Each is a borrow of the in-flight
     // exception whose lifetime is its arm body; the escape machinery consults
@@ -56,6 +57,16 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // that reaches exit only via a throw has been dropped from `endState`
     // and does not trip the undischarged check below.
     auto cfg = flow::buildCFG(body, /*treatTryAsOpaque=*/false);
+    // Async-readiness 3c (§30.5 / §30.9): before the dataflow runs, classify
+    // each owned local as suspend-local (live range crosses an await) and add
+    // the synthetic completion edges (abandonment / cancellation exits) so a
+    // suspend-local gets the §30.5 frame-disposal treatment on those edges.
+    // Both are additive and gated on `isAsync_`; for a synchronous body the
+    // CFG is identical and `annotateSuspendLocals` is a no-op (no await sites).
+    if (isAsync_) {
+        annotateSuspendLocals(*cfg);
+        addCompletionEdges(*cfg);
+    }
     BlockState endState = runDataflow(*cfg, entry);
     // §28.3 "Owned-local discharge requirement": an owned local must reach
     // an owned slot (or be disposed) before it goes out of scope on a
@@ -98,6 +109,19 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 "` left in moved-from state at method exit "
                 "(§28.8.1 — reassign the field before exiting)");
         }
+    }
+    // Async-readiness 3c (§30.5 Consumer-side; Appendix C.6): the at-await-site
+    // Pattern A / Pattern B enforcement. A single syntactic walk over the body
+    // examines each await once (no fixpoint, so no diagnostic duplication) and
+    // reports a Pattern A await whose operand is not an admitted owning
+    // location, and a Pattern B await not in an owned-consuming context. Gated
+    // on `isAsync_` — a synchronous body never reaches it. The dataflow above
+    // already enforces the across-suspend NORMAL-path discharge (suspend-locals
+    // are ordinary owned locals in the lattice) and the Pattern B operand-
+    // consume double-await (recordAwaitOperandConsume runs inside the transfer
+    // functions). // per §30.5
+    if (isAsync_) {
+        checkAwaitSites(body);
     }
 }
 
@@ -373,16 +397,29 @@ BlockState MethodOwnership::runDataflow(
         // a local that is still Owned on a normal-exit edge into `b` seeds
         // the meet result and survives the union with the exception edges
         // that dropped it — preserving a real normal-path leak (§28.6).
-        auto foldPred = [&](const flow::CFGBlock* p, bool excEdge) {
+        //
+        // Async-readiness 3c (§30.5 / §30.8): a synthetic COMPLETION edge
+        // (abandonment / cancellation) gets the SAME discharge treatment — the
+        // state-machine frame disposes every owned suspend-local it holds, so
+        // a still-owned local arriving via a completion edge is dropped from
+        // the meet (the frame disposed it), exactly as on an exception edge.
+        // Both are "discharge edges." The §28.6 ordering still holds: normal
+        // predecessors are folded first, so a real NORMAL-path leak survives
+        // the union with the completion/exception edges that dropped the local.
+        auto isDischargeEdge = [&](const flow::CFGBlock* p) {
+            return flow::CFG::isExceptionEdge(p, b) ||
+                   flow::CFG::isCompletionEdge(p, b);
+        };
+        auto foldPred = [&](const flow::CFGBlock* p, bool dischargeEdge) {
             if (!evaluated.count(p)) return;
             const bool loopEdge =
                 backEdges.count({p, b}) != 0 || isLoopSkipEdge(p, b);
             const BlockState& peRaw = exitState[p];
             BlockState peDischarged;
-            if (excEdge)
+            if (dischargeEdge)
                 peDischarged =
                     dischargeOnExceptionEdge(peRaw, unwoundDeclsFor(b));
-            const BlockState& pe = excEdge ? peDischarged : peRaw;
+            const BlockState& pe = dischargeEdge ? peDischarged : peRaw;
             if (!haveIn) {
                 in = pe;
                 haveIn = true;
@@ -393,9 +430,9 @@ BlockState MethodOwnership::runDataflow(
             }
         };
         for (const flow::CFGBlock* p : b->preds)
-            if (!flow::CFG::isExceptionEdge(p, b)) foldPred(p, false);
+            if (!isDischargeEdge(p)) foldPred(p, false);
         for (const flow::CFGBlock* p : b->preds)
-            if (flow::CFG::isExceptionEdge(p, b)) foldPred(p, true);
+            if (isDischargeEdge(p)) foldPred(p, true);
         return in;
     };
 
@@ -456,14 +493,14 @@ BlockState MethodOwnership::runDataflow(
     // discharge), so the throw path never produces a leak diagnostic.
     BlockState endState;
     bool haveEnd = false;
-    auto foldExitPred = [&](const flow::CFGBlock* p, bool excEdge) {
+    auto foldExitPred = [&](const flow::CFGBlock* p, bool dischargeEdge) {
         if (!evaluated.count(p)) return;
         const BlockState& peRaw = exitState[p];
         BlockState peDischarged;
-        if (excEdge)
+        if (dischargeEdge)
             peDischarged =
                 dischargeOnExceptionEdge(peRaw, unwoundDeclsFor(cfg.exit()));
-        const BlockState& pe = excEdge ? peDischarged : peRaw;
+        const BlockState& pe = dischargeEdge ? peDischarged : peRaw;
         if (!haveEnd) {
             endState = pe;
             haveEnd = true;
@@ -472,13 +509,49 @@ BlockState MethodOwnership::runDataflow(
                      /*unionKeys=*/true);
         }
     };
-    // Normal-exit predecessors first (same rationale as computeEntry: a
-    // normal-path Owned obligation must seed and survive the union with the
-    // exception edges that dropped the local).
-    for (const flow::CFGBlock* p : cfg.exit()->preds)
-        if (!flow::CFG::isExceptionEdge(p, cfg.exit())) foldExitPred(p, false);
-    for (const flow::CFGBlock* p : cfg.exit()->preds)
-        if (flow::CFG::isExceptionEdge(p, cfg.exit())) foldExitPred(p, true);
+    // §28.6 / §30.5: a "discharge edge" to exit is an exception edge (naked
+    // throw → whole-method unwind) OR a synthetic completion edge (async
+    // abandonment / cancellation → state-machine frame disposes its
+    // suspend-locals). Both drop their owned locals. To preserve a real
+    // NORMAL-path leak, each UNIQUE predecessor block is folded ONCE: as a
+    // normal edge when it has any non-discharge edge to exit (so its
+    // still-Owned locals seed the meet and survive the union), and as a
+    // discharge edge only when its ONLY edges to exit are discharge edges (a
+    // block whose sole exit path is a throw, or an await block whose control
+    // flows onward but which the frame could abandon here). This dedup matters
+    // for an async fall-off block that has BOTH a normal edge (the real
+    // normal-completion path, which must catch an undischarged owned local)
+    // and a synthetic completion edge: classifying it as normal preserves the
+    // normal-path leak. Normal predecessors are folded first (same §28.6
+    // ordering as computeEntry). // per §28.6, §30.5
+    auto exitEdgeIsDischargeOnly = [&](const flow::CFGBlock* p) {
+        // True when p reaches exit ONLY via discharge edges (no plain edge).
+        bool hasNormal = false, hasDischarge = false;
+        for (const flow::CFGBlock* s : p->succs) {
+            if (s != cfg.exit()) continue;
+            if (flow::CFG::isExceptionEdge(p, cfg.exit()) ||
+                flow::CFG::isCompletionEdge(p, cfg.exit()))
+                hasDischarge = true;
+            else
+                hasNormal = true;
+        }
+        return hasDischarge && !hasNormal;
+    };
+    std::unordered_set<const flow::CFGBlock*> foldedExitPred;
+    // Pass 1: blocks that reach exit via a normal edge (fold as normal — seeds
+    // and preserves any normal-path Owned obligation).
+    for (const flow::CFGBlock* p : cfg.exit()->preds) {
+        if (exitEdgeIsDischargeOnly(p)) continue;
+        if (!foldedExitPred.insert(p).second) continue;
+        foldExitPred(p, /*dischargeEdge=*/false);
+    }
+    // Pass 2: blocks whose ONLY exit edges are discharge edges (fold as
+    // discharge — their owned locals are auto-disposed on that exit).
+    for (const flow::CFGBlock* p : cfg.exit()->preds) {
+        if (!exitEdgeIsDischargeOnly(p)) continue;
+        if (!foldedExitPred.insert(p).second) continue;
+        foldExitPred(p, /*dischargeEdge=*/true);
+    }
     if (!haveEnd) {
         // No path reaches exit. Fall back to the entry-block exit state.
         auto it = exitState.find(cfg.entry());
@@ -620,6 +693,22 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) {
         return OwnershipState::PolyNull;
     }
+    // Async-readiness 3c (§30.5 Pattern B): `await <OwnedTask<T>>` for class T
+    // produces an OWNED value — ownership transfers from the task to the
+    // awaiter. The standard §28.3 owned-local discharge rules then apply to the
+    // binding (§30.5 line ~6148: "`x` is an owned local subject to standard
+    // discharge rules"). A Pattern A `await <Task<T>>` (class T) and a value/
+    // unit await carry no obligation and fall through to Borrowed. The await is
+    // only owned-producing in an async body (3b only types awaits there); the
+    // kind classifier reads the operand's resolved task type. // per §30.5
+    if (isAsync_) {
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            if (ue->op == "await" &&
+                awaitTaskKind(*ue) == AwaitTaskKind::PatternB) {
+                return OwnershipState::Owned;
+            }
+        }
+    }
     // Slice O13: a call to a method with an `owned T` return type
     // produces an Owned value. The callee MethodSymbol resolution
     // comes from sema; we look at its MethodDecl::returnOwned to
@@ -657,7 +746,27 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     } else {
         lo.state = OwnershipState::Uninitialized;
     }
+    // Async-readiness 3c (§30.5 / §30.9): set the SuspendLocal annotation when
+    // this owned local's declaration was classified (by annotateSuspendLocals)
+    // as live across an await. Informational for the ownership pass — the
+    // recorded contract for the async-codegen milestone (which locals go in the
+    // state-machine frame). Only ever set in an async body. // per §30.5
+    if (suspendLocalDecls_.count(&ld)) lo.suspendLocal = true;
     states_[lsym] = lo;
+    // Async-readiness 3c (§30.5 line ~6110): a `using var`/`var` initializer
+    // `:= await <bound owned task local>` consumes that operand task local
+    // (the Pattern B await is owned-consuming with respect to its operand).
+    // Record the consume so a straight-line second await of the same local is
+    // a read-after-consume. Done before the source-tracking below so the
+    // operand's state reflects the consume. // per §30.5
+    if (isAsync_ && ld.initializer) {
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(ld.initializer.get())) {
+            if (ue->op == "await" && ue->operand &&
+                awaitTaskKind(*ue) == AwaitTaskKind::PatternB) {
+                recordAwaitOperandConsume(*ue->operand, ue->span.begin);
+            }
+        }
+    }
     // Slice O8: if the initializer involves `move this.field`, mark
     // the field as moved-from (the move side-effect happens at
     // initializer evaluation time, regardless of the local's `using`
@@ -831,11 +940,22 @@ const std::vector<sema::Symbol*>* paramSymsOf(
     return nullptr;
 }
 
+// Async-readiness 3c (§30.1): true when a method's `static async ...`
+// modifier list contains `async`. The parser records the literal lexemes in
+// MethodDecl::modifiers; sema validates the legal combinations. Constructors,
+// destructors, and operators cannot be `async` (§30.1), so only MethodDecl is
+// asked. // per §30.1
+bool methodIsAsync(const ast::MethodDecl& md) {
+    for (std::string_view mod : md.modifiers)
+        if (mod == "async") return true;
+    return false;
+}
+
 void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
-            mo.run(md->stmts, paramSymsOf(m, ctx));
+            mo.run(md->stmts, paramSymsOf(m, ctx), methodIsAsync(*md));
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
