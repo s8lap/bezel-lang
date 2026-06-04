@@ -3164,6 +3164,54 @@ void Emitter::unifyMethodReturnTypeArg(
 }
 
 
+llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
+        const ast::Expr& receiver, llvm::Type*& slotTy) {
+    // #415: classify the `.Dispose()` receiver as a slot/field THIS scope owns —
+    // one whose nulling suppresses the only other reclaim of the object — so the
+    // explicit site can reclaim the block once and null the slot (no double-free
+    // with a following auto-dispose). See the helper's declaration for the cases.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&receiver)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            // §28.8: an `owned` parameter carries the disposal obligation. (A
+            // `ref`/`out`/borrow parameter does not — disposing it would free a
+            // value the caller still owns.) Skip `out owned` (by-ref, callee
+            // does not own at the dispose point).
+            if (ps->modifier == "owned") return lvalueAddr(receiver, slotTy);
+            return nullptr;
+        }
+        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+            if (!ld) return nullptr;
+            // A `using var` local is owned by this scope (§28.10). A plain `var`
+            // owned local (init `new C(...)` or an `owned T` return) is owned by
+            // structure — exactly the §28.3 unwind-disposal eligibility. Either
+            // way this scope's slot is the sole other reclaim path; nulling it
+            // after reclaiming makes free happen exactly once. A borrow-
+            // initialized local (no `owned`) returns null — its real owner
+            // reclaims elsewhere, so reclaiming here would double-free.
+            if (loc->isUsing) return lvalueAddr(receiver, slotTy);
+            if (unwindOwnedLocalClass(ld)) return lvalueAddr(receiver, slotTy);
+            return nullptr;
+        }
+        return nullptr;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&receiver)) {
+        // §28.5: an `owned` reference field — disposed with the containing object
+        // by the §28.4-step-2 owned-field auto-dispose, which null-guards its
+        // reload. Reclaiming + nulling the field here makes the explicit
+        // `field.Dispose()` (§28.5 line 5066) free the field once; the auto-
+        // dispose then finds null and skips. A non-owned (borrow) field returns
+        // null — the field's real owner frees it, so reclaiming would double-free.
+        if (auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ma))) {
+            if (isOwnedReferenceField(fs)) return lvalueAddr(receiver, slotTy);
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // Pre-create out var slots so lvalueAddr can find them in all paths.
@@ -3628,7 +3676,53 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             }
                         }
                     } else {
-                        emitDynamicDispose(recv);
+                        // #415 / §28.2 / §28.4: an explicit `.Dispose()` on a
+                        // class/interface instance. After #411 split dispatch
+                        // from reclamation, emitDynamicDispose only DISPATCHES
+                        // the idempotent Dispose (destructor + owned fields +
+                        // base chain, run AT MOST ONCE per object — §28.12 line
+                        // 5624). The block is reclaimed by the OWNING auto-
+                        // dispose site (emitDisposeAndReclaim). So when an owned
+                        // value's ONLY disposal is an explicit `.Dispose()` (a
+                        // plain `var` owned local or `owned` parameter disposed
+                        // via `x.Dispose()`, with no auto-dispose follow), the
+                        // destructor ran but the heap block LEAKED.
+                        //
+                        // Fix: when the receiver is a slot/field this scope OWNS
+                        // — and thus can NULL to block a second reclaim — RECLAIM
+                        // the block here and null that slot, mirroring the auto-
+                        // dispose site (LlvmBackend_Setup.cpp). §28.2: "the first
+                        // call performs the disposal; subsequent calls are no-
+                        // ops" — the run-once flag (§28.12) makes a second
+                        // DISPATCH a no-op, but a second RECLAIM (free) would be
+                        // a double-free, so only the FIRST disposal frees and the
+                        // slot is nulled so a following auto-dispose (using-var
+                        // scope-end, owned-field auto-dispose, unwind) reloads
+                        // null and skips. The scope-end / field / unwind paths
+                        // all null-guard their reload (LlvmBackend_Setup.cpp), so
+                        // free happens EXACTLY ONCE across explicit + auto.
+                        //
+                        // Conservative fallback (per #415): when the receiver is
+                        // NOT a slot this scope owns (a temporary like
+                        // `new R().Dispose()`, a borrow, or a non-owned field) we
+                        // CANNOT null a slot to prevent a second reclaim — a
+                        // borrow's real owner reclaims elsewhere via ITS slot —
+                        // so reclaiming could double-free. Stay dispatch-only for
+                        // those (the destructor still runs idempotently); an
+                        // owned TEMPORARY explicitly disposed (no second reclaim
+                        // path, but no slot to null either) is the deferred sub-
+                        // case noted in #415.
+                        llvm::Type* slotTy = nullptr;
+                        llvm::Value* slot =
+                            explicitDisposeOwnedReceiverSlot(*ma->target,
+                                                             slotTy);
+                        if (slot) {
+                            emitDisposeAndReclaim(recv);
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), slot);
+                        } else {
+                            emitDynamicDispose(recv);
+                        }
                     }
                     return nullptr;
                 }

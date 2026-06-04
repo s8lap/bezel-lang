@@ -2229,16 +2229,33 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // (idempotent) and reclaim the block once, so a `using var` bound to a
         // subclass instance runs the correct runtime Dispose. This scope-end
         // disposal runs exactly once per scope (normal and unwind exits are
-        // mutually exclusive; a break/continue terminates the block first). An
-        // earlier explicit `x.Dispose()` (§28.5 line 5066) only DISPATCHED the
-        // idempotent Dispose (it did not free), so this site reclaims the block
-        // exactly once — no double-free.
+        // mutually exclusive; a break/continue terminates the block first).
         // §27.5: a captured ("boxed") `using var` local lives in a shared
         // heap cell; load the object through the cell, not the cell pointer.
+        // #415 / §28.2 / §28.5 (line 5066): an earlier explicit `x.Dispose()`
+        // now RECLAIMS the block and NULLS this slot (the explicit-dispose
+        // lowering in LlvmBackend_Calls.cpp), so this scope-end site must skip a
+        // null slot — reloading null and calling emitDisposeAndReclaim(null)
+        // would dispatch through a null vtable. Null-guard (mirroring the
+        // dynamicDispose path) and null the slot after reclaim so the object is
+        // freed EXACTLY ONCE across the explicit + scope-end paths (no double-
+        // free): whichever site disposes first reclaims and nulls; the other
+        // finds null and skips.
         llvm::Type* ety = nullptr;
         llvm::Value* addr = boxedStorage(it->slot, ety);
         llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            obj, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* dispBB = llvm::BasicBlock::Create(llvm_, "using.cls.dispose",
+                                                currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "using.cls.cont",
+                                                currentFn_);
+        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.SetInsertPoint(dispBB);
         emitDisposeAndReclaim(obj);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
     }
 }
 
