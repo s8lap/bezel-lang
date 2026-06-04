@@ -2,6 +2,11 @@
 
 namespace bezel::codegen {
 
+// #383 / §28: forward declaration — defined later in this file. A reference
+// TypeRef carrying a vtable (a Named class/interface). Used by the §28.3
+// unwind-disposal eligibility helpers above its definition.
+static bool isClassOrInterfaceRef(const sema::TypeRef* rt);
+
 std::string Emitter::functionName(sema::MethodSymbol* ms) {
     if (isMain(ms)) return "main";
     std::string cls = ms->parent ? std::string(ms->parent->name) : "";
@@ -307,7 +312,13 @@ void Emitter::declareFunctions() {
         staticCtors_.push_back({cs, fn});
     }
 
-    // CG13: declare a Dispose function `void(this)` for every class.
+    // CG13 / §28.2: declare, for every class, the public idempotent Dispose
+    // `void(this)` (vtable slot 1) AND an unguarded "DisposeCore" that runs the
+    // destructor + owned-field auto-disposal + base-core chain. The public
+    // Dispose flag-guards a single call to its core (run-once, §28.6); the base
+    // chain (§28.4 step 3) targets the base CORE so the per-object flag — set
+    // once at the most-derived public entry — never short-circuits a base
+    // level's destructor.
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
@@ -317,6 +328,10 @@ void Emitter::declareFunctions() {
             fnType, llvm::Function::ExternalLinkage,
             "bz$" + std::string(ts->name) + "$Dispose", module_.get());
         disposerFns_[ts] = fn;
+        auto* coreFn = llvm::Function::Create(
+            fnType, llvm::Function::InternalLinkage,
+            "bz$" + std::string(ts->name) + "$DisposeCore", module_.get());
+        disposerCoreFns_[ts] = coreFn;
     }
 }
 
@@ -666,7 +681,11 @@ void Emitter::emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst) {
         // which then conservatively never frees.
         if (currentCaughtExc_ && excVal != currentCaughtExc_ && excAst &&
             !exprReferencesName(*excAst, currentCaughtName_)) {
-            emitDynamicDispose(currentCaughtExc_);
+            // #387 / §28.2: the caught object's lifetime is ending here with
+            // nothing retaining it — dispatch its idempotent Dispose and reclaim
+            // its block once. This is the sole free on this throw path: the
+            // caught-exception scope disposal is SKIPPED on unwind (isUnwind).
+            emitDisposeAndReclaim(currentCaughtExc_);
         }
         builder_.CreateStore(excVal, excGlobal());
     } else if (currentCaughtExc_) {
@@ -700,6 +719,55 @@ const ast::DestructorDecl* Emitter::findDestructor(const sema::TypeSymbol* ts) {
 
 
 void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
+    // §28.2 / §28.4 / §28.6: `fn` is the PUBLIC, idempotent Dispose (vtable slot
+    // 1). It guards a single call to the UNGUARDED core (disposerCoreFns_[ts])
+    // with the per-object run-once flag, so the destructor body, owned-field
+    // auto-disposal and base chain execute AT MOST ONCE per object no matter how
+    // many dispose sites reach this Dispose (explicit `.Dispose()`, scope-end
+    // auto-dispose, owned-field auto-dispose, exception unwind). The block free
+    // is NOT performed here; it is done once by the disposal site that holds the
+    // owning slot (emitDisposals / emitOwnedFieldDisposals / the caught-exception
+    // and unwind paths), so a re-dispatch never reads an already-freed object.
+    llvm::Function* coreFn = disposerCoreFns_[ts];
+    emitDisposerCore(ts, coreFn);
+
+    currentFn_ = fn;
+    currentThis_ = &*fn->args().begin();
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    disposeStack_.clear();
+    loopStack_.clear(); finallyStack_.clear();
+    propagateBB_ = nullptr;
+    unwindTarget_ = nullptr;
+    currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
+    unwindScopeDepth_ = 0;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+    // §28.2: load the run-once flag; if already set, this is a repeat disposal —
+    // a no-op (§28.2: "subsequent calls are no-ops"). Else set it BEFORE running
+    // the core so a re-entrant dispose during the core (e.g. a destructor that
+    // disposes `this` transitively) still short-circuits.
+    llvm::StructType* st = classStruct(ts);
+    unsigned fi = disposedFlagIndex(ts);
+    llvm::Value* flagAddr =
+        builder_.CreateStructGEP(st, currentThis_, fi, "disposed.flag");
+    llvm::Value* already = builder_.CreateICmpNE(
+        builder_.CreateLoad(disposedFlagTy(), flagAddr),
+        llvm::ConstantInt::get(disposedFlagTy(), 0), "already.disposed");
+    auto* doBB = llvm::BasicBlock::Create(llvm_, "dispose.do", fn);
+    auto* retBB = llvm::BasicBlock::Create(llvm_, "dispose.ret", fn);
+    builder_.CreateCondBr(already, retBB, doBB);
+    builder_.SetInsertPoint(doBB);
+    builder_.CreateStore(llvm::ConstantInt::get(disposedFlagTy(), 1), flagAddr);
+    builder_.CreateCall(coreFn, {currentThis_});
+    builder_.CreateBr(retBB);
+    builder_.SetInsertPoint(retBB);
+    builder_.CreateRetVoid();
+}
+
+
+void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
     currentFn_ = fn;
     currentThis_ = &*fn->args().begin();
     locals_.clear();
@@ -723,7 +791,7 @@ void Emitter::emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn) {
         emittingDisposerBody_ = false;
     }
     // §28.4: after the destructor body, dispose owned fields (reverse
-    // declaration order), then chain to the base class's Dispose.
+    // declaration order), then chain to the base class's CORE disposer.
     // (A destructor that returns early skips this — destructors with
     // both an early return and owned fields are a deferred corner.)
     if (!terminated) {
@@ -779,7 +847,16 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                                                 currentFn_);
         builder_.CreateCondBr(isNull, contBB, dispBB);
         builder_.SetInsertPoint(dispBB);
-        emitDynamicDispose(val);
+        // §28.4 step 2: dispatch the field object's idempotent Dispose and
+        // reclaim its block once, then null the field. §28.5 (line 5066): a
+        // destructor body may explicitly `field.Dispose()` BEFORE this auto-
+        // dispose — that explicit call only dispatched the field's idempotent
+        // Dispose (it did not free), so reclaiming here frees the field exactly
+        // once (no double-free). Nulling the field after makes any further
+        // disposal a guarded no-op (the #396 slot-null precedent), so a second
+        // §28.4-step-2 pass (or a re-entrant dispose) finds null and skips.
+        emitDisposeAndReclaim(val);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
     }
@@ -839,7 +916,20 @@ void Emitter::emitPendingCheck() {
 
 
 void Emitter::emitDynamicDispose(llvm::Value* obj) {
-    // vtable layout: [0]=type descriptor, [1]=Dispose, [2+]=methods.
+    // §28.2 / §28.4: dispatch the object's PUBLIC, idempotent Dispose through
+    // its vtable (slot 1) — which runs the destructor body, owned-field
+    // disposals and the full base chain, AT MOST ONCE per object (the run-once
+    // flag, §28.6). This does NOT free the object's heap block.
+    //
+    // #380 / §28: "dispose" still means run the destructor AND reclaim the block
+    // (no GC). But the free is now performed by the disposal SITE (see
+    // emitDisposeAndReclaim), not here. Reason: explicit `.Dispose()` (§28.5
+    // line 5066) plus the scope-end / owned-field auto-dispose reach Dispose
+    // TWICE on one object; if the first dispatch freed the block, the second
+    // dispatch's vtable load would read freed memory (use-after-free) regardless
+    // of any flag. Splitting "dispatch" (idempotent, repeatable) from "reclaim"
+    // (done once, by the owning slot's auto-dispose) keeps repeated disposal
+    // safe. vtable layout: [0]=type descriptor, [1]=Dispose, [2+]=methods.
     llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
     llvm::Value* slot = builder_.CreateGEP(ptrTy(), vptr,
                                            {builder_.getInt32(1)});
@@ -847,18 +937,19 @@ void Emitter::emitDynamicDispose(llvm::Value* obj) {
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     builder_.CreateCall(fnTy, disposeFn, {obj});
-    // #380 / §28: "dispose" means run the destructor AND reclaim the object's
-    // heap block (no GC). The vtable Dispose just dispatched is the MOST-DERIVED
-    // disposer; it has run the destructor body, owned-field disposals, and the
-    // full base-dispose chain (emitBaseDisposeChain calls base disposers
-    // DIRECTLY, never re-entering this dynamic-dispatch path). So freeing the
-    // object's `calloc`'d block here frees it exactly once, last, after every
-    // destructor has finished operating on valid memory. This dynamic path is
-    // the single entry for every class-instance dispose site (using-var
-    // scope-end, owned-field disposal, explicit .Dispose(), and exception
-    // unwind), so all of them reclaim the block; collection/dict/set/boxed/
-    // string types and value records never reach here (they free their own
-    // storage). free(null) is a no-op, matching the pre-existing null tolerance.
+}
+
+
+void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
+    // #380 / §28: an auto-dispose site that OWNS the slot/field holding `obj`
+    // (using-var scope-end, owned-field auto-dispose, exception unwind, the
+    // caught-exception normal-exit free). It is the LAST dispose of this object
+    // — sema guarantees no use-after-dispose, and any earlier explicit
+    // `.Dispose()` only dispatched (it did not free). So dispatch the idempotent
+    // Dispose (a no-op if already run) and THEN reclaim the block exactly once.
+    // The caller is responsible for null-ing its slot afterward where a second
+    // dispatch through the same slot is reachable. free(null) is a no-op.
+    emitDynamicDispose(obj);
     builder_.CreateCall(freeFn(), {obj});
 }
 
@@ -948,10 +1039,18 @@ llvm::Function* Emitter::owningDictValueDisposer(const sema::TypeRef* dictTy) {
 
 
 void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
+    // §28.4 step 3: chain to the base class's CORE disposer (unguarded), NOT its
+    // public Dispose. The per-object run-once flag (§28.2 / §28.6) is checked
+    // and set exactly once at the most-derived public Dispose entry; calling the
+    // base's public Dispose here would re-check that same flag (same object) and
+    // see it already set, skipping the base destructor + base owned fields. The
+    // core runs the base's destructor + owned-field disposal + its own base
+    // chain unconditionally, which is correct because the whole chain executes
+    // within the single guarded most-derived disposal.
     for (const sema::TypeSymbol* base : ts->baseTypes) {
         if (!base || base->kind != ast::TypeDeclKind::Class) continue;
-        auto it = disposerFns_.find(base);
-        if (it != disposerFns_.end()) builder_.CreateCall(it->second,
+        auto it = disposerCoreFns_.find(base);
+        if (it != disposerCoreFns_.end()) builder_.CreateCall(it->second,
                                                           {currentThis_});
         return;  // single base class
     }
@@ -983,6 +1082,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+
+    // §28.3 (line 4910): compute which owned locals/params are unwind-disposal
+    // ELIGIBLE (never moved / disposed / reassigned) before lowering, so
+    // registration can consult unwindIneligible_. Block bodies only — an
+    // expression body has no statements that could leak an owned local on
+    // unwind, and no dispose scope for owned params (a documented gap).
+    unwindIneligible_.clear();
+    unwindIneligibleFn_ = fn;
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
+        collectUnwindIneligible(*ci.stmts);
 
     bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
 
@@ -1049,6 +1158,10 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+    // §28.3 (line 4910): eligibility of owned ctor params for unwind disposal.
+    unwindIneligible_.clear();
+    unwindIneligibleFn_ = fn;
+    collectUnwindIneligible(cd->body);
     bindParameters(fn, /*hasThis=*/true, &cs->params);
 
     // CG16 (§12.8): a leading `base(...)`/`this(...)` chain call runs
@@ -1168,6 +1281,7 @@ void Emitter::bindParameters(llvm::Function* fn, bool hasThis,
                     const std::vector<sema::Symbol*>* paramSyms) {
     std::size_t paramIdx = 0;
     bool first = true;
+    pendingOwnedParams_.clear();
     for (auto& arg : fn->args()) {
         if (hasThis && first) {
             currentThis_ = &arg;
@@ -1190,6 +1304,12 @@ void Emitter::bindParameters(llvm::Function* fn, bool hasThis,
             llvm::AllocaInst* slot = entryAlloca(arg.getType());
             builder_.CreateStore(&arg, slot);
             if (psym) paramSlots_[psym] = slot;
+            // §28.3 (line 4910): an `owned` parameter is auto-disposed on an
+            // exception unwind out of the method. Defer its registration until
+            // the function-body root dispose scope exists (lowerScopedBlock
+            // registers pendingOwnedParams_ into the outermost scope), since no
+            // scope is open yet here.
+            if (psym) pendingOwnedParams_.push_back({psym, slot});
         }
         ++paramIdx;
     }
@@ -1464,6 +1584,354 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
 }
 
 
+const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld) {
+    // §28.3: a plain `var` owned local eligible for exception-unwind disposal.
+    // Restrict to a definitely-owned, definitely-assigned class/interface object
+    // so the unwind disposal (dynamic dispatch) is always valid:
+    //   (a) initializer is `new ClassType(...)`  — owned, class, assigned; or
+    //   (b) initializer is a call returning `owned T` (T class/interface).
+    // Collections/dicts/subscriptions are excluded (they free via their own
+    // runtime calls, not class dispatch, and are not the §28.3 leak findings);
+    // a borrow initializer (no `owned`) carries no disposal obligation; an
+    // uninitialized/null/value-typed local has nothing to dispose.
+    if (!ld->initializer) return nullptr;
+    if (collectionTypeOfLocal(ld) || dictTypeOfLocal(ld)) return nullptr;
+    if (ld->type && isSubscriptionType(ctx_.resolvedType(*ld->type)))
+        return nullptr;
+    if (isSubscriptionExpr(*ld->initializer)) return nullptr;
+    // (a) `new ClassType(...)` — an owned class instance.
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+        const sema::TypeSymbol* cls = classOfLocal(ld);
+        if (cls && cls->kind == ast::TypeDeclKind::Class &&
+            disposerFns_.find(cls) != disposerFns_.end())
+            return cls;
+        // An interface-/abstract-typed `new` is unusual; fall through.
+        (void)ne;
+        return nullptr;
+    }
+    // (b) a call returning `owned T` (class/interface). Dispatch is dynamic, so
+    // the concrete class is not needed — return a sentinel non-null class when
+    // the static type is a class with a disposer, else rely on dynamic dispatch.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get())) {
+        if (call->callee) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                ctx_.exprSymbol(*call->callee));
+            if (ms) {
+                auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                if (md && md->returnOwned &&
+                    isClassOrInterfaceRef(ctx_.exprType(*ld->initializer))) {
+                    // Use the resolved class when available (for the disposer
+                    // map); dispatch is dynamic in emitDisposals regardless.
+                    if (auto* rt = ctx_.exprType(*ld->initializer))
+                        if (rt->kind == sema::TypeRef::Kind::Named &&
+                            rt->declaration &&
+                            rt->declaration->kind == ast::TypeDeclKind::Class)
+                            return rt->declaration;
+                    // Interface return: dynamic dispatch with a null cls.
+                    return reinterpret_cast<const sema::TypeSymbol*>(1);
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+
+void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
+    // §28.3 (line 4910): a plain `var` owned local is auto-disposed when an
+    // exception unwinds out of its scope (an `unwindOnly` Disposal — normal exit
+    // skips it). Only register the conservative eligible subset (see
+    // unwindOwnedLocalClass + unwindIneligible_) so the unwind disposal can
+    // never double-dispose a value that was moved out / disposed / reassigned on
+    // the way to the throw.
+    if (disposeStack_.empty()) return;
+    if (emittingDisposerBody_) return;   // disposer locals handled by field pass
+    // Only register when the ineligible analysis covers the current body — see
+    // unwindIneligibleFn_ (skips lambda/thunk bodies whose moves/disposes were
+    // not analyzed, to avoid a double-dispose).
+    if (currentFn_ != unwindIneligibleFn_) return;
+    if (unwindIneligible_.count(static_cast<const void*>(ld))) return;
+    const sema::TypeSymbol* cls = unwindOwnedLocalClass(ld);
+    if (!cls) return;
+    auto it = locals_.find(ld);
+    if (it == locals_.end()) return;
+    Disposal d{it->second, nullptr};
+    d.unwindOnly = true;
+    disposeStack_.back().push_back(d);
+}
+
+
+void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
+                                       llvm::AllocaInst* slot) {
+    // §28.3 (line 4910): an `owned` parameter is auto-disposed when an exception
+    // unwinds out of its method (same unwindOnly mechanism as plain owned
+    // locals). Registered in the outermost scope so it covers the whole body.
+    if (disposeStack_.empty()) return;
+    if (emittingDisposerBody_) return;
+    if (currentFn_ != unwindIneligibleFn_) return;
+    if (unwindIneligible_.count(static_cast<const void*>(psym))) return;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
+    if (!ps) return;
+    // Only an `owned` parameter carries a disposal obligation (§28.8); `ref`/
+    // `out`/borrow params do not. (`out owned` is by-ref — the callee writes the
+    // caller's storage and does not own at entry — and is excluded.)
+    if (ps->modifier != "owned") return;
+    // Must be a class/interface type to have a Dispose to call.
+    const sema::TypeRef* rt =
+        ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
+    if (!isClassOrInterfaceRef(rt)) return;
+    Disposal d{slot, nullptr};
+    d.unwindOnly = true;
+    disposeStack_.front().push_back(d);
+}
+
+
+namespace {
+// §28.3: a conservative walk that records every local/parameter consumed in a
+// value (move / owned-arg / assignment / field-store / explicit-dispose)
+// position. Borrow-position reads — a method/property/indexer RECEIVER (other
+// than `.Dispose()`), and a `return x` operand (a normal-exit discharge the
+// unwindOnly disposal already skips) — do NOT taint the local. Anything not
+// recognized as borrow-safe is treated as consuming (sound over-approximation:
+// at worst it leaves a value un-disposed on its unwind path, never double-
+// disposed). `mark(node)` records the ineligible key (a LocalDecl node for a
+// local, the ParameterSymbol for a parameter).
+struct UnwindIneligibleWalker {
+    const sema::SemaContext& ctx;
+    std::unordered_set<const void*>& out;
+
+    // Record the symbol behind an identifier as consumed/ineligible.
+    void markIdent(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) { expr(e, /*consuming=*/true); return; }
+        sema::Symbol* s = ctx.exprSymbol(*id);
+        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(s)) {
+            if (loc->decl) out.insert(static_cast<const void*>(loc->decl));
+        } else if (dynamic_cast<sema::ParameterSymbol*>(s)) {
+            out.insert(static_cast<const void*>(s));
+        }
+    }
+
+    // Walk an expression. `consuming` = the value of this expression is moved /
+    // consumed by its context, so a bare identifier here taints its local.
+    void expr(const ast::Expr* e, bool consuming) {
+        if (!e) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (consuming) markIdent(id);
+            return;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            // `move x` always consumes its operand.
+            if (u->op == "move") markIdent(u->operand.get());
+            else expr(u->operand.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            // Receiver of a member access is a BORROW (not consumed) — e.g.
+            // `x.field`, and (handled in CallExpr) `x.Method(...)`.
+            expr(m->target.get(), /*consuming=*/false);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get(), /*consuming=*/false);
+            return;
+        }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get(), consuming);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            // `x.Dispose()` consumes/disposes x; any other `x.Method(...)`
+            // borrows the receiver. Bare-call arguments are conservatively
+            // treated as owned-arg moves (consuming).
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get())) {
+                if (ma->member == "Dispose") markIdent(ma->target.get());
+                else expr(ma->target.get(), /*consuming=*/false);
+            } else {
+                expr(c->callee.get(), /*consuming=*/false);
+            }
+            for (auto& a : c->args) expr(a.value.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get())) {
+                if (ma->member == "Dispose") markIdent(ma->target.get());
+                else expr(ma->target.get(), /*consuming=*/false);
+            } else {
+                expr(c->callee.get(), /*consuming=*/false);
+            }
+            for (auto& a : c->args) expr(a.value.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get(), /*consuming=*/false);  // indexer receiver = borrow
+            for (auto& a : ix->indices) expr(a.value.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get(), /*consuming=*/false);
+            expr(b->right.get(), /*consuming=*/false);
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get(), /*consuming=*/false);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get(), /*consuming=*/false);
+            expr(c->thenValue.get(), consuming);
+            expr(c->elseValue.get(), consuming);
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get(), false); expr(r->hi.get(), false);
+            expr(r->step.get(), false);
+            return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get(), /*consuming=*/false);
+            for (auto& a : w->assigns) expr(a.value.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get(), /*consuming=*/true);
+            for (auto& k : cl->keys) expr(k.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get(), false);
+            return;
+        }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // A closure capturing an owned local borrows it (§28.9); treat a
+            // captured local as consumed conservatively so it is not unwind-
+            // disposed while the closure may still reference it.
+            if (lam->exprBody) expr(lam->exprBody.get(), /*consuming=*/true);
+            for (auto& s : lam->stmts) stmt(s.get());
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get(), /*consuming=*/false);
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get(), false);
+                expr(arm.exprBody.get(), consuming);
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return;
+        }
+        // Any other expression form: recurse conservatively as borrow (it has
+        // no owned-consuming sub-positions we recognize); leaf literals no-op.
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // `var s := x;` moves x (owned local read in an owning init); a
+            // `move`/call/new RHS is handled by expr(consuming). Treat the whole
+            // initializer as a consuming position.
+            expr(ld->initializer.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get(), /*consuming=*/true); return;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            // `return x` is a normal-exit discharge; the unwindOnly disposal is
+            // skipped on the return path, so it does NOT taint x. (A throw before
+            // the return still disposes x via unwind.) Treat as borrow so the
+            // common accumulator-returned local stays eligible.
+            expr(r->value.get(), /*consuming=*/false); return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get(), /*consuming=*/false); return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get(), /*consuming=*/true); return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // `x := ...` reassigns x — its prior owned value's obligation is
+            // released here, so x is no longer the same owned value on the way
+            // to a later throw. Taint the target (a bare-identifier lvalue) and
+            // walk the RHS as consuming (`x := y` moves y).
+            markIdent(as->target.get());
+            expr(as->value.get(), /*consuming=*/true);
+            return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get(), /*consuming=*/false); return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get(), /*consuming=*/true); return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get(), /*consuming=*/true); return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get(), false);
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get(), false);
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get(), false);
+            for (auto& b : ws->body) stmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get(), false); expr(fs->withExpr.get(), false);
+            for (auto& b : fs->body) stmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get(), false);
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get(), false);
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get(), false);
+                expr(arm.exprBody.get(), false);
+                for (auto& a : arm.stmts) stmt(a.get());
+            }
+            return;
+        }
+        // BreakStmt / ContinueStmt: no sub-expressions.
+    }
+};
+}  // namespace
+
+
+void Emitter::collectUnwindIneligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    unwindIneligible_.clear();
+    UnwindIneligibleWalker w{ctx_, unwindIneligible_};
+    for (auto& s : body) w.stmt(s.get());
+}
+
+
 // #383 / §28: a reference TypeRef carrying a vtable — a user class or
 // interface (Named, with a class/interface declaration). Such objects are
 // disposed dynamically through their own vtable slot 1.
@@ -1596,6 +2064,17 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
 bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                       std::size_t startIdx) {
     disposeStack_.emplace_back();
+    // §28.3 (line 4910): the function-body ROOT scope (the first one pushed)
+    // owns the unwind disposal of the method's `owned` parameters. Register them
+    // here, where a scope finally exists, then clear so nested scopes don't
+    // re-register. (A lambda/thunk body that opens its own root scope inherits
+    // an empty pendingOwnedParams_ unless its own bindParameters filled it.)
+    if (disposeStack_.size() == 1 && !pendingOwnedParams_.empty()) {
+        auto pending = std::move(pendingOwnedParams_);
+        pendingOwnedParams_.clear();
+        for (auto& [psym, slot] : pending)
+            registerUnwindOwnedParam(psym, slot);
+    }
     bool terminated = false;
     for (std::size_t i = startIdx; i < body.size(); ++i) {
         if (body[i] && lowerStmt(*body[i])) { terminated = true; break; }
@@ -1616,7 +2095,41 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (it->caughtException) {
             if (isUnwind) continue;
             llvm::Value* obj = builder_.CreateLoad(ptrTy(), it->slot);
-            emitDynamicDispose(obj);
+            // §28.2 / #380: dispatch the idempotent Dispose and reclaim the
+            // block once. The caught object is in flight only for this arm and
+            // freed exactly here on a normal handled exit (a re-raise skips it
+            // via the isUnwind branch above).
+            emitDisposeAndReclaim(obj);
+            continue;
+        }
+        // §28.3 (line 4910): a plain `var` owned local / `owned` parameter. It is
+        // auto-disposed ONLY when an exception unwinds out of its scope; on a
+        // normal exit it must have reached a discharge point (sema-enforced), so
+        // disposing it here would double-dispose a moved-out / returned value.
+        // On the unwind path: dispatch its idempotent Dispose and reclaim the
+        // block once, null-guarded (an uninitialized/conditional owned local's
+        // slot may be null — registration is restricted to definitely-assigned,
+        // never-moved/disposed owned locals/params, but the null-check is kept
+        // for the nullable-owned and defensive cases). The dispatch is dynamic
+        // (runtime class), matching every other class-instance dispose site.
+        if (it->unwindOnly) {
+            if (!isUnwind) continue;
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "unwind.dispose",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "unwind.cont",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            emitDisposeAndReclaim(obj);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // per §2.11: a `using var` Subscription auto-disposes by removing its
@@ -1674,7 +2187,9 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // call returning `owned T`, or `move x.f`). Dispose dynamically through
         // its own vtable, null-guarded — an interface/nullable slot may hold
         // null. The dynamic dispatch runs the most-derived destructor + base
-        // chain and reclaims the block (#380), so the object is freed once.
+        // chain (idempotent, §28.2) and reclaims the block once (#380); the slot
+        // is nulled afterward so any further disposal through it is a no-op
+        // (§28.2; the #396 slot-null precedent).
         if (it->dynamicDispose) {
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
@@ -1687,21 +2202,28 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                                     currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
-            emitDynamicDispose(obj);
+            emitDisposeAndReclaim(obj);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
         }
         if (disposerFns_.find(it->cls) == disposerFns_.end()) continue;
-        // CG18: dispatch Dispose dynamically through the object's
-        // vtable, so a `using var` bound to a subclass instance runs
-        // the correct runtime Dispose.
+        // CG18 / §28.2: dispatch Dispose dynamically through the object's vtable
+        // (idempotent) and reclaim the block once, so a `using var` bound to a
+        // subclass instance runs the correct runtime Dispose. This scope-end
+        // disposal runs exactly once per scope (normal and unwind exits are
+        // mutually exclusive; a break/continue terminates the block first). An
+        // earlier explicit `x.Dispose()` (§28.5 line 5066) only DISPATCHED the
+        // idempotent Dispose (it did not free), so this site reclaims the block
+        // exactly once — no double-free.
         // §27.5: a captured ("boxed") `using var` local lives in a shared
         // heap cell; load the object through the cell, not the cell pointer.
         llvm::Type* ety = nullptr;
         llvm::Value* addr = boxedStorage(it->slot, ety);
         llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
-        emitDynamicDispose(obj);
+        emitDisposeAndReclaim(obj);
     }
 }
 

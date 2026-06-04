@@ -228,8 +228,25 @@ private:
         // arm keeps it in flight for the enclosing handler). `slot` holds the
         // object pointer; `cls` is null. See emitDisposals' isUnwind parameter.
         bool caughtException = false;
+        // §28.3 (line 4910) "Exception-path discharge": a plain `var` owned local
+        // or an `owned` parameter. Unlike `using var`, plain owned locals and
+        // owned params are NOT auto-disposed on NORMAL exit — §28.3 requires them
+        // only to REACH a discharge point statically (move/return/owned-arg/
+        // explicit Dispose), which sema enforces. But on an EXCEPTION-UNWIND exit
+        // they are auto-disposed "as if wrapped in an implicit try/finally". So
+        // an `unwindOnly` entry is SKIPPED by normal-exit emitDisposals and
+        // disposed (reclaimed, null-guarded) ONLY on the isUnwind path. `slot`
+        // holds the object pointer (via its alloca); `cls` is the static class
+        // when known (dispatch is dynamic regardless).
+        bool unwindOnly = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
+    // §28.3 (line 4910): owned parameters of the current function awaiting
+    // unwind-disposal registration. bindParameters collects them (no dispose
+    // scope is open yet); lowerScopedBlock registers them into the function-body
+    // ROOT scope (the first scope it pushes) so they are auto-disposed on an
+    // exception unwind out of the whole method. Cleared once registered.
+    std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>> pendingOwnedParams_;
     // CG13: the compiler-generated Dispose function for each class.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
     // #362 / stdlib §4.5: the cached per-element dispose thunk (built lazily).
@@ -1080,15 +1097,20 @@ private:
     // CG13: the class's user destructor body, if it declares one.
     const ast::DestructorDecl* findDestructor(const sema::TypeSymbol* ts);
 
-    // CG13: emit the compiler-generated Dispose body. This slice runs the
-    // user destructor body (if any) over `this`. Idempotency (the
-    // run-once flag), owned-field auto-disposal (§28.5), and base-class
-    // chaining (§28.4) are deferred to later slices — so Dispose is
-    // currently correct for classes with a destructor and no owned fields
-    // or disposable base. `using var` (the only caller in this slice)
-    // invokes it exactly once, so the missing idempotency is not yet
-    // observable.
+    // CG13 / §28.2 / §28.4 / §28.6: emit the PUBLIC, idempotent compiler-
+    // generated Dispose (vtable slot 1). It checks the per-object run-once flag
+    // (§28.6) and, on the first call only, sets it and calls the class's
+    // unguarded core disposer (emitDisposerCore). Subsequent calls are no-ops
+    // (§28.2). It does NOT free the object's block — reclamation is performed
+    // once by the disposal site that owns the slot, so a repeat dispatch never
+    // dereferences an already-freed object.
     void emitDisposerBody(const sema::TypeSymbol* ts, llvm::Function* fn);
+
+    // §28.4: emit the UNGUARDED core disposer — runs the user destructor body
+    // (if any), then disposes owned-bearing fields in reverse declaration order
+    // (§28.5), then chains to the base class's CORE disposer (§28.4 step 3). No
+    // run-once flag and no free; the public Dispose guards it.
+    void emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn);
 
     // CG18 (§28.5): dispose the class's owned reference fields (class- OR
     // interface-typed) in reverse declaration order, null-checking each.
@@ -1125,7 +1147,18 @@ private:
     // first), else continue.
     void emitPendingCheck();
 
+    // §28.2 / §28.4: dispatch an object's PUBLIC idempotent Dispose through its
+    // vtable (slot 1) — runs the destructor + owned fields + base chain at most
+    // once. Does NOT free the block. `obj` must be non-null. Used both as the
+    // dispatch primitive and directly by explicit `obj.Dispose()` (which only
+    // needs the run-once dispatch, never the reclaim).
     void emitDynamicDispose(llvm::Value* obj);
+
+    // #380 / §28: dispatch the idempotent Dispose AND reclaim the heap block —
+    // for an auto-dispose site that owns the slot/field and is the last dispose
+    // of the object (using-var scope-end, owned-field auto-dispose, exception
+    // unwind, caught-exception normal-exit free). free(null) is a no-op.
+    void emitDisposeAndReclaim(llvm::Value* obj);
 
     // #362 / stdlib §4.5: a module-level `void(void*)` thunk that runs an
     // owning collection element's destructor via dynamic dispatch (vtable
@@ -1157,6 +1190,25 @@ private:
     // §28.4 step 3: chain to the base class's Dispose. baseTypes[0] is
     // conventionally the base class when it resolves to one.
     void emitBaseDisposeChain(const sema::TypeSymbol* ts);
+
+    // §28.2 / §28.6: per-object "disposed" run-once flag support. The flag is an
+    // i8 at struct index 1 in every class struct — right after the vtable
+    // pointer and before all data fields (see classStruct), so it is at a fixed
+    // offset uniform across the hierarchy and all generic specializations.
+    // disposedFlagTy() is its LLVM type and disposedFlagIndex() its index. The
+    // most-derived generated Dispose checks/sets it so the destructor body,
+    // owned-field auto-disposal and base chain run AT MOST ONCE per object
+    // regardless of how many dispose sites reach it (idempotency).
+    llvm::Type* disposedFlagTy();
+    unsigned disposedFlagIndex(const sema::TypeSymbol* t);
+
+    // §28.4: the UNGUARDED core disposer for each class — runs the destructor
+    // body, owned-field auto-disposal, then chains to the base CORE. The public
+    // generated Dispose (disposerFns_) wraps this with the run-once flag guard.
+    // The base chain calls the base CORE directly so a single per-object flag,
+    // set once at the most-derived public entry, never short-circuits a base
+    // level's destructor.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerCoreFns_;
 
     static bool hasOwnedModifier(const sema::FieldSymbol* fs) {
         for (auto mod : fs->modifiers) {
@@ -1388,6 +1440,56 @@ private:
     // local is disposed at the end of its enclosing block in reverse
     // declaration order. Recorded against the innermost open scope.
     void registerUsingDisposal(const ast::LocalDecl* ld);
+
+    // §28.3 (line 4910): register a plain `var` owned local for EXCEPTION-UNWIND
+    // disposal only (an `unwindOnly` Disposal). Unlike `using var`, the plain
+    // owned local is auto-disposed solely when an exception unwinds out of its
+    // scope; on normal exit sema requires it to reach a discharge point. Only
+    // owned, class/interface-typed, definitely-assigned locals that are never
+    // moved / explicitly disposed / reassigned (unwindIneligible_) are
+    // registered — that conservative subset guarantees the local is still live
+    // (owned) at any throw in its scope, so the unwind disposal cannot double-
+    // dispose a moved-out or already-disposed value. A movable-but-not-here
+    // local is left unregistered (a bounded leak on its unwind path, never a
+    // double-free).
+    void registerUnwindOwnedLocal(const ast::LocalDecl* ld);
+
+    // §28.3 (line 4910): register an `owned` parameter for exception-unwind
+    // disposal (same unwindOnly mechanism / eligibility as plain owned locals).
+    // An owned param is owned at method entry (§28.8) and must reach a discharge
+    // point on normal exit; on an unwind out of the method it is auto-disposed.
+    void registerUnwindOwnedParam(sema::Symbol* psym, llvm::AllocaInst* slot);
+
+    // §28.3: is `ld`'s initializer an OWNED class/interface object that is
+    // definitely assigned at the declaration (a `new T()`, or a call returning
+    // `owned T`)? Only such plain owned locals are unwind-registered. A borrow
+    // initializer, a value/runtime-managed type, or an uninitialized/null local
+    // returns false.
+    const sema::TypeSymbol* unwindOwnedLocalClass(const ast::LocalDecl* ld);
+
+    // §28.3: the set of local-decl AST nodes and parameter symbols that are
+    // INELIGIBLE for unwind disposal because they are moved, explicitly
+    // disposed, reassigned, or otherwise consumed somewhere in the current
+    // method body — computed once per body by collectUnwindIneligible.
+    std::unordered_set<const void*> unwindIneligible_;
+    // §28.3: the function for which unwindIneligible_ was computed. Unwind-
+    // disposal registration only fires when currentFn_ matches — so a lambda /
+    // thunk body (lowered mid-function, whose own body is NOT analyzed) does not
+    // register its owned locals against the enclosing function's stale ineligible
+    // set, which could otherwise miss a move/dispose inside the lambda and
+    // double-dispose. Such a lambda local simply leaks on its unwind path
+    // (a bounded leak, never a double-free).
+    llvm::Function* unwindIneligibleFn_ = nullptr;
+
+    // §28.3: populate unwindIneligible_ from a method/ctor body. A tracked owned
+    // local/param becomes ineligible if it appears in a value-consuming position
+    // (a `move`, an owned argument / any call argument conservatively, an
+    // assignment target, a local-init RHS that moves it, a field store, or a
+    // `.Dispose()` receiver). Borrow-position reads (method/property/indexer
+    // receivers) and `return x` (a normal-exit discharge, skipped by the
+    // unwindOnly disposal) keep the local eligible.
+    void collectUnwindIneligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
     // CG13: the class type of a local — from its declared type, else the
     // resolved type of a `new T(...)` initializer.
