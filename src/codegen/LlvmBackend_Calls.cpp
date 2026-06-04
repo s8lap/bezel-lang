@@ -3580,10 +3580,53 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                         builder_.CreateCall(fn, {recv, disp});
                     } else if (isDictTypeName(recvTy)) {
+                        // #396 / stdlib §4.9: explicit Dispose() on an
+                        // OwnedDictionary<K,V> with a class value type cascades
+                        // disposal into each surviving value via the value-
+                        // disposer thunk (the same one the #394 scope-end path
+                        // uses). A borrowing Dictionary (and any value-typed V)
+                        // gets a null disposer — only the backing table and its
+                        // key bytes are freed.
+                        llvm::Function* valDisp =
+                            owningDictValueDisposer(recvTy);
+                        llvm::Value* disp = valDisp
+                            ? llvm::cast<llvm::Value>(valDisp)
+                            : llvm::ConstantPointerNull::get(ptrTy());
                         auto* fn = declareC("bz_dict_free",
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                        builder_.CreateCall(fn, {recv,
-                            llvm::ConstantPointerNull::get(ptrTy())});
+                        builder_.CreateCall(fn, {recv, disp});
+                        // §28.2 idempotency: a `using var` dict (or an owned
+                        // dict field) that is explicitly Dispose()d is ALSO
+                        // disposed at scope end (the #394 `it->dict` path) or by
+                        // a later explicit call. bz_dict_free is NOT idempotent
+                        // — a second call on the same freed table double-frees
+                        // it (and would double-dispose its values). Null the
+                        // receiver's slot so any subsequent bz_dict_free reloads
+                        // null and no-ops (bz_dict_free(null) returns). This
+                        // makes "first Dispose disposes; subsequent calls are
+                        // no-ops" (§28.2) hold for the dict's combined paths.
+                        // lvalueAddr yields the slot for an identifier receiver
+                        // (using-var local or owned field, boxed or not); for a
+                        // non-lvalue receiver (a temporary) there is no second
+                        // path to guard. Restricted to the identifier / member-
+                        // access lvalue forms — the ones that name a using-var
+                        // local or an owned field — so re-deriving the address
+                        // re-evaluates only a side-effect-free base (the local's
+                        // slot, or `this`/the owner for a field).
+                        bool lvalueRecv =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                ma->target.get()) ||
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                ma->target.get());
+                        llvm::Type* slotTy = nullptr;
+                        if (lvalueRecv) {
+                            if (llvm::Value* slot =
+                                    lvalueAddr(*ma->target, slotTy)) {
+                                builder_.CreateStore(
+                                    llvm::ConstantPointerNull::get(ptrTy()),
+                                    slot);
+                            }
+                        }
                     } else {
                         emitDynamicDispose(recv);
                     }

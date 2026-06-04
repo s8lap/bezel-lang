@@ -217,6 +217,61 @@ const char* kSetTwoSurvivors =
     "end; "
     "return inside * 10 + R._n;";
 
+// --- #396: explicit .Dispose() on an OwnedDictionary disposes its values. ---
+
+// #396 / §4.9 + §28.2: an explicit `d.Dispose()` on an OwnedDictionary<K,V>
+// (V a class) must cascade disposal into its surviving values — exactly as the
+// scope-end (#394) path does. Here both values are disposed BY the explicit
+// call (count 2 read AFTER it, INSIDE the scope), and the using-var's scope-end
+// disposal is a NO-OP (§28.2 idempotency: the first Dispose disposed; the
+// second is skipped), so the count is still 2 after the block → 2*10 + 2 = 22.
+//
+// This is the exactly-once interaction the issue calls out: explicit Dispose
+// followed by scope-end disposal of the same `using var`. Before #396 the
+// explicit call passed a NULL value-disposer (values leaked → inside count 0)
+// AND then bz_dict_free ran a SECOND time on the freed table at scope end (a
+// double-free / crash). The fix disposes the values once and nulls the slot so
+// the scope-end bz_dict_free reloads null and no-ops. The LSan leg is the
+// load-bearing check: no leak, no double-free, no use-after-free.
+const char* kDictExplicitDispose =
+    "var inside := -1; "
+    "do "
+    "  using var d := new OwnedDictionary<string, R>(); "
+    "  d.Add(\"a\", move (new R())); "
+    "  d.Add(\"b\", move (new R())); "
+    "  d.Dispose(); "
+    "  inside := R._n; "          // both disposed by the explicit call → 2
+    "end; "                       // scope-end disposal is a no-op (slot nulled)
+    "return inside * 10 + R._n;"; // 2*10 + 2 = 22
+
+// #396 / §4.9: an explicit `this._d.Dispose()` inside a DESTRUCTOR disposes the
+// owned dict field's surviving values once. An owned OwnedDictionary FIELD is
+// not auto-disposed by the destructor's field-disposal pass (that pass handles
+// class objects and array-backed collections, not hash-backed dicts), so the
+// explicit call in the destructor is the only disposal — it must dispose the
+// value. The owner is a `using var`; at its scope end the destructor runs,
+// disposes the dict's one value (R._n → 1), then the field-disposal pass leaves
+// the (now self-freed) dict field alone. The count is read after the owner's
+// scope → 1. Before #396 the value leaked (NULL value-disposer) → 0.
+const char* kDictFieldDestructorDispose =
+    "module M; "
+    "class R "
+    "  public static _n: int := 0; "
+    "  destructor _n := _n + 1; end destructor; "
+    "end R; "
+    "class Owner "
+    "  private owned _d: OwnedDictionary<string, R>; "
+    "  public constructor() "
+    "    this._d := new OwnedDictionary<string, R>(); "
+    "    this._d.Add(\"a\", move (new R())); "
+    "  end constructor; "
+    "  destructor this._d.Dispose(); end destructor; "
+    "end Owner; "
+    "class C public static method Main(): int "
+    "  do using var o := new Owner(); end; "
+    "  return R._n; "
+    "end Main; end C;";
+
 }  // namespace
 
 // ---- OwnedDictionary scope-end disposal (§4.9, #394) ---------------------
@@ -249,4 +304,22 @@ BEZEL_TEST(codegen_owned_set_394, class_elements_surviving_disposed_4_10) {
     // disposed at scope end via the OwnedArray element-disposer (#362). This
     // must remain true after the dict fix → 0*10 + 2 = 2.
     expectDisposedAndLeakFree(prog(kSetTwoSurvivors), 2);
+}
+
+// ---- #396: explicit .Dispose() disposes OwnedDictionary values (§4.9, §28.2) -
+
+BEZEL_TEST(codegen_owned_dict_396, explicit_dispose_disposes_values_exactly_once_4_9) {
+    // Explicit d.Dispose() disposes both values (inside count 2); the using
+    // var's scope-end disposal is a §28.2 no-op (slot nulled), so the count is
+    // still 2 after the block → 22. Before #396: values leaked AND the table
+    // was double-freed at scope end. The LSan leg is load-bearing — it confirms
+    // exactly-once disposal with no double-free / use-after-free.
+    expectDisposedAndLeakFree(prog(kDictExplicitDispose), 22);
+}
+
+BEZEL_TEST(codegen_owned_dict_396, explicit_dispose_of_owned_field_in_destructor_4_9) {
+    // this._d.Dispose() in a destructor disposes the owned dict field's one
+    // value exactly once → R._n == 1. Before #396 the value leaked (NULL value-
+    // disposer) → 0. LSan leg: no leak, no double-free.
+    expectDisposedAndLeakFree(kDictFieldDestructorDispose, 1);
 }
