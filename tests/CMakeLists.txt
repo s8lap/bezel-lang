@@ -206,6 +206,7 @@ set(BEZEL_TEST_SOURCES
     codegen/body_record_equality_test.cpp
     codegen/record_string_equality_test.cpp
     codegen/inline_array_test.cpp
+    codegen/inline_array_equality_test.cpp
     codegen/string_test.cpp
     codegen/string_compare_test.cpp
     codegen/string_tostring_test.cpp
