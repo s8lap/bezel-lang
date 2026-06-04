@@ -60,6 +60,21 @@ private:
     // (re-widening to the declared type).
     std::unordered_map<Symbol*, TypeRef*> narrowings_;
 
+    // §7.4 / §8.4 nullability flow-narrowing (issue #418). The set of simple
+    // variables (LocalSymbol / ParameterSymbol) statically known to be non-null
+    // at the current program point. A symbol is added when a null test proves
+    // it non-null (`if x <> null` then-block, `if x = null` else-block, the
+    // matching `is not null` / `is null` forms, an early-return `= null` guard),
+    // when a non-null value is assigned to it, and on the all-paths join of an
+    // if-statement; it is removed when a (possibly-)null value is assigned. The
+    // §7.4 member-access gate consults this set: a bare member access on a
+    // nullable simple variable NOT in this set is rejected. Unlike `narrowings_`
+    // this does NOT rewrite the variable's exprType — the declared (nullable)
+    // type is preserved so codegen's nullable-value layout logic (the tagged
+    // {hasValue; payload} representation of `record?`/`int?`) stays correct.
+    // Block-scoped the same way `narrowings_` is (saved/restored per block).
+    std::unordered_set<Symbol*> nullNarrowed_;
+
     // Slice S6: in-progress method static-ness, so visitExpr's
     // IdentifierExpr handling can diagnose `this`/`base` in static
     // member bodies.
@@ -215,6 +230,29 @@ private:
     // narrows in the requested branch, record the narrowing for the variable's
     // symbol. Returns true iff a narrowing was applied.
     bool narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch);
+
+    // §7.4 / §8.4 helper: if `cond` is a `<simple var> <> null` / `= null`
+    // test that narrows in the requested branch (`<> null` narrows the true
+    // branch, `= null` narrows the else branch — and `is not null` / `is null`
+    // desugar to these by the parser), record the variable's symbol in
+    // `nullNarrowed_` (known non-null). Returns true iff a narrowing was
+    // applied. (issue #418)
+    bool narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch);
+
+    // The resolved declared TypeRef of a local or parameter symbol, or null for
+    // any other symbol kind (or when the type is unresolved). Used by
+    // null-narrowing to compute the non-nullable form.
+    TypeRef* declaredTypeOf(Symbol* sym);
+
+    // §7.4 (issue #418): is `sym` a simple variable currently known non-null?
+    // True when it is in `nullNarrowed_` OR has a §12.7 type-narrowing (which is
+    // always to a non-nullable form) OR its declared type is non-nullable.
+    bool isKnownNonNull(Symbol* sym);
+
+    // §7.4 (issue #418): update `nullNarrowed_` for an assignment of a value of
+    // `valueType` to the simple variable `sym` — a non-null value makes it
+    // known-non-null; a (possibly-)null value clears that knowledge.
+    void narrowOnAssignment(Symbol* sym, const TypeRef* valueType);
 
     void visitTopDecl(const ast::TopDecl& d);
 

@@ -117,6 +117,7 @@ set(BEZEL_TEST_SOURCES
     sema/named_arguments_test.cpp
     sema/overload_resolution_test.cpp
     sema/field_init_restrictions_test.cpp
+    sema/null_narrowing_test.cpp
     sema/const_type_test.cpp
     sema/local_const_type_test.cpp
     sema/enum_restrictions_test.cpp
@@ -239,6 +240,7 @@ set(BEZEL_TEST_SOURCES
     codegen/collection_indexer_test.cpp
     codegen/dict_record_value_indexer_test.cpp
     codegen/is_narrow_receiver_test.cpp
+    codegen/null_narrow_member_test.cpp
 
     runtime/event_subscription_test.cpp
 

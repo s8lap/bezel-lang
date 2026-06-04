@@ -1353,6 +1353,57 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 checkEventVisibilityFence(es, ma.member, ma.span.begin);
         }
     }
+    // §7.4 (issue #418): member access (and method calls) on a NULLABLE value is
+    // a compile error unless the compiler has narrowed it to non-null. This gate
+    // is SCOPED TO SIMPLE VARIABLES — bare locals and parameters — exactly the
+    // operands the compiler narrows (§7.4 "Narrowing applies to locals only").
+    // Non-null knowledge comes from: a null guard (`if x <> null` / `is not
+    // null` then-block, `if x = null` else-block, an early-return `= null`
+    // guard), an assignment of a non-null value, a §12.7 type-narrowing, and the
+    // all-paths join of an if (see the IfStmt handler). The safe forms stay
+    // legal because they never reach this check with a bare-variable target:
+    // `x?.M` (§7.5) is a distinct AST node (NullCondMemberExpr); `x!.M` (§7.8)
+    // has a PostfixBangExpr (non-variable) target.
+    //
+    // DEFERRED (see issue #418 / §7.4): a NULLABLE FIELD or property access
+    // (`this._c.M`, `obj.Field.M`) is NOT gated here. §7.4 resolves that case
+    // only by copying the field to a local first (fields are un-narrowable for
+    // the TOCTOU reason §7.4 states); enforcing it would reject the existing
+    // field-guard idiom wholesale without a narrowing path to the guarded form.
+    // The original unsoundness (#416) for the common simple-variable case is
+    // closed; the field case remains a documented gap.
+    if (ma.target) {
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                ma.target.get())) {
+            if (tid->name != "this" && tid->name != "base") {
+                Symbol* tsym = lookupName(tid->name);
+                bool isSimpleVar =
+                    tsym && (dynamic_cast<LocalSymbol*>(tsym) ||
+                             dynamic_cast<ParameterSymbol*>(tsym));
+                // Only gate when the variable's declared type is KNOWN to be
+                // nullable. An unresolved/untyped variable (e.g. inferred from
+                // an intrinsic call sema doesn't yet type) is left alone — the
+                // gate must not over-reject on missing type information.
+                TypeRef* dt = isSimpleVar ? declaredTypeOf(tsym) : nullptr;
+                bool declaredNullable = dt && dt->nullable;
+                if (isSimpleVar && declaredNullable && !isKnownNonNull(tsym)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("member access `.") +
+                        std::string(ma.member) +
+                        "` on a nullable value requires narrowing it to "
+                        "non-null first (§7.4): guard with `if " +
+                        std::string(tid->name) +
+                        " <> null`, force-unwrap with `" +
+                        std::string(tid->name) +
+                        "!`, or use the null-conditional `" +
+                        std::string(tid->name) + "?." +
+                        std::string(ma.member) + "`");
+                    return;
+                }
+            }
+        }
+    }
     TypeSymbol* targetType = nullptr;
     // `this.X` — currentType_ takes precedence over name lookup so
     // we don't have to teach `this` to be an expression with type

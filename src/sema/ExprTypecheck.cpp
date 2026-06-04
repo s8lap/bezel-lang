@@ -462,15 +462,97 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
     return true;
 }
 
+// The resolved declared TypeRef of a local or parameter, or null for any other
+// symbol kind (issue #418). Locals carry an already-resolved declType; params
+// carry an ast::Type that must be looked up (or a context-supplied
+// resolvedDeclType for inferred lambda params).
+TypeRef* ExprTC::declaredTypeOf(Symbol* sym) {
+    if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
+        return loc->declType;
+    }
+    if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
+        if (par->declType) return ctx_.resolvedType(*par->declType);
+        return par->resolvedDeclType;
+    }
+    return nullptr;
+}
+
+// §7.4 (issue #418): a simple variable is known non-null when null-narrowing
+// has proved it so (`nullNarrowed_`), when a §12.7 type-narrowing is in effect
+// (those always narrow to a non-nullable form), or when its declared type is
+// itself non-nullable.
+bool ExprTC::isKnownNonNull(Symbol* sym) {
+    if (!sym) return false;
+    if (nullNarrowed_.count(sym)) return true;
+    if (auto it = narrowings_.find(sym); it != narrowings_.end())
+        return it->second && !it->second->nullable;
+    TypeRef* dt = declaredTypeOf(sym);
+    return dt && !dt->nullable;
+}
+
+// §7.4 (issue #418): refresh `nullNarrowed_` for `sym := value`. A non-null
+// value proves the variable non-null from here; a nullable value (including a
+// bare `null` literal, typed nullable) clears any prior knowledge.
+void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType) {
+    if (!sym) return;
+    if (!dynamic_cast<LocalSymbol*>(sym) &&
+        !dynamic_cast<ParameterSymbol*>(sym))
+        return;
+    if (valueType && !valueType->nullable)
+        nullNarrowed_.insert(sym);
+    else
+        nullNarrowed_.erase(sym);
+}
+
+// §7.4 / §8.4 (issue #418): a `<simple var> <> null` / `= null` test proves a
+// nullable simple variable non-null in one branch by recording it in
+// `nullNarrowed_`. The parser desugars `x is not null` to `x <> null` and
+// `x is null` to `x = null` (Parser_Exprs §17.4), so handling the two binary
+// operators covers all four spec spellings. `<> null` narrows the TRUE branch;
+// `= null` narrows the ELSE branch (where the value is known non-null). Returns
+// true iff a narrowing was recorded. Unlike §12.7 type-narrowing this does NOT
+// rewrite the variable's exprType (codegen relies on the declared nullable type
+// to locate the tagged-optional payload).
+bool ExprTC::narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch) {
+    auto* be = dynamic_cast<const ast::BinaryExpr*>(cond);
+    if (!be) return false;
+    bool narrowsThis;
+    if (be->op == "<>") narrowsThis = forTrueBranch;       // true branch
+    else if (be->op == "=") narrowsThis = !forTrueBranch;  // else branch
+    else return false;
+    if (!narrowsThis) return false;
+    // One operand must be the null literal and the other a simple variable
+    // (§7.4: narrowing applies to local variables only, never fields). Accept
+    // `x <> null` and `null <> x`.
+    const ast::Expr* varSide = nullptr;
+    if (dynamic_cast<const ast::NullLiteralExpr*>(be->right.get()))
+        varSide = be->left.get();
+    else if (dynamic_cast<const ast::NullLiteralExpr*>(be->left.get()))
+        varSide = be->right.get();
+    if (!varSide) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(varSide);
+    if (!id || id->name == "this" || id->name == "base") return false;
+    Symbol* sym = lookupName(id->name);
+    if (!sym) return false;
+    if (!dynamic_cast<LocalSymbol*>(sym) &&
+        !dynamic_cast<ParameterSymbol*>(sym))
+        return false;
+    nullNarrowed_.insert(sym);
+    return true;
+}
+
 // §12.7: collect every flow-narrowing an `if`/`elif` condition establishes for
 // one branch into narrowings_. A single type test narrows per
-// narrowFromTypeTest; `and`-joined tests (`x is T and y is S`) contribute all
-// their narrowings to the combined true branch. The caller has already visited
-// the condition (so operand symbols and test types are resolved) and is
-// responsible for save/restore of narrowings_ around the branch body.
+// narrowFromTypeTest; a single null test narrows per narrowFromNullTest (§7.4 /
+// §8.4); `and`-joined tests (`x is T and y is S`, `a <> null and b <> null`)
+// contribute all their narrowings to the combined true branch. The caller has
+// already visited the condition (so operand symbols and test types are
+// resolved) and is responsible for save/restore of narrowings_ around the
+// branch body.
 void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
     if (!cond) return;
     if (narrowFromTypeTest(cond, forTrueBranch)) return;
+    if (narrowFromNullTest(cond, forTrueBranch)) return;
     // `and`-joined tests: both sides narrow throughout the combined true
     // branch (§12.7). This does not extend to `or` (where neither side is
     // guaranteed) nor to the else branch of an `and` (De Morgan would make it
@@ -547,6 +629,8 @@ void ExprTC::runMethodBody(
     // this is normally already empty; clearing makes the boundary explicit and
     // robust to symbol reuse across methods.)
     narrowings_.clear();
+    // §7.4 (issue #418): nullability narrowing is likewise method-local.
+    nullNarrowed_.clear();
     for (const auto& p : params) {
         if (p.defaultValue) visitExpr(*p.defaultValue);
     }
@@ -831,6 +915,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
             currentScope_->names[ld->name] = lsym;
+            // §7.4 (issue #418): a nullable-declared local initialized with a
+            // non-null value is known non-null until reassigned (parallel to
+            // the assignment-narrowing in AssignmentStmt above).
+            if (ld->initializer && lsym->declType && lsym->declType->nullable) {
+                if (TypeRef* initTy = ctx_.exprType(*ld->initializer))
+                    if (!initTy->nullable) nullNarrowed_.insert(lsym);
+            }
         }
     } else if (auto* lc =
                    dynamic_cast<const ast::LocalConstDecl*>(&s)) {
@@ -947,6 +1038,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     as->value->span.begin, "assigned value");
             }
         }
+        // §7.4 (issue #418): a plain `:=` of a non-null value to a simple
+        // variable proves it non-null from here; assigning a (possibly-)null
+        // value clears that knowledge. (Compound ops keep the existing value's
+        // nullability, so they don't change the analysis.)
+        if (as->op == ":=" && as->target && as->value) {
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                if (tid->name != "this" && tid->name != "base") {
+                    if (Symbol* tsym = lookupName(tid->name))
+                        narrowOnAssignment(tsym, ctx_.exprType(*as->value));
+                }
+            }
+        }
     } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) visitExpr(*ds->value);
         // per §14.1 + §A.7 (issue #391): `_ := Generic.Create();` discards the
@@ -968,39 +1072,86 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 "catch arm body (§31.5)");
         }
     } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        // §12.7 flow narrowing. Each branch body is walked with the narrowings
-        // its guards establish, restored afterward so they never leak past the
-        // controlled block. The `if`/`elif` bodies see their own condition's
-        // true-branch narrowings; the `else` body sees the else-branch
-        // narrowings of every preceding condition (each one was false). The map
-        // is saved/restored around each body for scoping (and a reassignment
-        // inside a body drops the affected entry — see AssignmentStmt below).
+        // §12.7 flow narrowing (type) and §7.4 / §8.4 nullability narrowing.
+        // Each branch body is walked with the narrowings its guards establish,
+        // restored afterward so they never leak past the controlled block. The
+        // `if`/`elif` bodies see their own condition's true-branch narrowings;
+        // the `else` body sees the else-branch narrowings of every preceding
+        // condition (each one was false). Both narrowing maps are saved/restored
+        // around each body for scoping (and a reassignment inside a body updates
+        // the affected entry — see AssignmentStmt above).
+        //
+        // §7.4: nullability narrowing additionally PERSISTS past the if when it
+        // holds on every path that reaches the following statement: a branch
+        // that always exits (early `return`/`throw`) contributes no fall-through
+        // state, so e.g. `if x = null then return; end;` leaves x non-null
+        // afterward, and an if whose branches all establish non-null on their
+        // fall-through paths joins to non-null. The after-if set is the
+        // intersection of the surviving paths' exit sets (§7.4 "Narrowing also
+        // applies after early return").
         auto savedNarrowings = narrowings_;
+        auto entryNullNarrowed = nullNarrowed_;
+        // Collected exit sets of each fall-through path; null pointer means "no
+        // path here" (always-exits). We intersect the non-null ones.
+        std::vector<std::unordered_set<Symbol*>> fallThroughExits;
         if (ifs->ifBranch.condition) {
             visitExpr(*ifs->ifBranch.condition);
             checkConditionIsBool(*ifs->ifBranch.condition, "if");
         }
+        nullNarrowed_ = entryNullNarrowed;
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/true);
         for (const auto& bs : ifs->ifBranch.body) {
             if (bs) visitStmt(*bs);
         }
+        if (!bodyAlwaysExits(ifs->ifBranch.body))
+            fallThroughExits.push_back(nullNarrowed_);
         narrowings_ = savedNarrowings;
-        for (const auto& el : ifs->elifBranches) {
+        for (std::size_t i = 0; i < ifs->elifBranches.size(); ++i) {
+            const auto& el = ifs->elifBranches[i];
             if (el.condition) {
                 visitExpr(*el.condition);
                 checkConditionIsBool(*el.condition, "elif");
             }
+            // This elif is reached only when every preceding condition was
+            // false (their else-narrowings hold) and this condition is true.
+            nullNarrowed_ = entryNullNarrowed;
+            collectNarrowings(ifs->ifBranch.condition.get(),
+                              /*forTrueBranch=*/false);
+            for (std::size_t j = 0; j < i; ++j)
+                collectNarrowings(ifs->elifBranches[j].condition.get(),
+                                  /*forTrueBranch=*/false);
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/true);
             for (const auto& bs : el.body) if (bs) visitStmt(*bs);
+            if (!bodyAlwaysExits(el.body))
+                fallThroughExits.push_back(nullNarrowed_);
             narrowings_ = savedNarrowings;
         }
-        // The else body: all preceding guards were false, so each contributes
-        // its else-branch narrowing (`x is not T` narrows x to T here).
+        // The else body (explicit or implicit fall-through): all preceding
+        // guards were false, so each contributes its else-branch narrowing.
+        nullNarrowed_ = entryNullNarrowed;
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/false);
         for (const auto& el : ifs->elifBranches)
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/false);
         for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
+        // The else path falls through unless an explicit else body always exits.
+        if (!ifs->hasElse || !bodyAlwaysExits(ifs->elseBody))
+            fallThroughExits.push_back(nullNarrowed_);
         narrowings_ = savedNarrowings;
+        // After-if nullability = intersection of all fall-through exit sets.
+        if (fallThroughExits.empty()) {
+            // Every path exits the method; the after-if point is unreachable.
+            // Keep the entry set (harmless — nothing follows).
+            nullNarrowed_ = entryNullNarrowed;
+        } else {
+            std::unordered_set<Symbol*> joined = fallThroughExits.front();
+            for (std::size_t i = 1; i < fallThroughExits.size(); ++i) {
+                std::unordered_set<Symbol*> next;
+                for (Symbol* sym : joined)
+                    if (fallThroughExits[i].count(sym)) next.insert(sym);
+                joined = std::move(next);
+            }
+            nullNarrowed_ = std::move(joined);
+        }
     } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         if (ws->condition) {
             visitExpr(*ws->condition);
