@@ -164,12 +164,15 @@ llvm::Value* Emitter::lowerStringLiteral(std::string_view text, bool verbatim) {
         ".bz.str.data." + std::to_string(id));
     dataGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     dataGV->setAlignment(llvm::Align(width));
-    // %bz_string = { ptr data, i64 len, i8 width }
+    // %bz_string = { ptr data, i64 len, i8 width, i64 rc }
     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
     llvm::Constant* lenC = llvm::ConstantInt::get(i64(), cps.size());
     llvm::Constant* widC = llvm::ConstantInt::get(i8Ty, width);
+    // #422: a string literal is a constant global, never heap-allocated — give
+    // it the SENTINEL rc so bz_string_retain/release are no-ops and it is never
+    // freed (§4.6 / recorded decision: statics carry a sentinel rc).
     llvm::Constant* strVal = llvm::ConstantStruct::get(
-        stringType(), {dataGV, lenC, widC});
+        stringType(), {dataGV, lenC, widC, stringRcSentinel()});
     auto* strGV = new llvm::GlobalVariable(
         *module_, stringType(), /*isConstant=*/true,
         llvm::GlobalValue::PrivateLinkage, strVal,
@@ -332,6 +335,7 @@ llvm::Value* Emitter::emitStringConcat(llvm::Value* l, llvm::Value* r) {
     builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
     builder_.CreateStore(total,   builder_.CreateStructGEP(stringType(), newStr, 1));
     builder_.CreateStore(maxW8,   builder_.CreateStructGEP(stringType(), newStr, 2));
+    initStringRc(newStr);  // #422: producer's reference, rc := 1
     return newStr;
 }
 
@@ -507,6 +511,7 @@ llvm::Value* Emitter::emitSnprintfToString(const std::string& fmt,
     builder_.CreateStore(l64, builder_.CreateStructGEP(stringType(), so, 1));
     builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
                          builder_.CreateStructGEP(stringType(), so, 2));
+                         initStringRc(so);  // #422: producer's reference, rc := 1
     return so;
 }
 
@@ -624,6 +629,7 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
         builder_.CreateStructGEP(stringType(), newStr, 1));
     builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
         builder_.CreateStructGEP(stringType(), newStr, 2));
+        initStringRc(newStr);  // #422: producer's reference, rc := 1
     return newStr;
 }
 
@@ -784,6 +790,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             builder_.CreateStore(slen, builder_.CreateStructGEP(stringType(), so, 1));
             builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
                 builder_.CreateStructGEP(stringType(), so, 2));
+                initStringRc(so);  // #422: producer's reference, rc := 1
             return so;
         };
         llvm::Value* selfLc  = emitToLower(self);
@@ -1103,6 +1110,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(subLen, builder_.CreateStructGEP(stringType(), newStr, 1));
         builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
             builder_.CreateStructGEP(stringType(), newStr, 2));
+            initStringRc(newStr);  // #422: producer's reference, rc := 1
         return newStr;
     }
 
@@ -1173,6 +1181,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             builder_.CreateStore(
                 llvm::ConstantInt::get(i8Ty, 1),
                 builder_.CreateStructGEP(stringType(), newStr2, 2));
+                initStringRc(newStr2);  // #422: producer's reference, rc := 1
             return newStr2;
         }
     }
@@ -1282,6 +1291,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(fLen, builder_.CreateStructGEP(stringType(), resStr, 1));
         builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
             builder_.CreateStructGEP(stringType(), resStr, 2));
+            initStringRc(resStr);  // #422: producer's reference, rc := 1
         return resStr;
     }
 
@@ -1335,6 +1345,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(len, builder_.CreateStructGEP(stringType(), newStr, 1));
         builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
             builder_.CreateStructGEP(stringType(), newStr, 2));
+            initStringRc(newStr);  // #422: producer's reference, rc := 1
         return newStr;
     }
 
@@ -1431,6 +1442,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(trimLen, builder_.CreateStructGEP(stringType(), newStr, 1));
         builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
             builder_.CreateStructGEP(stringType(), newStr, 2));
+            initStringRc(newStr);  // #422: producer's reference, rc := 1
         return newStr;
     }
 
@@ -1487,6 +1499,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(width64, builder_.CreateStructGEP(stringType(), newStr, 1));
         builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
             builder_.CreateStructGEP(stringType(), newStr, 2));
+            initStringRc(newStr);  // #422: producer's reference, rc := 1
         auto* padEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
@@ -1535,6 +1548,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(totalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
         builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
             builder_.CreateStructGEP(stringType(), strObj, 2));
+            initStringRc(strObj);  // #422: producer's reference, rc := 1
         return strObj;
     }
 
@@ -1653,6 +1667,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(fieldLen, builder_.CreateStructGEP(stringType(), strObj, 1));
         builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
             builder_.CreateStructGEP(stringType(), strObj, 2));
+            initStringRc(strObj);  // #422: producer's reference, rc := 1
         return strObj;
     }
 
@@ -1753,6 +1768,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
         builder_.CreateStore(resultLen, builder_.CreateStructGEP(stringType(), newStr, 1));
         builder_.CreateStore(maxW8, builder_.CreateStructGEP(stringType(), newStr, 2));
+        initStringRc(newStr);  // #422: producer's reference, rc := 1
         return newStr;
     }
 
@@ -1806,6 +1822,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
         builder_.CreateStore(resultLen, builder_.CreateStructGEP(stringType(), newStr, 1));
         builder_.CreateStore(maxW8, builder_.CreateStructGEP(stringType(), newStr, 2));
+        initStringRc(newStr);  // #422: producer's reference, rc := 1
         return newStr;
     }
 

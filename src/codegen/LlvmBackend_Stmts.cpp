@@ -1101,6 +1101,7 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     builder_.CreateStore(kl, builder_.CreateStructGEP(stringType(), strObj, 1));
     builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
         builder_.CreateStructGEP(stringType(), strObj, 2));
+    initStringRc(strObj);  // #422: producer's reference, rc := 1
     builder_.CreateStore(strObj, varSlot);
     loopStack_.push_back({incBB, endBB, disposeStack_.size()});
     bool term = lowerScopedBlock(fs.body);

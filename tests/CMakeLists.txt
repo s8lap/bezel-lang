@@ -158,6 +158,7 @@ set(BEZEL_TEST_SOURCES
     codegen/explicit_dispose_reclaim_test.cpp
     codegen/undisposed_leak_test.cpp
     codegen/console_write_leak_test.cpp
+    codegen/string_refcount_test.cpp
     codegen/owned_field_disposal_test.cpp
     codegen/owned_collection_disposal_test.cpp
     codegen/remove_equals_test.cpp

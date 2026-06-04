@@ -377,6 +377,19 @@ void bz_subscription_dispose(void* sub);
 void bz_event_source_free(void* src);
 
 // ---------------------------------------------------------------------------
+// String reference counting (§4.6 / §28.9, issue #422 strings increment).
+// `string` is runtime-managed (§4.6): its memory is reclaimed automatically.
+// Strings are immutable, reference-shared LEAVES (§28.8), so acyclic reference
+// counting is sound. The header carries an int64 rc (offset 24, total header =
+// 32 bytes); every heap producer initializes it to 1 (the producer's
+// reference). retain increments; release decrements and, at zero, frees the
+// data buffer then the header. Literal/global strings carry a SENTINEL rc and
+// are no-ops for both (a constant LLVM global must never be freed). null is a
+// no-op. Non-atomic for now; becomes atomic when async lands.
+void bz_string_retain(void* s);
+void bz_string_release(void* s);
+
+// ---------------------------------------------------------------------------
 // Split a string by a delimiter: returns bz_array_t* of bz.string* (heap alloc'd).
 // Caller disposes result array. All pointers point into separately malloc'd strings.
 void* bz_string_split(const char* s, int64_t s_len,

@@ -713,8 +713,30 @@ int32_t bz_file_read_all_text(const char* path, char** out, int64_t* byte_len) {
     return r;
 }
 
-// bz.string layout: { void* data (8), int64_t len (8), int8_t width (1) } = 24 bytes.
-static const int64_t BZ_STRING_SIZEOF = 24;
+// bz.string layout (§4.6, issue #422 strings increment):
+//   { void* data (off 0), int64_t len (off 8), int8_t width (off 16),
+//     int64_t rc (off 24) } = 32 bytes.
+// The reference count `rc` was appended AFTER `width` so the three original
+// fields keep their offsets (0/8/16): codegen accesses them by StructGEP index
+// (layout-agnostic) and the runtime touches them by raw byte offset, so neither
+// side moves. `rc` starts at 1 (the producer's reference) at every heap-alloc
+// site; bz_string_retain / bz_string_release maintain it; a static/literal
+// string carries the SENTINEL rc and is never freed (see below).
+static const int64_t BZ_STRING_SIZEOF = 32;
+// Byte offset of the rc field inside the header (after data/len/width + pad).
+static const int64_t BZ_STRING_RC_OFFSET = 24;
+// Sentinel refcount for literal/global strings: retain/release are no-ops on it
+// so a constant LLVM global is never decremented toward free(). A live heap
+// string starts at 1 and could never reach this by retaining (2^63 retains).
+static const int64_t BZ_STRING_RC_SENTINEL = 0x7FFFFFFFFFFFFFFFLL;
+
+// Initialize the rc field of a freshly heap-allocated bz_string header to 1.
+// The header was calloc'd (rc reads 0); the producer holds the first reference.
+static inline void bz_string_init_rc(void* s) {
+    if (!s) return;
+    int64_t one = 1;
+    memcpy((uint8_t*)s + BZ_STRING_RC_OFFSET, &one, sizeof(int64_t));
+}
 
 void* bz_file_read_all_lines(const char* path) {
     uint8_t* buf; int64_t len;
@@ -734,6 +756,7 @@ void* bz_file_read_all_lines(const char* path) {
             memcpy(s, &lineData, sizeof(void*));            // data
             memcpy(s + 8, &lineLen, sizeof(int64_t));      // len
             s[16] = 1;                                      // width = 1 (ASCII)
+            bz_string_init_rc(s);  // #422: producer's reference, rc := 1
             bz_array_add(arr, &s, 8);  // store the pointer to s
             start = i + 1;
         }
@@ -1621,10 +1644,11 @@ void* bz_string_split(const char* s, int64_t s_len,
         char* copy = (char*)malloc((size_t)(s_len + 1));
         memcpy(copy, s, (size_t)s_len);
         copy[s_len] = '\0';
-        uint8_t* strObj = (uint8_t*)calloc(1, 24);
+        uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
         memcpy(strObj, &copy, sizeof(void*));
         memcpy(strObj + 8, &s_len, sizeof(int64_t));
         strObj[16] = 1;
+        bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
         bz_array_add(arr, &strObj, 8);
         return arr;
     }
@@ -1635,10 +1659,11 @@ void* bz_string_split(const char* s, int64_t s_len,
             char* part = (char*)malloc((size_t)(partLen + 1));
             memcpy(part, s + start, (size_t)partLen);
             part[partLen] = '\0';
-            uint8_t* strObj = (uint8_t*)calloc(1, 24);
+            uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
             memcpy(strObj, &part, sizeof(void*));
             memcpy(strObj + 8, &partLen, sizeof(int64_t));
             strObj[16] = 1;
+            bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
             bz_array_add(arr, &strObj, 8);
             i += delim_len;
             start = i;
@@ -1651,10 +1676,11 @@ void* bz_string_split(const char* s, int64_t s_len,
     char* part = (char*)malloc((size_t)(partLen + 1));
     memcpy(part, s + start, (size_t)partLen);
     part[partLen] = '\0';
-    uint8_t* strObj = (uint8_t*)calloc(1, 24);
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
     memcpy(strObj, &part, sizeof(void*));
     memcpy(strObj + 8, &partLen, sizeof(int64_t));
     strObj[16] = 1;
+    bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
     bz_array_add(arr, &strObj, 8);
     return arr;
 }
@@ -1738,4 +1764,51 @@ extern "C" char* bz_string_to_utf8z(const void* strp) {
     }
     out[off] = '\0';
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// String reference counting (§4.6 / §28.9, issue #422 strings increment).
+//
+// `string` is runtime-managed: "its memory is reclaimed automatically" (§4.6).
+// Strings are immutable, reference-shared LEAVES (§28.8) — a string can never
+// hold an owning reference to another heap object — so acyclic reference
+// counting is sound and sufficient: a value's data buffer and header are freed
+// exactly when the last reference goes away, with no cycle to leak.
+//
+// The count is a plain (non-atomic) int64 today; this becomes an atomic
+// fetch-add/sub when async (multiple threads sharing a string) lands. A single
+// inline retain/release keeps the hot path cheap.
+//
+// SENTINEL: literal/global strings (emitted as constant LLVM globals by
+// codegen, never heap-allocated) carry rc == BZ_STRING_RC_SENTINEL; retain and
+// release are no-ops on them. A literal must never be free()'d.
+//
+// null is a no-op for both (a nullable `string?` slot may hold null).
+
+extern "C" void bz_string_retain(void* s) {
+    if (!s) return;
+    int64_t rc;
+    memcpy(&rc, (uint8_t*)s + BZ_STRING_RC_OFFSET, sizeof(int64_t));
+    if (rc == BZ_STRING_RC_SENTINEL) return;  // static/literal — never counted
+    rc += 1;
+    memcpy((uint8_t*)s + BZ_STRING_RC_OFFSET, &rc, sizeof(int64_t));
+}
+
+extern "C" void bz_string_release(void* s) {
+    if (!s) return;
+    int64_t rc;
+    memcpy(&rc, (uint8_t*)s + BZ_STRING_RC_OFFSET, sizeof(int64_t));
+    if (rc == BZ_STRING_RC_SENTINEL) return;  // static/literal — never freed
+    rc -= 1;
+    if (rc > 0) {
+        memcpy((uint8_t*)s + BZ_STRING_RC_OFFSET, &rc, sizeof(int64_t));
+        return;
+    }
+    // Last reference gone: free the data buffer, then the header. Read the data
+    // pointer at offset 0 (the layout's first field). free(NULL) is safe (the
+    // empty-string case may carry a null data pointer).
+    void* data;
+    memcpy(&data, (uint8_t*)s, sizeof(void*));
+    free(data);
+    free(s);
 }

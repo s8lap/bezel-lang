@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <functional>
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
@@ -271,6 +272,17 @@ private:
         // holds the object pointer (via its alloca); `cls` is the static class
         // when known (dispatch is dynamic regardless).
         bool unwindOnly = false;
+        // #422 / §4.6 / §28.9: a `var` string local that PROVABLY does not
+        // escape its scope (a non-escape walk found every use is a
+        // non-consuming read) and was initialized once by a codegen-internal
+        // +1 producer (string `+` / interpolation — never a call, so no
+        // return-handoff ambiguity). The local holds exactly the producer's
+        // single reference; at scope end (normal OR unwind) we
+        // bz_string_release it, freeing the heap data+header exactly once. No
+        // other reference exists (proven non-escaping), so there is no dangler
+        // (no UAF) and it runs once per exit (no double-free). `slot` holds the
+        // string pointer; the class/collection/dict fields are unused.
+        bool stringRelease = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -547,16 +559,56 @@ private:
     llvm::Type* lowerPrimitive(sema::PrimitiveType p);
 
     // §4.6: lazily get (or create) the %bz_string struct type.
-    // Layout: { ptr data, i64 length, i8 width }
+    // Layout: { ptr data, i64 length, i8 width, i64 rc }
     //   data  : pointer to the code-point array (elements are width bytes each)
     //   length: number of Unicode code points (NOT bytes)
     //   width : bytes per code point — 1 (≤U+00FF), 2 (≤U+FFFF), or 4 (full)
+    //   rc    : #422 reference count — 1 at every heap producer (the producer's
+    //           reference); SENTINEL (INT64_MAX) on literal/global strings so
+    //           retain/release are no-ops and a constant is never freed. Field 3
+    //           was appended AFTER width so fields 0/1/2 keep their StructGEP
+    //           indices and the runtime's raw byte offsets (0/8/16) are unmoved.
     // This is the Python PEP 393 / Bezel §4.6 "per-string storage width" model.
     llvm::StructType* stringType() {
         if (!stringStructTy_)
             stringStructTy_ = llvm::StructType::create(
-                llvm_, {ptrTy(), i64(), llvm::Type::getInt8Ty(llvm_)}, "bz.string");
+                llvm_, {ptrTy(), i64(), llvm::Type::getInt8Ty(llvm_), i64()},
+                "bz.string");
         return stringStructTy_;
+    }
+
+    // #422: the sentinel rc value for static/literal strings (matches the
+    // runtime's BZ_STRING_RC_SENTINEL). retain/release no-op on it.
+    llvm::Constant* stringRcSentinel() {
+        return llvm::ConstantInt::get(i64(), 0x7FFFFFFFFFFFFFFFLL);
+    }
+
+    // #422: store rc := 1 into a freshly malloc'd bz_string header (field 3).
+    // Every heap producer in codegen calls this so the value carries the
+    // producer's reference (§4.6 runtime-managed lifetime).
+    void initStringRc(llvm::Value* strObj) {
+        builder_.CreateStore(llvm::ConstantInt::get(i64(), 1),
+                             builder_.CreateStructGEP(stringType(), strObj, 3));
+    }
+
+    // #422: emit a call to bz_string_retain(s) — increments rc (no-op on a
+    // sentinel/literal or null). Used when a string is copied into a
+    // longer-lived location (field store, return handoff, collection insert).
+    void emitStringRetain(llvm::Value* s) {
+        if (!s) return;
+        auto* fn = declareC("bz_string_retain",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {s});
+    }
+
+    // #422: emit a call to bz_string_release(s) — decrements rc and frees at
+    // zero (no-op on a sentinel/literal or null). Used at scope-end release of a
+    // string local and on overwrite of a string slot.
+    void emitStringRelease(llvm::Value* s) {
+        if (!s) return;
+        auto* fn = declareC("bz_string_release",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {s});
     }
 
     // Load the data pointer (field 0) from a bz_string pointer.
@@ -1682,6 +1734,29 @@ private:
     // double-dispose. Such a lambda local simply leaks on its unwind path
     // (a bounded leak, never a double-free).
     llvm::Function* unwindIneligibleFn_ = nullptr;
+
+    // #422 / §4.6 / §28.9: the set of `var` string LocalDecl nodes PROVABLY
+    // eligible for scope-end bz_string_release — initialized once by a
+    // codegen-internal +1 producer (string `+` / interpolation) and never
+    // escaping their scope (a conservative whole-body walk found every use is a
+    // non-consuming read). Computed once per body by collectStringReleaseEligible
+    // and consulted in lowerLocalDecl. Membership is the ONLY thing that arms a
+    // release; absence ⇒ the string leaks (the pre-existing, safe behavior).
+    std::unordered_set<const void*> stringReleaseEligible_;
+    // The function for which stringReleaseEligible_ was computed (mirrors
+    // unwindIneligibleFn_): a lambda/thunk body lowered mid-function inherits no
+    // eligibility, so its string locals just leak (never double-freed).
+    llvm::Function* stringReleaseEligibleFn_ = nullptr;
+    // Compute stringReleaseEligible_ for a block body (see the .cpp).
+    void collectStringReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // True if `init` is a codegen-internal +1 string producer: a string `+`
+    // BinaryExpr or an InterpolatedStringExpr. These are lowered to a fresh
+    // malloc'd rc=1 header that codegen fully controls — so binding the result
+    // to a local CONSUMES that single reference (no caller/callee handoff
+    // ambiguity, unlike a string-returning call). Used both to gate release
+    // eligibility and to release intermediate concat operands.
+    bool isPlusOneStringProducer(const ast::Expr* init) const;
 
     // §28.3: populate unwindIneligible_ from a method/ctor body. A tracked owned
     // local/param becomes ineligible if it appears in a value-consuming position
