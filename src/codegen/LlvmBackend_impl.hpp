@@ -2440,6 +2440,19 @@ private:
                                         llvm::Type* outTy,
                                         const sema::TypeSymbol* elemRec = nullptr);
 
+    // stdlib §5 SelectMany: a flatten-selector trampoline `void*(closure, elem)`.
+    // Calls the closure `(env, elem) -> ptr` (the inner collection) and wraps the
+    // returned collection as a lazy enumerator (bz_lazy_from_array) the runtime
+    // drains. `elemTy` is the upstream element type; `innerEsz` the inner U size.
+    llvm::Function* buildSelectManyTrampoline(llvm::Type* elemTy,
+                                              int64_t innerEsz);
+
+    // stdlib §5 Zip: a combine trampoline `void(closure, a, b, out)`. Loads the
+    // left element (`aTy`) and right element (`bTy`), calls the closure
+    // `(env, a, b) -> outTy`, and stores the result through `out`.
+    llvm::Function* buildZipTrampoline(llvm::Type* aTy, llvm::Type* bTy,
+                                       llvm::Type* outTy);
+
     // Detect Convert.ToInt32(s) / Convert.ToInt64(s) / Math.Abs(n) etc.
     // as intrinsic static class method calls. Returns a lowered value or null.
     llvm::Value* tryLowerBuiltinClassCall(const ast::CallExpr& call);

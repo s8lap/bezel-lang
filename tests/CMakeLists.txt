@@ -243,6 +243,7 @@ set(BEZEL_TEST_SOURCES
     codegen/collection_keys_test.cpp
     codegen/set_algebra_complete_test.cpp
     codegen/linq_test.cpp
+    codegen/linq_completeness_test.cpp
     codegen/event_test.cpp
     codegen/owned_collection_ops_test.cpp
     codegen/owned_dict_disposal_test.cpp
