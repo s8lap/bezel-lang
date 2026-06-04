@@ -212,3 +212,74 @@ BEZEL_TEST(codegen_numeric_conv, int_arg_to_int_param_unchanged) {
         "public static method Main(): int return Inc(41); "
         "end Main; end C;"), 42);
 }
+
+// ===========================================================================
+// §5.1 — unsigned-source int→FP widening uses UIToFP, not SIToFP (issue #410,
+// deferred from #408). For an unsigned source (uint/ulong/ushort/byte/char),
+// the integer→floating-point widening must zero-interpret the source bits.
+// SIToFP on a high-bit-set unsigned value would sign-interpret it as negative.
+//
+// The widening is exercised at the field-initializer store site (lowerNew →
+// coerceNumericToType), which threads the initializer's source signedness.
+// ===========================================================================
+
+// A `uint` value with the high bit set (3_000_000_000 > int.MaxValue) widened
+// to a `double` field. UIToFP yields +3e9; the old SIToFP yielded ≈ −1.29e9.
+BEZEL_TEST(codegen_numeric_conv, uint_init_double_field_uitofp_spec_5_1) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "class P "
+        "  public d: double := 3000000000u; "  // uint → double field
+        "  public constructor() end constructor; "
+        "end P; "
+        "class C public static method Main(): int "
+        "  using var p := new P(); "
+        "  return (1 if p.d > 2000000000.0 else 0); "  // +3e9 > 2e9 → 1
+        "end Main; end C;"), 1);
+}
+
+// §5.1 — unsigned integer widening uses ZExt, not SExt. A `uint` value with
+// the high bit set (3_000_000_000) widened to a `long` field must zero-extend
+// to the positive +3e9; SExt would sign-interpret the i32 as negative.
+BEZEL_TEST(codegen_numeric_conv, uint_init_long_field_zext_spec_5_1) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "class P "
+        "  public n: long := 3000000000u; "  // uint → long field (ZExt)
+        "  public constructor() end constructor; "
+        "end P; "
+        "class C public static method Main(): int "
+        "  using var p := new P(); "
+        "  return (1 if p.n > 2000000000L else 0); "  // +3e9 > 2e9 → 1
+        "end Main; end C;"), 1);
+}
+
+// Regression: a SIGNED negative int initializer for a double field must still
+// sign-extend correctly (SIToFP) — the unsigned refinement must not flip it.
+BEZEL_TEST(codegen_numeric_conv, negative_int_init_double_field_sitofp) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "class P "
+        "  public d: double := -7; "  // signed int → double field
+        "  public constructor() end constructor; "
+        "end P; "
+        "class C public static method Main(): int "
+        "  using var p := new P(); "
+        "  return (1 if p.d < 0.0 else 0); "  // −7.0 < 0 → 1
+        "end Main; end C;"), 1);
+}
+
+// Regression: a signed positive int initializer for a double field still
+// widens to the right magnitude (the common #408 path).
+BEZEL_TEST(codegen_numeric_conv, positive_int_init_double_field_value) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "class P "
+        "  public d: double := 5; "
+        "  public constructor() end constructor; "
+        "end P; "
+        "class C public static method Main(): int "
+        "  using var p := new P(); "
+        "  return int(p.d * 10.0); "  // 50
+        "end Main; end C;"), 50);
+}

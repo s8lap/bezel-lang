@@ -1902,14 +1902,23 @@ private:
 
     // §5.1: apply an implicit numeric widening to coerce a lowered value to
     // a target LLVM type when the pair is a §5.1-admitted widening — int →
-    // float / double (SIToFP), float → double (FPExt), or integer widening
-    // (SExt). Returns the value unchanged when no such widening applies (so
-    // pointers, structs, narrowing, equal types, etc. are left untouched).
-    // Used at store and argument-binding sites where sema admitted an
-    // implicit conversion but the lowered value still carries its source
-    // LLVM type. (Source signedness is assumed signed — the common case;
-    // §5.1 unsigned-source widenings are a deferred refinement.)
-    llvm::Value* coerceNumericToType(llvm::Value* v, llvm::Type* targetTy);
+    // float / double, float → double (FPExt), or integer widening. Returns
+    // the value unchanged when no such widening applies (so pointers,
+    // structs, narrowing, equal types, etc. are left untouched). Used at
+    // store and argument-binding sites where sema admitted an implicit
+    // conversion but the lowered value still carries its source LLVM type.
+    //
+    // `srcUnsigned` selects the source's signedness for the int→FP and
+    // int→int widenings (§5.1 / issue #410): an unsigned source uses UIToFP
+    // / ZExt, a signed source uses SIToFP / SExt. LLVM integer types carry
+    // no signedness, so the caller supplies it (e.g. via isUnsignedTargetExpr
+    // on the source expression). The two-argument overload assumes signed —
+    // the common case — for callers that do not have the source expression.
+    llvm::Value* coerceNumericToType(llvm::Value* v, llvm::Type* targetTy,
+                                     bool srcUnsigned);
+    llvm::Value* coerceNumericToType(llvm::Value* v, llvm::Type* targetTy) {
+        return coerceNumericToType(v, targetTy, /*srcUnsigned=*/false);
+    }
 
     // CG44: lower an enum cast `E(i)` (§5.4). The enum's underlying type is
     // i32, so width-adjust the integer argument to i32. (Out-of-range
