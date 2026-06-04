@@ -241,6 +241,7 @@ set(BEZEL_TEST_SOURCES
     codegen/owned_dict_disposal_test.cpp
     codegen/collection_indexer_test.cpp
     codegen/dict_record_value_indexer_test.cpp
+    codegen/dict_record_value_leak_test.cpp
     codegen/is_narrow_receiver_test.cpp
     codegen/null_narrow_member_test.cpp
 

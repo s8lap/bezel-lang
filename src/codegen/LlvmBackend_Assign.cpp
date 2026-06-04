@@ -348,7 +348,15 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         !recvTy->astNode->name->parts.empty() &&
         recvTy->astNode->name->parts[0] == "OwnedDictionary" &&
         collectionElemIsClass(recvTy, 1);
-    llvm::Function* valDisp = owningDict ? elementDisposerThunk() : nullptr;
+    // #401 / §4.8: a borrowing Dictionary<K, record> heap-boxes its values, so
+    // OVERWRITING an existing key would otherwise leak the displaced box. Free
+    // the displaced box here (plain free — a record is a value type, §3.2 / §9)
+    // via the disposing setter, so it is gone from the table and not freed again
+    // at scope end (no double-free; the scope-end #401 path frees only the
+    // surviving box). dictValueBoxFreer is non-null only for that case, and is
+    // mutually exclusive with the owning-class disposer above.
+    llvm::Function* valDisp =
+        owningDict ? elementDisposerThunk() : dictValueBoxFreer(recvTy);
     if (keyTy) {
         llvm::Value* keyPtr = k;
         if (!(keyIsRecord && k->getType()->isPointerTy())) {

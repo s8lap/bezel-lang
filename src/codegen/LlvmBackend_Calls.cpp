@@ -3676,15 +3676,22 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                         builder_.CreateCall(fn, {recv, disp});
                     } else if (isDictTypeName(recvTy)) {
-                        // #396 / stdlib §4.9: explicit Dispose() on an
-                        // OwnedDictionary<K,V> with a class value type cascades
-                        // disposal into each surviving value via the value-
-                        // disposer thunk (the same one the #394 scope-end path
-                        // uses). A borrowing Dictionary (and any value-typed V)
-                        // gets a null disposer — only the backing table and its
-                        // key bytes are freed.
+                        // #396 / stdlib §4.9 + #401 / stdlib §4.8: explicit
+                        // Dispose() on a hash-backed dictionary frees the backing
+                        // table (and key bytes) and runs the per-value callback,
+                        // the same one the #394/#401 scope-end path uses:
+                        //   * OwnedDictionary<K, class> → dispose+free each
+                        //     surviving class value (#396/#394).
+                        //   * borrowing Dictionary<K, record> → free each
+                        //     surviving record value BOX (#401; a record is a
+                        //     value type, nothing to dispose, §3.2 / §9).
+                        // A scalar/string-valued borrowing Dictionary stores no
+                        // box → null disposer (only the backing is freed). The
+                        // two value callbacks are mutually exclusive, so no box
+                        // is freed twice.
                         llvm::Function* valDisp =
                             owningDictValueDisposer(recvTy);
+                        if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
                         llvm::Value* disp = valDisp
                             ? llvm::cast<llvm::Value>(valDisp)
                             : llvm::ConstantPointerNull::get(ptrTy());
