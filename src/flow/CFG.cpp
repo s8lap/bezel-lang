@@ -34,6 +34,103 @@ void CFG::addExceptionEdge(CFGBlock* from, CFGBlock* to) {
 
 namespace {
 
+// Async-readiness 3a: record every explicit `await` UnaryExpr (§30.2)
+// reachable from `e` into `block->awaitSites`, via `cfg.recordAwaitSite`.
+//
+// The walk mirrors the sub-expression recursion shape used by the
+// definite-assignment analyzer (sema/DefiniteAssignment.cpp), descending
+// into every operand/argument/element. It deliberately does NOT descend
+// into a `LambdaExpr` body: a `LambdaExpr` is its own async scope (§30.6 —
+// an `async` lambda compiles to its own state machine), so an `await`
+// inside it is a suspend point of the lambda's CFG, not of the enclosing
+// method's. This matches how DefiniteAssignment treats lambda bodies as a
+// separate scope. Purely additive: only `awaitSites` is touched.
+void recordAwaitsInExpr(CFG& cfg, CFGBlock* block, const ast::Expr* e) {
+    if (!e) return;
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        if (ue->op == "await") {
+            // §30.2: this UnaryExpr is the suspend site.
+            cfg.recordAwaitSite(block, ue);
+        }
+        recordAwaitsInExpr(cfg, block, ue->operand.get());
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, be->left.get());
+        recordAwaitsInExpr(cfg, block, be->right.get());
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, ma->target.get());
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, nc->target.get());
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, ce->callee.get());
+        for (const auto& a : ce->args) recordAwaitsInExpr(cfg, block, a.value.get());
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, nc->callee.get());
+        for (const auto& a : nc->args) recordAwaitsInExpr(cfg, block, a.value.get());
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, ix->target.get());
+        for (const auto& a : ix->indices) recordAwaitsInExpr(cfg, block, a.value.get());
+        return;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, bg->operand.get());
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        for (const auto& a : ne->args) recordAwaitsInExpr(cfg, block, a.value.get());
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, cd->condition.get());
+        recordAwaitsInExpr(cfg, block, cd->thenValue.get());
+        recordAwaitsInExpr(cfg, block, cd->elseValue.get());
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, te->operand.get());
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, th->operand.get());
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, we->source.get());
+        for (const auto& ia : we->assigns) recordAwaitsInExpr(cfg, block, ia.value.get());
+        return;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e)) {
+        recordAwaitsInExpr(cfg, block, re->lo.get());
+        recordAwaitsInExpr(cfg, block, re->hi.get());
+        recordAwaitsInExpr(cfg, block, re->step.get());
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys) recordAwaitsInExpr(cfg, block, k.get());
+        for (const auto& v : cl->elements) recordAwaitsInExpr(cfg, block, v.get());
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& p : is->parts) recordAwaitsInExpr(cfg, block, p.expr.get());
+        return;
+    }
+    // LambdaExpr: not descended (separate async scope — see note above).
+    // Literals, identifiers, This/Base/TypeOf/NameOf/Default, UnitExpr,
+    // CaseExpr: no `await`-bearing child reachable along a synchronous
+    // sub-expression edge in the enclosing method's CFG.
+}
+
 // Loop context: where `break` and `continue` should branch to. The CFG
 // builder maintains a stack of these as it enters / exits loop bodies.
 struct LoopContext {
@@ -105,6 +202,62 @@ private:
         return cfg_.exit();
     }
 
+    // Async-readiness 3a: record into `block` every `await` suspend site
+    // carried by the *direct* expressions of the linear / terminator
+    // statement `s` (the kinds that `visitStmt` appends to a block). Nested
+    // statements (if/while/for/try bodies) are NOT handled here — the builder
+    // already recurses into them and records their awaits at their own visit
+    // sites. Control-flow conditions (if/while/for) are recorded by the
+    // respective visit methods into the branch/header block. Purely additive.
+    void recordStmtAwaits(CFGBlock* block, const ast::Stmt& s) {
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+            // §30.2 explicit awaits in the initializer execute in this block.
+            recordAwaitsInExpr(cfg_, block, ld->initializer.get());
+            // §28.12: `await using var` carries an implicit scope-end
+            // `DisposeAsync()` await. No UnaryExpr exists for it, so record
+            // the LocalDecl node itself as the await-bearing construct.
+            if (ld->isAwaitUsing) cfg_.recordAwaitSite(block, ld);
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+            recordAwaitsInExpr(cfg_, block, lc->value.get());
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+            recordAwaitsInExpr(cfg_, block, as->target.get());
+            recordAwaitsInExpr(cfg_, block, as->value.get());
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+            recordAwaitsInExpr(cfg_, block, es->expr.get());
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+            recordAwaitsInExpr(cfg_, block, ds->value.get());
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+            recordAwaitsInExpr(cfg_, block, rs->value.get());
+            return;
+        }
+        if (auto* tr = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+            recordAwaitsInExpr(cfg_, block, tr->value.get());
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+            recordAwaitsInExpr(cfg_, block, is->target.get());
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+            // §30.7: an async iterator's `yield return await ...;` carries an
+            // explicit await in the yielded expression.
+            recordAwaitsInExpr(cfg_, block, ys->value.get());
+            return;
+        }
+        // Break/Continue/DoEnd/If/While/For/Try carry no own direct value
+        // expression to scan here (conditions/bodies handled at their sites).
+    }
+
     // Visit one statement starting from `from`. Returns the block that
     // continues the linear thread after this statement (which may be
     // `from` for straight-line stmts, or a fresh merge block for
@@ -124,6 +277,7 @@ private:
         }
         if (dynamic_cast<const ast::ReturnStmt*>(&s)) {
             from->stmts.push_back(&s);
+            recordStmtAwaits(from, s); // async-readiness 3a (additive)
             cfg_.addEdge(from, cfg_.exit());
             return nullptr;
         }
@@ -134,6 +288,7 @@ private:
             // it so the ownership pass applies §28.3 exception-path
             // discharge to owned locals live at the throw.
             from->stmts.push_back(&s);
+            recordStmtAwaits(from, s); // async-readiness 3a (additive)
             cfg_.addExceptionEdge(from, exceptionTarget());
             return nullptr;
         }
@@ -171,6 +326,7 @@ private:
         // LocalConstDecl, DiscardStmt, IncrementStmt, YieldStmt, ...) are
         // linear: append to the current block.
         from->stmts.push_back(&s);
+        recordStmtAwaits(from, s); // async-readiness 3a (additive)
         return from;
     }
 
@@ -227,6 +383,9 @@ private:
         // but adding successor edges. To keep the contract clean, we
         // promote `from` to Branch kind.
         from->kind = CFGBlock::Kind::Branch;
+        // Async-readiness 3a: the (el)if condition is evaluated in this
+        // branch block; record any `await` in it as a suspend site here.
+        recordAwaitsInExpr(cfg_, from, b.condition.get());
         CFGBlock* bodyEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
         cfg_.addEdge(from, bodyEntry);
         // Walk the branch body in a sub-Builder so loops_ are preserved.
@@ -243,6 +402,9 @@ private:
     CFGBlock* visitWhile(const ast::WhileStmt& s, CFGBlock* from) {
         CFGBlock* header = cfg_.makeBlock(CFGBlock::Kind::Branch);
         header->isLoopHeader = true;
+        // Async-readiness 3a: the while-condition is re-evaluated each pass
+        // in the header; record any `await` in it as a suspend site there.
+        recordAwaitsInExpr(cfg_, header, s.condition.get());
         CFGBlock* bodyEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
         CFGBlock* after = cfg_.makeBlock(CFGBlock::Kind::Linear);
         cfg_.addEdge(from, header);
@@ -263,8 +425,18 @@ private:
     CFGBlock* visitFor(const ast::ForStmt& s, CFGBlock* from) {
         // For-loop CFG mirrors while-loop: header (the iteration check),
         // body, after.
+        // Async-readiness 3a: the iteration source (and optional `with`
+        // cancellation-token expression, §30.7) are evaluated once before
+        // the loop, in `from`; record any explicit `await` in them there.
+        recordAwaitsInExpr(cfg_, from, s.iterable.get());
+        recordAwaitsInExpr(cfg_, from, s.withExpr.get());
         CFGBlock* header = cfg_.makeBlock(CFGBlock::Kind::Branch);
         header->isLoopHeader = true;
+        // §30.7: `await for` desugars to a `MoveNextAsync()` `await` per
+        // iteration at the loop header. No UnaryExpr exists for this implicit
+        // await, so record the ForStmt node itself as the suspend site on the
+        // header (the block the desugaring re-evaluates each pass).
+        if (s.isAwait) cfg_.recordAwaitSite(header, &s);
         CFGBlock* bodyEntry = cfg_.makeBlock(CFGBlock::Kind::Linear);
         CFGBlock* after = cfg_.makeBlock(CFGBlock::Kind::Linear);
         cfg_.addEdge(from, header);
