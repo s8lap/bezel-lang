@@ -3117,6 +3117,51 @@ bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
 }
 
 
+// per §14.1/§14.2 + §26.5 (issue #391). Structurally unify a generic method's
+// declared return TypeRef against the concrete return type sema solved from the
+// call's target, binding any still-unbound method type parameter.
+void Emitter::unifyMethodReturnTypeArg(
+    const sema::TypeRef* declRet, const sema::TypeRef* resultTy,
+    const std::vector<ast::GenericParam>& genericParams,
+    std::unordered_map<std::string_view, llvm::Type*>& subst,
+    std::unordered_map<std::string_view, const sema::TypeRef*>& semaTy,
+    bool& added) {
+    if (!declRet || !resultTy) return;
+    // A bare type-parameter reference lowers to a Named TypeRef with no
+    // declaration whose single name part is the parameter name (mirrors the
+    // argument-inference loop and lowerTypeRef's generic-param fallback). When
+    // that name is one of this method's parameters and it is not yet bound,
+    // bind it to the matching concrete component of the result type.
+    if (declRet->kind == sema::TypeRef::Kind::Named && !declRet->declaration &&
+        declRet->astNode && declRet->astNode->name &&
+        declRet->astNode->name->parts.size() == 1) {
+        std::string_view nm = declRet->astNode->name->parts[0];
+        bool isParam = false;
+        for (const auto& gp : genericParams)
+            if (gp.name == nm) { isParam = true; break; }
+        if (isParam && !subst.count(nm)) {
+            subst[nm] = lowerTypeRef(resultTy);
+            semaTy[nm] = resultTy;
+            added = true;
+        }
+        return;
+    }
+    // A constructed generic return type (`Box<T>`) unifies against a
+    // same-shaped result (`Box<Widget>`): same declaration and generic-arg
+    // count; recurse pairwise so the nested parameter is solved from the
+    // result's matching argument (§26.5).
+    if (declRet->kind == sema::TypeRef::Kind::Named && declRet->declaration &&
+        resultTy->kind == sema::TypeRef::Kind::Named &&
+        declRet->declaration == resultTy->declaration &&
+        declRet->genericArgs.size() == resultTy->genericArgs.size()) {
+        for (std::size_t i = 0; i < declRet->genericArgs.size(); ++i)
+            unifyMethodReturnTypeArg(declRet->genericArgs[i],
+                                     resultTy->genericArgs[i], genericParams,
+                                     subst, semaTy, added);
+    }
+}
+
+
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // Pre-create out var slots so lvalueAddr can find them in all paths.
@@ -3676,6 +3721,39 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
             genericSubst_ = std::move(newSubst);
             genericSubstSemaTy_ = std::move(newSema);
+            // per §14.1/§14.2 + §26.5 (issue #391): a method type parameter
+            // that appears *only* in the return type — `Create<T>(): T` — is
+            // bound by no argument, so the loop above leaves it unset and
+            // `new T()` in the body would lower `T` to the i32 fallback (a
+            // miscompile that constructs nothing). Bezel has no call-site
+            // type-argument syntax (§A.7), so sema solves such a parameter from
+            // the call's *target* type and re-types the call to the substituted
+            // return type (recorded on the call's exprType). Recover the
+            // parameter here by unifying the method's *declared* return type
+            // against that concrete result type, then prime the substitution
+            // before the body is emitted.
+            sema::TypeRef* resultTy = ctx_.exprType(call);
+            sema::TypeRef* declRet = md->returnType
+                                         ? ctx_.resolvedType(*md->returnType)
+                                         : nullptr;
+            if (resultTy && declRet) {
+                std::unordered_map<std::string_view, llvm::Type*> retSubst =
+                    genericSubst_;
+                std::unordered_map<std::string_view, const sema::TypeRef*>
+                    retSema = genericSubstSemaTy_;
+                bool added = false;
+                // Unify the declared return TypeRef against the concrete result
+                // TypeRef, binding any still-unbound method type parameter to
+                // the matching concrete component. Handles a bare `T` return as
+                // well as a constructed `Box<T>` whose nested parameter is
+                // solved from the result's generic argument (§26.5).
+                unifyMethodReturnTypeArg(declRet, resultTy, md->genericParams,
+                                         retSubst, retSema, added);
+                if (added) {
+                    genericSubst_ = std::move(retSubst);
+                    genericSubstSemaTy_ = std::move(retSema);
+                }
+            }
         }
     }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified);
