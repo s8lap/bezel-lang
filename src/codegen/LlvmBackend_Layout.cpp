@@ -437,17 +437,93 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     llvm::Value* obj = lowerExpr(*te.operand);
     if (!obj) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+    if (!rt) return nullptr;
+    // DEFERRED (§8.6 / §12.7): `is string` / `is Object`. A string stored in an
+    // Object is a bare `bz_string*` with NO leading vtable/descriptor word, so
+    // emitIsA's descriptor walk (`*obj` → vtable, `*vtable` → descArray) cannot
+    // safely run on it; making `o is string` correct needs a string runtime
+    // type tag that does not exist yet. Returning nullptr preserves the prior
+    // non-crashing fallback rather than dereferencing a non-vtable pointer.
+    if (rt->kind == sema::TypeRef::Kind::Primitive &&
+        (rt->primitive == sema::PrimitiveType::String ||
+         rt->primitive == sema::PrimitiveType::Object))
         return nullptr;
-    auto dit = descArray_.find(rt->declaration);
-    if (dit == descArray_.end()) return nullptr;
-    llvm::Value* isA = emitIsA(obj, dit->second);
+    // §8.6 / §12.7: resolve the target's runtime descriptor. For a reference
+    // type (class/interface) this is its descArray_; for a boxable VALUE type
+    // (record/enum) or a value primitive it is the box descriptor built in
+    // setupBoxDescriptors — this is what makes `o is Rect` / `o is int`
+    // recognize a boxed value (findings 06/08/12/13).
+    llvm::GlobalVariable* targetDesc = boxDescriptorFor(rt);
+    if (!targetDesc) {
+        // Reference types declared inline still resolve via descArray_.
+        if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
+            auto dit = descArray_.find(rt->declaration);
+            if (dit != descArray_.end()) targetDesc = dit->second;
+        }
+    }
+    if (!targetDesc) return nullptr;
+    // emitIsA expects a pointer operand (the box / object). An Object/interface
+    // operand already lowers to ptr; guard defensively.
+    if (!obj->getType()->isPointerTy()) return nullptr;
+    llvm::Value* isA = emitIsA(obj, targetDesc);
     if (te.op == "is") return isA;
     if (te.op == "is not")
         return builder_.CreateXor(isA, builder_.getInt1(true));
-    if (te.op == "as")
+    if (te.op == "as") {
+        // §17.4: `x as T` for a VALUE-type target unboxes — load the value
+        // bytes out of the box `{ vtable*, value-bytes }` (offset = one word).
+        // For a value primitive the result is `T?` (a tagged {hasValue, value}
+        // struct). For a record the result is the unboxed bare record struct
+        // (the tagged nullable-record representation is deferred — finding 11).
+        // A reference-type target keeps the #399 behavior (the pointer IS the
+        // value). The payload load is guarded by `isA` so a failed cast (or a
+        // null operand) never dereferences the box.
+        if (isBoxableValueType(rt)) {
+            llvm::Type* valTy = lowerTypeRef(rt);
+            auto* loadBB = llvm::BasicBlock::Create(llvm_, "unbox.load",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "unbox.cont",
+                                                    currentFn_);
+            llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+            builder_.CreateCondBr(isA, loadBB, contBB);
+
+            builder_.SetInsertPoint(loadBB);
+            // value-bytes live after the leading vtable word.
+            llvm::Value* payload = builder_.CreateGEP(
+                ptrTy(), obj, {builder_.getInt32(1)}, "unbox.ptr");
+            llvm::Value* loaded = builder_.CreateLoad(valTy, payload, "unbox");
+            builder_.CreateBr(contBB);
+
+            builder_.SetInsertPoint(contBB);
+            if (rt->kind == sema::TypeRef::Kind::Primitive) {
+                // §8.6: a value primitive unboxes to a non-null T? on success,
+                // null on failure.
+                sema::TypeRef tmp = *rt;
+                tmp.nullable = true;
+                auto* nst = nullableValueStructTy(&tmp);
+                auto* valPhi = builder_.CreatePHI(valTy, 2);
+                valPhi->addIncoming(loaded, loadBB);
+                valPhi->addIncoming(llvm::Constant::getNullValue(valTy), preBB);
+                auto* hvPhi = builder_.CreatePHI(nullablePrimHasValTy(), 2);
+                hvPhi->addIncoming(
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1), loadBB);
+                hvPhi->addIncoming(
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 0), preBB);
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst), hvPhi, {0u});
+                return builder_.CreateInsertValue(res, valPhi, {1u});
+            }
+            // Record (aggregate) value type: the unboxed bare struct on success;
+            // a zeroed struct on a failed cast (a record null-sentinel is
+            // deferred — finding 11; success-path round-trip is the fix here).
+            auto* recPhi = builder_.CreatePHI(valTy, 2);
+            recPhi->addIncoming(loaded, loadBB);
+            recPhi->addIncoming(llvm::Constant::getNullValue(valTy), preBB);
+            return recPhi;
+        }
         return builder_.CreateSelect(
             isA, obj, llvm::ConstantPointerNull::get(ptrTy()));
+    }
     return nullptr;
 }
 
@@ -495,6 +571,90 @@ llvm::Value* Emitter::emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc
     result->addIncoming(builder_.getInt1(false), bodyBB);    // hit null
     result->addIncoming(builder_.getInt1(true), matchBB);    // matched
     return result;
+}
+
+
+// §8.6: box an already-lowered value `value` (static type `srcTy`) into a heap
+// wrapper `{ boxVtable*, value-bytes }` and return the box pointer. The leading
+// vtable word lets `emitIsA` and virtual dispatch recognize the box uniformly
+// with a class instance. A nullable value type whose source is null boxes to a
+// null Object reference (§8.6 Nullable value-type boxing). Boxed values are
+// runtime-managed (§28.9): the heap block is intentionally leaked — the spec
+// imposes no disposal obligation on a box, and a free here would risk a
+// double-free since `as` is non-destructive and a box may be aliased.
+llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
+    if (!value || !srcTy) return value;
+    // A nullable value type: strip the wrapper (§8.6). null → null Object;
+    // non-null → box the underlying value. The lowered value is the tagged
+    // {i8 hasValue; T value} struct.
+    bool nullableValue = isNullableValueTy(srcTy);
+    if (!nullableValue && !isBoxableValueType(srcTy)) return value;  // ref: no box
+    llvm::GlobalVariable* vt = boxVtableFor(srcTy);
+    if (!vt) return value;  // no descriptor (e.g. unsupported value kind)
+
+    llvm::Value* hasValue = nullptr;
+    llvm::Value* payload = value;
+    llvm::Type* payloadTy = value->getType();
+    if (nullableValue) {
+        // {i8 hasValue, T value} → hasValue bit + the stripped T value.
+        hasValue = builder_.CreateICmpNE(
+            builder_.CreateExtractValue(value, {0u}),
+            llvm::ConstantInt::get(nullablePrimHasValTy(), 0), "box.hasval");
+        payload = builder_.CreateExtractValue(value, {1u}, "box.payload");
+        payloadTy = payload->getType();
+    }
+
+    // The box struct { vtable*, payload }. Use calloc so any tail padding is
+    // zeroed (deterministic box bytes).
+    auto* boxTy = llvm::StructType::get(llvm_, {ptrTy(), payloadTy});
+    uint64_t sz = module_->getDataLayout().getTypeAllocSize(boxTy);
+    auto emitBox = [&]() -> llvm::Value* {
+        llvm::Value* box = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sz)});
+        builder_.CreateStore(vt, box);  // vtable* at offset 0
+        llvm::Value* pptr = builder_.CreateGEP(
+            ptrTy(), box, {builder_.getInt32(1)}, "box.valptr");
+        builder_.CreateStore(payload, pptr);  // value bytes after the word
+        return box;
+    };
+
+    if (!nullableValue) return emitBox();
+
+    // Nullable source: branch on hasValue — box only when present, else null.
+    auto* boxBB = llvm::BasicBlock::Create(llvm_, "box.some", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "box.cont", currentFn_);
+    llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+    builder_.CreateCondBr(hasValue, boxBB, contBB);
+    builder_.SetInsertPoint(boxBB);
+    llvm::Value* boxed = emitBox();
+    llvm::BasicBlock* boxEndBB = builder_.GetInsertBlock();
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+    auto* phi = builder_.CreatePHI(ptrTy(), 2);
+    phi->addIncoming(boxed, boxEndBB);
+    phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), preBB);
+    return phi;
+}
+
+
+// §8.6: box `v` (the lowered value of `init`) when the declared location
+// `declTy` is Object/interface and the source expression is a value type.
+// A no-op for reference sources and non-Object/interface targets — the #399
+// reference-type Object path (a class pointer coerced to Object stays a bare
+// pointer) is preserved by only boxing boxable VALUE sources.
+llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
+                                   const ast::Expr* init) {
+    if (!v || !declTy || !init) return v;
+    if (!isObjectOrInterfaceTarget(declTy)) return v;
+    const sema::TypeRef* srcTy = ctx_.exprType(*init);
+    if (!srcTy) return v;
+    // Only box a value-typed source. A reference source (class/interface/
+    // string/Object) already lowers to a pointer and reaches Object directly.
+    if (!isBoxableValueType(srcTy) && !isNullableValueTy(srcTy)) return v;
+    // The lowered value must be a scalar/struct (a value), not already a ptr
+    // (which would mean it was lowered as a reference — leave it alone).
+    if (v->getType()->isPointerTy() && !isNullableValueTy(srcTy)) return v;
+    return boxValue(v, srcTy);
 }
 
 

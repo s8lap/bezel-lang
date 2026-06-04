@@ -110,6 +110,7 @@ public:
         declareFunctions();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
         setupBuiltinExceptions();  // CG22
+        setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
         computeEnumValues();  // CG30
         declareExterns();  // CG26
         for (auto& [sym, fn] : methodFns_) {
@@ -133,6 +134,10 @@ private:
     std::unique_ptr<llvm::Module> module_;
     llvm::IRBuilder<> builder_;
     llvm::Function* currentFn_ = nullptr;
+    // §8.6: the declared return-type node of the method currently being
+    // emitted, so a `return <value>` whose declared return type is
+    // Object/interface boxes the value before returning.
+    const ast::Type* currentReturnTypeNode_ = nullptr;
     // CG9: the `this` pointer of the instance method currently being
     // emitted (null in static methods). Kept as a value, not a slot —
     // `this` is never reassignable.
@@ -386,6 +391,21 @@ private:
     // pointer lives at instance struct index 0.
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> vtables_;
     std::unordered_map<const sema::MethodSymbol*, unsigned> vtableSlot_;
+    // §8.6: per-boxable-value-type box vtable. A boxed value type (record /
+    // enum) is a heap wrapper `{ vtable*, value-bytes… }`; its first word
+    // points to this vtable so `emitIsA` (`*obj` → vtable, `vtable[0]` →
+    // descriptor array) recognizes it uniformly with a class instance, and
+    // interface dispatch on a boxed record indexes `vtable[ifaceSlot]`. The
+    // vtable layout matches a class vtable's prefix: [descArray, Dispose,
+    // iface-slots…]; the descriptor (vtable[0]) is the type's descArray_ entry.
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
+        boxVtable_;
+    // §8.6: per-primitive box descriptor + vtable (int/bool/string/… have no
+    // user TypeSymbol). The descriptor is the 2-element array [self, null] used
+    // by `o is int` / `o is string`; the vtable is the 1-element [descriptor]
+    // word every box carries at offset 0. Keyed by the primitive's name.
+    std::unordered_map<std::string, llvm::GlobalVariable*> primBoxDesc_;
+    std::unordered_map<std::string, llvm::GlobalVariable*> primBoxVtable_;
     // Per-class slot→method (vector index i = vtable slot i+1; slot 0 is
     // Dispose) and the virtual-method-name→slot map used to inherit slots.
     std::unordered_map<const sema::TypeSymbol*,
@@ -1093,6 +1113,44 @@ private:
     // CG19: emit a runtime is-a test — is `targetDesc` present in `obj`'s
     // type-descriptor array (vtable[0])? Null operand → false. Returns i1.
     llvm::Value* emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc);
+
+    // §8.6: build box descriptor + vtable globals for boxable value types
+    // (records, enums) and for the boxable primitives + string. Called once
+    // during setup, after the class descriptor/vtable globals exist.
+    void setupBoxDescriptors();
+
+    // §8.6: the descriptor-array global for a value type's box, by which
+    // `o is T` (T a record/enum/primitive/string) recognizes a boxed value.
+    // Records/enums reuse descArray_; primitives/string use primBoxDesc_.
+    llvm::GlobalVariable* boxDescriptorFor(const sema::TypeRef* rt);
+
+    // §8.6: the box vtable for a boxable value type — vtable[0] is its
+    // descriptor; for records the iface-method slots are filled so dispatch on
+    // a boxed record reaches the implementing method.
+    llvm::GlobalVariable* boxVtableFor(const sema::TypeRef* rt);
+
+    // §8.6: is `rt` a value type that boxes when coerced to Object/interface
+    // (record, enum, value primitive, or inline array)? Reference types
+    // (class, interface, string, Object, function, heap collections) do not.
+    bool isBoxableValueType(const sema::TypeRef* rt);
+
+    // §8.6: is `target` a reference type (Object / interface / Object?) — the
+    // kind of declared location that triggers boxing of a value-typed source?
+    bool isObjectOrInterfaceTarget(const sema::TypeRef* target);
+
+    // §8.6: box `value` (already lowered, of static type `srcTy`) into a heap
+    // wrapper `{ boxVtable*, value-bytes }` and return the box pointer. A
+    // nullable value type whose source is null boxes to a null pointer (§8.6
+    // Nullable value-type boxing). Returns `value` unchanged when it is not a
+    // boxable value (already a reference) or when no descriptor is available.
+    llvm::Value* boxValue(llvm::Value* value, const sema::TypeRef* srcTy);
+
+    // §8.6: given a coercion of `init`'s lowered value `v` into a declared
+    // location of type `declTy`, box `v` if the location is Object/interface
+    // and the source expression is a value type. Returns the (possibly boxed)
+    // value; a no-op for reference sources and non-Object targets.
+    llvm::Value* boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
+                              const ast::Expr* init);
 
     // CG13: the class's user destructor body, if it declares one.
     const ast::DestructorDecl* findDestructor(const sema::TypeSymbol* ts);

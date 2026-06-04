@@ -1090,6 +1090,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // unwind, and no dispose scope for owned params (a documented gap).
     unwindIneligible_.clear();
     unwindIneligibleFn_ = fn;
+    currentReturnTypeNode_ = ci.returnType;  // §8.6: for return-value boxing
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
         collectUnwindIneligible(*ci.stmts);
 
@@ -1112,6 +1113,11 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     bool terminated = false;
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
         llvm::Value* v = lowerExpr(*ci.exprBody);
+        // §8.6: box a value-typed `=> expr` result returned through an
+        // Object/interface return type (so the caller's is/as/dispatch works).
+        if (v && currentReturnTypeNode_)
+            v = boxForTarget(v, ctx_.resolvedType(*currentReturnTypeNode_),
+                             ci.exprBody);
         terminated = emitReturn(fn, v);
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
         terminated = lowerScopedBlock(*ci.stmts);
@@ -1126,6 +1132,7 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd) return;
     currentFn_ = fn;
+    currentReturnTypeNode_ = nullptr;  // ctors return void
     currentThis_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
@@ -1146,6 +1153,7 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd) return;
     currentFn_ = fn;
+    currentReturnTypeNode_ = nullptr;  // ctors return void
     currentThis_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
@@ -1406,6 +1414,13 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // CG40: a diverging initializer (`var x := throw E;`) terminated the
     // block; allocate the slot but emit no store.
     if (diverged_) return;
+    // §8.6: when the local is declared Object/interface and the initializer is
+    // a value type, box it — `var o: Object := new Rect(3,4)` allocates a heap
+    // wrapper whose first word is the value type's box vtable, so `is`/`as`/
+    // dispatch recognize the boxed value (findings 05/06/08/12/13). A reference
+    // source (class/string/interface) is left as its bare pointer (#399).
+    if (v && declType)
+        v = boxForTarget(v, ctx_.resolvedType(*declType), init);
     llvm::Type* declaredTy = declType ? lowerType(declType) : nullptr;
     // §5.1: when the local is declared with an explicit wider numeric type
     // and the initializer lowered to a narrower numeric LLVM type (e.g.
@@ -2245,6 +2260,234 @@ bool Emitter::lowerBody(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
         if (s && lowerStmt(*s)) return true;
     }
     return false;
+}
+
+
+// §8.6: the stable spelling of each boxable primitive (and string), used to key
+// primBoxDesc_/primBoxVtable_ and to match a type-test target's name.
+static const char* primBoxName(sema::PrimitiveType p) {
+    using P = sema::PrimitiveType;
+    switch (p) {
+        case P::Bool:    return "bool";
+        case P::Char:    return "char";
+        case P::String:  return "string";
+        case P::Byte:    return "byte";
+        case P::SByte:   return "sbyte";
+        case P::Short:   return "short";
+        case P::UShort:  return "ushort";
+        case P::Int:     return "int";
+        case P::UInt:    return "uint";
+        case P::Long:    return "long";
+        case P::ULong:   return "ulong";
+        case P::Float:   return "float";
+        case P::Double:  return "double";
+        default:         return nullptr;  // Object / Decimal / None: no box desc
+    }
+}
+
+
+// §8.6: build the box descriptor (vtable[0] type-tag array) + box vtable globals
+// for boxable value types — user records and enums, and the built-in primitives
+// + string. A boxed value is `{ vtable*, value-bytes }`; its first word points
+// here so `emitIsA` (`*obj` → vtable, `vtable[0]` → descriptor array) recognizes
+// the boxed value's dynamic type uniformly with a class instance. For a record
+// that implements interfaces (§9.6), the box vtable's interface-method slots are
+// filled with the record's implementations so virtual dispatch on a boxed record
+// reaches the right method. Runs after declareVtables/setupBuiltinExceptions so
+// every interface descriptor (used in a record's descriptor chain) already
+// exists.
+void Emitter::setupBoxDescriptors() {
+    // --- Records & enums: descriptor + box vtable -------------------------
+    // Pass A: declare a descriptor-array global for each record/enum (sized by
+    // its [self + transitive bases] chain). Records list their interfaces in
+    // baseTypes, so `o is IShape` on a boxed Rect works too.
+    std::unordered_map<const sema::TypeSymbol*,
+                       std::vector<const sema::TypeSymbol*>> supersOf;
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts) continue;
+        if (ts->kind != ast::TypeDeclKind::Record &&
+            ts->kind != ast::TypeDeclKind::Enum)
+            continue;
+        if (descArray_.count(ts)) continue;  // never overwrite a class/iface
+        std::vector<const sema::TypeSymbol*> supers;
+        collectTypeAndBases(ts, supers);
+        supersOf[ts] = supers;
+        auto* arrTy = llvm::ArrayType::get(ptrTy(), supers.size() + 1);
+        descArray_[ts] = new llvm::GlobalVariable(
+            *module_, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, nullptr,
+            "btd$" + std::string(ts->name));
+    }
+    // Pass B: fill each descriptor with [self + transitive bases, null]. A base
+    // that is itself a record/enum is in descArray_ from Pass A; an interface
+    // base is in descArray_ from declareVtables.
+    for (auto& [ts, supers] : supersOf) {
+        std::vector<llvm::Constant*> elems;
+        for (const sema::TypeSymbol* s : supers) {
+            auto it = descArray_.find(s);
+            llvm::Constant* d = it != descArray_.end()
+                ? llvm::cast<llvm::Constant>(it->second)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            elems.push_back(d);
+        }
+        elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+        auto* arrTy = llvm::cast<llvm::ArrayType>(
+            descArray_[ts]->getValueType());
+        descArray_[ts]->setInitializer(
+            llvm::ConstantArray::get(arrTy, elems));
+    }
+    // Pass C: build each record's box vtable. The layout matches a class
+    // vtable's prefix — [descArray, Dispose, iface-slots…] — so interface
+    // dispatch (`vtable[ifaceSlot]`) on a boxed record finds the method. Enums
+    // get the same shape (no iface methods filled). Slot 1 (Dispose) is the
+    // shared no-op: boxed value types are runtime-managed (§28.9) and own
+    // nothing.
+    for (auto& [ts, supers] : supersOf) {
+        std::vector<llvm::Constant*> elems(2 + ifaceSlotCount_,
+                                           llvm::ConstantPointerNull::get(
+                                               ptrTy()));
+        elems[0] = descArray_[ts];
+        if (builtinDisposeFn_) elems[1] = builtinDisposeFn_;
+        // §9.6 / §8.6: fill the interface-method slots this record implements.
+        // The real record method takes `this` = a pointer to the bare record
+        // bytes (field indices from 0). A boxed record's receiver, however, is
+        // the BOX pointer whose first word is the vtable; the record bytes start
+        // one word in. So the box vtable stores a small THUNK that advances
+        // `this` past the vtable word, then tail-calls the real method. This
+        // keeps the class-dispatch convention (this at offset 0) untouched.
+        std::unordered_set<const sema::TypeSymbol*> superSet(supers.begin(),
+                                                             supers.end());
+        for (const auto& [im, slot] : ifaceMethodSlot_) {
+            if (!im->parent || !superSet.count(im->parent)) continue;
+            sema::MethodSymbol* impl = findMethodByName(ts, im->name);
+            if (!impl) continue;
+            auto mit = methodFns_.find(impl);
+            if (mit == methodFns_.end()) continue;
+            llvm::Function* real = mit->second;
+            llvm::FunctionType* fnTy = real->getFunctionType();
+            auto* thunk = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage,
+                "bz$boxthunk$" + std::string(ts->name) + "$" +
+                    std::string(im->name),
+                module_.get());
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+            llvm::IRBuilder<> tb(bb);
+            std::vector<llvm::Value*> callArgs;
+            auto ai = thunk->arg_begin();
+            // this (arg 0): box ptr → record bytes (+1 word).
+            llvm::Value* recThis = tb.CreateGEP(
+                ptrTy(), &*ai, {llvm::ConstantInt::get(i32(), 1)}, "boxthis");
+            callArgs.push_back(recThis);
+            ++ai;
+            for (; ai != thunk->arg_end(); ++ai) callArgs.push_back(&*ai);
+            llvm::Value* r = tb.CreateCall(fnTy, real, callArgs);
+            if (fnTy->getReturnType()->isVoidTy()) tb.CreateRetVoid();
+            else tb.CreateRet(r);
+            elems[slot] = thunk;
+        }
+        auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
+        boxVtable_[ts] = new llvm::GlobalVariable(
+            *module_, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(arrTy, elems),
+            "bvt$box$" + std::string(ts->name));
+    }
+
+    // --- Primitives: descriptor + 1-word box vtable -----------------------
+    // Each boxable value primitive gets a 2-element descriptor [self, null] and
+    // a 1-element vtable [descriptor]. `emitIsA` reads only vtable[0], so one
+    // word suffices for `o is int`. (string is included so a boxed-value box
+    // could in principle carry it, but `is string` itself is deferred — see
+    // lowerTypeTest: a raw string operand has no vtable to walk.)
+    using P = sema::PrimitiveType;
+    static const P prims[] = {P::Bool, P::Char, P::String, P::Byte, P::SByte,
+                              P::Short, P::UShort, P::Int, P::UInt, P::Long,
+                              P::ULong, P::Float, P::Double};
+    for (P p : prims) {
+        const char* nm = primBoxName(p);
+        if (!nm || primBoxDesc_.count(nm)) continue;
+        auto* descTy = llvm::ArrayType::get(ptrTy(), 2);
+        auto* desc = new llvm::GlobalVariable(
+            *module_, descTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, nullptr,
+            std::string("ptd$") + nm);
+        desc->setInitializer(llvm::ConstantArray::get(
+            descTy, {desc, llvm::ConstantPointerNull::get(ptrTy())}));
+        primBoxDesc_[nm] = desc;
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 1);
+        primBoxVtable_[nm] = new llvm::GlobalVariable(
+            *module_, vtTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, {desc}),
+            std::string("pvt$") + nm);
+    }
+}
+
+
+// §8.6: is `rt` a value type that boxes when coerced to Object/interface?
+bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
+    if (!rt) return false;
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    if (rt->kind == K::Primitive) {
+        // string/Object are reference types; everything else (numeric, bool,
+        // char) is a value primitive that boxes.
+        return rt->primitive != P::String && rt->primitive != P::Object &&
+               rt->primitive != P::None && rt->primitive != P::Decimal;
+    }
+    if (rt->kind == K::Named && rt->declaration)
+        return rt->declaration->kind == ast::TypeDeclKind::Record ||
+               rt->declaration->kind == ast::TypeDeclKind::Enum;
+    return false;  // inline arrays / unit: deferred (not among the findings)
+}
+
+
+// §8.6: a declared location whose type triggers boxing of a value-typed source.
+bool Emitter::isObjectOrInterfaceTarget(const sema::TypeRef* target) {
+    if (!target) return false;
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    if (target->kind == K::Primitive) return target->primitive == P::Object;
+    if (target->kind == K::Named && target->declaration)
+        return target->declaration->kind == ast::TypeDeclKind::Interface;
+    return false;
+}
+
+
+// §8.6: the box descriptor for a value type's type-test target.
+llvm::GlobalVariable* Emitter::boxDescriptorFor(const sema::TypeRef* rt) {
+    if (!rt) return nullptr;
+    using K = sema::TypeRef::Kind;
+    if (rt->kind == K::Named && rt->declaration) {
+        auto it = descArray_.find(rt->declaration);
+        return it != descArray_.end() ? it->second : nullptr;
+    }
+    if (rt->kind == K::Primitive) {
+        const char* nm = primBoxName(rt->primitive);
+        if (!nm) return nullptr;
+        auto it = primBoxDesc_.find(nm);
+        return it != primBoxDesc_.end() ? it->second : nullptr;
+    }
+    return nullptr;
+}
+
+
+// §8.6: the box vtable for a boxable value type.
+llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
+    if (!rt) return nullptr;
+    using K = sema::TypeRef::Kind;
+    if (rt->kind == K::Named && rt->declaration) {
+        auto it = boxVtable_.find(rt->declaration);
+        return it != boxVtable_.end() ? it->second : nullptr;
+    }
+    if (rt->kind == K::Primitive) {
+        const char* nm = primBoxName(rt->primitive);
+        if (!nm) return nullptr;
+        auto it = primBoxVtable_.find(nm);
+        return it != primBoxVtable_.end() ? it->second : nullptr;
+    }
+    return nullptr;
 }
 
 
