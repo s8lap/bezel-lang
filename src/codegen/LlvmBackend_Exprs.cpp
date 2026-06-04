@@ -2101,6 +2101,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     if (!ne.type) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*ne.type);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    // per §14.2: `new T()` inside a generic body. T is a type parameter (its
+    // TypeRef has no declaration); resolve it to the concrete sema TypeRef of
+    // the active monomorphization so construction dispatches to the substituted
+    // type — a class's parameterless constructor for a class substitution, or
+    // `default(T)` for a record substitution. Without this the bare type-param
+    // TypeRef falls through every construction branch and the constructor is
+    // never called (issue #361 / D12).
+    if (!rt->declaration && rt->astNode && rt->astNode->name &&
+        rt->astNode->name->parts.size() == 1 &&
+        !genericSubstSemaTy_.empty()) {
+        auto sit = genericSubstSemaTy_.find(rt->astNode->name->parts[0]);
+        if (sit != genericSubstSemaTy_.end() && sit->second &&
+            sit->second->kind == sema::TypeRef::Kind::Named &&
+            sit->second->declaration) {
+            rt = const_cast<sema::TypeRef*>(sit->second);
+        }
+    }
     if (!rt->declaration) {
         // CG22: built-in exception types (Exception, ArgumentException, …)
         // have no user TypeSymbol (rt->declaration == null) but do have a

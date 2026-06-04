@@ -1069,6 +1069,64 @@ void ExprTC::checkEventVisibilityFence(EventSymbol* es, std::string_view op,
         " is not available; only `.Subscribe` may be used here (§24.3)");
 }
 
+// per §14.1/§14.2: substitute a member's declared type against the receiver's
+// concrete generic arguments. A field/property declared `v: T` on a generic
+// type `Holder<T>`, accessed off `b: Holder<Inner>`, has type `Inner` — not
+// the bare type parameter `T`. Substituting here lets chained access like
+// `b.v.x` resolve `.x` against the concrete record layout (issue #361 / D13).
+TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
+                                      const ast::Expr* target,
+                                      TypeSymbol* parent) {
+    if (!declared || !target || !parent) return declared;
+    if (parent->genericParams.empty()) return declared;
+    // Only a bare type-parameter reference needs substitution: an unresolved
+    // Named type whose single name part matches one of parent's params.
+    if (declared->kind != TypeRef::Kind::Named || declared->declaration)
+        return declared;
+    if (!declared->astNode || !declared->astNode->name ||
+        declared->astNode->name->parts.size() != 1)
+        return declared;
+    std::string_view paramName = declared->astNode->name->parts[0];
+    // Find the receiver's resolved TypeRef (carries the concrete generic args).
+    // Prefer the target's exprType; fall back to a local/parameter's declared
+    // type when the target itself was not given an exprType.
+    TypeRef* recvTy = ctx_.exprType(*target);
+    if (!recvTy || recvTy->declaration != parent ||
+        recvTy->genericArgs.empty()) {
+        Symbol* sym = ctx_.exprSymbol(*target);
+        if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
+            if (loc->declType && loc->declType->declaration == parent &&
+                !loc->declType->genericArgs.empty())
+                recvTy = loc->declType;
+        } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
+            if (par->declType) {
+                if (auto* prt = ctx_.resolvedType(*par->declType))
+                    if (prt->declaration == parent && !prt->genericArgs.empty())
+                        recvTy = prt;
+            }
+        }
+    }
+    if (!recvTy || recvTy->declaration != parent || recvTy->genericArgs.empty())
+        return declared;
+    // Map the param name to its positional concrete arg.
+    for (std::size_t gi = 0; gi < parent->genericParams.size() &&
+                             gi < recvTy->genericArgs.size(); ++gi) {
+        if (parent->genericParams[gi] &&
+            parent->genericParams[gi]->name == paramName) {
+            TypeRef* arg = recvTy->genericArgs[gi];
+            if (!arg) return declared;
+            // Preserve a `T?` annotation on the field through substitution.
+            if (declared->nullable && !arg->nullable) {
+                TypeRef* nn = ctx_.makeTypeRef(*arg);
+                nn->nullable = true;
+                return nn;
+            }
+            return arg;
+        }
+    }
+    return declared;
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // per §24.3: the event visibility fence. When the access target resolves
     // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
@@ -1507,19 +1565,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (fd && fd->type) {
             if (auto* rt = ctx_.resolvedType(*fd->type)) {
-                ctx_.setExprType(&ma, rt);
+                // per §14.1: substitute a generic-param field type against the
+                // receiver's concrete args (issue #361 / D13).
+                ctx_.setExprType(&ma,
+                    substituteMemberType(rt, ma.target.get(), fs->parent));
             }
         } else if (fs->posParam && fs->posParam->type) {
             // §9: positional record field — type comes from the Param.
             if (auto* rt = ctx_.resolvedType(*fs->posParam->type)) {
-                ctx_.setExprType(&ma, rt);
+                ctx_.setExprType(&ma,
+                    substituteMemberType(rt, ma.target.get(), fs->parent));
             }
         }
     } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         if (pd && pd->type) {
             if (auto* rt = ctx_.resolvedType(*pd->type)) {
-                ctx_.setExprType(&ma, rt);
+                ctx_.setExprType(&ma,
+                    substituteMemberType(rt, ma.target.get(), ps->parent));
             }
         }
     } else if (dynamic_cast<EnumConstantSymbol*>(member) && targetType) {

@@ -314,6 +314,18 @@ private:
 
     void resolveMemberAccess(const ast::MemberAccessExpr& ma);
 
+    // per §14.1/§14.2: substitute a member's declared type against the
+    // receiver's concrete generic arguments. When a field/property declared
+    // with a generic-parameter type (`v: T`) is accessed off a receiver of a
+    // concrete instantiation (`b: Holder<Inner>`), the access `b.v` has type
+    // `Inner`, not the bare `T`. Returns `declared` unchanged when no
+    // substitution applies (non-generic field, missing receiver args, etc.).
+    // See issue #361 (D13): without this, `b.v.x` cannot resolve `.x` because
+    // `b.v` was typed as the unresolved type parameter.
+    TypeRef* substituteMemberType(TypeRef* declared,
+                                  const ast::Expr* target,
+                                  TypeSymbol* parent);
+
     // §24.3: the event visibility fence. Outside the declaring class, an
     // event member's static type is `IEvent<T>` / `IAsyncEvent<T>`, which
     // exposes only `Subscribe`. The producer-side operations `Raise` /

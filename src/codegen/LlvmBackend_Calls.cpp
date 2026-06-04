@@ -3641,6 +3641,43 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
+    // per §14.1/§14.2: a generic *method* (its own `<T>` params, e.g.
+    // `static method Clone<T>(proto: T): T where T: class, new()`) is
+    // monomorphized by inferring each method type parameter from the actual
+    // argument types. Without this, a `new T()` in the body has no
+    // substitution and constructs nothing (issue #361 / D12). This handles
+    // both static and instance generic methods; the receiver-class path above
+    // covers class-level params and runs first, so this only adds the
+    // method-level params it left unset.
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (!md->genericParams.empty()) {
+            std::unordered_map<std::string_view, llvm::Type*> newSubst =
+                genericSubst_;
+            std::unordered_map<std::string_view, const sema::TypeRef*> newSema =
+                genericSubstSemaTy_;
+            for (const auto& gp : md->genericParams) {
+                if (newSubst.count(gp.name)) continue;  // already bound
+                // Find a value parameter whose declared type is exactly this
+                // type parameter, and read the matching call argument's type.
+                for (std::size_t pi = 0; pi < md->params.size() &&
+                     pi < call.args.size(); ++pi) {
+                    const ast::Type* pt = md->params[pi].type.get();
+                    if (!pt || pt->kind != ast::TypeKind::Named || !pt->name ||
+                        pt->name->parts.size() != 1 ||
+                        pt->name->parts[0] != gp.name)
+                        continue;
+                    if (!call.args[pi].value) continue;
+                    sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
+                    if (!at) continue;
+                    newSubst[gp.name] = lowerTypeRef(at);
+                    newSema[gp.name] = at;
+                    break;
+                }
+            }
+            genericSubst_ = std::move(newSubst);
+            genericSubstSemaTy_ = std::move(newSema);
+        }
+    }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified);
     // Record the concrete subst that was active during this call so that
     // lowerLocalDecl can associate it with the result's local variable.
