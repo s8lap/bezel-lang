@@ -2436,7 +2436,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // §5.1: an int initializer for a wider numeric field (e.g. a `double`
         // field with `:= 5`) is implicitly widened — convert before the store
         // so the field holds the value, not the int's raw bits (issue #408).
-        v = coerceNumericToType(v, st->getElementType(idxIt->second));
+        // An unsigned source (e.g. a `uint` field initializer for a `double`
+        // field) widens with UIToFP/ZExt, not SIToFP/SExt (issue #410).
+        v = coerceNumericToType(v, st->getElementType(idxIt->second),
+                                isUnsignedTargetExpr(*init));
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
@@ -2543,24 +2546,30 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
 // applied; everything else (pointers, structs, equal types, narrowing) is left
 // untouched, so callers can invoke this unconditionally.
 llvm::Value* Emitter::coerceNumericToType(llvm::Value* v,
-                                          llvm::Type* targetTy) {
+                                          llvm::Type* targetTy,
+                                          bool srcUnsigned) {
     if (!v || !targetTy) return v;
     llvm::Type* srcTy = v->getType();
     if (srcTy == targetTy) return v;
-    // int → float / double (§5.1: integers widen to binary floats).
+    // int → float / double (§5.1: integers widen to binary floats). An
+    // unsigned source (uint/ulong/ushort/byte/char) zero-interprets via
+    // UIToFP; a signed source sign-interprets via SIToFP (issue #410).
     if (srcTy->isIntegerTy() && !srcTy->isIntegerTy(1) &&
         targetTy->isFloatingPointTy())
-        return builder_.CreateSIToFP(v, targetTy);
+        return srcUnsigned ? builder_.CreateUIToFP(v, targetTy)
+                           : builder_.CreateSIToFP(v, targetTy);
     // float → double (§5.1: the one binary-float widening).
     if (srcTy->isFloatingPointTy() && targetTy->isFloatingPointTy() &&
         srcTy->getPrimitiveSizeInBits() < targetTy->getPrimitiveSizeInBits())
         return builder_.CreateFPExt(v, targetTy);
-    // integer widening (§5.1: e.g. int → long). Sign-extend (the common,
-    // signed case; unsigned-source widening is a deferred refinement).
+    // integer widening (§5.1: e.g. int → long, uint → long). An unsigned
+    // source zero-extends (ZExt); a signed source sign-extends (SExt)
+    // (issue #410).
     if (srcTy->isIntegerTy() && !srcTy->isIntegerTy(1) &&
         targetTy->isIntegerTy() &&
         srcTy->getIntegerBitWidth() < targetTy->getIntegerBitWidth())
-        return builder_.CreateSExt(v, targetTy);
+        return srcUnsigned ? builder_.CreateZExt(v, targetTy)
+                           : builder_.CreateSExt(v, targetTy);
     return v;  // no §5.1 numeric widening applies — leave the value as is.
 }
 

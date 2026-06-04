@@ -33,6 +33,46 @@ bool intLiteralMagnitude(std::string_view text, unsigned long long& out) {
     return true;
 }
 
+// §6.2: a primitive that participates in mixed-type arithmetic promotion.
+// These are the numeric types (§4.2/§4.3/§4.4) plus `char`, which §5.1
+// admits implicit conversions from (to int and wider). `bool`, `string`,
+// `Object`, and `None` do not promote.
+bool isPromotablePrimitive(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Byte:  case P::SByte: case P::Short: case P::UShort:
+        case P::Int:   case P::UInt:  case P::Long:  case P::ULong:
+        case P::Float: case P::Double: case P::Decimal: case P::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// The source spelling of a primitive type, for diagnostics.
+const char* primitiveSpelling(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Bool:    return "bool";
+        case P::Char:    return "char";
+        case P::String:  return "string";
+        case P::Byte:    return "byte";
+        case P::SByte:   return "sbyte";
+        case P::Short:   return "short";
+        case P::UShort:  return "ushort";
+        case P::Int:     return "int";
+        case P::UInt:    return "uint";
+        case P::Long:    return "long";
+        case P::ULong:   return "ulong";
+        case P::Float:   return "float";
+        case P::Double:  return "double";
+        case P::Decimal: return "decimal";
+        case P::Object:  return "Object";
+        case P::None:    return "<none>";
+    }
+    return "<unknown>";
+}
+
 }  // namespace
 
 void ExprTC::visitExpr(const ast::Expr& e) {
@@ -583,10 +623,30 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     ctx_.setExprType(&be, lt);
                     return;
                 }
-                // Neither widens to the other (e.g. double + decimal): §6.2
-                // requires an explicit cast. Leave the result typed as the
-                // left operand (matching the prior behavior); the dedicated
-                // mixed-incompatible diagnostic is deferred (issue #408).
+                // §6.2: "If no implicit conversion exists between the operand
+                // types (e.g. `double` and `decimal`), the operation is a
+                // compile error and an explicit cast is required." This covers
+                // every numeric pair §5.1 leaves with no conversion in either
+                // direction — `double`/`decimal`, `float`/`decimal`, and the
+                // signed/unsigned same-or-narrower-width pairs (`int`/`uint`,
+                // `long`/`ulong`, `short`/`ushort`, `byte`/`sbyte`, …). Both
+                // operands must be promotable primitives (numeric or `char`);
+                // a non-numeric mismatch (e.g. `bool`/`int`) is diagnosed by
+                // the operand-type rules elsewhere, not here (issue #410).
+                if (isPromotablePrimitive(lt->primitive) &&
+                    isPromotablePrimitive(rt->primitive)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, be.span.begin,
+                        std::string("operator `") + std::string(op) +
+                        "` has no implicit conversion between operand types `" +
+                        primitiveSpelling(lt->primitive) + "` and `" +
+                        primitiveSpelling(rt->primitive) +
+                        "` (§6.2); add an explicit cast (§5.2) to convert one"
+                        " operand to the other's type.");
+                    // Leave the result un-typed (the operation is rejected),
+                    // matching the bitwise-operand error above.
+                    return;
+                }
             }
         }
         if (lt) ctx_.setExprType(&be, lt);
