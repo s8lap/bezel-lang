@@ -373,8 +373,15 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
     }
     if (dynamic_cast<const sema::ConstMemberSymbol*>(&m)) {
         out.kind = MetaMemberKind::Const;
-        if (auto* cd = dynamic_cast<const ast::ConstDecl*>(m.decl))
+        if (auto* cd = dynamic_cast<const ast::ConstDecl*>(m.decl)) {
             out.type = convertAstType(cd->type.get(), ctx);
+            // §22.12: a class-level `const` initializer "must be a compile-time-
+            // constant expression", so its value is carried textually in the
+            // metadata and FOLDED at the importer's read site (issue #328
+            // FINDING [3] BUG A) — the library emits NO storage global for a
+            // const, so a cross-module read cannot bind to one.
+            out.valueText = renderConstExpr(cd->value.get());
+        }
         return true;
     }
     // Destructor (§13.3: not part of the public surface — Dispose() is) and
