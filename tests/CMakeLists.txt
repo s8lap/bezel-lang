@@ -220,6 +220,7 @@ set(BEZEL_TEST_SOURCES
     codegen/collection_test.cpp
     codegen/record_key_test.cpp
     codegen/collection_keys_test.cpp
+    codegen/set_algebra_complete_test.cpp
     codegen/linq_test.cpp
     codegen/event_test.cpp
     codegen/owned_collection_ops_test.cpp
