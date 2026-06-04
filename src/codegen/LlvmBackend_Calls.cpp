@@ -344,6 +344,130 @@ const sema::TypeSymbol* Emitter::recordKeyType(const sema::TypeRef* collTy,
 }
 
 
+// issue #400 / §25.2 / §8.4: a class customizes equality by overriding `Equals`
+// (it cannot overload `=`/`<>` — §25.2). Walk the class and its base chain for a
+// user-declared single-parameter `Equals` method. `Object.Equals` is a compiler
+// intrinsic and has no MethodSymbol in any user `members` list, so a class that
+// does not override `Equals` yields null here — and Remove then keeps the §8.3
+// reference-identity default. This parallels the ToString-override lookup the
+// string-interpolation lowering performs.
+sema::MethodSymbol* Emitter::classEqualsOverride(const sema::TypeSymbol* cls) {
+    if (!cls || cls->kind != ast::TypeDeclKind::Class) return nullptr;
+    for (auto* cur = cls; cur;) {
+        for (auto* sym : cur->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+            if (ms && !ms->isOperator && ms->name == "Equals" &&
+                ms->params.size() == 1 && !isStaticMethod(ms))
+                return ms;
+        }
+        const sema::TypeSymbol* nxt = nullptr;
+        for (auto* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+        cur = nxt;
+    }
+    return nullptr;
+}
+
+
+// issue #400 / §25.2: the per-element comparison `Array<T>`/`OwnedArray<T>`'s
+// `.Remove(item)` uses to match `el` (a stored element, borrowed) against
+// `target` (the query, a pure borrow — neither operand is consumed). The spec
+// requires collections to use the element type's `Equals` (§25.2: "which use
+// `Equals` rather than `=`"), defaulting per §8.3:
+//   - class WITH a user `Equals` override → virtual `el.Equals(target)` (§8.4),
+//     guarded so a null slot or null query falls back to reference identity
+//     (matching §8.4's null-safe `=`: null = null is true; null = nonNull false);
+//   - class WITHOUT an override → reference identity (§8.3 default);
+//   - record → structural field-by-field equality (§8.3, emitStructEquality —
+//     consistent with the record's auto `Equals`/`GetHashCode`);
+//   - string → content equality (§4.6);
+//   - primitive/enum (value type) → `==`.
+llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
+                                                llvm::Value* target,
+                                                const sema::TypeRef* elemTy,
+                                                bool elemIsClass) {
+    // Record element: structural value equality (§8.3). The Remove loop loads
+    // `el` from the slot and lowers `target` as the record's struct value; an
+    // ICmp on a struct is invalid, so this path is mandatory (not an extension).
+    if (const sema::TypeSymbol* rec = recordTypeOfRef(elemTy)) {
+        llvm::StructType* st = recordStruct(rec);
+        llvm::Value* l = el, *r = target;
+        if (l->getType()->isPointerTy()) l = builder_.CreateLoad(st, l);
+        if (r->getType()->isPointerTy()) r = builder_.CreateLoad(st, r);
+        if (l->getType()->isStructTy() && r->getType()->isStructTy())
+            return emitStructEquality(l, r, st, rec);  // §8.3 structural
+        // Shape mismatch (defensive): no match rather than an invalid compare.
+        return builder_.getFalse();
+    }
+
+    // Class element: dispatch through a user `Equals` override when present.
+    if (elemIsClass && el->getType()->isPointerTy() &&
+        target->getType()->isPointerTy()) {
+        const sema::TypeSymbol* cls =
+            (elemTy && elemTy->kind == sema::TypeRef::Kind::Named)
+                ? elemTy->declaration : nullptr;
+        if (sema::MethodSymbol* eqm = classEqualsOverride(cls)) {
+            // §8.4: `el.Equals(target)`. Guard against a null element slot or a
+            // null query: dispatching through a null `el` would load a null
+            // vtable. A null operand uses reference identity (= the null-safe
+            // `=` of §8.4: null = null → true, null = nonNull → false), which a
+            // plain pointer ICmp computes exactly.
+            auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+            llvm::Value* eitherNull = builder_.CreateOr(
+                builder_.CreateICmpEQ(el, nullP),
+                builder_.CreateICmpEQ(target, nullP));
+            auto* idBB   = llvm::BasicBlock::Create(llvm_, "rmi.eq.id", currentFn_);
+            auto* callBB = llvm::BasicBlock::Create(llvm_, "rmi.eq.call", currentFn_);
+            auto* joinBB = llvm::BasicBlock::Create(llvm_, "rmi.eq.join", currentFn_);
+            builder_.CreateCondBr(eitherNull, idBB, callBB);
+            // null path: reference identity.
+            builder_.SetInsertPoint(idBB);
+            llvm::Value* idEq = builder_.CreateICmpEQ(el, target);
+            llvm::BasicBlock* idEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(joinBB);
+            // non-null path: virtual Equals(Object?) call. `target` is already a
+            // class/Object pointer; `el` is the receiver (args[0]).
+            builder_.SetInsertPoint(callBB);
+            std::vector<llvm::Value*> eqArgs{el, target};
+            llvm::Value* callEq =
+                emitMethodCall(eqm, eqArgs, /*baseQualified=*/false);
+            if (!callEq) return nullptr;
+            if (callEq->getType()->isIntegerTy() &&
+                !callEq->getType()->isIntegerTy(1))
+                callEq = builder_.CreateICmpNE(
+                    callEq, llvm::ConstantInt::get(callEq->getType(), 0));
+            llvm::BasicBlock* callEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(joinBB);
+            builder_.SetInsertPoint(joinBB);
+            llvm::PHINode* phi = builder_.CreatePHI(i1(), 2, "rmi.eq");
+            phi->addIncoming(idEq, idEnd);
+            phi->addIncoming(callEq, callEnd);
+            return phi;
+        }
+        // §8.3: no override → reference identity (the class default).
+        return builder_.CreateICmpEQ(el, target);
+    }
+
+    // String element: content equality (§4.6).
+    if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
+        return emitStringEq(el, target);
+
+    // Value type (primitive/enum): `==`. Widen mismatched integer widths.
+    llvm::Value* elN = el, *tN = target;
+    if (el->getType() != target->getType() &&
+        el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
+        unsigned ew = el->getType()->getIntegerBitWidth();
+        unsigned tw = target->getType()->getIntegerBitWidth();
+        llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
+        elN = builder_.CreateSExt(el, wide);
+        tN  = builder_.CreateSExt(target, wide);
+    }
+    if (elN->getType()->isFloatingPointTy())
+        return builder_.CreateFCmpOEQ(elN, tN);
+    return builder_.CreateICmpEQ(elN, tN);
+}
+
+
 llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -1049,19 +1173,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz)});
             return llvm::ConstantInt::get(i32(), 0);
         }
-        // per §4.5: .Remove(item): bool — find the first matching element and
-        // remove it; returns whether one was found. For an OwnedArray<T> the
+        // per §4.4/§4.5: .Remove(item): bool — find the first matching element
+        // and remove it; returns whether one was found. For an OwnedArray<T> the
         // matched (class) element is DISPOSED (and freed) via the element
         // disposer, mirroring RemoveAt; for a borrowing Array<T> the slot is
-        // just removed. Match semantics: a class element compares by REFERENCE
-        // identity (the §25.2 default Equals for classes — a user-defined
-        // Equals/operator= override is not yet invoked here; see report); a
-        // string element compares by content (§4.6); a value element by ==.
+        // just removed. Match semantics (issue #400 / §25.2 — "collections use
+        // Equals rather than ="): dispatched per element type by
+        // emitRemoveElementEquality — a class with a user `Equals` override calls
+        // it virtually (§8.4), a class without one uses reference identity (§8.3),
+        // a record uses structural equality (§8.3), a string content (§4.6), a
+        // value type `==`. The query `target` is a PURE BORROW — it is only
+        // compared, never consumed or disposed by Remove (§4.5).
         if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
             llvm::Type* elemTy = getElemTy();
             bool elemIsClass = collectionElemIsClass(recvTy, 0);
+            const sema::TypeRef* elemRef =
+                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                         : nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             auto* idxSlot = entryAlloca(i64());
@@ -1079,25 +1209,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            llvm::Value* eq;
-            if (elemIsClass && el->getType()->isPointerTy() &&
-                target->getType()->isPointerTy()) {
-                eq = builder_.CreateICmpEQ(el, target);  // §25.2 reference identity
-            } else if (el->getType()->isPointerTy() &&
-                       target->getType()->isPointerTy()) {
-                eq = emitStringEq(el, target);           // §4.6 string content
-            } else {
-                llvm::Value* elN = el, *tN = target;
-                if (el->getType() != target->getType() &&
-                    el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
-                    unsigned ew = el->getType()->getIntegerBitWidth();
-                    unsigned tw = target->getType()->getIntegerBitWidth();
-                    llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
-                    elN = builder_.CreateSExt(el, wide);
-                    tN = builder_.CreateSExt(target, wide);
-                }
-                eq = builder_.CreateICmpEQ(elN, tN);
-            }
+            llvm::Value* eq =
+                emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+            if (!eq) return nullptr;
             builder_.CreateCondBr(eq, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
             // Remove (and, for an owning array, dispose) the matched slot.
