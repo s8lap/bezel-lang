@@ -63,12 +63,14 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
          valTy->declaration &&
          valTy->declaration->kind == ast::TypeDeclKind::Record)
             ? valTy->declaration : nullptr;
-    // A record (aggregate) value is heap-boxed in the dict and needs the
-    // null-guarded box-load decode that TryGetValue performs (LlvmBackend_Calls
-    // .cpp). The indexer-get's throw-on-absent guard means the box is non-null
-    // here, but the full record round-trip through the indexer is DEFERRED (see
-    // report): bail so the read falls through unchanged rather than mis-decode.
-    if (valRec) return nullptr;
+    // issue #393 / §4.8: a record (aggregate) value is heap-boxed in the dict
+    // (the runtime stores a malloc'd box of the record bytes — see the `.Set` /
+    // `.TryGetValue` encode/decode in LlvmBackend_Calls.cpp). It is too wide for
+    // the scalar inttoptr value-slot encoding, so the indexer get decodes it the
+    // same way TryGetValue does: load the box pointer, then load the record
+    // struct out of the box (the decode below, where `valLlvm` is the record's
+    // LLVM struct type). The throw-on-absent guard guarantees the box is
+    // non-null, so no extra null check is needed.
     llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : ptrTy();
     if (!valLlvm) valLlvm = ptrTy();
 
@@ -96,10 +98,13 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     }
     // §4.8: absent key → KeyNotFoundException.
     emitGuardThrow(builder_.CreateNot(found), "KeyNotFoundException");
-    // Decode the stored void* into the value type (mirror TryGetValue). Record
-    // (aggregate) values are bailed above; the remaining cases are scalars
-    // (decoded from the inttoptr'd slot) and object/string pointers.
+    // Decode the stored void* into the value type (mirror TryGetValue). The
+    // cases are: a record (aggregate) value — load the boxed record struct out
+    // of the box (issue #393); scalars — decoded from the inttoptr'd slot;
+    // object/string pointers — the void* IS the pointer.
     llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
+    if (valRec && valLlvm->isStructTy())
+        return builder_.CreateLoad(valLlvm, valPtr, "ix.rec");
     if (!valLlvm->isPointerTy()) {
         llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
         if (valLlvm->isDoubleTy())
@@ -175,15 +180,21 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
          valTy->declaration &&
          valTy->declaration->kind == ast::TypeDeclKind::Record)
             ? valTy->declaration : nullptr;
-    // A record (aggregate) value round-trip through the indexer is DEFERRED
-    // (see the get-side note): bail so `dict[key] := <record>` falls through
-    // unchanged rather than store a value the deferred get cannot read back.
-    if (valRec) return false;
-
-    // Encode the value as the stored void* (mirror the dict Add path). Record
-    // (aggregate) values are bailed above; the remaining cases are object/string
-    // pointers (stored directly) and scalars (widened to a slot and inttoptr'd).
+    // Encode the value as the stored void* (mirror the dict Add path in
+    // LlvmBackend_Calls.cpp). The cases are: a record (aggregate) value —
+    // heap-boxed (malloc + store of its bytes), the box pointer stored, decoded
+    // back by the indexer get (issue #393 / §4.8); object/string pointers —
+    // stored directly; scalars — widened to i64 and inttoptr'd.
     auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
+        if (valRec && v->getType()->isStructTy()) {
+            llvm::StructType* vst = recordStruct(valRec);
+            uint64_t vsz = module_->getDataLayout().getTypeAllocSize(vst);
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            llvm::Value* box =
+                builder_.CreateCall(mallocFn, {builder_.getInt64((int64_t)vsz)});
+            builder_.CreateStore(v, box);   // copy the record bytes into the box
+            return box;
+        }
         if (v->getType()->isPointerTy()) return v;
         llvm::Value* asI64 = v;
         if (v->getType()->isFloatingPointTy()) {
