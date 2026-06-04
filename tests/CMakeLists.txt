@@ -189,6 +189,7 @@ set(BEZEL_TEST_SOURCES
     codegen/enum_case_test.cpp
     codegen/expr_result_member_test.cpp
     codegen/conversion_test.cpp
+    codegen/numeric_conversion_test.cpp
     codegen/move_expr_test.cpp
     codegen/default_args_test.cpp
     codegen/named_args_test.cpp
