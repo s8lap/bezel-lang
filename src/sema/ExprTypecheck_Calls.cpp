@@ -511,6 +511,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
                         return true;
                     }
+                    // stdlib §5 Combination/Slicing: Concat/TakeWhile/SkipWhile
+                    // preserve the source element type T (lazy IEnumerable<T>).
+                    if (m == "Concat" || m == "TakeWhile" || m == "SkipWhile") {
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                        return true;
+                    }
+                    // stdlib §5 Projection: SelectMany(selector: (T)->IEnum<U>)
+                    // flattens to a lazy IEnumerable<U>. The output element type U
+                    // is the element type of the selector lambda's return type
+                    // (a collection or lazy enumerable carrying U at genericArgs[0]).
+                    if (m == "SelectMany" && !ce.args.empty() && ce.args[0].value) {
+                        TypeRef* outElem = srcElem;
+                        if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
+                            if (lamTy->kind == TypeRef::Kind::Function &&
+                                lamTy->funcReturn &&
+                                !lamTy->funcReturn->genericArgs.empty() &&
+                                lamTy->funcReturn->genericArgs[0])
+                                outElem = lamTy->funcReturn->genericArgs[0];
+                        ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
+                        return true;
+                    }
+                    // stdlib §5 Combination: Zip<U,R>(other, combine: (T,U)->R)
+                    // yields a lazy IEnumerable<R>. The output element type R is
+                    // the combine lambda's return type (the 2nd arg here).
+                    if (m == "Zip" && ce.args.size() >= 2 && ce.args[1].value) {
+                        TypeRef* outElem = srcElem;
+                        if (auto* lamTy = ctx_.exprType(*ce.args[1].value))
+                            if (lamTy->kind == TypeRef::Kind::Function && lamTy->funcReturn)
+                                outElem = lamTy->funcReturn;
+                        ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
+                        return true;
+                    }
                     return false;
                 };
                 // stdlib §5: chained LINQ on a lazy IEnumerable<T> receiver.
@@ -525,6 +557,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     else if (m == "Count" || m == "Sum" || m == "Min" || m == "Max")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    // stdlib §5/§5.1: Average returns double (the int/long/double
+                    // selector overloads and the per-type no-selector form all
+                    // produce double; decimal is the lone exception, not modeled).
+                    else if (m == "Average")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                    // stdlib §5 Aggregation: Aggregate(seed, fold) returns the
+                    // accumulator type TAccum — the static type of the seed arg.
+                    else if (m == "Aggregate" && !ce.args.empty() && ce.args[0].value) {
+                        if (auto* st = ctx_.exprType(*ce.args[0].value))
+                            ctx_.setExprType(&ce, st);
+                    }
                     else if (m == "First" || m == "Last" || m == "Single" ||
                              m == "ElementAt")
                         ctx_.setExprType(&ce, srcElem);
@@ -577,6 +620,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "Sum" || m == "Min" || m == "Max")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // stdlib §5/§5.1: Average → double (int/long/double forms).
+                        else if (m == "Average")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                        // stdlib §5 Aggregation: Aggregate(seed, fold) returns the
+                        // accumulator type TAccum = the static type of the seed.
+                        else if (m == "Aggregate" && !ce.args.empty() && ce.args[0].value) {
+                            if (auto* st = ctx_.exprType(*ce.args[0].value))
+                                ctx_.setExprType(&ce, st);
+                        }
                         // per §5 LINQ: ToArray/ToSet materialize the (already
                         // eager, for an Array source) collection. Typed as the
                         // lazy sentinel carrying the element type.
@@ -1062,11 +1114,16 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     // LINQ operators/aggregates whose (single) lambda is `(T) -> …` over the
     // source element T (stdlib §5). Select's selector and OrderBy's key fn are
     // also `(T) -> …`; Distinct/Take/Skip take no lambda (excluded).
+    // TakeWhile/SkipWhile take `(T) -> bool`; SelectMany takes
+    // `(T) -> IEnumerable<U>`; Average takes `(T) -> numeric` — all single-param
+    // over the source element T, so they seed the same way.
     bool elemLambda =
         m == "Where" || m == "Select" || m == "Count" || m == "Any" ||
         m == "All" || m == "First" || m == "Last" || m == "Single" ||
         m == "OrderBy" || m == "OrderByDescending" || m == "ForEach" ||
-        m == "Min" || m == "Max" || m == "Sum";
+        m == "Min" || m == "Max" || m == "Sum" ||
+        m == "TakeWhile" || m == "SkipWhile" || m == "SelectMany" ||
+        m == "Average";
     if (!elemLambda) return nullptr;
     auto* recvTy = ctx_.exprType(*ma->target);
     if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||

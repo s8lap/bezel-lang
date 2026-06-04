@@ -673,6 +673,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return phi;
         }
 
+        // per §5 LINQ: .Any(): bool — true iff the source is non-empty.
+        if (m == "Any" && call.args.empty()) {
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            return builder_.CreateICmpSGT(len, builder_.getInt64(0), "any0.r");
+        }
+
         // per §5 LINQ: .All(pred: (T)->bool): bool
         if (m == "All" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
@@ -816,6 +823,107 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             return builder_.CreateLoad(i32(), accSlot, "sum.r");
+        }
+        // per §5 LINQ: .Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum)
+        // — eager left fold. The accumulator starts at `seed` and folds each
+        // element via the binary `fold` lambda; the result is TAccum.
+        if (m == "Aggregate" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Type* elemTy = getElemTy();
+            // Seed value establishes the accumulator's LLVM type (TAccum).
+            llvm::Value* seed = lowerExpr(*call.args[0].value);
+            if (!seed) return nullptr;
+            llvm::Type* accTy = seed->getType();
+            // Lower the fold lambda `(TAccum, T) -> TAccum`. Its params are
+            // annotated in idiomatic use; lower it as a plain expression.
+            llvm::Value* foldCl = lowerExpr(*call.args[1].value);
+            if (!foldCl) return nullptr;
+            auto* accSlot = entryAlloca(accTy);
+            builder_.CreateStore(seed, accSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "agg.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "agg.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "agg.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* acc = builder_.CreateLoad(accTy, accSlot);
+            // Binary closure call: fn(env, acc, elem) -> TAccum.
+            llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), foldCl, "agg.fn");
+            llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), foldCl, {builder_.getInt32(1)});
+            llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "agg.env");
+            auto* foldTy = llvm::FunctionType::get(accTy, {ptrTy(), accTy, elemTy}, false);
+            llvm::Value* next = builder_.CreateCall(foldTy, fnPtr, {envPtr, acc, el}, "agg.next");
+            builder_.CreateStore(next, accSlot);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return builder_.CreateLoad(accTy, accSlot, "agg.r");
+        }
+        // per §5/§5.1 LINQ: .Average(fn: (T)->numeric): double  /  .Average(): double
+        // — eager. Accumulate each element (or selector result) as a double and
+        // divide by the element count. The §5 selector overloads (int/long/double)
+        // and the §5.1 per-type no-selector forms all return double.
+        if (m == "Average") {
+            llvm::Type* elemTy = getElemTy();
+            // The selector's actual LLVM return type (int/long/float/double per
+            // the §5 overloads); the closure must be called with its true return
+            // type, then coerced to double for accumulation.
+            llvm::Type* selRetTy = elemTy;
+            sema::TypeRef* selRetRef = nullptr;
+            if (!call.args.empty() && call.args[0].value)
+                if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+                    if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                        selRetRef = lamTy->funcReturn;
+                        if (auto* t = lowerTypeRef(selRetRef)) selRetTy = t;
+                    }
+            llvm::Value* closure = call.args.empty() ? nullptr
+                : lowerLinqLambda(call.args[0].value.get(), selRetRef);
+            if (!call.args.empty() && !closure) return nullptr;
+            llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
+            // Coerce an int/float numeric value to double.
+            auto toDouble = [&](llvm::Value* v) -> llvm::Value* {
+                if (v->getType()->isDoubleTy()) return v;
+                if (v->getType()->isFloatingPointTy())
+                    return builder_.CreateFPExt(v, dblTy);
+                return builder_.CreateSIToFP(v, dblTy);
+            };
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* idxSlot = entryAlloca(i64());
+            auto* accSlot = entryAlloca(dblTy);
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            builder_.CreateStore(llvm::ConstantFP::get(dblTy, 0.0), accSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "avg.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "avg.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "avg.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* val = closure
+                ? toDouble(callClosure(closure, el, selRetTy))
+                : toDouble(el);
+            llvm::Value* acc = builder_.CreateLoad(dblTy, accSlot);
+            builder_.CreateStore(builder_.CreateFAdd(acc, val), accSlot);
+            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            llvm::Value* total = builder_.CreateLoad(dblTy, accSlot, "avg.sum");
+            llvm::Value* cnt = builder_.CreateSIToFP(len, dblTy, "avg.cnt");
+            return builder_.CreateFDiv(total, cnt, "avg.r");
         }
         // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
         if ((m == "Min" || m == "Max") &&
@@ -4895,6 +5003,67 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
     return fn;
 }
 
+// stdlib §5 Projection: SelectMany flatten-selector trampoline. The runtime
+// calls this `void*(closure, elem)` per upstream element; it invokes the user
+// selector `(T) -> Array<U>` (returns a collection pointer) and wraps that
+// collection as a lazy enumerator the runtime then drains. innerEsz is U's size.
+llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
+                                                   int64_t innerEsz) {
+    auto* fty = llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$linq$flatsel", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* closure = fn->getArg(0);
+    llvm::Value* elem = builder_.CreateLoad(elemTy, fn->getArg(1), "fs.elem");
+    // Closure ABI { ptr fn, ptr env }; call fn(env, elem) -> ptr (the collection).
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "fs.fn");
+    llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "fs.env");
+    auto* clTy = llvm::FunctionType::get(ptrTy(), {ptrTy(), elemTy}, false);
+    llvm::Value* coll = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "fs.coll");
+    // Wrap the returned Array<U> as a lazy enumerator (the runtime drains it).
+    auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+    llvm::Value* inner = builder_.CreateCall(wrapFn,
+        {coll, builder_.getInt64(innerEsz)}, "fs.inner");
+    builder_.CreateRet(inner);
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// stdlib §5 Combination: Zip combine trampoline `void(closure, a, b, out)`.
+// Loads the left (aTy) and right (bTy) elements, calls the closure
+// `(env, a, b) -> outTy`, and stores the projected result through `out`.
+llvm::Function* Emitter::buildZipTrampoline(llvm::Type* aTy, llvm::Type* bTy,
+                                            llvm::Type* outTy) {
+    auto* fty = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy(), ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$linq$zip", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* closure = fn->getArg(0);
+    llvm::Value* a = builder_.CreateLoad(aTy, fn->getArg(1), "zip.a");
+    llvm::Value* b = builder_.CreateLoad(bTy, fn->getArg(2), "zip.b");
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "zip.fn");
+    llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "zip.env");
+    auto* clTy = llvm::FunctionType::get(outTy, {ptrTy(), aTy, bTy}, false);
+    llvm::Value* r = builder_.CreateCall(clTy, fnPtr, {envPtr, a, b}, "zip.r");
+    builder_.CreateStore(r, fn->getArg(3));
+    builder_.CreateRetVoid();
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
 llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                             sema::TypeRef*& elemRef) {
     auto* recvTy = ctx_.exprType(recvExpr);
@@ -4960,7 +5129,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
 
     // The deferred operators. Lower the source to a lazy enumerator first.
     bool isOp = (m == "Where" || m == "Select" || m == "Take" || m == "Skip" ||
-                 m == "Distinct" || m == "OrderBy" || m == "OrderByDescending");
+                 m == "Distinct" || m == "OrderBy" || m == "OrderByDescending" ||
+                 m == "Concat" || m == "TakeWhile" || m == "SkipWhile" ||
+                 m == "SelectMany" || m == "Zip");
     if (!isOp) return nullptr;
 
     sema::TypeRef* elemRef = nullptr;
@@ -5051,6 +5222,92 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                               {ptrTy(), ptrTy(), ptrTy(), i32()});
         return builder_.CreateCall(obFn,
             {src, closure, tramp, builder_.getInt32(desc)}, "linq.orderby");
+    }
+    // stdlib §5 Combination: Concat(other) — yield all of self, then all of
+    // `other`. Lower `other` (an Array<T> or lazy IEnumerable<T>) to its own lazy
+    // enumerator and hand both to the runtime.
+    if (m == "Concat" && call.args.size() == 1 && call.args[0].value) {
+        sema::TypeRef* otherElem = nullptr;
+        llvm::Value* down = lowerToLazyEnumerator(*call.args[0].value, otherElem);
+        if (!down) return nullptr;
+        auto* concatFn = declareC("bz_lazy_concat", ptrTy(), {ptrTy(), ptrTy()});
+        return builder_.CreateCall(concatFn, {src, down}, "linq.concat");
+    }
+    // stdlib §5 Slicing: TakeWhile/SkipWhile(predicate) — gate by a `(T)->bool`
+    // predicate (reusing the kind-0 predicate trampoline).
+    if ((m == "TakeWhile" || m == "SkipWhile") &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* closure = lowerLinqLambda(
+            call.args[0].value.get(),
+            ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildLinqTrampoline(0, elemTy, nullptr);
+        const char* rt = (m == "TakeWhile") ? "bz_lazy_takewhile"
+                                            : "bz_lazy_skipwhile";
+        auto* fn = declareC(rt, ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {src, closure, tramp},
+                                   m == "TakeWhile" ? "linq.takewhile"
+                                                    : "linq.skipwhile");
+    }
+    // stdlib §5 Projection: SelectMany(selector: (T)->IEnumerable<U>) — flatten.
+    // The selector returns an inner collection; the trampoline wraps it as a lazy
+    // enumerator. The inner element size U comes from the selector's return type
+    // (a collection/lazy carrying U at genericArgs[0]).
+    if (m == "SelectMany" && call.args.size() == 1 && call.args[0].value) {
+        sema::TypeRef* retSemaType = nullptr;
+        llvm::Type* innerElemTy = i32();
+        if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                retSemaType = lamTy->funcReturn;  // IEnumerable<U> / Array<U>
+                if (!retSemaType->genericArgs.empty() && retSemaType->genericArgs[0])
+                    if (auto* t = lowerTypeRef(retSemaType->genericArgs[0]))
+                        innerElemTy = t;
+            }
+        llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
+        if (!closure) return nullptr;
+        int64_t innerEsz = lazyElemSize(innerElemTy);
+        llvm::Function* tramp = buildSelectManyTrampoline(elemTy, innerEsz);
+        auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
+                              {ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(smFn,
+            {src, builder_.getInt64(innerEsz), closure, tramp}, "linq.selectmany");
+    }
+    // stdlib §5 Combination: Zip<U,R>(other, combine: (T,U)->R) — pair positionally.
+    if (m == "Zip" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        // Lower `other` (the second source) to its own lazy enumerator; capture
+        // its element type for the combine's 2nd parameter.
+        sema::TypeRef* otherElem = nullptr;
+        llvm::Value* down = lowerToLazyEnumerator(*call.args[0].value, otherElem);
+        if (!down) return nullptr;
+        llvm::Type* bTy = elemLlvmOf(otherElem);
+        // The combine lambda `(T, U) -> R`. Lower it with the expected function
+        // type so unannotated params get the right element LLVM types.
+        sema::TypeRef* retSemaType = nullptr;
+        llvm::Type* outTy = i32();
+        if (auto* lamTy = ctx_.exprType(*call.args[1].value))
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                retSemaType = lamTy->funcReturn;
+                if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
+            }
+        auto* combRef = ctx_.makeTypeRef();
+        combRef->kind = sema::TypeRef::Kind::Function;
+        combRef->funcReturn = retSemaType;
+        if (elemRef) { sema::TypeRef::FuncParam fp; fp.type = elemRef;
+                       combRef->funcParams.push_back(std::move(fp)); }
+        if (otherElem) { sema::TypeRef::FuncParam fp; fp.type = otherElem;
+                         combRef->funcParams.push_back(std::move(fp)); }
+        const sema::TypeRef* savedExp = expectedFunctionType_;
+        expectedFunctionType_ = combRef;
+        llvm::Value* closure = lowerExpr(*call.args[1].value);
+        expectedFunctionType_ = savedExp;
+        if (!closure) return nullptr;
+        llvm::Function* tramp = buildZipTrampoline(elemTy, bTy, outTy);
+        int64_t outEsz = lazyElemSize(outTy);
+        auto* zipFn = declareC("bz_lazy_zip", ptrTy(),
+                               {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(zipFn,
+            {src, down, builder_.getInt64(outEsz), closure, tramp}, "linq.zip");
     }
     return nullptr;
 }

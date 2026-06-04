@@ -319,6 +319,19 @@ void* bz_lazy_skip(void* up, int64_t n);
 void* bz_lazy_distinct(void* up, void* eqfn);                        // eqfn: i32(a, b) (null = raw bytes)
 void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
                       int32_t descending);                           // keyfn: i64(closure, elem)
+// stdlib §5 Combination: Concat appends `down` after `up` (both lazy enumerators).
+void* bz_lazy_concat(void* up, void* down);
+// stdlib §5 Slicing: TakeWhile/SkipWhile gate by a predicate trampoline.
+void* bz_lazy_takewhile(void* up, void* closure, void* pred);        // pred: i32(closure, elem)
+void* bz_lazy_skipwhile(void* up, void* closure, void* pred);        // pred: i32(closure, elem)
+// stdlib §5 Projection: SelectMany flattens (T)->IEnumerable<U>. The selector
+// trampoline returns a fresh lazy enumerator (or a collection wrapped as one).
+void* bz_lazy_selectmany(void* up, int64_t out_elem_size,
+                         void* closure, void* sel);                  // sel: void*(closure, elem)
+// stdlib §5 Combination: Zip pairs `up` and `down` positionally, applying a
+// binary combine trampoline. Stops at the shorter of the two sources.
+void* bz_lazy_zip(void* up, void* down, int64_t out_elem_size,
+                  void* closure, void* comb);                        // comb: void(closure, a, b, out)
 void* bz_lazy_to_array(void* lazy, int64_t elem_size);
 
 // issue #389 / stdlib §4.10: drain a lazy enumerator (a non-Set IEnumerable<T>

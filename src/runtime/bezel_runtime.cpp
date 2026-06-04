@@ -1172,16 +1172,27 @@ typedef int64_t (*bz_key_fn)(void* closure, const void* elem);
 // Element equality trampoline (Distinct): content-aware comparison the runtime
 // cannot do over type-erased bytes (e.g. string content equality vs. raw bytes).
 typedef int32_t (*bz_eq_fn)(const void* a, const void* b);
+// SelectMany selector trampoline: maps one element to a fresh lazy enumerator
+// (the inner IEnumerable<U>). Returns an opaque bz_lazy_t* the runtime drains.
+typedef void* (*bz_flatsel_fn)(void* closure, const void* elem);
+// Zip combine trampoline: pairs one element from each source into the output.
+typedef void  (*bz_comb_fn)(void* closure, const void* a, const void* b,
+                            void* out);
 
 enum bz_lazy_kind {
-    BZ_LAZY_ARRAY,    // source = bz_array_t*, iterate by index
-    BZ_LAZY_WHERE,    // filter via predicate
-    BZ_LAZY_SELECT,   // project via selector (esz = output element size)
-    BZ_LAZY_TAKE,     // first `n` elements
-    BZ_LAZY_SKIP,     // skip first `n` elements
-    BZ_LAZY_DISTINCT, // de-duplicate (raw-byte equality, order preserved)
-    BZ_LAZY_ORDERBY,  // materialize-on-first-MoveNext: sorted snapshot
-    BZ_LAZY_SET,      // dict-backed Set<T> source: owned key snapshot by index
+    BZ_LAZY_ARRAY,     // source = bz_array_t*, iterate by index
+    BZ_LAZY_WHERE,     // filter via predicate
+    BZ_LAZY_SELECT,    // project via selector (esz = output element size)
+    BZ_LAZY_TAKE,      // first `n` elements
+    BZ_LAZY_SKIP,      // skip first `n` elements
+    BZ_LAZY_DISTINCT,  // de-duplicate (raw-byte equality, order preserved)
+    BZ_LAZY_ORDERBY,   // materialize-on-first-MoveNext: sorted snapshot
+    BZ_LAZY_SET,       // dict-backed Set<T> source: owned key snapshot by index
+    BZ_LAZY_CONCAT,    // §5 Combination: yield all of `up`, then all of `down`
+    BZ_LAZY_TAKEWHILE, // §5 Slicing: prefix while predicate holds, then stop
+    BZ_LAZY_SKIPWHILE, // §5 Slicing: drop leading run satisfying predicate
+    BZ_LAZY_SELECTMANY,// §5 Projection: flatten (T)->IEnumerable<U>
+    BZ_LAZY_ZIP,       // §5 Combination: pair `up` and `down` via combine
 };
 
 struct bz_lazy_t {
@@ -1190,6 +1201,7 @@ struct bz_lazy_t {
     int64_t esz;        // element size in bytes (output size for SELECT)
     // Source: either an upstream lazy enumerator (`up`) or an array (`arr`).
     bz_lazy_t* up;      // upstream enumerator (null for ARRAY)
+    bz_lazy_t* down;    // second source (CONCAT/ZIP)
     void*   arr;        // bz_array_t* (ARRAY kind)
     int64_t idx;        // ARRAY: current index; TAKE/SKIP: count consumed
     int64_t n;          // TAKE/SKIP threshold
@@ -1199,15 +1211,22 @@ struct bz_lazy_t {
     bz_sel_fn  sel;
     bz_key_fn  keyfn;
     bz_eq_fn   eqfn;    // DISTINCT: element equality (null = raw memcmp)
+    bz_flatsel_fn flatsel;  // SELECTMANY: element -> inner lazy enumerator
+    bz_comb_fn comb;        // ZIP: (a, b) -> out
     int32_t descending; // ORDERBY direction
+    int64_t up_esz;     // ZIP: byte stride of the `up`/left element
+    int64_t down_esz;   // ZIP: byte stride of the `down`/right element
     // Scratch storage for the current element bytes (Current returns cur).
     void*   cur;        // malloc'd, esz bytes
     // DISTINCT: a dynamic array of seen elements.
     void*   seen;       // bz_array_t* of element bytes (DISTINCT)
     // ORDERBY: materialized + sorted snapshot, iterated by index.
     void*   sorted;     // bz_array_t* (ORDERBY)
-    int32_t skipped;    // SKIP: have we already dropped the first n?
+    int32_t skipped;    // SKIP/SKIPWHILE: have we already dropped the prefix?
     int32_t materialized;
+    int32_t phase;      // CONCAT: 0 = draining `up`, 1 = draining `down`
+    int32_t stopped;    // TAKEWHILE: predicate has failed; sequence ended
+    bz_lazy_t* inner;   // SELECTMANY: current inner enumerator (null = none)
 };
 
 // Advance the upstream enumerator and return a pointer to its current element,
@@ -1225,6 +1244,8 @@ static void*   bz_lazy_current(bz_lazy_t* e) { return e->cur; }
 static void    bz_lazy_dispose(bz_lazy_t* e) {
     if (!e) return;
     if (e->up) bz_lazy_dispose(e->up);
+    if (e->down) bz_lazy_dispose(e->down);   // CONCAT/ZIP second source
+    if (e->inner) bz_lazy_dispose(e->inner);  // SELECTMANY current inner
     if (e->cur) free(e->cur);
     if (e->seen) bz_array_free(e->seen, nullptr);
     if (e->sorted) bz_array_free(e->sorted, nullptr);
@@ -1326,6 +1347,70 @@ extern "C" void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
     e->closure = closure;
     e->keyfn = (bz_key_fn)keyfn;
     e->descending = descending;
+    return e;
+}
+
+// stdlib §5 Combination: Concat yields all of `up`, then all of `down`. Both
+// have the same element size (same T). Element bytes are copied through `cur`.
+extern "C" void* bz_lazy_concat(void* up, void* down) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_CONCAT, u->esz);
+    e->up = u;
+    e->down = (bz_lazy_t*)down;
+    e->phase = 0;
+    return e;
+}
+
+// stdlib §5 Slicing: TakeWhile yields the prefix while `pred` holds, then ends
+// the sequence permanently (later passing elements are NOT yielded).
+extern "C" void* bz_lazy_takewhile(void* up, void* closure, void* pred) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_TAKEWHILE, u->esz);
+    e->up = u;
+    e->closure = closure;
+    e->pred = (bz_pred_fn)pred;
+    return e;
+}
+
+// stdlib §5 Slicing: SkipWhile drops the leading run satisfying `pred`, then
+// yields the remainder verbatim (including elements that satisfy `pred`).
+extern "C" void* bz_lazy_skipwhile(void* up, void* closure, void* pred) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_SKIPWHILE, u->esz);
+    e->up = u;
+    e->closure = closure;
+    e->pred = (bz_pred_fn)pred;
+    return e;
+}
+
+// stdlib §5 Projection: SelectMany flattens. `out_esz` is the inner element U's
+// byte size. The selector trampoline returns a fresh inner lazy enumerator per
+// upstream element; the runtime drains each before pulling the next upstream.
+extern "C" void* bz_lazy_selectmany(void* up, int64_t out_esz,
+                                    void* closure, void* sel) {
+    auto* u = (bz_lazy_t*)up;
+    auto* e = bz_lazy_new(BZ_LAZY_SELECTMANY, out_esz);
+    e->up = u;
+    e->closure = closure;
+    e->flatsel = (bz_flatsel_fn)sel;
+    e->inner = nullptr;
+    return e;
+}
+
+// stdlib §5 Combination: Zip pairs `up` (left) and `down` (right) positionally,
+// applying `comb` to produce one `out_esz`-byte output per pair. Ends when
+// either source is exhausted (result length = min of the two).
+extern "C" void* bz_lazy_zip(void* up, void* down, int64_t out_esz,
+                             void* closure, void* comb) {
+    auto* u = (bz_lazy_t*)up;
+    auto* d = (bz_lazy_t*)down;
+    auto* e = bz_lazy_new(BZ_LAZY_ZIP, out_esz);
+    e->up = u;
+    e->down = d;
+    e->closure = closure;
+    e->comb = (bz_comb_fn)comb;
+    e->up_esz = u->esz;
+    e->down_esz = d->esz;
     return e;
 }
 
@@ -1436,6 +1521,75 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
         if (e->idx >= arr->count) return 0;
         memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
         e->idx++;
+        return 1;
+    }
+    case BZ_LAZY_CONCAT: {
+        // §5 Combination: drain `up` (phase 0), then `down` (phase 1).
+        if (e->phase == 0) {
+            const void* p = bz_lazy_up_next(e->up);
+            if (p) { memcpy(e->cur, p, (size_t)e->esz); return 1; }
+            e->phase = 1;  // fall through to the second source
+        }
+        const void* p = bz_lazy_up_next(e->down);
+        if (!p) return 0;
+        memcpy(e->cur, p, (size_t)e->esz);
+        return 1;
+    }
+    case BZ_LAZY_TAKEWHILE: {
+        // §5 Slicing: yield while the predicate holds; the first failure ends
+        // the sequence (subsequent MoveNext calls return 0).
+        if (e->stopped) return 0;
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) { e->stopped = 1; return 0; }
+        if (!e->pred(e->closure, p)) { e->stopped = 1; return 0; }
+        memcpy(e->cur, p, (size_t)e->esz);
+        return 1;
+    }
+    case BZ_LAZY_SKIPWHILE: {
+        // §5 Slicing: on first MoveNext, drop the leading run satisfying the
+        // predicate and yield the first element that fails it; thereafter yield
+        // every remaining element verbatim.
+        if (!e->skipped) {
+            const void* p;
+            while ((p = bz_lazy_up_next(e->up)) != nullptr) {
+                if (!e->pred(e->closure, p)) {
+                    e->skipped = 1;
+                    memcpy(e->cur, p, (size_t)e->esz);  // first non-skipped elem
+                    return 1;
+                }
+            }
+            e->skipped = 1;  // upstream exhausted entirely within the skip run
+            return 0;
+        }
+        const void* p = bz_lazy_up_next(e->up);
+        if (!p) return 0;
+        memcpy(e->cur, p, (size_t)e->esz);
+        return 1;
+    }
+    case BZ_LAZY_SELECTMANY: {
+        // §5 Projection: pull from the current inner enumerator; when it is
+        // exhausted, advance the upstream to obtain the next inner sequence.
+        for (;;) {
+            if (e->inner) {
+                const void* p = bz_lazy_up_next(e->inner);
+                if (p) { memcpy(e->cur, p, (size_t)e->esz); return 1; }
+                bz_lazy_dispose(e->inner);  // inner drained — release it
+                e->inner = nullptr;
+            }
+            const void* up_elem = bz_lazy_up_next(e->up);
+            if (!up_elem) return 0;          // upstream exhausted
+            e->inner = (bz_lazy_t*)e->flatsel(e->closure, up_elem);
+            if (!e->inner) return 0;          // defensive: null inner sequence
+        }
+    }
+    case BZ_LAZY_ZIP: {
+        // §5 Combination: advance both sources; stop at the shorter. Each source
+        // owns its own `cur`, so read the left/right element pointers directly.
+        const void* a = bz_lazy_up_next(e->up);
+        if (!a) return 0;
+        const void* b = bz_lazy_up_next(e->down);
+        if (!b) return 0;
+        e->comb(e->closure, a, b, e->cur);  // writes esz output bytes
         return 1;
     }
     }
