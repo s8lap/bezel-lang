@@ -377,3 +377,96 @@ BEZEL_TEST(codegen_collection_keys, for_in_set_break_spec_4_10) {
         "  return n; "                                // stops after 2
         "end Main; end C;"), 2);
 }
+
+// --- #351: record-element Set Clear() and set-algebra over the generic table ---
+//
+// §4.10: a `Set<T>` (T a record) is generic-hash-table-backed (#343/#370). After
+// #351, Clear() empties that table and the set-algebra ops whose `other` is a
+// same-typed dict-backed Set are wired by enumerating the other table's elements
+// (bz_dict_keys_gen) and folding them into/against self. Before #351 these all
+// fell through (returned nullptr) — so each test is load-bearing.
+
+// §4.10: Set<record>.Clear() empties the backing table; Count is 0 afterward and
+// the set is reusable (Add after Clear works).
+BEZEL_TEST(codegen_collection_keys, set_record_clear_empties_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var s := new Set<P>(); "
+        "  s.Add(new P(1, 2)); s.Add(new P(3, 4)); "
+        "  s.Clear(); "
+        "  s.Add(new P(5, 6)); "                       // reusable after Clear
+        "  return s.Count * 10 + int(s.Contains(new P(5, 6))); "  // 1*10 + 1 = 11
+        "end Main; end C;"), 11);
+}
+
+// §4.10: Set<int>.Clear() also empties (the generic table backs non-record
+// element sets too — D8). Count 0 after Clear.
+BEZEL_TEST(codegen_collection_keys, set_int_clear_empties_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var s := new Set<int>(); "
+        "  s.Add(1); s.Add(2); s.Add(3); "
+        "  s.Clear(); "
+        "  return s.Count; "                           // 0
+        "end Main; end C;"), 0);
+}
+
+// §4.10: Set<record>.UnionWith(other) adds every element of `other` not already
+// present. {(1,2),(3,4)} ∪ {(3,4),(5,6)} = {(1,2),(3,4),(5,6)} → Count 3 (the
+// shared (3,4) is not duplicated).
+BEZEL_TEST(codegen_collection_keys, set_record_unionwith_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Set<P>(); using var b := new Set<P>(); "
+        "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
+        "  b.Add(new P(3, 4)); b.Add(new P(5, 6)); "
+        "  a.UnionWith(b); "
+        "  return a.Count * 10 + int(a.Contains(new P(5, 6))); "  // 3*10 + 1 = 31
+        "end Main; end C;"), 31);
+}
+
+// §4.10: Set<record>.ExceptWith(other) removes every element of `other` from
+// self. {(1,2),(3,4),(5,6)} \ {(3,4)} = {(1,2),(5,6)} → Count 2; (3,4) gone.
+BEZEL_TEST(codegen_collection_keys, set_record_exceptwith_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Set<P>(); using var b := new Set<P>(); "
+        "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); a.Add(new P(5, 6)); "
+        "  b.Add(new P(3, 4)); "
+        "  a.ExceptWith(b); "
+        "  return a.Count * 10 + int(not a.Contains(new P(3, 4))); "  // 2*10 + 1 = 21
+        "end Main; end C;"), 21);
+}
+
+// §4.10: Set<record>.IsSubsetOf(other) is true iff every element of self is in
+// other. {(1,2)} ⊆ {(1,2),(3,4)} → true; {(1,2),(9,9)} ⊄ {(1,2),(3,4)} → false.
+BEZEL_TEST(codegen_collection_keys, set_record_issubsetof_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Set<P>(); using var b := new Set<P>(); "
+        "  using var c := new Set<P>(); "
+        "  a.Add(new P(1, 2)); "
+        "  b.Add(new P(1, 2)); b.Add(new P(3, 4)); "
+        "  c.Add(new P(1, 2)); c.Add(new P(9, 9)); "
+        "  return int(a.IsSubsetOf(b)) * 10 + int(c.IsSubsetOf(b)); "  // 1*10 + 0 = 10
+        "end Main; end C;"), 10);
+}
+
+// §4.10: Set<record>.IsSupersetOf(other) is true iff every element of other is
+// in self. {(1,2),(3,4)} ⊇ {(1,2)} → true; ⊉ {(7,7)} → false.
+BEZEL_TEST(codegen_collection_keys, set_record_issupersetof_spec_4_10) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record P(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  using var a := new Set<P>(); using var b := new Set<P>(); "
+        "  using var c := new Set<P>(); "
+        "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
+        "  b.Add(new P(1, 2)); "
+        "  c.Add(new P(7, 7)); "
+        "  return int(a.IsSupersetOf(b)) * 10 + int(a.IsSupersetOf(c)); "  // 1*10 + 0 = 10
+        "end Main; end C;"), 10);
+}

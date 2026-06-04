@@ -1740,6 +1740,18 @@ private:
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
 
+    // stdlib §4.10 (#351): lower a dict-backed Set's set-algebra op
+    // (UnionWith/ExceptWith/IsSubsetOf/IsSupersetOf) when `otherExpr` is a
+    // same-element dict-backed Set, by enumerating the other table's elements
+    // (bz_dict_keys_gen) and folding them into/against `selfTbl`. Returns the
+    // lowered value, or nullptr when `otherExpr` is not a same-typed dict-backed
+    // Set (the caller then defers the op).
+    llvm::Value* tryLowerSetAlgebra(std::string_view method,
+                                    llvm::Value* selfTbl,
+                                    const ast::Expr& otherExpr,
+                                    const sema::TypeRef* selfElemRef,
+                                    bool elemIsRecord);
+
     // stdlib §5: is `rt` a builtin (un-declared) IEnumerable<T> family type —
     // the type carried by a lazy LINQ operator result?
     static bool isLazyEnumerableType(const sema::TypeRef* rt);

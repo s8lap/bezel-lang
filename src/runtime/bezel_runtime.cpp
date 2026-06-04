@@ -95,6 +95,24 @@ void bz_array_remove_at(void* arrp, int64_t idx, int64_t elem_size) {
     arr->count--;
 }
 
+// stdlib §4.5: insert at idx, shifting [idx, count) up by one.
+void bz_array_insert_at(void* arrp, int64_t idx, const void* elem,
+                        int64_t elem_size) {
+    auto* arr = (bz_array_t*)arrp;
+    if (idx < 0) idx = 0;
+    if (idx > arr->count) idx = arr->count;            // clamp; idx==count appends
+    if (arr->count >= arr->capacity)
+        bz_array_grow(arr, elem_size, arr->count + 1);
+    int64_t tail = arr->count - idx;                    // elements to shift up
+    if (tail > 0) {
+        memmove((char*)arr->data + (idx + 1) * elem_size,
+                (char*)arr->data + idx * elem_size,
+                (size_t)(tail * elem_size));
+    }
+    memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
+    arr->count++;
+}
+
 void bz_array_clear(void* arrp) {
     if (arrp) ((bz_array_t*)arrp)->count = 0;
 }
@@ -410,6 +428,27 @@ bool bz_dict_remove_gen(void* dp, const void* key) {
 
 bool bz_dict_contains_gen(void* dp, const void* key) {
     return bz_dict_try_get_gen(dp, key, nullptr);
+}
+
+// stdlib §4.10 / §4.8: empty a hash table in place, keeping it allocated for
+// reuse. Frees each live key's malloc'd copy and, if `dispose_val` is non-null,
+// disposes each live value; then zeroes every bucket and resets the count. Used
+// by Set<T>.Clear() / Dictionary<K,V>.Clear() over the generic table. The
+// capacity, key_size, and hash/eq function pointers are preserved. For a
+// dict-backed Set the value slots are non-owned sentinels, so callers pass null
+// for `dispose_val`.
+void bz_dict_clear(void* dp, void (*dispose_val)(void*)) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            free(e.key);
+            if (dispose_val && e.val) dispose_val(e.val);
+        }
+    }
+    memset(d->buckets, 0, (size_t)d->capacity * sizeof(bz_entry_t));
+    d->count = 0;
 }
 
 // Enumerate the generic table's keys (issue #370, §4.8 Dictionary.Keys /
