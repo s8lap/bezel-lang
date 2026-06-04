@@ -103,6 +103,7 @@ llvm::Value* Emitter::emitConsoleReadLine() {
     builder_.CreateStore(finalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
     builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
         builder_.CreateStructGEP(stringType(), strObj, 2));
+        initStringRc(strObj);  // #422: producer's reference, rc := 1
     auto* okEnd = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
     // Merge.
@@ -1659,14 +1660,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
             llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
             // Build a bz.string object from the malloc'd buffer.
+            // #422: allocate the full header size (now 32 bytes incl. rc), not
+            // a hardcoded 24 — writing rc into field 3 of a 24-byte block would
+            // overflow. getTypeAllocSize is the single source of truth.
+            uint64_t sobjSz = module_->getDataLayout().getTypeAllocSize(stringType());
             auto* sobj = builder_.CreateCall(
-                callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+                callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sobjSz)});
             builder_.CreateStore(data,
                 builder_.CreateStructGEP(stringType(), sobj, 0));
             builder_.CreateStore(len,
                 builder_.CreateStructGEP(stringType(), sobj, 1));
             builder_.CreateStore(builder_.getInt8(1),
                 builder_.CreateStructGEP(stringType(), sobj, 2));
+            initStringRc(sobj);  // #422: producer's reference, rc := 1
             return sobj;
         }
     }
@@ -1752,6 +1758,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateStore(rawLen, builder_.CreateStructGEP(stringType(), strObj, 1));
             builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
                 builder_.CreateStructGEP(stringType(), strObj, 2));
+                initStringRc(strObj);  // #422: producer's reference, rc := 1
             auto* okEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
@@ -1890,6 +1897,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 builder_.CreateStore(len64, builder_.CreateStructGEP(stringType(), strObj, 1));
                 builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
                     builder_.CreateStructGEP(stringType(), strObj, 2));
+                    initStringRc(strObj);  // #422: producer's reference, rc := 1
                 return strObj;
             }
             // Binary (radix=2): emit a runtime bit-scan loop.
@@ -1993,6 +2001,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateStore(phiLen, builder_.CreateStructGEP(stringType(), strObj2, 1));
             builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
                 builder_.CreateStructGEP(stringType(), strObj2, 2));
+                initStringRc(strObj2);  // #422: producer's reference, rc := 1
             return strObj2;
         }
     }
@@ -2094,6 +2103,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         builder_.CreateStore(total, builder_.CreateStructGEP(stringType(), strObj, 1));
         builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
             builder_.CreateStructGEP(stringType(), strObj, 2));
+            initStringRc(strObj);  // #422: producer's reference, rc := 1
         return strObj;
     }
 
@@ -2424,14 +2434,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     };
     auto ptrToStr = [&](llvm::Value* ptr, llvm::Value* lenVal) -> llvm::Value* {
         // Build a bz.string from a malloc'd C string (ptr, len, width=1).
+        // #422: allocate the full header size (now 32 bytes incl. rc).
+        uint64_t sobjSz = module_->getDataLayout().getTypeAllocSize(stringType());
         auto* sobj = builder_.CreateCall(
-            callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+            callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sobjSz)});
         builder_.CreateStore(ptr,
             builder_.CreateStructGEP(stringType(), sobj, 0));
         builder_.CreateStore(lenVal,
             builder_.CreateStructGEP(stringType(), sobj, 1));
         builder_.CreateStore(builder_.getInt8(1),
             builder_.CreateStructGEP(stringType(), sobj, 2));
+        initStringRc(sobj);  // #422: producer's reference, rc := 1
         return sobj;
     };
 
@@ -2563,6 +2576,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateStore(lenG, builder_.CreateStructGEP(stringType(), strObjG, 1));
             builder_.CreateStore(llvm::ConstantInt::get(i8Ty3, 1),
                 builder_.CreateStructGEP(stringType(), strObjG, 2));
+                initStringRc(strObjG);  // #422: producer's reference, rc := 1
             auto* slotG = entryAlloca(ptrTy());
             builder_.CreateStore(strObjG, slotG);
             builder_.CreateCall(addFn3, {result, slotG, builder_.getInt64(8)});

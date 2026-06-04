@@ -75,8 +75,13 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 dataGV->setAlignment(llvm::Align(1));
                 llvm::Constant* lenC = llvm::ConstantInt::get(
                     i64(), content.size());
+                // The literal part is built from a byte string → width 1.
+                // #422: constant global literal — SENTINEL rc (never freed). The
+                // struct now has 4 fields {data, len, width, rc}; supply all.
+                llvm::Constant* widC = llvm::ConstantInt::get(
+                    llvm::Type::getInt8Ty(llvm_), 1);
                 llvm::Constant* strVal = llvm::ConstantStruct::get(
-                    stringType(), {dataGV, lenC});
+                    stringType(), {dataGV, lenC, widC, stringRcSentinel()});
                 auto* strGV = new llvm::GlobalVariable(
                     *module_, stringType(), true,
                     llvm::GlobalValue::PrivateLinkage, strVal,
@@ -444,6 +449,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 builder_.CreateStore(l64, builder_.CreateStructGEP(stringType(), so, 1));
                                 builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
                                     builder_.CreateStructGEP(stringType(), so, 2));
+                                initStringRc(so);  // #422: producer's reference, rc := 1
                                 return so;
                             }
                             return emitPrimitiveToString(recv, tt->primitive);
@@ -774,6 +780,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         builder_.CreateStore(len, builder_.CreateStructGEP(stringType(), strObj, 1));
                         builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
                             builder_.CreateStructGEP(stringType(), strObj, 2));
+                            initStringRc(strObj);  // #422: producer's reference, rc := 1
                         return strObj;
                     }
                 }
@@ -996,6 +1003,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 builder_.CreateStore(kl3, builder_.CreateStructGEP(stringType(), strObj3, 1));
                 builder_.CreateStore(llvm::ConstantInt::get(i8Ty2, 1),
                     builder_.CreateStructGEP(stringType(), strObj3, 2));
+                    initStringRc(strObj3);  // #422: producer's reference, rc := 1
                 auto* slotK2 = entryAlloca(ptrTy());
                 builder_.CreateStore(strObj3, slotK2);
                 builder_.CreateCall(addFn2, {result2, slotK2, builder_.getInt64(8)});

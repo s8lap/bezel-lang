@@ -216,7 +216,9 @@ llvm::Constant* Emitter::lowerStringLiteralConst(std::string_view text, bool ver
     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
     llvm::Constant* lenC = llvm::ConstantInt::get(i64(), cps.size());
     llvm::Constant* widC = llvm::ConstantInt::get(i8Ty, width);
-    llvm::Constant* strVal = llvm::ConstantStruct::get(stringType(), {dataGV, lenC, widC});
+    // #422: constant global literal — SENTINEL rc (never retained/freed).
+    llvm::Constant* strVal = llvm::ConstantStruct::get(
+        stringType(), {dataGV, lenC, widC, stringRcSentinel()});
     auto* strGV = new llvm::GlobalVariable(
         *module_, stringType(), /*isConstant=*/true,
         llvm::GlobalValue::PrivateLinkage, strVal,
@@ -1158,8 +1160,14 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     unwindIneligible_.clear();
     unwindIneligibleFn_ = fn;
     currentReturnTypeNode_ = ci.returnType;  // §8.6: for return-value boxing
-    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
+    // #422 / §4.6 / §28.9: which `var` string locals may be released at scope
+    // end (mirrors collectUnwindIneligible; consulted in lowerLocalDecl).
+    stringReleaseEligible_.clear();
+    stringReleaseEligibleFn_ = fn;
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectUnwindIneligible(*ci.stmts);
+        collectStringReleaseEligible(*ci.stmts);
+    }
 
     bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
 
@@ -1588,6 +1596,23 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // without an initializer (like all locals with explicit type).
         builder_.CreateStore(llvm::ConstantAggregateZero::get(slotTy),
                              slot);
+    }
+    // #422 / §4.6 / §28.9: if this `var` string local was proven non-escaping
+    // and initialized by a codegen +1 producer (string `+` / interpolation),
+    // register a scope-end bz_string_release of its single producer reference.
+    // The slot holds exactly that one reference (the value `v` just stored, at
+    // rc=1); no other reference exists (proven by the escape walk), so releasing
+    // it at scope end frees the data+header exactly once — no UAF, no
+    // double-free. Gated on currentFn_ matching the analyzed function (a
+    // lambda/thunk body lowered mid-function is not analyzed → its string locals
+    // just leak, never double-freed). disposeStack_ is non-empty inside any
+    // lowered block body.
+    if (v && currentFn_ == stringReleaseEligibleFn_ &&
+        stringReleaseEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.stringRelease = true;
+        disposeStack_.back().push_back(d);
     }
 }
 
@@ -2042,6 +2067,316 @@ void Emitter::collectUnwindIneligible(
 }
 
 
+// #422 / §4.6 / §28.9: is `init` a codegen-internal +1 string producer?
+// A string `+` BinaryExpr or an InterpolatedStringExpr — both lower to a fresh
+// malloc'd rc=1 header that codegen owns end-to-end. Binding such a result to a
+// local consumes its single reference. A string-returning CALL is deliberately
+// NOT included: the callee may return a borrow (a string field, a parameter)
+// without handing off a +1, so caller-side release of a call result could free a
+// value the callee still references (UAF). Restricting to `+`/interpolation
+// keeps the producer/consumer balance entirely inside codegen.
+bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
+    if (!init) return false;
+    if (dynamic_cast<const ast::InterpolatedStringExpr*>(init)) return true;
+    if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(init)) {
+        if (bin->op != "+") return false;
+        auto* rt = ctx_.exprType(*init);
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
+    return false;
+}
+
+namespace {
+// #422: a strict, conservative walk that decides whether a SPECIFIC string
+// `var` local (identified by its LocalDecl node) ever escapes its scope. A
+// local is "escaped" if its identifier appears anywhere except a non-consuming
+// READ position (concat/comparison operand, a string-method/index receiver, an
+// interpolation part, or an inner null-forgiving `s!`). Every other position —
+// a call argument, an assignment/return/throw/yield/discard operand, a binding
+// to another local, a `new`/`with`/collection element, a lambda capture, a
+// `move`, a `for ... in s` iterable, etc. — is treated as an ESCAPE. The walk
+// is an OVER-approximation of escape: any construct it does not explicitly
+// recognize as a safe read leaves the local escaped (→ no release → leak, the
+// safe direction). Only a local that NEVER escapes is released at scope end,
+// where releasing its single producer reference is provably free of UAF (no
+// other reference exists) and of double-free (once per scope exit).
+//
+// `safeRead`: true when a bare identifier in the current expression position is
+// a non-consuming read; false when it would escape.
+struct StringEscapeWalker {
+    const sema::SemaContext& ctx;
+    const void* target;   // the LocalDecl node we are testing
+    bool escaped = false;
+
+    bool isTargetIdent(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
+        return loc && loc->decl &&
+               static_cast<const void*>(loc->decl) == target;
+    }
+
+    void expr(const ast::Expr* e, bool safeRead) {
+        if (!e || escaped) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (isTargetIdent(id) && !safeRead) escaped = true;
+            return;
+        }
+        // Concat / comparison: both operands are non-consuming reads.
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get(), /*safeRead=*/true);
+            expr(b->right.get(), /*safeRead=*/true);
+            return;
+        }
+        // `s.Member` / `s.Method(...)`: the receiver is a read.
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(m->target.get(), /*safeRead=*/true);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get(), /*safeRead=*/true);
+            return;
+        }
+        // Call: the receiver (callee) is a read; every ARGUMENT escapes.
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get(), /*safeRead=*/true);
+            for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(c->callee.get(), /*safeRead=*/true);
+            for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        // Indexing `s[i]`: receiver is a read; indices escape (defensive).
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get(), /*safeRead=*/true);
+            for (auto& a : ix->indices) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        // `s!` forwards s onward — inherit the parent position.
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get(), safeRead);
+            return;
+        }
+        // Interpolation parts are reads (each is concatenated).
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get(), /*safeRead=*/true);
+            return;
+        }
+        // `s is T` reads only.
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get(), /*safeRead=*/true);
+            return;
+        }
+        // Conditional: condition is a read; each branch forwards the value on
+        // to the parent position, so inherit `safeRead`.
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get(), /*safeRead=*/true);
+            expr(c->thenValue.get(), safeRead);
+            expr(c->elseValue.get(), safeRead);
+            return;
+        }
+        // Range endpoints are reads.
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get(), /*safeRead=*/true);
+            expr(r->hi.get(), /*safeRead=*/true);
+            expr(r->step.get(), /*safeRead=*/true);
+            return;
+        }
+        // Everything that can carry the value to a longer-lived location is an
+        // ESCAPE for any contained occurrence of the target: new/with/collection
+        // literal/lambda/case/unary(`move`)/throw-expr. Recurse with
+        // safeRead=false so an occurrence taints, and bail conservatively (we do
+        // not attempt to prove these safe).
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get(), /*safeRead=*/false); return;
+        }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(th->operand.get(), /*safeRead=*/false); return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get(), /*safeRead=*/false);
+            for (auto& a : w->assigns) expr(a.value.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get(), /*safeRead=*/false);
+            for (auto& k : cl->keys) expr(k.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // A lambda may capture the local and outlive its scope — escape.
+            if (lam->exprBody) expr(lam->exprBody.get(), /*safeRead=*/false);
+            for (auto& s : lam->stmts) stmt(s.get());
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get(), /*safeRead=*/false);
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get(), /*safeRead=*/false);
+                expr(arm.exprBody.get(), /*safeRead=*/false);
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return;
+        }
+        // Leaf literals (int/float/char/string/bool/null/unit/typeof/nameof/
+        // default) contain no identifiers — nothing to do. Any OTHER expression
+        // type is unknown to this walk; conservatively, if it could contain the
+        // target we cannot prove non-escape — but leaves cannot, so this is
+        // safe. (An unrecognized composite node would simply not be recursed
+        // into; to stay sound we do not silently allow it: a composite the
+        // grammar can produce is one of the cases above.)
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s || escaped) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // Binding the target into ANOTHER local escapes it (the new local
+            // may itself be returned/stored). Walk the initializer as an escape
+            // position — but its sub-reads (e.g. `s.ToUpper()` receiver) are
+            // still recognized as safe by expr().
+            expr(ld->initializer.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            // A discarded expression (e.g. `Console.WriteLine(s);`). Its own
+            // sub-structure decides safe vs escape (the call args escape).
+            expr(es->expr.get(), /*safeRead=*/false); return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // The target being the local itself is a reassignment → escape
+            // (overwrite handling is out of this increment). The RHS escapes.
+            if (isTargetIdent(as->target.get())) { escaped = true; return; }
+            expr(as->target.get(), /*safeRead=*/false);
+            expr(as->value.get(), /*safeRead=*/false);
+            return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            // `s++` on a string is not valid, but be defensive: reassignment.
+            if (isTargetIdent(inc->target.get())) { escaped = true; return; }
+            expr(inc->target.get(), /*safeRead=*/false); return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get(), /*safeRead=*/false); return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get(), /*safeRead=*/true);
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get(), /*safeRead=*/true);
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get(), /*safeRead=*/true);
+            for (auto& b : ws->body) stmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            // `for var x in s do ... end` — iterating the local. Conservatively
+            // an escape (the enumerator may retain the source). expr(false).
+            expr(fs->iterable.get(), /*safeRead=*/false);
+            expr(fs->withExpr.get(), /*safeRead=*/false);
+            for (auto& b : fs->body) stmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get(), /*safeRead=*/true);
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get(), /*safeRead=*/false);
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get(), /*safeRead=*/false);
+                expr(arm.exprBody.get(), /*safeRead=*/false);
+                for (auto& a : arm.stmts) stmt(a.get());
+            }
+            return;
+        }
+        // BreakStmt / ContinueStmt: no sub-expressions. Any other statement type
+        // is not produced by the grammar here; leave the local eligible only if
+        // nothing above tainted it (the enumeration mirrors the complete set
+        // walked by UnwindIneligibleWalker).
+    }
+};
+}  // namespace
+
+
+void Emitter::collectStringReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    stringReleaseEligible_.clear();
+    // Find every `var` (non-using) string LocalDecl whose initializer is a
+    // codegen-internal +1 producer, then run the escape walk for each. A decl
+    // survives as eligible iff the walk proves it never escapes.
+    std::vector<const ast::LocalDecl*> candidates;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (!ld->isUsing && isPlusOneStringProducer(ld->initializer.get()))
+                candidates.push_back(ld);
+        }
+        // Recurse into nested blocks so locals declared inside if/while/for/
+        // do/try/case bodies are also considered.
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    for (const ast::LocalDecl* ld : candidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            stringReleaseEligible_.insert(static_cast<const void*>(ld));
+    }
+}
+
+
 // #383 / §28: a reference TypeRef carrying a vtable — a user class or
 // interface (Named, with a class/interface declaration). Such objects are
 // disposed dynamically through their own vtable slot 1.
@@ -2216,6 +2551,19 @@ bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& bo
 
 void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
+        // #422 / §4.6 / §28.9: a provably-non-escaping `var` string local.
+        // Release its single (producer) reference at scope end — on BOTH the
+        // normal and the unwind exit (the reference dies either way; a given
+        // exit goes one way only, so this runs exactly once per scope exit). The
+        // local was proven non-escaping, so nothing else holds the pointer:
+        // bz_string_release frees the data+header exactly once (no UAF, no
+        // double-free). bz_string_release is null-safe and a no-op on a
+        // sentinel/literal — but an eligible local always holds a heap +1 value.
+        if (it->stringRelease) {
+            llvm::Value* s = builder_.CreateLoad(ptrTy(), it->slot, "str.rel");
+            emitStringRelease(s);
+            continue;
+        }
         // #383 / §31.1: the caught exception object. On a normal handled exit
         // it is freed (destructor + base chain + block, via its vtable); on the
         // unwind path it is SKIPPED — a re-raise/throw leaving the arm keeps it
