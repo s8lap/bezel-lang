@@ -199,6 +199,34 @@ private:
     // is still in the Owned state at the return point.
     void checkIndirectEscapeOnReturn(const ast::Expr& e);
 
+    // §28.3 (#386 cases 1+2) INDIRECT escape through an assignment. When the
+    // assignment target is a *field of an object* (`obj.f := …`, including
+    // `this.f := …`) or an *out / ref / out-owned parameter* (`p := …`), and
+    // the RHS borrows an owned scope-bound LOCAL, the borrow is stored into a
+    // location that outlives that local — a use-after-dispose:
+    //   - A field of any object outlives a method-scope local; §28.3 forbids
+    //     assigning a borrow to any field ("class-typed fields that hold a
+    //     borrow are not expressible in this version").
+    //   - An out / ref parameter's storage is the caller's frame, which
+    //     outlives this method; writing a borrow of a local through it lets the
+    //     borrow outlive its source (§28.3 borrow-lifetime rules; §22.3 `out`
+    //     produces a borrow location for the caller).
+    // The source is restricted to an owned *local* (not an owned parameter):
+    // assigning an owned parameter into an owned field is the §28.8 ownership-
+    // transfer pattern, not a borrow store, so it must not be flagged here.
+    // Borrows whose source is a plain parameter are likewise not flagged — the
+    // parameter's source outlives this method (the "borrow in, borrow out"
+    // pattern). Called from handleAssignment before the RHS state transition.
+    void checkBorrowStoreEscape(const ast::AssignmentStmt& as);
+
+    // Like the owned-source half of borrowSourceForExpr but restricted to an
+    // owned scope-bound *local* (a `using var` or `var x := <owned producer>`),
+    // excluding owned parameters. Returns that local, or null. Used by
+    // checkBorrowStoreEscape to flag exactly the use-after-dispose hazard
+    // (a borrow of a value that dies at this scope's end) while leaving the
+    // §28.8 owned-parameter-into-owned-field transfer alone. // per §28.3
+    sema::Symbol* ownedLocalBorrowSource(const ast::Expr& rhs);
+
     // Compute the owned scope-bound source local that the initializer/RHS
     // expression `rhs` borrows from, or null if it borrows nothing owned.
     // Used to populate LocalOwnership.source so an aliasing local can be

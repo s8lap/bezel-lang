@@ -791,6 +791,22 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             if (const ast::IdentifierExpr* root = identifierRoot(rhs)) {
                 sema::Symbol* sym = ctx_.exprSymbol(*root);
                 if (isOwnedTrackedLocal(sym)) return sym;
+                // Multi-hop alias chain (#386 case 3): the re-borrow's root is
+                // not itself owned but is a tracked local that already carries
+                // a borrow source — it was bound from a re-borrow of an owned
+                // local one or more statements earlier. Re-borrowing it
+                // re-borrows the same owned source: `var b := r; var c := b;`
+                // makes `c`'s source `r`. Follow the chain to the underlying
+                // owned source, provided that source is still a live owned
+                // obligation here. The earlier link's `source` was itself set
+                // by this function, so deeper chains compose transitively (the
+                // n-th link points straight at the owned root). // per §28.3
+                if (sym) {
+                    auto it = states_.find(sym);
+                    if (it != states_.end() && it->second.source &&
+                        isOwnedTrackedLocal(it->second.source->sym))
+                        return it->second.source->sym;
+                }
             }
         }
     }
@@ -859,6 +875,81 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
         "owned scope-bound local and returning it lets the borrow outlive "
         "that local (§28.9 / §9.7 borrow-lifetime rule; bind the source in "
         "the caller's scope and build the aliasing value there instead)");
+}
+
+sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs) {
+    // Reuse the full borrow-source computation (covering the re-borrow,
+    // borrow-bearing-record, closure-capture, and multi-hop shapes), then
+    // restrict the result to an owned scope-bound *local*. An owned parameter
+    // is excluded: assigning an owned parameter into an owned field is the
+    // §28.8 ownership-transfer pattern, not a borrow store. // per §28.3, §28.8
+    sema::Symbol* src = borrowSourceForExpr(rhs);
+    if (!src) return nullptr;
+    if (!dynamic_cast<sema::LocalSymbol*>(src)) return nullptr;
+    return src;
+}
+
+void MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
+    if (as.op != ":=") return;
+    if (!as.target || !as.value) return;
+
+    // Identify the kind of escaping destination, and the diagnostic flavour.
+    // Two destinations outlive a method-scope local:
+    enum class Dest { None, Field, OutParam };
+    Dest dest = Dest::None;
+    if (dynamic_cast<const ast::MemberAccessExpr*>(as.target.get())) {
+        // `obj.f := …` / `this.f := …` — a field/property write. The field's
+        // object outlives the local; §28.3 forbids storing a borrow in any
+        // field ("class-typed fields that hold a borrow are not expressible in
+        // this version").
+        dest = Dest::Field;
+    } else if (const auto* id =
+                   dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+        // `p := …` where `p` is an out / ref / out-owned parameter — the
+        // parameter's storage is the caller's frame, which outlives this
+        // method. Writing a borrow of a local through it is the same lifetime
+        // violation as returning the borrow (§28.3; §22.3 `out` produces a
+        // borrow location for the caller). A plain (non-out/ref) parameter is
+        // not an output location, so it is not a destination here.
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            if (ps->modifier == "out" || ps->modifier == "ref" ||
+                ps->modifier == "out owned")
+                dest = Dest::OutParam;
+        }
+    }
+    if (dest == Dest::None) return;
+
+    // The RHS must borrow an owned scope-bound LOCAL (the value that dies at
+    // this scope's end). recordMovesIn has already run in handleAssignment, so
+    // a `move`d source is now MovedFrom, not Owned, and is correctly not seen
+    // as a live borrow source — `box.f := move r;` / `o := move r;` transfers,
+    // it does not store a borrow.
+    sema::Symbol* src = ownedLocalBorrowSource(*as.value);
+    if (!src) return;
+
+    if (dest == Dest::Field) {
+        report(
+            Severity::Error, as.span.begin,
+            std::string("borrow of `") + std::string(src->name) +
+            "` stored into a field would outlive its source — `" +
+            std::string(src->name) +
+            "` is an owned scope-bound local disposed at scope end, and a "
+            "field of the target object outlives it (§28.3 — a borrow may not "
+            "be assigned to any field of any object; store an owned value with "
+            "`move`, or keep the borrow's source alive as long as the field)");
+    } else {
+        report(
+            Severity::Error, as.span.begin,
+            std::string("borrow of `") + std::string(src->name) +
+            "` written through an out/ref parameter would outlive its source "
+            "— `" + std::string(src->name) +
+            "` is an owned scope-bound local disposed at scope end, and the "
+            "parameter's location lives in the caller's frame, which outlives "
+            "this method (§28.3 borrow-lifetime rule; produce an owned value "
+            "with `move` for an `out owned` parameter, or return/keep the "
+            "source in a longer-lived scope)");
+    }
 }
 
 const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
