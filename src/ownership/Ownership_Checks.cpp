@@ -1591,11 +1591,29 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     if (auto* st = lookupState(id->name)) {
         return st->state == OwnershipState::Borrowed;
     }
-    // Not a tracked local. A bare identifier resolving to a non-`owned`
-    // parameter is a borrowed parameter (source: the caller's frame, §28.3
-    // producers "Parameter `p` (no modifier) | Borrowed (source: caller)") —
-    // handing it to an `owned` sink is the double-dispose hazard.
+    // Not a tracked local. Resolve the symbol to classify the two remaining
+    // borrow forms a bare identifier can take.
     sema::Symbol* sym = ctx_.exprSymbol(*id);
+    // §31.1 (issue #404): a catch-bound exception variable. The caught
+    // exception is a borrow whose lifetime is the catch arm body — "may be
+    // passed to other methods (which further borrow for the duration of the
+    // call) but may not be assigned to an `owned` field, returned as `owned`,
+    // or captured by a closure that may outlive the arm." An `owned`-consuming
+    // sink (an `owned` parameter / constructor argument per §28.8, or an
+    // owning-collection `set(owned)` slot per §28.11) takes responsibility for
+    // disposing the value and may retain it past the call — the same retention
+    // §31.1 forbids; the runtime disposes the exception after the arm, so the
+    // sink's later disposal is a use-after-free / double-dispose. The catch
+    // binding is a method-scope LocalSymbol that is NOT in `states_`, so neither
+    // the `lookupState` Borrowed branch above nor the ParameterSymbol branch
+    // below sees it; recognize it directly via `isCatchBorrow`. (`move ex`
+    // unwrapped to the bare `ex` above is no more an owned value than the bare
+    // binding — the runtime, not this scope, owns it.) // per §31.1, §28.8
+    if (isCatchBorrow(sym)) return true;
+    // A bare identifier resolving to a non-`owned` parameter is a borrowed
+    // parameter (source: the caller's frame, §28.3 producers "Parameter `p`
+    // (no modifier) | Borrowed (source: caller)") — handing it to an `owned`
+    // sink is the double-dispose hazard.
     if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
         return ps->modifier != "owned" && ps->modifier != "out owned";
     }

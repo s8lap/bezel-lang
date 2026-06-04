@@ -252,7 +252,8 @@ set(BEZEL_TEST_SOURCES
     ownership/out_owned_discharge_test.cpp
     ownership/owned_sink_test.cpp
     ownership/owned_field_sink_test.cpp
-    ownership/owned_field_assign_test.cpp)
+    ownership/owned_field_assign_test.cpp
+    ownership/catch_owned_sink_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
