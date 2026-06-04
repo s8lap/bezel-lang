@@ -666,6 +666,12 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.
     recordMovesIn(*as.value);
+    // §28.3 (#386 cases 1+2): storing a borrow of an owned scope-bound local
+    // into a field of an object, or writing it through an out/ref parameter,
+    // lets the borrow outlive the local (use-after-dispose). Run AFTER
+    // recordMovesIn so a `move`d source is no longer Owned and the transfer
+    // form is correctly not flagged.
+    checkBorrowStoreEscape(as);
     if (const auto* id =
             dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
         // §28.9 / §9.7 indirect-escape tracking: recompute the borrow source
