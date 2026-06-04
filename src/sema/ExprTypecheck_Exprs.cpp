@@ -101,6 +101,17 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     }
                 }
             }
+            // §12.7: flow narrowing. Inside the controlled block of `if x is T`
+            // (or the else of `if x is not T`), a reference to the narrowed
+            // variable takes the narrowed type `T` instead of its declared
+            // base type — overriding whatever exprType the declared-type rules
+            // above attached. Member access on this identifier (`x.M`) then
+            // resolves against `T` (resolveMemberAccess reads the target's
+            // exprType first). Narrowing applies only to simple variables
+            // (locals and parameters), keyed by their resolved symbol.
+            if (auto nt = narrowings_.find(sym); nt != narrowings_.end()) {
+                ctx_.setExprType(&e, nt->second);
+            }
         } else if (primitiveFromName(id->name) != PrimitiveType::None) {
             // §5.2: a primitive type name used in expression position is
             // a conversion callee (`int(x)`). It has no value symbol;
