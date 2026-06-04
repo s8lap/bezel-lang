@@ -2334,6 +2334,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         }
         llvm::Value* v = lowerExpr(*init);
         if (!v) continue;
+        // §5.1: an int initializer for a wider numeric field (e.g. a `double`
+        // field with `:= 5`) is implicitly widened — convert before the store
+        // so the field holds the value, not the int's raw bits (issue #408).
+        v = coerceNumericToType(v, st->getElementType(idxIt->second));
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
@@ -2427,6 +2431,38 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSemaTy);
     return obj;
+}
+
+
+// §5.1: coerce a lowered value to a target LLVM type along a §5.1-admitted
+// numeric widening. Sema has already accepted the conversion (assignment to a
+// wider local/field, mixed-type arithmetic per §6.2, or argument binding to a
+// wider parameter per §22.6); codegen must materialize it, because the lowered
+// value still carries its source LLVM type. Without this an `int` (i32) stored
+// into / passed where a `float`/`double` is expected reaches the consumer as
+// raw integer bits (issue #408). Only the widening directions §5.1 admits are
+// applied; everything else (pointers, structs, equal types, narrowing) is left
+// untouched, so callers can invoke this unconditionally.
+llvm::Value* Emitter::coerceNumericToType(llvm::Value* v,
+                                          llvm::Type* targetTy) {
+    if (!v || !targetTy) return v;
+    llvm::Type* srcTy = v->getType();
+    if (srcTy == targetTy) return v;
+    // int → float / double (§5.1: integers widen to binary floats).
+    if (srcTy->isIntegerTy() && !srcTy->isIntegerTy(1) &&
+        targetTy->isFloatingPointTy())
+        return builder_.CreateSIToFP(v, targetTy);
+    // float → double (§5.1: the one binary-float widening).
+    if (srcTy->isFloatingPointTy() && targetTy->isFloatingPointTy() &&
+        srcTy->getPrimitiveSizeInBits() < targetTy->getPrimitiveSizeInBits())
+        return builder_.CreateFPExt(v, targetTy);
+    // integer widening (§5.1: e.g. int → long). Sign-extend (the common,
+    // signed case; unsigned-source widening is a deferred refinement).
+    if (srcTy->isIntegerTy() && !srcTy->isIntegerTy(1) &&
+        targetTy->isIntegerTy() &&
+        srcTy->getIntegerBitWidth() < targetTy->getIntegerBitWidth())
+        return builder_.CreateSExt(v, targetTy);
+    return v;  // no §5.1 numeric widening applies — leave the value as is.
 }
 
 

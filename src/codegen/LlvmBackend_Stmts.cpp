@@ -55,6 +55,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (!addr) return false;
             llvm::Value* rhs = lowerExpr(*as->value);
             if (!rhs) return false;
+            // §5.1: an int assigned to a wider numeric slot (e.g. `d := n;`
+            // with `d: double`, `n: int`) is implicitly widened. Materialize
+            // the conversion sema admitted so the slot receives the value, not
+            // the source type's raw bits (issue #408). No-op when the rhs type
+            // already matches or no §5.1 numeric widening applies.
+            if (elemTy)
+                rhs = coerceNumericToType(rhs, elemTy);
             // CG-nullable: if target slot is a nullable-prim struct and
             // rhs is a plain primitive, wrap it (or fix null literal).
             if (elemTy && llvm::isa<llvm::StructType>(elemTy)) {

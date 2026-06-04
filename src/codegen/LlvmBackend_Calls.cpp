@@ -3890,6 +3890,12 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         }
         llvm::FunctionType* fnTy = methodFnType(ms);
         if (!fnTy || args.size() != fnTy->getNumParams()) return nullptr;
+        // §5.1 / §22.6: widen each argument to its declared parameter type
+        // when sema admitted an implicit numeric conversion (e.g. an int
+        // argument bound to a double parameter). Otherwise the i32 reaches an
+        // f64 parameter as raw bits (issue #408 / finding [17]).
+        for (std::size_t ai = 0; ai < args.size(); ++ai)
+            args[ai] = coerceNumericToType(args[ai], fnTy->getParamType(ai));
         llvm::Value* recv = args[0];
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
         llvm::Value* slotPtr = builder_.CreateGEP(
@@ -3956,6 +3962,18 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 return r;
             }
         }
+    }
+    // §5.1 / §22.6: widen each argument to its declared parameter type when
+    // sema admitted an implicit numeric conversion (e.g. an int argument bound
+    // to a double parameter — also reached by the operator-overload path in
+    // lowerBinary). Without this the i32 reaches an f64 parameter as raw bits
+    // (issue #408 / finding [17]). Applied after the generic-specialization
+    // checks above so it does not perturb their arg/param type comparisons.
+    {
+        auto* callFnTy = callee->getFunctionType();
+        for (std::size_t ai = 0;
+             ai < args.size() && ai < callFnTy->getNumParams(); ++ai)
+            args[ai] = coerceNumericToType(args[ai], callFnTy->getParamType(ai));
     }
     llvm::Value* r = builder_.CreateCall(callee, args);
     emitPendingCheck();  // CG20: a callee may have thrown

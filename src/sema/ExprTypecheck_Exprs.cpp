@@ -548,6 +548,36 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 return;
             }
         }
+        // §6.2 mixed-type arithmetic: "the smaller-range operand is implicitly
+        // promoted to the larger type using §5.1. The result has the larger
+        // type." For the non-shift operators, when both operands are primitive
+        // numerics of different types, the result is the wider operand — the
+        // one the other implicitly widens to per §5.1. (Shift ops `<<`/`>>`
+        // keep the left operand's type: the right operand is a shift count,
+        // not an arithmetic operand, so no promotion applies.)
+        if (op != "<<" && op != ">>") {
+            TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+            if (lt && rt &&
+                lt->kind == TypeRef::Kind::Primitive &&
+                rt->kind == TypeRef::Kind::Primitive &&
+                lt->primitive != rt->primitive &&
+                !lt->nullable && !rt->nullable) {
+                if (primitiveWidens(lt->primitive, rt->primitive)) {
+                    // left widens to right → result is right (the wider).
+                    ctx_.setExprType(&be, rt);
+                    return;
+                }
+                if (primitiveWidens(rt->primitive, lt->primitive)) {
+                    // right widens to left → result is left (the wider).
+                    ctx_.setExprType(&be, lt);
+                    return;
+                }
+                // Neither widens to the other (e.g. double + decimal): §6.2
+                // requires an explicit cast. Leave the result typed as the
+                // left operand (matching the prior behavior); the dedicated
+                // mixed-incompatible diagnostic is deferred (issue #408).
+            }
+        }
         if (lt) ctx_.setExprType(&be, lt);
         return;
     }
