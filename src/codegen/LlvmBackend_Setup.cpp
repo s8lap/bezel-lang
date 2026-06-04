@@ -480,6 +480,12 @@ Emitter::builtinExceptionHierarchy() {
         {"NotImplementedException", "Exception"},
         {"NullReferenceException", "Exception"},
         {"IndexOutOfRangeException", "Exception"},
+        // issue #388 / stdlib §4.8: Dictionary<K,V>'s indexer getter raises
+        // KeyNotFoundException for an absent key. It is a stdlib type (in
+        // System.Collections.Generic), but the codegen synthesizes it at the
+        // indexer-read guard, so it joins the set of runtime-throwable
+        // exceptions here (and so a `catch KeyNotFoundException` resolves).
+        {"KeyNotFoundException", "Exception"},
         {"MatchFailureException", "Exception"},
         {"OperationCanceledException", "Exception"},
         {"TypeInitializationException", "Exception"},

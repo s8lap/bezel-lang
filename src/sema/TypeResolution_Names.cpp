@@ -16,6 +16,14 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "NotImplementedException" ||
         n == "NullReferenceException" ||
         n == "IndexOutOfRangeException" ||
+        // issue #388 / stdlib §4.8: KeyNotFoundException — raised by the
+        // Dictionary<K,V> indexer getter for an absent key. Per the spec it
+        // lives in System.Collections.Generic and requires `import`; the
+        // compiler does not yet enforce import-gating for that namespace (its
+        // sibling collection types Array/Dictionary/… all resolve without
+        // import here too), so it joins the resolvable built-in exception set
+        // for consistency, enabling `catch KeyNotFoundException`.
+        n == "KeyNotFoundException" ||
         n == "MatchFailureException" ||
         n == "OperationCanceledException" ||
         n == "TypeInitializationException" ||

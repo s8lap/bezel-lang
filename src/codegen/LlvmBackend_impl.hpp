@@ -741,6 +741,19 @@ private:
     // Returns true if the setter was handled.
     bool lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val);
 
+    // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer read
+    // `a[i]` / `dict[key]` against the runtime backing (bz_array_* / bz_dict_*).
+    // Returns the loaded element/value, or null if `ix`'s target is not a
+    // built-in heap collection (the caller falls through to other paths).
+    llvm::Value* lowerCollectionIndexerGet(const ast::IndexExpr& ix);
+
+    // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer setter
+    // `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwnedArray /
+    // OwnedDictionary) the displaced slot/value is disposed exactly once before
+    // the new (owned) one is stored (§4.5 / §4.9); a borrowing collection just
+    // overwrites. `val` is the already-lowered RHS. Returns true if handled.
+    bool lowerCollectionIndexerSet(const ast::IndexExpr& ix, llvm::Value* val);
+
     // CG15: collect a class's instance fields in layout order —
     // base-class fields FIRST (prefix layout: a `Derived*` aliases a
     // `Base*`), then own fields. Recurses the single base class

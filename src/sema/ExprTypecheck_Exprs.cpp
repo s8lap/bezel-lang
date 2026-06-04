@@ -333,6 +333,32 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 else if (tt->kind == TypeRef::Kind::Primitive &&
                          tt->primitive == PrimitiveType::String)
                     ctx_.setExprType(&e, ctx_.primitiveTypeRef(PrimitiveType::Char));
+                // issue #388: heap-collection indexer `a[i]` / `dict[key]`. The
+                // built-in collections resolve to a Named TypeRef with a null
+                // declaration (TypeResolution_Names) and carry their type
+                // arguments in genericArgs. Type the index access as the
+                // collection's element/result type so codegen can lower the
+                // read and the setter against it (mirrors the inline-array path
+                // above):
+                //   * Array<T> / OwnedArray<T> (stdlib §4.4 / §4.5): the
+                //     indexer `[i: int]: T` result is T = genericArgs[0].
+                //   * Dictionary<K,V> / OwnedDictionary<K,V> (§4.8 / §4.9): the
+                //     indexer `[key: K]: V` result is V = genericArgs[1].
+                else if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                         tt->astNode && tt->astNode->name &&
+                         !tt->astNode->name->parts.empty()) {
+                    std::string_view cn = tt->astNode->name->parts[0];
+                    bool isArrLike =
+                        cn == "Array" || cn == "OwnedArray";
+                    bool isDict =
+                        cn == "Dictionary" || cn == "OwnedDictionary";
+                    if (isArrLike && !tt->genericArgs.empty() &&
+                        tt->genericArgs[0])
+                        ctx_.setExprType(&e, tt->genericArgs[0]);
+                    else if (isDict && tt->genericArgs.size() > 1 &&
+                             tt->genericArgs[1])
+                        ctx_.setExprType(&e, tt->genericArgs[1]);
+                }
             }
         }
     }

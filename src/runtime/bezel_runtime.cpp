@@ -82,6 +82,21 @@ void bz_array_set(void* arrp, int64_t idx, const void* elem, int64_t elem_size) 
     memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
 }
 
+// issue #388 / stdlib §4.5: OwnedArray<T>'s `set(owned)` indexer — dispose the
+// element currently at idx (a pointer-sized owned object reference) before
+// overwriting the slot with the new owner. Reading the old pointer before the
+// store guarantees exactly-once disposal of the displaced owner.
+void bz_array_set_disposing(void* arrp, int64_t idx, const void* elem,
+                            int64_t elem_size, void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (dispose_elem && arr->data) {
+        void* prev = ((void**)arr->data)[idx];
+        if (prev) dispose_elem(prev);
+    }
+    memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
+}
+
 void bz_array_remove_at(void* arrp, int64_t idx, int64_t elem_size) {
     auto* arr = (bz_array_t*)arrp;
     if (idx < 0 || idx >= arr->count) return;
@@ -302,6 +317,23 @@ void bz_dict_set_str(void* dp, const char* k, int64_t k_len, void* val) {
     d->count++;
 }
 
+// issue #388 / stdlib §4.9: OwnedDictionary<string,V>'s `set(owned)` indexer.
+// If `k` is already present, dispose the value stored under it before replacing
+// it (exactly-once disposal of the displaced owner); a fresh key just inserts.
+void bz_dict_set_str_disposing(void* dp, const char* k, int64_t k_len,
+                               void* val, void (*dispose_val)(void*)) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d) return;
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx >= 0) {
+        if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
+        d->buckets[idx].val = val;
+        return;
+    }
+    bz_dict_set_str(dp, k, k_len, val);   // fresh key: nothing to dispose
+}
+
 bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
     auto* d = (bz_dict_t*)dp;
     uint32_t h = fnv1a(k, k_len);
@@ -411,6 +443,23 @@ void bz_dict_set_gen(void* dp, const void* key, void* val) {
     d->buckets[ins].hash = h;
     d->buckets[ins].deleted = false;
     d->count++;
+}
+
+// issue #388 / stdlib §4.9: generic-key counterpart to
+// bz_dict_set_str_disposing — dispose the value under `key` (if present) before
+// replacing it; a fresh key just inserts.
+void bz_dict_set_gen_disposing(void* dp, const void* key, void* val,
+                               void (*dispose_val)(void*)) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx >= 0) {
+        if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
+        d->buckets[idx].val = val;
+        return;
+    }
+    bz_dict_set_gen(dp, key, val);        // fresh key: nothing to dispose
 }
 
 bool bz_dict_remove_gen(void* dp, const void* key) {

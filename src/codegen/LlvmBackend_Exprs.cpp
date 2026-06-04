@@ -490,6 +490,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // §22.10: class/record indexer property getter.
         if (auto* idxGetVal = lowerIndexerGet(*ix))
             return idxGetVal;
+        // issue #388 / stdlib §4.4-§4.9: heap-collection indexer read
+        // `a[i]` / `dict[key]` against the runtime backing.
+        if (auto* collGetVal = lowerCollectionIndexerGet(*ix))
+            return collGetVal;
         // §15.1: inline array `a[i]` — GEP the array slot and load.
         llvm::Type* ety = nullptr;
         llvm::Value* addr = lvalueAddr(*ix->target, ety);
