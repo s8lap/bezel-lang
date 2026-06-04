@@ -614,6 +614,28 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (!sym) continue;
+            // §31.1 (issue #392): a returned/escaping closure capturing a
+            // catch-bound exception variable. The caught exception is a borrow
+            // whose lifetime is the catch arm body; capturing it does not
+            // transfer ownership, and a closure that escapes the arm outlives
+            // the exception (the runtime disposes it after the arm completes)
+            // — a use-after-free. The catch binding is not in `states_`, so it
+            // is recognized here directly. The binding is always a reference to
+            // a heap exception instance, so no value-typed gate is needed.
+            if (isCatchBorrow(sym)) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("returned closure captures the caught "
+                                "exception `") +
+                    std::string(sym->name) +
+                    "` — a caught exception is a borrow whose lifetime is the "
+                    "catch arm body (the runtime disposes it after the arm "
+                    "completes); a closure that escapes the arm would outlive "
+                    "it (use-after-free). (§31.1; copy the data you need out "
+                    "of it into an owned value the closure can capture "
+                    "instead)");
+                return;  // one diagnostic per return is enough
+            }
             // Resolve against the dataflow-tracked method-scope locals. A
             // captured lambda parameter is not in `states_`, so it is
             // naturally excluded; only an enclosing-method local/owned-param
@@ -767,7 +789,50 @@ bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
            it->second.state == OwnershipState::Owned;
 }
 
+bool MethodOwnership::isCatchBorrow(sema::Symbol* sym) const {
+    return sym && catchBorrows_.count(sym) != 0;
+}
+
+bool MethodOwnership::isEscapeBoundLocal(sema::Symbol* sym) const {
+    // §28.3 owned scope-bound local OR §31.1 catch-bound exception variable.
+    // Both are scope-bound borrows that may not outlive their scope: the owned
+    // local is disposed at scope end; the caught exception is disposed by the
+    // runtime when the arm completes. A borrow of either may not escape.
+    return isOwnedTrackedLocal(sym) || isCatchBorrow(sym);
+}
+
 sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
+    // §31.1 (issue #392) — a re-borrow of a catch-bound exception variable.
+    // `var b := ex;` binds `b` to the in-flight exception's borrow; the source
+    // is the catch binding `ex`. This is checked BEFORE the §28.3 borrow-vs-
+    // copy gate below: a built-in exception type resolves to a Named TypeRef
+    // with no declaration (it has no user TypeDecl), which `isBorrowableType`
+    // treats as a value type — so `returnedExprMayBorrow(ex)` is false even
+    // though the binding is always a reference to a heap exception instance
+    // (§31.1: `new SomeException(...)` produces an owned class instance). We
+    // therefore recognize a bare catch-binding identifier directly, without
+    // routing through that gate. A value/string projection off the exception
+    // (`ex.Message`) is a MemberAccessExpr whose root resolves to `ex` but is
+    // a copy, not the instance — it is NOT matched here (only the bare
+    // identifier is), so copying data out of the exception stays legal.
+    //
+    // The same bare-identifier branch also follows a multi-hop chain rooted at
+    // a catch binding (`var b := ex; var c := b;`): a holder local whose
+    // tracked source is a catch borrow re-borrows the same exception, so
+    // re-binding it (or escaping it) re-borrows `ex`. Both legs bypass the
+    // `returnedExprMayBorrow` gate below because a built-in exception type is
+    // mis-classified as a value type by `isBorrowableType` (no user TypeDecl);
+    // the catch binding and its re-borrows are always reference borrows of the
+    // heap exception instance. // per §31.1
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&rhs)) {
+        if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
+            if (isCatchBorrow(sym)) return sym;
+            auto it = states_.find(sym);
+            if (it != states_.end() && it->second.source &&
+                isCatchBorrow(it->second.source->sym))
+                return it->second.source->sym;
+        }
+    }
     // Shape 1 — a re-borrow rooted at an Owned local. Per §28.3 producers:
     // a local read `r` of an owned local in a borrow-consuming position is a
     // borrow (source: `r`); a field/indexer access `r.f` / `r[i]` is a
@@ -804,7 +869,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
                 if (sym) {
                     auto it = states_.find(sym);
                     if (it != states_.end() && it->second.source &&
-                        isOwnedTrackedLocal(it->second.source->sym))
+                        isEscapeBoundLocal(it->second.source->sym))
                         return it->second.source->sym;
                 }
             }
@@ -824,20 +889,22 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
                 const ast::IdentifierExpr* root = identifierRoot(*a.value);
                 if (!root) continue;
                 sema::Symbol* sym = ctx_.exprSymbol(*root);
-                if (isOwnedTrackedLocal(sym)) return sym;
+                if (isEscapeBoundLocal(sym)) return sym;
             }
         }
     }
-    // Shape 3 — a closure capturing an Owned local (§28.9). Capturing an
-    // owned class-typed local does not transfer ownership; the capture is a
-    // borrow whose source is the local's enclosing scope. Binding the closure
-    // to a holder local propagates that source.
+    // Shape 3 — a closure capturing an Owned local (§28.9) or a catch-bound
+    // exception variable (§31.1). Capturing an owned class-typed local — or
+    // the in-flight exception — does not transfer ownership; the capture is a
+    // borrow whose source is the enclosing scope (for the catch binding, the
+    // arm body). Binding the closure to a holder local propagates that source,
+    // so a later escape of the holder is recognized.
     if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&rhs)) {
         std::vector<const ast::IdentifierExpr*> ids;
         collectLambdaIdentifiers(*lam, ids);
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
-            if (isOwnedTrackedLocal(sym)) return sym;
+            if (isEscapeBoundLocal(sym)) return sym;
         }
     }
     return nullptr;
@@ -862,11 +929,29 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
         if (it != states_.end()) st = &it->second;
     }
     if (!st || !st->source) return;
-    // The source must still be a live owned scope-bound obligation at the
-    // return point. If it was already disposed / moved out, there is no live
-    // borrow to dangle (and a separate diagnostic would have covered misuse).
-    if (!isOwnedTrackedLocal(st->source->sym)) return;
+    // The source must still be a live scope-bound obligation at the return
+    // point: an owned scope-bound local (§28.9 / §9.7) or a catch-bound
+    // exception variable (§31.1, issue #392). If an owned source was already
+    // disposed / moved out, there is no live borrow to dangle (and a separate
+    // diagnostic would have covered misuse); a catch binding is always live
+    // within its arm.
+    if (!isEscapeBoundLocal(st->source->sym)) return;
     std::string_view srcName = st->source->sym->name;
+    if (isCatchBorrow(st->source->sym)) {
+        // §31.1: the holder re-borrows the in-flight exception. Returning it
+        // lets the exception instance escape the arm whose completion the
+        // runtime disposes it after — a use-after-free.
+        report(
+            Severity::Error, id->span.begin,
+            std::string("returned `") + std::string(id->name) +
+            "` carries a borrow of the caught exception `" +
+            std::string(srcName) +
+            "` — a caught exception is a borrow whose lifetime is the catch "
+            "arm body (the runtime disposes it after the arm completes), so "
+            "it may not escape the arm (§31.1; copy the data you need out of "
+            "it — e.g. its message — into an owned value instead)");
+        return;
+    }
     report(
         Severity::Error, id->span.begin,
         std::string("returned `") + std::string(id->name) +
@@ -887,6 +972,85 @@ sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs) {
     if (!src) return nullptr;
     if (!dynamic_cast<sema::LocalSymbol*>(src)) return nullptr;
     return src;
+}
+
+// ---------------------------------------------------------------------------
+// §31.1 (issue #392) — catch-bound exception variables are scope-bound borrows.
+// ---------------------------------------------------------------------------
+
+void MethodOwnership::collectCatchBorrowsStmt(const ast::Stmt& s) {
+    // Recurse into the control-flow forms that can lexically contain a try
+    // statement (mirrors collectLocalDeclsStmt's structure). The ownership
+    // CFG flattens these, but here we only need to find the catch arms and
+    // their binding symbols, so a syntactic walk is sufficient and simplest.
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        for (const auto& bs : ifs->ifBranch.body) if (bs) collectCatchBorrowsStmt(*bs);
+        for (const auto& el : ifs->elifBranches)
+            for (const auto& bs : el.body) if (bs) collectCatchBorrowsStmt(*bs);
+        for (const auto& bs : ifs->elseBody) if (bs) collectCatchBorrowsStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        for (const auto& bs : ws->body) if (bs) collectCatchBorrowsStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        for (const auto& bs : fs->body) if (bs) collectCatchBorrowsStmt(*bs);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body) if (bs) collectCatchBorrowsStmt(*bs);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : ts->body) if (bs) collectCatchBorrowsStmt(*bs);
+        for (const auto& arm : ts->catches) {
+            // §31.2.1 binding pattern `var ex: T`. The catch binding's
+            // LocalSymbol was created by ExprTypecheck anchored on the arm's
+            // body node (`bnd->decl = arm.body.get()`). Find it by that anchor.
+            if (arm.hasBinding && !arm.varName.empty() && arm.body) {
+                for (const auto& sym : ctx_.symbols()) {
+                    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
+                    if (ls && ls->decl == arm.body.get() &&
+                        ls->name == arm.varName) {
+                        catchBorrows_.insert(ls);
+                        break;
+                    }
+                }
+            }
+            // A catch arm body may itself contain a nested try.
+            if (arm.body) collectCatchBorrowsStmt(*arm.body);
+        }
+        for (const auto& bs : ts->finallyBody) if (bs) collectCatchBorrowsStmt(*bs);
+        return;
+    }
+}
+
+void MethodOwnership::collectCatchBorrows(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body) if (s) collectCatchBorrowsStmt(*s);
+}
+
+void MethodOwnership::checkCatchBorrowEscapesOnReturn(const ast::Expr& e) {
+    // §31.1: `return ex;` where `ex` is the bare catch-bound exception
+    // variable. Returning the binding (as `owned`, the only way a class
+    // instance is returned) lets the in-flight exception instance escape the
+    // arm whose completion the runtime disposes it after — a use-after-free.
+    // Only the BARE identifier is flagged: a value/string projection off the
+    // exception (`return ex.Message;`) is a copy, not the instance, and is the
+    // spec's documented escape hatch ("copy the relevant data out of it").
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!isCatchBorrow(sym)) return;
+    report(
+        Severity::Error, id->span.begin,
+        std::string("caught exception `") + std::string(id->name) +
+        "` may not be returned — a caught exception is a borrow whose lifetime "
+        "is the catch arm body (the runtime disposes it after the arm "
+        "completes), so the exception instance cannot escape the arm (§31.1; "
+        "copy the data you need out of it — e.g. its message — into an owned "
+        "value and return that, or re-raise with `throw;`)");
 }
 
 void MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
@@ -927,6 +1091,39 @@ void MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     // it does not store a borrow.
     sema::Symbol* src = ownedLocalBorrowSource(*as.value);
     if (!src) return;
+
+    // §31.1 (issue #392): the borrow source is a catch-bound exception
+    // variable. A caught exception's lifetime is the catch arm body; storing
+    // a borrow of it into a field (or through an out/ref param) lets the
+    // exception instance outlive the arm, after which the runtime disposes it
+    // — a use-after-free. This is the `_lastError := ex;` error from Guide 02
+    // §3. Distinct message from the owned-local case so the §31.1 rule is
+    // pointed to directly.
+    if (isCatchBorrow(src)) {
+        if (dest == Dest::Field) {
+            report(
+                Severity::Error, as.span.begin,
+                std::string("caught exception `") + std::string(src->name) +
+                "` may not be assigned to a field — a caught exception is a "
+                "borrow whose lifetime is the catch arm body (the runtime "
+                "disposes it after the arm completes), and a field outlives "
+                "the arm, so the stored reference would dangle (§31.1; copy "
+                "the data you need out of it — e.g. its message — into an "
+                "owned value instead)");
+        } else {
+            report(
+                Severity::Error, as.span.begin,
+                std::string("caught exception `") + std::string(src->name) +
+                "` may not be written through an out/ref parameter — a caught "
+                "exception is a borrow whose lifetime is the catch arm body "
+                "(the runtime disposes it after the arm completes), and the "
+                "parameter's location lives in the caller's frame, which "
+                "outlives the arm, so the written reference would dangle "
+                "(§31.1; copy the data you need out of it into an owned value "
+                "instead)");
+        }
+        return;
+    }
 
     if (dest == Dest::Field) {
         report(

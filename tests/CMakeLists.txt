@@ -242,6 +242,7 @@ set(BEZEL_TEST_SOURCES
     ownership/loop_fixpoint_test.cpp
     ownership/escape_closure_record_test.cpp
     ownership/escape_deeper_test.cpp
+    ownership/catch_escape_test.cpp
     ownership/out_owned_discharge_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})

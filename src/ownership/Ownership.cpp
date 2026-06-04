@@ -22,6 +22,13 @@ namespace bezel::ownership {
 
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms) {
+    // Issue #392 / §31.1: collect this method's catch-bound exception
+    // variables before the dataflow runs. Each is a borrow of the in-flight
+    // exception whose lifetime is its arm body; the escape machinery consults
+    // `catchBorrows_` to reject the binding (or a re-borrow of it) escaping
+    // the arm (store-to-owned-field, return-as-owned, escaping closure
+    // capture). Done first so the per-statement escape checks see it.
+    collectCatchBorrows(body);
     // Seed the dataflow entry state with `owned` / `out owned` parameters
     // (slice O10): each enters the method in the Owned state and must
     // reach a discharge point on every normal-exit path (§28.8).
@@ -742,6 +749,7 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     checkClosureEscapesOnReturn(e);       // D1: §28.9 closure capture escape
     checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
     checkIndirectEscapeOnReturn(e);       // §28.9/§9.7 indirect-via-local
+    checkCatchBorrowEscapesOnReturn(e);   // §31.1 caught-exception escape
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement
