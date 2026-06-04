@@ -161,6 +161,7 @@ set(BEZEL_TEST_SOURCES
     codegen/object_downcast_test.cpp
     codegen/exceptions_test.cpp
     codegen/exception_dispose_test.cpp
+    codegen/exception_disposal_test.cpp
     codegen/checked_arith_test.cpp
     codegen/null_forgiving_test.cpp
     codegen/float_test.cpp

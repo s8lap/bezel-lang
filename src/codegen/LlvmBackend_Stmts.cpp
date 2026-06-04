@@ -7,6 +7,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
         if (diverged_) return true;  // CG40: diverging initializer
         if (ld->isUsing) registerUsingDisposal(ld);
+        // §28.3 (line 4910): a plain `var` owned local is auto-disposed only on
+        // the exception-unwind path (an `unwindOnly` Disposal); normal exit
+        // requires it to reach a discharge point (sema-enforced).
+        else registerUnwindOwnedLocal(ld);
         return false;
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
@@ -451,7 +455,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // the caught object as a `caughtException` disposal in a dedicated
         // scope around the arm body: a NORMAL handled exit (fall-through,
         // return, break, continue) frees it via the disposal machinery
-        // (emitDynamicDispose — destructor + base chain + free, #380); the
+        // (emitDisposeAndReclaim — destructor + base chain + free, #380); the
         // UNWIND path (a re-raise `throw;` or `throw expr` from the arm body)
         // SKIPS it (emitDisposals' isUnwind), keeping it in flight so the
         // enclosing handler frees it exactly once. The binding is a borrow

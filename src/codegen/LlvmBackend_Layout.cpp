@@ -344,7 +344,8 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
         std::vector<const sema::Symbol*> storage;
         collectInstanceStorage(t, storage);
         std::vector<llvm::Type*> specFieldTys;
-        specFieldTys.push_back(ptrTy());
+        specFieldTys.push_back(ptrTy());            // [0] vtable pointer
+        specFieldTys.push_back(disposedFlagTy());   // [1] disposed run-once flag
         for (const sema::Symbol* m : storage)
             specFieldTys.push_back(storageType(m));
         // Cache lookup: specializedStructs_[t][specFieldTys] → existing
@@ -357,8 +358,9 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
         auto* specSt = llvm::StructType::create(llvm_, specName);
         specSt->setBody(specFieldTys);
         specMap[specFieldTys] = specSt;
-        // Register field indices for this specialization.
-        unsigned sidx = 1;
+        // Register field indices for this specialization (data fields start at
+        // index 2, after the vtable and the disposed flag).
+        unsigned sidx = 2;
         for (const sema::Symbol* m : storage)
             fieldIndex_[m] = sidx++;
         return specSt;
@@ -372,15 +374,40 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     std::vector<const sema::Symbol*> storage;
     collectInstanceStorage(t, storage);
     std::vector<llvm::Type*> fieldTys;
-    // CG17: slot 0 is the hidden vtable pointer; data fields follow.
+    // CG17: slot 0 is the hidden vtable pointer.
     fieldTys.push_back(ptrTy());
-    unsigned idx = 1;
+    // §28.2 / §28.6: slot 1 is the per-object i8 "disposed" run-once flag,
+    // calloc-zeroed to 0 = not-disposed. It sits BEFORE all data fields so it is
+    // at a FIXED offset (right after the vtable pointer) for every class — the
+    // same in a base, every derived class (prefix layout preserved: inherited
+    // data fields keep their index 2..), and every generic specialization
+    // (independent of field type sizes). The shared, type-erased generated
+    // Dispose (one per class template, used by all instantiations) therefore
+    // reads/writes the flag at the correct offset regardless of substitution.
+    fieldTys.push_back(disposedFlagTy());
+    unsigned idx = 2;
     for (const sema::Symbol* m : storage) {
         fieldTys.push_back(storageType(m));
         fieldIndex_[m] = idx++;
     }
     st->setBody(fieldTys);
     return st;
+}
+
+
+// §28.2 / §28.6: the LLVM type of the per-object "disposed" run-once flag — a
+// single byte right after the vtable pointer in every class struct. calloc
+// zeroes it (0 = not yet disposed); the generated Dispose sets it to 1 on first
+// disposal.
+llvm::Type* Emitter::disposedFlagTy() { return llvm::Type::getInt8Ty(llvm_); }
+
+
+// §28.2 / §28.6: the struct index of every class's disposed flag — fixed at 1,
+// right after the vtable pointer (index 0) and before all data fields. Uniform
+// across the hierarchy and across generic specializations, so the shared
+// generated Dispose accesses it correctly on any instance.
+unsigned Emitter::disposedFlagIndex(const sema::TypeSymbol* /*t*/) {
+    return 1u;
 }
 
 
