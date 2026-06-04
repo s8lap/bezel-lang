@@ -333,6 +333,63 @@ const char* kSplitRoundTrip =
     "  end Main; "
     "end C;";
 
+// §9.6 Split(char): the char overload allocates one part string per segment
+// (rc=1), like the string overload. Same conservative-leak status: the array and
+// its element strings are collection-held and deferred — value + no-corruption,
+// NOT LSan-clean. "a,bb,ccc".Split(',') -> 1+2+3 = 6. The cardinal point: the
+// fresh part allocations are not corrupted / double-freed.
+const char* kSplitCharRoundTrip =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var parts: Array<string> := \"a,bb,ccc\".Split(','); "
+    "    var total: int := 0; "
+    "    var i: int := 0; "
+    "    while i < parts.Count do "
+    "      total := total + parts[i].Length; "
+    "      i := i + 1; "
+    "    end; "
+    "    return total; "             // 6
+    "  end Main; "
+    "end C;";
+
+// §9.6 (static) Repeat(c, count): allocates a fresh +1 string. Here the result
+// is bound to a non-escaping local that is only READ (.Length) — it does not
+// escape, but it is initialized by a CALL (not a codegen-internal +1 producer),
+// so per the conservative escape policy it is LEFT leaked rather than released.
+// Value + no-corruption: the allocation is intact and never double-freed. Uses a
+// 1000-byte allocation (large enough that a corrupt write would likely fault),
+// then returns 0 iff the length is exactly 1000 (exit codes are 8-bit, so the
+// length itself can't be returned directly).
+const char* kRepeatStaticUsed =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var s: string := string.Repeat('x', 1000); "
+    "    return (0 if s.Length = 1000 else 1); "  // 0
+    "  end Main; "
+    "end C;";
+
+// §3.1 StringBuilder mutators allocate a fresh part on each call (the flattened
+// result). The builder is `using var` (disposed at scope end); ToString allocates
+// the final string. Old parts are conservatively leaked (the builder does not
+// retain/own its parts — matching Append/Clear). The decisive guard: repeatedly
+// mutating in a loop must NOT corrupt or double-free any part. Value +
+// no-corruption (a bounded per-iteration leak is tolerated). Returns 0.
+const char* kStringBuilderMutateLoop =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var sb := new StringBuilder(); "
+    "    sb.Append(\"start\"); "
+    "    var i: int := 0; "
+    "    while i < 500 do "
+    "      sb.Insert(0, \"<\"); "
+    "      sb.Replace(\"<\", \">\"); "
+    "      sb.Remove(0, 1); "
+    "      i := i + 1; "
+    "    end; "
+    "    return (0 if sb.ToString() = \"start\" else 1); "
+    "  end Main; "
+    "end C;";
+
 // §28.8: an alias `var b := a` shares the same string reference. With this
 // increment `a` escapes (it is bound into `b`) so it is NOT released, and `b`'s
 // initializer is an identifier (not a +1 producer) so it is NOT released
@@ -499,6 +556,21 @@ BEZEL_TEST(codegen_string_refcount_422, field_stored_string_no_uaf_28_9) {
 
 BEZEL_TEST(codegen_string_refcount_422, split_round_trip_no_uaf_4_6) {
     expectValueAndNoCorruption(kSplitRoundTrip, 6);
+}
+
+BEZEL_TEST(codegen_string_refcount_422, split_char_round_trip_no_uaf_9_6) {
+    // §9.6 Split(char): per-part allocations intact, no corruption/double-free.
+    expectValueAndNoCorruption(kSplitCharRoundTrip, 6);
+}
+
+BEZEL_TEST(codegen_string_refcount_422, repeat_static_used_no_uaf_9_6) {
+    // §9.6 (static) Repeat(c, count): the fresh allocation is intact and usable.
+    expectValueAndNoCorruption(kRepeatStaticUsed, 0);
+}
+
+BEZEL_TEST(codegen_string_refcount_422, stringbuilder_mutate_loop_no_uaf_3_1) {
+    // §3.1 mutators in a loop: no part is corrupted or double-freed.
+    expectValueAndNoCorruption(kStringBuilderMutateLoop, 0);
 }
 
 BEZEL_TEST(codegen_string_refcount_422, alias_shared_freed_once_no_double_free_28_8) {

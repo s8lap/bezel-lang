@@ -452,12 +452,47 @@ void bz_box_release(void* b);
 void* bz_string_split(const char* s, int64_t s_len,
                        const char* delim, int64_t delim_len);
 
+// per §9.6 Compare(a, b, ignoreCase: bool): int — ordinal string comparison
+// over code points (width-1/byte mode). Returns negative/0/positive like the
+// 2-arg form. When `ignore_case` is non-zero, each byte is compared under its
+// simple ASCII case-folded form (tolower), per §9.6's note that ignoreCase
+// comparison is ordinal case-folding with no culture tailoring. Either pointer
+// may be null (a null string compares as empty: null==null is 0, null<non-empty).
+int32_t bz_string_compare(const char* a, int64_t a_len,
+                          const char* b, int64_t b_len, int32_t ignore_case);
+
+// per §9.6 Split(separators: Array<char>): owned Array<string>. Splits `s` at
+// every position where ONE OF the `nsep` code points in `seps` occurs (each
+// separator is a single code point — the §9.6 char-set overload). A run of two
+// adjacent separators yields an empty segment between them, matching the
+// single-string Split's "no coalescing" behaviour. Returns a bz_array_t* of
+// bz.string* (each a fresh +1 producer); the caller (owned result) disposes it.
+void* bz_string_split_anychar(const char* s, int64_t s_len,
+                              const int32_t* seps, int64_t nsep);
+
 // StringBuilder helper — concatenates an array of bz.string pointers.
 // Caller must free *out_data with free() after use.
 // ---------------------------------------------------------------------------
 void bz_strbuilder_to_string(void* parts_arr,  // bz_array_t* of bz.string ptrs
                               char** out_data,
                               int64_t* out_len);
+
+// ---------------------------------------------------------------------------
+// StringBuilder mutators (§3.1). A StringBuilder is a bz_array_t* of bz.string*
+// parts; its logical content is the concatenation of those parts. Each mutator
+// flattens the current parts to one buffer, applies the operation, and resets
+// the parts array to a single fresh +1 string part. The old part pointers are
+// left as-is (the builder does not retain/own its parts — matching Append and
+// Clear, which never release them; a leak is tolerated, a double-free is not).
+// Each is a no-op on out-of-range arguments that would read out of bounds; the
+// index/length conventions match the §9.6 String forms.
+//   Insert(index, value): insert `value` (as bytes) at code-point `index`.
+//   Remove(startIndex, length): delete `length` code points from `startIndex`.
+//   Replace(oldValue, newValue): replace every occurrence of `oldValue`.
+// `value`/`oldValue`/`newValue` are bz.string* (may be a literal/global).
+void bz_sb_insert(void* parts_arr, int64_t index, const void* value);
+void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length);
+void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value);
 
 // ---------------------------------------------------------------------------
 // per §32.5/§32.6: re-encode a bz_string (layout {ptr data, i64 len, i8 width})

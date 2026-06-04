@@ -230,6 +230,7 @@ set(BEZEL_TEST_SOURCES
     codegen/interpolated_string_test.cpp
     codegen/string_indexer_test.cpp
     codegen/string_methods_test.cpp
+    codegen/stringbuilder_methods_test.cpp
     codegen/string_for_in_test.cpp
     codegen/range_for_test.cpp
     codegen/lambda_test.cpp

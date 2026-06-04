@@ -1826,16 +1826,48 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         return newStr;
     }
 
-    // §9.6: Split(delimiter: string): Array<string> — splits self on delimiter.
-    // Returns an Array<string> of parts. Width=1 (ASCII/UTF-8 byte mode).
+    // §9.6: Split — two of the three overloads are lowered here:
+    //   Split(separator: char)   — split on a single code point
+    //   Split(separator: string) — split on a substring delimiter
+    // Both return owned Array<string>. Width=1 (ASCII/UTF-8 byte mode), matching
+    // bz_string_split/ToString. The Split(separators: Array<char>) overload is
+    // NOT yet lowered: it depends on Array<char>'s element storage being a
+    // contiguous i32 buffer, which interacts with pre-existing Array<char>
+    // read-path issues — deferred rather than risk a miscompile.
     if (method == "Split" && call.args.size() == 1 && call.args[0].value) {
-        llvm::Value* delim = lowerExpr(*call.args[0].value);
-        if (!delim) return nullptr;
-        // Emit via a runtime helper to keep IR compact.
-        auto* fn = declareC("bz_string_split", ptrTy(),
-                            {ptrTy(), ptrTy(), i64(), ptrTy(), i64()});
+        auto* argTy = ctx_.exprType(*call.args[0].value);
         llvm::Value* selfData = loadStringData(self);
         llvm::Value* selfLen  = loadStringLen(self);
+
+        // Split(separator: char): one separator code point. Reuse the any-char
+        // splitter with a single-element separator buffer on the stack.
+        if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+            argTy->primitive == sema::PrimitiveType::Char) {
+            llvm::Value* sepCh = lowerExpr(*call.args[0].value);
+            if (!sepCh) return nullptr;
+            if (!sepCh->getType()->isIntegerTy(32))
+                sepCh = builder_.CreateSExt(sepCh, i32());
+            llvm::AllocaInst* sepSlot = entryAlloca(i32());
+            builder_.CreateStore(sepCh, sepSlot);
+            auto* fn = declareC("bz_string_split_anychar", ptrTy(),
+                                {ptrTy(), i64(), ptrTy(), i64()});
+            return builder_.CreateCall(
+                fn, {selfData, selfLen, sepSlot, builder_.getInt64(1)},
+                "split.char.result");
+        }
+
+        // Split(separator: string): substring delimiter. Guard the receiver
+        // type: only lower a genuine string argument here. A non-string, non-
+        // char argument (e.g. an Array<char> for the not-yet-supported set
+        // overload) must NOT reach loadStringData, which would mis-GEP a non-
+        // string value — fall through to nullptr (normal unsupported path).
+        if (!argTy || argTy->kind != sema::TypeRef::Kind::Primitive ||
+            argTy->primitive != sema::PrimitiveType::String)
+            return nullptr;
+        llvm::Value* delim = lowerExpr(*call.args[0].value);
+        if (!delim) return nullptr;
+        auto* fn = declareC("bz_string_split", ptrTy(),
+                            {ptrTy(), ptrTy(), i64(), ptrTy(), i64()});
         llvm::Value* delimData = loadStringData(delim);
         llvm::Value* delimLen  = loadStringLen(delim);
         return builder_.CreateCall(fn, {selfData, selfLen, delimData, delimLen},
