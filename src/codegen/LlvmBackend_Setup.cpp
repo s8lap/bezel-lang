@@ -1227,13 +1227,16 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         llvm::Value* val = builder_.CreateLoad(ptrTy(), addr);
         // #362 / stdlib §4.5: an owned collection field frees its backing and
         // cascades disposal into its class elements (for an owning collection).
-        // bz_array_free is null-safe, so no field null-check is needed here.
+        // bz_array_free / bz_llist_free are null-safe, so no field null-check needed.
         if (it->collTy) {
             llvm::Function* elemDisp = owningCollectionElemDisposer(it->collTy);
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
                 : llvm::ConstantPointerNull::get(ptrTy());
-            auto* fn = declareC("bz_array_free",
+            // per §4.6/§4.7: LinkedList fields free via bz_llist_free.
+            bool isLL = isLinkedListTypeName(it->collTy);
+            const char* freeName = isLL ? "bz_llist_free" : "bz_array_free";
+            auto* fn = declareC(freeName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {val, disp});
             continue;
@@ -2575,6 +2578,16 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // register a collection disposal. For an OWNING collection of class
     // elements the disposal cascades into the elements (the leak fixed here);
     // a borrowing collection or value elements free only the backing.
+    // per §4.6/§4.7: a `using var` LinkedList<T>/OwnedLinkedList<T>. Check BEFORE
+    // the array-backed collection path because isCollectionTypeName now excludes
+    // LinkedList (it is bz_llist_t-backed, not bz_array_t-backed).
+    if (const sema::TypeRef* llTy = linkedListTypeOfLocal(ld)) {
+        Disposal d{it->second, nullptr};
+        d.linkedList = true;
+        d.collectionElemDisposer = owningCollectionElemDisposer(llTy);
+        disposeStack_.back().push_back(d);
+        return;
+    }
     if (const sema::TypeRef* collTy = collectionTypeOfLocal(ld)) {
         if (isCollectionTypeName(collTy)) {
             Disposal d{it->second, nullptr};
@@ -2663,7 +2676,8 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
     // a borrow initializer (no `owned`) carries no disposal obligation; an
     // uninitialized/null/value-typed local has nothing to dispose.
     if (!ld->initializer) return nullptr;
-    if (collectionTypeOfLocal(ld) || dictTypeOfLocal(ld)) return nullptr;
+    if (collectionTypeOfLocal(ld) || dictTypeOfLocal(ld) ||
+        linkedListTypeOfLocal(ld)) return nullptr;
     if (ld->type && isSubscriptionType(ctx_.resolvedType(*ld->type)))
         return nullptr;
     if (isSubscriptionExpr(*ld->initializer)) return nullptr;
@@ -4103,6 +4117,26 @@ const sema::TypeRef* Emitter::collectionTypeOfLocal(const ast::LocalDecl* ld) {
 }
 
 
+// per §4.6/§4.7: recover a local's LinkedList<T>/OwnedLinkedList<T> TypeRef.
+const sema::TypeRef* Emitter::linkedListTypeOfLocal(const ast::LocalDecl* ld) {
+    if (ld->type) {
+        if (auto* rt = ctx_.resolvedType(*ld->type))
+            if (isLinkedListTypeName(rt)) return rt;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+        if (ne->type) {
+            if (auto* rt = ctx_.resolvedType(*ne->type))
+                if (isLinkedListTypeName(rt)) return rt;
+        }
+    }
+    if (ld->initializer) {
+        if (auto* rt = ctx_.exprType(*ld->initializer))
+            if (isLinkedListTypeName(rt)) return rt;
+    }
+    return nullptr;
+}
+
+
 const sema::TypeRef* Emitter::dictTypeOfLocal(const ast::LocalDecl* ld) {
     // #394: recover a local's resolved Dictionary/OwnedDictionary TypeRef (with
     // generic args). Mirrors collectionTypeOfLocal but recognizes the dict
@@ -4307,6 +4341,24 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {tbl, disp});
+            continue;
+        }
+        // per §4.6/§4.7: a `using var` LinkedList<T> / OwnedLinkedList<T>.
+        // Free the node chain via bz_llist_free; for an OwnedLinkedList<T> of
+        // class elements the element-disposer thunk cascades disposal into each
+        // (non-null) element exactly once (same owningCollectionElemDisposer
+        // pattern as OwnedArray — but on the node value pointer, not an array slot).
+        if (it->linkedList) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* list = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* disp = it->collectionElemDisposer
+                ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_llist_free",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {list, disp});
             continue;
         }
         // §6.1 / §30.8: a `using var` CancellationTokenSource. Dispose via

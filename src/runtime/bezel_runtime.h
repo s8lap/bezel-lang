@@ -92,6 +92,62 @@ void* bz_array_ptr_at(void* arr, int64_t idx, int64_t elem_size);
 void bz_array_reserve(void* arr, int64_t elem_size, int64_t cap);
 
 // ---------------------------------------------------------------------------
+// bz_llist_t — doubly-linked list used by LinkedList<T> and OwnedLinkedList<T>.
+// stdlib §4.6 / §4.7.  Node layout: { prev*, next*, value[elem_size] }.
+// List layout: { head*, tail*, count }.  All pointers are opaque to Bezel code.
+// Elements are stored inline in each node (same elem_size model as bz_array_t).
+// For OwnedLinkedList<T> pass a non-null dispose_elem; for LinkedList<T> pass null.
+// ---------------------------------------------------------------------------
+
+// Allocate an empty list. elem_size = bytes per element value stored inline.
+void* bz_llist_alloc(int64_t elem_size);
+
+// Return the number of elements in the list.
+int64_t bz_llist_count(void* list);
+
+// Prepend a new node (copies elem_size bytes from `elem`). Returns the new node*.
+void* bz_llist_add_first(void* list, const void* elem, int64_t elem_size);
+
+// Append a new node. Returns the new node*.
+void* bz_llist_add_last(void* list, const void* elem, int64_t elem_size);
+
+// Insert a new node before `node`. Returns the new node*.
+void* bz_llist_add_before(void* list, void* node, const void* elem, int64_t elem_size);
+
+// Insert a new node after `node`. Returns the new node*.
+void* bz_llist_add_after(void* list, void* node, const void* elem, int64_t elem_size);
+
+// Remove and free the first node. If dispose_elem is non-null, calls it on the element first.
+void bz_llist_remove_first(void* list, void (*dispose_elem)(void*));
+
+// Remove and free the last node. If dispose_elem is non-null, calls it on the element first.
+void bz_llist_remove_last(void* list, void (*dispose_elem)(void*));
+
+// Remove and free a specific node (unlinks from list). Calls dispose_elem if non-null.
+void bz_llist_remove_node(void* list, void* node, void (*dispose_elem)(void*));
+
+// Find the first node whose element bytes equal `elem` (using memcmp). Returns null if not found.
+void* bz_llist_find(void* list, const void* elem, int64_t elem_size);
+
+// Return the head node (or null if empty).
+void* bz_llist_first_node(void* list);
+
+// Return the tail node (or null if empty).
+void* bz_llist_last_node(void* list);
+
+// Return a pointer to the element bytes stored inline in `node`.
+void* bz_llist_node_value_ptr(void* node);
+
+// Return the next node (or null if at tail).
+void* bz_llist_node_next(void* node);
+
+// Return the previous node (or null if at head).
+void* bz_llist_node_prev(void* node);
+
+// Free all nodes (calling dispose_elem on each element if non-null) and the list struct.
+void bz_llist_free(void* list, void (*dispose_elem)(void*));
+
+// ---------------------------------------------------------------------------
 // bz_dict_t — open-addressing hash table used by Dictionary<K,V>.
 // Two variants: string keys (most common) and generic keys (via fn pointers).
 // Values are stored as raw `void*` (the Bezel object pointer or boxed scalar).

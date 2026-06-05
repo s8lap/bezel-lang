@@ -1177,6 +1177,15 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     return builder_.CreateTrunc(builder_.CreateLoad(i64(), sumSlot), i32());
                 }
             }
+            // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T>.Count via bz_llist_count.
+            if (isLinkedListTypeName(tt)) {
+                llvm::Value* obj = lowerExpr(*ma->target);
+                if (obj) {
+                    auto* fn = declareC("bz_llist_count", i64(), {ptrTy()});
+                    llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
+                    return builder_.CreateTrunc(cnt64, i32(), "ll.cnt");
+                }
+            }
             if (isCollectionTypeName(tt)) {
                 // issues #343 / D8 / §4.10: a Set is dict-backed (records,
                 // primitives, AND strings — see lowerNew), so its Count comes
@@ -1202,6 +1211,68 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
                     llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
                     return builder_.CreateTrunc(cnt64, i32(), "dict.cnt");
+                }
+            }
+        }
+    }
+    // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T> node-returning properties
+    // (FirstNode, LastNode, First, Last) and LinkedListNode<T> accessor
+    // properties (Value, Next, Previous).
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) {
+            auto* tt = ctx_.exprType(*ma->target);
+            bool isLL = isLinkedListTypeName(tt);
+            // LinkedList<T> node properties.
+            if (isLL && (ma->member == "FirstNode" || ma->member == "LastNode" ||
+                         ma->member == "First" || ma->member == "Last")) {
+                llvm::Value* list = lowerExpr(*ma->target);
+                if (!list) return nullptr;
+                int64_t esz = collectionElemSize(tt);
+                llvm::Type* elemLLTy = i32();
+                if (tt && !tt->genericArgs.empty() && tt->genericArgs[0])
+                    elemLLTy = lowerTypeRef(tt->genericArgs[0]);
+                if (ma->member == "FirstNode" || ma->member == "LastNode") {
+                    const char* fn = ma->member == "FirstNode"
+                        ? "bz_llist_first_node" : "bz_llist_last_node";
+                    auto* f = declareC(fn, ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(f, {list}, "ll.nodeptr");
+                }
+                // First / Last: return the value of the first/last node (T).
+                // If list is empty this is undefined — same as Array.First() on empty.
+                {
+                    const char* fn = ma->member == "First"
+                        ? "bz_llist_first_node" : "bz_llist_last_node";
+                    auto* nodeF = declareC(fn, ptrTy(), {ptrTy()});
+                    llvm::Value* nodePtr = builder_.CreateCall(nodeF, {list}, "ll.fnode");
+                    auto* valF = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+                    llvm::Value* valPtr = builder_.CreateCall(valF, {nodePtr}, "ll.vptr");
+                    return builder_.CreateLoad(elemLLTy, valPtr, "ll.val");
+                }
+            }
+            // LinkedListNode<T> accessor properties.
+            bool isNode = (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                           !tt->declaration && tt->astNode && tt->astNode->name &&
+                           !tt->astNode->name->parts.empty() &&
+                           tt->astNode->name->parts[0] == "LinkedListNode");
+            if (isNode) {
+                llvm::Value* nodePtr = lowerExpr(*ma->target);
+                if (!nodePtr) return nullptr;
+                if (ma->member == "Value") {
+                    // elem type is the first generic arg.
+                    llvm::Type* elemLLTy2 = ptrTy();
+                    if (tt && !tt->genericArgs.empty() && tt->genericArgs[0])
+                        elemLLTy2 = lowerTypeRef(tt->genericArgs[0]);
+                    auto* valF = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+                    llvm::Value* vp = builder_.CreateCall(valF, {nodePtr}, "nd.vptr");
+                    return builder_.CreateLoad(elemLLTy2, vp, "nd.val");
+                }
+                if (ma->member == "Next") {
+                    auto* f = declareC("bz_llist_node_next", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(f, {nodePtr}, "nd.next");
+                }
+                if (ma->member == "Previous") {
+                    auto* f = declareC("bz_llist_node_prev", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(f, {nodePtr}, "nd.prev");
                 }
             }
         }
@@ -2625,11 +2696,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         {builder_.getInt64((int64_t)ksz), hashT, eqT});
                 }
             }
+            // per §4.6/§4.7: LinkedList/OwnedLinkedList use the real doubly-linked-
+            // list runtime (bz_llist_alloc), not the bz_array_t backing. The
+            // elem_size argument tells the runtime how many bytes to store inline
+            // in each node — same sizing as bz_array_t (4 for int/float, 8 otherwise).
+            if (colName == "LinkedList" || colName == "OwnedLinkedList") {
+                auto* allocFn = declareC("bz_llist_alloc", ptrTy(), {i64()});
+                return builder_.CreateCall(allocFn, {builder_.getInt64(elemSize)});
+            }
             if (colName == "Array" || colName == "OwnedArray" ||
                 colName == "Stack" || colName == "OwnedStack" ||
                 colName == "Queue" || colName == "OwnedQueue" ||
-                colName == "Set" || colName == "OwnedSet" ||
-                colName == "LinkedList" || colName == "OwnedLinkedList") {
+                colName == "Set" || colName == "OwnedSet") {
                 auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
                 return builder_.CreateCall(allocFn,
                     {builder_.getInt64(elemSize), builder_.getInt64(16)});

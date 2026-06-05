@@ -49,7 +49,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "Stack" || n == "OwnedStack" ||
         n == "Queue" || n == "OwnedQueue" ||
         n == "Set" || n == "OwnedSet" ||
-        n == "LinkedList" || n == "OwnedLinkedList") {
+        n == "LinkedList" || n == "OwnedLinkedList" ||
+        // §4.6: LinkedListNode<T> is the node handle returned by Add*/Find; it
+        // carries a single generic element-type parameter and is resolved
+        // without a user TypeDecl (same pattern as the collection types above).
+        n == "LinkedListNode") {
         return 1;
     }
     // §3 stdlib two-parameter collection types (arity 2):

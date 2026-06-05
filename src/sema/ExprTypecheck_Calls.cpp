@@ -742,6 +742,60 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Add/Push/Enqueue/Set/RemoveAt/Clear → unit (void)
                     }
+                    // per §4.6/§4.7: LinkedList<T> / OwnedLinkedList<T> node-based API.
+                    // AddFirst/AddLast/AddBefore/AddAfter return LinkedListNode<T>.
+                    // Find returns LinkedListNode<T>? (nullable).
+                    // FirstNode/LastNode properties return LinkedListNode<T>?.
+                    // First/Last return T? (nullable element).
+                    // RemoveFirst/RemoveLast/RemoveNode → unit.
+                    if ((colName == "LinkedList" || colName == "OwnedLinkedList") &&
+                        recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                        auto* elemTy = recvTy->genericArgs[0];
+                        // Helper: make a LinkedListNode<T> TypeRef (non-null borrow).
+                        auto makeNodeTy = [&]() -> TypeRef* {
+                            auto* nt = ctx_.makeTypeRef();
+                            nt->kind = TypeRef::Kind::Named;
+                            nt->nullable = false;
+                            // Build an ast::Type for "LinkedListNode<T>" so
+                            // codegen can identify the node type by name.
+                            // We don't copy the inner element's astNode —
+                            // codegen only needs the top-level name.
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("LinkedListNode");
+                            ann->name.reset(nm);
+                            nt->astNode = ann;
+                            // Forward the element TypeRef as a generic arg.
+                            nt->genericArgs.push_back(elemTy);
+                            return nt;
+                        };
+                        auto makeNullableNodeTy = [&]() -> TypeRef* {
+                            auto* nt = makeNodeTy();
+                            nt->nullable = true;
+                            return nt;
+                        };
+                        if (m == "AddFirst" || m == "AddLast" ||
+                            m == "AddBefore" || m == "AddAfter") {
+                            ctx_.setExprType(&ce, makeNodeTy());
+                        } else if (m == "Find") {
+                            ctx_.setExprType(&ce, makeNullableNodeTy());
+                        } else if (m == "Remove" && ce.args.size() == 1) {
+                            // Remove(item: T): bool — per §4.6
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        }
+                        // First/Last value properties (T? — nullable element)
+                        // are property accesses, not call expressions — typed in
+                        // the member-access typechecker (ExprTypecheck_Calls.cpp
+                        // §2194 property section and LlvmBackend_Exprs.cpp).
+                    }
+                    // per §4.6: LinkedListNode<T> accessor methods / properties.
+                    if (colName == "LinkedListNode" &&
+                        recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                        // .Value: T — accessed as a property; typed in member handler.
+                        // .Next / .Previous: LinkedListNode<T>? — same.
+                        // No call-expression methods on the node type per §4.6.
+                    }
                     // Dictionary methods
                     if (colName == "Dictionary" || colName == "OwnedDictionary") {
                         if (m == "Count")
@@ -2222,6 +2276,86 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (ok) {
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+            }
+        }
+        // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T> node-returning properties
+        // (FirstNode, LastNode, First, Last) and LinkedListNode<T> accessor
+        // properties (Value, Next, Previous). None have user TypeSymbols, so the
+        // ordinary member-lookup path never types them.
+        if (ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            bool isBuiltinLL = tt && tt->kind == TypeRef::Kind::Named &&
+                !tt->declaration && tt->astNode && tt->astNode->name &&
+                !tt->astNode->name->parts.empty();
+            std::string_view llcn = isBuiltinLL
+                ? std::string_view(tt->astNode->name->parts[0]) : std::string_view{};
+
+            // LinkedList<T> / OwnedLinkedList<T> node properties.
+            if ((llcn == "LinkedList" || llcn == "OwnedLinkedList") &&
+                !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                auto* elemTy = tt->genericArgs[0];
+                const auto& mbr = ma.member;
+
+                // Helper: build a LinkedListNode<T> TypeRef with the element type.
+                // Codegen only needs the top-level name; we forward elemTy as the
+                // generic arg in the TypeRef, not via the astNode's genericArgs.
+                auto makeNodeTy = [&](bool nullable) -> TypeRef* {
+                    auto* nt = ctx_.makeTypeRef();
+                    nt->kind = TypeRef::Kind::Named;
+                    nt->nullable = nullable;
+                    auto* ann = new ast::Type();
+                    ann->kind = ast::TypeKind::Named;
+                    auto* nm  = new ast::QualifiedName();
+                    nm->parts.push_back("LinkedListNode");
+                    ann->name.reset(nm);
+                    nt->astNode = ann;
+                    nt->genericArgs.push_back(elemTy);
+                    return nt;
+                };
+                auto makeNullableElemTy = [&]() -> TypeRef* {
+                    auto* et = ctx_.makeTypeRef();
+                    *et = *elemTy;
+                    et->nullable = true;
+                    return et;
+                };
+
+                if (mbr == "FirstNode" || mbr == "LastNode") {
+                    // returns LinkedListNode<T>? (null when empty)
+                    ctx_.setExprType(&ma, makeNodeTy(/*nullable=*/true));
+                    return;
+                }
+                if (mbr == "First" || mbr == "Last") {
+                    // returns T? (null when empty)
+                    ctx_.setExprType(&ma, makeNullableElemTy());
+                    return;
+                }
+            }
+
+            // LinkedListNode<T> accessor properties: Value, Next, Previous.
+            if (llcn == "LinkedListNode" &&
+                !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                auto* elemTy = tt->genericArgs[0];
+                const auto& mbr = ma.member;
+                if (mbr == "Value") {
+                    ctx_.setExprType(&ma, elemTy);
+                    return;
+                }
+                if (mbr == "Next" || mbr == "Previous") {
+                    // returns LinkedListNode<T>? — a nullable node borrow.
+                    // Use makeNodeTy(nullable=true) pattern from above.
+                    auto* nt = ctx_.makeTypeRef();
+                    nt->kind = TypeRef::Kind::Named;
+                    nt->nullable = true;
+                    auto* ann = new ast::Type();
+                    ann->kind = ast::TypeKind::Named;
+                    auto* nm  = new ast::QualifiedName();
+                    nm->parts.push_back("LinkedListNode");
+                    ann->name.reset(nm);
+                    nt->astNode = ann;
+                    nt->genericArgs.push_back(elemTy);
+                    ctx_.setExprType(&ma, nt);
                     return;
                 }
             }

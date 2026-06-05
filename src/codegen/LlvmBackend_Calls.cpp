@@ -298,11 +298,23 @@ bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
     auto n = rt->astNode->name->parts[0];
+    // per §4.6/§4.7: LinkedList/OwnedLinkedList are NOT array-backed — they
+    // use bz_llist_t. Exclude them here so they route through their own
+    // tryLowerLinkedListInstanceCall handler rather than the bz_array_* paths.
     return n == "Array" || n == "OwnedArray" ||
            n == "Stack" || n == "OwnedStack" ||
            n == "Queue" || n == "OwnedQueue" ||
-           n == "Set" || n == "OwnedSet" ||
-           n == "LinkedList" || n == "OwnedLinkedList";
+           n == "Set" || n == "OwnedSet";
+}
+
+// per §4.6 / §4.7: true for LinkedList<T> and OwnedLinkedList<T> (bz_llist_t-backed).
+bool Emitter::isLinkedListTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    auto n = rt->astNode->name->parts[0];
+    return n == "LinkedList" || n == "OwnedLinkedList";
 }
 
 
@@ -4613,6 +4625,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // collection path so they intercept LINQ calls on both Array<T> receivers
     // and lazy IEnumerable<T> receivers (chaining).
     if (auto* v = tryLowerLazyLinqCall(call)) return v;
+    // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T> node-based API.
+    if (auto* v = tryLowerLinkedListInstanceCall(call)) return v;
     // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
@@ -4993,6 +5007,18 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                         builder_.CreateCall(fn, {recv,
                             llvm::ConstantPointerNull::get(ptrTy())});
+                    } else if (isLinkedListTypeName(recvTy)) {
+                        // per §4.6/§4.7: LinkedList<T>.Dispose() → bz_llist_free.
+                        // OwnedLinkedList<T> cascades disposal into class elements
+                        // (same owningCollectionElemDisposer pattern as OwnedArray).
+                        llvm::Function* elemDisp =
+                            owningCollectionElemDisposer(recvTy);
+                        llvm::Value* disp = elemDisp
+                            ? llvm::cast<llvm::Value>(elemDisp)
+                            : llvm::ConstantPointerNull::get(ptrTy());
+                        auto* fn = declareC("bz_llist_free",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                        builder_.CreateCall(fn, {recv, disp});
                     } else if (isCollectionTypeName(recvTy)) {
                         // #362 / stdlib §4.5: explicit Dispose() on an owning
                         // collection cascades disposal into its class elements;
@@ -6661,6 +6687,200 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     if (m == "Reverse" && call.args.empty()) {
         auto* revFn = declareC("bz_lazy_reverse", ptrTy(), {ptrTy()});
         return builder_.CreateCall(revFn, {src}, "linq.reverse");
+    }
+    return nullptr;
+}
+
+
+// ---------------------------------------------------------------------------
+// per §4.6/§4.7: LinkedList<T> / OwnedLinkedList<T> node-based API codegen.
+// The runtime is bz_llist_t (doubly-linked list of inline-value nodes).
+// A LinkedListNode<T> Bezel value is a raw ptr to bz_llist_node_t; `.Value`
+// loads the inline bytes; `.Next`/`.Previous` follow the pointer chain.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+
+    auto* recvTy = ctx_.exprType(*ma->target);
+
+    // -----------------------------------------------------------------------
+    // LinkedListNode<T> property accessor lowerings (syntactically a call-expr
+    // when the parser sees node.Next or node.Value — or a member-access expr;
+    // handled here for safety).  In practice these are MemberAccessExprs, not
+    // CallExprs, so this block likely won't fire — but guard anyway.
+    // -----------------------------------------------------------------------
+    // (The real work for node properties is in lowerExpr's MemberAccessExpr
+    // handling below.  tryLowerLinkedListInstanceCall handles CALL forms.)
+
+    // -----------------------------------------------------------------------
+    // LinkedList<T> / OwnedLinkedList<T> method lowerings.
+    // -----------------------------------------------------------------------
+    if (!isLinkedListTypeName(recvTy)) return nullptr;
+
+    // Element size for this instantiation.
+    int64_t esz = collectionElemSize(recvTy);
+    bool isOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    recvTy->astNode->name->parts[0] == "OwnedLinkedList";
+
+    llvm::Value* recv = lowerExpr(*ma->target);
+    if (!recv) return nullptr;
+
+    // Element LLVM type (for loading values from nodes).
+    llvm::Type* elemLLTy = i32();
+    if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+        elemLLTy = lowerTypeRef(recvTy->genericArgs[0]);
+
+    // --- AddFirst(item): LinkedListNode<T> ---
+    if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_add_first", ptrTy(),
+                            {ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)},
+                                   "ll.addFirst");
+    }
+    // --- AddLast(item): LinkedListNode<T> ---
+    if (m == "AddLast" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_add_last", ptrTy(),
+                            {ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)},
+                                   "ll.addLast");
+    }
+    // --- AddBefore(node, item): LinkedListNode<T> ---
+    if (m == "AddBefore" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* node = lowerExpr(*call.args[0].value);
+        llvm::Value* v    = lowerExpr(*call.args[1].value);
+        if (!node || !v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_add_before", ptrTy(),
+                            {ptrTy(), ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn,
+            {recv, node, slot, builder_.getInt64(esz)}, "ll.addBefore");
+    }
+    // --- AddAfter(node, item): LinkedListNode<T> ---
+    if (m == "AddAfter" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* node = lowerExpr(*call.args[0].value);
+        llvm::Value* v    = lowerExpr(*call.args[1].value);
+        if (!node || !v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_add_after", ptrTy(),
+                            {ptrTy(), ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn,
+            {recv, node, slot, builder_.getInt64(esz)}, "ll.addAfter");
+    }
+    // --- RemoveFirst() ---
+    if (m == "RemoveFirst" && call.args.empty()) {
+        llvm::Function* elemDisp =
+            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_llist_remove_first", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, disp});
+        return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- RemoveLast() ---
+    if (m == "RemoveLast" && call.args.empty()) {
+        llvm::Function* elemDisp =
+            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_llist_remove_last", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, disp});
+        return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- RemoveNode(node) ---
+    if (m == "RemoveNode" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* node = lowerExpr(*call.args[0].value);
+        if (!node) return nullptr;
+        llvm::Function* elemDisp =
+            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_llist_remove_node", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {recv, node, disp});
+        return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- Find(item): LinkedListNode<T>? ---
+    // Find by memcmp (value equality for primitives/records; pointer identity
+    // for class types — per §8.3 / §4.6 the class node value IS the pointer).
+    if (m == "Find" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* fn = declareC("bz_llist_find", ptrTy(),
+                            {ptrTy(), ptrTy(), i64()});
+        return builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)},
+                                   "ll.find");
+    }
+    // --- Count (no-arg call form, e.g. l.Count()) → int ---
+    if (m == "Count" && call.args.empty()) {
+        auto* fn = declareC("bz_llist_count", i64(), {ptrTy()});
+        llvm::Value* cnt = builder_.CreateCall(fn, {recv}, "ll.cnt");
+        return builder_.CreateTrunc(cnt, i32(), "ll.cnt.i32");
+    }
+    // --- Clear() --- disposes all elements (OwnedLinkedList) and frees all
+    // nodes, then re-allocates an empty list. Simplest: remove all from front.
+    // We implement by calling bz_llist_free then re-alloc would break existing
+    // pointer. Instead: walk and free each node via remove_first repeatedly.
+    // Cleanest: add bz_llist_clear to runtime. For now, implement as a loop.
+    if (m == "Clear" && call.args.empty()) {
+        llvm::Function* elemDisp =
+            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        // Loop: while (first_node != null) remove_first.
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "ll.clr.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ll.clr.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "ll.clr.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+        llvm::Value* firstNode = builder_.CreateCall(firstFn, {recv}, "ll.first");
+        llvm::Value* notNull = builder_.CreateICmpNE(
+            firstNode, llvm::ConstantPointerNull::get(ptrTy()), "ll.notNull");
+        builder_.CreateCondBr(notNull, bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        auto* remFn = declareC("bz_llist_remove_first",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(remFn, {recv, disp});
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- Contains(item): bool — find by value equality, return true if found ---
+    if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        auto* findFn = declareC("bz_llist_find", ptrTy(),
+                                {ptrTy(), ptrTy(), i64()});
+        llvm::Value* node = builder_.CreateCall(findFn,
+            {recv, slot, builder_.getInt64(esz)}, "ll.find");
+        return builder_.CreateICmpNE(
+            node, llvm::ConstantPointerNull::get(ptrTy()), "ll.has");
     }
     return nullptr;
 }
