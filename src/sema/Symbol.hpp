@@ -78,6 +78,15 @@ struct TypeSymbol : Symbol {
     // genericArgs[0]=int). Used by override-signature checking to
     // apply the concrete substitution before comparing types.
     std::vector<TypeRef*> baseTypeRefs;
+    // §2.5 / §2.6 / §6.1 / §28 (issue #434): true for the synthetic builtin
+    // TypeSymbol objects that represent VALUE types — DateTime, TimeSpan, Guid,
+    // CancellationToken. These are scalar/struct types with no heap allocation and
+    // no disposal obligation. They carry kind==Class so that the sema and codegen
+    // paths that inspect class-typed member accesses continue to work unchanged;
+    // only the ownership checker consults this flag to suppress the §28.3 owned-
+    // local obligation that would otherwise be inferred from kind==Class. Owned
+    // builtins (CancellationTokenSource, Array, Dictionary, …) leave this false.
+    bool isValueBuiltin = false;
 };
 
 // A.2 TypeAliasDecl — its target type is resolved by Type Resolution.

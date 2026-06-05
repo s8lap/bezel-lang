@@ -692,9 +692,29 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
                 if (rt->kind == sema::TypeRef::Kind::Named &&
                     rt->declaration &&
-                    rt->declaration->kind != ast::TypeDeclKind::Class &&
-                    rt->declaration->kind != ast::TypeDeclKind::Interface) {
+                    (rt->declaration->kind != ast::TypeDeclKind::Class &&
+                     rt->declaration->kind != ast::TypeDeclKind::Interface)) {
                     return OwnershipState::Borrowed;  // value type: no obligation
+                }
+                // §2.5 / §2.6 / §6.1 / §28 (issue #434): builtin value types
+                // (DateTime, TimeSpan, Guid, CancellationToken) carry
+                // isValueBuiltin=true when the TypeSymbol was created via
+                // builtinClassSym. When TypeResolution found the name in the
+                // builtinTypeArity table it leaves declaration null and the name
+                // is on the ast::Type node; check both paths. // per §28
+                if (rt->kind == sema::TypeRef::Kind::Named) {
+                    // Path A: declaration set by ExprTypecheck (builtinClassSym).
+                    if (rt->declaration && rt->declaration->isValueBuiltin)
+                        return OwnershipState::Borrowed;
+                    // Path B: TypeResolution left declaration null; read the
+                    // type name from the ast::Type to recognise value builtins.
+                    if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                        rt->astNode->name->parts.size() == 1) {
+                        std::string_view n = rt->astNode->name->parts[0];
+                        if (n == "DateTime" || n == "TimeSpan" ||
+                            n == "Guid"     || n == "CancellationToken")
+                            return OwnershipState::Borrowed;
+                    }
                 }
             }
         }

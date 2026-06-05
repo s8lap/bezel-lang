@@ -67,6 +67,11 @@ void ExprTC::run(const ast::SourceFile& src) {
 }
 
 // Return (or lazily create) a synthetic TypeSymbol for a built-in class.
+// §2.5 / §2.6 / §6.1 / §28 (issue #434): value-type builtins (DateTime,
+// TimeSpan, Guid, CancellationToken) carry isValueBuiltin=true so the
+// ownership checker treats them as non-owned (no §28.3 disposal obligation).
+// All other builtins (CancellationTokenSource, Encoding, …) keep the default
+// isValueBuiltin=false and remain owned/reference-typed.
 TypeSymbol* ExprTC::builtinClassSym(std::string_view name) {
     auto key = std::string(name);
     auto it = builtinClassCache_.find(key);
@@ -75,6 +80,12 @@ TypeSymbol* ExprTC::builtinClassSym(std::string_view name) {
     ts->kind = ast::TypeDeclKind::Class;
     ts->name = name;
     ts->decl = nullptr;
+    // per §2.5 / §2.6 / §6.1 / §28 (issue #434): scalar/struct value types
+    // have no heap allocation and no disposal obligation.
+    if (name == "DateTime" || name == "TimeSpan" ||
+        name == "Guid"     || name == "CancellationToken") {
+        ts->isValueBuiltin = true;
+    }
     builtinClassCache_[key] = ts;
     return ts;
 }
