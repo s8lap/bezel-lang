@@ -184,6 +184,34 @@ double  bz_random_next_double(void* r);
 void    bz_random_next_bytes(void* r, uint8_t* buf, int64_t len);
 
 // ---------------------------------------------------------------------------
+// Guid (stdlib §2.6) — 128-bit globally unique identifier.
+// Layout: two uint64_t fields (lo, hi) — a 16-byte value type. All functions
+// take pointers to bz_guid_t so the value can be passed without LLVM ABI
+// pain. ToString returns a heap-allocated bz_string (rc := 1, caller owns).
+// ---------------------------------------------------------------------------
+
+typedef struct { uint64_t lo; uint64_t hi; } bz_guid_t;
+
+// Fill *g with a random v4 UUID (RFC 4122).
+void bz_guid_new(bz_guid_t* g);
+
+// Return a heap-allocated bz_string* (rc := 1) with the canonical 36-char
+// lowercase dashed form "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+void* bz_guid_to_string(const bz_guid_t* g);
+
+// Parse the canonical 36-char dashed form from a bz_string*. Returns 1 on
+// success (writes *out), 0 on failure (leaves *out unchanged).
+int32_t bz_guid_try_parse(const void* str, bz_guid_t* out);
+
+// Parse the canonical form; abort/unreachable on failure (caller guarantees
+// well-formed input — used by Guid.Parse where failure is an exception).
+// Returns 1 on success, 0 on parse failure (codegen emits a trap on 0).
+int32_t bz_guid_parse(const void* str, bz_guid_t* out);
+
+// Bytewise equality: returns 1 if *a == *b, 0 otherwise.
+int32_t bz_guid_equals(const bz_guid_t* a, const bz_guid_t* b);
+
+// ---------------------------------------------------------------------------
 // DateTime / TimeSpan (100-ns ticks since 0001-01-01 00:00:00 UTC,
 // matching the Bezel spec §2.5 which follows .NET DateTime semantics)
 // ---------------------------------------------------------------------------

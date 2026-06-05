@@ -634,6 +634,111 @@ void bz_random_next_bytes(void* rp, uint8_t* buf, int64_t len) {
 }
 
 // ---------------------------------------------------------------------------
+// Guid (stdlib §2.6) — 128-bit globally unique identifier.
+// Representation: { uint64_t lo, uint64_t hi } (matches LLVM { i64, i64 }).
+// NewGuid fills bytes from /dev/urandom and stamps RFC 4122 v4 version/variant
+// bits.  ToString produces the canonical 36-char lowercase dashed form.
+// Parse / TryParse accept exactly that form.
+// ---------------------------------------------------------------------------
+
+// bz_string_hdr: layout must match stringType() in LlvmBackend_impl.hpp.
+// { ptr data, i64 len, i8 width, i64 rc } = { char*, int64_t, uint8_t, int64_t }.
+// The rc field is at field-index 3 (offset 24 on LP64). BZ_GUID_STRING_RC_INIT is
+// the "producer holds one reference" value (§4.6 runtime-managed lifetime).
+typedef struct { char* data; int64_t len; uint8_t width; int64_t rc; } bz_string_hdr;
+static const int64_t BZ_GUID_STRING_RC_INIT = 1;
+
+void bz_guid_new(bz_guid_t* g) {
+    // Fill 16 random bytes from /dev/urandom (available on all POSIX systems
+    // including Linux/Fedora 43). getrandom(2) would be slightly better but
+    // would require a conditional #include inside a function which is not
+    // permitted; /dev/urandom is always suitable for GUID generation.
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (f) { (void)fread(g, 1, 16, f); fclose(f); }
+    // Stamp RFC 4122 v4 version/variant bits.
+    // Byte 6 (7th byte from start): version nibble = 0100 (4).
+    // Byte 8 (9th byte from start): variant bits = 10xx.
+    uint8_t* b = (uint8_t*)g;
+    b[6] = (b[6] & 0x0F) | 0x40;   // version 4
+    b[8] = (b[8] & 0x3F) | 0x80;   // variant 10xx
+}
+
+void* bz_guid_to_string(const bz_guid_t* g) {
+    // Canonical form: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars).
+    // The 16 bytes are laid out in the standard UUID field order.
+    const uint8_t* b = (const uint8_t*)g;
+    char* buf = (char*)malloc(37);  // 36 + NUL
+    snprintf(buf, 37,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0], b[1], b[2], b[3],
+        b[4], b[5],
+        b[6], b[7],
+        b[8], b[9],
+        b[10], b[11], b[12], b[13], b[14], b[15]);
+    // Build a bz_string header wrapping the buffer.
+    bz_string_hdr* s = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+    s->data  = buf;
+    s->len   = 36;
+    s->width = 1;
+    s->rc    = BZ_GUID_STRING_RC_INIT;  // producer's reference (§4.6)
+    return s;
+}
+
+// Helper: decode two lowercase hex chars at pos, return the byte value
+// or -1 on non-hex input.
+static int guid_parse_hex_byte(const char* s) {
+    auto hd = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    int hi = hd(s[0]); int lo = hd(s[1]);
+    if (hi < 0 || lo < 0) return -1;
+    return (hi << 4) | lo;
+}
+
+// Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" (exactly 36 chars, dashes at
+// positions 8, 13, 18, 23).  Returns 1 on success, 0 on format error.
+static int32_t guid_parse_str(const char* s, int64_t len, bz_guid_t* out) {
+    if (len != 36) return 0;
+    if (s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-') return 0;
+    uint8_t bytes[16];
+    // group 1: 8 hex chars → bytes 0-3
+    const int offsets[16][2] = {
+        {0,2},{2,2},{4,2},{6,2},
+        {9,2},{11,2},
+        {14,2},{16,2},
+        {19,2},{21,2},
+        {24,2},{26,2},{28,2},{30,2},{32,2},{34,2}
+    };
+    for (int i = 0; i < 16; i++) {
+        int v = guid_parse_hex_byte(s + offsets[i][0]);
+        if (v < 0) return 0;
+        bytes[i] = (uint8_t)v;
+    }
+    memcpy(out, bytes, 16);
+    return 1;
+}
+
+int32_t bz_guid_try_parse(const void* str, bz_guid_t* out) {
+    const bz_string_hdr* s = (const bz_string_hdr*)str;
+    if (!s || !s->data) return 0;
+    return guid_parse_str(s->data, s->len, out);
+}
+
+int32_t bz_guid_parse(const void* str, bz_guid_t* out) {
+    int32_t ok = bz_guid_try_parse(str, out);
+    // On failure, zero the output (codegen traps via a separate check).
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
+}
+
+int32_t bz_guid_equals(const bz_guid_t* a, const bz_guid_t* b) {
+    return a->lo == b->lo && a->hi == b->hi ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // DateTime — .NET compatible tick epoch (0001-01-01 00:00:00 UTC)
 // POSIX epoch is 1970-01-01 00:00:00 UTC = tick 621355968000000000
 // ---------------------------------------------------------------------------

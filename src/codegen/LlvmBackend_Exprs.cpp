@@ -987,6 +987,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 if (id2->name == "CancellationToken" && ma->member == "None") {
                     return llvm::ConstantPointerNull::get(ptrTy());
                 }
+                // stdlib §2.6: Guid.Empty — the all-zero Guid (static readonly property).
+                if (id2->name == "Guid" && ma->member == "Empty") {
+                    return llvm::ConstantAggregateZero::get(guidStructType());
+                }
             }
         }
     }
