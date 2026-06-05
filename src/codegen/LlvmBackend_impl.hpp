@@ -507,18 +507,19 @@ private:
         staticGlobals_;
 
     // CG17: virtual dispatch. Each class's vtable is a constant array of
-    // function pointers: slot 0 is Dispose, slots 1+ are virtual methods
-    // (an override reuses its base method's slot). The hidden vtable
+    // function pointers: [0]=td$C, [1]=itmap$C, [2]=Dispose, [3..]=virtual
+    // methods (override reuses the base method's slot). The hidden vtable
     // pointer lives at instance struct index 0.
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*> vtables_;
     std::unordered_map<const sema::MethodSymbol*, unsigned> vtableSlot_;
     // §8.6: per-boxable-value-type box vtable. A boxed value type (record /
     // enum) is a heap wrapper `{ vtable*, value-bytes… }`; its first word
     // points to this vtable so `emitIsA` (`*obj` → vtable, `vtable[0]` →
-    // descriptor array) recognizes it uniformly with a class instance, and
-    // interface dispatch on a boxed record indexes `vtable[ifaceSlot]`. The
-    // vtable layout matches a class vtable's prefix: [descArray, Dispose,
-    // iface-slots…]; the descriptor (vtable[0]) is the type's descArray_ entry.
+    // descriptor array) recognizes it uniformly with a class instance. The
+    // vtable layout matches the class vtable prefix:
+    //   [0]=td, [1]=itmap, [2]=Dispose
+    // Interface dispatch on a boxed record goes through bz_itable_lookup.
+    // The descriptor (vtable[0]) is the type's descArray_ entry.
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         boxVtable_;
     // §8.6: per-primitive box descriptor + vtable (int/bool/string/… have no
@@ -527,20 +528,32 @@ private:
     // word every box carries at offset 0. Keyed by the primitive's name.
     std::unordered_map<std::string, llvm::GlobalVariable*> primBoxDesc_;
     std::unordered_map<std::string, llvm::GlobalVariable*> primBoxVtable_;
-    // Per-class slot→method (vector index i = vtable slot i+1; slot 0 is
-    // Dispose) and the virtual-method-name→slot map used to inherit slots.
+    // Per-class slot→method (vector index i = vtable slot i+3; slots 0..2 are
+    // td$, itmap$, Dispose) and the virtual-method-name→slot map used to
+    // inherit slots.
     std::unordered_map<const sema::TypeSymbol*,
                        std::vector<sema::MethodSymbol*>> vtableMethods_;
     std::unordered_map<const sema::TypeSymbol*,
                        std::unordered_map<std::string_view, unsigned>>
         vtableNameSlot_;
-    // CG35: interface method dispatch. Every interface method gets a fixed
-    // vtable slot in [2, 2+G); each implementing class fills that slot with
-    // its implementation, so a call through an interface-typed value indexes
-    // the runtime object's vtable at the interface method's slot. Class
-    // virtual-method slots follow at [2+G, …).
-    std::unordered_map<const sema::MethodSymbol*, unsigned> ifaceMethodSlot_;
-    unsigned ifaceSlotCount_ = 0;
+    // CG35-itable (§13 / §12): per-interface itable dispatch. For each
+    // interface method `ms`, ifaceMethodIndex_[ms] is its 0-based position in
+    // the interface's non-static method declaration order. This index is used
+    // to GEP into `itab$C$I` (the per-(class×interface) itable). The old
+    // dense shared-slot region (ifaceMethodSlot_ / ifaceSlotCount_) has been
+    // replaced with per-interface itables: vtable[1] = itmap$C (a
+    // null-terminated [ td$I, itab$C$I, … ] array); dispatch calls the
+    // runtime helper bz_itable_lookup(itmap, td$I) → itab$C$I, then GEPs
+    // to position k within the itable to find the function pointer.
+    std::unordered_map<const sema::MethodSymbol*, unsigned> ifaceMethodIndex_;
+    // Per (class × interface): the itab$C$I global (array of fn ptrs in
+    // interface declaration order). Key: (cls, iface).
+    std::map<std::pair<const sema::TypeSymbol*, const sema::TypeSymbol*>,
+             llvm::GlobalVariable*>
+        itables_;
+    // Per class: the itmap$C global ([td$I1, itab$C$I1, …, null]).
+    std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
+        itmaps_;
     // CG19: per-type runtime descriptor (class AND interface) — a
     // null-terminated array of pointers to the descriptor globals of this
     // type plus all its transitive base types. A type's identity is its

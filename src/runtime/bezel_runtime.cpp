@@ -2417,6 +2417,22 @@ extern "C" void bz_box_release(void* b) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// CG35-itable / §13: per-interface itable lookup.
+// `itmap` points to a null-terminated flat array
+//   [ td*I1, itab*I1, td*I2, itab*I2, ..., NULL ]
+// stored in vtable[1] of every class/box vtable. Walk pairs until a td*
+// matches `iface_td` and return the adjacent itab* pointer. For a
+// well-typed Bezel program this always succeeds (the implementing class
+// must have the interface in its itmap); returning NULL here is unreachable.
+extern "C" void** bz_itable_lookup(void** itmap, void* iface_td) {
+    if (!itmap) return nullptr;
+    for (void** p = itmap; *p; p += 2) {
+        if (p[0] == iface_td) return (void**)p[1];
+    }
+    return nullptr;  // unreachable for a typed program
+}
+
 // per §33.3 / §22.13 (line 3845): the runtime's interception point for an
 // exception that escapes Main with no enclosing handler. Codegen emits a call to
 // this from Main's top-level no-handler propagation block (in place of the old

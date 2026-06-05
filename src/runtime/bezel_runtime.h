@@ -520,6 +520,18 @@ void* bz_encoding_utf8_get_bytes(const void* str);
 void* bz_encoding_utf8_get_string(void* bytes, int64_t index, int64_t count);
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Per-interface itable lookup (CG35-itable, §13 / §12 interface dispatch).
+// Scans the null-terminated flat map `itmap` stored in vtable[1]:
+//   [ td*I1, itab*I1, td*I2, itab*I2, ..., NULL ]
+// Returns the itab* whose td* == iface_td, or NULL (unreachable for a typed
+// program — every implementing class has the interface in its itmap).
+// The itab is a constant array of function pointers in interface-declaration
+// order; callers GEP into it by method index. No allocation: returns an
+// interior pointer into the static global itmap.
+void** bz_itable_lookup(void** itmap, void* iface_td);
+
+// ---------------------------------------------------------------------------
 // per §33.3 / §22.13 (line 3845): abnormal-termination handler for an exception
 // that escapes Main with no enclosing handler. §33.3 reserves exit code 0 for
 // NORMAL completion (and for a legitimate `return 0`); §22.13 distinguishes
