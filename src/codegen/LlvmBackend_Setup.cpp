@@ -655,6 +655,31 @@ void Emitter::declareVtables() {
                 ifaceMethodIndex_[ms] = idx++;
         }
     }
+    // §13 / §2.5 / §2.6 (issue #426 / #328): populate ifaceMethodIndex_ for
+    // IMPORTED interfaces too. A cross-module interface call (either on an
+    // imported object or through an imported interface type held by the importer)
+    // reaches the dispatch path in LlvmBackend_Calls.cpp with ms->parent being an
+    // imported TypeSymbol. Pass 0 above only walked ctx_.symbols() (local types),
+    // so ifaceMethodIndex_.find(ms) would return end() and dispatch would silently
+    // bail. Mirror the same 0-based positional scheme over the imported interface's
+    // non-static members, in the order the loader reconstructed them (which mirrors
+    // the exporter's declaration order — the loader preserves member order). The
+    // importer thus computes the SAME index k the exporter stored in its itab$C$I,
+    // letting bz_itable_lookup + GEP(itab, k) reach the correct function pointer.
+    // Imported symbols live in a separate list (ctx_.importedSymbols()), so the
+    // local Pass 0 loop never touched them; this is the only place they are indexed.
+    if (ctx_.hasImports()) {
+        for (sema::Symbol* sym : ctx_.importedSymbols()) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);
+            if (!ts || ts->kind != ast::TypeDeclKind::Interface) continue;
+            unsigned idx = 0;
+            for (sema::Symbol* m : ts->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && !isStaticMethod(ms))
+                    ifaceMethodIndex_[ms] = idx++;
+            }
+        }
+    }
     // Pass A: assign vtable slots for all classes (base-first).
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
@@ -668,10 +693,10 @@ void Emitter::declareVtables() {
     // §12) and base chain — both reconstructed by the loader — so it computes the
     // SAME slot numbering the exporter used, provided neither module introduces
     // interface slots into the shared region (a cross-module interface-dispatch
-    // limitation that predates this change; class-virtual dispatch — the item-2
-    // soundness fix — is correct). No vtable GLOBAL is emitted for an imported
-    // type (Pass D below iterates only local symbols); the importer installs the
-    // EXTERNAL `vt$<Type>` via the exporter's bz$<Type>$init.
+    // limitation superseded by the ifaceMethodIndex_ fix above; class-virtual
+    // dispatch — the item-2 soundness fix — is also correct). No vtable GLOBAL is
+    // emitted for an imported type (Pass D below iterates only local symbols); the
+    // importer installs the EXTERNAL `vt$<Type>` via the exporter's bz$<Type>$init.
     if (ctx_.hasImports()) {
         for (sema::Symbol* sym : ctx_.importedSymbols()) {
             auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);

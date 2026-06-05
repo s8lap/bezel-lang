@@ -1465,4 +1465,193 @@ BEZEL_TEST(cross_module_import, local_derives_imported_base_dispose_chain_spec_2
     BEZEL_EXPECT_EQ(code, 11);
 }
 
+// --- Cross-module interface dispatch (§13 / §2.5 / §2.6, issue #426 / #328) --
+//
+// Three scenarios verify the two cross-module itable cases:
+//
+//  1. Interface call on an IMPORTED object: the object's class + its itab$/itmap$
+//     live in the dependency. The importer needs only `td$I` (external) and
+//     `ifaceMethodIndex_[ms]` (populated from imported interface members). The
+//     runtime bz_itable_lookup follows the vt[1] pointer in the exporter's vtable.
+//
+//  2. Local class implements an IMPORTED interface: the local class emits its own
+//     itab$Local$I + itmap$Local referencing the external td$I. ifaceMethodIndex_
+//     must be populated for imported interface methods (same positional scheme).
+//
+//  3. Interface inheritance across the boundary: A defines I1, I2 : I1; B
+//     dispatches calls through both I1 and I2 typed references.
+
+// §13 / §2.5 / §2.6 (issue #426 case 1): interface call on an IMPORTED object.
+// Module A defines `public interface IShape { method Area(): int; }` and
+// `public class Square : IShape { Area => 16 }`. Module B imports A, constructs
+// a Square, holds it through an IShape-typed reference, and calls Area() via
+// interface dispatch. The dispatch must follow A's vt[1]=itmap$ chain and arrive
+// at Square.Area → 16.
+BEZEL_TEST(cross_module_import, interface_call_on_imported_object_spec_13) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_iface1_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module ShapeLib; "
+        "public interface IShape "
+        "  method Area(): int; "
+        "end IShape; "
+        "public class Square : IShape "
+        "  public method Area(): int => 16; "
+        "  destructor end destructor; "
+        "end Square;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import ShapeLib; "
+        "public class Program "
+        "  public static method GetArea(s: IShape): int => s.Area(); "
+        "  public static method Main(): int "
+        "    using var sq := new Square(); "
+        "    return GetArea(sq); "  // interface dispatch on imported object -> 16
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Run three times for determinism (interface dispatch is pointer-based;
+    // any non-determinism in symbol resolution would show as non-42 exit).
+    for (int run = 0; run < 3; ++run) {
+        int status = std::system(bExe.path.c_str());
+        int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+        BEZEL_EXPECT_EQ(code, 16);
+    }
+}
+
+// §13 / §2.5 / §2.6 (issue #426 case 2): local class implements an IMPORTED
+// interface. Module A defines `public interface IShape { method Area(): int; }`.
+// Module B defines a local `class Local : IShape { Area => 42 }`, dispatches
+// through an IShape-typed reference → 42. B's codegen must emit itab$Local$IShape
+// (referencing the external td$IShape from A) and bz_itable_lookup must find it.
+BEZEL_TEST(cross_module_import, local_class_implements_imported_interface_spec_13) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_iface2_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module ILib; "
+        "public interface IShape "
+        "  method Area(): int; "
+        "end IShape;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import ILib; "
+        "public class Local : IShape "
+        "  public method Area(): int => 42; "
+        "  destructor end destructor; "
+        "end Local; "
+        "public class Program "
+        "  public static method Measure(s: IShape): int => s.Area(); "
+        "  public static method Main(): int "
+        "    using var loc := new Local(); "
+        "    return Measure(loc); "  // interface dispatch through imported I -> 42
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    for (int run = 0; run < 3; ++run) {
+        int status = std::system(bExe.path.c_str());
+        int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+        BEZEL_EXPECT_EQ(code, 42);
+    }
+}
+
+// §13 / §2.5 / §2.6 (issue #426 case 3): interface inheritance across the module
+// boundary. Module A defines `public interface IBase { method Base(): int; }` and
+// `public interface IDerived : IBase { method Derived(): int; }`. A also supplies
+// a class `Impl` that implements both. Module B imports A, holds an `Impl` through
+// IBase and IDerived typed references, and dispatches both methods. The combined
+// return Base() * 10 + Derived() must equal 1*10+2=12.
+BEZEL_TEST(cross_module_import, interface_inheritance_across_boundary_spec_13) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_iface3_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module MultiLib; "
+        "public interface IBase "
+        "  method Base(): int; "
+        "end IBase; "
+        "public interface IDerived : IBase "
+        "  method Derived(): int; "
+        "end IDerived; "
+        "public class Impl : IDerived "
+        "  public method Base(): int => 1; "
+        "  public method Derived(): int => 2; "
+        "  destructor end destructor; "
+        "end Impl;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import MultiLib; "
+        "public class Program "
+        "  public static method CallBase(b: IBase): int => b.Base(); "
+        "  public static method CallDerived(d: IDerived): int => d.Derived(); "
+        "  public static method Main(): int "
+        "    using var impl := new Impl(); "
+        "    var b := CallBase(impl); "    // interface dispatch via IBase -> 1
+        "    var d := CallDerived(impl); " // interface dispatch via IDerived -> 2
+        "    return b * 10 + d; "          // 12
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    for (int run = 0; run < 3; ++run) {
+        int status = std::system(bExe.path.c_str());
+        int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+        BEZEL_EXPECT_EQ(code, 12);
+    }
+}
+
 }  // namespace bezel::module
