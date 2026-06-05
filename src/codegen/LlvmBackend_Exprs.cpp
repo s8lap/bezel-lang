@@ -2532,7 +2532,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // CG17: install the vtable pointer (instance slot 0) before field
     // initializers / the constructor, so virtual dispatch on the new
     // object resolves to its own class.
-    if (llvm::GlobalVariable* vt = vtableOf(t)) {
+    //
+    // §28.5: for a generic instantiation whose class has an `owned` type-
+    // parameter field (`private owned _slot: T`), install the PER-INSTANTIATION
+    // vtable instead of the shared `vt$<T>`. Its slot-1 Dispose disposes that
+    // field, classified by the concrete substituted type of THIS instantiation
+    // (§28.4 step 2 / §28.5); the shared, type-erased disposer cannot, because
+    // the concrete T — and even the field's pointer-vs-value layout — varies per
+    // instantiation. specializedVtableFor falls back to the shared vtable when no
+    // specialization is needed. genericSubst_ is active here (set above).
+    if (llvm::GlobalVariable* vt = specializedVtableFor(t)) {
         builder_.CreateStore(vt, builder_.CreateStructGEP(st, obj, 0));
     }
 
