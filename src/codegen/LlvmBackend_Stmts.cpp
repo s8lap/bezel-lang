@@ -310,13 +310,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
         return lowerCaseStmt(*cs);
     }
-    // §29.3: yield return / yield break inside an iterator method.
+    // §29.3: yield return / yield break inside an iterator method. This is the
+    // `Yield` suspend point: it spills the suspend-locals into the shared
+    // state-machine frame, transitions the state index, and returns from
+    // MoveNext. The frame plumbing (smStateStruct_/smSelf_/smAllocaToField_/
+    // smStateGEP_/smStateBBs_/smNextSuspendState_) is the kind-agnostic
+    // scaffolding from LlvmBackend_Iterators.cpp; the value-producing pieces
+    // (current_val store, ret true/false) are yield-specific. The §30 `await`
+    // suspend point (Phase 2b) reuses the same spill/restore + state-index
+    // machinery here with await-specific suspend/resume actions (register a
+    // task continuation, return the in-progress Task; resume reads the result).
     if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (iterStateStruct_ && iterSelf_) {
-            // Save all iterator locals to the state struct before yielding.
-            for (auto& [allocaSlot, fieldIdx] : iterAllocaToField_) {
+        if (smStateStruct_ && smSelf_ && smKind_ == SuspendKind::Yield) {
+            // Save all suspend-locals to the state frame before yielding.
+            for (auto& [allocaSlot, fieldIdx] : smAllocaToField_) {
                 llvm::Value* fptr = builder_.CreateStructGEP(
-                    iterStateStruct_, iterSelf_, fieldIdx);
+                    smStateStruct_, smSelf_, fieldIdx);
                 llvm::Value* curVal = builder_.CreateLoad(
                     allocaSlot->getAllocatedType(), allocaSlot);
                 builder_.CreateStore(curVal, fptr);
@@ -324,7 +333,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
 
             if (ys->isBreak) {
                 // yield break: set state=-1, return false.
-                builder_.CreateStore(builder_.getInt32(-1), iterStateGEP_);
+                builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
                 builder_.CreateRet(builder_.getFalse());
                 return true;
             }
@@ -337,21 +346,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         v = builder_.CreateTrunc(v, iterElemTy_);
                     if (v->getType() == iterElemTy_) {
                         llvm::Value* cvField = builder_.CreateStructGEP(
-                            iterStateStruct_, iterSelf_, iterCurrentValField_);
+                            smStateStruct_, smSelf_, iterCurrentValField_);
                         builder_.CreateStore(v, cvField);
                     }
                 }
             }
-            unsigned nextState = ++iterNextYieldState_;
-            builder_.CreateStore(builder_.getInt32((int)nextState), iterStateGEP_);
+            unsigned nextState = ++smNextSuspendState_;
+            builder_.CreateStore(builder_.getInt32((int)nextState), smStateGEP_);
             builder_.CreateRet(builder_.getTrue());
             // Continue emitting code after this yield in the next state block.
-            if (nextState < iterStateBBs_.size()) {
-                builder_.SetInsertPoint(iterStateBBs_[nextState]);
+            if (nextState < smStateBBs_.size()) {
+                builder_.SetInsertPoint(smStateBBs_[nextState]);
                 // Restore all iterator locals from the state struct.
-                for (auto& [allocaSlot, fieldIdx] : iterAllocaToField_) {
+                for (auto& [allocaSlot, fieldIdx] : smAllocaToField_) {
                     llvm::Value* fptr = builder_.CreateStructGEP(
-                        iterStateStruct_, iterSelf_, fieldIdx);
+                        smStateStruct_, smSelf_, fieldIdx);
                     llvm::Value* savedVal = builder_.CreateLoad(
                         allocaSlot->getAllocatedType(), fptr);
                     builder_.CreateStore(savedVal, allocaSlot);
@@ -675,10 +684,10 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
 
     llvm::AllocaInst* slot = entryAlloca(lo->getType());
     // §29.3: in an iterator method, map the loop variable to a struct field.
-    if (iterStateStruct_ && iterSelf_) {
-        auto fit = iterLocalFields_.find(&fs);
-        if (fit != iterLocalFields_.end())
-            iterAllocaToField_[slot] = fit->second;
+    if (smStateStruct_ && smSelf_) {
+        auto fit = smLocalFields_.find(&fs);
+        if (fit != smLocalFields_.end())
+            smAllocaToField_[slot] = fit->second;
     }
     builder_.CreateStore(lo, slot);
     // Anchor on the ForStmt node — sema gave `lsym->decl = fs` so that
@@ -690,7 +699,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     // are uninitialized in resumed states (state≥1), causing the upper
     // bound to be garbage. Re-evaluating in condBB is correct because
     // all params/locals it depends on ARE restored from the state struct.
-    if (iterStateStruct_) {
+    if (smStateStruct_) {
         auto* condBB = llvm::BasicBlock::Create(llvm_, "for.cond", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "for.body", currentFn_);
         auto* incBB  = llvm::BasicBlock::Create(llvm_, "for.inc",  currentFn_);

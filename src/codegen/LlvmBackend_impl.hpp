@@ -1836,12 +1836,101 @@ private:
         return isCollectionTypeName(rt) ? rt : nullptr;
     }
 
-    // §29.3: Pre-scan iterator body to collect all LocalDecl/ForStmt nodes and
-    // their types. Returns {node, llvmType} pairs for all locals that need
-    // to survive across yield points (i.e., all locals in the body).
-    void collectIterLocals(
+    // ====================================================================
+    // Suspend/resume state-machine scaffolding (§29 iterators / §30 async).
+    //
+    // Phase 2a: this scaffolding is the machinery shared by BOTH suspending
+    // constructs in the language — `yield` (§29.3 iterator methods) and
+    // `await` (§30 async methods). Both lower a method body into a state
+    // machine that suspends at a *suspend point*, spilling the locals that
+    // are live across the suspension into a heap-allocated frame, and resumes
+    // by restoring them and branching on a saved state index. The pieces that
+    // differ per construct (what a suspend point *does* — produce a value and
+    // return `true` for `yield`, vs. register a continuation on a task and
+    // return for `await`; and the surrounding driver shape — an
+    // IEnumerator<T> with MoveNext/Current vs. a Task<T> with continuations)
+    // are layered on top of the kind-agnostic scaffolding below.
+    //
+    // §30 (`Await`) is NOT yet emitted: `SuspendKind::Await` exists as the
+    // seam where the async path plugs in (see the Phase 2b plan). The iterator
+    // (`Yield`) path is byte-for-behavior identical to before this extraction.
+    // ====================================================================
+
+    // Which suspending construct the in-flight state machine lowers.
+    enum class SuspendKind { Yield, Await };
+
+    // Layout of a suspend/resume frame (the heap struct a suspended method
+    // spills into). Field order, kind-independent:
+    //   [0] vtable        — driver dispatch table (IEnumerator<T> vtable for
+    //                       `Yield`; the async path decides its own slot 0 use)
+    //   [1] state         — i32 resume index (0 = entry, k = after k-th
+    //                       suspend point, -1 = done)
+    //   [2 .. ]           — captures: `this` (instance methods) then params
+    //   [.. ]             — body locals live across a suspend point
+    //   [last]            — `Yield` only: the current yielded value (`T`)
+    struct StateMachineFrame {
+        llvm::StructType* structTy = nullptr;
+        // Captures (this + params) to spill at construction / restore on
+        // resume. {nullptr, ptrTy()} is the `this` capture; others carry the
+        // ParameterSymbol so the resume path can rebind a slot for it.
+        std::vector<std::pair<sema::Symbol*, llvm::Type*>> captures;
+        // Body locals (LocalDecl / ForStmt-loop-var nodes) that survive a
+        // suspend point, with their lowered types.
+        std::vector<std::pair<const ast::Node*, llvm::Type*>> bodyLocals;
+        unsigned vtableField = 0;
+        unsigned stateField = 1;
+        unsigned captureStart = 2;
+        unsigned localStart = 0;   // captureStart + captures.size()
+        // `Yield` only: index of the `current_val` field (unused for `Await`).
+        unsigned currentValField = 0;
+        // Maps a body-local AST node → its frame field index.
+        std::unordered_map<const ast::Node*, unsigned> localFields;
+    };
+
+    // Pre-scan a method body to collect all LocalDecl/ForStmt nodes and their
+    // types — the locals that must survive across a suspend point (a `yield`
+    // or, for async, an `await`). Returns {node, llvmType} pairs. Kind-
+    // agnostic: the conservative spill set is "every local in the body."
+    void collectSuspendLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
+
+    // Build the kind-agnostic frame layout for a state machine: compute the
+    // captures (this + params), the suspend-live body locals, assemble the
+    // LLVM struct type, and fill the AST-node→field-index map. `extraTrailing`
+    // are kind-specific trailing fields appended after the locals (for `Yield`
+    // this is the single `current_val` field of element type `T`); their first
+    // field index is recorded in `frame.currentValField`. `structName` names
+    // the emitted LLVM struct type.
+    StateMachineFrame buildStateMachineFrame(
+        sema::MethodSymbol* ms,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        llvm::ArrayRef<llvm::Type*> extraTrailing,
+        const std::string& structName);
+
+    // On the construction path (e.g. iterator GetEnumerator), store each
+    // capture (this + params) from the current function's bound slots into the
+    // freshly-allocated frame `st`. Requires `bindParameters` to have run so
+    // `paramSlots_`/`currentThis_` are populated. Kind-agnostic.
+    void emitFrameCaptureStores(const StateMachineFrame& frame, llvm::Value* st);
+
+    // On the resume path (e.g. iterator MoveNext entry), restore each capture
+    // from the frame `self` back into fresh slots: `this` into `currentThis_`,
+    // each param into a new alloca recorded in `paramSlots_`. Kind-agnostic.
+    void emitFrameCaptureRestores(const StateMachineFrame& frame,
+                                  llvm::Value* self);
+
+    // Emit the resume dispatch: a `done` block (returns the kind's "exhausted"
+    // value via `emitDone`), N+1 state blocks (entry + one per suspend point),
+    // and a switch on the saved state index that targets them. Returns the
+    // state blocks (index 0 is the entry block where body emission begins).
+    // `numSuspends` is the count of suspend points in the body. Sets the
+    // sm*_ members so the per-suspend-point spill/restore (lowerStmt) can run.
+    // Kind-agnostic; `emitDone` supplies the kind-specific exhausted-return.
+    std::vector<llvm::BasicBlock*> emitResumeDispatch(
+        const StateMachineFrame& frame, llvm::Value* self,
+        llvm::Value* stateGEP, unsigned numSuspends,
+        const std::function<void()>& emitDone);
 
     // §29.3: Detect if a block of statements contains any yield return / yield break.
     static bool containsYield(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
@@ -1850,30 +1939,39 @@ private:
     static void collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
                                std::vector<const ast::YieldStmt*>& out);
 
-    // §29.3: Emit an iterator method (one containing `yield return`).
-    // Creates:
-    //   - State struct: { ptr vtable, i32 state, param0..N, T current_val }
-    //   - MoveNext(ptr self): bool  — state machine body
+    // §29.3: Emit an iterator method (one containing `yield return`). Layers
+    // the yield-specific driver — IEnumerator<T> with MoveNext/Current/Dispose
+    // and an IEnumerator<T> vtable — on top of the kind-agnostic suspend/resume
+    // scaffolding above. Creates:
+    //   - State frame: { ptr vtable, i32 state, param0..N, locals..., T current_val }
+    //   - MoveNext(ptr self): bool  — state machine body (resume dispatch)
     //   - Current getter(ptr self): T
     //   - Dispose(ptr self): void   — no-op
-    //   - Module-level vtable for the anonymous IEnumerator<T> class
-    //   - The original function becomes GetEnumerator: allocs + fills struct, returns it
+    //   - Module-level IEnumerator<T> vtable
+    //   - The original function becomes GetEnumerator: allocs + fills frame, returns it
     void emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                              const CallableInfo& ci);
 
-    // Iterator state for the currently-emitting iterator MoveNext function.
-    llvm::StructType* iterStateStruct_ = nullptr;
-    llvm::Value* iterSelf_ = nullptr;
-    llvm::Value* iterStateGEP_ = nullptr;
-    std::vector<llvm::BasicBlock*> iterStateBBs_;
-    llvm::BasicBlock* iterDoneBB_ = nullptr;
+    // ---- Live suspend/resume state for the in-flight MoveNext / resume fn ----
+    // Kind-agnostic frame state. The per-suspend-point spill/restore
+    // (lowerStmt's YieldStmt handler, and — for 2b — the await lowering) reads
+    // these to spill `smAllocaToField_` slots into `smStateStruct_` before a
+    // suspension and restore them at the next state block. (Historically named
+    // iter*_; renamed to sm*_ in Phase 2a as the scaffolding is now shared.)
+    SuspendKind smKind_ = SuspendKind::Yield;
+    llvm::StructType* smStateStruct_ = nullptr;
+    llvm::Value* smSelf_ = nullptr;
+    llvm::Value* smStateGEP_ = nullptr;
+    std::vector<llvm::BasicBlock*> smStateBBs_;
+    llvm::BasicBlock* smDoneBB_ = nullptr;
+    unsigned smNextSuspendState_ = 0;
+    // Maps LocalDecl/ForStmt AST node → frame field index for suspend-locals.
+    std::unordered_map<const ast::Node*, unsigned> smLocalFields_;
+    // Maps alloca slot → frame field index (spill at suspend, restore at state entry).
+    std::unordered_map<llvm::AllocaInst*, unsigned> smAllocaToField_;
+    // ---- Yield-specific live state (used only when smKind_ == Yield) ----
     unsigned iterCurrentValField_ = 0;
-    unsigned iterNextYieldState_ = 0;
     llvm::Type* iterElemTy_ = nullptr;
-    // Maps LocalDecl/ForStmt AST node → struct field index for iterator locals.
-    std::unordered_map<const ast::Node*, unsigned> iterLocalFields_;
-    // Maps alloca slot → struct field index (for save at yield, restore at state entry).
-    std::unordered_map<llvm::AllocaInst*, unsigned> iterAllocaToField_;
 
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);
