@@ -4504,10 +4504,43 @@ void Emitter::setupBoxDescriptors() {
                     auto mit = methodFns_.find(impl);
                     if (mit != methodFns_.end()) {
                         llvm::Function* real = mit->second;
-                        llvm::FunctionType* fnTy = real->getFunctionType();
-                        // Build a thunk: box ptr → record bytes (+2 words).
+                        llvm::FunctionType* realFnTy = real->getFunctionType();
+                        // §10 / §8.6 / §13 / #435: box thunks adapt
+                        // interface dispatch (box ptr as `this`) to the
+                        // underlying method's calling convention.
+                        //
+                        // For RECORDS: `this` is a pointer to the bare
+                        // record bytes. The box is { vtable*, i64 rc,
+                        // record-bytes }; record bytes start two words in
+                        // (offset 16). The thunk GEPs past the two header
+                        // words and passes the resulting pointer.
+                        //
+                        // For ENUMS: `this` is the i32 enum value itself
+                        // (§10, CG30). The box stores the i32 at offset 16
+                        // (two words from the box base, same layout).
+                        // The thunk must LOAD the i32 from that slot and
+                        // pass it by value — a GEP with an i32 base is
+                        // malformed IR (IR verifier failure, #435).
+                        //
+                        // In both cases the thunk's external signature
+                        // (seen by the interface caller) has ptrTy() as the
+                        // first parameter, matching the interface method ABI.
+                        bool isEnumImpl =
+                            ts->kind == ast::TypeDeclKind::Enum;
+                        // Build the thunk's own function type: replace the
+                        // first param with ptrTy() (box pointer). Param
+                        // types 1..N are unchanged.
+                        std::vector<llvm::Type*> thunkParamTys;
+                        thunkParamTys.push_back(ptrTy());  // box ptr
+                        for (unsigned pi = 1;
+                             pi < realFnTy->getNumParams(); ++pi)
+                            thunkParamTys.push_back(
+                                realFnTy->getParamType(pi));
+                        auto* thunkFnTy = llvm::FunctionType::get(
+                            realFnTy->getReturnType(), thunkParamTys,
+                            /*isVarArg=*/false);
                         auto* thunk = llvm::Function::Create(
-                            fnTy, llvm::Function::InternalLinkage,
+                            thunkFnTy, llvm::Function::InternalLinkage,
                             "bz$boxthunk$" + std::string(ts->name) + "$" +
                                 std::string(im->name),
                             module_.get());
@@ -4516,16 +4549,30 @@ void Emitter::setupBoxDescriptors() {
                         llvm::IRBuilder<> tb(bb);
                         std::vector<llvm::Value*> callArgs;
                         auto ai = thunk->arg_begin();
-                        llvm::Value* recThis = tb.CreateGEP(
+                        // GEP to the value slot: box + 2 * sizeof(ptr) = +16.
+                        llvm::Value* valSlot = tb.CreateGEP(
                             ptrTy(), &*ai,
-                            {llvm::ConstantInt::get(i32(), 2)}, "boxthis");
-                        callArgs.push_back(recThis);
+                            {llvm::ConstantInt::get(i32(), 2)}, "box.valptr");
+                        if (isEnumImpl) {
+                            // §10 / #435: enum `this` is i32 by value —
+                            // load it from the box's value slot.
+                            llvm::Value* enumVal = tb.CreateLoad(
+                                i32(), valSlot, "box.enumval");
+                            callArgs.push_back(enumVal);
+                        } else {
+                            // Record: pass the pointer to the value slot
+                            // as the record `this`.
+                            callArgs.push_back(valSlot);
+                        }
                         ++ai;
                         for (; ai != thunk->arg_end(); ++ai)
                             callArgs.push_back(&*ai);
-                        llvm::Value* r = tb.CreateCall(fnTy, real, callArgs);
-                        if (fnTy->getReturnType()->isVoidTy()) tb.CreateRetVoid();
-                        else tb.CreateRet(r);
+                        llvm::Value* r = tb.CreateCall(realFnTy, real,
+                                                       callArgs);
+                        if (realFnTy->getReturnType()->isVoidTy())
+                            tb.CreateRetVoid();
+                        else
+                            tb.CreateRet(r);
                         fp = thunk;
                     }
                 }
