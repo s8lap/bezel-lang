@@ -482,10 +482,65 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     bool isStrBld = (recvTy && recvTy->astNode && recvTy->astNode->name &&
                      !recvTy->astNode->name->parts.empty() &&
                      recvTy->astNode->name->parts[0] == "StringBuilder");
-    if (!isArr && !isDict && !isStrBld) return nullptr;
 
-    llvm::Value* recv = lowerExpr(*ma->target);
+    // FINDING [5] / stdlib §5: an EAGER terminal LINQ operator (Count / Sum /
+    // Aggregate / Any / All / First / …) chained DIRECTLY onto a LAZY pipeline
+    // (Select/Where/Concat/TakeWhile/SkipWhile/Zip/SelectMany — each returns
+    // IEnumerable<T>). The terminal lowerings below read their source with
+    // bz_array_len/bz_array_ptr_at, which assume a CONCRETE bz_array_t*; a lazy
+    // enumerator (bz_lazy_t*) reports length 0, so the fold ran zero iterations
+    // and returned the empty-sequence result (0/false/garbage). Fix: when the
+    // receiver is a lazy IEnumerable<T> and the method is one of the
+    // array-consuming terminals, MATERIALIZE the pipeline into a concrete
+    // Array<T> (bz_lazy_to_array — the same drain ToArray uses, which disposes
+    // the enumerator and releases its inline-lambda closures), then run the
+    // existing array-based terminal over the materialized array. The temp array
+    // (a borrowing snapshot of the enumerated bytes — it owns no elements) is
+    // freed at the terminal's return with bz_array_free(arr, /*disposer=*/null).
+    bool lazyRecv = isLazyEnumerableType(recvTy);
+    bool isArrTerminal =
+        m == "Count" || m == "Sum" || m == "Aggregate" || m == "Average" ||
+        m == "Min" || m == "Max" || m == "First" || m == "Single" ||
+        m == "Last" || m == "ElementAt" || m == "Any" || m == "All" ||
+        m == "ForEach" || m == "Contains" || m == "IndexOf";
+    bool lazyTerminal = lazyRecv && isArrTerminal;
+
+    if (!isArr && !isDict && !isStrBld && !lazyTerminal) return nullptr;
+
+    // The materialized-array temp to free before the terminal returns its
+    // result (null unless we materialized a lazy receiver above).
+    llvm::Value* lazyTempArr = nullptr;
+    llvm::Value* recv = nullptr;
+    if (lazyTerminal) {
+        sema::TypeRef* elemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
+        if (!lazy) return nullptr;
+        // The materialized element byte size mirrors collectionElemSize: both
+        // read the element TypeRef (genericArgs[0]). The lazy sentinel carries
+        // it too, so collectionElemSize(recvTy) yields the same value the lazy
+        // operators used when they were built (matching bz_lazy_to_array's esz).
+        int64_t esz = collectionElemSize(recvTy);
+        auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+        recv = builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)},
+                                   "linq.term.mat");
+        lazyTempArr = recv;
+        isArr = true;  // route through the concrete-array terminal lowerings
+    } else {
+        recv = lowerExpr(*ma->target);
+    }
     if (!recv) return nullptr;
+
+    // Free the materialized lazy snapshot (no element disposal — it borrows).
+    // A no-op when the receiver was already a concrete collection. Emitted at
+    // each terminal's return site so the result value is computed (loaded) from
+    // the array BEFORE the backing buffer is released.
+    auto freeLazyTemp = [&]() {
+        if (!lazyTempArr) return;
+        auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn,
+            {lazyTempArr, llvm::ConstantPointerNull::get(ptrTy())});
+    };
 
     // -----------------------------------------------------------------------
     // Array / Stack / Queue / Set / LinkedList methods
@@ -685,6 +740,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phi->addIncoming(builder_.getFalse(), condBB);
             phi->addIncoming(builder_.getTrue(), bodyBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return phi;
         }
 
@@ -692,7 +748,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (m == "Any" && call.args.empty()) {
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            return builder_.CreateICmpSGT(len, builder_.getInt64(0), "any0.r");
+            llvm::Value* nonEmpty =
+                builder_.CreateICmpSGT(len, builder_.getInt64(0), "any0.r");
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            return nonEmpty;
         }
 
         // per §5 LINQ: .All(pred: (T)->bool): bool
@@ -728,6 +787,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phi->addIncoming(builder_.getTrue(), condBB);
             phi->addIncoming(builder_.getFalse(), bodyBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return phi;
         }
 
@@ -759,6 +819,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return llvm::ConstantInt::get(i32(), 0);
         }
 
@@ -799,6 +860,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return builder_.CreateLoad(i32(), cntSlot, "cnt.r");
         }
 
@@ -809,7 +871,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if ((m == "Length" || m == "Count") && call.args.empty()) {
             auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len64 = builder_.CreateCall(fn, {recv});
-            return builder_.CreateTrunc(len64, i32(), "arr.len");
+            llvm::Value* len32 = builder_.CreateTrunc(len64, i32(), "arr.len");
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            return len32;
         }
         // per §5 LINQ: .Sum(fn: (T)->int): int  /  .Sum(): int (for Array<int>)
         if (m == "Sum") {
@@ -845,6 +909,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return builder_.CreateLoad(i32(), accSlot, "sum.r");
         }
         // per §5 LINQ: .Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum)
@@ -891,6 +956,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(foldCl);  // #422: inline-lambda transient
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return builder_.CreateLoad(accTy, accSlot, "agg.r");
         }
         // per §5/§5.1 LINQ: .Average(fn: (T)->numeric): double  /  .Average(): double
@@ -950,6 +1016,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* total = builder_.CreateLoad(dblTy, accSlot, "avg.sum");
             llvm::Value* cnt = builder_.CreateSIToFP(len, dblTy, "avg.cnt");
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return builder_.CreateFDiv(total, cnt, "avg.r");
         }
         // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
@@ -1000,6 +1067,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return builder_.CreateLoad(i32(), accSlot, "mm.r");
         }
         // per §5 LINQ: .First(pred: (T)->bool): T  (throws if empty/not found)
@@ -1037,7 +1105,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
-            return builder_.CreateLoad(elemTy, resultSlot, "fst.r");
+            llvm::Value* fstv = builder_.CreateLoad(elemTy, resultSlot, "fst.r");
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            return fstv;
         }
         // per §5 LINQ element access (no-predicate forms): First()/Single()
         // return the first element; Last() returns the last; ElementAt(i)
@@ -1052,7 +1122,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                    {ptrTy(), i64(), ptrTy(), i64()});
             builder_.CreateCall(getFn,
                 {recv, builder_.getInt64(0), out, builder_.getInt64(esz)});
-            return builder_.CreateLoad(retTy, out, "fst.r");
+            llvm::Value* fstv = builder_.CreateLoad(retTy, out, "fst.r");
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            return fstv;
         }
         if (m == "Last" && call.args.empty()) {
             llvm::Type* retTy = getElemTy();
@@ -1063,7 +1135,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
                                    {ptrTy(), i64(), ptrTy(), i64()});
             builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
-            return builder_.CreateLoad(retTy, out, "lst.r");
+            llvm::Value* lstv = builder_.CreateLoad(retTy, out, "lst.r");
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            return lstv;
         }
         if (m == "ElementAt" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* idx = lowerExpr(*call.args[0].value);
@@ -1074,7 +1148,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
                                    {ptrTy(), i64(), ptrTy(), i64()});
             builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
-            return builder_.CreateLoad(retTy, out, "elemat.r");
+            llvm::Value* eav = builder_.CreateLoad(retTy, out, "elemat.r");
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            return eav;
         }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
 
@@ -1219,7 +1295,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phiIdx = builder_.CreatePHI(i64(), 2, "iof.r");
             phiIdx->addIncoming(result64, foundBB);
             phiIdx->addIncoming(builder_.getInt64(-1), condBB);
-            return builder_.CreateTrunc(phiIdx, i32(), "iof.i32");
+            llvm::Value* iofv = builder_.CreateTrunc(phiIdx, i32(), "iof.i32");
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            return iofv;
         }
         // per §5 LINQ: .Distinct() is LAZY — see tryLowerLazyLinqCall.
 
@@ -1510,8 +1588,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phiCon = builder_.CreatePHI(i1(), 2, "con.r");
             phiCon->addIncoming(builder_.getTrue(), foundBB);
             phiCon->addIncoming(builder_.getFalse(), condBB);
+            freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return phiCon;
         }
+
+        // FINDING [5]: if the receiver was a materialized lazy snapshot but no
+        // terminal handler above claimed the call (an arg shape we don't model),
+        // release the temp before deferring so it does not leak. A concrete-array
+        // receiver (lazyTempArr == null) falls through unchanged.
+        if (lazyTempArr) { freeLazyTemp(); return nullptr; }
     }
 
     // -----------------------------------------------------------------------

@@ -396,6 +396,51 @@ const char* kBorrowedPredicateLazyReuse =
     "  end Main; "
     "end C;";
 
+// FINDING [5] / stdlib §5: an EAGER terminal (Count) applied DIRECTLY to a LAZY
+// pipeline (Where with an inline predicate) is now correct — the terminal
+// MATERIALIZES the pipeline (bz_lazy_to_array), folds the snapshot, then frees
+// the snapshot array (bz_array_free, no element disposal). bz_lazy_to_array also
+// disposes the enumerator, releasing its inline-lambda predicate cell. Churned
+// 100000× ⇒ a large unmistakable leak if either the materialized array or the
+// predicate cell were not freed; LSan-clean after the fix. Where(x>1) over
+// {1,2,3,4} yields {2,3,4}, so Count() == 3. Returns 0 on match.
+const char* kLazyWhereThenCountChurn =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var a := new Array<int>(); "
+    "    a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+    "    var i: int := 0; var ok: int := 1; "
+    "    while i < 100000 do "
+    "      if a.Where((x) => x > 1).Count() <> 3 then ok := 0; end; "
+    "      i := i + 1; "
+    "    end; "
+    "    if ok = 1 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// FINDING [5]: a CHAINED lazy pipeline (Where then Select, two inline closures)
+// consumed by an eager terminal (Aggregate, its own inline fold). The
+// materialized snapshot array is freed at the terminal return; the Where and
+// Select inline-lambda cells are released at bz_lazy_dispose during
+// materialization; the eager fold cell is released at the terminal loop-end.
+// Churned 50000×; LSan-clean. Where(x>1)={2,3,4}; Select(*10)={20,30,40};
+// Aggregate(+) = 90. Returns 0 on match.
+const char* kLazyWhereSelectThenAggregateChurn =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var a := new Array<int>(); "
+    "    a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+    "    var i: int := 0; var ok: int := 1; "
+    "    while i < 50000 do "
+    "      var s: int := a.Where((x) => x > 1).Select((x) => x * 10)"
+    "                     .Aggregate(0, (acc: int, x: int) => acc + x); "
+    "      if s <> 90 then ok := 0; end; "
+    "      i := i + 1; "
+    "    end; "
+    "    if ok = 1 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // --- EAGER: inline-lambda transient released at the call-site loop-end ---
@@ -430,6 +475,23 @@ BEZEL_TEST(linq_refcount, lazy_orderby_toarray_inline_lambda_leak_free_spec_28_9
 
 BEZEL_TEST(linq_refcount, lazy_zip_nested_where_two_owned_closures_leak_free_spec_28_9) {
     expectValueAndLeakFree(kLazyZipNestedWhereToArrayChurn, 0);
+}
+
+// --- FINDING [5]: eager terminal applied DIRECTLY to a lazy pipeline. The
+//     terminal materializes the pipeline, folds, and frees the snapshot array;
+//     the lazy enumerator's inline-lambda closures are released at its dispose.
+//     Both must be leak-free; run the basic case 3× to stress the path. ---
+
+BEZEL_TEST(linq_refcount, lazy_where_then_count_terminal_leak_free_spec_5) {
+    BEZEL_EXPECT_EQ(compileAndRun(kLazyWhereThenCountChurn), 0);
+    for (int rep = 0; rep < 3; ++rep) {
+        int lsan = runUnderLeakSanitizer(kLazyWhereThenCountChurn);
+        if (lsan != -1) BEZEL_EXPECT_EQ(lsan, 0);
+    }
+}
+
+BEZEL_TEST(linq_refcount, lazy_where_select_then_aggregate_terminal_leak_free_spec_5) {
+    expectValueAndLeakFree(kLazyWhereSelectThenAggregateChurn, 0);
 }
 
 // --- LAZY regression guard: iterate-then-drop of a release-on-dispose closure
