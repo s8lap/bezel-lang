@@ -203,6 +203,302 @@ bool ExprTC::armBodyAlwaysExits(const ast::CaseArm& arm) {
     return false;
 }
 
+namespace {
+
+// §19.3: an unguarded `_` (DiscardPattern) or unconstrained `var x`
+// (BindingPattern with no type annotation) matches any value — a
+// catch-all that makes the `case` trivially exhaustive (§19.6).
+bool isUnguardedCatchAll(const ast::CaseArm& arm) {
+    if (arm.guard) return false;  // a guard can fail at runtime
+    const ast::Pattern* p = arm.pattern.get();
+    if (dynamic_cast<const ast::DiscardPattern*>(p)) return true;
+    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(p))
+        return bp->type == nullptr;  // `var x` (untyped) is total; `var x: T` is a type test
+    return false;
+}
+
+// §19.6: collect the last name part of every enum-constant pattern an
+// unguarded arm covers. Enum patterns appear as a NamedPattern (`E.Red`
+// or bare `Red`) or as a ConstantPattern holding one or more constant
+// expressions (each a MemberAccessExpr `E.Red`, an IdentifierExpr `Red`,
+// or a QualifiedName-bearing form).
+void collectEnumPatternNames(const ast::CaseArm& arm,
+                             std::unordered_set<std::string_view>& covered) {
+    if (arm.guard) return;  // a guarded arm cannot be relied on for coverage
+    const ast::Pattern* p = arm.pattern.get();
+    if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
+        if (np->name && !np->name->parts.empty())
+            covered.insert(np->name->parts.back());
+    } else if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
+        for (const auto& c : cp->constants) {
+            if (!c) continue;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(c.get()))
+                covered.insert(ma->member);
+            else if (auto* id =
+                         dynamic_cast<const ast::IdentifierExpr*>(c.get()))
+                covered.insert(id->name);
+        }
+    }
+}
+
+// §19.6: does any unguarded arm explicitly match `null` (NullPattern)?
+bool armsCoverNull(const ast::CaseExpr& ce) {
+    for (const auto& arm : ce.arms) {
+        if (arm.guard) continue;
+        if (dynamic_cast<const ast::NullPattern*>(arm.pattern.get()))
+            return true;
+    }
+    return false;
+}
+
+// §11.7 / §19.6: is `cls` a closed abstract base — one whose complete set
+// of leaf types is statically knowable? Two forms qualify:
+//   * `sealed abstract`: no subclass outside the declaring module can
+//     exist, so the closed set holds across module boundaries (§11.7).
+//   * a same-module (non-imported) `abstract` class whose every direct
+//     subclass is itself `sealed`/closed (recursively forms a closed set,
+//     §19.6). An imported plain-abstract base may have unseen subclasses,
+//     so it is treated as open.
+bool hasModifier(const TypeSymbol* t, std::string_view m) {
+    for (auto mod : t->modifiers) if (mod == m) return true;
+    return false;
+}
+
+} // namespace
+
+// §19.6: emit a non-exhaustiveness WARNING for an expression-position
+// `case` whose arms the compiler cannot prove cover every possible value.
+// The spec lists the scrutinee shapes for which exhaustiveness IS provable
+// — enum (all constants), bool (both literals), a closed sealed-abstract
+// class hierarchy (all leaves), and the nullable variant of those (the
+// above plus an explicit `null` arm). An unguarded `_` or unconstrained
+// `var x` arm is a catch-all and is always exhaustive. Every other shape
+// (an open class hierarchy, int/string/range scrutinees, the scrutinee-
+// less boolean-condition form, partial coverage) cannot be proven
+// exhaustive, so the warning fires unless a catch-all is present (§19.6).
+//
+// This is a WARNING, not an error: §19.6 states an unmatched value raises
+// MatchFailureException at runtime and "the compiler warns when it cannot
+// prove exhaustiveness statically." The diagnostic does not fail
+// compilation (DiagnosticEngine::hasErrors counts only errors).
+void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) {
+    // An unguarded catch-all (`_` / untyped `var x`) covers everything.
+    for (const auto& arm : ce.arms) {
+        if (isUnguardedCatchAll(arm)) return;
+    }
+
+    auto warn = [&](const std::string& detail) {
+        ctx_.diagnostics().report(
+            Severity::Warning, ce.span.begin,
+            "non-exhaustive `case`: " + detail +
+            " (add a `_` arm or cover the remaining value(s)) (§19.6)");
+    };
+
+    // A nullable scrutinee additionally requires an explicit `null` arm
+    // for exhaustiveness (§19.6: "the rules above plus an explicit `null`
+    // pattern"). If the value can be null but no arm matches null, the
+    // case is non-exhaustive regardless of the non-null coverage below.
+    bool nullableUncovered =
+        scrutTy && scrutTy->nullable && !armsCoverNull(ce);
+
+    // --- Bool scrutinee (§19.6): both `true` and `false` must be covered.
+    if (scrutTy && !scrutTy->nullable &&
+        scrutTy->kind == TypeRef::Kind::Primitive &&
+        scrutTy->primitive == PrimitiveType::Bool) {
+        bool t = false, f = false;
+        for (const auto& arm : ce.arms) {
+            if (arm.guard) continue;
+            auto scan = [&](const ast::Expr* e) {
+                if (auto* b = dynamic_cast<const ast::BoolLiteralExpr*>(e)) {
+                    if (b->value) t = true; else f = true;
+                }
+            };
+            if (auto* cp =
+                    dynamic_cast<const ast::ConstantPattern*>(arm.pattern.get()))
+                for (const auto& c : cp->constants) if (c) scan(c.get());
+        }
+        if (!(t && f))
+            warn("bool scrutinee does not cover both `true` and `false`");
+        return;
+    }
+
+    // --- Enum / closed-hierarchy scrutinee both resolve to a Named type.
+    TypeSymbol* sub = (scrutTy && scrutTy->kind == TypeRef::Kind::Named)
+                          ? scrutTy->declaration
+                          : nullptr;
+
+    if (sub && sub->kind == ast::TypeDeclKind::Enum) {
+        // §19.6: every declared enum constant must have a matching pattern.
+        std::unordered_set<std::string_view> covered;
+        for (const auto& arm : ce.arms) collectEnumPatternNames(arm, covered);
+        std::vector<std::string_view> missing;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(sub->decl)) {
+            for (const auto& ec : td->enumConstants)
+                if (!covered.count(ec.name)) missing.push_back(ec.name);
+        } else {
+            // No AST decl (e.g. imported enum): fall back to symbol members.
+            for (const Symbol* m : sub->members)
+                if (dynamic_cast<const EnumConstantSymbol*>(m) &&
+                    !covered.count(m->name))
+                    missing.push_back(m->name);
+        }
+        if (!missing.empty() || nullableUncovered) {
+            std::string detail = "enum `" + std::string(sub->name) + "`";
+            if (!missing.empty()) {
+                detail += " is missing constant(s):";
+                for (auto n : missing) detail += " " + std::string(n);
+            }
+            if (nullableUncovered)
+                detail += (missing.empty() ? " nullable value not covered"
+                                           : " (and a `null` arm)");
+            warn(detail);
+        }
+        return;
+    }
+
+    if (sub && sub->kind == ast::TypeDeclKind::Class) {
+        // §11.7 / §19.6: the scrutinee's hierarchy is closed only when the
+        // base is `sealed abstract`, or a same-module abstract whose every
+        // subclass is recursively sealed/closed. Otherwise the set of leaf
+        // types is open and exhaustiveness cannot be proven.
+        bool isAbstract = hasModifier(sub, "abstract");
+        bool isSealed = hasModifier(sub, "sealed");
+
+        // Gather every transitive subclass of `sub` visible in this
+        // compilation. A leaf to cover is a concrete (non-abstract)
+        // subclass; abstract intermediates are matched only through their
+        // concrete descendants. `descendants` keeps the full set (including
+        // abstract intermediates) so a pattern naming an intermediate by
+        // name still resolves (subtype matching, §19.3).
+        std::vector<TypeSymbol*> leaves;
+        std::vector<TypeSymbol*> descendants;
+        bool sawOpenLeaf = false;  // a non-sealed subclass leaves the set open
+        for (const auto& s : ctx_.symbols()) {
+            auto* ts = dynamic_cast<TypeSymbol*>(s.get());
+            if (!ts || ts == sub || ts->kind != ast::TypeDeclKind::Class)
+                continue;
+            // Is `sub` an ancestor of `ts`?
+            bool isDescendant = false;
+            std::vector<TypeSymbol*> work = ts->baseTypes;
+            std::unordered_set<TypeSymbol*> seen;
+            while (!work.empty()) {
+                TypeSymbol* b = work.back();
+                work.pop_back();
+                if (!b || !seen.insert(b).second) continue;
+                if (b == sub) { isDescendant = true; break; }
+                for (TypeSymbol* bb : b->baseTypes) work.push_back(bb);
+            }
+            if (!isDescendant) continue;
+            descendants.push_back(ts);
+            if (!hasModifier(ts, "abstract"))
+                leaves.push_back(ts);  // concrete leaf to be covered
+            if (!hasModifier(ts, "sealed") && !hasModifier(ts, "abstract"))
+                sawOpenLeaf = true;    // a non-sealed concrete subclass
+        }
+
+        // The hierarchy is provably closed when the base is `sealed
+        // abstract` (cross-module guarantee, §11.7), OR a same-module
+        // abstract base with no non-sealed concrete leaf (recursively
+        // closed, §19.6). A non-imported plain-abstract base whose leaves
+        // are all sealed still forms a closed set within the module.
+        bool closed =
+            (isAbstract && isSealed) ||
+            (isAbstract && !ctx_.isImported(sub) && !sawOpenLeaf);
+        if (!closed) {
+            warn("class hierarchy rooted at `" + std::string(sub->name) +
+                 "` is open");
+            return;
+        }
+
+        // Collect the leaf types covered by an unguarded type-test arm.
+        std::unordered_set<const TypeSymbol*> coveredLeaves;
+        for (const auto& arm : ce.arms) {
+            if (arm.guard) continue;
+            const ast::Pattern* p = arm.pattern.get();
+            TypeSymbol* matchTy = nullptr;
+            // A type-test arm names the matched class either as a bare
+            // NamedPattern (`Circle => …`) or as a typed binding
+            // (`var c: Circle => …`). Resolve the named class by its last
+            // name part against the closed hierarchy's leaf set — the
+            // BindingPattern's `bp->type` annotation is NOT resolved by
+            // TypeResolution inside case arms (no `resolvedType` entry), so
+            // we match by name, consistent with the NamedPattern path.
+            std::string_view typeName;
+            if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
+                if (np->name && !np->name->parts.empty())
+                    typeName = np->name->parts.back();
+            } else if (auto* bp =
+                           dynamic_cast<const ast::BindingPattern*>(p)) {
+                if (bp->type && bp->type->name &&
+                    !bp->type->name->parts.empty())
+                    typeName = bp->type->name->parts.back();
+            }
+            // Resolve against the full descendant set (a leaf, or an
+            // abstract intermediate that subtype-covers its own leaves), or
+            // against `sub` itself (`var x: Shape` covers everything).
+            if (!typeName.empty()) {
+                if (typeName == sub->name) matchTy = sub;
+                for (auto* d : descendants)
+                    if (d->name == typeName) matchTy = d;
+            }
+            if (matchTy) {
+                // A pattern naming an ancestor also covers all its leaf
+                // descendants (subtype matching, §19.3).
+                for (auto* lf : leaves) {
+                    if (lf == matchTy) { coveredLeaves.insert(lf); continue; }
+                    std::vector<TypeSymbol*> work = lf->baseTypes;
+                    std::unordered_set<TypeSymbol*> seen;
+                    while (!work.empty()) {
+                        TypeSymbol* b = work.back();
+                        work.pop_back();
+                        if (!b || !seen.insert(b).second) continue;
+                        if (b == matchTy) { coveredLeaves.insert(lf); break; }
+                        for (TypeSymbol* bb : b->baseTypes)
+                            work.push_back(bb);
+                    }
+                }
+            }
+        }
+        std::vector<std::string_view> missing;
+        for (auto* lf : leaves)
+            if (!coveredLeaves.count(lf)) missing.push_back(lf->name);
+        if (!missing.empty() || nullableUncovered) {
+            std::string detail =
+                "closed hierarchy `" + std::string(sub->name) + "`";
+            if (!missing.empty()) {
+                detail += " is missing leaf type(s):";
+                for (auto n : missing) detail += " " + std::string(n);
+            }
+            if (nullableUncovered)
+                detail += (missing.empty() ? " nullable value not covered"
+                                           : " (and a `null` arm)");
+            warn(detail);
+        }
+        return;
+    }
+
+    // --- The scrutinee-less boolean-condition form (§19.1) has no value
+    // set to enumerate and no `_` (we already returned on a catch-all), so
+    // it cannot be proven exhaustive (§19.6).
+    if (!ce.scrutinee) {
+        warn("scrutinee-less `case` has no catch-all `_` arm");
+        return;
+    }
+
+    // A scrutinee whose type failed to resolve (Error sentinel) or was not
+    // inferred is suppressed here: a non-exhaustiveness warning layered on
+    // top of an upstream type error would be a confusing cascade (the Error
+    // kind exists precisely to suppress such follow-on diagnostics —
+    // TypeRef.hpp). The real diagnostic is reported by the resolution pass.
+    if (!scrutTy || scrutTy->kind == TypeRef::Kind::Error) return;
+
+    // --- Every other scrutinee shape (int / string / range / float /
+    // open class) cannot be proven exhaustive (§19.6): there is no finite,
+    // statically-knowable value set to enumerate. Without a catch-all arm
+    // (handled above) the case is non-exhaustive.
+    warn("scrutinee type cannot be proven exhaustive");
+}
+
 // Slice S21: does a callable with this return-type ascription
 // produce a value? No ascription → no (unit). An ascription that
 // resolves to the unit type → no. Anything else → yes.

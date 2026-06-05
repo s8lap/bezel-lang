@@ -168,6 +168,17 @@ private:
 
     bool armBodyAlwaysExits(const ast::CaseArm& arm);
 
+    // §19.6: exhaustiveness analysis for an EXPRESSION-position `case`.
+    // In expression position an unmatched value raises MatchFailureException
+    // at runtime; the spec says the compiler WARNS (not errors) when it
+    // cannot prove exhaustiveness statically. Statement-position `case`
+    // falls through with no action and is exempt (handled in CaseStmt). The
+    // analysis proves exhaustiveness for the four spec-listed scrutinee
+    // shapes (enum / bool / sealed-abstract closed hierarchy / nullable),
+    // and treats an unguarded `_` or unconstrained `var x` arm as a
+    // catch-all that is always exhaustive.
+    void checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy);
+
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
     // resolves to the unit type → no. Anything else → yes.

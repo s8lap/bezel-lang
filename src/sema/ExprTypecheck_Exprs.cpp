@@ -1143,6 +1143,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
             }
         }
+        // §19.6: an expression-position `case` whose value cannot be proven
+        // to be covered by some arm raises MatchFailureException at runtime;
+        // the compiler emits a non-exhaustiveness warning here. Statement-
+        // position `case` (CaseStmt) is exempt — an unmatched value simply
+        // falls through with no action (§19.6).
+        checkCaseExhaustiveness(*ce, scrutTy);
     } else if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
         if (we->source) visitExpr(*we->source);
         for (const auto& ia : we->assigns) {
