@@ -854,9 +854,17 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
                 {arrObj, idxR2, builder_.getInt64(esz)});
             llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
             builder_.CreateStore(elem, varSlotR);
+            // The loop's continue-target is incBBR; the body falls through to
+            // it unless it already terminated (e.g. a trailing return/throw).
+            // Emit the increment INTO incBBR (not the body block) so a
+            // `continue` that branches to incBBR lands on a real, terminated
+            // block — emitting the increment in bodyBBR left incBBR without a
+            // terminator (malformed IR), mirroring the far.inc path below.
             loopStack_.push_back({incBBR, endBBR, disposeStack_.size()});
-            lowerScopedBlock(fs.body);
+            bool termR = lowerScopedBlock(fs.body);
             loopStack_.pop_back();
+            if (!termR) builder_.CreateBr(incBBR);
+            builder_.SetInsertPoint(incBBR);
             llvm::Value* idxR3 = builder_.CreateLoad(i64(), idxSlotR);
             builder_.CreateStore(builder_.CreateAdd(idxR3, builder_.getInt64(1)), idxSlotR);
             builder_.CreateBr(condBBR);

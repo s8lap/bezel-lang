@@ -2194,7 +2194,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // null → return null (string?). Non-null: wrap in bz_string.
             auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
             llvm::Value* isNull = builder_.CreateICmpEQ(rawPtr, nullPtr);
-            auto* nullBB = llvm::BasicBlock::Create(llvm_, "env.null", currentFn_);
+            // The null case branches straight to endBB (its PHI edge supplies
+            // the null pointer); no separate null block is needed. A
+            // previously-created but never-branched-to `env.null` block was left
+            // without a terminator, producing malformed IR.
             auto* okBB   = llvm::BasicBlock::Create(llvm_, "env.ok",   currentFn_);
             auto* endBB  = llvm::BasicBlock::Create(llvm_, "env.end",  currentFn_);
             auto* entBB  = builder_.GetInsertBlock();
@@ -3340,7 +3343,10 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // null → true
         llvm::Value* isNull = builder_.CreateICmpEQ(
             arg, llvm::ConstantPointerNull::get(ptrTy()), "ine.null");
-        auto* nullBB = llvm::BasicBlock::Create(llvm_, "ine.null", currentFn_);
+        // The null case branches straight to endBB (its PHI edge supplies
+        // `true`); no separate null block is needed. A previously-created but
+        // never-branched-to `ine.null` block was left without a terminator,
+        // producing malformed IR.
         auto* checkBB= llvm::BasicBlock::Create(llvm_, "ine.check", currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "ine.end",   currentFn_);
         auto* entBB  = builder_.GetInsertBlock();
@@ -3877,6 +3883,14 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
             p.type = const_cast<sema::TypeRef*>(pt);
             handlerTy.funcParams.push_back(p);
         }
+        // §24.3: a handler returns unit. Set funcReturn so lowerLambda resolves
+        // a block-bodied handler's return type to void — without this it
+        // defaulted to i32, defining the handler as i32(...) while the Raise
+        // loop calls it through a void(...) function pointer (an indirect-call
+        // type mismatch / malformed IR: `ret void` in an i32 function).
+        auto* unitRet = ctx_.makeTypeRef();
+        unitRet->kind = sema::TypeRef::Kind::Unit;
+        handlerTy.funcReturn = unitRet;
         expectedFunctionType_ = &handlerTy;
         llvm::Value* closure = lowerExpr(*call.args[0].value);
         expectedFunctionType_ = saved;

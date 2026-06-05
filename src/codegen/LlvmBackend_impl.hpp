@@ -163,13 +163,25 @@ public:
         // FINDING [3]: malformed IR (e.g. a block with two terminators) reached
         // the optimizer as a segfault because nothing checked the IR after
         // emission. The module verifier turns such a defect into a printed
-        // report instead of a crash deep in an LLVM pass. It is OPT-IN via
-        // BEZEL_VERIFY_IR (mirroring the BEZEL_DUMP_IR knob above) rather than
-        // always-on: the verifier currently flags several PRE-EXISTING, unrelated
-        // codegen defects in other paths (a separate concern from this fix), so
-        // running it unconditionally would spam every build/test with noise from
-        // bugs this change does not own. Non-fatal — it reports and continues.
-        if (module_ && std::getenv("BEZEL_VERIFY_IR") &&
+        // report instead of a crash deep in an LLVM pass.
+        //
+        // The corpus-surfaced malformed-IR defects this verifier originally
+        // flagged (bz_string_split arg-count mismatch; dead unterminated
+        // ine.null/env.null blocks; the rt.inc continue-target with no
+        // terminator; the void-handler lambda defined as i32 / case+conditional
+        // all-arms-diverge join blocks) are now FIXED, so the full test suite is
+        // verifier-clean. The verifier therefore runs unconditionally in
+        // ASSERT builds (!NDEBUG) — early detection of any future malformed-IR
+        // regression — and remains opt-in via BEZEL_VERIFY_IR in release builds.
+        // It stays NON-FATAL (report-and-continue): a not-yet-exercised program
+        // shape that trips it should print a diagnostic, not hard-fail the
+        // build/JIT, until that case too is fixed.
+#ifndef NDEBUG
+        bool wantVerify = true;
+#else
+        bool wantVerify = std::getenv("BEZEL_VERIFY_IR") != nullptr;
+#endif
+        if (module_ && wantVerify &&
             llvm::verifyModule(*module_, &llvm::errs())) {
             llvm::errs() << "bezel codegen: IR verification failed "
                             "(malformed IR emitted; see report above)\n";
