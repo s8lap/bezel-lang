@@ -411,6 +411,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         if (md && md->returnType) {
             if (auto* rt = ctx_.resolvedType(*md->returnType)) {
+                // per §14.1 (generics are monomorphized): a method whose
+                // declared return type is a bare type parameter of its parent
+                // class — `method GetIt(): T` on `Box<T>` — has the substituted
+                // type at a concrete instantiation: `b.GetIt()` on
+                // `b: Box<Pair>` is a `Pair`, not the erased `T`. Substitute
+                // against the receiver's concrete generic args (exactly as
+                // resolveMemberAccess does for a `T`-typed field/property, and
+                // as the user-indexer typing does for a `T`-typed indexer
+                // result). Without this the call is typed as the bare `T`, so a
+                // record substitution's fields can't resolve at the use site
+                // and the result is read as garbage (§9: a record is a value
+                // type with by-value semantics). The
+                // helper is a no-op for a non-type-parameter return type and
+                // for a static method (no receiver target).
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce.callee.get())) {
+                    if (ma->target && ms->parent)
+                        rt = substituteMemberType(rt, ma->target.get(),
+                                                  ms->parent);
+                }
                 ctx_.setExprType(&ce, rt);
             }
         } else if (md && !md->returnType) {

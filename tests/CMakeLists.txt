@@ -266,6 +266,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_record_value_leak_test.cpp
     codegen/is_narrow_receiver_test.cpp
     codegen/null_narrow_member_test.cpp
+    codegen/generic_record_return_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

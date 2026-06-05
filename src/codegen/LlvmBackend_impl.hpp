@@ -1715,6 +1715,21 @@ private:
         return it != genericSubstSemaTy_.end() ? it->second : nullptr;
     }
 
+    // per §14.1 (generics are monomorphized): install `genericSubst_` for a
+    // member access / call / indexer get whose RECEIVER expression `target` has
+    // a concrete instantiation of the generic class `parent` (e.g. the getter
+    // body of `Box<Pair>[i]` must read its `T`-typed field as the substituted
+    // `Pair`, not the i32 erasure). Builds the param→concrete-LLVM-type map from
+    // the receiver's `genericArgs`, falling back to the local's stored
+    // `localGenericSubst_` when a positional arg is still the i32 fallback (the
+    // identical pattern fieldAddr / the property getter path use). Returns the
+    // previous `genericSubst_` so the caller restores it after lowering the
+    // member; a no-op (returns the current map unchanged) when the receiver is
+    // not a concrete instantiation of `parent`.
+    std::unordered_map<std::string_view, llvm::Type*>
+    setupReceiverGenericSubst(const ast::Expr* target,
+                              const sema::TypeSymbol* parent);
+
     // §28.5: is `fs` an `owned` field whose declared type is a generic type
     // PARAMETER of its enclosing class — regardless of any active substitution?
     // Used to decide, ONCE per generic class, whether its disposer must be

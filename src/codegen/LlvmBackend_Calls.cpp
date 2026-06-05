@@ -321,6 +321,46 @@ bool Emitter::isListInterfaceName(const sema::TypeRef* rt, bool* outOwning) {
 // is a "record key" when the generic arg resolves to a record TypeSymbol that
 // actually carries synthesized GetHashCode/Equals (positional records, or
 // auto-equality-bearing body records — §9.1 / §9.2). For such keys the generic
+// per §14.1 (generics are monomorphized): see the header comment. Build and
+// install `genericSubst_` from the receiver `target`'s concrete instantiation
+// of `parent`, returning the previous map for the caller to restore.
+std::unordered_map<std::string_view, llvm::Type*>
+Emitter::setupReceiverGenericSubst(const ast::Expr* target,
+                                   const sema::TypeSymbol* parent) {
+    auto savedSubst = genericSubst_;
+    if (!target || !parent || !parent->decl) return savedSubst;
+    auto* td = dynamic_cast<const ast::TypeDecl*>(parent->decl);
+    if (!td || td->genericParams.empty()) return savedSubst;
+    sema::TypeRef* recvTy = ctx_.exprType(*target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+        recvTy->declaration != parent || recvTy->genericArgs.empty())
+        return savedSubst;
+    if (td->genericParams.size() != recvTy->genericArgs.size())
+        return savedSubst;
+    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+    for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi)
+        newSubst[td->genericParams[gi].name] =
+            lowerTypeRef(recvTy->genericArgs[gi]);
+    // A still-unresolved positional arg (i32 fallback) — recover the local's
+    // stored concrete substitution, the same fallback fieldAddr / the property
+    // getter path use for a generic receiver bound through a `var` local.
+    bool hasUnresolved = false;
+    for (auto& [n, ty] : newSubst)
+        if (ty == i32()) { hasUnresolved = true; break; }
+    if (hasUnresolved) {
+        sema::Symbol* recvSym = ctx_.exprSymbol(*target);
+        const ast::Node* decl = nullptr;
+        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(recvSym))
+            decl = loc->decl;
+        if (decl) {
+            auto lit = localGenericSubst_.find(decl);
+            if (lit != localGenericSubst_.end()) newSubst = lit->second;
+        }
+    }
+    genericSubst_ = std::move(newSubst);
+    return savedSubst;
+}
+
 // runtime variant is used; string and primitive keys keep their fast paths.
 // issue #343 / §9.1 / §9.2: if `ref` resolves to a record type that actually
 // carries synthesized GetHashCode/Equals (a positional record, or an
