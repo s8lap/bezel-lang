@@ -1270,4 +1270,199 @@ BEZEL_TEST(cross_module_import, imported_generic_static_method_still_ok_spec_14)
     BEZEL_EXPECT_EQ(code, 42);
 }
 
+// §2.5 / §2.6 / §12 (issue #328 / #103): a LOCAL class deriving from an IMPORTED
+// base. A's `Base` has `virtual Hello() => 1`, a non-virtual `Greet() => 100`,
+// and a ctor setting `field := 7`. B declares `Derived : Base` LOCALLY,
+// overriding `Hello() => 2` and adding its own field. Before the fix this CRASHED
+// the compiler in LLVM global emission: the importer never reconstructed the
+// imported base's type descriptor (`td$Base`), so the derived descriptor's
+// chain (Pass C) got a null map default → a malformed ConstantArray →
+// SIGSEGV in getRelocationInfo during object emission. After: the exporter emits
+// `td$Base` with EXTERNAL linkage and the importer declares it, so the derived
+// descriptor links to it; the base ctor chain (`base()`) is declared on demand
+// so the base subobject's field is initialized; and the derived vtable installs
+// the override. This single test exercises, end to end: (a) the override called
+// directly → 2; (b) virtual dispatch through a base-typed reference → 2;
+// (c) an inherited non-virtual base method → 100; (d) an inherited base FIELD,
+// initialized by the imported base ctor → 7; (e) the derived's own field → 50.
+// Sum = 2 + 2 + 100 + 7 + 50 = 161.
+BEZEL_TEST(cross_module_import, local_derives_imported_base_spec_12) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_derive_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Lib; "
+        "public class Base "
+        "  public field: int; "
+        "  public constructor() field := 7; end constructor; "
+        "  public virtual method Hello(): int => 1; "
+        "  public method Greet(): int => 100; "
+        "  destructor end destructor; "
+        "end Base;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Lib; "
+        "public class Derived : Base "
+        "  public extra: int; "
+        "  public constructor() base(); extra := 50; end constructor; "
+        "  public override method Hello(): int => 2; "
+        "  destructor end destructor; "
+        "end Derived; "
+        "public class Program "
+        "  public static method ViaBase(b: Base): int => b.Hello(); "
+        "  public static method Main(): int "
+        "    using var d := new Derived(); "
+        "    return d.Hello() + ViaBase(d) + d.Greet() + d.field + d.extra; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 161);
+}
+
+// §2.5 / §12 (issue #328 / #103): base-subobject FIELD LAYOUT across modules.
+// A's `Base` has two fields `a`, `b` set by its ctor (10, 20); B's local
+// `Derived` adds `c` (30) and overrides `Sum()` to read all three. The base
+// fields must be laid out before the derived field, and the imported base ctor
+// (run via `base()`) must initialize them. The override reads a, b, c; the call
+// site also reads each field individually, confirming offsets agree with the
+// exporter's `%class.Base` layout. Sum()=60, then a*1000 + b*100 + c*10 =
+// 10000 + 2000 + 300; total 12360 (exit code = 12360 mod 256 = 72).
+BEZEL_TEST(cross_module_import, local_derives_imported_base_field_layout_spec_12) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_derivefields_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Lib; "
+        "public class Base "
+        "  public a: int; "
+        "  public b: int; "
+        "  public constructor() a := 10; b := 20; end constructor; "
+        "  public virtual method Sum(): int => a + b; "
+        "  destructor end destructor; "
+        "end Base;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Lib; "
+        "public class Derived : Base "
+        "  public c: int; "
+        "  public constructor() base(); c := 30; end constructor; "
+        "  public override method Sum(): int => a + b + c; "
+        "  destructor end destructor; "
+        "end Derived; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var d := new Derived(); "
+        "    return d.Sum() + d.a * 1000 + d.b * 100 + d.c * 10; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 12360 % 256);
+}
+
+// §2.5 / §2.6 / §28.4 step 3 / §12 (issue #328 / #103): a LOCAL class deriving
+// from an IMPORTED base disposes the WHOLE chain exactly once. A's `Base` counts
+// its destructor in a static; B's local `Derived : Base` counts its own. A
+// `using var Derived` disposed at scope end must run Derived's destructor (1) AND
+// chain to Base's destructor (1). Before the fix the cross-module chain targeted
+// the base's INTERNAL `DisposeCore` (not linkable) — observed: the base
+// destructor never ran (BaseDisposed stayed 0). After: the exporter exports
+// `bz$Base$DisposeCore` with EXTERNAL linkage and the importer's derived
+// `DisposeCore` chains to it, so each level's destructor runs once within the
+// single flag-guarded most-derived disposal. Encoded BaseDisposed*10 +
+// DerivedDisposed = 1*10 + 1 = 11.
+BEZEL_TEST(cross_module_import, local_derives_imported_base_dispose_chain_spec_28_4) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_derivedisp_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Lib; "
+        "public class Base "
+        "  public static BaseDisposed: int := 0; "
+        "  public constructor() end constructor; "
+        "  public virtual method Hello(): int => 1; "
+        "  destructor BaseDisposed := BaseDisposed + 1; end destructor; "
+        "end Base;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Lib; "
+        "public class Derived : Base "
+        "  public static DerivedDisposed: int := 0; "
+        "  public constructor() base(); end constructor; "
+        "  public override method Hello(): int => 2; "
+        "  destructor DerivedDisposed := DerivedDisposed + 1; end destructor; "
+        "end Derived; "
+        "public class Program "
+        "  public static method Use(): int "
+        "    using var d := new Derived(); "
+        "    return d.Hello(); "
+        "  end Use; "
+        "  public static method Main(): int "
+        "    var r := Use(); "
+        "    return Base.BaseDisposed * 10 + Derived.DerivedDisposed; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 11);
+}
+
 }  // namespace bezel::module
