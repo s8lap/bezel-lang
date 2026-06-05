@@ -639,8 +639,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return v;
         };
 
+        // #422 / §28.9 / §28.3: an EAGER LINQ predicate/selector closure produced
+        // INLINE (a lambda literal) is a +1 transient we own; the eager op fully
+        // consumes it in a loop that completes before the call returns, so we
+        // release it at the loop-end. A closure arriving via a variable/field is a
+        // BORROW (not ours to free). Only release the inline-lambda form — exactly
+        // the GetOrAdd factoryIsInlineLambda guard. (Null-safe; LAZY ops differ —
+        // they store the closure and release at enumerator dispose, see below.)
+        auto argIsInlineLambda = [&](size_t i) -> bool {
+            return i < call.args.size() && call.args[i].value &&
+                   dynamic_cast<const ast::LambdaExpr*>(call.args[i].value.get())
+                       != nullptr;
+        };
+
         // per §5 LINQ: .Any(pred: (T)->bool): bool
         if (m == "Any" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
             llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
                 ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
             if (!closure) return nullptr;
@@ -670,6 +684,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "any.r");
             phi->addIncoming(builder_.getFalse(), condBB);
             phi->addIncoming(builder_.getTrue(), bodyBB);
+            if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             return phi;
         }
 
@@ -682,6 +697,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 
         // per §5 LINQ: .All(pred: (T)->bool): bool
         if (m == "All" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
             llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
                 ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
             if (!closure) return nullptr;
@@ -711,11 +727,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "all.r");
             phi->addIncoming(builder_.getTrue(), condBB);
             phi->addIncoming(builder_.getFalse(), bodyBB);
+            if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             return phi;
         }
 
         // per §5 LINQ: .ForEach(fn: (T)->())
         if (m == "ForEach" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
             auto* unitRef = ctx_.makeTypeRef();
             unitRef->kind = sema::TypeRef::Kind::Unit;
             llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), unitRef);
@@ -740,11 +758,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             return llvm::ConstantInt::get(i32(), 0);
         }
 
         // per §5 LINQ: .Count(pred: (T)->bool): int
         if (m == "Count" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
             llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
                 ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
             if (!closure) return nullptr;
@@ -778,6 +798,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             return builder_.CreateLoad(i32(), cntSlot, "cnt.r");
         }
 
@@ -792,6 +813,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // per §5 LINQ: .Sum(fn: (T)->int): int  /  .Sum(): int (for Array<int>)
         if (m == "Sum") {
+            const bool relCl = argIsInlineLambda(0);
             llvm::Type* elemTy = getElemTy();
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
             llvm::Value* closure = call.args.empty() ? nullptr
@@ -822,6 +844,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             return builder_.CreateLoad(i32(), accSlot, "sum.r");
         }
         // per §5 LINQ: .Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum)
@@ -836,6 +859,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Type* accTy = seed->getType();
             // Lower the fold lambda `(TAccum, T) -> TAccum`. Its params are
             // annotated in idiomatic use; lower it as a plain expression.
+            const bool relCl = argIsInlineLambda(1);
             llvm::Value* foldCl = lowerExpr(*call.args[1].value);
             if (!foldCl) return nullptr;
             auto* accSlot = entryAlloca(accTy);
@@ -866,6 +890,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(foldCl);  // #422: inline-lambda transient
             return builder_.CreateLoad(accTy, accSlot, "agg.r");
         }
         // per §5/§5.1 LINQ: .Average(fn: (T)->numeric): double  /  .Average(): double
@@ -873,6 +898,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // divide by the element count. The §5 selector overloads (int/long/double)
         // and the §5.1 per-type no-selector forms all return double.
         if (m == "Average") {
+            const bool relCl = argIsInlineLambda(0);
             llvm::Type* elemTy = getElemTy();
             // The selector's actual LLVM return type (int/long/float/double per
             // the §5 overloads); the closure must be called with its true return
@@ -923,12 +949,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             llvm::Value* total = builder_.CreateLoad(dblTy, accSlot, "avg.sum");
             llvm::Value* cnt = builder_.CreateSIToFP(len, dblTy, "avg.cnt");
+            if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             return builder_.CreateFDiv(total, cnt, "avg.r");
         }
         // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
         if ((m == "Min" || m == "Max") &&
             (call.args.empty() || call.args.size() == 1)) {
             bool isMax = (m == "Max");
+            const bool relCl = argIsInlineLambda(0);
             llvm::Type* elemTy = getElemTy();
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
             llvm::Value* closure = call.args.empty() ? nullptr
@@ -971,10 +999,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             return builder_.CreateLoad(i32(), accSlot, "mm.r");
         }
         // per §5 LINQ: .First(pred: (T)->bool): T  (throws if empty/not found)
         if (m == "First" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
             llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
                 ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
             if (!closure) return nullptr;
@@ -1006,6 +1036,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             return builder_.CreateLoad(elemTy, resultSlot, "fst.r");
         }
         // per §5 LINQ element access (no-predicate forms): First()/Single()
@@ -5498,6 +5529,27 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     if (!src) return nullptr;
     llvm::Type* elemTy = elemLlvmOf(elemRef);
 
+    // #422 / §28.9 / §28.3: a LAZY operator stores its closure in the enumerator
+    // (e->closure) and invokes it LATER during iteration — so the closure must
+    // OUTLIVE the call. When it was produced INLINE (a lambda literal), it is a
+    // +1 transient the enumerator owns; mark the enumerator with
+    // bz_lazy_own_closure so bz_lazy_dispose releases it at enumerator dispose
+    // (NOT here — a call-site release would be a use-after-free). A closure
+    // arriving via a variable/field is a BORROW and is left untouched. Mirrors
+    // the GetOrAdd/eager factoryIsInlineLambda guard.
+    auto argIsInlineLambda = [&](size_t i) -> bool {
+        return i < call.args.size() && call.args[i].value &&
+               dynamic_cast<const ast::LambdaExpr*>(call.args[i].value.get())
+                   != nullptr;
+    };
+    // Thread the enumerator pointer through bz_lazy_own_closure(e) iff the
+    // operator's closure arg was an inline lambda; otherwise return it unchanged.
+    auto ownClosureIf = [&](llvm::Value* e, bool inlineLambda) -> llvm::Value* {
+        if (!inlineLambda || !e) return e;
+        auto* fn = declareC("bz_lazy_own_closure", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {e}, "linq.owncl");
+    };
+
     // Lower a LINQ lambda argument with the expected (T)->ret function type so
     // unannotated lambda params get the right LLVM type.
     auto lowerLinqLambda = [&](const ast::Expr* argExpr,
@@ -5524,7 +5576,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         if (!closure) return nullptr;
         llvm::Function* tramp = buildLinqTrampoline(0, elemTy, nullptr);
         auto* whereFn = declareC("bz_lazy_where", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
-        return builder_.CreateCall(whereFn, {src, closure, tramp}, "linq.where");
+        llvm::Value* e = builder_.CreateCall(whereFn, {src, closure, tramp}, "linq.where");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
     }
     if (m == "Select" && call.args.size() == 1 && call.args[0].value) {
         sema::TypeRef* retSemaType = nullptr;
@@ -5540,8 +5593,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         int64_t outEsz = lazyElemSize(outTy);
         auto* selFn = declareC("bz_lazy_select", ptrTy(),
                                {ptrTy(), i64(), ptrTy(), ptrTy()});
-        return builder_.CreateCall(selFn,
+        llvm::Value* e = builder_.CreateCall(selFn,
             {src, builder_.getInt64(outEsz), closure, tramp}, "linq.select");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
     }
     if (m == "Take" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* nV = lowerExpr(*call.args[0].value);
@@ -5579,8 +5633,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Function* tramp = buildLinqTrampoline(2, elemTy, nullptr);
         auto* obFn = declareC("bz_lazy_orderby", ptrTy(),
                               {ptrTy(), ptrTy(), ptrTy(), i32()});
-        return builder_.CreateCall(obFn,
+        llvm::Value* e = builder_.CreateCall(obFn,
             {src, closure, tramp, builder_.getInt32(desc)}, "linq.orderby");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
     }
     // stdlib §5 Combination: Concat(other) — yield all of self, then all of
     // `other`. Lower `other` (an Array<T> or lazy IEnumerable<T>) to its own lazy
@@ -5604,9 +5659,10 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         const char* rt = (m == "TakeWhile") ? "bz_lazy_takewhile"
                                             : "bz_lazy_skipwhile";
         auto* fn = declareC(rt, ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
-        return builder_.CreateCall(fn, {src, closure, tramp},
+        llvm::Value* e = builder_.CreateCall(fn, {src, closure, tramp},
                                    m == "TakeWhile" ? "linq.takewhile"
                                                     : "linq.skipwhile");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
     }
     // stdlib §5 Projection: SelectMany(selector: (T)->IEnumerable<U>) — flatten.
     // The selector returns an inner collection; the trampoline wraps it as a lazy
@@ -5628,8 +5684,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Function* tramp = buildSelectManyTrampoline(elemTy, innerEsz);
         auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
                               {ptrTy(), i64(), ptrTy(), ptrTy()});
-        return builder_.CreateCall(smFn,
+        llvm::Value* e = builder_.CreateCall(smFn,
             {src, builder_.getInt64(innerEsz), closure, tramp}, "linq.selectmany");
+        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
     }
     // stdlib §5 Combination: Zip<U,R>(other, combine: (T,U)->R) — pair positionally.
     if (m == "Zip" && call.args.size() == 2 &&
@@ -5665,8 +5722,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         int64_t outEsz = lazyElemSize(outTy);
         auto* zipFn = declareC("bz_lazy_zip", ptrTy(),
                                {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
-        return builder_.CreateCall(zipFn,
+        llvm::Value* e = builder_.CreateCall(zipFn,
             {src, down, builder_.getInt64(outEsz), closure, tramp}, "linq.zip");
+        return ownClosureIf(e, argIsInlineLambda(1));  // #422: combine is args[1]
     }
     return nullptr;
 }
