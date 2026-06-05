@@ -1095,6 +1095,31 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
 void ExprTC::checkImportedNewExprArgs(
     const ast::NewExpr& ne, TypeSymbol* t,
     const std::vector<ConstructorSymbol*>& ctors) {
+    // §14 / §2.5 / §2.6 (issue #328 FINDING [2]): constructing an IMPORTED
+    // GENERIC type is not yet supported. Generics are monomorphized
+    // per-instantiation (§14), so a generic template exports NO stable
+    // `bz$<Type>$init`/`$ctor` symbol the importer could link against; and the
+    // dependency metadata carries only the type's PUBLIC SIGNATURE — no
+    // constructor body, no field initializers (see ModuleMetadata) — so the
+    // importer cannot monomorphize `T<Args>` at its use site the way a LOCAL
+    // `new T<Args>(...)` does (which inlines the AST ctor body + field inits).
+    // Reject the construction here with an honest diagnostic instead of letting
+    // codegen emit a dangling external `bz$<Type>$init` reference that yields a
+    // cryptic `undefined reference` at link time. (Full support would require
+    // exporting the generic body in metadata so the importer can monomorphize —
+    // a larger feature, deferred. Imported generic STATIC METHODS and LOCAL
+    // generic instantiation are unaffected — only imported generic-type `new`.)
+    if (!t->genericParams.empty()) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            std::string("constructing an imported generic type (`new ") +
+                std::string(t->name) +
+                "<...>`) is not yet supported: a generic type is monomorphized "
+                "per-instantiation (\xC2\xA7""14) and its body is not carried in "
+                "the dependency's metadata, so it cannot be instantiated across "
+                "a module boundary (\xC2\xA7""2.5)");
+        return;
+    }
     if (ctors.empty()) {
         // §22.7: no declared ctor → implicit default takes zero arguments.
         if (!ne.args.empty())

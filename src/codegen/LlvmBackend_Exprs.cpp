@@ -2546,21 +2546,30 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     llvm::Value* obj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), sizeofSt});
 
-    // §2.5 / §2.6 / §22.8 step 1+2 (issue #328 item 2+3): for an IMPORTED type
-    // the vtable, field initializers and event-source initializers all live in
-    // the dependency (the in-module init below reads `m->decl`/`genericSubst_`,
-    // which an imported symbol does not carry — so an inline replay would miss a
-    // non-foldable initializer AND never install the external vtable). Call the
-    // linked `bz$<Type>$init(this)` instead, so the EXPORTER's emitInstanceInit
-    // runs cross-module: it installs the type's external vtable (correct virtual
-    // dispatch + slot-1 Dispose) and runs every §22.8 step-2 field initializer
-    // regardless of foldability. The constructor call (below) then runs the ctor
-    // body. This supersedes the old constant-foldable-only replay.
-    if (ctx_.isImported(t)) {
+    // §14 / §2.5 / §2.6 (issue #328 FINDING [2]): an IMPORTED GENERIC type has
+    // NO stable per-type symbols to link against — a generic is monomorphized
+    // per-instantiation (§14), so the dependency emits no `bz$<Type>$init` (the
+    // declareFunctions carve-out exports init only for non-generic public types)
+    // and its `bz$<Type>$ctor` is the template (T→i32), not this instantiation.
+    // Sema rejects `new ImportedGeneric<...>(...)` before codegen runs
+    // (checkImportedNewExprArgs), so this branch is normally unreachable for a
+    // generic imported type; the guard is a BACKSTOP so codegen never emits a
+    // dangling external `bz$<Type>$init`/`$ctor` reference (the FINDING [2] link
+    // failure) even if reached out-of-band. The bare calloc'd object is returned
+    // as-is. Full cross-module generic construction needs the generic body in
+    // metadata so the importer can monomorphize locally — a deferred feature.
+    const bool importedGeneric =
+        ctx_.isImported(t) && !t->genericParams.empty();
+    if (ctx_.isImported(t) && !importedGeneric) {
         llvm::Function* initFn = declareImportedInit(t);
         builder_.CreateCall(initFn, {obj});
-    } else {
+    } else if (!ctx_.isImported(t)) {
         emitInstanceInit(t, obj, st);
+    }
+    if (importedGeneric) {
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        return obj;  // decline: no dangling per-type symbol for a generic import
     }
 
     // CG10: run the explicit constructor (if any) after the field
