@@ -355,4 +355,227 @@ BEZEL_TEST(codegen_excdisp_03, dtor_field_dispose_plus_autodispose_no_double_fre
     expectExitAndLeakFree(kDtorDisposesFieldRepro, 0);
 }
 
+// --------------------------------------------------------------------------
+// [04] §22.9 / §28.3 — a constructor body that throws AFTER assigning an owned
+// field: the in-flight `new T(...)` instance and the assigned owned field are
+// disposed on the unwind (the field's destructor runs, both heap blocks are
+// reclaimed). Pre-fix: the partially-constructed instance and its owned field
+// leaked (Res destructor count == 0; ASan: 24B instance + 16B field).
+// --------------------------------------------------------------------------
+
+// §22.9 step-3 bullet: "An exception in the constructor body (step 3) triggers
+// disposal of every owned field assigned during initialization ... Owned fields
+// assigned imperatively in the body are also disposed if assigned successfully
+// before the throwing statement." Holder's ctor assigns `_r := new Res()` then
+// throws; on the unwind out of `new Holder()` the assigned `_r` is disposed
+// (Res destructor: count == 1) and the Holder instance block is reclaimed.
+const char* kCtorThrowAfterAssignCount =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Boom end Boom; "
+    "class Holder "
+    "  private owned _r: Res; "
+    "  public constructor() "
+    "    _r := new Res(); "
+    "    throw new Boom(); "
+    "  end constructor; "
+    "  destructor end destructor; "
+    "end Holder; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var h := new Holder(); "
+    "    catch Boom => Console.WriteLine(\"caught\"); end; "
+    "    return Res.count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_after_assign_disposes_owned_field) {
+    // Res destructor runs exactly once for the assigned owned field on unwind.
+    BEZEL_EXPECT_EQ(run(kCtorThrowAfterAssignCount), 1);
+}
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_after_assign_leak_free) {
+    // ASan/LSan-clean: the assigned owned field (16B) and the partially-built
+    // instance (24B) are both reclaimed exactly once; the caught Boom is freed
+    // when the handler completes. No double-free on the assigned field.
+    int lsan = runUnderLeakSanitizer(kCtorThrowAfterAssignCount);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// §22.9: a ctor that throws BEFORE assigning any owned field still reclaims the
+// partially-constructed instance (no owned-field disposal — the field is null).
+// Pre-fix: the 24-byte instance leaked. The owned field is declared NULLABLE
+// (`Res?`) so the program satisfies §7.9 definite-assignment with no body
+// assignment — the throw-before-assign scenario the finding describes — and the
+// full sema pipeline (DA + ownership) used by the ASan leg accepts it.
+const char* kCtorThrowBeforeAssign =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Boom end Boom; "
+    "class Holder "
+    "  private owned _r: Res?; "
+    "  public constructor() "
+    "    throw new Boom(); "
+    "  end constructor; "
+    "  destructor end destructor; "
+    "end Holder; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var h := new Holder(); "
+    "    catch Boom => Console.WriteLine(\"caught\"); end; "
+    "    return Res.count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_before_assign_no_field_dispose) {
+    // No owned field was assigned → no disposal (the null `_r` is skipped).
+    BEZEL_EXPECT_EQ(run(kCtorThrowBeforeAssign), 0);
+}
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_before_assign_instance_reclaimed) {
+    // ASan/LSan-clean: the partially-built instance (24B) is reclaimed; the
+    // null owned field is correctly skipped (no spurious dispatch / free).
+    int lsan = runUnderLeakSanitizer(kCtorThrowBeforeAssign);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// §22.9: a ctor that assigns TWO owned fields then throws — both are disposed,
+// in reverse declaration order, exactly once. The counter (2) proves both
+// destructors ran; ASan proves no double-free.
+const char* kCtorThrowAfterTwoFields =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Boom end Boom; "
+    "class Holder "
+    "  private owned _a: Res; "
+    "  private owned _b: Res; "
+    "  public constructor() "
+    "    _a := new Res(); "
+    "    _b := new Res(); "
+    "    throw new Boom(); "
+    "  end constructor; "
+    "  destructor end destructor; "
+    "end Holder; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var h := new Holder(); "
+    "    catch Boom => Console.WriteLine(\"caught\"); end; "
+    "    return Res.count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_after_two_fields_both_disposed) {
+    // Both assigned owned fields disposed (count == 2), each exactly once.
+    BEZEL_EXPECT_EQ(run(kCtorThrowAfterTwoFields), 2);
+}
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_after_two_fields_leak_free) {
+    // ASan/LSan-clean: both owned fields and the instance reclaimed, no
+    // double-free (reverse-order disposal, each null-guarded slot once).
+    int lsan = runUnderLeakSanitizer(kCtorThrowAfterTwoFields);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// CONTROL (§28.4): a ctor that COMPLETES normally → the instance + its owned
+// field are disposed exactly once at scope end, with NO double-free introduced
+// by the new unwind-cleanup path (it must fire ONLY on the throw edge). The
+// owned field's destructor runs once when the `using var` is disposed.
+const char* kCtorCompletesControl =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Holder "
+    "  private owned _r: Res; "
+    "  public constructor() "
+    "    _r := new Res(); "
+    "  end constructor; "
+    "  destructor end destructor; "
+    "end Holder; "
+    "class C "
+    "  public static method Main(): int "
+    "    do "
+    "      using var h := new Holder(); "
+    "    end; "
+    "    return Res.count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_04, ctor_completes_normally_field_disposed_once) {
+    // Normal completion: the owned field's destructor runs exactly once at
+    // scope end (count == 1) — the new throw-path cleanup did NOT also fire.
+    BEZEL_EXPECT_EQ(run(kCtorCompletesControl), 1);
+}
+
+BEZEL_TEST(codegen_excdisp_04, ctor_completes_normally_no_double_free) {
+    // Exit 1 AND ASan/LSan-clean: no exception is thrown, so the unwind-cleanup
+    // path must NOT fire — the field + instance are disposed exactly once at
+    // scope end (no double-free, the cardinal risk of this fix).
+    expectExitAndLeakFree(kCtorCompletesControl, 1);
+}
+
+// §22.9: a throwing ctor whose `new` result is DROPPED (not bound to a `using
+// var`) is still cleaned up — the unwind cleanup lives in the ctor / call site,
+// independent of how the caller would have bound the result.
+const char* kCtorThrowResultDropped =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Boom end Boom; "
+    "class Holder "
+    "  private owned _r: Res; "
+    "  public constructor() "
+    "    _r := new Res(); "
+    "    throw new Boom(); "
+    "  end constructor; "
+    "  destructor end destructor; "
+    "end Holder; "
+    "class C "
+    "  public static method Use() "
+    "    new Holder(); "
+    "  end Use; "
+    "  public static method Main(): int "
+    "    try "
+    "      Use(); "
+    "    catch Boom => Console.WriteLine(\"caught\"); end; "
+    "    return Res.count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_result_dropped_still_cleaned) {
+    // The dropped `new Holder()` whose ctor throws still disposes its assigned
+    // owned field (count == 1) on the unwind.
+    BEZEL_EXPECT_EQ(run(kCtorThrowResultDropped), 1);
+}
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_result_dropped_leak_free) {
+    // ASan/LSan-clean even with the result dropped.
+    int lsan = runUnderLeakSanitizer(kCtorThrowResultDropped);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
 }  // namespace

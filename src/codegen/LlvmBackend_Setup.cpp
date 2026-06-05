@@ -1294,6 +1294,29 @@ void Emitter::emitPendingCheck() {
 }
 
 
+void Emitter::emitNewPendingCheck(llvm::Value* obj) {
+    // §22.9 / §28.3 (FINDING [4]): same as emitPendingCheck, but on the unwind
+    // edge ALSO reclaim the in-flight instance block `obj` whose constructor
+    // threw. The ctor's own cleanup disposed the owned fields it had assigned and
+    // the base subobject (it does not free `this`); freeing the block here — the
+    // allocating site — reclaims it exactly once. This branch is taken only when
+    // the ctor set the pending exception, so the free never reaches a normally-
+    // constructed object (which is reclaimed later by its owning slot).
+    llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
+    llvm::Value* pending = builder_.CreateICmpNE(
+        exc, llvm::ConstantPointerNull::get(ptrTy()));
+    auto* unwind =
+        llvm::BasicBlock::Create(llvm_, "new.unwind", currentFn_);
+    auto* cont = llvm::BasicBlock::Create(llvm_, "new.cont", currentFn_);
+    builder_.CreateCondBr(pending, unwind, cont);
+    builder_.SetInsertPoint(unwind);
+    builder_.CreateCall(freeFn(), {obj});  // reclaim the instance block once
+    emitUnwindDisposals();
+    builder_.CreateBr(unwindBB());
+    builder_.SetInsertPoint(cont);
+}
+
+
 void Emitter::emitDynamicDispose(llvm::Value* obj) {
     // §28.2 / §28.4: dispatch the object's PUBLIC, idempotent Dispose through
     // its vtable (slot 1) — which runs the destructor body, owned-field
@@ -1645,8 +1668,59 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         emitImplicitBase(cs->parent, currentThis_);
     }
     // CG20: a base/this constructor (the chain) may throw — unwind
-    // before running the rest of this constructor's body.
+    // before running the rest of this constructor's body. §22.9 step-1: an
+    // exception during the base/chained ctor "leaves no derived state to clean
+    // up — the base ctor's own exception-safety logic disposes ... the base
+    // subobject." This emitPendingCheck routes such a throw to the BARE
+    // propagate block (no derived field/base disposal); the instance block is
+    // reclaimed by the `new` site (emitNewPendingCheck). It is intentionally
+    // emitted BEFORE installing the body's cleanup propagate (below), so the
+    // base-call throw does not run the derived cleanup.
     emitPendingCheck();
+
+    // §22.9 step-3 (FINDING [4]): install a constructor-cleanup block as the
+    // propagate target for the BODY. An exception in the ctor body (step 3) must
+    // dispose "every owned field assigned during initialization (step 2) and the
+    // base subobject" — and owned fields assigned imperatively in the body —
+    // before the exception leaves the ctor. emitOwnedFieldDisposals disposes
+    // exactly the assigned subset: each owned field is null-guarded, and an
+    // unassigned field is calloc-zeroed (null) so its disposal is a no-op; an
+    // assigned field is non-null and is disposed (reverse declaration order) and
+    // its slot nulled, so it cannot be disposed twice. emitBaseDisposeChain then
+    // disposes the (fully-constructed, since the base ctor completed) base
+    // subobject. `this` is NOT freed here — only the `new` site frees the block
+    // (emitNewPendingCheck), exactly once, avoiding any double-free with an
+    // enclosing base-ctor frame in an inheritance chain. This cleanup fires only
+    // on the throw edge; normal completion falls through to the RetVoid below and
+    // the instance is disposed later by its owning slot (no double-free).
+    //
+    // Pre-seeding propagateBB_ makes every body exception edge (a direct throw, a
+    // call that throws, or a try with no matching catch re-propagating) route
+    // here: lowerTry's outerUnwind and emitThrow/emitPendingCheck all fall back
+    // to propagateBB() when no enclosing handler is set.
+    bool hasOwnedToClean = false;
+    for (const sema::Symbol* m : cs->parent->members) {
+        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+        if (fs && (isOwnedReferenceField(fs) ||
+                   isOwnedBuiltinExceptionField(fs) ||
+                   ownedCollectionFieldType(fs))) {
+            hasOwnedToClean = true;
+            break;
+        }
+    }
+    if (hasOwnedToClean || baseClassOf(cs->parent)) {
+        auto* savedInsert = builder_.GetInsertBlock();
+        auto* cleanupBB =
+            llvm::BasicBlock::Create(llvm_, "ctor.cleanup", currentFn_);
+        builder_.SetInsertPoint(cleanupBB);
+        emitOwnedFieldDisposals(cs->parent);   // assigned owned fields (reverse)
+        emitBaseDisposeChain(cs->parent);      // the base subobject
+        builder_.CreateRetVoid();              // exc stays set; `new` site frees
+        if (savedInsert) builder_.SetInsertPoint(savedInsert);
+        // Route the body's exception edges to the cleanup block. The bare
+        // propagate (used by the base-call check above) keeps its own block.
+        propagateBB_ = cleanupBB;
+    }
 
     bool terminated = lowerScopedBlock(cd->body, startIdx);
     if (!terminated) builder_.CreateRetVoid();

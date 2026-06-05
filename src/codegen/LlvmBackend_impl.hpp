@@ -1499,6 +1499,18 @@ private:
     // first), else continue.
     void emitPendingCheck();
 
+    // §22.9 / §28.3 (FINDING [4]): the new-expression variant of emitPendingCheck.
+    // When the constructor of an in-flight `new T(...)` throws, the freshly-
+    // calloc'd instance `obj` is never bound to a `using var`/scope, so the
+    // ordinary scope-end / owned-local unwind disposal never reclaims it — it
+    // leaks. The constructor's own cleanup path has already disposed the owned
+    // fields it assigned (and the base subobject) WITHOUT freeing `this` (the
+    // ctor never frees the block it did not allocate). So on the unwind edge here
+    // — the sole site that allocated `obj` — reclaim the instance block exactly
+    // once with `free`. This fires ONLY on the throw edge; on normal completion
+    // `obj` flows out as a normal owned value disposed later by its owning slot.
+    void emitNewPendingCheck(llvm::Value* obj);
+
     // §28.2 / §28.4: dispatch an object's PUBLIC idempotent Dispose through its
     // vtable (slot 1) — runs the destructor + owned fields + base chain at most
     // once. Does NOT free the block. `obj` must be non-null. Used as the dispatch

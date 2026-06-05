@@ -2689,7 +2689,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if (ok && args.size() == ctorFn->arg_size())
                 builder_.CreateCall(ctorFn, args);
         }
-        emitPendingCheck();  // CG20: an imported constructor may throw
+        // §22.9 / §28.3 (FINDING [4]): an imported constructor may throw. As for
+        // an in-module ctor, the imported ctor (compiled by this same compiler in
+        // the dependency) disposes its assigned owned fields + base subobject on
+        // its own unwind path without freeing `this`; reclaim the instance block
+        // here, the allocating site, exactly once on the unwind edge.
+        emitNewPendingCheck(obj);  // CG20: an imported constructor may throw
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         return obj;
@@ -2724,12 +2729,33 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
 
                 if (!typesMismatch && !needsInlineForLayout) {
                     builder_.CreateCall(it->second, args);
+                    // §22.9 / §28.3 (FINDING [4]): the called ctor disposed its
+                    // assigned owned fields + base subobject on its own unwind
+                    // path (without freeing `this`); reclaim the instance block
+                    // here on the throw edge.
+                    emitNewPendingCheck(obj);
                 } else {
                     // Inline the constructor body with the generic
                     // substitution so field stores use concrete types.
+                    //
+                    // §22.9 / §28.3 (FINDING [4]): the body is inlined into THIS
+                    // frame, so its exception edges route to this function's
+                    // unwind chain — not a dedicated ctor cleanup block. Build a
+                    // cleanup block that disposes the assigned owned fields + base
+                    // subobject (with the generic substitution still active, so an
+                    // owned type-parameter field is classified by its concrete
+                    // type), frees the instance block, then continues to the
+                    // ENCLOSING unwind. Route the inlined body's exceptions to it
+                    // by setting unwindTarget_ = cleanupBB for the body (and
+                    // unwindScopeDepth_ to the current dispose depth, so unwound
+                    // owned locals of the body are disposed first). Saved/restored
+                    // around the body. This mirrors emitConstructorBody's cleanup
+                    // for the called-ctor case.
                     llvm::Value* savedThis = currentThis_;
                     auto savedLocals = locals_;
                     auto savedParams = paramSlots_;
+                    llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
+                    std::size_t savedUnwindDepth = unwindScopeDepth_;
                     currentThis_ = obj;
                     locals_.clear();
                     paramSlots_.clear();
@@ -2739,19 +2765,37 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         builder_.CreateStore(args[pi + 1], slot);
                         paramSlots_[cs->params[pi]] = slot;
                     }
+                    // Capture the enclosing unwind destination (BEFORE we
+                    // override unwindTarget_) so the cleanup re-propagates there.
+                    auto* savedInsert = builder_.GetInsertBlock();
+                    llvm::BasicBlock* enclosingUnwind = unwindBB();
+                    auto* cleanupBB = llvm::BasicBlock::Create(
+                        llvm_, "ctor.inline.cleanup", currentFn_);
+                    builder_.SetInsertPoint(cleanupBB);
+                    emitOwnedFieldDisposals(t);
+                    emitBaseDisposeChain(t);
+                    builder_.CreateCall(freeFn(), {obj});
+                    builder_.CreateBr(enclosingUnwind);
+                    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+                    unwindTarget_ = cleanupBB;
+                    unwindScopeDepth_ = disposeStack_.size();
                     lowerScopedBlock(cd->body);
+                    unwindTarget_ = savedUnwindTarget;
+                    unwindScopeDepth_ = savedUnwindDepth;
                     currentThis_ = savedThis;
                     locals_ = std::move(savedLocals);
                     paramSlots_ = std::move(savedParams);
                 }
-                emitPendingCheck();  // CG20: a constructor may throw
             }
         }
     } else if (!hasAnyConstructor(t)) {
         // CG16: no explicit ctor → the implicit ctor runs an implicit
         // `base()`, so a base-class ctor still runs on `new Derived()`.
         emitImplicitBase(t, obj);
-        emitPendingCheck();  // CG20: the base constructor may throw
+        // §22.9 / §28.3 (FINDING [4]): the implicit base ctor may throw; the
+        // base ctor's own cleanup disposed the base subobject without freeing
+        // `this`, so reclaim the instance block here on the throw edge.
+        emitNewPendingCheck(obj);  // CG20: the base constructor may throw
     }
     // CG-generic: record the substitution for this new object so that
     // lowerLocalDecl can associate it correctly even when the outer
