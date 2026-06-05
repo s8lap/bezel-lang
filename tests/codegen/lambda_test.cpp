@@ -357,3 +357,47 @@ BEZEL_TEST(codegen_cg60, array_element_string_return) {
         "    return r0.Length + r1.Length; "  // 3+5=8
         "  end Main; end C;"), 8);
 }
+
+// ── §27.6 / issue #436: instance method references in value position ─────────
+// A bare `obj.Method` (no parens) is a method reference — a `() -> R` value.
+// The CORRECT forms below must still compile and produce the right result.
+
+BEZEL_TEST(codegen_cg60, instance_method_ref_stored_then_called) {
+    // §27.6: `var f: () -> int := a.GetVal; return f();` — store instance
+    // method reference in a function-typed local, then call it.  This is the
+    // canonical idiom and must produce the method's return value (42).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A "
+        "  public _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  destructor end destructor; "
+        "  public method GetVal(): int => _v; "
+        "end A; "
+        "class C public static method Main(): int "
+        "  using var a := new A(42); "
+        "  var f: () -> int := a.GetVal; "
+        "  return f(); "
+        "end Main; end C;"), 42);
+}
+
+BEZEL_TEST(codegen_cg60, instance_method_ref_passed_as_arg) {
+    // §27.6: pass `a.GetVal` where a `() -> int` parameter is expected.
+    // The method reference must be bound to the receiver `a` and the
+    // invocation inside Apply must return the receiver's value (7).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class A "
+        "  public _v: int := 0; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  destructor end destructor; "
+        "  public method GetVal(): int => _v; "
+        "end A; "
+        "class C "
+        "  public static method Apply(f: () -> int): int return f(); end Apply; "
+        "  public static method Main(): int "
+        "    using var a := new A(7); "
+        "    return Apply(a.GetVal); "
+        "  end Main; "
+        "end C;"), 7);
+}

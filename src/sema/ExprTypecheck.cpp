@@ -697,6 +697,18 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         reportNotConvertible();
         return;
     }
+    // §27.6 / §5.1 (issue #436): a bare method reference has a Function type.
+    // A Function value is not implicitly convertible to a non-Function type
+    // (Primitive or Named). Report a type mismatch so the user sees a clean
+    // §5.1 error instead of producing malformed IR.  Function-to-Function
+    // compatibility (e.g. `var f: () -> int := obj.Method`) is left to a
+    // future function-type signature-matching slice; for now it passes silently
+    // (the existing codegen path handles it correctly).
+    if (from->kind == TypeRef::Kind::Function &&
+        to->kind != TypeRef::Kind::Function) {
+        reportNotConvertible();
+        return;
+    }
     // Mixed / generic-parameter / null-literal cases: skip.
 }
 
