@@ -2757,6 +2757,42 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         et->kind = TypeRef::Kind::Named;
         et->declaration = targetType;
         ctx_.setExprType(&ma, et);
+    } else if (auto* ms = dynamic_cast<MethodSymbol*>(member)) {
+        // §27.6 (issue #436): a bare `obj.Method` in value position (not the
+        // callee of a CallExpr) is a method reference — a function value of
+        // type `(paramTypes) -> returnType`. Assign a Function TypeRef here so
+        // that downstream assignability checks (return-type §5.1 slice T3,
+        // local-init §5.1 slice T1, assignment §5.1 slice T2) can detect a
+        // type mismatch (e.g. `return a.GetVal;` where the method returns `int`
+        // — the function type `() -> int` is not assignable to `int`).
+        //
+        // The call-expression handler (typeCall) reads the callee's exprSymbol,
+        // not exprType, so assigning a Function type here does NOT affect
+        // `obj.Method(args)` — the call is still typed via the MethodSymbol.
+        auto* ft = ctx_.makeTypeRef();
+        ft->kind = TypeRef::Kind::Function;
+        // Build parameter types from the method's ParameterSymbol list.
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        for (auto* psym : ms->params) {
+            auto* par = dynamic_cast<ParameterSymbol*>(psym);
+            if (!par) continue;
+            TypeRef::FuncParam fp;
+            fp.modifier = par->modifier;
+            fp.name = par->name;
+            if (par->declType)
+                fp.type = ctx_.resolvedType(*par->declType);
+            ft->funcParams.push_back(fp);
+        }
+        // Return type: from MethodDecl->returnType, or unit when absent.
+        if (md && md->returnType) {
+            ft->funcReturn = ctx_.resolvedType(*md->returnType);
+            ft->funcReturnOwned = md->returnOwned;
+        } else {
+            auto* unit = ctx_.makeTypeRef();
+            unit->kind = TypeRef::Kind::Unit;
+            ft->funcReturn = unit;
+        }
+        ctx_.setExprType(&ma, ft);
     }
 }
 
