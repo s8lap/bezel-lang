@@ -168,6 +168,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_owned_field_disposal_test.cpp
     codegen/owned_collection_disposal_test.cpp
     codegen/remove_equals_test.cpp
+    codegen/contains_indexof_equals_test.cpp
     codegen/inherited_fields_test.cpp
     codegen/ctor_chaining_test.cpp
     codegen/virtual_dispatch_test.cpp
