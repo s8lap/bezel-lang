@@ -3020,6 +3020,72 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
 }
 
 
+// stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes[,i,c]).
+// The call's callee is `(Encoding.Utf8).GetBytes` — a member access whose TARGET
+// is itself the member access `Encoding.Utf8`. We match that two-level shape:
+//   ma          = (Encoding.Utf8).GetBytes        (the callee)
+//   ma->target  = Encoding.Utf8                    (a MemberAccessExpr)
+//   inner       = Encoding.Utf8 — inner->target is the `Encoding` identifier,
+//                 inner->member is the singleton name (Utf8/Utf16/Utf32/Ascii).
+// Only Utf8 is implemented (see bz_encoding_*); the others are rejected in sema,
+// so we never reach codegen for them — defensively return null if seen here.
+llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get());
+    if (!inner || !inner->target) return nullptr;
+    auto* clsId = dynamic_cast<const ast::IdentifierExpr*>(inner->target.get());
+    if (!clsId || clsId->name != "Encoding") return nullptr;
+    // Only the Utf8 singleton is implemented (§3.2). Utf16/Utf32/Ascii are
+    // deferred; sema rejects them, so this guard is a defensive backstop.
+    if (inner->member != "Utf8") return nullptr;
+
+    const auto& m = ma->member;
+
+    // GetBytes(s): owned Array<byte> — UTF-8 encode the string into a fresh
+    // bz_array_t* of bytes (elem_size 1). The result is owned by the caller.
+    if (m == "GetBytes" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* strPtr = lowerExpr(*call.args[0].value);
+        if (!strPtr) return nullptr;
+        auto* fn = declareC("bz_encoding_utf8_get_bytes", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {strPtr}, "enc.bytes");
+    }
+
+    // GetString(bytes): string — decode the whole array (index 0, count Length).
+    // GetString(bytes, index, count): string — decode the requested sub-range.
+    if (m == "GetString" &&
+        (call.args.size() == 1 || call.args.size() == 3) &&
+        call.args[0].value) {
+        llvm::Value* arr = lowerExpr(*call.args[0].value);
+        if (!arr) return nullptr;
+        llvm::Value* index;
+        llvm::Value* count;
+        if (call.args.size() == 1) {
+            // index = 0, count = bz_array_len(arr).
+            index = builder_.getInt64(0);
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            count = builder_.CreateCall(lenFn, {arr}, "enc.arrlen");
+        } else {
+            if (!call.args[1].value || !call.args[2].value) return nullptr;
+            llvm::Value* iv = lowerExpr(*call.args[1].value);
+            llvm::Value* cv = lowerExpr(*call.args[2].value);
+            if (!iv || !cv) return nullptr;
+            // §3.2 index/count are `int` (i32); widen to the runtime's i64.
+            index = iv->getType()->isIntegerTy(64)
+                        ? iv : builder_.CreateSExt(iv, i64(), "enc.idx");
+            count = cv->getType()->isIntegerTy(64)
+                        ? cv : builder_.CreateSExt(cv, i64(), "enc.cnt");
+        }
+        auto* fn = declareC("bz_encoding_utf8_get_string", ptrTy(),
+                            {ptrTy(), i64(), i64()});
+        return builder_.CreateCall(fn, {arr, index, count}, "enc.str");
+    }
+
+    return nullptr;
+}
+
+
 llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -3853,6 +3919,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* v = tryLowerLazyLinqCall(call)) return v;
     // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
+    // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
+    if (auto* v = tryLowerEncodingCall(call)) return v;
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
     if (auto* v = tryLowerBuiltinClassCall(call)) return v;
     // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a

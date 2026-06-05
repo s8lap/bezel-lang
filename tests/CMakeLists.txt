@@ -159,6 +159,7 @@ set(BEZEL_TEST_SOURCES
     codegen/undisposed_leak_test.cpp
     codegen/console_write_leak_test.cpp
     codegen/string_refcount_test.cpp
+    codegen/encoding_test.cpp
     codegen/closure_refcount_test.cpp
     codegen/box_refcount_test.cpp
     codegen/owned_field_disposal_test.cpp

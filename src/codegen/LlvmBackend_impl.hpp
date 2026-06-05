@@ -2470,6 +2470,12 @@ private:
     // as intrinsic static class method calls. Returns a lowered value or null.
     llvm::Value* tryLowerBuiltinClassCall(const ast::CallExpr& call);
 
+    // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
+    // The callee is a member access whose target is itself `Encoding.<singleton>`.
+    // Only the Utf8 singleton is implemented; the others are rejected. Returns a
+    // lowered value (owned Array<byte> or string), or null if not this shape.
+    llvm::Value* tryLowerEncodingCall(const ast::CallExpr& call);
+
     // §3.4: static methods on primitive type names — `int.Parse(s)`,
     // `double.Parse(s)`, etc. The target is a primitive keyword identifier.
     llvm::Value* tryLowerPrimitiveStaticCall(const ast::CallExpr& call);
