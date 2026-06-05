@@ -136,7 +136,15 @@ struct ConstMemberSymbol : MemberSymbol {
     bool isStatic = false;
 };
 
-struct EnumConstantSymbol : MemberSymbol {};
+struct EnumConstantSymbol : MemberSymbol {
+    // §10/§10.2: the constant's underlying integer value. For an IMPORTED enum
+    // the symbol is reconstructed from dependency metadata (which carries the
+    // value, issue #328 FINDING [1]) and has no AST TypeDecl, so codegen reads
+    // this field instead of re-deriving from the (absent) AST. For a LOCAL enum
+    // codegen still derives values from the AST in computeEnumValues(); this
+    // field is the cross-module carrier. Defaults to 0 when not set.
+    std::int64_t value = 0;
+};
 
 // Nested type — a TypeSymbol that lives inside another TypeSymbol's
 // members. Same shape; the parent pointer is captured by the enclosing
