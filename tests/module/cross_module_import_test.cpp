@@ -216,6 +216,49 @@ BEZEL_TEST(cross_module_import, sibling_named_type_resolves_spec_2_5) {
     }
 }
 
+// §11.7 (FINDING [6]): a `sealed abstract` (closed abstract) base may be
+// inherited only *within its declaring module*. The importer App imports a
+// `sealed abstract` Shape from Lib and declares a local `class Local : Shape` —
+// a CROSS-module derivation of the closed-abstract base — which the compiler
+// must reject ("the compiler rejects subclasses in other modules", §11.7). The
+// base arrives flagged as imported, so the inheritance gate distinguishes it
+// from a same-module base.
+BEZEL_TEST(cross_module_import, sealed_abstract_cross_module_subclass_rejected_spec_11_7) {
+    ModuleMetadata dep = buildMetaFor(
+        "module ShapeLib; "
+        "public sealed abstract class Shape "
+        "  public abstract method Area(): int; "
+        "end Shape;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import ShapeLib; "
+        "public class Local : Shape "  // cross-module subclass of closed base
+        "  public override method Area(): int => 1; "
+        "end Local;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
+// §11.7 control: importing and *using* a closed-abstract type (without
+// subclassing it across the boundary) is fine. App imports ShapeLib's `Shape`
+// and merely names it as a method-parameter type — no cross-module derivation,
+// so no error. Isolates the rejection above to the inheritance gate.
+BEZEL_TEST(cross_module_import, imported_sealed_abstract_use_without_subclass_ok_spec_11_7) {
+    ModuleMetadata dep = buildMetaFor(
+        "module ShapeLib; "
+        "public sealed abstract class Shape "
+        "  public abstract method Area(): int; "
+        "end Shape;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import ShapeLib; "
+        "public class Program "
+        "  public static method AreaOf(s: Shape): int => s.Area(); "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
 // --- full end-to-end build (the headline test) ------------------------------
 //
 // §2.6: compile module A (exports public static methods) → a native OBJECT with
