@@ -578,4 +578,54 @@ BEZEL_TEST(codegen_excdisp_04, ctor_throw_result_dropped_leak_free) {
     BEZEL_EXPECT_EQ(lsan, 0);
 }
 
+// §22.9 / §28.4 + §7.1: a ctor that assigns a NULLABLE owned reference field
+// (`owned _r: Res?`) NON-null, then throws — the assigned non-null field is
+// disposed on the unwind, exactly once. This composes the §22.9 ctor-unwind
+// cleanup with the nullable-owned-field classification: a reference `T?` is a
+// nullable pointer (§7.1), so `isOwnedReferenceField` classifies `Res?` by its
+// inner class (the `nullable` flag rides on the same Named TypeRef, not a
+// separate wrapper), and the unwind cleanup reuses `emitOwnedFieldDisposals`,
+// whose load-then-null-guard disposes the non-null slot. The pre-existing
+// `kCtorThrowBeforeAssign` test pins the complementary NULL case (a
+// never-assigned `Res?` disposes nothing); this pins the non-null case the
+// ctor-throw lane surfaced.
+const char* kCtorThrowAfterNullableAssign =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Boom end Boom; "
+    "class Holder "
+    "  private owned _r: Res?; "
+    "  public constructor() "
+    "    _r := new Res(); "
+    "    throw new Boom(); "
+    "  end constructor; "
+    "  destructor end destructor; "
+    "end Holder; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var h := new Holder(); "
+    "    catch Boom => Console.WriteLine(\"caught\"); end; "
+    "    return Res.count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_after_nullable_assign_field_disposed) {
+    // The assigned non-null nullable owned field is disposed on the unwind
+    // (count == 1) — the §22.9 cleanup classifies and disposes `Res?` too.
+    BEZEL_EXPECT_EQ(run(kCtorThrowAfterNullableAssign), 1);
+}
+
+BEZEL_TEST(codegen_excdisp_04, ctor_throw_after_nullable_assign_leak_free) {
+    // ASan/LSan-clean: the assigned nullable owned field and the partial
+    // instance are reclaimed exactly once; no double-free on the field slot.
+    int lsan = runUnderLeakSanitizer(kCtorThrowAfterNullableAssign);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
 }  // namespace

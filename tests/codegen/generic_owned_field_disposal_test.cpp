@@ -311,6 +311,37 @@ const char* kNonGenericControlDisposedOnce =
     "  end Main; "
     "end C;";
 
+// §28.5 + §7.1: a NULLABLE owned type-parameter field (`private owned _value:
+// T?`), instantiated with a class (T = Res). The field's declared type is the
+// type parameter with the `nullable` flag set; instantiation-time
+// classification resolves T → Res (a class), and the nullable wrapper is just
+// a nullable pointer (§7.1), so the specialized disposer disposes the
+// (non-null) referent exactly once → count 1. This composes the nullable
+// classification with the per-instantiation type-parameter path (#95): the
+// `nullable` flag does not block the bare-type-parameter shape detection nor
+// the concrete-substitution lookup. Pre-fix premise (a distinct nullable
+// wrapper) would have leaked the inner Res; this pins that it does not.
+const char* kNullableOwnedTypeParamField =
+    "module M; "
+    "class Res "
+    "  public static count: int := 0; "
+    "  public constructor() end constructor; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Box<T> "
+    "  private owned _value: T?; "
+    "  public constructor(owned v: T) _value := v; end constructor; "
+    "  destructor end destructor; "
+    "end Box; "
+    "class C "
+    "  public static method Main(): int "
+    "    do "
+    "      using var b := new Box<Res>(new Res()); "
+    "    end; "
+    "    return Res.count; "                  // 1
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // --- Tests ---------------------------------------------------------------
@@ -349,4 +380,12 @@ BEZEL_TEST(codegen_generic_owned_field, non_generic_control_disposed_once_28_5) 
     // CONTROL: the non-generic owned-class-field path is unchanged (no
     // regression) — disposed exactly once, LSan-clean.
     expectValueAndLeakFree(kNonGenericControlDisposedOnce, 1);
+}
+
+BEZEL_TEST(codegen_generic_owned_field, nullable_owned_type_param_field_28_5) {
+    // §28.5 + §7.1: a nullable owned type-parameter field (`owned _value: T?`,
+    // T = Res) is disposed exactly once when instantiated with a class — the
+    // nullable flag composes with the per-instantiation type-parameter
+    // classification → count 1, LSan-clean.
+    expectValueAndLeakFree(kNullableOwnedTypeParamField, 1);
 }
