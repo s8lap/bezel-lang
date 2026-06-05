@@ -164,6 +164,7 @@ set(BEZEL_TEST_SOURCES
     codegen/linq_refcount_test.cpp
     codegen/box_refcount_test.cpp
     codegen/owned_field_disposal_test.cpp
+    codegen/generic_owned_field_disposal_test.cpp
     codegen/owned_collection_disposal_test.cpp
     codegen/remove_equals_test.cpp
     codegen/inherited_fields_test.cpp

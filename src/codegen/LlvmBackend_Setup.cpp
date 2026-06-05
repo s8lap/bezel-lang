@@ -1013,6 +1013,166 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
 }
 
 
+// §28.5: does `ts` declare at least one `owned` field whose type is one of its
+// own generic type parameters (`private owned _slot: T`)? Such a field is
+// classified — and so auto-disposed — at INSTANTIATION (the substituted type),
+// not in the shared type-erased disposer, so a class with one needs a per-
+// instantiation specialized Dispose/vtable.
+bool Emitter::classHasOwnedTypeParamField(const sema::TypeSymbol* ts) {
+    if (!ts) return false;
+    for (const sema::Symbol* m : ts->members) {
+        auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+        if (fs && isOwnedTypeParamFieldShape(fs)) return true;
+    }
+    return false;
+}
+
+
+// §28.5: build (once per instantiation) the specialized core + public disposer
+// for the active monomorphization of `ts`. Mirrors emitDisposerCore /
+// emitDisposerBody but is emitted with the current genericSubst_ active, so an
+// owned type-parameter field is laid out (the spec struct) and classified (the
+// substituted concrete type) correctly. `suffix` disambiguates the function
+// names across instantiations. Returns the public idempotent Dispose.
+//
+// State: the caller (lowerNew, mid-body) owns builder_/currentFn_/etc.; we save
+// the full disposer-emit state and the builder insert point and restore them so
+// the caller can continue emitting where it left off.
+llvm::Function* Emitter::emitSpecializedDisposer(const sema::TypeSymbol* ts,
+                                                 const std::string& suffix) {
+    auto* fnType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {ptrTy()}, /*isVarArg=*/false);
+    auto* pubFn = llvm::Function::Create(
+        fnType, llvm::Function::InternalLinkage,
+        "bz$" + std::string(ts->name) + "$Dispose" + suffix, module_.get());
+    auto* coreFn = llvm::Function::Create(
+        fnType, llvm::Function::InternalLinkage,
+        "bz$" + std::string(ts->name) + "$DisposeCore" + suffix, module_.get());
+
+    // Save all state the disposer-emit clobbers, plus the builder insert point.
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = locals_;
+    auto savedParamSlots = paramSlots_;
+    auto savedRefParams = refParams_;
+    auto savedDisposeStack = disposeStack_;
+    auto savedLoopStack = loopStack_;
+    auto savedFinallyStack = finallyStack_;
+    llvm::BasicBlock* savedPropagate = propagateBB_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::Value* savedCaughtExc = currentCaughtExc_;
+    std::string_view savedCaughtName = currentCaughtName_;
+    std::size_t savedScopeDepth = unwindScopeDepth_;
+    llvm::IRBuilder<>::InsertPoint savedIP = builder_.saveIP();
+
+    // The core (destructor body + owned-field disposal + base chain) and the
+    // public run-once wrapper — identical to emitDisposerCore / emitDisposerBody
+    // but specialized: genericSubst_ stays active so classStruct(ts) resolves to
+    // the spec struct and isOwnedReferenceField sees the concrete T.
+    emitDisposerCore(ts, coreFn);
+
+    currentFn_ = pubFn;
+    currentThis_ = &*pubFn->args().begin();
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    disposeStack_.clear();
+    loopStack_.clear(); finallyStack_.clear();
+    propagateBB_ = nullptr;
+    unwindTarget_ = nullptr;
+    currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
+    unwindScopeDepth_ = 0;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", pubFn));
+    llvm::StructType* st = classStruct(ts);
+    unsigned fi = disposedFlagIndex(ts);
+    llvm::Value* flagAddr =
+        builder_.CreateStructGEP(st, currentThis_, fi, "disposed.flag");
+    llvm::Value* already = builder_.CreateICmpNE(
+        builder_.CreateLoad(disposedFlagTy(), flagAddr),
+        llvm::ConstantInt::get(disposedFlagTy(), 0), "already.disposed");
+    auto* doBB = llvm::BasicBlock::Create(llvm_, "dispose.do", pubFn);
+    auto* retBB = llvm::BasicBlock::Create(llvm_, "dispose.ret", pubFn);
+    builder_.CreateCondBr(already, retBB, doBB);
+    builder_.SetInsertPoint(doBB);
+    builder_.CreateStore(llvm::ConstantInt::get(disposedFlagTy(), 1), flagAddr);
+    builder_.CreateCall(coreFn, {currentThis_});
+    builder_.CreateBr(retBB);
+    builder_.SetInsertPoint(retBB);
+    builder_.CreateRetVoid();
+
+    // Restore the caller's state and insert point.
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParamSlots);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);
+    propagateBB_ = savedPropagate;
+    unwindTarget_ = savedUnwind;
+    currentCaughtExc_ = savedCaughtExc;
+    currentCaughtName_ = savedCaughtName;
+    unwindScopeDepth_ = savedScopeDepth;
+    builder_.restoreIP(savedIP);
+    return pubFn;
+}
+
+
+// §28.5: the per-instantiation vtable to install in a freshly-constructed
+// instance of the active monomorphization of `ts`, in place of the shared
+// `vt$<T>`. Identical to the shared vtable except slot 1 (Dispose) is a
+// specialized disposer that classifies and disposes the class's owned type-
+// parameter field(s) using the active substitution. Falls back to the shared
+// vtable when the class needs no specialization. Cached per (class, spec field
+// types) so each distinct instantiation builds exactly one.
+llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) {
+    llvm::GlobalVariable* shared = vtableOf(ts);
+    // No specialization needed: no active substitution, or no owned type-param
+    // field. Use the shared vtable (the unchanged, type-erased disposer).
+    if (!shared || genericSubst_.empty() || !classHasOwnedTypeParamField(ts))
+        return shared;
+
+    // Key by the same spec field types as the instance struct so Box<Res> and
+    // Box<int> get distinct vtables (and distinct disposers).
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(ts, storage);
+    std::vector<llvm::Type*> specFieldTys;
+    specFieldTys.push_back(ptrTy());
+    specFieldTys.push_back(disposedFlagTy());
+    for (const sema::Symbol* m : storage)
+        specFieldTys.push_back(storageType(m));
+
+    auto& specMap = specializedVtables_[ts];
+    auto sit = specMap.find(specFieldTys);
+    if (sit != specMap.end()) return sit->second;
+
+    // Build the specialized disposer for THIS instantiation, then clone the
+    // shared vtable's initializer with slot 1 replaced by it. The shared vtable
+    // already has its full initializer (built in declareVtables, before bodies),
+    // so every other slot (descriptor, interface slots, virtual methods) carries
+    // over unchanged.
+    std::string suffix = "$spec" + std::to_string(specMap.size());
+    llvm::Function* specDispose = emitSpecializedDisposer(ts, suffix);
+
+    auto* arrTy = llvm::cast<llvm::ArrayType>(shared->getValueType());
+    auto* sharedInit = llvm::cast<llvm::ConstantArray>(shared->getInitializer());
+    std::vector<llvm::Constant*> elems;
+    elems.reserve(arrTy->getNumElements());
+    for (unsigned i = 0; i < arrTy->getNumElements(); ++i)
+        elems.push_back(sharedInit->getAggregateElement(i));
+    elems[1] = llvm::cast<llvm::Constant>(specDispose);  // slot 1 = Dispose
+    auto* init = llvm::ConstantArray::get(arrTy, elems);
+    auto* gv = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, init,
+        "vt$" + std::string(ts->name) + suffix);
+    specMap[specFieldTys] = gv;
+    return gv;
+}
+
+
 llvm::GlobalVariable* Emitter::excGlobal() {
     if (!excGlobal_) {
         excGlobal_ = new llvm::GlobalVariable(

@@ -1418,6 +1418,38 @@ private:
     // run-once flag and no free; the public Dispose guards it.
     void emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn);
 
+    // §28.5: does `ts` declare at least one `owned` field whose type is one of
+    // its own generic type parameters? Such a field is classified (and so auto-
+    // disposed) at INSTANTIATION, not in the shared type-erased disposer; a
+    // class with one needs a per-instantiation specialized Dispose/vtable.
+    static bool classHasOwnedTypeParamField(const sema::TypeSymbol* ts);
+
+    // §28.5: for the generic instantiation currently active in `genericSubst_`
+    // (e.g. Box<Res>), return the per-instantiation vtable global to install in
+    // a freshly-constructed instance, in place of the shared `vt$<T>`. Its slot
+    // 1 is a specialized Dispose that classifies and disposes the class's owned
+    // type-parameter field(s) using the active substitution (§28.5); all other
+    // slots are copied from the shared vtable. Returns the shared vtable when
+    // the class needs no specialization. Cached per (class, substituted field
+    // types) so each distinct instantiation builds exactly one.
+    llvm::GlobalVariable* specializedVtableFor(const sema::TypeSymbol* ts);
+
+    // §28.5: build the specialized core disposer for the active instantiation
+    // of `ts` — same shape as emitDisposerCore but emitted with the current
+    // `genericSubst_`/`genericSubstSemaTy_` active so that an owned type-
+    // parameter field is laid out (spec struct) and classified (substituted
+    // type) correctly. Returns the public idempotent Dispose wrapping it.
+    llvm::Function* emitSpecializedDisposer(const sema::TypeSymbol* ts,
+                                            const std::string& suffix);
+
+    // specializedVtables_[ts][substituted field types] = cached per-
+    // instantiation vtable global (slot 1 = specialized Dispose). Keyed by the
+    // same field-type vector as specializedStructs_ so distinct instantiations
+    // (Box<Res> vs Box<int>) get distinct vtables.
+    std::map<const sema::TypeSymbol*,
+             std::map<std::vector<llvm::Type*>, llvm::GlobalVariable*>>
+        specializedVtables_;
+
     // CG18 (§28.5): dispose the class's owned reference fields (class- OR
     // interface-typed) in reverse declaration order, null-checking each.
     // Disposal is DYNAMIC — dispatched through the field object's own
@@ -1584,16 +1616,87 @@ private:
         return false;
     }
 
-    // CG18: an `owned` field whose type is a reference type (class or
-    // interface) — the kinds that carry a Dispose and can be disposed
-    // dynamically through the held object's vtable.
+    // §28.5: if `fs` is an `owned` field whose declared type is a generic type
+    // PARAMETER of its enclosing class (`private owned _slot: T`), and there is
+    // an active monomorphization substitution that binds that parameter to a
+    // concrete sema TypeRef, return that concrete TypeRef; otherwise null.
+    //
+    // A type-parameter reference resolves to a Named TypeRef with a null
+    // `declaration` (it is not a real user type) and a single-part name. Whether
+    // such a field is an OWNED REFERENCE field (and so auto-disposed by §28.4
+    // step 2) is decided at *instantiation*, per §28.5 — the substituted type is
+    // what matters, not the bare parameter. The disposer that consults this is
+    // emitted PER INSTANTIATION (see emitSpecializedDisposer), so the active
+    // `genericSubstSemaTy_` names the concrete bound type for THIS instantiation
+    // (e.g. T → Res when emitting Box<Res>'s disposer).
+    const sema::TypeRef* ownedTypeParamConcreteType(const sema::FieldSymbol* fs) {
+        if (!hasOwnedModifier(fs)) return nullptr;
+        if (genericSubstSemaTy_.empty()) return nullptr;
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return nullptr;
+        auto* rt = ctx_.resolvedType(*fd->type);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+            rt->declaration != nullptr)
+            return nullptr;
+        if (!rt->astNode || !rt->astNode->name ||
+            rt->astNode->name->parts.size() != 1)
+            return nullptr;
+        auto it = genericSubstSemaTy_.find(rt->astNode->name->parts[0]);
+        return it != genericSubstSemaTy_.end() ? it->second : nullptr;
+    }
+
+    // §28.5: is `fs` an `owned` field whose declared type is a generic type
+    // PARAMETER of its enclosing class — regardless of any active substitution?
+    // Used to decide, ONCE per generic class, whether its disposer must be
+    // specialized per instantiation: the concrete T is unknown in the shared,
+    // type-erased disposer, so only a per-instantiation disposer can correctly
+    // classify and dispose the field (§28.5 instantiation-time classification).
+    // The field's name must be one of the enclosing class's declared generic
+    // parameters; a single-part name that is NOT a parameter (a concrete class)
+    // takes the ordinary class-field disposal path, not specialization.
+    static bool isOwnedTypeParamFieldShape(const sema::FieldSymbol* fs) {
+        if (!hasOwnedModifier(fs)) return false;
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return false;
+        const ast::Type* ty = fd->type.get();
+        if (!ty->name || ty->name->parts.size() != 1 ||
+            !ty->genericArgs.empty())
+            return false;
+        if (!fs->parent) return false;
+        std::string_view pname = ty->name->parts[0];
+        for (const sema::Symbol* gp : fs->parent->genericParams)
+            if (gp && gp->name == pname) return true;
+        return false;
+    }
+
+    // CG18 / §28.5: an `owned` field that must be disposed dynamically through
+    // the held object's vtable. Two cases:
+    //   (a) the declared type is a class or interface type (the ordinary case);
+    //   (b) the declared type is a generic type PARAMETER whose concrete
+    //       instantiation (the active substitution) is a class or interface —
+    //       §28.5's instantiation-time classification. Consulted only inside a
+    //       per-instantiation specialized disposer, where the substitution is
+    //       active; a value-type instantiation (where `owned` does not apply)
+    //       yields no concrete class/interface and is NOT disposed as a
+    //       reference (no spurious dispatch on a value slot).
     bool isOwnedReferenceField(const sema::FieldSymbol* fs) {
         if (!hasOwnedModifier(fs)) return false;
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return false;
         auto* rt = ctx_.resolvedType(*fd->type);
-        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
-            return false;
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        // (b) §28.5: a generic type-parameter field — classify by the concrete
+        // substituted type of the current instantiation.
+        if (!rt->declaration) {
+            const sema::TypeRef* concr = ownedTypeParamConcreteType(fs);
+            if (!concr || concr->kind != sema::TypeRef::Kind::Named ||
+                !concr->declaration)
+                return false;
+            auto ck = concr->declaration->kind;
+            return ck == ast::TypeDeclKind::Class ||
+                   ck == ast::TypeDeclKind::Interface;
+        }
+        // (a) the ordinary class- or interface-typed owned field.
         auto k = rt->declaration->kind;
         return k == ast::TypeDeclKind::Class || k == ast::TypeDeclKind::Interface;
     }
