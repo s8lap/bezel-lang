@@ -2415,3 +2415,19 @@ extern "C" void bz_box_release(void* b) {
     // codegen, so no other reference exists — no UAF, no double-free.
     free(b);
 }
+
+// ---------------------------------------------------------------------------
+// per §33.3 / §22.13 (line 3845): the runtime's interception point for an
+// exception that escapes Main with no enclosing handler. Codegen emits a call to
+// this from Main's top-level no-handler propagation block (in place of the old
+// `ret i32 0`, which conflated abnormal termination with normal completion /
+// `return 0`). It reports the failure to stderr and terminates the process with
+// a non-zero exit code so the OS / shell / CI observe the abnormal state. Exit
+// code 70 = EX_SOFTWARE ("internal software error", BSD sysexits.h): a clean,
+// deterministic exit (not a signal); the spec pins only "not the normal-
+// completion code 0", so the exact value is an implementation choice (recorded
+// in the commit message).
+extern "C" void bz_unhandled_exception(void) {
+    fputs("Unhandled exception\n", stderr);
+    exit(70);
+}

@@ -519,6 +519,24 @@ void* bz_encoding_utf8_get_bytes(const void* str);
 // passes index=0, count=Array.Length. The byte array is borrowed (not freed).
 void* bz_encoding_utf8_get_string(void* bytes, int64_t index, int64_t count);
 
+// ---------------------------------------------------------------------------
+// per §33.3 / §22.13 (line 3845): abnormal-termination handler for an exception
+// that escapes Main with no enclosing handler. §33.3 reserves exit code 0 for
+// NORMAL completion (and for a legitimate `return 0`); §22.13 distinguishes
+// "Main returning normally" from "Main returning by an uncaught exception that
+// the runtime intercepts". This helper is the runtime's interception point: it
+// writes a short diagnostic to stderr and terminates the process with a non-zero
+// exit code so the abnormal state is observable to the OS / shell / CI. The exit
+// code (70 = EX_SOFTWARE, "internal software error", BSD sysexits.h) is an
+// implementation choice — the spec pins only "not the normal-completion code".
+// Declared [[noreturn]]: it never returns to the caller.
+#ifdef __cplusplus
+[[noreturn]]
+#else
+_Noreturn
+#endif
+void bz_unhandled_exception(void);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
