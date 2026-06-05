@@ -287,6 +287,14 @@ struct Loader {
                 e->visibility = fromMetaVisibility(mm.visibility);
                 e->parent = &parent;
                 e->scope = parent.memberScope;
+                // §10/§10.2 (issue #328 FINDING [1]): carry the constant's
+                // underlying integer value from the dependency metadata so
+                // codegen lowers `int(Color.Green)` / enum equality / `case`
+                // arms to the real value instead of 0. The builder always
+                // records hasEnumValue for a literal/continuation constant;
+                // when it could not (a non-literal const-expr initializer) the
+                // value stays 0, matching the metadata's default.
+                if (mm.hasEnumValue) e->value = mm.enumValue;
                 return e;
             }
             case MetaMemberKind::Constructor: {

@@ -926,4 +926,191 @@ BEZEL_TEST(cross_module_import, imported_nonfoldable_field_initializer_spec_22_8
     BEZEL_EXPECT_EQ(code, 5);
 }
 
+// §10 / §10.2 / §5.4 (issue #328 FINDING [1]): `int(Color.Green)` on an IMPORTED
+// enum must observe the library's declared value (2), not 0. Before the fix the
+// importer dropped each imported constant's value — the loader reconstructed the
+// EnumConstantSymbol without it and codegen's computeEnumValues skipped imported
+// enums (no AST TypeDecl), so every imported enum constant lowered to 0. The
+// metadata already carried the value; the loader + symbol-field + codegen walk
+// now propagate it. §10: "Each value is backed by an integer at runtime."
+BEZEL_TEST(cross_module_import, imported_enum_int_cast_explicit_values_spec_10_2) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_enum_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module EnumLib; "
+        "public enum Color Red := 1, Green := 2, Blue := 3; end Color;");
+    // int(Green)=2, int(Red)=1, int(Blue)=3 → 2*100 + 1*10 + 3 = 213.
+    writeSource(bSrc.path,
+        "module App; "
+        "import EnumLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    return int(Color.Green) * 100 + int(Color.Red) * 10 "
+        "         + int(Color.Blue); "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 213);
+}
+
+// §10 (issue #328 FINDING [1]): equality between two references to the SAME
+// imported enum constant must be true. Before the fix `Color.Green = Color.Green`
+// folded to `0 = 0`... but observably returned false in the repro because the
+// two sides lowered independently; either way it must now be true. Two DISTINCT
+// constants must compare unequal. Returns 42 when both hold.
+BEZEL_TEST(cross_module_import, imported_enum_equality_spec_10) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_enumeq_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module EnumLib; "
+        "public enum Color Red := 1, Green := 2, Blue := 3; end Color;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import EnumLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    if Color.Green = Color.Green and Color.Green <> Color.Red then "
+        "      return 42; "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// §19 / §10 (issue #328 FINDING [1]): a `case` over an IMPORTED enum scrutinee
+// selects the arm whose constant matches. Each arm's constant lowers via the
+// same enumValue_ lookup as int(enum)/equality, so the fix that populates it for
+// imported enums covers this path too. Scrutinee Green → arm value 22.
+BEZEL_TEST(cross_module_import, imported_enum_case_arm_selects_spec_19) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_enumcase_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module EnumLib; "
+        "public enum Color Red := 1, Green := 2, Blue := 3; end Color;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import EnumLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var c := Color.Green; "
+        "    return case c "
+        "      Color.Red => 11, "
+        "      Color.Green => 22, "
+        "      Color.Blue => 33, "
+        "    end; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 22);
+}
+
+// §10.1 (issue #328 FINDING [1]): an IMPLICIT-value imported enum (no `:=`)
+// assigns 0,1,2 in declaration order from zero; these continuation values must
+// also cross the module boundary. int(Mid)=1, int(Lo)=0, int(Hi)=2 →
+// 1*100 + 0*10 + 2 = 102.
+BEZEL_TEST(cross_module_import, imported_enum_implicit_values_spec_10_1) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_enumimp_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module EnumLib; "
+        "public enum Level Lo, Mid, Hi; end Level;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import EnumLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    return int(Level.Mid) * 100 + int(Level.Lo) * 10 "
+        "         + int(Level.Hi); "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 102);
+}
+
 }  // namespace bezel::module

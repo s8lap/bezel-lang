@@ -2195,6 +2195,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                          dynamic_cast<MemberSymbol*>(member)
                                              ? dynamic_cast<MemberSymbol*>(member)->parent
                                              : nullptr));
+        } else if (auto* ec = dynamic_cast<EnumConstantSymbol*>(member)) {
+            // §10 (issue #328 FINDING [1]): an IMPORTED enum-constant access
+            // `Color.Green` has the enum type, exactly like the local-enum case
+            // below. The non-imported path falls through to the EnumConstant
+            // branch further down, but an imported member returns early here, so
+            // set the type now. The enum type is the constant's parent; an
+            // imported enum has no AST decl, so use the symbol's parent directly.
+            // Without this a `var c := Color.Green` local and a `case c` /
+            // `case Color.Green` scrutinee carry no type, and codegen's
+            // enumTypeOf() cannot resolve the arms (they all lower to nothing).
+            if (ec->parent) {
+                TypeRef* et = ctx_.makeTypeRef();
+                et->kind = TypeRef::Kind::Named;
+                et->declaration = ec->parent;
+                ctx_.setExprType(&ma, et);
+            }
         }
         return;
     }

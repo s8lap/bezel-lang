@@ -65,6 +65,19 @@ void Emitter::computeEnumValues() {
             running = val + 1;
         }
     }
+    // §10/§10.2 (issue #328 FINDING [1]): an IMPORTED enum has no AST TypeDecl,
+    // so the loop above skips it (the `if (!td) continue;` guard) and its
+    // constants would otherwise lower to 0. The dependency metadata carried each
+    // constant's underlying value, which the loader stored on the reconstructed
+    // EnumConstantSymbol::value. Mirror it into enumValue_ so the SAME value
+    // lookup used by `int(enum)`, enum equality, and `case` arms resolves for
+    // imported enums exactly as for local ones. Imported symbols live in a list
+    // separate from symbols() (see SemaContext), hence the extra walk.
+    for (const sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* ec = dynamic_cast<const sema::EnumConstantSymbol*>(sym);
+        if (!ec) continue;
+        enumValue_[ec] = ec->value;
+    }
 }
 
 
