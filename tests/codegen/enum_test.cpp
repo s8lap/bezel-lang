@@ -64,3 +64,84 @@ BEZEL_TEST(codegen_cg30, explicit_then_implicit_values) {
         "var x := E.B; "
         "return (6 if (x = E.B) and (x <> E.A) else 0);"), 6);
 }
+
+// ---- #435 / §10 / §8.6 / §13: enum implementing interface, box thunk --------
+// When an enum implements an interface the box thunk must LOAD the i32 enum
+// value from the box's value slot (offset 16) and pass it to the enum method
+// by value.  The old code GEP'd with an i32 base, which is malformed IR
+// (IR verifier failure).  These tests are the repro and regression guard.
+
+BEZEL_TEST(codegen_cg30_iface, enum_via_interface_returns_value) {
+    // §10 / §13 / #435: Color : ICode; Code() returns int(this).
+    // Dispatch through ICode-typed parameter must yield the enum's i32 value.
+    // This is the primary #435 repro: before the fix the IR verifier rejects
+    // the module (GEP on i32 base) and the program exits with garbage / 0.
+    BEZEL_EXPECT_EQ(runJit(
+        "module M; "
+        "interface ICode method Code(): int; end ICode; "
+        "enum Color : ICode "
+        "  Red := 1, Green := 2, Blue := 3; "
+        "  public method Code(): int => int(this); "
+        "end Color; "
+        "class C "
+        "  public static method Get(c: ICode): int => c.Code(); "
+        "  public static method Main(): int "
+        "    var g := Color.Green; return Get(g); "
+        "  end Main; "
+        "end C;").exitCode, 2);
+}
+
+BEZEL_TEST(codegen_cg30_iface, enum_via_interface_two_constants) {
+    // §10 / §13 / #435: dispatch through the interface for two different
+    // enum constants must return their respective underlying values.
+    BEZEL_EXPECT_EQ(runJit(
+        "module M; "
+        "interface ICode method Code(): int; end ICode; "
+        "enum Color : ICode "
+        "  Red := 10, Green := 20, Blue := 30; "
+        "  public method Code(): int => int(this); "
+        "end Color; "
+        "class C "
+        "  public static method Get(c: ICode): int => c.Code(); "
+        "  public static method Main(): int "
+        "    var r := Color.Red; var b := Color.Blue; "
+        "    return Get(r) + Get(b); "
+        "  end Main; "
+        "end C;").exitCode, 40);
+}
+
+BEZEL_TEST(codegen_cg30_iface, enum_via_interface_with_extra_arg) {
+    // §10 / §13 / #435: the thunk must forward extra arguments past `this`
+    // unchanged.  Method takes an int `n` and returns int(this) + n.
+    BEZEL_EXPECT_EQ(runJit(
+        "module M; "
+        "interface IAdder method Add(n: int): int; end IAdder; "
+        "enum E : IAdder "
+        "  A := 5, B := 10; "
+        "  public method Add(n: int): int => int(this) + n; "
+        "end E; "
+        "class C "
+        "  public static method Use(a: IAdder): int => a.Add(7); "
+        "  public static method Main(): int "
+        "    var e := E.B; return Use(e); "
+        "  end Main; "
+        "end C;").exitCode, 17);
+}
+
+BEZEL_TEST(codegen_cg30_iface, record_interface_box_thunk_regression) {
+    // §8.6 / §9.6 / §13: REGRESSION — record box thunk must be unaffected
+    // by the enum fix.  Rect : IArea; dispatch via IArea must still reach
+    // the record's method with the correct field values.
+    BEZEL_EXPECT_EQ(runJit(
+        "module M; "
+        "interface IArea method Area(): int; end IArea; "
+        "record Rect(w: int, h: int): IArea "
+        "  public method Area(): int => w * h; "
+        "end Rect; "
+        "class C "
+        "  public static method Measure(s: IArea): int => s.Area(); "
+        "  public static method Main(): int "
+        "    var r := new Rect(6, 7); return Measure(r); "
+        "  end Main; "
+        "end C;").exitCode, 42);
+}
