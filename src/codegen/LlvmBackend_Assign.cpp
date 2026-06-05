@@ -483,6 +483,13 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     llvm::Value* savedThis = currentThis_;
     auto savedLocals = locals_;
     auto savedParams = paramSlots_;
+    // per §14.1 (generics are monomorphized): a generic indexer
+    // `property [i: int]: T` on `Box<Pair>` returns a `Pair`, not the erased
+    // `T`. Install the receiver's substitution so a `T`-typed field read inside
+    // the getter body (`=> _v`) loads the concrete record (§9: a record is a
+    // value type), not its i32 erasure (which would truncate the multi-field
+    // record to one word).
+    auto savedSubst = setupReceiverGenericSubst(ix.target.get(), ps->parent);
     currentThis_ = obj;
     locals_.clear();
     paramSlots_.clear();
@@ -500,6 +507,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
+    genericSubst_ = std::move(savedSubst);
     return result;
 }
 
