@@ -650,6 +650,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "ContainsKey" || m == "Remove" || m == "TryGetValue")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // stdlib §4.8 / §4.9: GetOrAdd(key, factory): V — the
+                        // result is the value type V (the second generic arg). For
+                        // OwnedDictionary the result is a BORROW of the stored value
+                        // (§4.9 "returns borrow"); for the borrowing Dictionary it is
+                        // the stored value (§4.8). Either way the static type is V,
+                        // which the ownership checker treats as Borrowed (no disposal
+                        // obligation) since GetOrAdd has no resolved `owned` return.
+                        else if (m == "GetOrAdd" && recvTy &&
+                                 recvTy->genericArgs.size() > 1 &&
+                                 recvTy->genericArgs[1])
+                            ctx_.setExprType(&ce, recvTy->genericArgs[1]);
                     }
                     // StringBuilder methods
                     if (colName == "StringBuilder") {
