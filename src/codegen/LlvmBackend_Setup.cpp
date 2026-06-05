@@ -2398,9 +2398,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // §29.3: in an iterator MoveNext body, map locals to state-struct fields
     // so they persist across yield returns.
     llvm::AllocaInst* slot = nullptr;
-    if (iterStateStruct_ && iterSelf_) {
-        auto fit = iterLocalFields_.find(declNode);
-        if (fit != iterLocalFields_.end()) {
+    if (smStateStruct_ && smSelf_) {
+        auto fit = smLocalFields_.find(declNode);
+        if (fit != smLocalFields_.end()) {
             // Use the struct field as the "slot" — it's a GEP result.
             // We can't store a GEP as an AllocaInst, so we must use a
             // different path: store the GEP in a separate alloca-of-ptr
@@ -2412,11 +2412,11 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // For now: use entryAlloca but track it for save/restore.
             slot = entryAlloca(slotTy);
             // Record this slot → field mapping for yield save/restore.
-            iterAllocaToField_[slot] = fit->second;
+            smAllocaToField_[slot] = fit->second;
             locals_[declNode] = slot;
             // Restore from struct at this point (in case we're in state > 0).
             llvm::Value* fptr = builder_.CreateStructGEP(
-                iterStateStruct_, iterSelf_, fit->second);
+                smStateStruct_, smSelf_, fit->second);
             llvm::Value* saved = builder_.CreateLoad(slotTy, fptr);
             // Only restore if state != 0 (first entry); use v if state=0.
             // For simplicity: always load from struct, then overwrite with init below.

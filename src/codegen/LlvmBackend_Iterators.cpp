@@ -2,7 +2,18 @@
 
 namespace bezel::codegen {
 
-void Emitter::collectIterLocals(
+// ===========================================================================
+// Suspend/resume state-machine scaffolding (§29 iterators / §30 async).
+//
+// Phase 2a extracted the kind-agnostic machinery — frame layout, the spill set
+// (locals live across a suspend point), capture spill/restore, and the resume
+// switch — out of the yield-specific iterator emitter so the async (`await`)
+// path can reuse it (§30). The iterator (`Yield`) path below layers the
+// yield-specific driver (IEnumerator<T> MoveNext/Current/Dispose + vtable) on
+// top of those helpers. No behavior changes for iterators.
+// ===========================================================================
+
+void Emitter::collectSuspendLocals(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
     for (const auto& s : body) {
@@ -24,18 +35,147 @@ void Emitter::collectIterLocals(
                 }
                 out.push_back({fs, ty});
             }
-            collectIterLocals(fs->body, out);
+            collectSuspendLocals(fs->body, out);
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
-            collectIterLocals(ws->body, out);
+            collectSuspendLocals(ws->body, out);
         } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
-            collectIterLocals(ifs->ifBranch.body, out);
+            collectSuspendLocals(ifs->ifBranch.body, out);
             for (const auto& el : ifs->elifBranches)
-                collectIterLocals(el.body, out);
-            if (ifs->hasElse) collectIterLocals(ifs->elseBody, out);
+                collectSuspendLocals(el.body, out);
+            if (ifs->hasElse) collectSuspendLocals(ifs->elseBody, out);
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
-            collectIterLocals(db->body, out);
+            collectSuspendLocals(db->body, out);
         }
     }
+}
+
+
+Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
+    sema::MethodSymbol* ms,
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    llvm::ArrayRef<llvm::Type*> extraTrailing,
+    const std::string& structName) {
+    StateMachineFrame frame;
+
+    // Collect all parameters to capture: `this` (instance methods) then params.
+    bool isInstance = !isStaticMethod(ms);
+    if (isInstance)
+        frame.captures.push_back({nullptr, ptrTy()});  // 'this' capture
+    for (auto* param : ms->params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(param);
+        if (!ps) continue;
+        llvm::Type* pty = ptrTy();  // default ptr for class params
+        if (ps->declType) {
+            if (auto* rt = ctx_.resolvedType(*ps->declType))
+                pty = lowerTypeRef(rt);
+        }
+        frame.captures.push_back({ps, pty});
+    }
+
+    // Pre-scan body to find all locals that need to live across a suspend point.
+    collectSuspendLocals(body, frame.bodyLocals);
+
+    // Build state struct type:
+    //   { ptr vtable, i32 state, captures..., locals..., extraTrailing... }
+    std::vector<llvm::Type*> fields;
+    fields.push_back(ptrTy());   // vtable  → field 0
+    fields.push_back(i32());     // state   → field 1
+    for (auto& [sym, ty] : frame.captures) fields.push_back(ty);  // captures
+    frame.localStart = (unsigned)(2 + frame.captures.size());
+    for (auto& [node, ty] : frame.bodyLocals) fields.push_back(ty);  // locals
+    // Kind-specific trailing fields (e.g. `Yield`'s `current_val`). Record the
+    // index of the first one as `currentValField` for the yield driver.
+    frame.currentValField =
+        (unsigned)(frame.localStart + frame.bodyLocals.size());
+    for (llvm::Type* ty : extraTrailing) fields.push_back(ty);
+
+    frame.structTy = llvm::StructType::create(llvm_, fields, structName);
+    frame.vtableField = 0;
+    frame.stateField = 1;
+    frame.captureStart = 2;
+
+    // Build mapping from AST nodes to struct field indices.
+    for (unsigned li = 0; li < frame.bodyLocals.size(); ++li)
+        frame.localFields[frame.bodyLocals[li].first] = frame.localStart + li;
+
+    return frame;
+}
+
+
+void Emitter::emitFrameCaptureStores(const StateMachineFrame& frame,
+                                     llvm::Value* st) {
+    unsigned idx = frame.captureStart;
+    for (auto& [sym, ty] : frame.captures) {
+        llvm::Value* capField =
+            builder_.CreateStructGEP(frame.structTy, st, idx++);
+        llvm::Value* val = nullptr;
+        if (!sym) {
+            // 'this' capture
+            val = currentThis_ ? currentThis_ : currentFn_->arg_begin();
+        } else {
+            auto it = paramSlots_.find(sym);
+            if (it != paramSlots_.end())
+                val = builder_.CreateLoad(ty, it->second);
+        }
+        if (val) builder_.CreateStore(val, capField);
+    }
+}
+
+
+void Emitter::emitFrameCaptureRestores(const StateMachineFrame& frame,
+                                       llvm::Value* self) {
+    unsigned idx = frame.captureStart;
+    for (auto& [sym, ty] : frame.captures) {
+        llvm::Value* capField =
+            builder_.CreateStructGEP(frame.structTy, self, idx++);
+        llvm::Value* val = builder_.CreateLoad(ty, capField);
+        if (!sym) {
+            // 'this' — set currentThis_
+            currentThis_ = val;
+        } else {
+            // param — create a slot and store it
+            auto* slot = entryAlloca(ty);
+            builder_.CreateStore(val, slot);
+            paramSlots_[sym] = slot;
+        }
+    }
+}
+
+
+std::vector<llvm::BasicBlock*> Emitter::emitResumeDispatch(
+    const StateMachineFrame& frame, llvm::Value* self,
+    llvm::Value* stateGEP, unsigned numSuspends,
+    const std::function<void()>& emitDone) {
+    // State 0: beginning. States 1..N: after each suspend point. The switch's
+    // default + state -1 land in `doneBB`, which emits the kind's exhausted-
+    // return.
+    auto* doneBB = llvm::BasicBlock::Create(llvm_, "mn.done", currentFn_);
+    std::vector<llvm::BasicBlock*> stateBBs;
+    for (unsigned s = 0; s <= numSuspends; ++s)
+        stateBBs.push_back(
+            llvm::BasicBlock::Create(llvm_, "mn.s" + std::to_string(s),
+                                     currentFn_));
+
+    llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP);
+    auto* sw = builder_.CreateSwitch(curState, doneBB, numSuspends + 1);
+    for (unsigned s = 0; s <= numSuspends; ++s)
+        sw->addCase(builder_.getInt32((int)s), stateBBs[s]);
+
+    // doneBB: exhausted → kind-specific return.
+    builder_.SetInsertPoint(doneBB);
+    emitDone();
+
+    // Publish the live state so the per-suspend-point spill/restore (lowerStmt)
+    // can run.
+    smStateStruct_ = frame.structTy;
+    smSelf_ = self;
+    smStateGEP_ = stateGEP;
+    smStateBBs_ = stateBBs;
+    smDoneBB_ = doneBB;
+    smNextSuspendState_ = 0;
+    smLocalFields_ = frame.localFields;
+
+    return stateBBs;
 }
 
 
@@ -86,6 +226,8 @@ void Emitter::collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
 void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                          const CallableInfo& ci) {
     if (!ci.stmts) return;
+    smKind_ = SuspendKind::Yield;
+
     // Determine element type T from the return type's generic arg.
     llvm::Type* elemTy = i32();  // default
     if (ci.returnType) {
@@ -94,49 +236,18 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             elemTy = lowerTypeRef(retRef->genericArgs[0]);
     }
 
-    // Collect all parameters to capture.
-    std::vector<std::pair<sema::Symbol*, llvm::Type*>> captures;
-    bool isInstance = !isStaticMethod(ms);
-    if (isInstance)
-        captures.push_back({nullptr, ptrTy()});  // 'this' capture
-    for (auto* param : ms->params) {
-        auto* ps = dynamic_cast<sema::ParameterSymbol*>(param);
-        if (!ps) continue;
-        llvm::Type* pty = ptrTy();  // default ptr for class params
-        if (ps->declType) {
-            if (auto* rt = ctx_.resolvedType(*ps->declType))
-                pty = lowerTypeRef(rt);
-        }
-        captures.push_back({ps, pty});
-    }
-
-    // Pre-scan body to find all locals that need to live across yield points.
-    std::vector<std::pair<const ast::Node*, llvm::Type*>> bodyLocals;
-    if (ci.stmts) collectIterLocals(*ci.stmts, bodyLocals);
-
-    // Build state struct type:
-    // { ptr vtable, i32 state, captures..., locals..., T current_val }
-    std::vector<llvm::Type*> fields;
-    fields.push_back(ptrTy());   // vtable  → field 0
-    fields.push_back(i32());     // state   → field 1
-    for (auto& [sym, ty] : captures) fields.push_back(ty);  // params → fields 2..N
-    // Body locals → fields N+1..M
-    const unsigned LOCAL_START = (unsigned)(2 + captures.size());
-    for (auto& [node, ty] : bodyLocals) fields.push_back(ty);
-    fields.push_back(elemTy);    // current_val → last field
-    auto* stateStructTy = llvm::StructType::create(llvm_, fields,
+    // Build the kind-agnostic frame; the yield driver's one extra trailing
+    // field is the `current_val` of element type T.
+    // Layout: { ptr vtable, i32 state, captures..., locals..., T current_val }
+    StateMachineFrame frame = buildStateMachineFrame(
+        ms, *ci.stmts, {elemTy},
         std::string("iter.") + std::string(ms->name));
+    auto* stateStructTy = frame.structTy;
+    const unsigned VTABLE_FIELD = frame.vtableField;
+    const unsigned STATE_FIELD = frame.stateField;
+    const unsigned CURRENT_VAL_FIELD = frame.currentValField;
 
-    const unsigned VTABLE_FIELD = 0;
-    const unsigned STATE_FIELD = 1;
-    const unsigned CAPTURE_START = 2;
-    const unsigned CURRENT_VAL_FIELD = (unsigned)(2 + captures.size() + bodyLocals.size());
-
-    // Build mapping from AST nodes to struct field indices.
-    std::unordered_map<const ast::Node*, unsigned> localFields;
-    for (unsigned li = 0; li < bodyLocals.size(); ++li)
-        localFields[bodyLocals[li].first] = LOCAL_START + li;
-
+    bool isInstance = !isStaticMethod(ms);
     std::string prefix = std::string("bz$iter$") + std::string(ms->name) + "$";
 
     // --- MoveNext(ptr self) -> i1 ---
@@ -205,21 +316,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // Store state = 0
         llvm::Value* stateField = builder_.CreateStructGEP(stateStructTy, st, STATE_FIELD);
         builder_.CreateStore(builder_.getInt32(0), stateField);
-        // Store each capture
-        unsigned ci_idx = CAPTURE_START;
-        for (auto& [sym, ty] : captures) {
-            llvm::Value* capField = builder_.CreateStructGEP(stateStructTy, st, ci_idx++);
-            llvm::Value* val = nullptr;
-            if (!sym) {
-                // 'this' capture
-                val = currentThis_ ? currentThis_ : fn->arg_begin();
-            } else {
-                auto it = paramSlots_.find(sym);
-                if (it != paramSlots_.end())
-                    val = builder_.CreateLoad(ty, it->second);
-            }
-            if (val) builder_.CreateStore(val, capField);
-        }
+        // Store each capture (this + params) into the frame.
+        emitFrameCaptureStores(frame, st);
         // Return the state struct (as ptr)
         builder_.CreateRet(st);
     }
@@ -249,60 +347,27 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         llvm::Value* self = &*moveNextFn->arg_begin();
 
-        // Restore captured params from struct.
-        unsigned ci_idx2 = CAPTURE_START;
-        for (auto& [sym, ty] : captures) {
-            llvm::Value* capField = builder_.CreateStructGEP(stateStructTy, self, ci_idx2++);
-            llvm::Value* val = builder_.CreateLoad(ty, capField);
-            if (!sym) {
-                // 'this' — set currentThis_
-                currentThis_ = val;
-            } else {
-                // param — create a slot and store it
-                auto* slot = entryAlloca(ty);
-                builder_.CreateStore(val, slot);
-                paramSlots_[sym] = slot;
-            }
-        }
+        // Restore captured params (this + params) from the frame.
+        emitFrameCaptureRestores(frame, self);
 
-        // Read state field.
-        llvm::Value* stateGEP = builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
-        llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP);
+        // State field GEP — read by the resume dispatch, written at each yield.
+        llvm::Value* stateGEP =
+            builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
 
         // Collect all yield stmts and assign state numbers.
         std::vector<const ast::YieldStmt*> yields;
         collectYields(*ci.stmts, yields);
         unsigned numYields = (unsigned)yields.size();
 
-        // Create basic blocks for each state.
-        // State 0: beginning, State 1..N: after each yield, State -1: done
-        auto* doneBB = llvm::BasicBlock::Create(llvm_, "mn.done", currentFn_);
-        std::vector<llvm::BasicBlock*> stateBBs;
-        for (unsigned s = 0; s <= numYields; ++s) {
-            stateBBs.push_back(
-                llvm::BasicBlock::Create(llvm_, "mn.s" + std::to_string(s), currentFn_));
-        }
+        // Emit the resume switch + state blocks. `Yield`'s exhausted-return is
+        // `ret false` (MoveNext: "no more elements").
+        std::vector<llvm::BasicBlock*> stateBBs = emitResumeDispatch(
+            frame, self, stateGEP, numYields,
+            [&]() { builder_.CreateRet(builder_.getFalse()); });
 
-        // Switch dispatch on state.
-        auto* sw = builder_.CreateSwitch(curState, doneBB, numYields + 1);
-        for (unsigned s = 0; s <= numYields; ++s)
-            sw->addCase(builder_.getInt32((int)s), stateBBs[s]);
-
-        // doneBB: exhausted → return false
-        builder_.SetInsertPoint(doneBB);
-        builder_.CreateRet(builder_.getFalse());
-
-        // Set up the yield callback so lowerStmt knows what to do.
-        // We use iterYields_ and iterStateGEP_ members.
-        iterStateStruct_ = stateStructTy;
-        iterSelf_ = self;
-        iterStateGEP_ = stateGEP;
-        iterStateBBs_ = stateBBs;
-        iterDoneBB_ = doneBB;
+        // Yield-specific live state for the YieldStmt handler in lowerStmt.
         iterCurrentValField_ = CURRENT_VAL_FIELD;
-        iterNextYieldState_ = 0;  // incremented as yields are processed
         iterElemTy_ = elemTy;
-        iterLocalFields_ = localFields;
 
         // Emit MoveNext body starting from state 0.
         // The body is emitted linearly; YieldStmt handlers interrupt it to
@@ -313,15 +378,15 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         disposeStack_.pop_back();
         // If body didn't terminate, fall through to done.
         if (!term && !builder_.GetInsertBlock()->getTerminator()) {
-            builder_.CreateStore(builder_.getInt32(-1), iterStateGEP_);
+            builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRet(builder_.getFalse());
         }
 
-        // Clear iterator state.
-        iterStateStruct_ = nullptr;
-        iterSelf_ = nullptr;
-        iterLocalFields_.clear();
-        iterAllocaToField_.clear();
+        // Clear state-machine state.
+        smStateStruct_ = nullptr;
+        smSelf_ = nullptr;
+        smLocalFields_.clear();
+        smAllocaToField_.clear();
     }
 }
 
