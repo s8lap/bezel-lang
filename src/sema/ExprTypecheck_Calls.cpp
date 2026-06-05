@@ -787,6 +787,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
         checkCallArity(ce, ms);
     }
+
+    // §7.5 / FINDING [3] ADDENDUM: a null-conditional call `x?.M(args)` is
+    // ALWAYS nullable — it returns null when the receiver is null. The callee is
+    // a NullCondMemberExpr; lift the (raw) return type recorded above to its
+    // nullable form so downstream consumers (`??`, `= null`, `!`, an `int?`
+    // slot) see the §7.5 result type. A unit/void result and an already-nullable
+    // return are left unchanged.
+    if (dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
+        if (auto* ct = ctx_.exprType(ce)) {
+            if (!ct->nullable && ct->kind != TypeRef::Kind::Unit) {
+                TypeRef* nn = ctx_.makeTypeRef(*ct);
+                nn->nullable = true;
+                ctx_.setExprType(&ce, nn);
+            }
+        }
+    }
 }
 
 void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {

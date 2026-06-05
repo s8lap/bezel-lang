@@ -5065,8 +5065,24 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     if (!fnTy) return nullptr;
     llvm::Type* retTy = fnTy->getReturnType();
     bool refResult = retTy->isPointerTy();
-    if (!retTy->isVoidTy() && !refResult)
-        return nullptr;  // value-typed result deferred
+    bool voidResult = retTy->isVoidTy();
+    // §7.5 / FINDING [3] ADDENDUM: a value-typed return (`int`, `bool`, an enum,
+    // a record) lifts to the always-nullable {i8 hasValue; T value} tagged
+    // struct — null when the receiver is null, the wrapped value otherwise. A
+    // method that ALREADY returns a nullable value (e.g. `int?`) returns the
+    // tagged struct directly; its own hasValue carries through.
+    const sema::TypeRef* callTy = ctx_.exprType(call);
+    bool valueResult = !refResult && !voidResult;
+    bool nullableReturn = valueResult && callTy && isNullableValueTy(callTy) &&
+        retTy->isStructTy();
+    // The §7.5 result type: a pointer for reference returns, the tagged struct
+    // for value returns (StructType::get is uniqued, matching the consumer slot).
+    llvm::Type* resTy = nullptr;
+    if (valueResult)
+        resTy = nullableReturn
+            ? retTy
+            : static_cast<llvm::Type*>(llvm::StructType::get(
+                  llvm_, {nullablePrimHasValTy(), retTy}));
     llvm::Value* recv = lowerExpr(*nm.target);
     if (!recv || !recv->getType()->isPointerTy()) return nullptr;
 
@@ -5092,12 +5108,28 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         argExprs.push_back(a.value.get());
     }
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs);
-    if (!r && refResult) return nullptr;
+    if (!r && (refResult || valueResult)) return nullptr;
+    // Lift the call result to the §7.5 result form. A value-typed return wraps
+    // into {i8 1, r}; an already-nullable return passes its own hasValue through.
+    llvm::Value* callVal = r;
+    if (valueResult && !nullableReturn) {
+        callVal = builder_.CreateInsertValue(
+            llvm::UndefValue::get(resTy),
+            llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+        callVal = builder_.CreateInsertValue(callVal, r, {1u});
+    }
     auto* callEnd = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
 
     builder_.SetInsertPoint(endBB);
-    if (!refResult) return nullptr;  // void: result discarded by caller
+    if (voidResult) return nullptr;  // void: result discarded by caller
+    if (valueResult) {
+        // Null receiver → the all-zero (hasValue=false) tagged struct.
+        auto* phi = builder_.CreatePHI(resTy, 2);
+        phi->addIncoming(llvm::ConstantAggregateZero::get(resTy), entryBB);
+        phi->addIncoming(callVal, callEnd);
+        return phi;
+    }
     auto* phi = builder_.CreatePHI(ptrTy(), 2);
     phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), entryBB);
     phi->addIncoming(r, callEnd);

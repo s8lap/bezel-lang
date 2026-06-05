@@ -621,15 +621,60 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 return res;
             }
         }
+        // §7.5 / FINDING [3]: the receiver is a class/string reference, so a null
+        // receiver is the null pointer. Resolve the accessed member to either a
+        // storage field (class receiver) or the `Length` intrinsic (string
+        // receiver). The MEMBER may be value-typed (`int`, `bool`, an enum, a
+        // record) — its §7.5 (always-nullable) result is the tagged
+        // {i8 hasValue; T value} struct, with hasValue=false when the receiver is
+        // null. Reference-typed members keep the null-pointer-as-null
+        // representation (the prior path).
         llvm::Value* obj = lowerExpr(*nm->target);
         if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+        // Determine the accessed member's LLVM type without yet emitting the
+        // access: a storage field's element type, or i32 for `string.Length`.
+        auto* targetTy = ctx_.exprType(*nm->target);
+        bool stringLength = nm->member == "Length" && targetTy &&
+            targetTy->kind == sema::TypeRef::Kind::Primitive &&
+            targetTy->primitive == sema::PrimitiveType::String;
         auto* ms = storageMemberOf(ctx_.exprSymbol(e));
-        if (!ms || !ms->parent) return nullptr;
-        auto idxIt = fieldIndex_.find(ms);
-        if (idxIt == fieldIndex_.end()) return nullptr;
-        llvm::StructType* st = classStruct(ms->parent);
-        llvm::Type* memTy = st->getElementType(idxIt->second);
-        if (!memTy->isPointerTy()) return nullptr;  // value result deferred
+        llvm::StructType* st = nullptr;
+        llvm::Type* memTy = nullptr;
+        unsigned memIdx = 0;
+        if (stringLength) {
+            memTy = i32();  // stdlib §9.6: Length: int
+        } else {
+            if (!ms || !ms->parent) return nullptr;
+            auto idxIt = fieldIndex_.find(ms);
+            if (idxIt == fieldIndex_.end()) return nullptr;
+            st = classStruct(ms->parent);
+            memIdx = idxIt->second;
+            memTy = st->getElementType(memIdx);
+        }
+        // The §7.5 result form the member lifts to. A reference-typed member is a
+        // (possibly-null) pointer; a value-typed member is the tagged
+        // {i8 hasValue; T value} struct (StructType::get is uniqued, so building
+        // it from the member's LLVM type matches the consumer's slot type). The
+        // `?.` TypeRef recorded by sema (the nullable member type) tells us when
+        // the member is ITSELF already nullable.
+        const sema::TypeRef* resultTy = ctx_.exprType(e);
+        bool refMember = memTy->isPointerTy();
+        // A member that is ITSELF nullable (`int?` field) already loads as the
+        // tagged {i8 hasValue; T} struct; its own LLVM type equals the result's
+        // nullable struct. A NON-nullable value member (`int`, a record) loads as
+        // a bare value whose LLVM type is strictly the payload, so it must be
+        // wrapped. Distinguish by comparing the member's loaded type against the
+        // result's tagged struct — NOT by `resultTy` alone (the §7.5-lifted
+        // result is nullable for both, so it cannot tell them apart).
+        bool nullableMember = !refMember && resultTy &&
+            isNullableValueTy(resultTy) &&
+            memTy == nullableValueStructTy(resultTy);
+        llvm::Type* resTy = refMember
+            ? static_cast<llvm::Type*>(ptrTy())
+            : (nullableMember
+                   ? memTy  // member already a {i8 hasValue; T} struct
+                   : static_cast<llvm::Type*>(llvm::StructType::get(
+                         llvm_, {nullablePrimHasValTy(), memTy})));
         auto* entryBB = builder_.GetInsertBlock();
         auto* accessBB =
             llvm::BasicBlock::Create(llvm_, "nullcond.access", currentFn_);
@@ -639,15 +684,40 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             obj, llvm::ConstantPointerNull::get(ptrTy()));
         builder_.CreateCondBr(isNull, endBB, accessBB);
         builder_.SetInsertPoint(accessBB);
-        llvm::Value* addr =
-            builder_.CreateStructGEP(st, obj, idxIt->second);
-        llvm::Value* val = builder_.CreateLoad(memTy, addr);
+        llvm::Value* val;
+        if (stringLength) {
+            llvm::Value* len64 = loadStringLen(obj);
+            val = builder_.CreateTrunc(len64, i32(), "str.len.i32");
+        } else {
+            llvm::Value* addr = builder_.CreateStructGEP(st, obj, memIdx);
+            val = builder_.CreateLoad(memTy, addr);
+        }
+        // Lift the accessed value to the §7.5 (always-nullable) result. A
+        // reference member's pointer is its own null sentinel; a member that is
+        // itself an `int?` passes its own hasValue through (the receiver is
+        // non-null on this edge); any other value member wraps into {i8 1, val}.
+        llvm::Value* accessVal;
+        if (refMember || nullableMember) {
+            accessVal = val;
+        } else {
+            accessVal = builder_.CreateInsertValue(
+                llvm::UndefValue::get(resTy),
+                llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+            accessVal = builder_.CreateInsertValue(accessVal, val, {1u});
+        }
         auto* accessEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
-        auto* phi = builder_.CreatePHI(ptrTy(), 2);
-        phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), entryBB);
-        phi->addIncoming(val, accessEnd);
+        // The null-receiver incoming value: a null pointer for reference members,
+        // or the all-zero (hasValue=false) tagged struct for value members.
+        llvm::Value* nullVal = refMember
+            ? static_cast<llvm::Value*>(
+                  llvm::ConstantPointerNull::get(ptrTy()))
+            : static_cast<llvm::Value*>(
+                  llvm::ConstantAggregateZero::get(resTy));
+        auto* phi = builder_.CreatePHI(resTy, 2);
+        phi->addIncoming(nullVal, entryBB);
+        phi->addIncoming(accessVal, accessEnd);
         return phi;
     }
     // §3.4: static properties on primitive type names (`int.MaxValue`,
