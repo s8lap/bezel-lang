@@ -36,8 +36,10 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 namespace bezel::codegen {
 
@@ -1966,13 +1968,14 @@ private:
     static bool containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     static bool exprContainsAwait(const ast::Expr* e);
 
-    // §30.2 deferred tail: detect an `await` that appears inside a loop body
-    // (for / while) or while-condition. The flat resume model breaks SSA
-    // dominance across a loop back-edge, so await-in-loop is deferred; the
-    // emitter rejects it with a diagnostic + safe stub. `inLoop` is true once
-    // recursion has entered a loop body.
-    static bool awaitInLoop(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
-                            bool inLoop);
+    // §30.9 deferred tail (#438): detect an `await` anywhere inside a
+    // try / catch / finally construct. Resuming into the correct handler scope
+    // across a suspend (and re-raising the original exception object) is the
+    // next increment; the emitter rejects it with a clear diagnostic + safe
+    // stub rather than emitting handler-state that the flat resume model can't
+    // re-establish. Recurses into nested loops / ifs / do-blocks so a try
+    // nested inside them is still caught.
+    static bool awaitInTry(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 
     // §30.1 / §30.2: emit an `async` method (one returning Task / Task<T> /
     // OwnedTask<T>; the async-iterator forms — async + yield — are deferred).
@@ -2012,6 +2015,25 @@ private:
     // enclosing function is not an async state machine (so the await falls
     // through to the normal nullptr — a defensive guard, not a normal path).
     llvm::Value* lowerAwait(const ast::UnaryExpr& un);
+
+    // §30.2 (#438): repair SSA dominance in a resume function after the body is
+    // lowered. An `await` inside a larger expression (e.g. `total + await f()`,
+    // including the loop-carried `total := total + await f(i)` form) leaves an
+    // SSA temporary that is computed BEFORE the suspend but used in the resume
+    // block — which the dispatch switch (and a loop back-edge) re-enters, so the
+    // temporary's def no longer dominates its use ("instruction does not
+    // dominate all uses"). Named locals already round-trip through the frame
+    // (smAllocaToField_); this catches the remaining anonymous temporaries by
+    // demoting every register whose def fails to dominate a use to a stack slot
+    // (llvm::DemoteRegToStack / DemotePHIToStack). On the synchronous /
+    // already-done cut (§30.1) the await fast path falls through to the resume
+    // block within the same activation, so the demoted slot is stored-then-
+    // loaded and the result is correct; the dispatch-switch re-entry edge (a
+    // real cross-activation suspend) is the deferred concurrency increment.
+    // Runs only on async resume functions; iterators (yield) never produce a
+    // cross-suspend temporary (the yielded expression is fully consumed before
+    // the suspend), so this is async-specific.
+    void fixupSuspendDominance(llvm::Function* fn);
 
     // ---- Live suspend/resume state for the in-flight MoveNext / resume fn ----
     // Kind-agnostic frame state. The per-suspend-point spill/restore

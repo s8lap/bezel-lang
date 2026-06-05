@@ -14,13 +14,17 @@
 // runs under LeakSanitizer to verify the frame/task reclaim is leak- and
 // corruption-free on the synchronous completion path (skipped when no toolchain).
 //
-// SCOPE of this increment (what is exercised here): the synchronous / already-
-// done cut — `await SomeAsyncCall()` where the producer completes inline. The
-// supported shapes are straight-line sequential awaits, awaits in if/else
-// branches, locals live across an await, `Task` (no value) awaits, and basic
-// fault propagation. DEFERRED (not exercised; rejected with a diagnostic or out
-// of scope): `await` inside a loop body (for/while), `await` inside try/catch/
-// finally, a real cross-thread suspend, atomic refcounts, and async iterators.
+// SCOPE (what is exercised here): the synchronous / already-done cut —
+// `await SomeAsyncCall()` where the producer completes inline. The supported
+// shapes are straight-line sequential awaits, awaits in if/else branches, awaits
+// embedded in larger expressions, locals live across an await, `Task` (no value)
+// awaits, basic fault propagation, AND — added by #438 — `await` inside loop
+// bodies (while / range-for / nested), including loop-carried accumulation and
+// pre-/post-loop locals live across the loop's suspends. DEFERRED (not
+// exercised; rejected with a diagnostic or out of scope): `await` inside
+// try/catch/finally (§30.9, the new boundary — rejected with a clean
+// diagnostic), a real cross-thread suspend, atomic refcounts, and async
+// iterators.
 
 #include <cstdio>
 #include <cstdlib>
@@ -263,12 +267,15 @@ BEZEL_TEST(async_30_9, awaiting_faulted_task_propagates) {
         70);
 }
 
-// §30.2 deferred tail: `await` inside a loop body is NOT yet supported (the flat
-// resume model breaks SSA dominance across the loop back-edge). It must be
-// rejected with a clear diagnostic — and crucially must NOT emit malformed IR.
-// This pins the increment boundary.
-BEZEL_TEST(async_30_2, await_in_loop_is_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// §30.2 (#438): `await` inside a `while` loop body, accumulating into a
+// loop-carried local. The await is embedded in a larger expression
+// (`total + await ...`), so the left operand `total` is loaded BEFORE the
+// suspend and the `+` runs AFTER the resume — the case that broke SSA dominance
+// in the flat resume model. fixupSuspendDominance demotes the offending
+// temporary to a stack slot so the resume verifies; the loop-carried `total`
+// round-trips through the frame. 1 + 2 + 3 = 6.
+BEZEL_TEST(async_30_2, await_in_while_loop_accumulates) {
+    expectValueLeakFree(
         "module M; class C "
         "  public static async method Producer(n: int): Task<int> "
         "    return n; "
@@ -280,5 +287,183 @@ BEZEL_TEST(async_30_2, await_in_loop_is_rejected) {
         "      i := i + 1; "
         "    end; "
         "    return total; "
+        "  end Main; end C;",
+        6);
+}
+
+// §30.2 / §16.4 (#438): `await` inside a `for var i in lo..hi` range loop. The
+// loop variable `i` is a frame-backed suspend-local (the iterator path's
+// machinery, reused here); each iteration awaits a producer and accumulates.
+// Producer doubles its arg: 2 + 4 + 6 = 12.
+BEZEL_TEST(async_30_2, await_in_range_for_loop) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n * 2; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 0; "
+        "    for var i in 1..3 do "
+        "      total := total + await Producer(i); "
+        "    end; "
+        "    return total; "
+        "  end Main; end C;",
+        12);
+}
+
+// §30.2 (#438): a loop-carried local (`total`) AND a pre-loop local (`seed`)
+// BOTH live across the in-loop await. `seed` is set before the loop and read on
+// every iteration; `total` accumulates. Both must survive the suspend (frame
+// round-trip) and the back-edge. seed=10: (10+1)+(10+2)+(10+3) = 36.
+BEZEL_TEST(async_30_2, preloop_and_loop_carried_locals_across_await) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var seed := 10; "
+        "    var total := 0; var i := 1; "
+        "    while i <= 3 do "
+        "      total := total + seed + await Producer(i); "
+        "      i := i + 1; "
+        "    end; "
+        "    return total; "
+        "  end Main; end C;",
+        36);
+}
+
+// §30.2 (#438): a value computed BEFORE a loop (that contains an await) and used
+// AFTER the loop. `pre` (50) is set before the loop, never touched inside it, and
+// added to the accumulated total after the loop completes. Verifies the pre-loop
+// value survives the loop's suspend/resume cycles. (1+2+3) + 50 = 56.
+BEZEL_TEST(async_30_2, value_before_loop_used_after_loop_with_await) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var pre := 50; "
+        "    var total := 0; var i := 1; "
+        "    while i <= 3 do "
+        "      total := total + await Producer(i); "
+        "      i := i + 1; "
+        "    end; "
+        "    return total + pre; "
+        "  end Main; end C;",
+        56);
+}
+
+// §30.2 (#438): nested loops, with the await in the inner loop body. Both loop
+// variables (`i`, `j`) and the accumulator round-trip across the suspend.
+// total += i*j for i,j in {1,2}x{1,2}: 1 + 2 + 2 + 4 = 9.
+BEZEL_TEST(async_30_2, await_in_nested_loops) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 0; var i := 1; "
+        "    while i <= 2 do "
+        "      var j := 1; "
+        "      while j <= 2 do "
+        "        total := total + await Producer(i * j); "
+        "        j := j + 1; "
+        "      end; "
+        "      i := i + 1; "
+        "    end; "
+        "    return total; "
+        "  end Main; end C;",
+        9);
+}
+
+// §30.2 (#438): an `await` inside an if-branch that is itself inside a loop. Only
+// iterations where the branch is taken await; the value still threads through the
+// resume correctly. i in 1..4, awaits only when i > 2: 3 + 4 = 7.
+BEZEL_TEST(async_30_2, await_in_branch_inside_loop) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 0; var i := 1; "
+        "    while i <= 4 do "
+        "      if i > 2 then total := total + await Producer(i); end; "
+        "      i := i + 1; "
+        "    end; "
+        "    return total; "
+        "  end Main; end C;",
+        7);
+}
+
+// §30.2 (#438): two awaits in a single loop-body expression. Both suspend points
+// resume correctly within the iteration; the loop-carried accumulator is right.
+// total += i + i each iteration: 2*(1+2+3) = 12.
+BEZEL_TEST(async_30_2, two_awaits_per_loop_iteration) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 0; var i := 1; "
+        "    while i <= 3 do "
+        "      total := total + await Producer(i) + await Producer(i); "
+        "      i := i + 1; "
+        "    end; "
+        "    return total; "
+        "  end Main; end C;",
+        12);
+}
+
+// §30.2 (#438) regression: an `await` embedded in a larger expression OUTSIDE any
+// loop (`total + await f()`). This straight-line case has the SAME pre-suspend
+// temporary as the loop case (the left operand loaded before the await), so it
+// is fixed by the same dominance repair. 10 + 5 = 15.
+BEZEL_TEST(async_30_2, await_embedded_in_expression_straight_line) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 10; "
+        "    total := total + await Producer(5); "
+        "    return total; "
+        "  end Main; end C;",
+        15);
+}
+
+// §30.9 deferred tail (#438): `await` inside a try/catch is NOT yet supported —
+// resuming into the handler scope across a suspend (and re-raising the original
+// exception object) is the next async increment. It must be rejected with a
+// clear diagnostic and must NOT emit malformed IR. This pins the new boundary.
+BEZEL_TEST(async_30_9, await_in_try_is_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Producer(5); catch Exception => x := 1; end; "
+        "    return x; "
+        "  end Main; end C;"));
+}
+
+// §30.9 deferred tail (#438): `await` inside a `finally` is likewise rejected.
+BEZEL_TEST(async_30_9, await_in_finally_is_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 1; "
+        "    try x := 1; finally x := await Producer(5); end; "
+        "    return x; "
         "  end Main; end C;"));
 }

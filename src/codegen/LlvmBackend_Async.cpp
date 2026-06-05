@@ -28,10 +28,17 @@ namespace bezel::codegen {
 //     `return e;` completes the outer task (LlvmBackend_Stmts.cpp ReturnStmt,
 //     gated on smKind_ == Await).
 //
+// #438: `await` inside a loop body (while / range-for / nested) is supported.
+// Loop-carried and pre-/post-loop locals are frame-backed allocas (the iterator
+// path's spill/restore machinery, reused), and fixupSuspendDominance demotes the
+// remaining anonymous cross-suspend temporaries (e.g. the left operand of
+// `total + await f()`) to stack slots so the resume function verifies.
+//
 // Deferred to later increments (not emitted here): await inside try/catch/
-// finally (resuming into the right handler scope), §30.9 faulting re-raise
-// beyond the basic check, atomic refcounts (§30 2c), async iterators
-// (IAsyncEnumerable / `await for`), Task.FireAndForget, and `await using`.
+// finally (resuming into the right handler scope — rejected with a §30.9
+// diagnostic), §30.9 faulting re-raise beyond the basic check, atomic refcounts
+// (§30 2c), async iterators (IAsyncEnumerable / `await for`),
+// Task.FireAndForget, and `await using`.
 // ===========================================================================
 
 bool Emitter::exprContainsAwait(const ast::Expr* e) {
@@ -167,49 +174,63 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
 }
 
 
-// §30.2 (deferred tail): detect an `await` that appears INSIDE a loop body
-// (for / while). The flat state-block + dispatch-switch resume model produces
-// malformed IR (a value computed in a resume block does not dominate its uses
-// on the loop back-edge) for await-in-loop; that case needs CFG reconstruction
-// and is deferred to a later increment. We detect it up front and emit a safe
-// stub instead of malformed IR. `inLoop` becomes true once we recurse into a
-// loop body.
-bool Emitter::awaitInLoop(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
-                          bool inLoop) {
+// §30.9 deferred tail (#438): detect an `await` anywhere inside a try / catch /
+// finally construct. Resuming into the right handler scope across a suspend —
+// and re-raising the ORIGINAL exception object — is the next async increment;
+// until then the emitter rejects await-in-try with a diagnostic + safe stub
+// rather than emitting handler state the flat resume model can't re-establish.
+// On encountering a TryStmt, an await anywhere in its body, a catch arm
+// (guard or body), or its finally is the deferred case; we also recurse into
+// the other compound statements so a try nested inside a loop / if / do-block is
+// still caught.
+bool Emitter::awaitInTry(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
     for (const auto& s : stmts) {
         if (!s) continue;
-        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
-            if (awaitInLoop(fs->body, /*inLoop=*/true)) return true;
-        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
-            // An await in a while condition is itself a loop-carried await.
-            if (exprContainsAwait(ws->condition.get())) return true;
-            if (awaitInLoop(ws->body, /*inLoop=*/true)) return true;
-        } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
-            if (inLoop) {
-                if (exprContainsAwait(ifs->ifBranch.condition.get()))
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // The whole try construct is a handler scope; reuse containsAwait
+            // for the body / finally and check each catch arm explicitly.
+            if (containsAwait(ts->body)) return true;
+            for (const auto& arm : ts->catches) {
+                if (arm.guard && exprContainsAwait(arm.guard.get()))
                     return true;
-                for (const auto& el : ifs->elifBranches)
-                    if (exprContainsAwait(el.condition.get())) return true;
+                if (arm.body) {
+                    // A catch arm body is a single Stmt (often a DoEndBlock).
+                    // containsAwait operates on a statement list; inspect the
+                    // single statement directly via the common shapes.
+                    if (auto* db =
+                            dynamic_cast<const ast::DoEndBlock*>(arm.body.get())) {
+                        if (containsAwait(db->body)) return true;
+                    } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(
+                                   arm.body.get())) {
+                        if (exprContainsAwait(es->expr.get())) return true;
+                    } else if (auto* asn = dynamic_cast<const ast::AssignmentStmt*>(
+                                   arm.body.get())) {
+                        if (exprContainsAwait(asn->value.get())) return true;
+                    } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
+                                   arm.body.get())) {
+                        if (exprContainsAwait(ld->initializer.get())) return true;
+                    } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(
+                                   arm.body.get())) {
+                        if (exprContainsAwait(rs->value.get())) return true;
+                    }
+                }
             }
-            if (awaitInLoop(ifs->ifBranch.body, inLoop)) return true;
+            if (containsAwait(ts->finallyBody)) return true;
+            continue;
+        }
+        // Recurse into other compound statements so a try nested inside a loop,
+        // if, or do-block is still caught.
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
+            if (awaitInTry(fs->body)) return true;
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
+            if (awaitInTry(ws->body)) return true;
+        } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+            if (awaitInTry(ifs->ifBranch.body)) return true;
             for (const auto& el : ifs->elifBranches)
-                if (awaitInLoop(el.body, inLoop)) return true;
-            if (ifs->hasElse && awaitInLoop(ifs->elseBody, inLoop)) return true;
+                if (awaitInTry(el.body)) return true;
+            if (ifs->hasElse && awaitInTry(ifs->elseBody)) return true;
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
-            if (awaitInLoop(db->body, inLoop)) return true;
-        } else if (inLoop) {
-            // Inside a loop body, any await-bearing statement is the deferred case.
-            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
-                if (exprContainsAwait(ld->initializer.get())) return true;
-            } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s.get())) {
-                if (exprContainsAwait(lc->value.get())) return true;
-            } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get())) {
-                if (exprContainsAwait(as->value.get())) return true;
-            } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s.get())) {
-                if (exprContainsAwait(es->expr.get())) return true;
-            } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get())) {
-                if (exprContainsAwait(rs->value.get())) return true;
-            }
+            if (awaitInTry(db->body)) return true;
         }
     }
     return false;
@@ -221,19 +242,19 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     if (!ci.stmts) return;
     smKind_ = SuspendKind::Await;
 
-    // §30.2 deferred tail: `await` inside a loop body needs CFG reconstruction
-    // (the flat resume model breaks SSA dominance across the loop back-edge).
-    // Detect it and emit a safe, well-formed stub rather than malformed IR, with
-    // a clear diagnostic so the limitation is visible (the IR verifier must stay
-    // clean for all emitted async IR). The synchronous prefix + straight-line /
-    // branch awaits are supported; await-in-loop is the next increment.
-    if (awaitInLoop(*ci.stmts, /*inLoop=*/false)) {
+    // §30.9 deferred tail (#438): `await` inside try / catch / finally needs the
+    // resume to re-establish the handler scope (and re-raise the ORIGINAL
+    // exception object) across a suspend — the flat resume model can't yet do
+    // that. Detect it and emit a safe, well-formed stub rather than malformed IR,
+    // with a clear diagnostic. (await-in-loop is now supported — see
+    // fixupSuspendDominance below.)
+    if (awaitInTry(*ci.stmts)) {
         ctx_.diagnostics().report(
             Severity::Error,
             ms->decl ? ms->decl->span.begin : SourceLocation{},
-            "not yet implemented: `await` inside a loop body (for/while) — the "
-            "async state machine for await-in-loop is a deferred increment "
-            "(§30.2)");
+            "not yet implemented: `await` inside a try/catch/finally — resuming "
+            "into the handler scope across a suspend is a deferred increment "
+            "(§30.9)");
         // Emit a minimal well-formed body so no malformed IR escapes: alloc the
         // task, complete it with a zero/default result, and return it (or the
         // exit code for async Main). The diagnostic above fails the compile.
@@ -451,6 +472,14 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.CreateRetVoid();
         }
 
+        // §30.2 (#438): repair SSA dominance broken by awaits embedded in larger
+        // expressions (e.g. the loop-carried `total := total + await f(i)`): a
+        // temporary computed before the suspend but used in the resume block,
+        // which the dispatch switch / loop back-edge re-enters. Named locals
+        // already round-trip through the frame; this demotes the remaining
+        // anonymous temporaries to stack slots so the resume function verifies.
+        fixupSuspendDominance(resumeFn);
+
         // Clear state-machine state.
         smStateStruct_ = nullptr;
         smSelf_ = nullptr;
@@ -621,8 +650,73 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
 }
 
 
+// §30.2 (#438): repair SSA dominance in a resume function. After the body is
+// lowered, every value computed before a suspend and used in a resume block (the
+// dispatch switch / loop back-edge re-enters those blocks) must not assume its
+// def dominates the use. Named locals already round-trip through the frame
+// (smAllocaToField_); the remaining offenders are anonymous temporaries — e.g.
+// the left operand of `total + await f()` loaded before the await, used after.
+// We demote every register whose def fails to dominate a use to a stack slot
+// (llvm::DemoteRegToStack), and every PHI with a mismatched incoming edge via
+// DemotePHIToStack, iterating to a fixpoint (a demote can expose a new offender
+// when one demoted value fed another). On the synchronous / already-done cut
+// the await fast path falls through to the resume block within the same
+// activation, so each demoted slot is stored-then-loaded and the result is
+// correct; a real cross-activation suspend (the dispatch-switch re-entry edge)
+// is the deferred concurrency increment.
+void Emitter::fixupSuspendDominance(llvm::Function* fn) {
+    if (!fn || fn->isDeclaration()) return;
+
+    // Iterate to a fixpoint: each pass recomputes the dominator tree, finds the
+    // first instruction with a non-dominated use, and demotes it. Bounded by the
+    // instruction count (each instruction is demoted at most once).
+    bool changed = true;
+    unsigned guard = 0;
+    const unsigned cap = 100000;  // safety bound; never expected to be hit
+    while (changed && guard++ < cap) {
+        changed = false;
+        llvm::DominatorTree dt(*fn);
+
+        for (llvm::BasicBlock& bb : *fn) {
+            for (llvm::Instruction& inst : bb) {
+                // An alloca defines a pointer that is trivially available; skip.
+                if (llvm::isa<llvm::AllocaInst>(&inst)) continue;
+
+                bool offends = false;
+                for (llvm::Use& use : inst.uses()) {
+                    auto* user = llvm::dyn_cast<llvm::Instruction>(use.getUser());
+                    if (!user) continue;
+                    // A PHI use is checked against the corresponding incoming
+                    // block, not the PHI's own block (LLVM dominance rule).
+                    if (auto* phi = llvm::dyn_cast<llvm::PHINode>(user)) {
+                        llvm::BasicBlock* incoming =
+                            phi->getIncomingBlock(use);
+                        if (!dt.dominates(inst.getParent(), incoming)) {
+                            offends = true;
+                            break;
+                        }
+                    } else if (!dt.dominates(&inst, user)) {
+                        offends = true;
+                        break;
+                    }
+                }
+                if (!offends) continue;
+
+                if (auto* phi = llvm::dyn_cast<llvm::PHINode>(&inst))
+                    llvm::DemotePHIToStack(phi);
+                else
+                    llvm::DemoteRegToStack(inst);
+                changed = true;
+                break;  // dominator tree is now stale; recompute next pass
+            }
+            if (changed) break;
+        }
+    }
+}
+
+
 // §30.2 deferred tail: emit a well-formed but inert entry for an async method
-// whose body codegen is deferred (await-in-loop). The compile already failed via
+// whose body codegen is deferred (await-in-try). The compile already failed via
 // the diagnostic; this only keeps the emitted IR valid. The body is NOT lowered.
 void Emitter::emitAsyncStub(sema::MethodSymbol* ms, llvm::Function* fn,
                             const CallableInfo& ci) {
