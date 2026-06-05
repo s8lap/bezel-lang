@@ -2313,6 +2313,36 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     return emitPrimitiveToString(arg, argTy->primitive);
             }
         }
+        // §2.3: Convert.TryToInt32(value: string, out result: int): bool.
+        // Returns true and sets result when `value` is a fully-valid integer;
+        // false and leaves result at its default (0) otherwise. Mirrors the
+        // int.TryParse strtol-with-endptr validation (§5.2).
+        if (m == "TryToInt32" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Value* strData = loadStringData(strVal);
+            // Address of the out parameter (slot pre-created by ensureOutVarSlots).
+            llvm::Type* et = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+            if (!outAddr) return nullptr;
+            auto* strtolFn = declareC("strtol", i64(), {ptrTy(), ptrTy(), i32()});
+            auto* endSlot = entryAlloca(ptrTy());
+            llvm::Value* val64 = builder_.CreateCall(
+                strtolFn, {strData, endSlot, builder_.getInt32(10)}, "cvt.val");
+            llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlot);
+            // ok = (endPtr advanced past start) && (*endPtr == '\0')
+            llvm::Value* advanced = builder_.CreateICmpNE(endPtr, strData, "cvt.adv");
+            auto* i8t = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* endCh = builder_.CreateLoad(i8t, endPtr, "cvt.end");
+            llvm::Value* atNul = builder_.CreateICmpEQ(
+                endCh, llvm::ConstantInt::get(i8t, 0), "cvt.nul");
+            llvm::Value* ok = builder_.CreateAnd(advanced, atNul, "cvt.ok");
+            // Store the (truncated to i32) parsed value; on failure strtol
+            // returns 0, matching the "default value" contract.
+            builder_.CreateStore(builder_.CreateTrunc(val64, i32()), outAddr);
+            return ok;
+        }
         // Convert.ToString(n, radix: int): string — radix-based conversion.
         if (m == "ToString" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
@@ -2642,13 +2672,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateCall(cbrtFn, {arg}, "cbrt.result");
             }
             if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round" || m == "Truncate") {
-                // Use llvm intrinsics for common math ops.
+                // Use llvm intrinsics for common math ops. §2.2: one-argument
+                // Round is BANKER'S ROUNDING (round half to even) — that is
+                // llvm.roundeven (IEEE 754 roundToNearestTiesToEven), NOT
+                // llvm.round (which rounds halves away from zero).
                 llvm::Intrinsic::ID iid =
                     m == "Sqrt"     ? llvm::Intrinsic::sqrt :
                     m == "Floor"    ? llvm::Intrinsic::floor :
                     m == "Ceiling"  ? llvm::Intrinsic::ceil :
                     m == "Truncate" ? llvm::Intrinsic::trunc :
-                                      llvm::Intrinsic::round;
+                                      llvm::Intrinsic::roundeven;
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
                 if (!arg->getType()->isDoubleTy())
                     arg = builder_.CreateSIToFP(arg, dbl);
@@ -2698,12 +2731,38 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 }
                 return builder_.CreateCall(powFn, {a, b}, "pow.result");
             }
+            // §2.2: Math.Round(x, digits): double — banker's rounding to `digits`
+            // fractional digits. Compute roundeven(x * 10^digits) / 10^digits,
+            // where 10^digits is libc pow(10, digits). roundeven gives the same
+            // round-half-to-even semantics as the one-argument form.
+            if (m == "Round") {
+                auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                // `digits` is an int; widen to double for pow.
+                llvm::Value* digD = b;
+                if (!digD->getType()->isDoubleTy())
+                    digD = builder_.CreateSIToFP(digD, dbl);
+                auto* powFn = module_->getFunction("pow");
+                if (!powFn) {
+                    auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
+                    powFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "pow", module_.get());
+                }
+                llvm::Value* scale = builder_.CreateCall(
+                    powFn, {llvm::ConstantFP::get(dbl, 10.0), digD}, "round.scale");
+                llvm::Value* scaled = builder_.CreateFMul(a, scale, "round.scaled");
+                auto* reFn = llvm::Intrinsic::getDeclaration(
+                    module_.get(), llvm::Intrinsic::roundeven, {dbl});
+                llvm::Value* rounded = builder_.CreateCall(reFn, {scaled}, "round.re");
+                return builder_.CreateFDiv(rounded, scale, "round.result");
+            }
         }
-        // Math.PI, Math.E — named constants.
+        // §2.2: Math.Pi, Math.E, Math.Tau — named constants. (`PI` is the legacy
+        // spelling kept for the existing intrinsic test; the spec name is `Pi`.)
         if (call.args.empty()) {
             auto* dbl = llvm::Type::getDoubleTy(llvm_);
-            if (m == "PI") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
+            if (m == "Pi" || m == "PI") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
             if (m == "E")  return llvm::ConstantFP::get(dbl, 2.71828182845904523536);
+            if (m == "Tau") return llvm::ConstantFP::get(dbl, 6.28318530717958647692);
         }
         // Math.Log(x), Math.Log2(x), Math.Log10(x)
         // Math.Clamp(value, min, max): clamp value to [min, max].
