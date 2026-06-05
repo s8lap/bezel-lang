@@ -144,7 +144,20 @@ public:
             emitStaticConstructorBody(cs, fn);
         }
         for (auto& [ts, fn] : disposerFns_) {
+            // §2.5 (issue #328 item 1): an IMPORTED class's disposerFns_ entry is
+            // an EXTERNAL declaration (the exporter holds the body); skip it.
+            if (ctx_.isImported(ts)) continue;
             emitDisposerBody(ts, fn);
+        }
+        // §2.5 / §22.8 (issue #328 item 2+3): emit the exported
+        // `bz$<Type>$init` body for every public non-generic class declared in
+        // THIS module. (An IMPORTED type's entry in initFns_ is an external
+        // declaration — emitInstanceInitFunction is a no-op for it: imported
+        // types are never declared with a local init body here, only via
+        // declareImportedInit at the `new` site.)
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (ts && initFns_.count(ts)) emitInstanceInitFunction(ts);
         }
         return std::move(module_);
     }
@@ -325,6 +338,11 @@ private:
     std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>> pendingOwnedParams_;
     // CG13: the compiler-generated Dispose function for each class.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
+    // §2.5 / §22.8 (issue #328 item 2+3): the `bz$<Type>$init(ptr)` function for
+    // each public non-generic class (exporter: a definition; importer: an
+    // external declaration). Installs the vtable + runs field initializers, so a
+    // cross-module `new` runs §22.8 step-1+2 by linking to the exporter's code.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> initFns_;
     // #362 / stdlib §4.5: the cached per-element dispose thunk (built lazily).
     llvm::Function* elementDisposerThunk_ = nullptr;
     // #401 / stdlib §4.8: the cached value-box-free thunk (built lazily) for a
@@ -1793,6 +1811,32 @@ private:
                                    llvm::Function* fn);
 
     void emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* fn);
+
+    // §2.5 / §22.8 / §12 (issue #328 item 2+3): run §22.8 step-1+2 instance
+    // initialization on `obj` (LLVM struct type `st`, sema type `t`): install
+    // the most-derived vtable into slot 0 and execute the full-hierarchy field
+    // initializers (base-first, own last), the collection-literal initializers,
+    // and the event-source initializers. Factored out of `lowerNew` so the SAME
+    // sequence runs at the in-module `new` site AND inside the cross-module
+    // `bz$<Type>$init` function (so a non-foldable field initializer crosses the
+    // module boundary). genericSubst_ must be set for a generic instantiation
+    // when called from `lowerNew`; the standalone init function is emitted only
+    // for non-generic public types (the importable construction surface).
+    void emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
+                          llvm::StructType* st);
+
+    // §2.5 / §2.6 / §22.8 (issue #328 item 2+3): emit the exported
+    // `bz$<Type>$init(ptr this)` for a public non-generic class — it calls
+    // emitInstanceInit so an importer's cross-module construction installs the
+    // vtable and runs every field initializer (foldable or not) by linking to
+    // this. One per public class; cached in initFns_.
+    void emitInstanceInitFunction(const sema::TypeSymbol* ts);
+
+    // §2.5 (issue #328 item 2+3): declare the external `bz$<Type>$init(ptr)` for
+    // an IMPORTED type, so the importer's `new` calls the linked initializer
+    // (vtable install + field initializers) before the imported ctor. Cached in
+    // initFns_.
+    llvm::Function* declareImportedInit(const sema::TypeSymbol* ts);
 
     // CG16: if `s` is a leading constructor chain call (`base(...)` or
     // `this(...)` as an ExpressionStmt-of-CallExpr), return the call and

@@ -751,4 +751,179 @@ BEZEL_TEST(cross_module_import, imported_field_initializer_runs_native_spec_22_8
     BEZEL_EXPECT_EQ(code, 7);
 }
 
+// §2.5 / §2.6 / §12 (cross-module instance, item 2 — SOUNDNESS): a VIRTUAL method
+// call on an imported object must dispatch to the correct override. A's `Animal`
+// has `virtual Sound() => 1` and `Dog : Animal` overrides `Sound() => 2`. B holds
+// a `Dog` through an `Animal`-typed parameter (a polymorphic call site that must
+// go through the vtable) and calls `Sound()`. Before the fix the exporter emitted
+// the type's vtable (vt$Dog) with INTERNAL linkage, so the importer could not
+// install it; the `new Dog()` slot-0 vtable stayed calloc-zero and the dispatch
+// mis-resolved (observed: returns the base's 1). After: the exporter exports
+// vt$Dog with EXTERNAL linkage and the importer installs it via bz$Dog$init, so
+// the polymorphic call resolves to Dog's override → 2. Exercises BOTH a derived
+// class overriding an imported base's virtual AND a base-reference dispatch.
+BEZEL_TEST(cross_module_import, imported_virtual_dispatch_override_spec_12) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_vdisp_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module VLib; "
+        "public class Animal "
+        "  public virtual method Sound(): int => 1; "
+        "  destructor end destructor; "
+        "end Animal; "
+        "public class Dog : Animal "
+        "  public override method Sound(): int => 2; "
+        "  destructor end destructor; "
+        "end Dog;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import VLib; "
+        "public class Program "
+        "  public static method Speak(a: Animal): int => a.Sound(); "
+        "  public static method Main(): int "
+        "    using var d := new Dog(); "
+        "    return Speak(d); "  // polymorphic dispatch → Dog.Sound() == 2
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 2);
+}
+
+// §2.5 / §2.6 / §28.4 (cross-module instance, item 1 — LEAK): an imported
+// `using var` must be disposed exactly once at scope end. A's `Tracker` increments
+// a static `Disposed` counter in its destructor; B constructs a `using var
+// Tracker` in a helper scope and, after that scope returns, reads `Tracker.Disposed`
+// (an imported static field, observed cross-module). Before the fix the importer
+// had no disposerFns_ entry / no external Dispose for the imported type, so the
+// scope-end disposal was never registered and the destructor never ran (counter
+// stays 0 — the leak). After: the exporter exports bz$Tracker$Dispose with
+// EXTERNAL linkage, the importer registers it, and the `using var` disposes once
+// at scope end → counter == 1.
+BEZEL_TEST(cross_module_import, imported_using_var_disposed_once_spec_28_4) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_dispose_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module DLib; "
+        "public class Tracker "
+        "  public static Disposed: int := 0; "
+        "  public constructor() end constructor; "
+        "  public method Ping(): int => 1; "
+        "  destructor "
+        "    Disposed := Disposed + 1; "
+        "  end destructor; "
+        "end Tracker;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import DLib; "
+        "public class Program "
+        "  public static method Use(): int "
+        "    using var t := new Tracker(); "  // disposed at scope end
+        "    return t.Ping(); "
+        "  end Use; "
+        "  public static method Main(): int "
+        "    var r := Use(); "
+        "    return Tracker.Disposed; "  // destructor ran once → 1
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 1);
+}
+
+// §2.5 / §2.6 / §22.8 (cross-module instance, item 3 — MISCOMPILE): a NON-foldable
+// field initializer must run during cross-module construction. A's `Holder` has
+// `n: int := Compute();` where `Compute()` is a static method (a non-compile-time-
+// constant initializer that renderConstExpr cannot fold) and an empty constructor
+// that does NOT assign `n`. B reads `Get()` after `new Holder()`. Before the fix
+// only constant-foldable initializers crossed (replayed textually); a non-foldable
+// one left the field calloc-zero (0). After: §22.8 step-2 field initializers run
+// inside the exporter's cross-module construction path (bz$Holder$init), so the
+// initializer executes regardless of foldability → 5.
+BEZEL_TEST(cross_module_import, imported_nonfoldable_field_initializer_spec_22_8) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_nfinit_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module NLib; "
+        "public class Holder "
+        "  public n: int := Compute(); "  // §22.8 step 2, NON-foldable
+        "  public static method Compute(): int => 5; "
+        "  public constructor() end constructor; "  // body does NOT set n
+        "  public method Get(): int => n; "
+        "  destructor end destructor; "
+        "end Holder;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import NLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var h := new Holder(); "
+        "    return h.Get(); "  // non-foldable field initializer ran → 5
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 5);
+}
+
 }  // namespace bezel::module

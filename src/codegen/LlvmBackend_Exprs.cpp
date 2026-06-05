@@ -2529,117 +2529,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     llvm::Value* obj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), sizeofSt});
 
-    // CG17: install the vtable pointer (instance slot 0) before field
-    // initializers / the constructor, so virtual dispatch on the new
-    // object resolves to its own class.
-    //
-    // §28.5: for a generic instantiation whose class has an `owned` type-
-    // parameter field (`private owned _slot: T`), install the PER-INSTANTIATION
-    // vtable instead of the shared `vt$<T>`. Its slot-1 Dispose disposes that
-    // field, classified by the concrete substituted type of THIS instantiation
-    // (§28.4 step 2 / §28.5); the shared, type-erased disposer cannot, because
-    // the concrete T — and even the field's pointer-vs-value layout — varies per
-    // instantiation. specializedVtableFor falls back to the shared vtable when no
-    // specialization is needed. genericSubst_ is active here (set above).
-    if (llvm::GlobalVariable* vt = specializedVtableFor(t)) {
-        builder_.CreateStore(vt, builder_.CreateStructGEP(st, obj, 0));
-    }
-
-    // Run field initializers, inherited (base-first) then own, so a
-    // `new Derived()` initializes base fields too (calloc already
-    // zeroed the rest). CG16's base-ctor chaining runs ctor *bodies*,
-    // not these initializers, so there is no double-initialization.
-    std::vector<const sema::Symbol*> storage;
-    collectInstanceStorage(t, storage);
-    for (const sema::Symbol* m : storage) {
-        const ast::Expr* init = nullptr;
-        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
-            init = fd->initializer.get();
-        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
-            init = pd->autoInitializer.get();  // CG33: `property X := v;`
-        if (!init) continue;  // no initializer → calloc-zeroed
-        auto idxIt = fieldIndex_.find(m);
-        if (idxIt == fieldIndex_.end()) continue;
-        // §15.1 / §16: collection literal `[e1, e2, …]` initializer.
-        // Build the array in-place via GEP into the field slot.
-        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
-            cl && !cl->isDict && !cl->elements.empty()) {
-            // Determine the struct field type (array type).
-            llvm::Value* fieldGep =
-                builder_.CreateStructGEP(st, obj, idxIt->second);
-            llvm::Type* fieldTy = st->getElementType(idxIt->second);
-            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(fieldTy)) {
-                llvm::Type* elemTy = aty->getElementType();
-                for (std::size_t i = 0; i < cl->elements.size(); ++i) {
-                    if (!cl->elements[i]) continue;
-                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                    if (!ev) continue;
-                    if (ev->getType() != elemTy &&
-                        ev->getType()->isIntegerTy() &&
-                        elemTy->isIntegerTy()) {
-                        unsigned eb = ev->getType()->getIntegerBitWidth();
-                        unsigned db = elemTy->getIntegerBitWidth();
-                        ev = db > eb ? builder_.CreateSExt(ev, elemTy)
-                                     : builder_.CreateTrunc(ev, elemTy);
-                    }
-                    builder_.CreateStore(
-                        ev, builder_.CreateGEP(fieldTy, fieldGep,
-                            {builder_.getInt32(0), builder_.getInt32(i)}));
-                }
-            }
-            continue;
-        }
-        llvm::Value* v = lowerExpr(*init);
-        if (!v) continue;
-        // §5.1: an int initializer for a wider numeric field (e.g. a `double`
-        // field with `:= 5`) is implicitly widened — convert before the store
-        // so the field holds the value, not the int's raw bits (issue #408).
-        // An unsigned source (e.g. a `uint` field initializer for a `double`
-        // field) widens with UIToFP/ZExt, not SIToFP/SExt (issue #410).
-        v = coerceNumericToType(v, st->getElementType(idxIt->second),
-                                isUnsignedTargetExpr(*init));
-        builder_.CreateStore(
-            v, builder_.CreateStructGEP(st, obj, idxIt->second));
-    }
-
-    // §2.5 / §22.8 step 2 (issue #328 FINDING [7]): replay an IMPORTED type's
-    // CONSTANT-FOLDABLE field initializers. The loop above reads `m->decl`, which
-    // is null for an imported field, so the initializer would otherwise not run
-    // cross-module (it lives at the exporter's `new` site, not in its ctor
-    // symbol). The exporter carried each foldable initializer textually in the
-    // metadata (ModuleMetadataBuilder); fold it here to the field's type and
-    // store it, so construction observes the initialized value rather than the
-    // calloc-zero. A non-foldable initializer was not carried — that case is a
-    // documented limitation, not a silent miscompile (the field stays zeroed).
+    // §2.5 / §2.6 / §22.8 step 1+2 (issue #328 item 2+3): for an IMPORTED type
+    // the vtable, field initializers and event-source initializers all live in
+    // the dependency (the in-module init below reads `m->decl`/`genericSubst_`,
+    // which an imported symbol does not carry — so an inline replay would miss a
+    // non-foldable initializer AND never install the external vtable). Call the
+    // linked `bz$<Type>$init(this)` instead, so the EXPORTER's emitInstanceInit
+    // runs cross-module: it installs the type's external vtable (correct virtual
+    // dispatch + slot-1 Dispose) and runs every §22.8 step-2 field initializer
+    // regardless of foldability. The constructor call (below) then runs the ctor
+    // body. This supersedes the old constant-foldable-only replay.
     if (ctx_.isImported(t)) {
-        for (const sema::Symbol* m : storage) {
-            auto* mem = dynamic_cast<const sema::MemberSymbol*>(m);
-            if (!mem || mem->decl != nullptr) continue;  // own fields handled above
-            const std::string* text = ctx_.importedConstValue(mem);
-            if (!text || text->empty()) continue;
-            auto idxIt = fieldIndex_.find(m);
-            if (idxIt == fieldIndex_.end()) continue;
-            llvm::Value* v =
-                foldImportedConstText(*text, ctx_.importedMemberType(mem));
-            if (!v) continue;
-            v = coerceNumericToType(v, st->getElementType(idxIt->second),
-                                    /*srcUnsigned=*/false);
-            builder_.CreateStore(
-                v, builder_.CreateStructGEP(st, obj, idxIt->second));
-        }
-    }
-
-    // per §24.1: initialize each instance event's backing EventSource<T> slot
-    // to a fresh, empty source during construction. (calloc zeroed it; an
-    // empty source is what an event must hold before any subscription.)
-    for (const sema::Symbol* m : storage) {
-        if (!dynamic_cast<const sema::EventSymbol*>(m)) continue;
-        auto idxIt = fieldIndex_.find(m);
-        if (idxIt == fieldIndex_.end()) continue;
-        auto* newFn = declareC("bz_event_source_new", ptrTy(), {});
-        llvm::Value* esrc = builder_.CreateCall(newFn, {});
-        builder_.CreateStore(
-            esrc, builder_.CreateStructGEP(st, obj, idxIt->second));
+        llvm::Function* initFn = declareImportedInit(t);
+        builder_.CreateCall(initFn, {obj});
+    } else {
+        emitInstanceInit(t, obj, st);
     }
 
     // CG10: run the explicit constructor (if any) after the field
