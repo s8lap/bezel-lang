@@ -611,7 +611,18 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // treated as an owned sink — the throw transfers it back to the runtime,
     // which §31.1 explicitly permits. // per §31.1, §28.8
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-        if (th->value) handleDischarge(*th->value);
+        // §31.1 (issue #430): check for a catch borrow escaping via a
+        // NON-OWNED constructor argument of the thrown object. This is the
+        // `throw new Wrap(ex)` pattern where Wrap's ctor stores ex in a
+        // non-owned field. The throw escapes the catch arm, so ex may outlive
+        // it after the runtime frees the caught exception. // per §31.1
+        if (th->value) {
+            if (const auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(th->value.get())) {
+                checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
+            }
+            handleDischarge(*th->value);
+        }
         return;
     }
     // Slice O4: if-then-else handling with branch-join semantics
@@ -902,6 +913,11 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
     checkIndirectEscapeOnReturn(e);       // §28.9/§9.7 indirect-via-local
     checkCatchBorrowEscapesOnReturn(e);   // §31.1 caught-exception escape
+    // §31.1 (issue #430): `return new Wrap(ex)` where Wrap's ctor stores
+    // ex in a non-owned field. The returned object escapes the catch arm;
+    // same use-after-free hazard as the throw case above. // per §31.1
+    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
+        checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement

@@ -305,6 +305,7 @@ set(BEZEL_TEST_SOURCES
     ownership/owned_field_assign_test.cpp
     ownership/catch_owned_sink_test.cpp
     ownership/throw_owned_arg_test.cpp
+    ownership/catch_borrow_escaping_via_ctor_test.cpp
     ownership/async_ownership_test.cpp
     ownership/move_interface_slot_test.cpp)
 

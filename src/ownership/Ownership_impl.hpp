@@ -344,6 +344,23 @@ private:
     // `isEscapeBoundLocal` extend to recognize the catch binding as a source.
     void checkCatchBorrowEscapesOnReturn(const ast::Expr& e);
 
+    // §31.1 (issue #430): scan the constructor arguments of `ne` for a catch
+    // borrow in a NON-OWNED parameter position. Returns the first catch-borrow
+    // symbol found, or null. Only BARE identifier arguments are examined (value
+    // projections like `ex.Message` are MemberAccessExprs and are skipped).
+    // Owned-parameter positions are excluded to avoid double-reporting with the
+    // existing #404 `checkOwnedArgSource` check. // per §31.1, §28.3
+    sema::Symbol* catchBorrowAmongNonOwnedCtorArgs(const ast::NewExpr& ne) const;
+
+    // §31.1 (issue #430): emit a §31.1 diagnostic when the NewExpr `ne` is in
+    // an ESCAPING position (throw or return from a catch arm) and
+    // `catchBorrowAmongNonOwnedCtorArgs` finds a catch borrow in a non-owned-
+    // param argument. The escaping constructed object may store the borrow in
+    // a field, leaving a dangling reference after the arm completes. Called
+    // from the throw handler (`visitStmt`) and `handleReturn`. // per §31.1
+    void checkCatchBorrowEscapesViaNewExpr(const ast::NewExpr& ne,
+                                           SourceLocation loc);
+
     // §9.7: true when `rt` is a record type that holds at least one
     // borrow-carrying field of a non-runtime-managed type (a class/
     // interface reference field, an inline array of reference elements,
