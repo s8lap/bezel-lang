@@ -1090,6 +1090,61 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
                 if (isEscapeBoundLocal(sym)) return sym;
             }
         }
+        // Shape 2b (§31.1 / issue #430) — a CLASS construction (not a record)
+        // whose constructor takes a catch borrow through a NON-OWNED parameter.
+        // The constructed class instance may store the borrow in a non-owned
+        // field (§28.3 forbids this but the ctor is not analysed
+        // interprocedurally here). Binding it to a holder local propagates the
+        // source so a later throw or return of the holder is caught by the
+        // throw/return-time checks. Restricted to:
+        //   (a) class types only (records are handled above; primitives etc. carry
+        //       no borrow obligation);
+        //   (b) BARE identifier arguments only — a value projection like
+        //       `ex.Message` (MemberAccessExpr) is a copy, not the borrow, and
+        //       must not propagate the source;
+        //   (c) CATCH BORROWS only (not owned scope-bound locals): an owned local
+        //       passed to a class ctor is a legitimate ownership-transfer pattern
+        //       (the ctor's owned param takes the local's ownership); only the
+        //       catch binding, which is never owned by the caller, triggers this.
+        //   (d) NON-OWNED parameter positions only — owned-param positions are
+        //       handled at construction time by checkOwnedArgSource (#404) and
+        //       propagating a borrow source there too would be redundant.
+        // // per §31.1, §28.3
+        if (rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+            rt->declaration->kind == ast::TypeDeclKind::Class) {
+            // Resolve the constructor to identify owned vs non-owned params.
+            const ast::ConstructorDecl* cd2 = nullptr;
+            {
+                std::size_t nArgs = ne->args.size();
+                for (sema::Symbol* m : rt->declaration->members) {
+                    if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
+                        auto* d = dynamic_cast<const ast::ConstructorDecl*>(
+                            cs->decl);
+                        if (d && d->params.size() == nArgs) {
+                            cd2 = d;
+                            break;
+                        }
+                    }
+                }
+            }
+            std::size_t pos = 0;
+            for (const ast::CallArgument& a : ne->args) {
+                if (!a.value) { ++pos; continue; }
+                const bool paramIsOwned =
+                    cd2 && pos < cd2->params.size() &&
+                    (cd2->params[pos].modifier == "owned" ||
+                     cd2->params[pos].modifier == "out owned");
+                if (!paramIsOwned) {
+                    const auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+                    if (id) {
+                        sema::Symbol* sym = ctx_.exprSymbol(*id);
+                        if (isCatchBorrow(sym)) return sym;
+                    }
+                }
+                ++pos;
+            }
+        }
     }
     // Shape 3 — a closure capturing an Owned local (§28.9) or a catch-bound
     // exception variable (§31.1). Capturing an owned class-typed local — or
@@ -1249,6 +1304,112 @@ void MethodOwnership::checkCatchBorrowEscapesOnReturn(const ast::Expr& e) {
         "completes), so the exception instance cannot escape the arm (§31.1; "
         "copy the data you need out of it — e.g. its message — into an owned "
         "value and return that, or re-raise with `throw;`)");
+}
+
+// ---------------------------------------------------------------------------
+// §31.1 (issue #430) — catch borrow escaping via a NON-OWNED constructor
+// parameter of an object that is THROWN or RETURNED from the catch arm.
+//
+// The existing #392/#404 checks already reject a catch borrow flowing into an
+// `owned` field (directly or through an `owned` ctor param). The gap #430
+// closes: a `new T(ex)` where T's constructor takes ex through a NON-OWNED
+// borrow parameter — the ctor can store ex into a non-owned field (§28.3
+// forbids this inside the ctor body too, but interprocedural analysis is not
+// performed here). If the constructed object then ESCAPES the catch arm (via
+// throw or return), ex may outlive the arm after which the runtime frees it.
+//
+// PRAGMATIC SOUND APPROXIMATION: reject when a catch borrow `ex` is passed
+// as a BARE IDENTIFIER argument to a constructor at a NON-OWNED parameter
+// position, AND the constructed object is in an escaping position (thrown or
+// returned). The bare-identifier restriction avoids false positives on value-
+// typed projections like `ex.Message` (a MemberAccessExpr, not a bare
+// identifier); method-call results (`ex.Code()`) and other expression forms
+// are similarly skipped. The non-owned-param restriction avoids double-
+// reporting with the existing #404 `checkOwnedArgSource` path.
+//
+// This is slightly conservative (it would also reject a ctor that takes ex as
+// a borrow but does not store it in a field), but that is sound under §28.3:
+// "A borrowed local may not be assigned to any field of any object — neither
+// owned nor non-owned", so the ctor body ALSO must not store ex in `_inner`.
+// Both the ctor body violation and the throw-escape are jointly unsound, and
+// #430 addresses the observable symptom at the escape site.
+// ---------------------------------------------------------------------------
+
+sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
+    const ast::NewExpr& ne) const {
+    // Resolve the constructor declaration to identify owned vs non-owned params.
+    const ast::ConstructorDecl* cd = nullptr;
+    if (ne.type) {
+        if (const auto* rt = ctx_.resolvedType(*ne.type)) {
+            if (rt->declaration) {
+                std::size_t nArgs = ne.args.size();
+                for (sema::Symbol* m : rt->declaration->members) {
+                    if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
+                        auto* d = dynamic_cast<const ast::ConstructorDecl*>(
+                            cs->decl);
+                        if (d && d->params.size() == nArgs) {
+                            cd = d;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::size_t pos = 0;
+    for (const auto& a : ne.args) {
+        if (!a.value) { ++pos; continue; }
+        // Skip args destined for `owned` parameters — the existing #404
+        // `checkOwnedArgSource` path already rejects those. We only add a
+        // new diagnostic for NON-owned parameter positions, which the existing
+        // check does not cover. // per §31.1, §28.8
+        const bool paramIsOwned =
+            cd && pos < cd->params.size() &&
+            (cd->params[pos].modifier == "owned" ||
+             cd->params[pos].modifier == "out owned");
+        if (!paramIsOwned) {
+            // Only flag BARE identifier arguments — a value/string projection
+            // like `ex.Message` is a MemberAccessExpr, not a bare identifier,
+            // so it is a copy of the value, not the exception borrow itself,
+            // and must not be rejected. // per §31.1
+            const auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (id) {
+                sema::Symbol* sym = ctx_.exprSymbol(*id);
+                if (!sym) { ++pos; continue; }
+                // Direct catch borrow: `new Wrap(ex)` where ex is the binding.
+                if (isCatchBorrow(sym)) return sym;
+                // Re-borrow holder: `var b := ex; new Wrap(b)`. The holder b
+                // carries ex as its source (set by borrowSourceForExpr).
+                auto it = states_.find(sym);
+                if (it != states_.end() && it->second.source &&
+                    isCatchBorrow(it->second.source->sym))
+                    return it->second.source->sym;
+            }
+        }
+        ++pos;
+    }
+    return nullptr;
+}
+
+void MethodOwnership::checkCatchBorrowEscapesViaNewExpr(
+    const ast::NewExpr& ne, SourceLocation loc) {
+    // §31.1 / #430: the NewExpr is in an ESCAPING position (thrown or
+    // returned). If any non-owned-param argument is a catch borrow, the
+    // constructed object carries that borrow into the escaped value →
+    // use-after-free when the runtime disposes ex after the arm completes.
+    sema::Symbol* src = catchBorrowAmongNonOwnedCtorArgs(ne);
+    if (!src) return;
+    report(
+        Severity::Error, loc,
+        std::string("caught exception `") + std::string(src->name) +
+        "` may not be passed to a constructor of an object that escapes the "
+        "catch arm — a caught exception is a borrow whose lifetime is the catch "
+        "arm body (the runtime disposes it after the arm completes); the "
+        "constructed object escaping the arm would leave any stored reference to "
+        "it dangling (§31.1 / #430; copy the data you need out of the exception "
+        "— e.g. its message — before constructing the wrapper, or re-raise with "
+        "`throw;`)");
 }
 
 bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
