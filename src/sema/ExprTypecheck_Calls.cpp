@@ -982,6 +982,15 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             if (!cs->isStatic) ctors.push_back(cs);
         }
     }
+    // §2.5 / §22.7 (issue #328 FINDING [7] B): an IMPORTED type's constructors
+    // carry no ast::ConstructorDecl — their parameters are ParameterSymbols whose
+    // resolved types ride `resolvedDeclType`. Check `new ImportedT(args)` against
+    // those reconstructed signatures (the AST-driven paths below would all bail
+    // on the null decl). Mirrors checkImportedCallArity for imported method calls.
+    if (ctx_.isImported(t)) {
+        checkImportedNewExprArgs(ne, t, ctors);
+        return;
+    }
     if (ctors.size() > 1) {
         // §22.6 applies identically to constructor overload sets (§22.7);
         // §22.5 named-argument binding filters the candidate set first.
@@ -1072,6 +1081,56 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     checkArgsAgainstParams(cd->params, ne.args, ne.span.begin,
                            std::string("`new ") + std::string(t->name) +
                            "`");
+}
+
+// §2.2 / §2.5 / §22.7 (issue #328 FINDING [7] B): type-check `new ImportedT(args)`
+// against the imported type's reconstructed constructor signatures. The imported
+// ctors carry no ast::ConstructorDecl; their parameters are ParameterSymbols whose
+// resolved types ride `resolvedDeclType`. Checks the all-positional case: with no
+// explicit ctor the implicit default (0 args) applies (§22.7); with a single
+// reconstructed ctor, argument count (§22.5) and per-argument assignability
+// (§5.1) are checked. Multiple imported ctors (overloads) and named/modifier
+// arguments are conservatively skipped (cross-module ctor overload resolution is
+// deferred, as for imported method calls).
+void ExprTC::checkImportedNewExprArgs(
+    const ast::NewExpr& ne, TypeSymbol* t,
+    const std::vector<ConstructorSymbol*>& ctors) {
+    if (ctors.empty()) {
+        // §22.7: no declared ctor → implicit default takes zero arguments.
+        if (!ne.args.empty())
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                std::string("`new ") + std::string(t->name) + "` has " +
+                    std::to_string(ne.args.size()) +
+                    " argument(s) but the implicit default constructor "
+                    "takes 0 (§22.7)");
+        return;
+    }
+    // A named/modifier argument is outside this conservative check.
+    for (const auto& a : ne.args)
+        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return;
+    if (ctors.size() != 1) return;  // imported ctor overloads deferred
+    ConstructorSymbol* cs = ctors[0];
+    const std::size_t nparams = cs->params.size();
+    const std::string desc =
+        std::string("`new ") + std::string(t->name) + "`";
+    if (ne.args.size() != nparams) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            desc + " has " + std::to_string(ne.args.size()) +
+                " argument(s) but the parameter list has " +
+                std::to_string(nparams) + " (§22.5)");
+        return;
+    }
+    for (std::size_t j = 0; j < nparams; ++j) {
+        auto* p = dynamic_cast<ParameterSymbol*>(cs->params[j]);
+        if (!p || !p->resolvedDeclType) continue;
+        const ast::CallArgument& a = ne.args[j];
+        if (!a.value) continue;
+        checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
+                        a.value->span.begin,
+                        desc + ": argument " + std::to_string(j + 1));
+    }
 }
 
 // §17.1: postfix `.` member access. The target's type determines

@@ -316,6 +316,22 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.decl)) {
         out.kind = MetaMemberKind::Field;
         out.type = convertAstType(fd->type.get(), ctx);
+        // §2.5 / §22.8 (issue #328 FINDING [7]): carry an INSTANCE field's
+        // constant-foldable initializer textually so the importer can replay it
+        // during cross-module construction (step 2 of §22.8). The single-module
+        // path emits the initializer at the `new` site; the importer has no AST,
+        // so a foldable initializer crosses the boundary via this text (mirrors
+        // the §22.12 const valueText path). renderConstExpr returns "" for a
+        // non-foldable initializer (`new Array()`, `DateTime.Now`, an expression
+        // referencing other members) — that initializer does NOT cross the
+        // boundary and is a documented limitation. Static fields are exported as
+        // EXTERNAL storage globals (their initializer runs in the exporter), so
+        // they need no valueText here.
+        bool isStaticField = false;
+        for (auto mod : m.modifiers)
+            if (mod == "static") isStaticField = true;
+        if (!isStaticField && fd->initializer)
+            out.valueText = renderConstExpr(fd->initializer.get());
         return true;
     }
     // §9.1 positional record field — the FieldSymbol's decl is the TypeDecl and

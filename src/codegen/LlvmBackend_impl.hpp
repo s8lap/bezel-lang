@@ -1195,6 +1195,20 @@ private:
     llvm::Value* importedConstValue(const ast::Expr& e,
                                     sema::ConstMemberSymbol* cs);
 
+    // §22.12 / §22.8 (issue #328 FINDING [3] / [7]): fold a textual, compile-
+    // time-constant value (an imported const value, or an imported field's
+    // constant initializer) into an LLVM constant of type `rt`. Null when the
+    // text is not a foldable literal shape.
+    llvm::Value* foldImportedConstText(const std::string& text,
+                                       const sema::TypeRef* rt);
+
+    // §2.5 / §22.7 (issue #328 FINDING [7]): the external `bz$<Type>$ctor`
+    // function for an IMPORTED type's reconstructed constructor, declared on
+    // demand and cached in ctorFns_. The signature is `void(ptr this,
+    // params...)`, matching the exporter's emitter, so the importer's `new` call
+    // binds to the linked definition.
+    llvm::Function* declareImportedCtor(const sema::ConstructorSymbol* cs);
+
     void declareStatics();
 
     // The constant initializer for a static field, or zero if absent or

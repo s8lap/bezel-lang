@@ -2593,6 +2593,33 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
 
+    // §2.5 / §22.8 step 2 (issue #328 FINDING [7]): replay an IMPORTED type's
+    // CONSTANT-FOLDABLE field initializers. The loop above reads `m->decl`, which
+    // is null for an imported field, so the initializer would otherwise not run
+    // cross-module (it lives at the exporter's `new` site, not in its ctor
+    // symbol). The exporter carried each foldable initializer textually in the
+    // metadata (ModuleMetadataBuilder); fold it here to the field's type and
+    // store it, so construction observes the initialized value rather than the
+    // calloc-zero. A non-foldable initializer was not carried — that case is a
+    // documented limitation, not a silent miscompile (the field stays zeroed).
+    if (ctx_.isImported(t)) {
+        for (const sema::Symbol* m : storage) {
+            auto* mem = dynamic_cast<const sema::MemberSymbol*>(m);
+            if (!mem || mem->decl != nullptr) continue;  // own fields handled above
+            const std::string* text = ctx_.importedConstValue(mem);
+            if (!text || text->empty()) continue;
+            auto idxIt = fieldIndex_.find(m);
+            if (idxIt == fieldIndex_.end()) continue;
+            llvm::Value* v =
+                foldImportedConstText(*text, ctx_.importedMemberType(mem));
+            if (!v) continue;
+            v = coerceNumericToType(v, st->getElementType(idxIt->second),
+                                    /*srcUnsigned=*/false);
+            builder_.CreateStore(
+                v, builder_.CreateStructGEP(st, obj, idxIt->second));
+        }
+    }
+
     // per §24.1: initialize each instance event's backing EventSource<T> slot
     // to a fresh, empty source during construction. (calloc zeroed it; an
     // empty source is what an event must hold before any subscription.)
@@ -2615,6 +2642,50 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // arity-distinct overloads; full type-based overload resolution
     // is deferred). The chosen ctor runs its own base/this chain.
     //
+    // §2.5 / §2.6 step 4 / §22.7 / §22.8 (issue #328 FINDING [7]): when `new`
+    // targets an IMPORTED type, the constructor is defined in the linked
+    // dependency, not this module — there is no AST body to inline and no
+    // local ctorFns_ entry. Declare the external `bz$<Type>$ctor` and emit the
+    // CALL (instance + positional args), so the library's ctor body runs
+    // cross-module (manifestation A) instead of the field-zero bare calloc. The
+    // ctor signature was reconstructed by the loader (manifestation B). Named /
+    // modifier arguments are conservatively skipped here, matching the sema-side
+    // check (cross-module ctor overloads + by-ref binding are deferred); an
+    // imported type cannot be generic-substituted in this path (its struct is
+    // built from reconstructed field types, not a live template).
+    if (ctx_.isImported(t)) {
+        bool allPositional = true;
+        for (const auto& a : ne.args)
+            if (!a.name.empty() || !a.modifier.empty() || a.isDiscard)
+                { allPositional = false; break; }
+        if (sema::ConstructorSymbol* cs = ctorForArgs(t, ne.args);
+            cs && allPositional && ne.args.size() == cs->params.size()) {
+            llvm::Function* ctorFn = declareImportedCtor(cs);
+            std::vector<llvm::Value*> args;
+            args.push_back(obj);
+            bool ok = true;
+            auto* fnTy = ctorFn->getFunctionType();
+            for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+                if (!ne.args[ai].value) { ok = false; break; }
+                llvm::Value* v = lowerExpr(*ne.args[ai].value);
+                if (!v) { ok = false; break; }
+                // §5.1: widen an int argument to a wider numeric parameter, as
+                // the in-module ctor-call path does, so the ABI matches.
+                if (ai + 1 < fnTy->getNumParams())
+                    v = coerceNumericToType(
+                        v, fnTy->getParamType(ai + 1),
+                        isUnsignedTargetExpr(*ne.args[ai].value));
+                args.push_back(v);
+            }
+            if (ok && args.size() == ctorFn->arg_size())
+                builder_.CreateCall(ctorFn, args);
+        }
+        emitPendingCheck();  // CG20: an imported constructor may throw
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        return obj;
+    }
+
     // CG-generic: when the type has an active generic substitution, the
     // constructor function was compiled for the generic template (T→i32)
     // but the actual arguments use concrete types. Emit the constructor
