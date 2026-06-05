@@ -596,6 +596,46 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         if (ys->value) resolveTypesInExpr(*ys->value, scope);
         return;
     }
+    // §19: statement-position `case`. Resolve the scrutinee, each arm's
+    // pattern type (so a typed binding `var x: T` resolves T), guard, and
+    // arm-body statements. Previously CaseStmt was not handled here at all,
+    // so a member-access guard over a `var x: T` binding had no resolved
+    // member symbol and codegen emitted malformed IR.
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) resolveTypesInExpr(*cs->scrutinee, scope);
+        for (const auto& arm : cs->arms) {
+            if (arm.pattern) resolveTypesInPattern(*arm.pattern, scope);
+            if (arm.guard) resolveTypesInExpr(*arm.guard, scope);
+            if (arm.exprBody) resolveTypesInExpr(*arm.exprBody, scope);
+            for (const auto& st : arm.stmts) {
+                if (st) resolveTypesInStmt(*st, scope);
+            }
+        }
+        return;
+    }
+}
+
+void Resolver::resolveTypesInPattern(const ast::Pattern& p, Scope* scope) {
+    // §19: a typed binding `var x: T` (BindingPattern) and a primitive type
+    // pattern `T` (TypePattern) each carry a Type node that must be resolved
+    // so ExprTypecheck can type the bound name / the type test. A
+    // DestructuringPattern composes sub-patterns (`Point(var x: T, ...)`),
+    // each of which may itself carry a type node, so recurse. This mirrors
+    // the catch-arm pattern-type resolution in resolveTypesInStmt (TryStmt).
+    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(&p)) {
+        if (bp->type) resolveType(*bp->type, scope);
+        return;
+    }
+    if (auto* tp = dynamic_cast<const ast::TypePattern*>(&p)) {
+        if (tp->type) resolveType(*tp->type, scope);
+        return;
+    }
+    if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(&p)) {
+        for (const auto& sp : dp->subPatterns) {
+            if (sp.pattern) resolveTypesInPattern(*sp.pattern, scope);
+        }
+        return;
+    }
 }
 
 void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
@@ -687,6 +727,10 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     if (auto* cae = dynamic_cast<const ast::CaseExpr*>(&e)) {
         if (cae->scrutinee) resolveTypesInExpr(*cae->scrutinee, scope);
         for (const auto& arm : cae->arms) {
+            // §19: resolve the arm pattern's embedded Type nodes (the `T` in a
+            // `var x: T` binding or a `T` type pattern) so ExprTypecheck can
+            // type the bound name and codegen can resolve member accesses on it.
+            if (arm.pattern) resolveTypesInPattern(*arm.pattern, scope);
             if (arm.guard) resolveTypesInExpr(*arm.guard, scope);
             if (arm.exprBody) resolveTypesInExpr(*arm.exprBody, scope);
             for (const auto& s : arm.stmts) {

@@ -203,6 +203,7 @@ set(BEZEL_TEST_SOURCES
     codegen/const_member_test.cpp
     codegen/default_expr_test.cpp
     codegen/case_stmt_test.cpp
+    codegen/pattern_guard_member_test.cpp
     codegen/coalesce_test.cpp
     codegen/null_forgiving_member_test.cpp
     codegen/throw_expr_test.cpp

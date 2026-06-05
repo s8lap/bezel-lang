@@ -288,6 +288,14 @@ private:
     void resolveTypesInStmt(const ast::Stmt& s, Scope* scope);
     void resolveTypesInExpr(const ast::Expr& e, Scope* scope);
 
+    // §19: resolve the Type nodes embedded in a case-arm pattern (a typed
+    // `var x: T` binding, a primitive `T` type pattern, or any nested
+    // sub-pattern of a destructuring). Without this, `bp->type` carries no
+    // resolved TypeRef and ExprTypecheck cannot type the bound name (so a
+    // member access on it in the guard/body fails to resolve — issue: a
+    // member-access guard `var c: Circle when c.r > 5` crashed codegen).
+    void resolveTypesInPattern(const ast::Pattern& p, Scope* scope);
+
     TypeRef* resolveType(const ast::Type& t, Scope* scope);
 
     void resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref);
