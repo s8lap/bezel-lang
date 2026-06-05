@@ -1697,6 +1697,177 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             return found;
         }
+        // .GetOrAdd(k, factory): V  (stdlib §4.8 borrowing / §4.9 owning)
+        //   Dictionary<K,V>:       factory is (K) -> V
+        //   OwnedDictionary<K,V>:  factory is (K) -> owned V, result is a BORROW
+        //
+        // Semantics (§4.8 / §4.9): if `k` is present, return the existing value
+        // and DO NOT invoke the factory; otherwise invoke factory(k) to produce a
+        // V, store it under `k` (the same insert path Add/Set uses — record values
+        // heap-boxed, class pointers stored directly), and return that value.
+        //
+        // Ownership (the cardinal risk, §28.3 / §28.8):
+        //   * OwnedDictionary MISS: the factory yields an `owned V` (+1 class
+        //     pointer); we STORE it (the dict takes ownership, exactly as
+        //     `Add(owned)` / the indexer set does — encodeValue stores the pointer
+        //     directly, bz_dict_set_* records it) and RETURN A BORROW = the stored
+        //     slot read back (NOT a transfer; the dict still owns it and disposes
+        //     it once at scope-end via its #394 disposal cascade). producerState
+        //     in the ownership checker classifies the GetOrAdd result as Borrowed
+        //     (no resolved `owned` return), so the caller gets no disposal
+        //     obligation — no double-free.
+        //   * OwnedDictionary HIT: the factory is NOT invoked (the call is in the
+        //     miss branch only), so no owned V is produced — nothing leaks. The
+        //     existing slot's value is returned as a borrow.
+        //   * Borrowing Dictionary: V is a value/record/string; the factory yields
+        //     a V which we store on the same insert path Add/Set uses; the return
+        //     is the slot value read back (a copy for records/scalars, the pointer
+        //     for strings/objects). No owned semantics either way.
+        //
+        // Lowering = TryGet, then conditionally (invoke factory + store) on the
+        // miss path, then decode the slot value on BOTH paths and PHI-merge. The
+        // factory closure is lowered ONCE up front (constructing the {fn,env}
+        // closure value has no side effects — the factory BODY only runs when the
+        // closure is called, which happens in the miss branch only).
+        if (m == "GetOrAdd" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            // Result LLVM type = V (the value type, genericArgs[1]).
+            llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : ptrTy();
+            if (!valLlvm) valLlvm = ptrTy();
+
+            // Decode a stored void* slot value into the V LLVM type — identical to
+            // the TryGetValue / indexer-get decode (record → load the boxed struct;
+            // scalar → ptrtoint then truncate/bitcast; pointer → the void* IS the
+            // string/object pointer). `slotV` is the raw stored void*.
+            auto decodeSlot = [&](llvm::Value* slotV) -> llvm::Value* {
+                if (valRec && valLlvm->isStructTy())
+                    return builder_.CreateLoad(valLlvm, slotV, "goa.rec");
+                if (!valLlvm->isPointerTy()) {
+                    llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
+                    if (valLlvm->isDoubleTy())
+                        return builder_.CreateBitCast(asI64, valLlvm);
+                    if (valLlvm->isFloatTy())
+                        return builder_.CreateBitCast(
+                            builder_.CreateTrunc(asI64, i32()), valLlvm);
+                    if (valLlvm->isIntegerTy(64)) return asI64;
+                    return builder_.CreateTrunc(asI64, valLlvm);
+                }
+                return slotV;  // pointer value (string / object)
+            };
+
+            // Lower the key once, and spill it for the generic-key path.
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            if (!k) return nullptr;
+            llvm::Value* genKey = keyTy ? genKeyPtr(k) : nullptr;
+            llvm::Value* strKd = nullptr, *strKl = nullptr;
+            if (!keyTy) { auto p = strDataLen(k); strKd = p.first; strKl = p.second; }
+
+            // Lower the factory closure (K) -> V. Build a synthetic Function
+            // TypeRef so an unannotated lambda param/return picks up the right
+            // LLVM type (mirrors the LINQ lowerLinqLambda helper). The closure is
+            // a { ptr fn, ptr env } struct value; calling it is fn(env, key).
+            auto* funcRef = ctx_.makeTypeRef();
+            funcRef->kind = sema::TypeRef::Kind::Function;
+            funcRef->funcReturn = valTy ? const_cast<sema::TypeRef*>(valTy)
+                                        : nullptr;
+            if (recvTy && !recvTy->genericArgs.empty() &&
+                recvTy->genericArgs[0]) {
+                sema::TypeRef::FuncParam fp;
+                fp.type = recvTy->genericArgs[0];   // K — the factory's parameter
+                funcRef->funcParams.push_back(std::move(fp));
+            }
+            const sema::TypeRef* savedExpected = expectedFunctionType_;
+            expectedFunctionType_ = funcRef;
+            llvm::Value* closure = lowerExpr(*call.args[1].value);
+            expectedFunctionType_ = savedExpected;
+            if (!closure) return nullptr;
+            // #422: a closure produced INLINE here (a lambda literal) is a fresh
+            // transient with rc=1 that we own and must release after use; a closure
+            // arriving via a variable/field is borrowed (not ours to free). Only
+            // release the inline-lambda form.
+            const bool factoryIsInlineLambda =
+                dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get())
+                    != nullptr;
+
+            // First TryGet: is the key already present?
+            auto* tmpSlot = entryAlloca(ptrTy());
+            llvm::Value* found;
+            if (keyTy) {
+                auto* fn = declareC("bz_dict_try_get_gen", i1(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, genKey, tmpSlot});
+            } else {
+                auto* fn = declareC("bz_dict_try_get_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, strKd, strKl, tmpSlot});
+            }
+
+            auto* missBB = llvm::BasicBlock::Create(llvm_, "goa.miss", currentFn_);
+            auto* hitBB  = llvm::BasicBlock::Create(llvm_, "goa.hit",  currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "goa.end",  currentFn_);
+            builder_.CreateCondBr(found, hitBB, missBB);
+
+            // HIT: decode the already-stored slot value. The factory is NOT called.
+            builder_.SetInsertPoint(hitBB);
+            llvm::Value* hitSlot = builder_.CreateLoad(ptrTy(), tmpSlot, "goa.hslot");
+            llvm::Value* hitVal = decodeSlot(hitSlot);
+            llvm::BasicBlock* hitEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+
+            // MISS: invoke factory(k) → V, encode + store it (the dict takes
+            // ownership for the owning case, exactly as Add(owned)/indexer-set do),
+            // then re-read the stored slot and decode → the borrow-return value.
+            builder_.SetInsertPoint(missBB);
+            llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "goa.fn");
+            llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure,
+                                                      {builder_.getInt32(1)});
+            llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "goa.env");
+            auto* facTy = llvm::FunctionType::get(valLlvm, {ptrTy(), k->getType()},
+                                                  false);
+            llvm::Value* produced =
+                builder_.CreateCall(facTy, fnPtr, {envPtr, k}, "goa.fac");
+            llvm::Value* encoded = encodeValue(produced);
+            if (keyTy) {
+                auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {recv, genKey, encoded});
+            } else {
+                auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, strKd, strKl, encoded});
+            }
+            // Re-read the now-stored slot so the returned value is the BORROW of the
+            // stored slot (mirrors the indexer-get-borrow; for a record value this
+            // reads the freshly-stored box, for a class value the stored pointer).
+            auto* tmpSlot2 = entryAlloca(ptrTy());
+            if (keyTy) {
+                auto* fn = declareC("bz_dict_try_get_gen", i1(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {recv, genKey, tmpSlot2});
+            } else {
+                auto* fn = declareC("bz_dict_try_get_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, strKd, strKl, tmpSlot2});
+            }
+            llvm::Value* missSlot = builder_.CreateLoad(ptrTy(), tmpSlot2, "goa.mslot");
+            llvm::Value* missVal = decodeSlot(missSlot);
+            llvm::BasicBlock* missEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+
+            // Merge the two paths.
+            builder_.SetInsertPoint(endBB);
+            llvm::PHINode* phi = builder_.CreatePHI(valLlvm, 2, "goa.r");
+            phi->addIncoming(hitVal, hitEnd);
+            phi->addIncoming(missVal, missEnd);
+            // #422: the factory closure, when produced INLINE (a lambda literal),
+            // is a transient temporary we produced with rc=1 (the producer
+            // reference); both paths are done using it here, so release it (frees
+            // the cell + its env; captures are borrows, never freed — §28.9). On
+            // the HIT path the closure was never called, but it was still
+            // allocated and must be reclaimed. Null-safe.
+            if (factoryIsInlineLambda) emitClosureRelease(closure);
+            return phi;
+        }
     }
 
     // ---------------------------------------------------------------------------
