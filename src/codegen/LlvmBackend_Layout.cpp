@@ -275,6 +275,21 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 if (fn == "CString" || fn == "WString" || fn == "RawBytes")
                     return ptrTy();  // per §32.5: opaque C-boundary pointer
             }
+            // §2.5: DateTime and TimeSpan are value types stored as a scalar
+            // int64 tick count — NOT heap-allocated pointers. Lower to i64 so
+            // they pass through function arguments and return values correctly.
+            // This applies to both the "no-declaration" (parsed annotation)
+            // and the "builtinClassSym" (returned by Now/UtcNow/From*) shapes.
+            if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty()) {
+                auto n0 = rt->astNode->name->parts[0];
+                if (n0 == "DateTime" || n0 == "TimeSpan") return i64();
+            }
+            if (rt->declaration && !rt->declaration->decl &&
+                (rt->declaration->name == "DateTime" ||
+                 rt->declaration->name == "TimeSpan")) {
+                return i64();
+            }
             // §3 stdlib: collection and IO built-in classes (no user TypeDecl).
             // All are heap-allocated opaque pointers to runtime structs.
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
@@ -287,7 +302,6 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "Set" || n == "OwnedSet" ||
                     n == "LinkedList" || n == "OwnedLinkedList" ||
                     n == "StringBuilder" || n == "Random" ||
-                    n == "DateTime" || n == "TimeSpan" ||
                     // §29: iteration interfaces are heap-allocated objects.
                     n == "IEnumerable" || n == "IEnumerator" ||
                     n == "OwnedEnumerable" || n == "OwnedEnumerator" ||

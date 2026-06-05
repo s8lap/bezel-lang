@@ -746,9 +746,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "Exists")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     }
-                    // DateTime
-                    if (colName == "DateTime" && (m == "Now" || m == "UtcNow"))
-                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Long));
+                    // §2.5: DateTime static properties/methods → DateTime type.
+                    // DateTime and TimeSpan are scalar i64 value types; we
+                    // use builtinClassSym to carry the type name through sema so
+                    // subsequent member accesses (Year, Month, etc.) are typed.
+                    auto makeDTType = [&]() -> TypeRef* {
+                        auto* t = ctx_.makeTypeRef();
+                        t->kind = TypeRef::Kind::Named;
+                        t->declaration = builtinClassSym("DateTime");
+                        return t;
+                    };
+                    auto makeTSType = [&]() -> TypeRef* {
+                        auto* t = ctx_.makeTypeRef();
+                        t->kind = TypeRef::Kind::Named;
+                        t->declaration = builtinClassSym("TimeSpan");
+                        return t;
+                    };
+                    if (colName == "DateTime") {
+                        if (m == "Now" || m == "UtcNow" || m == "Today" ||
+                            m == "MinValue" || m == "MaxValue" || m == "FromTicks")
+                            ctx_.setExprType(&ce, makeDTType());
+                    }
+                    // §2.5: TimeSpan static factories → TimeSpan type.
+                    if (colName == "TimeSpan") {
+                        if (m == "FromDays" || m == "FromHours" || m == "FromMinutes" ||
+                            m == "FromSeconds" || m == "FromMilliseconds" || m == "Zero")
+                            ctx_.setExprType(&ce, makeTSType());
+                    }
                     // §6.1 / §30.8: CancellationToken instance method return types.
                     // ThrowIfCancellationRequested() → unit (void); Register(cb) →
                     // owned Subscription (leave untyped — Register is deferred).
@@ -772,6 +796,61 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctTy->declaration = builtinClassSym("CancellationToken");
                             ctx_.setExprType(&ce, ctTy);
                         }
+                    }
+                }
+                // §2.5: DateTime instance method return types.
+                // The receiver's TypeRef uses builtinClassSym (non-null declaration,
+                // null decl) so colName is empty; check via declaration->name directly.
+                {
+                    auto builtinInstName = [](const TypeRef* rt) -> std::string_view {
+                        if (!rt || rt->kind != TypeRef::Kind::Named) return {};
+                        if (!rt->declaration) {
+                            if (rt->astNode && rt->astNode->name &&
+                                !rt->astNode->name->parts.empty())
+                                return rt->astNode->name->parts[0];
+                            return {};
+                        }
+                        if (!rt->declaration->decl) return rt->declaration->name;
+                        return {};
+                    };
+                    std::string_view rcn = builtinInstName(recvTy);
+                    if (rcn == "DateTime") {
+                        // Add*/Subtract(TimeSpan) → DateTime; Subtract(DateTime) →
+                        // TimeSpan. AddYears/AddMonths → DateTime. ToUtc/ToLocal →
+                        // DateTime. Subtract overload dispatch by arg type is not
+                        // tracked here — both overloads typed as DateTime; the
+                        // Subtract(DateTime) → TimeSpan is handled in codegen.
+                        auto* dtTy = ctx_.makeTypeRef();
+                        dtTy->kind = TypeRef::Kind::Named;
+                        dtTy->declaration = builtinClassSym("DateTime");
+                        auto* tsTy = ctx_.makeTypeRef();
+                        tsTy->kind = TypeRef::Kind::Named;
+                        tsTy->declaration = builtinClassSym("TimeSpan");
+                        if (m == "Add" || m == "AddDays" || m == "AddHours" ||
+                            m == "AddMinutes" || m == "AddSeconds" ||
+                            m == "AddMilliseconds" || m == "AddYears" ||
+                            m == "AddMonths" || m == "ToUtc" || m == "ToLocal")
+                            ctx_.setExprType(&ce, dtTy);
+                        else if (m == "Subtract") {
+                            // Overload: Subtract(DateTime) → TimeSpan;
+                            //           Subtract(TimeSpan) → DateTime.
+                            // Check first arg type to pick the right return.
+                            bool argIsTS = false;
+                            if (!ce.args.empty() && ce.args[0].value) {
+                                auto* argTy = ctx_.exprType(*ce.args[0].value);
+                                argIsTS = argTy && builtinInstName(argTy) == "TimeSpan";
+                            }
+                            ctx_.setExprType(&ce, argIsTS ? dtTy : tsTy);
+                        }
+                    }
+                    // TimeSpan arithmetic methods return TimeSpan (fallback if
+                    // the operator desugaring lands here rather than BinaryExpr).
+                    if (rcn == "TimeSpan") {
+                        auto* tsTy = ctx_.makeTypeRef();
+                        tsTy->kind = TypeRef::Kind::Named;
+                        tsTy->declaration = builtinClassSym("TimeSpan");
+                        if (m == "Add" || m == "Subtract" || m == "Negate")
+                            ctx_.setExprType(&ce, tsTy);
                     }
                 }
             }
@@ -2072,6 +2151,91 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                     return;
+                }
+            }
+        }
+        // §2.5: DateTime and TimeSpan instance property/method member accesses.
+        // These are builtin value types stored as scalar i64; the ordinary
+        // member-lookup path never finds their properties.
+        if (ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            auto builtinTyNameLocal = [](const TypeRef* rt) -> std::string_view {
+                if (!rt || rt->kind != TypeRef::Kind::Named) return {};
+                if (!rt->declaration) {
+                    if (rt->astNode && rt->astNode->name &&
+                        !rt->astNode->name->parts.empty())
+                        return rt->astNode->name->parts[0];
+                    return {};
+                }
+                if (!rt->declaration->decl) return rt->declaration->name;
+                return {};
+            };
+            std::string_view dtcn = builtinTyNameLocal(tt);
+            if (dtcn == "DateTime") {
+                const auto& mbr = ma.member;
+                // Integer properties → int.
+                if (mbr == "Year" || mbr == "Month" || mbr == "Day" ||
+                    mbr == "Hour" || mbr == "Minute" || mbr == "Second" ||
+                    mbr == "Millisecond" || mbr == "DayOfYear") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+                // DayOfWeek → int (codegen treats enum as i32).
+                if (mbr == "DayOfWeek") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+                // Ticks → long (the raw i64 tick count).
+                if (mbr == "Ticks") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
+                    return;
+                }
+                // Add*/Subtract instance methods → return DateTime or TimeSpan
+                // (resolved in the call-expression handler below, not as a property).
+            }
+            if (dtcn == "TimeSpan") {
+                const auto& mbr = ma.member;
+                // Total* properties → double.
+                if (mbr == "TotalDays" || mbr == "TotalHours" ||
+                    mbr == "TotalMinutes" || mbr == "TotalSeconds" ||
+                    mbr == "TotalMilliseconds") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
+                    return;
+                }
+                // Component properties → int.
+                if (mbr == "Days" || mbr == "Hours" || mbr == "Minutes" ||
+                    mbr == "Seconds" || mbr == "Milliseconds") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+                // Ticks → long.
+                if (mbr == "Ticks") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
+                    return;
+                }
+            }
+            // §2.5: DateTime static properties accessed as DateTime.Now, etc.
+            // These appear as MemberAccess on the "DateTime" identifier.
+            if (auto* did = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+                if (did->name == "DateTime") {
+                    auto* dt = ctx_.makeTypeRef();
+                    dt->kind = TypeRef::Kind::Named;
+                    dt->declaration = builtinClassSym("DateTime");
+                    if (ma.member == "Now" || ma.member == "UtcNow" ||
+                        ma.member == "Today" || ma.member == "MinValue" ||
+                        ma.member == "MaxValue") {
+                        ctx_.setExprType(&ma, dt);
+                        return;
+                    }
+                }
+                if (did->name == "TimeSpan") {
+                    if (ma.member == "Zero") {
+                        auto* ts = ctx_.makeTypeRef();
+                        ts->kind = TypeRef::Kind::Named;
+                        ts->declaration = builtinClassSym("TimeSpan");
+                        ctx_.setExprType(&ma, ts);
+                        return;
+                    }
                 }
             }
         }

@@ -185,7 +185,10 @@ void    bz_random_next_bytes(void* r, uint8_t* buf, int64_t len);
 
 // ---------------------------------------------------------------------------
 // DateTime / TimeSpan (100-ns ticks since 0001-01-01 00:00:00 UTC,
-// matching the Bezel spec §2.5 which follows .NET DateTime semantics)
+// matching the Bezel spec §2.5 which follows .NET DateTime semantics).
+//
+// DateTime is a value type stored as a scalar int64 tick count.
+// TimeSpan is likewise a scalar int64 tick count (signed duration).
 // ---------------------------------------------------------------------------
 
 int64_t bz_datetime_now_ticks(void);
@@ -201,6 +204,44 @@ void bz_datetime_ticks_to_parts(int64_t ticks,
 int64_t bz_datetime_parts_to_ticks(int32_t year, int32_t month,  int32_t day,
                                     int32_t hour, int32_t minute, int32_t second,
                                     int32_t ms);
+
+// Per §2.5: computed scalar properties extracted from a DateTime tick value.
+int32_t bz_datetime_year(int64_t ticks);
+int32_t bz_datetime_month(int64_t ticks);
+int32_t bz_datetime_day(int64_t ticks);
+int32_t bz_datetime_hour(int64_t ticks);
+int32_t bz_datetime_minute(int64_t ticks);
+int32_t bz_datetime_second(int64_t ticks);
+int32_t bz_datetime_millisecond(int64_t ticks);
+// DayOfWeek: 0=Sunday, 1=Monday, ..., 6=Saturday (per §2.5 DayOfWeek enum)
+int32_t bz_datetime_day_of_week(int64_t ticks);
+// DayOfYear: 1..366
+int32_t bz_datetime_day_of_year(int64_t ticks);
+
+// Per §2.5: Add* instance methods on DateTime (return new tick value).
+// AddYears/AddMonths perform calendar-aware arithmetic; others are tick math.
+int64_t bz_datetime_add_years(int64_t ticks, int32_t years);
+int64_t bz_datetime_add_months(int64_t ticks, int32_t months);
+
+// ---------------------------------------------------------------------------
+// Per §2.5: TimeSpan component properties (all computed from a signed i64
+// tick count). Total* return double; component Days/Hours/Minutes/Seconds/
+// Milliseconds return int (the partial component, not the total).
+// ---------------------------------------------------------------------------
+
+// Decompose a TimeSpan tick count into (days, hours, minutes, seconds, ms).
+// All are signed; e.g. a negative TimeSpan gives negative components.
+void bz_timespan_components(int64_t ticks,
+                             int32_t* days, int32_t* hours,
+                             int32_t* minutes, int32_t* seconds,
+                             int32_t* ms);
+
+// Total* properties (double): e.g. TotalMinutes = ticks / TICKS_PER_MINUTE.
+double bz_timespan_total_days(int64_t ticks);
+double bz_timespan_total_hours(int64_t ticks);
+double bz_timespan_total_minutes(int64_t ticks);
+double bz_timespan_total_seconds(int64_t ticks);
+double bz_timespan_total_milliseconds(int64_t ticks);
 
 // ---------------------------------------------------------------------------
 // File I/O — wraps POSIX read/write. All path parameters are NUL-terminated
