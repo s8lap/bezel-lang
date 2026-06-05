@@ -474,6 +474,12 @@ static bool isOwnedRelevantLocal(sema::Symbol* sym) {
     if (rt->nullable) return false;
     if (rt->kind != sema::TypeRef::Kind::Named) return false;
     if (!rt->declaration) return false;
+    // §2.5 / §2.6 / §6.1 / §28 (issue #434): value-type builtins
+    // (DateTime, TimeSpan, Guid, CancellationToken) carry kind==Class so
+    // that sema/codegen member resolution works, but they are scalars with
+    // no heap allocation and no disposal obligation. Exclude them from the
+    // ownership-tracking set. // per §28
+    if (rt->declaration->isValueBuiltin) return false;
     return rt->declaration->kind == ast::TypeDeclKind::Class ||
            rt->declaration->kind == ast::TypeDeclKind::Interface;
 }
@@ -558,6 +564,9 @@ bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
             return true;
         case sema::TypeRef::Kind::Named:
             if (!rt->declaration) return false;  // generic param → not conservative
+            // §2.5 / §2.6 / §6.1 / §28 (issue #434): value-type builtins are
+            // scalars/structs — they are not reference types and not borrowable.
+            if (rt->declaration->isValueBuiltin) return false;
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
         case sema::TypeRef::Kind::Error:
@@ -898,6 +907,9 @@ bool MethodOwnership::isBorrowBearingRecord(const sema::TypeRef* rt) const {
         switch (ft->kind) {
             case sema::TypeRef::Kind::Named: {
                 if (!ft->declaration) return false;  // generic param
+                // §2.5 / §2.6 / §6.1 / §28 (issue #434): value-type builtins
+                // are scalars/structs; they never carry a borrow. // per §28
+                if (ft->declaration->isValueBuiltin) return false;
                 if (ft->declaration->kind == ast::TypeDeclKind::Class ||
                     ft->declaration->kind == ast::TypeDeclKind::Interface)
                     return true;
@@ -1110,7 +1122,10 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
         //       handled at construction time by checkOwnedArgSource (#404) and
         //       propagating a borrow source there too would be redundant.
         // // per §31.1, §28.3
+        // §2.5/§2.6/§6.1/§28 (issue #434): value-type builtins are scalars;
+        // they cannot hold a borrow of a catch variable. // per §28
         if (rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+            !rt->declaration->isValueBuiltin &&
             rt->declaration->kind == ast::TypeDeclKind::Class) {
             // Resolve the constructor to identify owned vs non-owned params.
             const ast::ConstructorDecl* cd2 = nullptr;
