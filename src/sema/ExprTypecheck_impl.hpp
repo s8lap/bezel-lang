@@ -388,6 +388,13 @@ private:
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
 
+    // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
+    // against an imported type's reconstructed constructor signatures (no
+    // ast::ConstructorDecl; ParameterSymbol resolved types). Single-ctor,
+    // all-positional case; overloads/named args deferred.
+    void checkImportedNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t,
+                                  const std::vector<ConstructorSymbol*>& ctors);
+
     // §17.1: postfix `.` member access. The target's type determines
     // the lookup scope. For now we handle `this.member` (lookup in the
     // current type) and `<expr>.member` where the expression has a

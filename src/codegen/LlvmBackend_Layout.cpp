@@ -362,6 +362,18 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
     if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
         if (fs->posParam)
             return lowerType(fs->posParam->type.get());
+    // §2.5 / §22.8 (issue #328 FINDING [7]): an IMPORTED instance field has no
+    // ast::FieldDecl — its resolved type rides the importedMemberType side table
+    // (ModuleLoader). Without consulting it, an imported field of a non-int type
+    // (string/class/long/double) would fall through to the i32 default below,
+    // giving the imported instance the WRONG layout (size + every field offset
+    // after it), so a cross-module `new` + field read would load garbage. The
+    // field type is needed for the instance layout the constructor and field
+    // accesses depend on; this is the layout half of the FINDING [7] fix.
+    if (auto* mem = dynamic_cast<const sema::MemberSymbol*>(m))
+        if (mem->decl == nullptr)
+            if (sema::TypeRef* tr = ctx_.importedMemberType(mem))
+                return lowerTypeRef(tr);
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
         return lowerType(fd->type.get());
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))

@@ -151,21 +151,34 @@ llvm::Value* Emitter::importedConstValue(const ast::Expr& e,
     const sema::TypeRef* rt = ctx_.exprType(e);
     if (!rt || rt->kind != sema::TypeRef::Kind::Primitive)
         rt = ctx_.importedMemberType(cs);
+    return foldImportedConstText(*text, rt);
+}
+
+// §22.12 / §22.8 (issue #328 FINDING [3] / [7]): materialize a textual,
+// compile-time-constant value carried in a dependency's metadata as an LLVM
+// constant of type `rt`. Shared by the imported-const read path and the
+// imported-field-initializer replay (FINDING [7]). Returns null when the text is
+// not a shape this folds (e.g. a by-name reference to another const/enum, which
+// renderConstExpr emitted as an identifier rather than a digit string) —
+// declining is a loud failure rather than an unsound 0.
+llvm::Value* Emitter::foldImportedConstText(const std::string& text,
+                                            const sema::TypeRef* rt) {
+    if (text.empty()) return nullptr;
     sema::PrimitiveType prim =
         (rt && rt->kind == sema::TypeRef::Kind::Primitive)
             ? rt->primitive
             : sema::PrimitiveType::Int;
     switch (prim) {
         case sema::PrimitiveType::Bool:
-            return llvm::ConstantInt::get(i1(), *text == "true" ? 1 : 0);
+            return llvm::ConstantInt::get(i1(), text == "true" ? 1 : 0);
         case sema::PrimitiveType::Char:
             return llvm::ConstantInt::get(
-                i32(), static_cast<std::uint64_t>(parseCharLiteral(*text)),
+                i32(), static_cast<std::uint64_t>(parseCharLiteral(text)),
                 /*isSigned=*/false);
         case sema::PrimitiveType::Float:
         case sema::PrimitiveType::Double: {
             std::string digits;
-            for (char c : *text) {
+            for (char c : text) {
                 if (c == '_' || c == 'f' || c == 'F' || c == 'd' || c == 'D')
                     continue;
                 digits.push_back(c);
@@ -180,10 +193,10 @@ llvm::Value* Emitter::importedConstValue(const ast::Expr& e,
             // A string-literal const value is rendered with its surrounding
             // quotes by renderConstExpr; lowerStringLiteralConst takes the inner
             // text, so strip the delimiters when present.
-            if (text->size() >= 2 && text->front() == '"' && text->back() == '"')
+            if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
                 return lowerStringLiteralConst(
-                    std::string_view(*text).substr(1, text->size() - 2), false);
-            return lowerStringLiteralConst(*text, false);
+                    std::string_view(text).substr(1, text.size() - 2), false);
+            return lowerStringLiteralConst(text, false);
         default:
             // All integer primitives (§4): width comes from the const's type.
             break;
@@ -194,13 +207,13 @@ llvm::Value* Emitter::importedConstValue(const ast::Expr& e,
     // Decline instead (CLAUDE.md decline-with-reasons): returning null leaves
     // the read unlowered — a loud failure — rather than an unsound value. The
     // repro and the common case are literal consts, which are covered.
-    const char c0 = text->empty() ? '\0' : text->front();
+    const char c0 = text.empty() ? '\0' : text.front();
     if (!((c0 >= '0' && c0 <= '9') || c0 == '+' || c0 == '-')) return nullptr;
     llvm::Type* ty = rt && rt->kind == sema::TypeRef::Kind::Primitive
                          ? lowerPrimitive(rt->primitive)
                          : i32();
     return llvm::ConstantInt::get(
-        ty, static_cast<std::uint64_t>(parseIntLiteral(*text)),
+        ty, static_cast<std::uint64_t>(parseIntLiteral(text)),
         /*isSigned=*/true);
 }
 
@@ -475,6 +488,37 @@ void Emitter::declareImportedFunctions() {
             module_.get());
         methodFns_[ms] = fn;
     }
+}
+
+// §2.5 / §2.6 step 4 / §22.7 (issue #328 FINDING [7]): declare an IMPORTED
+// constructor as an EXTERNAL `void(ptr this, params...)` function so a
+// cross-module `new ImportedT(args)` binds to the dependency's emitted
+// `bz$<Type>$ctor` at link time. The signature mirrors declareFunctions' own
+// ctor declaration above (this pointer first, then a parameter per ctor param,
+// by-ref params passed as pointers); the parameter types come from the imported
+// ctor's reconstructed ParameterSymbols (resolvedDeclType). Cached in ctorFns_
+// so repeated `new`s of the same type reuse one declaration. Engages only on the
+// imported path (lowerNew gates on ctx_.isImported), so the single-module ctor
+// declaration loop is untouched.
+llvm::Function* Emitter::declareImportedCtor(const sema::ConstructorSymbol* cs) {
+    auto it = ctorFns_.find(const_cast<sema::ConstructorSymbol*>(cs));
+    if (it != ctorFns_.end()) return it->second;
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());  // this
+    for (sema::Symbol* p : cs->params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
+        sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
+        paramTys.push_back(isByRefMod(ps ? ps->modifier : std::string_view())
+                               ? ptrTy()
+                               : (pt ? lowerTypeRef(pt) : i32()));
+    }
+    auto* fnType = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                           paramTys, /*isVarArg=*/false);
+    std::string cls = cs->parent ? std::string(cs->parent->name) : "";
+    auto* fn = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage,
+                                      "bz$" + cls + "$ctor", module_.get());
+    ctorFns_[const_cast<sema::ConstructorSymbol*>(cs)] = fn;
+    return fn;
 }
 
 

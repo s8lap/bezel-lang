@@ -254,6 +254,15 @@ struct Loader {
                 f->parent = &parent;
                 f->scope = parent.memberScope;
                 fieldTypes_[f] = convert(mm.type);
+                // §2.5 / §22.8 (issue #328 FINDING [7]): a class-level field's
+                // initializer runs as part of construction (step 2). In the
+                // single-module path the initializer is emitted at the `new`
+                // site; the importer has no AST, so a CONSTANT-FOLDABLE
+                // initializer is carried textually in the metadata (like a
+                // §22.12 const value) and replayed by the importer's lowerNew. A
+                // non-foldable initializer (`new Array()`, `DateTime.Now`) is not
+                // carried (valueText empty) — see ModuleMetadataBuilder.
+                if (!mm.valueText.empty()) constValues_[f] = mm.valueText;
                 return f;
             }
             case MetaMemberKind::Const: {
@@ -280,9 +289,31 @@ struct Loader {
                 e->scope = parent.memberScope;
                 return e;
             }
-            // Property / Indexer / Constructor / Event are part of the schema
-            // but not reconstructed in this increment (the basic A→B e2e exercises
-            // methods, fields, consts and enum constants); see the deferred note.
+            case MetaMemberKind::Constructor: {
+                // §2.5 / §22.7 (issue #328 FINDING [7]): a public constructor is
+                // part of the module's public interface. Reconstruct it as a
+                // ConstructorSymbol so `new ImportedType(args)` resolves against
+                // the real signature (arity + arg types — §22.6), instead of the
+                // importer assuming only the implicit 0-arg default. The ctor's
+                // parameters become ParameterSymbols whose resolved types ride
+                // `resolvedDeclType`, matching the imported-method path. A static
+                // constructor (§22.7) is not part of the callable surface — it
+                // runs once in the EXPORTER's static-init; it is filtered out by
+                // the builder (only instance ctors are exported), but guard here
+                // too via the "static" modifier for fidelity.
+                auto* c = ctx.makeImportedSymbol<sema::ConstructorSymbol>();
+                c->name = ctx.internString(mm.name);
+                c->visibility = fromMetaVisibility(mm.visibility);
+                c->modifiers = intern(mm.modifiers);
+                c->parent = &parent;
+                c->scope = scope;
+                for (const std::string& md : mm.modifiers)
+                    if (md == "static") c->isStatic = true;
+                c->params = convertParams(mm.params, scope);
+                return c;
+            }
+            // Property / Indexer / Event are part of the schema but not
+            // reconstructed in this increment; see the deferred note.
             default:
                 return nullptr;
         }

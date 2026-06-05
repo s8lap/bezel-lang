@@ -259,6 +259,182 @@ BEZEL_TEST(cross_module_import, imported_sealed_abstract_use_without_subclass_ok
     BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
+// §2.5 / §22.7 (FINDING [7] manifestation B): a non-default imported constructor
+// is part of the module's public interface — its declared `constructor(args)`
+// must be VISIBLE to the importer, so `new T(args)` resolves against the real
+// signature. Before the fix the loader did not reconstruct the constructor, so
+// the importer assumed only the implicit 0-arg default and rejected `new T(10)`.
+BEZEL_TEST(cross_module_import, imported_nondefault_ctor_visible_spec_22_7) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib; "
+        "public class Counter "
+        "  public v: int; "
+        "  public constructor(start: int) v := start; end constructor; "
+        "  public method Get(): int => v; "
+        "  destructor end destructor; "
+        "end Counter;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var c := new Counter(10); "  // the imported ctor's arity
+        "    return c.Get(); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// §22.7 (FINDING [7] B): a call to an imported non-default constructor with the
+// WRONG argument count is rejected against the reconstructed signature. `new
+// Counter()` supplies 0 args but the imported ctor takes 1.
+BEZEL_TEST(cross_module_import, imported_ctor_wrong_arity_zero_rejected_spec_22_7) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib; "
+        "public class Counter "
+        "  public v: int; "
+        "  public constructor(start: int) v := start; end constructor; "
+        "end Counter;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var c := new Counter(); "  // needs 1 arg
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
+// §22.7 (FINDING [7] B): a call to an imported non-default constructor with too
+// MANY arguments is rejected. `new Counter(1, 2)` supplies 2 args; the imported
+// ctor takes 1.
+BEZEL_TEST(cross_module_import, imported_ctor_wrong_arity_two_rejected_spec_22_7) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib; "
+        "public class Counter "
+        "  public v: int; "
+        "  public constructor(start: int) v := start; end constructor; "
+        "end Counter;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var c := new Counter(1, 2); "  // ctor takes 1, not 2
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
+// §5.1 (FINDING [7] B): a call to an imported constructor whose argument is not
+// assignable to the imported parameter type is rejected. `new Counter("hi")`
+// supplies a string where the imported ctor wants an int.
+BEZEL_TEST(cross_module_import, imported_ctor_wrong_arg_type_rejected_spec_5_1) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib; "
+        "public class Counter "
+        "  public v: int; "
+        "  public constructor(start: int) v := start; end constructor; "
+        "end Counter;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var c := new Counter(\"hi\"); "  // string != int
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
+// §2.5 by-name resolution: an imported constructor is reconstructed as a
+// ConstructorSymbol on the imported TypeSymbol, with its parameters carrying
+// resolved types (so codegen + overload resolution can read them). Verifies the
+// loader-level reconstruction (the sema side of FINDING [7] B).
+BEZEL_TEST(cross_module_import, imported_ctor_reconstructed_as_member_spec_2_5) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib; "
+        "public class Counter "
+        "  public v: int; "
+        "  public constructor(start: int) v := start; end constructor; "
+        "end Counter;");
+    DiagnosticEngine diags;
+    sema::SemaContext ctx(diags);
+    BEZEL_EXPECT_TRUE(loadMetadata(dep, ctx));
+    const std::vector<sema::TypeSymbol*>* exported = ctx.importedTypesOf("Lib");
+    BEZEL_EXPECT_TRUE(exported != nullptr);
+    if (!exported) return;
+    sema::TypeSymbol* counter = nullptr;
+    for (sema::TypeSymbol* t : *exported)
+        if (t->name == "Counter") counter = t;
+    BEZEL_EXPECT_TRUE(counter != nullptr);
+    if (!counter) return;
+    sema::ConstructorSymbol* ctor = nullptr;
+    for (sema::Symbol* m : counter->members)
+        if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) ctor = cs;
+    BEZEL_EXPECT_TRUE(ctor != nullptr);
+    if (!ctor) return;
+    BEZEL_EXPECT_EQ(ctor->params.size(), static_cast<std::size_t>(1));
+    auto* p = dynamic_cast<sema::ParameterSymbol*>(ctor->params[0]);
+    BEZEL_EXPECT_TRUE(p != nullptr);
+    if (p) {
+        BEZEL_EXPECT_TRUE(p->resolvedDeclType != nullptr);
+        if (p->resolvedDeclType) {
+            BEZEL_EXPECT_TRUE(p->resolvedDeclType->kind ==
+                              sema::TypeRef::Kind::Primitive);
+            BEZEL_EXPECT_TRUE(p->resolvedDeclType->primitive ==
+                              sema::PrimitiveType::Int);
+        }
+    }
+}
+
+// §22.7 read-older-tolerance (issue #328 gate 5): an imported type that exports
+// NO constructor (the shape an older v2 .bezel.meta carries — it has no ctor
+// reconstruction) still loads and constructs gracefully: the importer applies the
+// implicit default 0-arg constructor (§22.7), so `new T()` is accepted and
+// `new T(x)` is rejected. The "no exported ctors" path must behave exactly as
+// before this change for such types.
+BEZEL_TEST(cross_module_import, imported_type_without_ctor_uses_implicit_default_spec_22_7) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib; "
+        "public class Plain "
+        "  public x: int; "  // no declared constructor
+        "  public method Get(): int => x; "
+        "end Plain;");
+    // `new Plain()` (the implicit default) type-checks clean.
+    auto rOk = runImporter(
+        dep,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var p := new Plain(); "
+        "    return p.Get(); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!rOk->hadErrors);
+    // `new Plain(1)` exceeds the implicit default's 0 parameters → rejected.
+    auto rBad = runImporter(
+        dep,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var p := new Plain(1); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(rBad->hadErrors);
+}
+
 // --- full end-to-end build (the headline test) ------------------------------
 //
 // §2.6: compile module A (exports public static methods) → a native OBJECT with
@@ -420,6 +596,159 @@ BEZEL_TEST(cross_module_import, imported_static_field_read_spec_22_12) {
     int status = std::system(bExe.path.c_str());
     int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
     BEZEL_EXPECT_EQ(code, 99);
+}
+
+// §2.5 / §2.6 / §22.8 (FINDING [7] manifestation A): constructing an imported
+// type must RUN the library's constructor across the module boundary. A's `Box`
+// has `constructor() n := 42;`; B does `new Box()` then reads `b.Get()`. Before
+// the fix `new Box()` lowered to a bare calloc with no ctor call, so the field
+// stayed 0; after, the importer calls the linked `bz$Box$ctor`, so the ctor body
+// runs and `Get()` returns 42. The repro's deterministic-0 miscompile is the
+// canonical FINDING [7] A case; assert 42 (the ctor body ran).
+BEZEL_TEST(cross_module_import, imported_ctor_body_runs_native_spec_22_8) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_inc4_ctorA_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Lib; "
+        "public class Box "
+        "  public n: int; "
+        "  public constructor() n := 42; end constructor; "
+        "  public method Get(): int => n; "
+        "  destructor end destructor; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new Box(); "
+        "    return b.Get(); "  // ctor body ran cross-module → 42
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// §2.5 / §2.6 / §22.8 (FINDING [7] manifestation B): a NON-DEFAULT imported
+// constructor is both visible AND runs. A's `Counter` has `constructor(start:
+// int) v := start;`; B does `new Counter(10)` then reads `c.Get()`. Before the
+// fix B rejected `new Counter(10)` outright (the ctor signature was invisible);
+// after, the importer resolves the ctor and calls the linked `bz$Counter$ctor`
+// with the argument, so the field holds 10.
+BEZEL_TEST(cross_module_import, imported_nondefault_ctor_runs_native_spec_22_8) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_inc4_ctorB_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Lib; "
+        "public class Counter "
+        "  public v: int; "
+        "  public constructor(start: int) v := start; end constructor; "
+        "  public method Get(): int => v; "
+        "  destructor end destructor; "
+        "end Counter;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var c := new Counter(10); "
+        "    return c.Get(); "  // non-default ctor ran with arg → 10
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 10);
+}
+
+// §22.8 construction sequence: FIELD INITIALIZERS (step 2), not just the ctor
+// body, run across the module boundary. A's `Widget` has a field initializer
+// `w: int := 7;` and an empty constructor that does NOT assign w; B reads
+// `Get()` after `new Widget()`. The field initializer must have run during
+// cross-module construction, so the result is 7 (not the calloc-zero 0).
+BEZEL_TEST(cross_module_import, imported_field_initializer_runs_native_spec_22_8) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_inc4_fieldinit_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Lib; "
+        "public class Widget "
+        "  public w: int := 7; "  // §22.8 step 2 field initializer
+        "  public constructor() end constructor; "  // body does NOT set w
+        "  public method Get(): int => w; "
+        "  destructor end destructor; "
+        "end Widget;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var x := new Widget(); "
+        "    return x.Get(); "  // field initializer ran → 7
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 7);
 }
 
 }  // namespace bezel::module

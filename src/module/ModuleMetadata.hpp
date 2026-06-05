@@ -56,7 +56,22 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // because a hypothetical v1 reader given a v2 blob would not expect the trailing
 // record — but a v1 reader rejects a v2 blob anyway (version > its
 // kSchemaVersion), per the read-older / skip-unknown rule.
-inline constexpr std::uint32_t kSchemaVersion = 2;
+//
+// v3 (issue #328 FINDING [7]): IMPORTED CONSTRUCTORS + FIELD INITIALIZERS join
+// the cross-module surface. No WIRE-FORMAT change is introduced: the
+// MetaMemberKind::Constructor member and the per-member trailing `valueText`
+// REC_STRING were both already part of the v2 format (the builder emitted ctor
+// members, and `valueText` rides every member). What changed is the MEANING the
+// CONSUMER assigns to those bytes — the loader now reconstructs constructor
+// members as ConstructorSymbols, and reads an INSTANCE field's `valueText` as a
+// constant-foldable §22.8 field initializer (not just a §22.12 const value). The
+// bump records that semantic step and lets a build tool distinguish an artifact
+// whose importer-side ctor/field-init support is present. Read-older holds in
+// both directions: a v3 reader reads a v2 (or v1) blob unchanged — a v2 blob
+// simply carries no instance-field `valueText` (absent → empty) and its ctor
+// members reconstruct exactly as a v3-produced blob's would — and a v2 reader
+// rejects a v3 blob (version > its kSchemaVersion), per the documented rule.
+inline constexpr std::uint32_t kSchemaVersion = 3;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
