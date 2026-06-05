@@ -326,6 +326,18 @@ BEZEL_TEST(integration, string_isnotempty_branch) {
         "end Main; end C;"), 5);
 }
 
+BEZEL_TEST(integration, string_isempty_branch) {
+    // string.IsNullOrEmpty gate (empty path → true). Exercises the branch whose
+    // PHI edge supplies `true`; a dead, unterminated `ine.null` block (malformed
+    // IR, removed) used to sit alongside it. Empty string → true → return 7.
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C public static method Main(): int "
+        "  var s := \"\"; "
+        "  if string.IsNullOrEmpty(s) then return 7; end; "
+        "  return s.Length; "
+        "end Main; end C;"), 7);
+}
+
 BEZEL_TEST(integration, string_replace_and_case) {
     // Replace + ToUpper chain.
     BEZEL_EXPECT_EQ(compileAndRun(

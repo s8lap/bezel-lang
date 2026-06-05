@@ -120,6 +120,26 @@ BEZEL_TEST(codegen_cg4, conditional_throw_then_arm_value_path) {
         "end C;"), 9);
 }
 
+// BOTH branches diverge (`throw`): the whole conditional diverges, like a
+// case whose every arm throws. The join block is unreachable and must be
+// capped with a terminator (`unreachable`) — otherwise it is a terminator-less
+// block (malformed IR). The selected branch's throw fires and is caught by the
+// caller's try/catch. Parenthesized so each throw's operand stays the exception.
+BEZEL_TEST(codegen_cg4, conditional_both_arms_throw_diverges) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C "
+        "  public static method Helper(c: bool): int "
+        "    return (throw new Exception(\"a\")) if c "
+        "           else (throw new Exception(\"b\")); "
+        "  end Helper; "
+        "  public static method Main(): int "
+        "    try return Helper(true); "
+        "    catch Exception => return 42; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
 // --- §20: branches of differing-but-common numeric type. ---
 // `5 if c else 9000000000L` is an int branch and a long branch; the §20
 // common type is `long`. Codegen must coerce the int branch to i64 before

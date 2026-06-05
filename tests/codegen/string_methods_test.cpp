@@ -123,9 +123,9 @@ BEZEL_TEST(codegen_cg27f, substring_length) {
 
 // -------------------------------------------------------------------------
 // §9.6 Split(separator: char): owned Array<string> — split on a single code
-// point. (The Split(separator: string) overload is already covered elsewhere;
-// these exercise the char overload, which routes through bz_string_split_anychar
-// with a one-element separator set.)
+// point. The char overload routes through bz_string_split_anychar with a
+// one-element separator set; the string-delimiter overload (below) routes
+// through bz_string_split.
 // -------------------------------------------------------------------------
 
 BEZEL_TEST(codegen_string_split_char_spec_9_6, three_parts) {
@@ -157,6 +157,37 @@ BEZEL_TEST(codegen_string_split_char_spec_9_6, no_separator_whole_string) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var p: Array<string> := \"abc\".Split(','); "
+        "  return (1 if (p.Count = 1 and p[0] = \"abc\") else 0); "
+        "end Main; end C;"), 1);
+}
+
+// -------------------------------------------------------------------------
+// §9.6 Split(separator: string): owned Array<string> — split on a substring
+// delimiter. Routes through bz_string_split. Regression: the call previously
+// emitted malformed IR (declared bz_string_split with 5 params while calling
+// it with 4) — verifiable only with BEZEL_VERIFY_IR, and untested at runtime.
+// These exercise the multi-char delimiter end-to-end through the JIT.
+// -------------------------------------------------------------------------
+
+BEZEL_TEST(codegen_string_split_str_spec_9_6, multichar_delim_three_parts) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var p: Array<string> := \"a::b::c\".Split(\"::\"); return p.Count; "
+        "end Main; end C;"), 3);
+}
+
+BEZEL_TEST(codegen_string_split_str_spec_9_6, multichar_delim_part_content) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var p: Array<string> := \"aa::bb::cc\".Split(\"::\"); "
+        "  return (1 if (p[0] = \"aa\" and p[1] = \"bb\" and p[2] = \"cc\") else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_string_split_str_spec_9_6, multichar_delim_no_match_whole_string) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var p: Array<string> := \"abc\".Split(\"::\"); "
         "  return (1 if (p.Count = 1 and p[0] = \"abc\") else 0); "
         "end Main; end C;"), 1);
 }

@@ -55,6 +55,26 @@ BEZEL_TEST(collection_array, for_in) {
         "end Main; end C;"), 6);
 }
 
+// §A.6: `continue` inside `for var x in <runtime Array<T>>`. The loop's
+// continue-target is the per-iteration increment block; the body must branch
+// there on `continue` and the increment must live in that block. Regression:
+// the increment was previously emitted in the body block, leaving the
+// continue-target block without a terminator (malformed IR) — a `continue`
+// branched to an unterminated block. Sums only the even elements (skips odds).
+BEZEL_TEST(collection_array, for_in_with_continue) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var s := 0; "
+        "  for var x in a do "
+        "    if x mod 2 <> 0 then continue; end; "
+        "    s := s + x; "
+        "  end; "
+        "  return s; "          // 2 + 4 = 6 (odds 1,3 skipped)
+        "end Main; end C;"), 6);
+}
+
 // --- Stack<T> and Queue<T> ---
 
 BEZEL_TEST(collection_stack, push_peek_pop) {

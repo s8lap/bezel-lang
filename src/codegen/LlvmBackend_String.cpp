@@ -1866,8 +1866,12 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             return nullptr;
         llvm::Value* delim = lowerExpr(*call.args[0].value);
         if (!delim) return nullptr;
+        // Runtime signature (bezel_runtime.h): bz_string_split(s, s_len, delim,
+        // delim_len) — 4 params {ptr,i64,ptr,i64}. The previous declaration had a
+        // spurious leading ptr (5 params) while the call passes 4, producing
+        // malformed IR (arg-count mismatch) and an ABI-mismatched call.
         auto* fn = declareC("bz_string_split", ptrTy(),
-                            {ptrTy(), ptrTy(), i64(), ptrTy(), i64()});
+                            {ptrTy(), i64(), ptrTy(), i64()});
         llvm::Value* delimData = loadStringData(delim);
         llvm::Value* delimLen  = loadStringLen(delim);
         return builder_.CreateCall(fn, {selfData, selfLen, delimData, delimLen},

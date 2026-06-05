@@ -2255,8 +2255,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
     } else {
         lowerScopedBlock(lam.stmts);
-        if (!builder_.GetInsertBlock()->getTerminator())
-            builder_.CreateRetVoid();
+        // Fall-through terminator: must match the lambda's actual return type.
+        // A block-bodied handler/lambda whose declared return type is non-void
+        // (retTy != void) would otherwise get a `ret void` here — malformed IR
+        // (ret-type mismatch). Mirror emitImplicitReturn: void → retvoid, else
+        // a zero-initialized value of retTy.
+        if (!builder_.GetInsertBlock()->getTerminator()) {
+            if (retTy->isVoidTy()) builder_.CreateRetVoid();
+            else builder_.CreateRet(llvm::Constant::getNullValue(retTy));
+        }
     }
 
     // --- Restore emitter state ---
@@ -3065,6 +3072,10 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     // diverged_ so the enclosing return/decl/expr context skips emitting code
     // into the (predecessorless) endBB, exactly as lowerConditional does.
     if (incomings.empty()) {
+        // endBB has no predecessors and the caller (diverged_) emits nothing
+        // into it; an empty block is malformed IR (no terminator). Cap it with
+        // `unreachable` so the block is well-formed — it is provably dead.
+        builder_.CreateUnreachable();
         diverged_ = true;
         return llvm::PoisonValue::get(resultTy);
     }
@@ -3308,7 +3319,13 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // is excluded from the join. When only one branch reaches, its
     // value is the result; when both diverge, endBB is unreachable.
     diverged_ = thenDiv && elseDiv;
-    if (thenDiv && elseDiv) return llvm::PoisonValue::get(tv->getType());
+    if (thenDiv && elseDiv) {
+        // Both branches threw: endBB has no predecessors and the caller emits
+        // nothing into it (diverged_). Cap it with `unreachable` so the block
+        // is a well-formed (provably dead) block rather than terminator-less.
+        builder_.CreateUnreachable();
+        return llvm::PoisonValue::get(tv->getType());
+    }
     if (thenDiv) return ev;
     if (elseDiv) return tv;
     // Both branches reach the join: build the PHI over their (now
