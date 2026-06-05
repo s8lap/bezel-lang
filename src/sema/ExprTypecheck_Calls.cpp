@@ -580,6 +580,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
                     else if (typeLinqOperator(srcElem)) { /* typed */ }
                 }
+                // stdlib §3.2: a method call on an `Encoding` receiver
+                // (`Encoding.Utf8.GetBytes(s)` / `.GetString(b[,i,c])` / `.Name`).
+                // The receiver's type is the Encoding TypeSymbol (set in
+                // resolveMemberAccess), so colName is empty (the lambda only reads
+                // astNode-backed builtins). Type the result so an inferred local
+                // and chained member access resolve: GetBytes → owned Array<byte>
+                // (carried structurally as a lazy-sentinel Named ref with byte at
+                // genericArgs[0] — the same representation ToArray uses, which the
+                // codegen and `.Length`/`.Get` paths recognize); GetString → string;
+                // Name → string. Only Utf8 reaches here (the other singletons are
+                // rejected at member access).
+                if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    recvTy->declaration &&
+                    recvTy->declaration->name == "Encoding") {
+                    if (m == "GetBytes") {
+                        ctx_.setExprType(
+                            &ce, makeLazyEnumerable(ctx_.primitiveTypeRef(P::Byte)));
+                    } else if (m == "GetString" || m == "Name") {
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                    }
+                }
                 if (!colName.empty()) {
                     // Array/Stack/Queue/Set/LinkedList methods
                     bool isArrLike = colName == "Array" || colName == "OwnedArray" ||
@@ -1638,6 +1659,70 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                 }
+            }
+        }
+    }
+    // stdlib §3.2: the Encoding singletons. `Encoding.Utf8` (and Utf16/Utf32/
+    // Ascii) are `public static readonly property ...: Encoding`. The target is
+    // the auto-imported `Encoding` builtin class (a synthetic TypeSymbol with a
+    // null decl), so the ordinary member-lookup path has no property to find.
+    // Type the access as the `Encoding` type (a Named ref whose declaration is
+    // the Encoding TypeSymbol) so the subsequent `.GetBytes(s)` / `.GetString(b)`
+    // call resolves. Only Utf8 is implemented; Utf16/Utf32/Ascii are rejected
+    // here (their concrete GetBytes/GetString semantics are not specified by
+    // §3.2 — endianness, surrogate handling, Ascii out-of-range — so a sound
+    // implementation is not yet possible: decline-with-reasons per CLAUDE.md §4).
+    if (ma.target) {
+        if (auto* eid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            if (eid->name == "Encoding") {
+                const auto& sg = ma.member;
+                if (sg == "Utf8") {
+                    auto* encTy = ctx_.makeTypeRef();
+                    encTy->kind = TypeRef::Kind::Named;
+                    encTy->declaration = builtinClassSym("Encoding");
+                    ctx_.setExprType(&ma, encTy);
+                    return;
+                }
+                if (sg == "Utf16" || sg == "Utf32" || sg == "Ascii") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`Encoding." + std::string(sg) +
+                        "` is not yet implemented; only `Encoding.Utf8` is "
+                        "available (stdlib §3.2). The Utf16/Utf32/Ascii "
+                        "GetBytes/GetString semantics are not specified, so "
+                        "they are deferred rather than guessed");
+                    return;
+                }
+            }
+        }
+        // The `Encoding` singleton is reachable ONLY through the direct
+        // `Encoding.Utf8.GetBytes(...)` / `.GetString(...)` form (the codegen
+        // lowers exactly that two-level shape; there is no first-class singleton
+        // OBJECT yet). Reject an INDIRECT use — a member access whose target is
+        // an `Encoding`-typed value that is NOT the direct `Encoding.<singleton>`
+        // member access (e.g. a local `var e := Encoding.Utf8; e.GetBytes(s)`).
+        // Without this guard such a call has no codegen lowering and would
+        // miscompile (a null receiver → crash). A clear compile error is the
+        // sound outcome until a real singleton object is modeled.
+        if (auto* tt = ctx_.exprType(*ma.target)) {
+            bool targetIsEncoding =
+                tt->kind == TypeRef::Kind::Named && tt->declaration &&
+                tt->declaration->name == "Encoding";
+            bool targetIsDirectSingleton = false;
+            if (auto* inner =
+                    dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
+                if (auto* iid = dynamic_cast<const ast::IdentifierExpr*>(
+                        inner->target.get()))
+                    targetIsDirectSingleton = iid->name == "Encoding";
+            }
+            if (targetIsEncoding && !targetIsDirectSingleton) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    "an `Encoding` value is usable only as the immediate "
+                    "receiver of `Encoding.Utf8.GetBytes(...)` / "
+                    "`.GetString(...)` (stdlib §3.2); binding it to a variable "
+                    "or using it indirectly is not yet supported");
+                return;
             }
         }
     }

@@ -504,6 +504,21 @@ void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value
 // NULL for a non-NULL input (an empty/allocation-failure case yields "").
 char* bz_string_to_utf8z(const void* str);
 
+// ---------------------------------------------------------------------------
+// Encoding (stdlib §3.2) — UTF-8 concrete encoding only (Utf16/Utf32/Ascii are
+// deferred; their GetBytes/GetString semantics are not pinned down by §3.2).
+//
+// bz_encoding_utf8_get_bytes(s): `Encoding.Utf8.GetBytes(s): owned Array<byte>`.
+// Returns a fresh, owned bz_array_t* of bytes (elem_size 1) holding the UTF-8
+// encoding of the string's code points. The caller owns the result.
+void* bz_encoding_utf8_get_bytes(const void* str);
+
+// bz_encoding_utf8_get_string(bytes, index, count): `Encoding.Utf8.GetString`.
+// Decodes `count` UTF-8 bytes starting at `index` of the byte array into a fresh
+// +1 managed bz.string (rc := 1, narrowest §4.6 width). The one-argument overload
+// passes index=0, count=Array.Length. The byte array is borrowed (not freed).
+void* bz_encoding_utf8_get_string(void* bytes, int64_t index, int64_t count);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

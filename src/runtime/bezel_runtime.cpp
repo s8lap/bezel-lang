@@ -2074,6 +2074,143 @@ extern "C" char* bz_string_to_utf8z(const void* strp) {
 }
 
 // ---------------------------------------------------------------------------
+// Encoding (stdlib §3.2). The abstract `Encoding` base declares
+// `GetBytes(s): owned Array<byte>` and `GetString(bytes[, index, count]): string`.
+// This runtime implements the UTF-8 concrete encoding (`Encoding.Utf8`), which is
+// total and lossless over every Bezel `string` (UTF-8 is the canonical byte form
+// referenced throughout §3.4 / §32.5). Utf16/Utf32/Ascii are NOT implemented here
+// (their concrete GetBytes/GetString semantics — endianness, surrogate handling,
+// and out-of-range behaviour for Ascii — are not pinned down by §3.2); codegen
+// rejects those singletons until the spec specifies them.
+//
+// GetBytes returns a fresh, owned `Array<byte>` (a bz_array_t* with elem_size 1):
+// the caller's `owned` binding releases it via the ordinary collection-dispose
+// path. GetString returns a fresh +1 managed `string` (rc := 1, exactly like
+// every other heap string producer); the byte input is borrowed and untouched.
+
+// Encoding.Utf8.GetBytes(s): walk the string's code points (width 1/2/4) and
+// UTF-8-encode each into a fresh byte array. Mirrors bz_string_to_utf8z's encoder
+// but emits into a bz_array_t<byte> (no trailing NUL — a byte array carries an
+// explicit length, unlike the NUL-terminated FFI buffer).
+extern "C" void* bz_encoding_utf8_get_bytes(const void* strp) {
+    void* arr = bz_array_alloc(1, 0);  // Array<byte>: elem_size 1
+    if (!strp) return arr;
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len;
+    if (n < 0) n = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp;
+        if (s->width == 1)      cp = ((const uint8_t*)s->data)[i];
+        else if (s->width == 2) cp = ((const uint16_t*)s->data)[i];
+        else                    cp = ((const uint32_t*)s->data)[i];
+        uint8_t b;
+        if (cp <= 0x7F) {
+            b = (uint8_t)cp;                          bz_array_add(arr, &b, 1);
+        } else if (cp <= 0x7FF) {
+            b = (uint8_t)(0xC0 | (cp >> 6));          bz_array_add(arr, &b, 1);
+            b = (uint8_t)(0x80 | (cp & 0x3F));        bz_array_add(arr, &b, 1);
+        } else if (cp <= 0xFFFF) {
+            b = (uint8_t)(0xE0 | (cp >> 12));         bz_array_add(arr, &b, 1);
+            b = (uint8_t)(0x80 | ((cp >> 6) & 0x3F)); bz_array_add(arr, &b, 1);
+            b = (uint8_t)(0x80 | (cp & 0x3F));        bz_array_add(arr, &b, 1);
+        } else {
+            b = (uint8_t)(0xF0 | (cp >> 18));          bz_array_add(arr, &b, 1);
+            b = (uint8_t)(0x80 | ((cp >> 12) & 0x3F)); bz_array_add(arr, &b, 1);
+            b = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));  bz_array_add(arr, &b, 1);
+            b = (uint8_t)(0x80 | (cp & 0x3F));         bz_array_add(arr, &b, 1);
+        }
+    }
+    return arr;
+}
+
+// Encoding.Utf8.GetString(bytes, index, count): decode `count` UTF-8 bytes
+// starting at `index` of the byte array into a fresh +1 managed string. The
+// `index`/`count` pair models the §3.2 three-argument overload; the one-argument
+// overload passes index=0 and count=Array.Length.
+//
+// The decoded string is stored at the NARROWEST width (1/2/4) that holds every
+// code point — exactly the §4.6 adaptive-storage rule the codegen literal
+// emitter (codePointsWidth: ≤0xFF→1, ≤0xFFFF→2, else 4) uses. This is required,
+// not merely an optimization: the string-equality codegen compares `len*width`
+// bytes via memcmp and is only correct when both operands share a width
+// (LlvmBackend_String.cpp comment at emitStringEquals). Producing the same width
+// the literal emitter would makes `GetString(GetBytes(s)) == s` compare correctly
+// and round-trip exactly. A malformed/truncated UTF-8 sequence decodes its
+// leading byte as a literal code point and advances by one (lenient, no OOB read).
+extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
+                                              int64_t count) {
+    auto* arr = (bz_array_t*)arrp;
+    const uint8_t* data = arr ? (const uint8_t*)arr->data : nullptr;
+    int64_t total = arr ? arr->count : 0;
+    if (index < 0) index = 0;
+    if (count < 0) count = 0;
+    if (index > total) index = total;
+    if (index + count > total) count = total - index;
+    const uint8_t* p = data + index;
+    int64_t end = count;
+
+    // Pass 1: decode into a temporary width-4 code-point buffer; track max cp.
+    uint32_t* cps = (uint32_t*)malloc((size_t)(count > 0 ? count : 1) * 4);
+    int64_t ncp = 0;
+    uint32_t maxCp = 0;
+    int64_t i = 0;
+    while (i < end) {
+        uint8_t b0 = p[i];
+        uint32_t cp;
+        int64_t adv;
+        if (b0 < 0x80) {                       // 1-byte: 0xxxxxxx
+            cp = b0; adv = 1;
+        } else if ((b0 & 0xE0) == 0xC0 && i + 1 < end &&
+                   (p[i + 1] & 0xC0) == 0x80) { // 2-byte: 110xxxxx 10xxxxxx
+            cp = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)(p[i + 1] & 0x3F);
+            adv = 2;
+        } else if ((b0 & 0xF0) == 0xE0 && i + 2 < end &&
+                   (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80) {
+            cp = ((uint32_t)(b0 & 0x0F) << 12) |
+                 ((uint32_t)(p[i + 1] & 0x3F) << 6) |
+                 (uint32_t)(p[i + 2] & 0x3F);
+            adv = 3;
+        } else if ((b0 & 0xF8) == 0xF0 && i + 3 < end &&
+                   (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80 &&
+                   (p[i + 3] & 0xC0) == 0x80) {
+            cp = ((uint32_t)(b0 & 0x07) << 18) |
+                 ((uint32_t)(p[i + 1] & 0x3F) << 12) |
+                 ((uint32_t)(p[i + 2] & 0x3F) << 6) |
+                 (uint32_t)(p[i + 3] & 0x3F);
+            adv = 4;
+        } else {
+            cp = b0; adv = 1;                  // lenient: pass the byte through
+        }
+        cps[ncp++] = cp;
+        if (cp > maxCp) maxCp = cp;
+        i += adv;
+    }
+
+    // Pass 2: select the narrowest width (§4.6 adaptive storage) and pack.
+    int8_t width = (maxCp <= 0xFF) ? 1 : (maxCp <= 0xFFFF ? 2 : 4);
+    void* sdata = malloc((size_t)(ncp > 0 ? ncp : 1) * (size_t)width);
+    if (width == 1) {
+        uint8_t* d = (uint8_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = (uint8_t)cps[k];
+    } else if (width == 2) {
+        uint16_t* d = (uint16_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = (uint16_t)cps[k];
+    } else {
+        uint32_t* d = (uint32_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = cps[k];
+    }
+    free(cps);
+
+    // Build the bz.string header { data, len, width, rc=1 }.
+    uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(s, &sdata, sizeof(void*));      // data (narrowest-width buffer)
+    memcpy(s + 8, &ncp, sizeof(int64_t));  // len (code-point count)
+    s[16] = (uint8_t)width;                // width = 1/2/4
+    bz_string_init_rc(s);                  // producer's reference, rc := 1
+    return s;
+}
+
+// ---------------------------------------------------------------------------
 // String reference counting (§4.6 / §28.9, issue #422 strings increment).
 //
 // `string` is runtime-managed: "its memory is reclaimed automatically" (§4.6).
