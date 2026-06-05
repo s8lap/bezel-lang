@@ -720,30 +720,26 @@ void ExprTC::checkConditionIsBool(const ast::Expr& cond, std::string_view ctx) {
 // an exception value (Named) and a plain value (e.g. a primitive). They
 // have no common type, so codegen never reaches the ill-typed PHI that
 // crashed it; sema rejects the program first.
-void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
-                             const ast::Expr& e) {
-    TypeRef* tt = cnd.thenValue ? ctx_.exprType(*cnd.thenValue) : nullptr;
-    TypeRef* et = cnd.elseValue ? ctx_.exprType(*cnd.elseValue) : nullptr;
-    // A bottom-typed branch leaves its type null: the result is the other
-    // branch's type, with no compatibility constraint. This is the valid
-    // `x if c else throw E` idiom (and its mirror).
-    if (!tt || !et) {
-        if (tt) ctx_.setExprType(&e, tt);
-        else if (et) ctx_.setExprType(&e, et);
-        return;
-    }
-    // An Error-kind branch already produced a diagnostic; don't cascade —
-    // adopt the other branch's type so downstream typing can proceed.
-    if (tt->kind == TypeRef::Kind::Error) { ctx_.setExprType(&e, et); return; }
-    if (et->kind == TypeRef::Kind::Error) { ctx_.setExprType(&e, tt); return; }
-    // `Object` is the common supertype of everything; if one branch is
-    // Object (e.g. an untyped `null`) the common type is Object.
+// §20: the pairwise common type of two typed branches/arms — the one the
+// other widens (§5.1) or subtypes (§12) into. Returns null when neither
+// converts to the other (no common type exists). Both inputs must be
+// non-null (callers handle the bottom-typed `null` case before getting here:
+// a bottom-typed arm imposes no constraint). An Error-kind input yields the
+// other operand so a prior diagnostic doesn't cascade. `Object` is the
+// universal common supertype. Conservative (mirrors checkAssignable /
+// convertsInto) so it never false-positives while the type lattice is
+// incomplete.
+TypeRef* ExprTC::commonTypeOf(TypeRef* a, TypeRef* b) {
+    if (!a) return b;
+    if (!b) return a;
+    if (a->kind == TypeRef::Kind::Error) return b;
+    if (b->kind == TypeRef::Kind::Error) return a;
     auto isObject = [](TypeRef* t) {
         return t->kind == TypeRef::Kind::Primitive &&
                t->primitive == PrimitiveType::Object;
     };
-    if (isObject(tt)) { ctx_.setExprType(&e, tt); return; }
-    if (isObject(et)) { ctx_.setExprType(&e, et); return; }
+    if (isObject(a)) return a;
+    if (isObject(b)) return b;
     // `from` widens/subtypes into `to` — so `to` is a candidate common type.
     auto convertsInto = [&](TypeRef* from, TypeRef* to) -> bool {
         if (from->kind != to->kind) return false;
@@ -763,10 +759,31 @@ void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
         // same-kind as compatible to avoid false positives.
         return true;
     };
-    // The common type is whichever branch the other converts into. Prefer
-    // the then-branch on a tie (equal types / mutual conversion).
-    if (convertsInto(et, tt)) { ctx_.setExprType(&e, tt); return; }
-    if (convertsInto(tt, et)) { ctx_.setExprType(&e, et); return; }
+    // The common type is whichever operand the other converts into. Prefer
+    // `a` on a tie (equal types / mutual conversion).
+    if (convertsInto(b, a)) return a;
+    if (convertsInto(a, b)) return b;
+    return nullptr;  // no common type
+}
+
+void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
+                             const ast::Expr& e) {
+    TypeRef* tt = cnd.thenValue ? ctx_.exprType(*cnd.thenValue) : nullptr;
+    TypeRef* et = cnd.elseValue ? ctx_.exprType(*cnd.elseValue) : nullptr;
+    // A bottom-typed branch leaves its type null: the result is the other
+    // branch's type, with no compatibility constraint. This is the valid
+    // `x if c else throw E` idiom (and its mirror).
+    if (!tt || !et) {
+        if (tt) ctx_.setExprType(&e, tt);
+        else if (et) ctx_.setExprType(&e, et);
+        return;
+    }
+    // Both branches typed: take the §20 common type (the one the other
+    // widens/subtypes into). commonTypeOf handles Error-kind and Object.
+    if (TypeRef* common = commonTypeOf(tt, et)) {
+        ctx_.setExprType(&e, common);
+        return;
+    }
     // No common type: report and adopt the then-branch type so member
     // access on the (already-erroneous) result still resolves downstream.
     ctx_.setExprType(&e, tt);
@@ -775,6 +792,54 @@ void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
         "the two branches of an `if` expression have no common type: "
         "neither branch's type is implicitly convertible to the other "
         "(§20)");
+}
+
+// §19 + §20: type a `case` EXPRESSION with the COMMON type of its
+// (non-diverging) arm bodies. A diverging arm — a `throw` (§17.12) or
+// other bottom-typed body — leaves its body's exprType null and imposes
+// no type constraint, exactly like the bottom-typed branch of an `if`
+// expression. The result is the running common type of the value-producing
+// arms (each folded through commonTypeOf, identical to typeConditional's
+// pairwise rule). When two value arms have no common type, a clean §20
+// error is reported here rather than letting codegen build an ill-typed
+// result PHI and crash. When EVERY arm diverges, the case yields no value
+// and no type is recorded.
+void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
+    TypeRef* common = nullptr;     // running common type of value arms
+    bool haveValueArm = false;     // at least one non-diverging arm seen
+    bool reported = false;         // emit the §20 error at most once
+    for (const auto& arm : cse.arms) {
+        // Only expression-bodied arms produce a value (statement / `do…end`
+        // arms are statement-position only, §19.2). A bottom-typed arm body
+        // (e.g. `throw E`) has a null exprType and imposes no constraint.
+        if (!arm.exprBody) continue;
+        TypeRef* at = ctx_.exprType(*arm.exprBody);
+        if (!at) continue;  // diverging (bottom) arm — no constraint
+        if (!haveValueArm) {
+            common = at;
+            haveValueArm = true;
+            continue;
+        }
+        TypeRef* merged = commonTypeOf(common, at);
+        if (!merged) {
+            // No common type between this arm and the arms so far. Report
+            // once and keep the running type so later arms still merge.
+            if (!reported) {
+                ctx_.diagnostics().report(
+                    Severity::Error, cse.span.begin,
+                    "the arms of a `case` expression have no common type: "
+                    "an arm's type is not implicitly convertible to that of "
+                    "the other arms (§20)");
+                reported = true;
+            }
+            continue;  // leave `common` unchanged
+        }
+        common = merged;
+    }
+    // Record the common type (when there was a value-producing arm) so
+    // member access on the case result (`(case … end).M`) resolves. When
+    // every arm diverges, no type is recorded — the case produces no value.
+    if (haveValueArm && common) ctx_.setExprType(&e, common);
 }
 
 // Slice S7: diagnose assignment to a readonly field outside the
