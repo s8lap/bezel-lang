@@ -520,6 +520,22 @@ private:
     void checkEventVisibilityFence(EventSymbol* es, std::string_view op,
                                    SourceLocation loc);
 
+    // §13.1 member-visibility enforcement (issue #432). Checks that the
+    // member `msym` accessed at `loc` is visible from the current type
+    // context `currentType_`. Reports a diagnostic and returns true when
+    // access is rejected; returns false when access is allowed (caller
+    // continues normally). Handles all four levels:
+    //   private   — declaring type only (§13.1).
+    //   protected — declaring type + derived types (§13.1).
+    //   internal  — same module only; cross-module import → rejected (§13.4).
+    //   public    — always allowed.
+    // The overload-suppression heuristic (a non-private sibling with the same
+    // name → suppress the error) is applied for private and protected, matching
+    // the original private-only check.
+    bool checkMemberVisibility(const MemberSymbol* msym,
+                               std::string_view memberName,
+                               SourceLocation loc);
+
     // §7.5 null-conditional member access `x?.M`. Resolves the member on
     // the target's (non-nullable) type exactly like `.`, but the result
     // type is ALWAYS nullable (the access yields null when the target is

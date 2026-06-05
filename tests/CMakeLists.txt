@@ -131,6 +131,7 @@ set(BEZEL_TEST_SOURCES
     sema/static_ctor_params_test.cpp
     sema/base_visibility_test.cpp
     sema/event_visibility_test.cpp
+    sema/protected_internal_visibility_test.cpp
     sema/definite_return_test.cpp
     sema/generic_constraints_test.cpp
     sema/generic_return_inference_test.cpp

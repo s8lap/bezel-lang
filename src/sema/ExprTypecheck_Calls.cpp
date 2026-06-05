@@ -1327,6 +1327,110 @@ void ExprTC::checkEventVisibilityFence(EventSymbol* es, std::string_view op,
         " is not available; only `.Subscribe` may be used here (§24.3)");
 }
 
+// §13.1 member-visibility enforcement (issue #432).
+// Returns true and emits a diagnostic when the access is rejected;
+// returns false when the access is allowed.
+//
+// Visibility rules (§13.1, §13.4):
+//   public    — always allowed.
+//   internal  — allowed when the member is NOT imported (i.e. is defined in the
+//               same module as the access site — §13.4). Cross-module imports
+//               are rejected because `internal` is module-private.
+//   protected — allowed when currentType_ is the declaring type itself or is a
+//               type that derives (transitively) from the declaring type (§13.1).
+//   private   — allowed only when currentType_ == declaring type (§13.1, slice S8).
+//
+// Overload-suppression: for private and protected, if a non-private-or-accessible
+// sibling with the same name exists on the declaring type (i.e. there is a
+// public/internal overload of the same name), the error is suppressed — the
+// codegen overload-resolution step will pick the accessible variant.
+bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
+                                   std::string_view memberName,
+                                   SourceLocation loc) {
+    if (!msym || !msym->parent) return false;
+    TypeSymbol* declaring = msym->parent;
+    const ast::Visibility vis = msym->visibility;
+
+    // public — always allowed (§13.1).
+    if (vis == ast::Visibility::Public || vis == ast::Visibility::None)
+        return false;
+
+    // internal — allowed iff the member is in the same module (not imported).
+    // §13.4: `internal` = code in the same module. An imported symbol is by
+    // definition from a different module, so it is never same-module.
+    if (vis == ast::Visibility::Internal) {
+        if (!ctx_.isImported(msym)) return false;  // same module — OK
+        // Cross-module: internal member is inaccessible.
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("`") + std::string(memberName) +
+            "` is internal to module `" +
+            std::string(declaring->name) +
+            "` and not accessible from outside that module"
+            " (§13.1 — `internal` is visible to the same module only)");
+        return true;
+    }
+
+    // protected — allowed when currentType_ is the declaring type or derives
+    // from it (§13.1). Access from within the hierarchy is always valid.
+    if (vis == ast::Visibility::Protected) {
+        // Same type or subtype — OK.
+        if (currentType_ == declaring) return false;
+        if (currentType_ && isSubtype(currentType_, declaring)) return false;
+        // Outside the hierarchy: check for an accessible overload with the same
+        // name before emitting (mirrors the private overload-suppression).
+        bool hasAccessibleOverload = false;
+        for (Symbol* sib : declaring->members) {
+            if (!sib || sib == msym || sib->name != memberName) continue;
+            if (auto* sm = dynamic_cast<MemberSymbol*>(sib)) {
+                if (sm->visibility != ast::Visibility::Private &&
+                    sm->visibility != ast::Visibility::Protected)
+                    hasAccessibleOverload = true;
+            }
+        }
+        if (hasAccessibleOverload) return false;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("`") + std::string(memberName) +
+            "` is protected on type `" +
+            std::string(declaring->name) +
+            "` and not accessible from `" +
+            std::string(currentType_ ? currentType_->name
+                                     : std::string_view("(global)")) +
+            "` (§13.1 — `protected` is visible to the declaring class and "
+            "derived classes only)");
+        return true;
+    }
+
+    // private — allowed only from the declaring type (§13.1, original slice S8).
+    if (vis == ast::Visibility::Private) {
+        if (msym->parent == currentType_) return false;
+        // Check for a non-private overload (the codegen will pick it).
+        bool hasPublicOverload = false;
+        for (Symbol* sib : declaring->members) {
+            if (!sib || sib == msym || sib->name != memberName) continue;
+            if (auto* sm = dynamic_cast<MemberSymbol*>(sib)) {
+                if (sm->visibility != ast::Visibility::Private)
+                    hasPublicOverload = true;
+            }
+        }
+        if (hasPublicOverload) return false;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("`") + std::string(memberName) +
+            "` is private to type `" +
+            std::string(declaring->name) +
+            "` and not accessible from `" +
+            std::string(currentType_ ? currentType_->name
+                                     : std::string_view("(global)")) +
+            "` (§13.1 — `private` is visible to the declaring "
+            "class only)");
+        return true;
+    }
+
+    return false;
+}
+
 // per §14.1/§14.2: substitute a member's declared type against the receiver's
 // concrete generic arguments. A field/property declared `v: T` on a generic
 // type `Holder<T>`, accessed off `b: Holder<Inner>`, has type `Inner` — not
@@ -2192,40 +2296,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
         return;
     }
-    // Slice S8: visibility check. A `private` member is accessible
-    // only from inside the declaring type. Walk the member's
-    // parent TypeSymbol; if it isn't currentType_, diagnose.
-    // Other visibilities (internal/protected/public) are deferred.
-    // Exception: if there are also public members with the same name
-    // (overloads), suppress the error — the codegen picks by arity.
+    // §13.1 (issue #432): full visibility check — private, protected, internal,
+    // public. Replaces the old private-only slice S8 check. The helper
+    // checkMemberVisibility handles all four levels and the overload-suppression
+    // heuristic (a non-private accessible sibling → suppress the error).
     if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
-        if (msym->visibility == ast::Visibility::Private &&
-            msym->parent && msym->parent != currentType_) {
-            // Check if there is any public member with the same name
-            // in the same type — if so, this is an overload set and
-            // the codegen will select the accessible one.
-            bool hasPublicOverload = false;
-            for (Symbol* sib : msym->parent->members) {
-                if (sib && sib != member && sib->name == member->name) {
-                    if (auto* sm = dynamic_cast<MemberSymbol*>(sib)) {
-                        if (sm->visibility != ast::Visibility::Private)
-                            hasPublicOverload = true;
-                    }
-                }
-            }
-            if (!hasPublicOverload) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ma.span.begin,
-                    std::string("`") + std::string(ma.member) +
-                    "` is private to type `" +
-                    std::string(msym->parent->name) +
-                    "` and not accessible from `" +
-                    std::string(currentType_ ? currentType_->name
-                                             : std::string_view("(global)")) +
-                    "` (§13.1 — `private` is visible to the declaring "
-                    "class only)");
-            }
-        }
+        checkMemberVisibility(msym, ma.member, ma.span.begin);
     }
     ctx_.setExprSymbol(&ma, member);
     // §2.2 / §2.5 (issue #328 inc 3): an imported field/const member has no
@@ -2307,33 +2383,10 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     if (!targetType) return;
     Symbol* member = lookupMember(targetType, nm.member);
     if (!member) return;
+    // §13.1 (issue #432): full visibility check — delegates to the shared
+    // checkMemberVisibility helper (same four-level rule as resolveMemberAccess).
     if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {
-        if (msym->visibility == ast::Visibility::Private &&
-            msym->parent && msym->parent != currentType_) {
-            // Suppress error if a non-private sibling with the same name
-            // exists (overload set) — codegen will pick the accessible one.
-            bool hasPublicOverload = false;
-            for (Symbol* sib : msym->parent->members) {
-                if (sib && sib != member && sib->name == member->name) {
-                    if (auto* sm = dynamic_cast<MemberSymbol*>(sib)) {
-                        if (sm->visibility != ast::Visibility::Private)
-                            hasPublicOverload = true;
-                    }
-                }
-            }
-            if (!hasPublicOverload) {
-                ctx_.diagnostics().report(
-                    Severity::Error, nm.span.begin,
-                    std::string("`") + std::string(nm.member) +
-                    "` is private to type `" +
-                    std::string(msym->parent->name) +
-                    "` and not accessible from `" +
-                    std::string(currentType_ ? currentType_->name
-                                             : std::string_view("(global)")) +
-                    "` (§13.1 — `private` is visible to the declaring "
-                    "class only)");
-            }
-        }
+        checkMemberVisibility(msym, nm.member, nm.span.begin);
     }
     ctx_.setExprSymbol(&nm, member);
     TypeRef* memberTy = nullptr;
