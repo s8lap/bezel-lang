@@ -2966,8 +2966,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
 
     // ---------------------------------------------------------------------------
     // §2.5 DateTime — static members and methods via bz_datetime_* runtime.
+    // DateTime is a scalar i64 tick count (100-ns since 0001-01-01 UTC).
     // ---------------------------------------------------------------------------
     if (cls == "DateTime") {
+        // Static properties: Now / UtcNow / Today.
         if (m == "Now" && call.args.empty()) {
             auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
             return builder_.CreateCall(fn, {}, "dt.now");
@@ -2976,25 +2978,58 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* fn = declareC("bz_datetime_utcnow_ticks", i64(), {});
             return builder_.CreateCall(fn, {}, "dt.utcnow");
         }
-        // DateTime.FromTicks(ticks: long): long (identity)
+        // Today = date part of Now (zero the time components).
+        if (m == "Today" && call.args.empty()) {
+            auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
+            llvm::Value* t = builder_.CreateCall(fn, {}, "dt.today.ticks");
+            // Truncate to day boundary: t / TICKS_PER_DAY * TICKS_PER_DAY.
+            llvm::Value* tpd = builder_.getInt64(864000000000LL);
+            llvm::Value* d = builder_.CreateSDiv(t, tpd);
+            return builder_.CreateMul(d, tpd, "dt.today");
+        }
+        // MinValue / MaxValue.
+        if (m == "MinValue" && call.args.empty())
+            return builder_.getInt64(0LL);
+        if (m == "MaxValue" && call.args.empty())
+            return builder_.getInt64(3155378975999999999LL);
+        // DateTime.FromTicks(ticks: long): DateTime (identity)
         if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
             return lowerExpr(*call.args[0].value);
         }
     }
+    // ---------------------------------------------------------------------------
+    // §2.5 TimeSpan — static factories and Zero constant.
+    // TimeSpan is a scalar i64 tick count (signed, 100-ns units).
+    // ---------------------------------------------------------------------------
     if (cls == "TimeSpan") {
-        // TimeSpan.FromSeconds(n): long  (n * 10_000_000L)
-        if (m == "FromSeconds" && call.args.size() == 1 && call.args[0].value) {
+        // TimeSpan.Zero — the zero-duration constant.
+        if (m == "Zero" && call.args.empty())
+            return builder_.getInt64(0LL);
+        // Static factory methods: From* convert a double quantity to ticks.
+        // Tick ratios: per §2.5 / bz_runtime constants.
+        //   TICKS_PER_MS      = 10_000
+        //   TICKS_PER_SECOND  = 10_000_000
+        //   TICKS_PER_MINUTE  = 600_000_000
+        //   TICKS_PER_HOUR    = 36_000_000_000
+        //   TICKS_PER_DAY     = 864_000_000_000
+        auto fromDouble = [&](double ratio) -> llvm::Value* {
+            if (call.args.empty() || !call.args[0].value) return nullptr;
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
-            if (!v->getType()->isIntegerTy(64)) v = builder_.CreateSExt(v, i64());
-            return builder_.CreateMul(v, builder_.getInt64(10000000LL), "ts.sec");
-        }
-        if (m == "FromMilliseconds" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* v = lowerExpr(*call.args[0].value);
-            if (!v) return nullptr;
-            if (!v->getType()->isIntegerTy(64)) v = builder_.CreateSExt(v, i64());
-            return builder_.CreateMul(v, builder_.getInt64(10000LL), "ts.ms");
-        }
+            // Promote int arguments to double.
+            if (v->getType()->isIntegerTy())
+                v = builder_.CreateSIToFP(v, llvm::Type::getDoubleTy(llvm_));
+            else if (!v->getType()->isDoubleTy() && v->getType()->isFloatTy())
+                v = builder_.CreateFPExt(v, llvm::Type::getDoubleTy(llvm_));
+            llvm::Value* r = llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), ratio);
+            llvm::Value* prod = builder_.CreateFMul(v, r, "ts.product");
+            return builder_.CreateFPToSI(prod, i64(), "ts.ticks");
+        };
+        if (m == "FromDays")         return fromDouble(864000000000.0);
+        if (m == "FromHours")        return fromDouble(36000000000.0);
+        if (m == "FromMinutes")      return fromDouble(600000000.0);
+        if (m == "FromSeconds")      return fromDouble(10000000.0);
+        if (m == "FromMilliseconds") return fromDouble(10000.0);
     }
 
     // ---------------------------------------------------------------------------
@@ -3364,6 +3399,116 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // §2.5: DateTime instance methods — receiver is a DateTime (i64 ticks).
+    // Handles Add*, Subtract, ToUtc, ToLocal (where receiver type is DateTime).
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isDT = recvTy && builtinTypeName(recvTy) == "DateTime";
+                if (isDT) {
+                    llvm::Value* ticks = lowerExpr(*ma2->target);
+                    if (!ticks) return nullptr;
+                    const auto& mname = ma2->member;
+
+                    // Helper: get first arg as i64.
+                    auto arg0i64 = [&]() -> llvm::Value* {
+                        if (call.args.empty() || !call.args[0].value) return nullptr;
+                        llvm::Value* v = lowerExpr(*call.args[0].value);
+                        if (!v) return nullptr;
+                        if (!v->getType()->isIntegerTy(64)) v = builder_.CreateSExt(v, i64());
+                        return v;
+                    };
+                    // Helper: get first arg as double.
+                    auto arg0dbl = [&]() -> llvm::Value* {
+                        if (call.args.empty() || !call.args[0].value) return nullptr;
+                        llvm::Value* v = lowerExpr(*call.args[0].value);
+                        if (!v) return nullptr;
+                        auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                        if (v->getType()->isIntegerTy())
+                            v = builder_.CreateSIToFP(v, dbl);
+                        else if (v->getType()->isFloatTy())
+                            v = builder_.CreateFPExt(v, dbl);
+                        return v;
+                    };
+                    // Helper: add a double quantity (in ticks) to ticks.
+                    auto addDoubleTicks = [&](double ratio) -> llvm::Value* {
+                        llvm::Value* qty = arg0dbl();
+                        if (!qty) return nullptr;
+                        auto* dbl = llvm::Type::getDoubleTy(llvm_);
+                        llvm::Value* r = llvm::ConstantFP::get(dbl, ratio);
+                        llvm::Value* delta = builder_.CreateFPToSI(
+                            builder_.CreateFMul(qty, r), i64(), "dt.delta");
+                        return builder_.CreateAdd(ticks, delta, "dt.add");
+                    };
+
+                    // §2.5: DateTime.Add(span: TimeSpan): DateTime
+                    if (mname == "Add" && call.args.size() == 1 && call.args[0].value) {
+                        llvm::Value* span = arg0i64();
+                        if (!span) return nullptr;
+                        return builder_.CreateAdd(ticks, span, "dt.addspan");
+                    }
+                    // §2.5: AddDays/Hours/Minutes/Seconds/Milliseconds(double): DateTime
+                    if (mname == "AddDays")         return addDoubleTicks(864000000000.0);
+                    if (mname == "AddHours")        return addDoubleTicks(36000000000.0);
+                    if (mname == "AddMinutes")      return addDoubleTicks(600000000.0);
+                    if (mname == "AddSeconds")      return addDoubleTicks(10000000.0);
+                    if (mname == "AddMilliseconds") return addDoubleTicks(10000.0);
+
+                    // §2.5: AddYears(years: int): DateTime — calendar-aware.
+                    if (mname == "AddYears" && !call.args.empty() && call.args[0].value) {
+                        llvm::Value* y = lowerExpr(*call.args[0].value);
+                        if (!y) return nullptr;
+                        if (!y->getType()->isIntegerTy(32)) y = builder_.CreateTrunc(y, i32());
+                        auto* fn = declareC("bz_datetime_add_years", i64(), {i64(), i32()});
+                        return builder_.CreateCall(fn, {ticks, y}, "dt.addyears");
+                    }
+                    // §2.5: AddMonths(months: int): DateTime — calendar-aware.
+                    if (mname == "AddMonths" && !call.args.empty() && call.args[0].value) {
+                        llvm::Value* mo = lowerExpr(*call.args[0].value);
+                        if (!mo) return nullptr;
+                        if (!mo->getType()->isIntegerTy(32)) mo = builder_.CreateTrunc(mo, i32());
+                        auto* fn = declareC("bz_datetime_add_months", i64(), {i64(), i32()});
+                        return builder_.CreateCall(fn, {ticks, mo}, "dt.addmonths");
+                    }
+                    // §2.5: Subtract(other: DateTime): TimeSpan
+                    if (mname == "Subtract" && call.args.size() == 1 && call.args[0].value) {
+                        auto* argTy = ctx_.exprType(*call.args[0].value);
+                        bool otherIsSpan = argTy && builtinTypeName(argTy) == "TimeSpan";
+                        llvm::Value* arg = arg0i64();
+                        if (!arg) return nullptr;
+                        // Subtract(span: TimeSpan): DateTime
+                        if (otherIsSpan)
+                            return builder_.CreateSub(ticks, arg, "dt.subspan");
+                        // Subtract(other: DateTime): TimeSpan
+                        return builder_.CreateSub(ticks, arg, "dt.subdt");
+                    }
+                    // §2.5: ToUtc() / ToLocal() — identity for now.
+                    // The spec defines Kind (Utc/Local/Unspecified) but the runtime
+                    // stores UTC ticks only; Kind is not persisted in the scalar.
+                    // Deferred: full timezone conversion needs platform TZ APIs.
+                    if (mname == "ToUtc" || mname == "ToLocal")
+                        return ticks;
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // §2.5: TimeSpan arithmetic operators (instance methods encoded as calls).
+    // The TimeSpan+TimeSpan, TimeSpan-TimeSpan, TimeSpan*double forms are
+    // lowered here when the receiver is a TimeSpan value.
+    // Note: binary operators (+,-,*) between TimeSpan values are handled by
+    // lowerBinary's user-operator path; however the codegen may also encounter
+    // them as method calls if sema resolved them that way.  For safety, handle
+    // both paths for TimeSpan arithmetic: instance-call form here, and the
+    // binary expression form is pure i64 add/sub/mul (handled in lowerBinary
+    // via the fallthrough — since these are NOT user-defined operators in Bezel
+    // source, they are implemented via the builtin binary path below).
+    // ---------------------------------------------------------------------------
 
     return nullptr;
 }

@@ -875,6 +875,39 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         return strObj;
                     }
                 }
+                // §2.5: DateTime static properties accessed as property reads
+                // (without parentheses): DateTime.Now, DateTime.UtcNow, etc.
+                // Also handles TimeSpan.Zero and TimeSpan.FromX() zero args.
+                if (id->name == "DateTime") {
+                    const auto& mbr = ma->member;
+                    if (mbr == "Now") {
+                        auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
+                        return builder_.CreateCall(fn, {}, "dt.now");
+                    }
+                    if (mbr == "UtcNow") {
+                        auto* fn = declareC("bz_datetime_utcnow_ticks", i64(), {});
+                        return builder_.CreateCall(fn, {}, "dt.utcnow");
+                    }
+                    if (mbr == "Today") {
+                        auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
+                        llvm::Value* t = builder_.CreateCall(fn, {}, "dt.today.ticks");
+                        llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                        llvm::Value* d = builder_.CreateSDiv(t, tpd);
+                        return builder_.CreateMul(d, tpd, "dt.today");
+                    }
+                    if (mbr == "MinValue")
+                        return builder_.getInt64(0LL);
+                    if (mbr == "MaxValue")
+                        return builder_.getInt64(3155378975999999999LL);
+                }
+                if (id->name == "TimeSpan") {
+                    const auto& mbr = ma->member;
+                    if (mbr == "Zero")
+                        return builder_.getInt64(0LL);
+                    // TimeSpan.FromX static factories are handled in
+                    // tryLowerBuiltinClassCall (CallExpr path); but if accessed
+                    // without () (not valid Bezel for factories), return nullptr.
+                }
                 if (id->name == "int") {
                     if (ma->member == "MaxValue")
                         return llvm::ConstantInt::getSigned(i32(), 2147483647);
@@ -987,6 +1020,90 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 if (id2->name == "CancellationToken" && ma->member == "None") {
                     return llvm::ConstantPointerNull::get(ptrTy());
                 }
+            }
+        }
+    }
+    // §2.5: DateTime and TimeSpan instance property reads.
+    // DateTime/TimeSpan are scalar i64 tick values; properties are computed
+    // by calling the appropriate bz_datetime_* / bz_timespan_* runtime helpers.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) {
+            auto* tt = ctx_.exprType(*ma->target);
+            std::string_view cn = builtinTypeName(tt);
+            if (cn == "DateTime") {
+                llvm::Value* ticks = lowerExpr(*ma->target);
+                if (!ticks) return nullptr;
+                const auto& mbr = ma->member;
+                // Integer (i32) component properties.
+                const char* fnName = nullptr;
+                if      (mbr == "Year")        fnName = "bz_datetime_year";
+                else if (mbr == "Month")       fnName = "bz_datetime_month";
+                else if (mbr == "Day")         fnName = "bz_datetime_day";
+                else if (mbr == "Hour")        fnName = "bz_datetime_hour";
+                else if (mbr == "Minute")      fnName = "bz_datetime_minute";
+                else if (mbr == "Second")      fnName = "bz_datetime_second";
+                else if (mbr == "Millisecond") fnName = "bz_datetime_millisecond";
+                else if (mbr == "DayOfWeek")   fnName = "bz_datetime_day_of_week";
+                else if (mbr == "DayOfYear")   fnName = "bz_datetime_day_of_year";
+                if (fnName) {
+                    auto* fn = declareC(fnName, i32(), {i64()});
+                    return builder_.CreateCall(fn, {ticks}, llvm::Twine(mbr));
+                }
+                // Ticks property — return the raw i64.
+                if (mbr == "Ticks") return ticks;
+            }
+            if (cn == "TimeSpan") {
+                llvm::Value* ticks = lowerExpr(*ma->target);
+                if (!ticks) return nullptr;
+                const auto& mbr = ma->member;
+                // Total* properties return double.
+                if (mbr == "TotalDays") {
+                    auto* fn = declareC("bz_timespan_total_days",
+                                        llvm::Type::getDoubleTy(llvm_), {i64()});
+                    return builder_.CreateCall(fn, {ticks}, "ts.totaldays");
+                }
+                if (mbr == "TotalHours") {
+                    auto* fn = declareC("bz_timespan_total_hours",
+                                        llvm::Type::getDoubleTy(llvm_), {i64()});
+                    return builder_.CreateCall(fn, {ticks}, "ts.totalhours");
+                }
+                if (mbr == "TotalMinutes") {
+                    auto* fn = declareC("bz_timespan_total_minutes",
+                                        llvm::Type::getDoubleTy(llvm_), {i64()});
+                    return builder_.CreateCall(fn, {ticks}, "ts.totalmins");
+                }
+                if (mbr == "TotalSeconds") {
+                    auto* fn = declareC("bz_timespan_total_seconds",
+                                        llvm::Type::getDoubleTy(llvm_), {i64()});
+                    return builder_.CreateCall(fn, {ticks}, "ts.totalsecs");
+                }
+                if (mbr == "TotalMilliseconds") {
+                    auto* fn = declareC("bz_timespan_total_milliseconds",
+                                        llvm::Type::getDoubleTy(llvm_), {i64()});
+                    return builder_.CreateCall(fn, {ticks}, "ts.totalms");
+                }
+                // Component (int) properties — decompose via bz_timespan_components.
+                // Each allocates output slots, calls the helper, returns one slot.
+                auto emitComponent = [&](int slot) -> llvm::Value* {
+                    llvm::Value* dS  = entryAlloca(i32());
+                    llvm::Value* hS  = entryAlloca(i32());
+                    llvm::Value* miS = entryAlloca(i32());
+                    llvm::Value* sS  = entryAlloca(i32());
+                    llvm::Value* msS = entryAlloca(i32());
+                    auto* fn = declareC("bz_timespan_components",
+                        llvm::Type::getVoidTy(llvm_),
+                        {i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(fn, {ticks, dS, hS, miS, sS, msS});
+                    llvm::Value* slots[] = {dS, hS, miS, sS, msS};
+                    return builder_.CreateLoad(i32(), slots[slot]);
+                };
+                if (mbr == "Days")         return emitComponent(0);
+                if (mbr == "Hours")        return emitComponent(1);
+                if (mbr == "Minutes")      return emitComponent(2);
+                if (mbr == "Seconds")      return emitComponent(3);
+                if (mbr == "Milliseconds") return emitComponent(4);
+                // Ticks property — raw i64.
+                if (mbr == "Ticks") return ticks;
             }
         }
     }
@@ -2546,6 +2663,43 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if (colName == "CancellationTokenSource") {
                 auto* allocFn = declareC("bz_cts_alloc", ptrTy(), {});
                 return builder_.CreateCall(allocFn, {}, "cts.alloc");
+            }
+            // §2.5: new DateTime(year, month, day) or
+            //        new DateTime(year, month, day, hour, minute, second) or
+            //        new DateTime(year, month, day, hour, minute, second, ms).
+            // DateTime is a scalar i64 tick value — no heap allocation.
+            if (colName == "DateTime") {
+                auto getI32 = [&](size_t idx) -> llvm::Value* {
+                    if (idx >= ne.args.size() || !ne.args[idx].value)
+                        return builder_.getInt32(0);
+                    llvm::Value* v = lowerExpr(*ne.args[idx].value);
+                    if (!v) return builder_.getInt32(0);
+                    if (!v->getType()->isIntegerTy(32))
+                        v = builder_.CreateTrunc(v, i32());
+                    return v;
+                };
+                llvm::Value* yr  = getI32(0);
+                llvm::Value* mo  = getI32(1);
+                llvm::Value* day = getI32(2);
+                llvm::Value* hr  = getI32(3);
+                llvm::Value* mn  = getI32(4);
+                llvm::Value* sec = getI32(5);
+                llvm::Value* ms  = getI32(6);
+                auto* fn = declareC("bz_datetime_parts_to_ticks", i64(),
+                    {i32(), i32(), i32(), i32(), i32(), i32(), i32()});
+                return builder_.CreateCall(fn,
+                    {yr, mo, day, hr, mn, sec, ms}, "dt.ctor");
+            }
+            // §2.5: new TimeSpan(ticks: long) — construct from raw tick count.
+            // No heap allocation — TimeSpan is a scalar i64.
+            if (colName == "TimeSpan") {
+                if (!ne.args.empty() && ne.args[0].value) {
+                    llvm::Value* v = lowerExpr(*ne.args[0].value);
+                    if (v && !v->getType()->isIntegerTy(64))
+                        v = builder_.CreateSExt(v, i64());
+                    return v ? v : builder_.getInt64(0);
+                }
+                return builder_.getInt64(0);  // default: zero TimeSpan
             }
         }
         return nullptr;

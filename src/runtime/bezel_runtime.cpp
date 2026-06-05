@@ -687,6 +687,141 @@ int64_t bz_datetime_parts_to_ticks(int32_t year, int32_t month,  int32_t day,
          + (int64_t)ms * TICKS_PER_MS;
 }
 
+// Per §2.5: scalar property extractors from a DateTime tick value.
+// All delegate through bz_datetime_ticks_to_parts for calendar accuracy.
+
+int32_t bz_datetime_year(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return y;
+}
+int32_t bz_datetime_month(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return mo;
+}
+int32_t bz_datetime_day(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return d;
+}
+int32_t bz_datetime_hour(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return h;
+}
+int32_t bz_datetime_minute(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return mi;
+}
+int32_t bz_datetime_second(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return s;
+}
+int32_t bz_datetime_millisecond(int64_t ticks) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    return ms;
+}
+
+// DayOfWeek: 0=Sunday...6=Saturday — per §2.5 DayOfWeek enum ordering.
+// Uses gmtime's tm_wday (0=Sunday, which matches the Bezel enum).
+int32_t bz_datetime_day_of_week(int64_t ticks) {
+    int64_t posix_sec = (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
+    time_t t = (time_t)posix_sec;
+    struct tm* ti = gmtime(&t);
+    return (int32_t)ti->tm_wday;  // 0=Sunday ... 6=Saturday
+}
+
+// DayOfYear: 1..366 — per §2.5; uses gmtime's tm_yday (0-based) + 1.
+int32_t bz_datetime_day_of_year(int64_t ticks) {
+    int64_t posix_sec = (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
+    time_t t = (time_t)posix_sec;
+    struct tm* ti = gmtime(&t);
+    return (int32_t)(ti->tm_yday + 1);
+}
+
+// Per §2.5: AddYears/AddMonths perform calendar-aware arithmetic.
+// We decompose to components, adjust, then recompose.
+int64_t bz_datetime_add_years(int64_t ticks, int32_t years) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    y += years;
+    // Clamp Feb 29 in a non-leap year to Feb 28.
+    if (mo == 2 && d == 29) {
+        bool leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
+        if (!leap) d = 28;
+    }
+    return bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
+}
+
+int64_t bz_datetime_add_months(int64_t ticks, int32_t months) {
+    int32_t y, mo, d, h, mi, s, ms;
+    bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
+    // Convert month to 0-based for arithmetic, then back.
+    int32_t total_months = (y * 12 + (mo - 1)) + months;
+    y  = total_months / 12;
+    mo = total_months % 12 + 1;
+    if (mo <= 0) { mo += 12; y--; }
+    // Clamp day to the last day of the resulting month.
+    static const int32_t days_in_month[] =
+        {0, 31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
+    int32_t dim = (mo == 2 && leap) ? 29 : days_in_month[mo];
+    if (d > dim) d = dim;
+    return bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
+}
+
+// ---------------------------------------------------------------------------
+// Per §2.5: TimeSpan component extractors.
+// Ticks are signed 100-ns units.
+// ---------------------------------------------------------------------------
+
+static const int64_t TICKS_PER_MINUTE = 600000000LL;     // 60 * 10_000_000
+static const int64_t TICKS_PER_HOUR   = 36000000000LL;   // 3600 * 10_000_000
+static const int64_t TICKS_PER_DAY    = 864000000000LL;  // 86400 * 10_000_000
+
+void bz_timespan_components(int64_t ticks,
+                             int32_t* days, int32_t* hours,
+                             int32_t* minutes, int32_t* seconds,
+                             int32_t* ms) {
+    // Preserve sign: work with absolute value, then negate if negative.
+    int32_t sign = (ticks < 0) ? -1 : 1;
+    int64_t t = (ticks < 0) ? -ticks : ticks;
+    int64_t d   = t / TICKS_PER_DAY;
+    t %= TICKS_PER_DAY;
+    int64_t h   = t / TICKS_PER_HOUR;
+    t %= TICKS_PER_HOUR;
+    int64_t min = t / TICKS_PER_MINUTE;
+    t %= TICKS_PER_MINUTE;
+    int64_t sec = t / TICKS_PER_SECOND;
+    t %= TICKS_PER_SECOND;
+    int64_t mss = t / TICKS_PER_MS;
+    if (days)    *days    = (int32_t)(sign * d);
+    if (hours)   *hours   = (int32_t)(sign * h);
+    if (minutes) *minutes = (int32_t)(sign * min);
+    if (seconds) *seconds = (int32_t)(sign * sec);
+    if (ms)      *ms      = (int32_t)(sign * mss);
+}
+
+double bz_timespan_total_days(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_DAY;
+}
+double bz_timespan_total_hours(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_HOUR;
+}
+double bz_timespan_total_minutes(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_MINUTE;
+}
+double bz_timespan_total_seconds(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_SECOND;
+}
+double bz_timespan_total_milliseconds(int64_t ticks) {
+    return (double)ticks / (double)TICKS_PER_MS;
+}
+
 // ---------------------------------------------------------------------------
 // File I/O
 // ---------------------------------------------------------------------------
