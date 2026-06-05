@@ -305,7 +305,25 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // through to the i32 default, truncating the pointer when a
                     // Subscription was a method return / parameter / field — so
                     // its later `.Dispose()` saw a non-pointer and was skipped.
-                    n == "Subscription")
+                    n == "Subscription" ||
+                    // §6.1 / §30.8: CancellationToken is a builtin record whose
+                    // value representation is a single borrow-pointer to the
+                    // cancellation state cell (bz_cancel_state_t*).  It lowers
+                    // to a pointer word (ptr) rather than an i32 so the borrowed
+                    // state pointer is stored at full width.
+                    // CancellationTokenSource is an owned class type — also a ptr.
+                    n == "CancellationToken" ||
+                    n == "CancellationTokenSource") {
+                    return ptrTy();
+                }
+            }
+            // §6.1 / §30.8: a CancellationToken-typed variable produced by
+            // cts.Token has a non-null builtinClassSym declaration (used to
+            // carry the type name through sema); recognise it by declaration name
+            // so lowerTypeRef returns ptrTy() for it.
+            if (rt->declaration && !rt->declaration->decl &&
+                (rt->declaration->name == "CancellationToken" ||
+                 rt->declaration->name == "CancellationTokenSource")) {
                     return ptrTy();
             }
             // #405 / §31.1 / §31.4: a built-in exception type (Exception or a

@@ -355,6 +355,12 @@ private:
         // UAF) and it runs once per exit (no double-free). `slot` holds the box
         // pointer; the class/collection/dict fields are unused.
         bool boxRelease = false;
+        // §6.1 / §30.8: a `using var` bound to a CancellationTokenSource.
+        // The source has no user TypeSymbol, so classOfLocal returns null and the
+        // class-disposal path misses it. At scope end it is freed via
+        // bz_cts_dispose (idempotent — signals surviving tokens and frees the
+        // source). Recognised by the local's declared/resolved type name.
+        bool cancellationTokenSource = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -2581,6 +2587,12 @@ private:
 
     // Check if the named type (TypeRef with null declaration) is a collection.
     static bool isCollectionTypeName(const sema::TypeRef* rt);
+    // §6.1 / §30.8: extract the builtin type name from a Named TypeRef that has
+    // no user TypeDecl.  Two shapes exist:
+    //   a) !rt->declaration: the name lives in rt->astNode->name->parts[0].
+    //   b) rt->declaration is a builtinClassSym (null decl): name is declaration->name.
+    // Returns an empty string_view if the TypeRef is not a builtin named type.
+    static std::string_view builtinTypeName(const sema::TypeRef* rt);
 
     static bool isDictTypeName(const sema::TypeRef* rt);
 

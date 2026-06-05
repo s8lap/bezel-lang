@@ -172,7 +172,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    id->name == "File" || id->name == "Directory" ||
                    id->name == "Path" ||
                    // §4 Linq:
-                   id->name == "Linq") {
+                   id->name == "Linq" ||
+                   // §6.1 / §30.8 (stdlib §6.1): CancellationToken is auto-imported
+                   // (§2.3); used in expression position for `CancellationToken.None`.
+                   // CancellationTokenSource requires `import System.Threading` per
+                   // spec; import-gating not yet enforced (same stance as §4.8
+                   // KeyNotFoundException).
+                   id->name == "CancellationToken" ||
+                   id->name == "CancellationTokenSource") {
             // §2.3: these System classes are auto-imported and always
             // available without an explicit import. Give them a synthetic
             // TypeSymbol (null decl) so member access can proceed; the

@@ -749,6 +749,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // DateTime
                     if (colName == "DateTime" && (m == "Now" || m == "UtcNow"))
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Long));
+                    // §6.1 / §30.8: CancellationToken instance method return types.
+                    // ThrowIfCancellationRequested() → unit (void); Register(cb) →
+                    // owned Subscription (leave untyped — Register is deferred).
+                    // IsCancellationRequested is a property (not a call), handled
+                    // in resolveMemberAccess.
+                    if (colName == "CancellationToken") {
+                        // ThrowIfCancellationRequested() returns unit (void/untyped).
+                        // Register — deferred (needs closure-list infra).
+                    }
+                    // §6.1: CancellationTokenSource instance method return types.
+                    // Token is a property; Cancel() and CancelAfter() → unit;
+                    // IsCancellationRequested property → handled in resolveMemberAccess.
+                    if (colName == "CancellationTokenSource") {
+                        if (m == "Token") {
+                            // Token property returns CancellationToken.  Set the
+                            // declaration to builtinClassSym("CancellationToken") so
+                            // subsequent member accesses (IsCancellationRequested) and
+                            // lowerTypeRef can identify the type by name.
+                            auto* ctTy = ctx_.makeTypeRef();
+                            ctTy->kind = TypeRef::Kind::Named;
+                            ctTy->declaration = builtinClassSym("CancellationToken");
+                            ctx_.setExprType(&ce, ctTy);
+                        }
+                    }
                 }
             }
         }
@@ -2051,6 +2075,70 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // §6.1 / §30.8: CancellationToken and CancellationTokenSource builtin
+        // members — neither has a user TypeDecl, so the ordinary member-lookup
+        // path never types their properties/methods.  Two TypeRef shapes exist:
+        //   a) !declaration: TypeRef from a parsed type annotation (CancellationToken
+        //      parameter/field), name in astNode->name->parts[0].
+        //   b) declaration = builtinClassSym (null decl): TypeRef returned by
+        //      cts.Token / CancellationToken.None, name in declaration->name.
+        // Extract the name via a helper lambda matching both shapes.
+        if (ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            auto builtinTyName = [](const TypeRef* rt) -> std::string_view {
+                if (!rt || rt->kind != TypeRef::Kind::Named) return {};
+                if (!rt->declaration) {
+                    if (rt->astNode && rt->astNode->name &&
+                        !rt->astNode->name->parts.empty())
+                        return rt->astNode->name->parts[0];
+                    return {};
+                }
+                if (!rt->declaration->decl) return rt->declaration->name;
+                return {};
+            };
+            std::string_view cn = builtinTyName(tt);
+            if (cn == "CancellationToken") {
+                // IsCancellationRequested: bool property (§6.1)
+                if (ma.member == "IsCancellationRequested") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
+                // ThrowIfCancellationRequested(): void — leave untyped (unit).
+                // Register(cb): owned Subscription — deferred (see codegen note).
+            }
+            if (cn == "CancellationTokenSource") {
+                // Token: CancellationToken (§6.1).  Use builtinClassSym so the
+                // TypeRef's declaration carries the name "CancellationToken" —
+                // used by subsequent IsCancellationRequested resolution, lowerTypeRef
+                // (layout), and the instance-method codegen dispatch.
+                if (ma.member == "Token") {
+                    auto* ctTy = ctx_.makeTypeRef();
+                    ctTy->kind = TypeRef::Kind::Named;
+                    ctTy->declaration = builtinClassSym("CancellationToken");
+                    ctx_.setExprType(&ma, ctTy);
+                    return;
+                }
+                // IsCancellationRequested: bool (§6.1)
+                if (ma.member == "IsCancellationRequested") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
+                // Cancel() / CancelAfter() / Dispose() → unit (leave untyped).
+            }
+            // §30.8: CancellationToken.None — static readonly property on the
+            // CancellationToken builtin type name used as an identifier expression.
+            // The target's exprType is null (an identifier-as-type-name, not a
+            // value expression), so we look at the exprSymbol instead.
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+                if (tid->name == "CancellationToken" && ma.member == "None") {
+                    auto* ctTy = ctx_.makeTypeRef();
+                    ctTy->kind = TypeRef::Kind::Named;
+                    ctTy->declaration = builtinClassSym("CancellationToken");
+                    ctx_.setExprType(&ma, ctTy);
+                    return;
+                }
+            }
+        }
         // CG27a (§4.6): handle known intrinsic string members directly —
         // string has no user TypeSymbol in the symbol table.
         if (ma.target) {
@@ -2201,6 +2289,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 else if (m == "NextDouble" || m == "NextFloat")
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
                 // Seed → unit (leave untyped)
+            }
+            // §6.1 / §30.8: CancellationToken instance property reads.
+            // Reached when tok was bound via `cts.Token` (builtinClassSym decl).
+            if (cls == "CancellationToken") {
+                if (m == "IsCancellationRequested")
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                // Token is CancellationToken.None — handled as identifier.
+                // ThrowIfCancellationRequested / Register → unit (leave untyped).
+            }
+            // §6.1: CancellationTokenSource instance property reads.
+            if (cls == "CancellationTokenSource") {
+                if (m == "Token") {
+                    auto* ctTy = ctx_.makeTypeRef();
+                    ctTy->kind = TypeRef::Kind::Named;
+                    ctTy->declaration = builtinClassSym("CancellationToken");
+                    ctx_.setExprType(&ma, ctTy);
+                } else if (m == "IsCancellationRequested") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                }
+                // Cancel / CancelAfter / Dispose → unit (leave untyped).
             }
         } else if (targetType->kind == ast::TypeDeclKind::Record ||
                    targetType->kind == ast::TypeDeclKind::Enum) {

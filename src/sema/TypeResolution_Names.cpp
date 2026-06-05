@@ -4,7 +4,12 @@ namespace bezel::sema {
 
 int Resolver::builtinTypeArity(std::string_view n) {
     if (n == "Type" || n == "IDisposable" || n == "IAsyncDisposable" ||
-        n == "Subscription" || n == "CancellationToken") {
+        n == "Subscription" || n == "CancellationToken" ||
+        // §6.1 / §30.8: CancellationTokenSource requires `import System.Threading`
+        // per the spec, but the compiler does not yet enforce import-gating for
+        // System.Threading (same stance as KeyNotFoundException / System.Collections.
+        // Generic — see the comment near the KeyNotFoundException entry below).
+        n == "CancellationTokenSource") {
         return 0;
     }
     // Slice S25 (§31.4): language-built-in exception types, all

@@ -951,6 +951,45 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // §6.1 / §30.8: CancellationToken and CancellationTokenSource property reads
+    // (accessed WITHOUT call parentheses — `tok.IsCancellationRequested` etc.).
+    // Mirrors the pattern used for string.Length above: recognise the builtin
+    // type name from the receiver's exprType astNode name part.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) {
+            auto* tt = ctx_.exprType(*ma->target);
+            std::string_view cn = builtinTypeName(tt);
+            // CancellationToken property reads.
+            if (cn == "CancellationToken" &&
+                ma->member == "IsCancellationRequested") {
+                llvm::Value* tok = lowerExpr(*ma->target);
+                if (!tok) return builder_.getFalse();
+                auto* fn = declareC("bz_ctoken_is_cancelled", i32(), {ptrTy()});
+                llvm::Value* flag = builder_.CreateCall(fn, {tok}, "ct.iscancelled");
+                return builder_.CreateICmpNE(flag, builder_.getInt32(0), "ct.icr.b");
+            }
+            // CancellationTokenSource property reads.
+            if (cn == "CancellationTokenSource") {
+                llvm::Value* cts = lowerExpr(*ma->target);
+                if (!cts) return nullptr;
+                if (ma->member == "IsCancellationRequested") {
+                    auto* fn = declareC("bz_cts_is_cancelled", i32(), {ptrTy()});
+                    llvm::Value* flag = builder_.CreateCall(fn, {cts}, "cts.iscancelled");
+                    return builder_.CreateICmpNE(flag, builder_.getInt32(0), "cts.icr.b");
+                }
+                if (ma->member == "Token") {
+                    auto* fn = declareC("bz_cts_token", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {cts}, "cts.token.prop");
+                }
+            }
+            // CancellationToken.None (static property, target is type-name identifier).
+            if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+                if (id2->name == "CancellationToken" && ma->member == "None") {
+                    return llvm::ConstantPointerNull::get(ptrTy());
+                }
+            }
+        }
+    }
     // §15.1: inline array `a.Length` — compile-time constant equal to N.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Length") {
@@ -2501,6 +2540,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* ts = builder_.CreateCall(timeFn, {});
                 auto* allocFn = declareC("bz_random_alloc", ptrTy(), {i64()});
                 return builder_.CreateCall(allocFn, {ts});
+            }
+            // §6.1 / §30.8: new CancellationTokenSource() — allocate via
+            // bz_cts_alloc (stdlib §6.1 default constructor).
+            if (colName == "CancellationTokenSource") {
+                auto* allocFn = declareC("bz_cts_alloc", ptrTy(), {});
+                return builder_.CreateCall(allocFn, {}, "cts.alloc");
             }
         }
         return nullptr;

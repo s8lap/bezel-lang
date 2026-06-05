@@ -2584,6 +2584,35 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         disposeStack_.back().push_back({it->second, nullptr, /*subscription=*/true});
         return;
     }
+    // §6.1 / §30.8: a `using var` bound to a CancellationTokenSource — a
+    // builtin owned class with no user TypeSymbol, disposed via bz_cts_dispose
+    // (idempotent: cancels surviving token observers, then frees the source).
+    // Recognised by the declared type name or, for inferred `var cts := new
+    // CancellationTokenSource()`, by the NewExpr's type name.
+    {
+        bool isCTS = false;
+        if (ld->type) {
+            auto* rt = ctx_.resolvedType(*ld->type);
+            isCTS = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                    !rt->declaration && rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->astNode->name->parts[0] == "CancellationTokenSource";
+        }
+        if (!isCTS && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+                isCTS = ne->type && ne->type->name &&
+                        !ne->type->name->parts.empty() &&
+                        ne->type->name->parts[0] == "CancellationTokenSource";
+            }
+        }
+        if (isCTS) {
+            Disposal d{it->second, nullptr};
+            d.cancellationTokenSource = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // #362 / stdlib §4.5: a `using var` bound to a heap collection
     // (Array<T>/OwnedArray<T>/Dictionary/Set/…). These are builtins with no
     // user TypeSymbol, so classOfLocal returns null; recognize them by name and
@@ -4322,6 +4351,20 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {tbl, disp});
+            continue;
+        }
+        // §6.1 / §30.8: a `using var` CancellationTokenSource. Dispose via
+        // bz_cts_dispose (idempotent: signals all tokens, then frees the source).
+        // null-guarded: bz_cts_dispose handles null internally (its disposed flag
+        // prevents double-free), but we guard anyway for consistency with other
+        // builtin disposal sites.
+        if (it->cancellationTokenSource) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* cts = builder_.CreateLoad(ptrTy(), addr);
+            auto* fn = declareC("bz_cts_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {cts});
             continue;
         }
         // #383 / §28: a `using var` owning a class/interface object whose

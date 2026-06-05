@@ -532,6 +532,66 @@ void* bz_encoding_utf8_get_string(void* bytes, int64_t index, int64_t count);
 void** bz_itable_lookup(void** itmap, void* iface_td);
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// CancellationToken / CancellationTokenSource (stdlib §6.1 / language spec §30.8)
+//
+// CancellationTokenSource is a disposable heap object that owns a cancellation
+// state cell.  CancellationToken is a thin handle (a borrowed pointer to the
+// same state cell); it carries NO ownership and lives only as long as its source
+// is alive (§30.8 / §9.7).
+//
+// The state cell is a plain int32_t flag (0 = not cancelled, 1 = cancelled).
+// Access is non-atomic for now (single-threaded JIT tests); the spec (§30.8)
+// requires atomicity for cross-thread use — this matches the non-atomic
+// stance the rest of the runtime takes (bz_string_retain, bz_closure_retain,
+// etc.) until the async milestone lands.
+//
+// Token value = pointer to the state cell (bz_cancel_state_t*).
+// CancellationToken.None = null pointer (source never cancels).
+// ---------------------------------------------------------------------------
+
+// Allocate a new CancellationTokenSource.  Returns an opaque pointer to the
+// internal bz_cancel_source_t struct (the source owns a state cell).
+// The Token property is the inner state cell pointer (bz_ctoken_t*).
+void* bz_cts_alloc(void);
+
+// Retrieve the CancellationToken handle (borrow of the source's state cell).
+// The handle is valid only while the source is alive — per §30.8.
+void* bz_cts_token(void* src);
+
+// Read the IsCancellationRequested flag on the source (convenience mirror of
+// bz_ctoken_is_cancelled, per stdlib §6.1: the two always agree).
+int32_t bz_cts_is_cancelled(void* src);
+
+// Cancel the source: set the flag and signal any registered tokens.
+// Idempotent — a second call is a no-op (flag already 1).
+void bz_cts_cancel(void* src);
+
+// Dispose the CancellationTokenSource: marks the source cancelled (so any
+// surviving token observers see IsCancellationRequested == true, per §6.1
+// destructor note), then frees the source struct.  The state cell itself is
+// NOT freed here — outstanding token handles borrow it and outlive this call
+// by design (the spec requires the source to outlive its tokens, but defensive
+// code may read the token after the source is disposed; we keep the cell alive
+// via a separate refcount so reads are safe).  In practice, for the
+// synchronous single-threaded tests, callers always keep the source alive as
+// long as they need the token.
+void bz_cts_dispose(void* src);
+
+// Read IsCancellationRequested on a token handle.
+// token == null  → false  (CancellationToken.None never cancels, §6.1).
+int32_t bz_ctoken_is_cancelled(void* token);
+
+// ThrowIfCancellationRequested (stdlib §6.1): if the token is cancelled, raise
+// OperationCanceledException by storing it in the global exception slot and
+// branching to the enclosing handler.  In the C runtime we mark cancellation by
+// setting the global exception pointer to a sentinel non-null value and returning
+// 1 so codegen can branch.  If not cancelled, returns 0.
+// The codegen emits:
+//   if (bz_ctoken_throw_if_cancelled(token)) goto unwind;
+int32_t bz_ctoken_throw_if_cancelled(void* token);
+
+// ---------------------------------------------------------------------------
 // per §33.3 / §22.13 (line 3845): abnormal-termination handler for an exception
 // that escapes Main with no enclosing handler. §33.3 reserves exit code 0 for
 // NORMAL completion (and for a legitimate `return 0`); §22.13 distinguishes
