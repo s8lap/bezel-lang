@@ -453,8 +453,21 @@ void Emitter::declareFunctions() {
             fnType, llvm::Function::ExternalLinkage,
             "bz$" + std::string(ts->name) + "$Dispose", module_.get());
         disposerFns_[ts] = fn;
+        // §2.5 / §2.6 / §28.4 step 3 (issue #328 / #103): the DisposeCore (the
+        // unguarded destructor + owned-field disposal + base-core chain) is
+        // EXTERNAL for a PUBLIC, non-generic class, because a LOCAL class deriving
+        // from this imported base must chain to THIS core (not the flag-guarded
+        // public Dispose, which the most-derived disposal has already tripped) so
+        // the base destructor + base owned fields run within the single guarded
+        // most-derived disposal. A non-public/generic type keeps INTERNAL linkage
+        // (single-module codegen and private types unchanged); only genuinely
+        // exported types widen the link surface, matching the vt$/init pattern.
+        bool exportedCore = ts->visibility == ast::Visibility::Public &&
+                            ts->genericParams.empty();
         auto* coreFn = llvm::Function::Create(
-            fnType, llvm::Function::InternalLinkage,
+            fnType,
+            exportedCore ? llvm::Function::ExternalLinkage
+                         : llvm::Function::InternalLinkage,
             "bz$" + std::string(ts->name) + "$DisposeCore", module_.get());
         disposerCoreFns_[ts] = coreFn;
 
@@ -508,6 +521,23 @@ void Emitter::declareFunctions() {
                 fnType, llvm::Function::ExternalLinkage,
                 "bz$" + std::string(ts->name) + "$Dispose", module_.get());
             disposerFns_[ts] = fn;
+            // §2.5 / §2.6 / §28.4 step 3 (issue #328 / #103): also declare the
+            // imported class's external DisposeCore, so a LOCAL class deriving
+            // from this imported base chains its disposal to the base's destructor
+            // (emitBaseDisposeChain calls disposerCoreFns_[base]). Without it the
+            // base destructor + base owned fields never run on the derived's
+            // disposal. The exporter emits it with EXTERNAL linkage for public,
+            // non-generic classes; declare it under the same condition so we never
+            // emit an external reference the dependency does not define.
+            if (!disposerCoreFns_.count(ts) &&
+                ts->visibility == ast::Visibility::Public &&
+                ts->genericParams.empty()) {
+                auto* coreFn = llvm::Function::Create(
+                    fnType, llvm::Function::ExternalLinkage,
+                    "bz$" + std::string(ts->name) + "$DisposeCore",
+                    module_.get());
+                disposerCoreFns_[ts] = coreFn;
+            }
         }
     }
 }
@@ -659,15 +689,71 @@ void Emitter::declareVtables() {
         collectTypeAndBases(ts, supers);
         supersOf[ts] = supers;
         auto* arrTy = llvm::ArrayType::get(ptrTy(), supers.size() + 1);
+        // §2.5 / §2.6 / §12 (issue #328 / #103): a PUBLIC, non-generic class or
+        // interface's type DESCRIPTOR (`td$<Type>`) is part of its cross-module
+        // surface. A LOCAL class deriving from an IMPORTED base must embed the
+        // base's descriptor in its own descriptor chain (Pass C) and reference it
+        // for `is`/`as`; an importer implementing/using an imported interface or
+        // boxing an imported value type likewise needs the descriptor. So the
+        // descriptor carries EXTERNAL linkage under the same export condition the
+        // vtable (`vt$<Type>`) uses, letting the importer link against this exact
+        // descriptor instead of fabricating its own (which would break `is`/`as`
+        // identity and, for a missing imported-base entry, crash global emission).
+        // A non-public type or a generic template (per-instantiation descriptor)
+        // keeps INTERNAL linkage, so single-module codegen and private types are
+        // unchanged.
+        bool exportedDesc = ts->visibility == ast::Visibility::Public &&
+                            ts->genericParams.empty();
         descArray_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage, nullptr,
-            "td$" + std::string(ts->name));
+            exportedDesc ? llvm::GlobalValue::ExternalLinkage
+                         : llvm::GlobalValue::InternalLinkage,
+            nullptr, "td$" + std::string(ts->name));
     }
-    // Pass C: fill each descriptor with [self + transitive bases, null].
+    // §2.5 / §2.6 / §12 (issue #328 / #103): declare EXTERNAL descriptor globals
+    // for IMPORTED public, non-generic classes/interfaces that a local type's
+    // descriptor chain (Pass C) or vtable (Pass D) must reference — chiefly a
+    // local class deriving from an imported base, whose descriptor must embed the
+    // imported base's `td$<Base>` and whose vtable's slot 0 is its own descriptor
+    // (which transitively references the base's). Without this, descArray_[base]
+    // is a null map default in Pass C → a malformed ConstantArray → SIGSEGV in
+    // LLVM global emission. The size matches the exporter's: [self + transitive
+    // bases, null], computed from the loader-reconstructed base chain so the
+    // declared type exactly matches the exporter's definition. The body lives in
+    // the dependency object (exported above); here we only declare it.
+    if (ctx_.hasImports()) {
+        for (sema::Symbol* sym : ctx_.importedSymbols()) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);
+            if (!ts) continue;
+            if (ts->kind != ast::TypeDeclKind::Class &&
+                ts->kind != ast::TypeDeclKind::Interface)
+                continue;
+            if (descArray_.count(ts)) continue;
+            if (ts->visibility != ast::Visibility::Public ||
+                !ts->genericParams.empty())
+                continue;
+            std::vector<const sema::TypeSymbol*> supers;
+            collectTypeAndBases(ts, supers);
+            auto* arrTy = llvm::ArrayType::get(ptrTy(), supers.size() + 1);
+            descArray_[ts] = new llvm::GlobalVariable(
+                *module_, arrTy, /*isConstant=*/true,
+                llvm::GlobalValue::ExternalLinkage, /*init=*/nullptr,
+                "td$" + std::string(ts->name));
+        }
+    }
+    // Pass C: fill each descriptor with [self + transitive bases, null]. A base
+    // that is imported is in descArray_ as an EXTERNAL declaration from the loop
+    // above; guard with .find so a not-yet-reconstructed base lowers to null
+    // rather than a default-inserted null map entry (which yields a malformed
+    // ConstantArray and crashes global emission, issue #103).
     for (auto& [ts, supers] : supersOf) {
         std::vector<llvm::Constant*> elems;
-        for (const sema::TypeSymbol* s : supers) elems.push_back(descArray_[s]);
+        for (const sema::TypeSymbol* s : supers) {
+            auto it = descArray_.find(s);
+            elems.push_back(it != descArray_.end()
+                                ? llvm::cast<llvm::Constant>(it->second)
+                                : llvm::ConstantPointerNull::get(ptrTy()));
+        }
         elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
         auto* arrTy = llvm::cast<llvm::ArrayType>(
             descArray_[ts]->getValueType());
@@ -2046,8 +2132,19 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         if (!isThis && n == 0) emitImplicitBase(targetCls, currentThis_);
         return;
     }
+    // §2.5 / §2.6 / §12 (issue #328 / #103): a LOCAL class's `base(...)` chain to
+    // an IMPORTED base runs the dependency's `bz$<Base>$ctor`. The imported ctor
+    // has no local ctorFns_ entry until declared, so declare it on demand (as
+    // lowerNew does for `new ImportedT(...)`); otherwise the chain call is
+    // silently dropped and the base subobject's fields stay calloc-zeroed.
     auto it = ctorFns_.find(target);
-    if (it == ctorFns_.end()) return;
+    if (it == ctorFns_.end()) {
+        if (ctx_.isImported(targetCls)) {
+            declareImportedCtor(target);
+            it = ctorFns_.find(target);
+        }
+        if (it == ctorFns_.end()) return;
+    }
     std::vector<llvm::Value*> args;
     args.push_back(currentThis_);
     for (const auto& a : call->args) {
@@ -2067,6 +2164,13 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
     if (!b) return;
     if (sema::ConstructorSymbol* target = ctorByArity(b, 0, nullptr)) {
         auto it = ctorFns_.find(target);
+        // §2.5 / §12 (issue #328 / #103): an implicit base chain into an IMPORTED
+        // base runs the dependency's `bz$<Base>$ctor`; declare it on demand so
+        // the base subobject is constructed (mirrors emitChainCall).
+        if (it == ctorFns_.end() && ctx_.isImported(b)) {
+            declareImportedCtor(target);
+            it = ctorFns_.find(target);
+        }
         if (it != ctorFns_.end() && it->second->arg_size() == 1) {
             builder_.CreateCall(it->second, {obj});
         }
