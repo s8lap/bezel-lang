@@ -173,6 +173,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // returned value reflects pre-disposal state.
         llvm::Value* v = rs->value ? lowerExpr(*rs->value) : nullptr;
         if (diverged_) return true;  // CG40: the value expression threw
+        // §30.1: inside an async method's Resume function, `return expression;`
+        // completes the OUTER task with the value (and `return;` / fall-off
+        // completes with no value), then returns void from Resume — it does NOT
+        // box for or `ret` the entry function's Task ptr return type. Handled
+        // before the §8.6 boxing / ownership-transfer / finally machinery, which
+        // are all keyed off the (Task-typed) declared return and don't apply to
+        // the unwrapped result value. (await-in-try / return-through-finally in
+        // async bodies is deferred; finallyStack_ is empty for the minimal cut.)
+        if (smKind_ == SuspendKind::Await && smStateStruct_) {
+            emitAllDisposals();
+            emitAsyncComplete(v);
+            builder_.CreateRetVoid();
+            return true;
+        }
         // §8.6: box a value-typed `return expr` whose declared return type is
         // Object/interface, so the caller's is/as/virtual dispatch sees a box.
         if (v && rs->value && currentReturnTypeNode_)
