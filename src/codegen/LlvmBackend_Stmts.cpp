@@ -1475,6 +1475,10 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                     if (getterFn) {
                         auto* fnTy = getterFn->getFunctionType();
                         curVal = builder_.CreateCall(fnTy, getterFn, {enumObj2});
+                        // §31.1/§31.2 (FINDING [4]): a throw inside the
+                        // standalone block getter must propagate, not be
+                        // swallowed — check the pending flag like a method call.
+                        emitPendingCheck();
                     }
                 }
                 currentThis_ = savedThis;
