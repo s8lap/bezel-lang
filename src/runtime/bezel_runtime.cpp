@@ -2447,3 +2447,123 @@ extern "C" void bz_unhandled_exception(void) {
     fputs("Unhandled exception\n", stderr);
     exit(70);
 }
+
+// ---------------------------------------------------------------------------
+// CancellationToken / CancellationTokenSource — stdlib §6.1 / spec §30.8.
+//
+// Layout:
+//   bz_cancel_state_t  — the shared cancellation flag cell.  Allocated by the
+//                        source; borrowed (by pointer) by every derived token.
+//                        Kept alive by a simple reference count so a token read
+//                        after source disposal is safe (flag remains readable;
+//                        the spec requires the source to outlive tokens but
+//                        defensive runtime code should not crash on violation).
+//   bz_cancel_source_t — the CancellationTokenSource object.  Owns one
+//                        bz_cancel_state_t (the initial rc is 1 for the source's
+//                        reference; bz_cts_token adds one more for each token
+//                        handle handed out).
+//
+// CancellationToken handle = void* == bz_cancel_state_t*.
+// CancellationToken.None  = null pointer.
+// ---------------------------------------------------------------------------
+
+struct bz_cancel_state_t {
+    int32_t cancelled;   // 0 = live, 1 = cancelled
+    int32_t rc;          // reference count (source + outstanding tokens)
+};
+
+struct bz_cancel_source_t {
+    bz_cancel_state_t* state;
+    bool disposed;
+};
+
+// Internal helpers — not exported.
+static void bz_cancel_state_retain(bz_cancel_state_t* s) {
+    if (s) s->rc++;
+}
+static void bz_cancel_state_release(bz_cancel_state_t* s) {
+    if (!s) return;
+    if (--s->rc <= 0) free(s);
+}
+
+extern "C" void* bz_cts_alloc(void) {
+    auto* src = (bz_cancel_source_t*)calloc(1, sizeof(bz_cancel_source_t));
+    src->state = (bz_cancel_state_t*)calloc(1, sizeof(bz_cancel_state_t));
+    src->state->cancelled = 0;
+    src->state->rc = 1;  // source holds one reference
+    src->disposed = false;
+    return src;
+}
+
+extern "C" void* bz_cts_token(void* srcp) {
+    auto* src = (bz_cancel_source_t*)srcp;
+    if (!src || !src->state) return nullptr;
+    bz_cancel_state_retain(src->state);  // token borrows a reference
+    return src->state;                   // CancellationToken handle
+}
+
+extern "C" int32_t bz_cts_is_cancelled(void* srcp) {
+    auto* src = (bz_cancel_source_t*)srcp;
+    if (!src || !src->state) return 0;
+    return src->state->cancelled;
+}
+
+extern "C" void bz_cts_cancel(void* srcp) {
+    auto* src = (bz_cancel_source_t*)srcp;
+    if (!src || !src->state) return;
+    src->state->cancelled = 1;  // idempotent: already 1 → no-op
+}
+
+extern "C" void bz_cts_dispose(void* srcp) {
+    auto* src = (bz_cancel_source_t*)srcp;
+    if (!src) return;
+    if (src->disposed) return;  // idempotent (§28.2)
+    src->disposed = true;
+    // Per stdlib §6.1 destructor note: signals cancellation to any tokens
+    // still observing.  Outstanding token handles retain the state cell via
+    // the rc, so reads after dispose stay safe.
+    if (src->state) {
+        src->state->cancelled = 1;
+        bz_cancel_state_release(src->state);  // drop the source's reference
+        src->state = nullptr;
+    }
+    free(src);
+}
+
+extern "C" int32_t bz_ctoken_is_cancelled(void* token) {
+    auto* s = (bz_cancel_state_t*)token;
+    if (!s) return 0;  // CancellationToken.None never cancels
+    return s->cancelled;
+}
+
+// Shared OperationCanceledException vtable for ThrowIfCancellationRequested.
+// We use the same machinery as the built-in exception types in
+// LlvmBackend_Setup.cpp: each built-in exception has a static vtable global
+// (builtinVtable_["OperationCanceledException"]) and the global exception slot
+// stores the object pointer.  We cannot access that vtable from the pure-C
+// runtime, so instead we use a sentinel approach: a process-global
+// "cancellation exception" object is allocated once and reused for every
+// ThrowIfCancellationRequested.  The object layout matches the 16-byte
+// built-in exception format (vtable_slot, message_slot) that LlvmBackend_Setup
+// allocates for every `new OperationCanceledException()`.  We leave the vtable
+// slot null here — the codegen catch machinery matches by the global exception
+// slot being non-null AND by type descriptor, which it retrieves from the
+// object's vtable_slot.  A null vtable would break type-based catch dispatch.
+//
+// Therefore we take a different approach: bz_ctoken_throw_if_cancelled sets
+// a thread-local "cancellation requested" flag and returns 1; the codegen emits
+// a call to bz_ctoken_materialize_exception (below) to construct the real
+// OperationCanceledException object before branching to the unwind path.  This
+// two-step matches the pattern used by other synthetic throws (e.g. the
+// index-out-of-range guard in the array indexer path).
+//
+// Actually, the simpler approach that mirrors existing code is:
+// bz_ctoken_throw_if_cancelled simply returns a bool; the codegen wraps it in
+// a conditional block that, on true, executes `throw new OperationCanceledException()`.
+// This is the cleanest design — no special materialize call needed.
+
+extern "C" int32_t bz_ctoken_throw_if_cancelled(void* token) {
+    auto* s = (bz_cancel_state_t*)token;
+    if (!s) return 0;   // None — never cancels
+    return s->cancelled ? 1 : 0;
+}

@@ -273,6 +273,25 @@ int64_t Emitter::collectionElemSize(const sema::TypeRef* collTy) {
 }
 
 
+// §6.1 / §30.8: extract the builtin type name from a Named TypeRef with no
+// user TypeDecl.  Two shapes are possible:
+//   a) !rt->declaration: the name lives in rt->astNode->name->parts[0].
+//   b) rt->declaration is a builtinClassSym (null decl): name = declaration->name.
+// Returns an empty string_view if the TypeRef is not in either shape.
+std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
+    if (!rt->declaration) {
+        if (rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty())
+            return rt->astNode->name->parts[0];
+        return {};
+    }
+    // builtinClassSym — non-null declaration, null decl (no user TypeDecl).
+    if (!rt->declaration->decl) return rt->declaration->name;
+    return {};
+}
+
+
 bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
@@ -2875,6 +2894,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
+    // §6.1 / §30.8: CancellationToken static properties.
+    // CancellationToken.None is the "never-cancels" sentinel (null ptr).
+    if (cls == "CancellationToken") {
+        if (m == "None" && call.args.empty()) {
+            // CancellationToken.None = null pointer (bz_cancel_state_t* == null).
+            return llvm::ConstantPointerNull::get(ptrTy());
+        }
+    }
+    // §6.1: CancellationTokenSource static methods.
+    // WithCancelAfter(delay) — deferred (needs timer/scheduler infra).
+
     // §2.x: Random class — pseudorandom numbers via libc rand()/srand().
     if (cls == "Random") {
         auto* randFn = module_->getFunction("rand");
@@ -3221,6 +3251,115 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                             llvm::Type::getDoubleTy(llvm_), {ptrTy()});
                         return builder_.CreateCall(fn, {rng});
                     }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // §6.1 / §30.8: CancellationTokenSource instance methods and properties.
+    // The receiver's exprType name-part is "CancellationTokenSource".
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isCTS = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    builtinTypeName(recvTy) == "CancellationTokenSource";
+                if (isCTS) {
+                    llvm::Value* cts = lowerExpr(*ma2->target);
+                    if (!cts) return nullptr;
+                    const auto& mname = ma2->member;
+                    // §6.1: Token property — returns the CancellationToken handle.
+                    if (mname == "Token" && call.args.empty()) {
+                        auto* fn = declareC("bz_cts_token", ptrTy(), {ptrTy()});
+                        return builder_.CreateCall(fn, {cts}, "cts.token");
+                    }
+                    // §6.1: IsCancellationRequested property (convenience mirror).
+                    if (mname == "IsCancellationRequested" && call.args.empty()) {
+                        auto* fn = declareC("bz_cts_is_cancelled", i32(), {ptrTy()});
+                        llvm::Value* flag = builder_.CreateCall(fn, {cts}, "cts.iscancelled");
+                        return builder_.CreateICmpNE(flag, builder_.getInt32(0), "cts.icr");
+                    }
+                    // §6.1: Cancel() — sets the cancellation flag.
+                    if (mname == "Cancel" && call.args.empty()) {
+                        auto* fn = declareC("bz_cts_cancel",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {cts});
+                        return nullptr;  // unit
+                    }
+                    // §6.1: CancelAfter / WithCancelAfter — deferred (needs timer).
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // §6.1 / §30.8: CancellationToken instance methods and properties.
+    // The receiver's exprType name-part is "CancellationToken".
+    // CancellationToken.None is handled in tryLowerStaticCall (member of type name).
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isCT = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    builtinTypeName(recvTy) == "CancellationToken";
+                if (isCT) {
+                    llvm::Value* tok = lowerExpr(*ma2->target);
+                    const auto& mname = ma2->member;
+                    // §6.1: IsCancellationRequested property.
+                    if (mname == "IsCancellationRequested" && call.args.empty()) {
+                        if (!tok) return builder_.getFalse();
+                        auto* fn = declareC("bz_ctoken_is_cancelled", i32(), {ptrTy()});
+                        llvm::Value* flag = builder_.CreateCall(fn, {tok}, "ct.iscancelled");
+                        return builder_.CreateICmpNE(flag, builder_.getInt32(0), "ct.icr");
+                    }
+                    // §6.1: ThrowIfCancellationRequested() — if cancelled, construct
+                    // and throw an OperationCanceledException.  We call the runtime
+                    // predicate (bz_ctoken_throw_if_cancelled → i32) and then emit a
+                    // conditional block that, on true, executes the exception throw.
+                    // This mirrors the index-out-of-range guard (tryLowerIndexExpr).
+                    if (mname == "ThrowIfCancellationRequested" && call.args.empty()) {
+                        if (!tok) return nullptr;  // None — never cancels, no-op
+                        auto* fn = declareC("bz_ctoken_throw_if_cancelled",
+                                            i32(), {ptrTy()});
+                        llvm::Value* flag = builder_.CreateCall(fn, {tok}, "ct.tfcr");
+                        llvm::Value* isCancelled =
+                            builder_.CreateICmpNE(flag, builder_.getInt32(0));
+                        auto* throwBB  = llvm::BasicBlock::Create(llvm_, "ct.throw",
+                                                                   currentFn_);
+                        auto* resumeBB = llvm::BasicBlock::Create(llvm_, "ct.resume",
+                                                                   currentFn_);
+                        builder_.CreateCondBr(isCancelled, throwBB, resumeBB);
+
+                        // throwBB: construct OperationCanceledException and throw.
+                        // emitThrowValue terminates the block (branches to unwindBB),
+                        // so no explicit terminator is needed for throwBB afterward.
+                        builder_.SetInsertPoint(throwBB);
+                        {
+                            auto vit = builtinVtable_.find("OperationCanceledException");
+                            if (vit != builtinVtable_.end()) {
+                                llvm::Value* obj = builder_.CreateCall(
+                                    callocFn(),
+                                    {builder_.getInt64(1), builder_.getInt64(16)},
+                                    "oce.obj");
+                                builder_.CreateStore(vit->second, obj);
+                                emitThrowValue(obj);
+                                // emitThrowValue ends with CreateBr(unwindBB)
+                                // — throwBB is now terminated.
+                            } else {
+                                // Fallback: branch to resumeBB (no vtable available).
+                                builder_.CreateBr(resumeBB);
+                            }
+                        }
+
+                        builder_.SetInsertPoint(resumeBB);
+                        return nullptr;  // unit
+                    }
+                    // §6.1: Register(cb) — deferred.  Needs closure-list infra
+                    // (a per-source list of registered lambdas fired on Cancel()).
+                    // Report: not implemented.
                 }
             }
         }
@@ -4464,6 +4603,25 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
             if (ma->member == "Dispose" && ma->target) {
+                // §6.1 / §30.8: CancellationTokenSource.Dispose() — runs the
+                // source's destructor (cancels surviving token observers, frees
+                // the source object) via bz_cts_dispose.  Recognized by the
+                // receiver's builtin type name "CancellationTokenSource".
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    bool isCTS = recvTy &&
+                        recvTy->kind == sema::TypeRef::Kind::Named &&
+                        builtinTypeName(recvTy) == "CancellationTokenSource";
+                    if (isCTS) {
+                        llvm::Value* recv = lowerExpr(*ma->target);
+                        if (recv && recv->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_cts_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {recv});
+                        }
+                        return nullptr;
+                    }
+                }
                 // per §2.11 / §24.4: disposing a Subscription removes the
                 // handler from its event source. A Subscription is the value
                 // produced by `<event>.Subscribe(...)`; a local bound to such a
