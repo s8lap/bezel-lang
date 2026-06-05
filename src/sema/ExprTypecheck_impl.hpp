@@ -226,6 +226,18 @@ private:
     // so this pass never produces false positives on incomplete typing.
     void checkConditionIsBool(const ast::Expr& cond, std::string_view ctx);
 
+    // §20: type the `if` expression `x if c else y` with the COMMON type
+    // of its two branches and record it on `e`. A branch whose type is
+    // null (a bottom-typed `throw`/diverging expression) imposes no
+    // constraint — the result type is the other branch's. When both
+    // branches have resolved types, the common type is the one the other
+    // widens/subtypes into; if neither converts to the other (e.g. a
+    // primitive vs a class, as in the `throw E if c else x` shape), no
+    // common type exists and a clean §20 type error is reported instead
+    // of letting codegen build an ill-typed PHI and crash. Returns the
+    // common TypeRef (already set on `e`), or null when none exists.
+    void typeConditional(const ast::ConditionalExpr& cnd, const ast::Expr& e);
+
     // Slice S7: diagnose assignment to a readonly field outside the
     // declaring class's constructor. Tracks only the `this.<field>`
     // target shape; `other.f := X` would need cross-object readonly

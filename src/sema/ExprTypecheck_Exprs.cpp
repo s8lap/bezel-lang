@@ -326,18 +326,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             }
         }
     }
-    // §20: the `if` expression `x if c else y` has the common type of
-    // its two branches. Take the then-branch's type, falling back to
-    // the else-branch (e.g. when the then-branch is a bottom-typed
-    // `throw`). Without this the expression is untyped, so member
-    // access on its result (`(a if c else b).M`) fails to resolve.
+    // §20: the `if` expression `x if c else y` has the COMMON type of its
+    // two branches (the type the other branch widens/subtypes into). A
+    // bottom-typed (`throw`) branch imposes no constraint; incompatible
+    // branches (e.g. the `throw E if c else x` shape, which parses as
+    // `throw (E if c else x)`) get a clean §20 error rather than crashing
+    // codegen's PHI. typeConditional records the result type on `e` so
+    // member access on the result (`(a if c else b).M`) resolves.
     if (auto* cnd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
-        TypeRef* tt =
-            cnd->thenValue ? ctx_.exprType(*cnd->thenValue) : nullptr;
-        TypeRef* et =
-            cnd->elseValue ? ctx_.exprType(*cnd->elseValue) : nullptr;
-        if (tt) ctx_.setExprType(&e, tt);
-        else if (et) ctx_.setExprType(&e, et);
+        typeConditional(*cnd, e);
     }
     // §17.4: `is` / `is not` yield bool; `as` yields the nullable form
     // of the target type (a failed cast is null). Recording it lets

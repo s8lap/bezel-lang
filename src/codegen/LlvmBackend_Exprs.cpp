@@ -3231,6 +3231,18 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     llvm::Value* cond = lowerExpr(*c.condition);
     if (!cond) return nullptr;
 
+    // §20 / §5.1: the conditional's result type is the §20 common type of
+    // its branches, which sema records on the expression. The branches may
+    // have different (but common-typed) source types — e.g. `5 if c else
+    // 9L` is an int branch and a long branch whose common type is `long`.
+    // A PHI requires every incoming value to share the PHI's type, so each
+    // branch value is coerced to this result type before the join (in the
+    // branch's own block, so the coerced value dominates its PHI edge).
+    // Without this the i32/i64 mismatch crashes LLVM's PHI verifier.
+    // Same-type branches pass through coerceNumericToType unchanged.
+    llvm::Type* resultTy = nullptr;
+    if (const sema::TypeRef* rt = ctx_.exprType(c)) resultTy = lowerTypeRef(rt);
+
     auto* thenBB = llvm::BasicBlock::Create(llvm_, "cond.then", currentFn_);
     auto* elseBB = llvm::BasicBlock::Create(llvm_, "cond.else", currentFn_);
     auto* endBB = llvm::BasicBlock::Create(llvm_, "cond.end", currentFn_);
@@ -3239,12 +3251,18 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     builder_.SetInsertPoint(thenBB);
     llvm::Value* tv = lowerExpr(*c.thenValue);
     bool thenDiv = diverged_;  // CG40: e.g. `cond ? throw E : b`
+    if (tv && resultTy && !thenDiv)
+        tv = coerceNumericToType(tv, resultTy,
+                                 isUnsignedTargetExpr(*c.thenValue));
     llvm::BasicBlock* thenEnd = builder_.GetInsertBlock();
     if (!thenDiv) builder_.CreateBr(endBB);
 
     builder_.SetInsertPoint(elseBB);
     llvm::Value* ev = lowerExpr(*c.elseValue);
     bool elseDiv = diverged_;
+    if (ev && resultTy && !elseDiv)
+        ev = coerceNumericToType(ev, resultTy,
+                                 isUnsignedTargetExpr(*c.elseValue));
     llvm::BasicBlock* elseEnd = builder_.GetInsertBlock();
     if (!elseDiv) builder_.CreateBr(endBB);
 
@@ -3257,6 +3275,8 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     if (thenDiv && elseDiv) return llvm::PoisonValue::get(tv->getType());
     if (thenDiv) return ev;
     if (elseDiv) return tv;
+    // Both branches reach the join: build the PHI over their (now
+    // common-typed) values.
     llvm::PHINode* phi = builder_.CreatePHI(tv->getType(), 2);
     phi->addIncoming(tv, thenEnd);
     phi->addIncoming(ev, elseEnd);

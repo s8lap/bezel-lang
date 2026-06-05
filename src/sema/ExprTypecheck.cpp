@@ -705,6 +705,78 @@ void ExprTC::checkConditionIsBool(const ast::Expr& cond, std::string_view ctx) {
         " condition must be `bool` (§21.2)");
 }
 
+// §20: type the `if` expression with the COMMON type of its branches.
+// The common type is the one branch's type that the other widens (§5.1)
+// or subtypes (§12) into; a bottom-typed (`throw`/diverging) branch — its
+// type left null — imposes no constraint and the result is the other
+// branch's type. When both branches are typed but neither converts to the
+// other, no common type exists and a clean §20 error is reported. The
+// reporting is conservative (mirroring checkAssignable) so the pass never
+// false-positives while the type lattice is incomplete.
+//
+// This is also what guards the `throw E if c else x` shape — which parses
+// as `throw (E if c else x)` per the grammar (ThrowExpr's operand is a
+// full Expression; §17.12, Appendix A) — where the conditional's arms are
+// an exception value (Named) and a plain value (e.g. a primitive). They
+// have no common type, so codegen never reaches the ill-typed PHI that
+// crashed it; sema rejects the program first.
+void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
+                             const ast::Expr& e) {
+    TypeRef* tt = cnd.thenValue ? ctx_.exprType(*cnd.thenValue) : nullptr;
+    TypeRef* et = cnd.elseValue ? ctx_.exprType(*cnd.elseValue) : nullptr;
+    // A bottom-typed branch leaves its type null: the result is the other
+    // branch's type, with no compatibility constraint. This is the valid
+    // `x if c else throw E` idiom (and its mirror).
+    if (!tt || !et) {
+        if (tt) ctx_.setExprType(&e, tt);
+        else if (et) ctx_.setExprType(&e, et);
+        return;
+    }
+    // An Error-kind branch already produced a diagnostic; don't cascade —
+    // adopt the other branch's type so downstream typing can proceed.
+    if (tt->kind == TypeRef::Kind::Error) { ctx_.setExprType(&e, et); return; }
+    if (et->kind == TypeRef::Kind::Error) { ctx_.setExprType(&e, tt); return; }
+    // `Object` is the common supertype of everything; if one branch is
+    // Object (e.g. an untyped `null`) the common type is Object.
+    auto isObject = [](TypeRef* t) {
+        return t->kind == TypeRef::Kind::Primitive &&
+               t->primitive == PrimitiveType::Object;
+    };
+    if (isObject(tt)) { ctx_.setExprType(&e, tt); return; }
+    if (isObject(et)) { ctx_.setExprType(&e, et); return; }
+    // `from` widens/subtypes into `to` — so `to` is a candidate common type.
+    auto convertsInto = [&](TypeRef* from, TypeRef* to) -> bool {
+        if (from->kind != to->kind) return false;
+        if (from->kind == TypeRef::Kind::Primitive) {
+            if (from->primitive == to->primitive) return true;
+            return primitiveWidens(from->primitive, to->primitive);
+        }
+        if (from->kind == TypeRef::Kind::Named &&
+            from->declaration && to->declaration) {
+            // Defer generics to the variance slice (conservative skip).
+            if (!from->genericArgs.empty() || !to->genericArgs.empty())
+                return true;
+            if (from->declaration == to->declaration) return true;
+            return isSubtype(from->declaration, to->declaration);
+        }
+        // Other kinds (InlineArray/Function/Unit): conservatively treat
+        // same-kind as compatible to avoid false positives.
+        return true;
+    };
+    // The common type is whichever branch the other converts into. Prefer
+    // the then-branch on a tie (equal types / mutual conversion).
+    if (convertsInto(et, tt)) { ctx_.setExprType(&e, tt); return; }
+    if (convertsInto(tt, et)) { ctx_.setExprType(&e, et); return; }
+    // No common type: report and adopt the then-branch type so member
+    // access on the (already-erroneous) result still resolves downstream.
+    ctx_.setExprType(&e, tt);
+    ctx_.diagnostics().report(
+        Severity::Error, cnd.span.begin,
+        "the two branches of an `if` expression have no common type: "
+        "neither branch's type is implicitly convertible to the other "
+        "(§20)");
+}
+
 // Slice S7: diagnose assignment to a readonly field outside the
 // declaring class's constructor. Tracks only the `this.<field>`
 // target shape; `other.f := X` would need cross-object readonly
