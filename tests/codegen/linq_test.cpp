@@ -446,3 +446,180 @@ BEZEL_TEST(linq, first_noarg_int_inferred_spec_5) {
         "  return n; "
         "end Main; end C;"), 42);
 }
+
+// ===========================================================================
+// FINDING [5] / stdlib §5: an EAGER terminal LINQ operator chained DIRECTLY
+// onto a LAZY LINQ result (Select/Where/Concat/TakeWhile/SkipWhile/Zip/...)
+// must enumerate the lazy sequence — not treat it as empty. Before the fix
+// these returned 0/false/garbage because the terminal lowering indexed the
+// lazy enumerator object as if it were a concrete bz_array_t. The fix
+// materializes the lazy pipeline (bz_lazy_to_array) before the array fold.
+// ===========================================================================
+
+// .Select(...).Count() — Count over a lazy projection.
+BEZEL_TEST(linq, lazy_select_then_count_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return a.Select((x: int) => x * 2).Count(); "  // 3 elements
+        "end Main; end C;"), 3);
+}
+
+// .Where(...).Count() — Count over a lazy filter.
+BEZEL_TEST(linq, lazy_where_then_count_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return a.Where((x: int) => x > 1).Count(); "  // {2,3} -> 2
+        "end Main; end C;"), 2);
+}
+
+// .Where(...).Any() — Any over a lazy filter is true when a match exists.
+BEZEL_TEST(linq, lazy_where_then_any_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return int(a.Where((x: int) => x > 1).Any()); "  // true
+        "end Main; end C;"), 1);
+}
+
+// .Where(...).Any() — false when nothing matches the lazy filter.
+BEZEL_TEST(linq, lazy_where_then_any_empty_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return int(a.Where((x: int) => x > 99).Any()); "  // false
+        "end Main; end C;"), 0);
+}
+
+// .Where(...).First() — First over a lazy filter returns the first match.
+BEZEL_TEST(linq, lazy_where_then_first_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return a.Where((x: int) => x > 1).First(); "  // first match = 2
+        "end Main; end C;"), 2);
+}
+
+// .Select(...).Aggregate(seed, fold) — left fold over a lazy projection.
+BEZEL_TEST(linq, lazy_select_then_aggregate_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return a.Select((x: int) => x * 2).Aggregate(0, (acc: int, x: int) => acc + x); "
+        "end Main; end C;"), 12);  // 2+4+6
+}
+
+// .Select(...).Sum() — Sum over a lazy projection (no selector overload).
+BEZEL_TEST(linq, lazy_select_then_sum_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return a.Select((x: int) => x * 2).Sum(); "  // 2+4+6 = 12
+        "end Main; end C;"), 12);
+}
+
+// .TakeWhile(...).Aggregate(...) — terminal over a lazy slice.
+BEZEL_TEST(linq, lazy_takewhile_then_aggregate_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(5); a.Add(3); "
+        "  return a.TakeWhile((x: int) => x < 5).Aggregate(0, (acc: int, x: int) => acc + x); "
+        "end Main; end C;"), 3);  // {1,2} -> 1+2 = 3 (stops at 5)
+}
+
+// a.Zip(b, *).Aggregate(...) — Zip is lazy; Aggregate folds the combined seq.
+BEZEL_TEST(linq, lazy_zip_then_aggregate_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  using var b := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  b.Add(10); b.Add(20); b.Add(30); "
+        "  return a.Zip(b, (x: int, y: int) => x * y)"
+        "          .Aggregate(0, (acc: int, p: int) => acc + p); "
+        "end Main; end C;"), 140);  // 10 + 40 + 90 = 140
+}
+
+// Chained lazy then terminal: Where().Select().Count().
+BEZEL_TEST(linq, lazy_where_select_then_count_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  return a.Where((x: int) => x mod 2 = 0).Select((x: int) => x * 10).Count(); "
+        "end Main; end C;"), 2);  // {2,4} -> {20,40} -> 2
+}
+
+// .Concat(...).Sum() — terminal over a lazy concatenation.
+BEZEL_TEST(linq, lazy_concat_then_sum_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  using var b := new Array<int>(); "
+        "  a.Add(1); a.Add(2); "
+        "  b.Add(3); b.Add(4); "
+        "  return a.Concat(b).Sum(); "  // 1+2+3+4 = 10
+        "end Main; end C;"), 10);
+}
+
+// .Where(...).All(pred) — All over a lazy filter (every survivor satisfies it).
+BEZEL_TEST(linq, lazy_where_then_all_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  return int(a.Where((x: int) => x > 1).All((x: int) => x > 1)); "  // true
+        "end Main; end C;"), 1);
+}
+
+// .Where(...).Count(pred) — Count(pred) over a lazy filter.
+BEZEL_TEST(linq, lazy_where_then_count_pred_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  return a.Where((x: int) => x > 1).Count((x: int) => x mod 2 = 0); "  // {2,3,4} even -> {2,4} -> 2
+        "end Main; end C;"), 2);
+}
+
+// CONTROL: terminal on a concrete array is unchanged (Aggregate over Array).
+BEZEL_TEST(linq, control_concrete_aggregate_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  return a.Aggregate(0, (acc: int, x: int) => acc + x); "  // 6
+        "end Main; end C;"), 6);
+}
+
+// CONTROL: lazy materialized to array first (ToArray) is unchanged.
+BEZEL_TEST(linq, control_lazy_toarray_length_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  using var m: Array<int> := a.Select((x: int) => x * 2).ToArray(); "
+        "  return m.Length; "  // 3
+        "end Main; end C;"), 3);
+}
+
+// CONTROL: for-loop over a lazy pipeline is unchanged.
+BEZEL_TEST(linq, control_for_over_lazy_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var s := 0; "
+        "  for var x in a.Select((x: int) => x * 2) do s := s + x; end; "
+        "  return s; "  // 2+4+6 = 12
+        "end Main; end C;"), 12);
+}
