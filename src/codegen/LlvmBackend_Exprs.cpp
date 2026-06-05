@@ -299,7 +299,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // never consumed (the block does not reach any join).
     if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
         llvm::Value* exc = th->operand ? lowerExpr(*th->operand) : nullptr;
-        emitThrowValue(exc);
+        // #397: pass the AST so emitThrowValue can detect a direct re-throw
+        // `throw ex` in expression position (the one case that must not free
+        // the caught exception — see emitThrowValue for the full rationale).
+        emitThrowValue(exc, th->operand.get());
         diverged_ = true;
         return llvm::PoisonValue::get(ptrTy());
     }

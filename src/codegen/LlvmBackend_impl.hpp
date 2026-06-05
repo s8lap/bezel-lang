@@ -408,10 +408,10 @@ private:
     // CG20: the exception value caught by the enclosing catch arm, so a
     // bare `throw;` can re-raise it (the global was cleared on arm entry).
     llvm::Value* currentCaughtExc_ = nullptr;
-    // #387 / §31.1: the name the enclosing catch arm binds the caught
-    // exception to ("" for a bare-type arm with no binding). Used to decide
-    // whether a `throw <newExpr>` leaving the arm provably cannot reference
-    // the caught exception (see emitThrowValue / exprReferencesName).
+    // #397 / §31.1: the name the enclosing catch arm binds the caught
+    // exception to ("" for a bare-type arm with no binding). Used by
+    // emitThrowValue to detect a direct re-throw `throw ex;` (the one case
+    // that must not free the caught exception when throwing from the arm).
     std::string_view currentCaughtName_;
     // CG40: set true by lowering a `throw` expression (§31.2) — the
     // expression diverges (branches to the unwind target), leaving the
@@ -1437,13 +1437,6 @@ private:
     void emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst = nullptr);
 
     // #387 / §31.1: does `e` syntactically reference an identifier named
-    // `name` anywhere in its subtree? Fail-safe: an expression shape this
-    // walker does not recurse into returns `true` ("might reference"), so an
-    // unrecognized form never causes the caught exception to be freed — the
-    // conservative direction (a leak, never a use-after-free). Used to decide
-    // whether a `throw <newExpr>` from a catch arm can free the caught object.
-    bool exprReferencesName(const ast::Expr& e, std::string_view name) const;
-
     // CG22: if `cond` (i1, true = error) holds, throw `name`; otherwise
     // continue. Splits the current block.
     void emitGuardThrow(llvm::Value* cond, const char* name);
