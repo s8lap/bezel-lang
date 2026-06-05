@@ -420,19 +420,63 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!ps) return nullptr;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return nullptr;
-    // Find a getter accessor body.
+    // Find a getter accessor body. The getter is either an expression body
+    // (`property [i]: T => expr;` or `get => expr;`) or a BLOCK body
+    // (`get => do … end;`, §23.4). A block body may contain a `return`, so it
+    // must be lowered as a standalone function (§22.9) rather than inlined into
+    // the caller — see ensureIndexerBlockGetter.
     const ast::Expr* getterExpr = nullptr;
-    const std::vector<std::unique_ptr<ast::Stmt>>* getterStmts = nullptr;
+    const ast::PropertyAccessor* getterBlock = nullptr;
     if (pd->bodyKind == ast::PropertyBodyKind::Expression && pd->exprBody)
         getterExpr = pd->exprBody.get();
     for (const auto& a : pd->accessors) {
         if (!a.isSet) {
-            if (a.exprBody) getterExpr = a.exprBody.get();
-            else if (!a.stmts.empty()) getterStmts = &a.stmts;
+            if (a.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                getterBlock = &a;
+            else if (a.exprBody)
+                getterExpr = a.exprBody.get();
             break;
         }
     }
-    if (!getterExpr && !getterStmts) return nullptr;
+    if (!getterExpr && !getterBlock) return nullptr;
+
+    // --- Block-form getter: emit/call a standalone getter function. ---
+    // §23.4 / §22.9 / §9.4: the body's `return` must terminate only the getter,
+    // and the (possibly record/aggregate) result flows back by value through the
+    // function's declared return type — exactly as a record-returning method
+    // does. Inlining the block would (a) discard the value and (b) ret out of
+    // the enclosing method with the wrong type.
+    if (getterBlock) {
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj) return nullptr;
+        // §9.2: a record receiver is a by-value struct; spill it and pass the
+        // address (the getter takes `this` as a pointer), mirroring the
+        // block-form property-getter call path.
+        if (!obj->getType()->isPointerTy()) {
+            llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+            builder_.CreateStore(obj, tmp);
+            obj = tmp;
+        }
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(obj);
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix.indices.size(); ++k) {
+            if (!ix.indices[k].value) return nullptr;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) return nullptr;
+            callArgs.push_back(argVal);
+        }
+        llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
+        llvm::Value* res =
+            builder_.CreateCall(fn->getFunctionType(), fn, callArgs);
+        // §31.1/§31.2: a throw inside the standalone getter leaves the pending
+        // exception set and returns; route it to the enclosing unwind target,
+        // exactly as an ordinary method call does.
+        emitPendingCheck();
+        return res;
+    }
+
+    // --- Expression-bodied getter: inline the body against `this`+params. ---
     // Bind `this` to the target object and indexer params to the args.
     llvm::Value* obj = lowerExpr(*ix.target);
     if (!obj) return nullptr;
@@ -452,9 +496,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         builder_.CreateStore(argVal, slot);
         paramSlots_[ps->indexerParams[k]] = slot;
     }
-    llvm::Value* result = nullptr;
-    if (getterExpr) result = lowerExpr(*getterExpr);
-    else { lowerScopedBlock(*getterStmts); }
+    llvm::Value* result = lowerExpr(*getterExpr);
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -603,6 +645,110 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     currentCaughtExc_   = nullptr;
     unwindScopeDepth_   = 0;
     diverged_           = false;
+
+    // --- Emit body ---
+    lowerScopedBlock(acc->stmts);
+    if (!builder_.GetInsertBlock()->getTerminator())
+        emitImplicitReturn(fn);
+
+    // --- Restore state ---
+    currentFn_          = savedFn;
+    currentThis_        = savedThis;
+    locals_             = std::move(savedLocals);
+    paramSlots_         = std::move(savedParams);
+    refParams_          = std::move(savedRef);
+    disposeStack_       = std::move(savedDispose);
+    loopStack_          = std::move(savedLoop);
+    unwindTarget_       = savedUnwind;
+    propagateBB_        = savedProp;
+    currentCaughtExc_   = savedCaught;
+    unwindScopeDepth_   = savedUD;
+    diverged_           = savedDiv;
+    genericSubst_       = std::move(savedGSubst);
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
+
+    return fn;
+}
+
+
+// §23.4 / §22.9: emit a standalone function for a BLOCK-form indexer getter
+// (`property [i: …]: T get => do…end;`). Mirrors ensurePropertyBlockGetter but
+// the signature carries the index parameters after `this`, and the body binds
+// each index param to a spilled stack slot so the getter body's identifier
+// reads resolve them. Emitting the getter as its own function (rather than
+// inlining the block into the caller) is required for any block getter — the
+// `return` inside the body must terminate only the getter, not the enclosing
+// method — and it lets a record (aggregate) result flow back by value through
+// the function's declared return type (§9.4), the same path the block-form
+// property getter and a record-returning method use.
+llvm::Function* Emitter::ensureIndexerBlockGetter(
+    const ast::PropertyDecl* pd, const ast::PropertyAccessor* acc,
+    const sema::PropertySymbol* ps) {
+    auto it = propBlockGetterFns_.find(pd);
+    if (it != propBlockGetterFns_.end()) return it->second;
+
+    llvm::Type* retTy = lowerType(pd->type.get());
+    if (!retTy) retTy = i32();
+
+    // Signature: (this, idx0, idx1, …). The index params take their declared
+    // (lowered) types; an absent/unlowerable type falls back to i32.
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());                     // `this`
+    for (const auto& p : pd->indexerParams) {
+        llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+        paramTys.push_back(pt ? pt : i32());
+    }
+
+    auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, "bz$indexer$get", *module_);
+    propBlockGetterFns_[pd] = fn;
+
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+
+    // --- Save entire emitter state ---
+    auto* savedFn        = currentFn_;
+    auto  savedBB        = builder_.GetInsertBlock();
+    auto  savedBBOffset  = savedBB ? builder_.GetInsertPoint() : decltype(savedBB->begin()){};
+    auto* savedThis      = currentThis_;
+    auto  savedLocals    = locals_;
+    auto  savedParams    = paramSlots_;
+    auto  savedRef       = refParams_;
+    auto  savedDispose   = disposeStack_;
+    auto  savedLoop      = loopStack_;
+    auto* savedUnwind    = unwindTarget_;
+    auto* savedProp      = propagateBB_;
+    auto* savedCaught    = currentCaughtExc_;
+    auto  savedUD        = unwindScopeDepth_;
+    auto  savedDiv       = diverged_;
+    auto  savedGSubst    = genericSubst_;
+
+    // --- Switch into the getter function ---
+    currentFn_          = fn;
+    builder_.SetInsertPoint(entryBB);
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    disposeStack_.clear();
+    loopStack_.clear(); finallyStack_.clear();
+    unwindTarget_       = nullptr;
+    propagateBB_        = nullptr;
+    currentCaughtExc_   = nullptr;
+    unwindScopeDepth_   = 0;
+    diverged_           = false;
+
+    // arg 0 is `this`; args 1.. are the index params. Spill each index param to
+    // a stack slot so localSlot() resolves the body's identifier reads.
+    auto argIt = fn->args().begin();
+    currentThis_ = &*argIt;
+    ++argIt;
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         argIt != fn->args().end(); ++k, ++argIt) {
+        llvm::Argument& a = *argIt;
+        llvm::AllocaInst* slot = entryAlloca(a.getType());
+        builder_.CreateStore(&a, slot);
+        paramSlots_[ps->indexerParams[k]] = slot;
+    }
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
