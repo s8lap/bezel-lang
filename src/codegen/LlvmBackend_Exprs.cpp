@@ -795,8 +795,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
                 if (id->name == "Math") {
-                    if (ma->member == "PI") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
+                    // §2.2: spec constants Pi / E / Tau. `PI` (uppercase) is a
+                    // legacy spelling kept for the existing intrinsic test.
+                    if (ma->member == "Pi" || ma->member == "PI")
+                        return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
                     if (ma->member == "E")  return llvm::ConstantFP::get(dbl, 2.71828182845904523536);
+                    if (ma->member == "Tau") return llvm::ConstantFP::get(dbl, 6.28318530717958647692);
                 }
                 if (id->name == "Environment") {
                     // §2.3: Environment static properties.

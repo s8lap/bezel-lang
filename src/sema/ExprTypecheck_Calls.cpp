@@ -2022,12 +2022,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 else if (m=="ToInt64") setLong();
                 else if (m=="ToDouble"||m=="Sqrt"||m=="Pow"||m=="Log"||m=="Log2"||m=="Log10"||
                          m=="Ceiling"||m=="Floor"||m=="Round"||m=="Truncate"||
-                         m=="PI"||m=="E"||
+                         // §2.2: the spec constants are `Pi`, `E`, `Tau` (the
+                         // legacy `PI` spelling is retained for the existing
+                         // intrinsic-path test but is not a spec name).
+                         m=="Pi"||m=="PI"||m=="E"||m=="Tau"||
                          m=="Fmod"||m=="IEEERemainder"||m=="Sin"||m=="Cos"||m=="Tan"||
                          m=="Asin"||m=="Acos"||m=="Atan"||m=="Atan2"||m=="Exp"||m=="Hypot"||
                          m=="Sinh"||m=="Cosh"||m=="Tanh") setDbl();
                 // Min/Max/Clamp are overloaded (int or double) — leave untyped.
                 else if (m=="ToBoolean") setBool();
+                // §2.3: Convert.TryToInt32(value, out result): bool.
+                else if (m=="TryToInt32") setBool();
                 else if (m=="ToString") setStr();
             }
             // Console input methods.
