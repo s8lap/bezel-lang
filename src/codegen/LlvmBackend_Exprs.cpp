@@ -2126,6 +2126,14 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             if (llvm::Value* moved = lowerMoveFromCollectionSlot(*ix))
                 return moved;
 
+    // §30.2: `await <task>` — the async suspend point. Handled here, before the
+    // generic operand lowering, because the await owns its operand evaluation
+    // (lower the task, fast-path or suspend, then read the result). Only valid
+    // inside an async state machine (smKind_ == Await); sema rejects `await`
+    // elsewhere, so the guard inside lowerAwait is defensive.
+    if (un.op == "await")
+        return lowerAwait(un);
+
     llvm::Value* v = lowerExpr(*un.operand);
     if (!v) return nullptr;
     const auto& op = un.op;

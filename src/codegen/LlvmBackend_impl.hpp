@@ -1952,6 +1952,67 @@ private:
     void emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                              const CallableInfo& ci);
 
+    // §30.1: a method carrying the `async` modifier (mirrors isStaticMethod).
+    static bool isAsyncMethod(sema::MethodSymbol* ms) {
+        for (auto mod : ms->modifiers)
+            if (mod == "async") return true;
+        return false;
+    }
+
+    // §30.2: detect whether a block of statements contains an `await`. Used to
+    // decide if an async method needs a real suspending state machine, or can
+    // complete synchronously (no await → run-to-completion fast emit). Recurses
+    // into compound statements and into expressions (await is an expression).
+    static bool containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+    static bool exprContainsAwait(const ast::Expr* e);
+
+    // §30.2 deferred tail: detect an `await` that appears inside a loop body
+    // (for / while) or while-condition. The flat resume model breaks SSA
+    // dominance across a loop back-edge, so await-in-loop is deferred; the
+    // emitter rejects it with a diagnostic + safe stub. `inLoop` is true once
+    // recursion has entered a loop body.
+    static bool awaitInLoop(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+                            bool inLoop);
+
+    // §30.1 / §30.2: emit an `async` method (one returning Task / Task<T> /
+    // OwnedTask<T>; the async-iterator forms — async + yield — are deferred).
+    // Mirrors emitIteratorMethod with smKind_ == Await. Layers the task-driver
+    // shape on the kind-agnostic suspend/resume scaffolding:
+    //   - State frame: { ptr vtable, i32 state, captures..., locals...,
+    //                    ptr outerTask, ptr pendingTask }
+    //   - The original function becomes the ENTRY: bz_task_alloc the outer task,
+    //     calloc the frame, store captures + outer task, invoke Resume once
+    //     (the already-done fast path lets a sync-completable body finish
+    //     inline), and return the outer task pointer.
+    //   - A Resume(void* completedTask, void* frame) continuation (matching the
+    //     bz_task_then ABI) restores captures and runs the resume dispatch; each
+    //     `await` suspend point registers Resume on the awaited task and returns;
+    //     `return e;` completes the outer task (bz_task_complete) and returns.
+    void emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
+                         const CallableInfo& ci);
+
+    // §30.1 / §30.9: complete the in-flight async method's outer task with the
+    // given lowered return value (null for `Task` / fall-off / `return;`). Reads
+    // the outer-task pointer from the frame and calls bz_task_complete. Requires
+    // the sm*_ async state to be live (smKind_ == Await).
+    void emitAsyncComplete(llvm::Value* value);
+
+    // §30.2 deferred tail: emit a well-formed but inert async-method entry for a
+    // body whose codegen is deferred (await-in-loop), after the diagnostic has
+    // failed the compile. Keeps emitted IR valid without lowering the body.
+    void emitAsyncStub(sema::MethodSymbol* ms, llvm::Function* fn,
+                       const CallableInfo& ci);
+
+    // §30.2: lower an `await <task>` suspend point (smKind_ == Await). Emits the
+    // already-done fast path inline and, on the slow path, spills suspend-locals,
+    // registers the Resume continuation on the awaited task, returns from the
+    // resume fn, and resumes at the next state block. Returns the awaited
+    // result value (an int/value/string for Task<T>/OwnedTask<T>; a null
+    // placeholder for `await Task` which yields unit). Returns nullptr if the
+    // enclosing function is not an async state machine (so the await falls
+    // through to the normal nullptr — a defensive guard, not a normal path).
+    llvm::Value* lowerAwait(const ast::UnaryExpr& un);
+
     // ---- Live suspend/resume state for the in-flight MoveNext / resume fn ----
     // Kind-agnostic frame state. The per-suspend-point spill/restore
     // (lowerStmt's YieldStmt handler, and — for 2b — the await lowering) reads
@@ -1972,6 +2033,21 @@ private:
     // ---- Yield-specific live state (used only when smKind_ == Yield) ----
     unsigned iterCurrentValField_ = 0;
     llvm::Type* iterElemTy_ = nullptr;
+
+    // ---- Async-specific live state (used only when smKind_ == Await) ----
+    // Frame field indices for the two trailing async slots (see emitAsyncMethod):
+    //   asyncOuterTaskField_   — the Task this method returns / completes.
+    //   asyncPendingTaskField_ — the task currently being awaited (set at the
+    //                            suspend point so the resume can read its result).
+    unsigned asyncOuterTaskField_ = 0;
+    unsigned asyncPendingTaskField_ = 0;
+    // The async resume function (the bz_task_then continuation). The await
+    // suspend point registers this on the awaited task.
+    llvm::Function* asyncResumeFn_ = nullptr;
+    // The async method's result element type T (Task<T>/OwnedTask<T>), or null
+    // for a `Task` (no value). Used to size bz_task_complete's result buffer and
+    // to type the value read back at the await site.
+    llvm::Type* asyncResultTy_ = nullptr;
 
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);

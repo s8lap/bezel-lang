@@ -151,6 +151,7 @@ set(BEZEL_TEST_SOURCES
     codegen/control_flow_test.cpp
     codegen/static_call_test.cpp
     codegen/native_exe_test.cpp
+    codegen/async_test.cpp
     codegen/instances_test.cpp
     codegen/instance_methods_test.cpp
     codegen/constructors_test.cpp
