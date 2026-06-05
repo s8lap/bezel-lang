@@ -438,7 +438,7 @@ void Emitter::declareFunctions() {
     }
 
     // CG13 / §28.2: declare, for every class, the public idempotent Dispose
-    // `void(this)` (vtable slot 1) AND an unguarded "DisposeCore" that runs the
+    // `void(this)` (vtable slot 2, CG35-itable) AND an unguarded "DisposeCore" that runs the
     // destructor + owned-field auto-disposal + base-core chain. The public
     // Dispose flag-guards a single call to its core (run-once, §28.6); the base
     // chain (§28.4 step 3) targets the base CORE so the per-object flag — set
@@ -505,7 +505,7 @@ void Emitter::declareFunctions() {
     // disposal-registration and disposal-emit gates both consult disposerFns_)
     // and discharged at scope end. The registered function is only a membership
     // gate + a linkable declaration: the actual scope-end disposal dispatches
-    // DYNAMICALLY through the object's vtable slot 1 (emitDisposeAndReclaim),
+    // DYNAMICALLY through the object's vtable slot 2 (emitDisposeAndReclaim),
     // which the imported vtable (installed by bz$<Type>$init) routes to the
     // exporter's real Dispose — so the destructor runs cross-module exactly once.
     // Imported entries are NEVER emitted a body (the run() loop skips imported
@@ -616,10 +616,9 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
         slots = vtableMethods_[base];
         nameSlot = vtableNameSlot_[base];
     }
-    // Vtable: [0]=descriptor, [1]=Dispose, [2..2+G)=interface-method
-    // slots, [2+G..]=virtual methods. So a virtual method's slot is its
-    // position in `slots` + (2 + G).
-    const unsigned base = 2 + ifaceSlotCount_;
+    // Vtable (CG35-itable): [0]=td$C, [1]=itmap$C, [2]=Dispose, [3..]=virtual
+    // methods. So a virtual method's slot is its position in `slots` + 3.
+    const unsigned base = 3;
     for (sema::Symbol* m : t->members) {
         auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
         if (!ms || isStaticMethod(ms) || !isVirtual(ms)) continue;
@@ -640,15 +639,20 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
 
 
 void Emitter::declareVtables() {
-    // Pass 0 (CG35): assign each interface method a fixed vtable slot in
-    // [2, 2+G), shared across all implementers.
+    // Pass 0 (CG35-itable): assign each interface method its 0-based position
+    // within that interface's non-static method declaration order. This index
+    // (ifaceMethodIndex_[ms]) is used to GEP into the per-(class×interface)
+    // itable array at dispatch time. The old dense shared slot region
+    // (ifaceMethodSlot_ / ifaceSlotCount_) is gone; each interface now has its
+    // own per-pair itable, looked up at runtime via bz_itable_lookup.
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts || ts->kind != ast::TypeDeclKind::Interface) continue;
+        unsigned idx = 0;
         for (sema::Symbol* m : ts->members) {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
             if (ms && !isStaticMethod(ms))
-                ifaceMethodSlot_[ms] = 2 + ifaceSlotCount_++;
+                ifaceMethodIndex_[ms] = idx++;
         }
     }
     // Pass A: assign vtable slots for all classes (base-first).
@@ -760,41 +764,87 @@ void Emitter::declareVtables() {
         descArray_[ts]->setInitializer(
             llvm::ConstantArray::get(arrTy, elems));
     }
-    // Pass D: build each class's vtable global.
+    // Pass D: build per-interface itables (itab$C$I), itmaps (itmap$C), and
+    // each class's vtable global. New layout (CG35-itable, §13):
+    //   [0]=td$C, [1]=itmap$C, [2]=Dispose, [3..]=virtual methods.
+    // The dense shared slot region (ifaceMethodSlot_/ifaceSlotCount_) is gone.
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+
+        // Collect the interfaces that C (transitively) implements. For each
+        // interface I, build itab$C$I: an array of fn-ptrs in I's non-static
+        // method declaration order. Then assemble itmap$C.
+        std::vector<const sema::TypeSymbol*> supers;
+        collectTypeAndBases(ts, supers);
+
+        std::vector<llvm::Constant*> itmapElems;  // [td$I, itab$C$I, ..., null]
+        for (const sema::TypeSymbol* iface : supers) {
+            if (iface->kind != ast::TypeDeclKind::Interface) continue;
+
+            // Collect iface's non-static methods in declaration order.
+            std::vector<sema::MethodSymbol*> ifaceMethods;
+            for (sema::Symbol* m : iface->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && !isStaticMethod(ms)) ifaceMethods.push_back(ms);
+            }
+            if (ifaceMethods.empty()) continue;  // skip empty interfaces
+
+            // Build itab$C$I: array of function pointers (C's impl of each
+            // method of I, in I's declaration order). Missing impls → null.
+            std::vector<llvm::Constant*> itabElems;
+            for (sema::MethodSymbol* im : ifaceMethods) {
+                llvm::Constant* fp = llvm::ConstantPointerNull::get(ptrTy());
+                if (sema::MethodSymbol* impl = findMethodByName(ts, im->name)) {
+                    auto mit = methodFns_.find(impl);
+                    if (mit != methodFns_.end())
+                        fp = llvm::cast<llvm::Constant>(mit->second);
+                }
+                itabElems.push_back(fp);
+            }
+            auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
+            auto* itabGV = new llvm::GlobalVariable(
+                *module_, itabArrTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantArray::get(itabArrTy, itabElems),
+                "itab$" + std::string(ts->name) + "$" +
+                    std::string(iface->name));
+            itables_[{ts, iface}] = itabGV;
+
+            // Append td$I and itab$C$I to the itmap pair list.
+            auto dit2 = descArray_.find(iface);
+            if (dit2 != descArray_.end()) {
+                itmapElems.push_back(
+                    llvm::cast<llvm::Constant>(dit2->second));
+                itmapElems.push_back(
+                    llvm::ConstantExpr::getPointerCast(itabGV, ptrTy()));
+            }
+        }
+        // Null terminator.
+        itmapElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+        auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), itmapElems.size());
+        auto* itmapGV = new llvm::GlobalVariable(
+            *module_, itmapArrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(itmapArrTy, itmapElems),
+            "itmap$" + std::string(ts->name));
+        itmaps_[ts] = itmapGV;
+
+        // Build vtable: [0]=td$C, [1]=itmap$C, [2]=Dispose, [3..]=virtuals.
         const auto& slots = vtableMethods_[ts];
-        // [0] descriptor, [1] Dispose, [2..2+G) interface slots,
-        // [2+G..] virtual methods.
-        std::vector<llvm::Constant*> elems(2 + ifaceSlotCount_ +
-                                               slots.size(),
+        std::vector<llvm::Constant*> elems(3 + slots.size(),
                                            llvm::ConstantPointerNull::get(
                                                ptrTy()));
         elems[0] = descArray_[ts];
+        elems[1] = llvm::ConstantExpr::getPointerCast(itmapGV, ptrTy());
         auto dit = disposerFns_.find(ts);
         if (dit != disposerFns_.end())
-            elems[1] = llvm::cast<llvm::Constant>(dit->second);
-        // CG35: fill the interface-method slots this class implements.
-        std::vector<const sema::TypeSymbol*> supers;
-        collectTypeAndBases(ts, supers);
-        std::unordered_set<const sema::TypeSymbol*> superSet(supers.begin(),
-                                                            supers.end());
-        for (const auto& [im, slot] : ifaceMethodSlot_) {
-            if (!im->parent || !superSet.count(im->parent)) continue;
-            if (sema::MethodSymbol* impl =
-                    findMethodByName(ts, im->name)) {
-                auto mit = methodFns_.find(impl);
-                if (mit != methodFns_.end())
-                    elems[slot] = llvm::cast<llvm::Constant>(mit->second);
-            }
-        }
-        // Virtual methods at [2+G..].
+            elems[2] = llvm::cast<llvm::Constant>(dit->second);
+        // Virtual methods at [3..].
         for (std::size_t i = 0; i < slots.size(); ++i) {
             auto mit = methodFns_.find(slots[i]);
             if (mit != methodFns_.end())
-                elems[2 + ifaceSlotCount_ + i] =
-                    llvm::cast<llvm::Constant>(mit->second);
+                elems[3 + i] = llvm::cast<llvm::Constant>(mit->second);
         }
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         auto* init = llvm::ConstantArray::get(arrTy, elems);
@@ -911,10 +961,24 @@ void Emitter::setupBuiltinExceptions() {
         builtinDesc_[name]->setInitializer(
             llvm::ConstantArray::get(arrTy, elems));
     }
-    // Pass 3: vtable per built-in = [descriptor, Dispose].
+    // Pass 3: vtable per built-in = [descriptor, itmap (null=empty), Dispose].
+    // Built-in exceptions implement no user interfaces, so the itmap is a
+    // single-null array. Layout matches the new CG35-itable class vtable prefix:
+    //   [0]=td, [1]=itmap (null-terminated, empty), [2]=Dispose.
+    // A common empty itmap (just a null ptr) is shared across all builtins.
+    auto* emptyItmapTy = llvm::ArrayType::get(ptrTy(), 1);
+    auto* emptyItmap = new llvm::GlobalVariable(
+        *module_, emptyItmapTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(emptyItmapTy,
+                                 {llvm::ConstantPointerNull::get(ptrTy())}),
+        "itmap$bz$empty");
     for (const auto& [name, par] : hier) {
-        std::vector<llvm::Constant*> v = {builtinDesc_[name],
-                                          builtinDisposeFn_};
+        std::vector<llvm::Constant*> v = {
+            builtinDesc_[name],
+            llvm::ConstantExpr::getPointerCast(emptyItmap, ptrTy()),
+            builtinDisposeFn_
+        };
         auto* arrTy = llvm::ArrayType::get(ptrTy(), v.size());
         builtinVtable_[name] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
@@ -1181,7 +1245,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // It has no user TypeSymbol (so isOwnedReferenceField rejects it),
             // but it is an ordinary owned heap class instance and is disposed
             // through the same dynamic-dispatch path as a class field below
-            // (vtable slot 1 is the shared no-op bz$exDispose; the block is
+            // (vtable slot 2 is the shared no-op bz$exDispose; the block is
             // reclaimed, the runtime-managed message string is not freed).
             owned.push_back({fs, nullptr});
         } else if (const sema::TypeRef* ct = ownedCollectionFieldType(fs)) {
@@ -1339,7 +1403,7 @@ llvm::Function* Emitter::emitSpecializedDisposer(const sema::TypeSymbol* ts,
 
 // §28.5: the per-instantiation vtable to install in a freshly-constructed
 // instance of the active monomorphization of `ts`, in place of the shared
-// `vt$<T>`. Identical to the shared vtable except slot 1 (Dispose) is a
+// `vt$<T>`. Identical to the shared vtable except slot 2 (Dispose) is a
 // specialized disposer that classifies and disposes the class's owned type-
 // parameter field(s) using the active substitution. Falls back to the shared
 // vtable when the class needs no specialization. Cached per (class, spec field
@@ -1366,10 +1430,10 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     if (sit != specMap.end()) return sit->second;
 
     // Build the specialized disposer for THIS instantiation, then clone the
-    // shared vtable's initializer with slot 1 replaced by it. The shared vtable
-    // already has its full initializer (built in declareVtables, before bodies),
-    // so every other slot (descriptor, interface slots, virtual methods) carries
-    // over unchanged.
+    // shared vtable's initializer with slot 2 (Dispose) replaced by it. The
+    // shared vtable already has its full initializer (built in declareVtables,
+    // before bodies), so every other slot (descriptor, itmap, virtual methods)
+    // carries over unchanged.
     std::string suffix = "$spec" + std::to_string(specMap.size());
     llvm::Function* specDispose = emitSpecializedDisposer(ts, suffix);
 
@@ -1379,7 +1443,7 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     elems.reserve(arrTy->getNumElements());
     for (unsigned i = 0; i < arrTy->getNumElements(); ++i)
         elems.push_back(sharedInit->getAggregateElement(i));
-    elems[1] = llvm::cast<llvm::Constant>(specDispose);  // slot 1 = Dispose
+    elems[2] = llvm::cast<llvm::Constant>(specDispose);  // slot 2 = Dispose
     auto* init = llvm::ConstantArray::get(arrTy, elems);
     auto* gv = new llvm::GlobalVariable(
         *module_, arrTy, /*isConstant=*/true,
@@ -1492,7 +1556,7 @@ void Emitter::emitNewPendingCheck(llvm::Value* obj) {
 
 void Emitter::emitDynamicDispose(llvm::Value* obj) {
     // §28.2 / §28.4: dispatch the object's PUBLIC, idempotent Dispose through
-    // its vtable (slot 1) — which runs the destructor body, owned-field
+    // its vtable (slot 2, CG35-itable) — which runs the destructor body, owned-field
     // disposals and the full base chain, AT MOST ONCE per object (the run-once
     // flag, §28.6). This does NOT free the object's heap block.
     //
@@ -1504,10 +1568,10 @@ void Emitter::emitDynamicDispose(llvm::Value* obj) {
     // dispatch's vtable load would read freed memory (use-after-free) regardless
     // of any flag. Splitting "dispatch" (idempotent, repeatable) from "reclaim"
     // (done once, by the owning slot's auto-dispose) keeps repeated disposal
-    // safe. vtable layout: [0]=type descriptor, [1]=Dispose, [2+]=methods.
+    // safe. vtable layout (CG35-itable): [0]=td$, [1]=itmap$, [2]=Dispose, [3+]=virtuals.
     llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
     llvm::Value* slot = builder_.CreateGEP(ptrTy(), vptr,
-                                           {builder_.getInt32(1)});
+                                           {builder_.getInt32(2)});
     llvm::Value* disposeFn = builder_.CreateLoad(ptrTy(), slot);
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
@@ -1531,9 +1595,9 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
 
 llvm::Function* Emitter::elementDisposerThunk() {
     // #362 / stdlib §4.5: a standalone `void(void*)` thunk that runs an owning
-    // collection element's destructor via the element's own vtable (slot 1),
-    // skipping a null element. Built once with its own IRBuilder so the active
-    // `builder_` insert point is untouched.
+    // collection element's destructor via the element's own vtable (slot 2,
+    // CG35-itable), skipping a null element. Built once with its own IRBuilder
+    // so the active `builder_` insert point is untouched.
     if (elementDisposerThunk_) return elementDisposerThunk_;
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
@@ -1549,9 +1613,9 @@ llvm::Function* Emitter::elementDisposerThunk() {
         obj, llvm::ConstantPointerNull::get(ptrTy()));
     b.CreateCondBr(isNull, retBB, dispBB);
     b.SetInsertPoint(dispBB);
-    // vtable layout: [0]=descriptor, [1]=Dispose. Dispatch through the element.
+    // vtable layout (CG35-itable): [0]=td$, [1]=itmap$, [2]=Dispose.
     llvm::Value* vptr = b.CreateLoad(ptrTy(), obj);
-    llvm::Value* slot = b.CreateGEP(ptrTy(), vptr, {b.getInt32(1)});
+    llvm::Value* slot = b.CreateGEP(ptrTy(), vptr, {b.getInt32(2)});
     llvm::Value* disposeFn = b.CreateLoad(ptrTy(), slot);
     auto* dispTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                            {ptrTy()}, /*isVarArg=*/false);
@@ -1602,7 +1666,7 @@ llvm::Function* Emitter::owningDictValueDisposer(const sema::TypeRef* dictTy) {
     // backing table and its key bytes are freed. The owned thing is the VALUE
     // (genericArgs[1]), not the key (§4.9: "Owns its values; keys are
     // value-like"); the shared elementDisposerThunk disposes+frees any class
-    // object via its own vtable (slot 1), so it applies to the stored value
+    // object via its own vtable (slot 2, CG35-itable), so it applies to the stored value
     // pointer exactly as it does to an OwnedArray element.
     if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
         dictTy->astNode->name->parts.empty())
@@ -2544,7 +2608,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // exceptions have no user TypeSymbol, so classOfLocal returns null and the
     // branch above misses them; they are nevertheless ordinary owned heap class
     // instances and must be disposed + reclaimed at scope end. Dispose
-    // dynamically through the object's own vtable (slot 1 = no-op bz$exDispose;
+    // dynamically through the object's own vtable (slot 2 = no-op bz$exDispose;
     // the 16-byte block is reclaimed, the runtime-managed message string is
     // not). The value is never an in-flight exception here: a `using var` forbids
     // the move that a `throw` would require (§28.10), so this slot and the
@@ -3925,7 +3989,7 @@ void Emitter::collectBoxReleaseEligible(
 
 // #383 / §28: a reference TypeRef carrying a vtable — a user class or
 // interface (Named, with a class/interface declaration). Such objects are
-// disposed dynamically through their own vtable slot 1.
+// disposed dynamically through their own vtable slot 2 (CG35-itable).
 static bool isClassOrInterfaceRef(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
@@ -3978,7 +4042,7 @@ bool Emitter::usingVarOwnsBuiltinException(const ast::LocalDecl* ld) {
     // (Exception or a §31.4 subtype). Recognize it from the declared type, a
     // `new <builtin-exception>(...)` initializer, or the initializer's resolved
     // type. A built-in exception is an owned heap class instance; its block must
-    // be reclaimed at scope end (dispatch is dynamic, vtable slot 1).
+    // be reclaimed at scope end (dispatch is dynamic, vtable slot 2, CG35-itable).
     if (ld->type && isBuiltinExceptionTypeRef(ctx_.resolvedType(*ld->type)))
         return true;
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
@@ -4392,56 +4456,102 @@ void Emitter::setupBoxDescriptors() {
         descArray_[ts]->setInitializer(
             llvm::ConstantArray::get(arrTy, elems));
     }
-    // Pass C: build each record's box vtable. The layout matches a class
-    // vtable's prefix — [descArray, Dispose, iface-slots…] — so interface
-    // dispatch (`vtable[ifaceSlot]`) on a boxed record finds the method. Enums
-    // get the same shape (no iface methods filled). Slot 1 (Dispose) is the
-    // shared no-op: boxed value types are runtime-managed (§28.9) and own
-    // nothing.
+    // Pass C: build each record's box vtable using the new itable layout
+    // (CG35-itable, §9.6 / §8.6 / §13). New layout:
+    //   [0]=td, [1]=itmap$box$C (null-terminated [td$I, itab$box$C$I, …]),
+    //   [2]=Dispose (no-op: boxed value types are runtime-managed, §28.9)
+    // Interface dispatch on a boxed record goes through bz_itable_lookup,
+    // just like a class. Enums get the same shape (no interface methods).
+    //
+    // Box thunks: the real record method takes `this` = pointer to the bare
+    // record bytes. A boxed record's receiver is the BOX pointer
+    // { vtable*, i64 rc, record-bytes } (#422); the record bytes start TWO
+    // words in. Each itable entry is a small thunk that advances `this` past
+    // both words then tail-calls the real method.
     for (auto& [ts, supers] : supersOf) {
-        std::vector<llvm::Constant*> elems(2 + ifaceSlotCount_,
+        std::unordered_set<const sema::TypeSymbol*> superSet(supers.begin(),
+                                                             supers.end());
+
+        // Build itab$box$C$I for each interface I that this record implements.
+        std::vector<llvm::Constant*> itmapElems;
+        for (const sema::TypeSymbol* iface : supers) {
+            if (iface->kind != ast::TypeDeclKind::Interface) continue;
+
+            // Collect iface's non-static methods in declaration order.
+            std::vector<sema::MethodSymbol*> ifaceMethods;
+            for (sema::Symbol* m : iface->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && !isStaticMethod(ms)) ifaceMethods.push_back(ms);
+            }
+            if (ifaceMethods.empty()) continue;
+
+            std::vector<llvm::Constant*> itabElems;
+            for (sema::MethodSymbol* im : ifaceMethods) {
+                llvm::Constant* fp = llvm::ConstantPointerNull::get(ptrTy());
+                sema::MethodSymbol* impl = findMethodByName(ts, im->name);
+                if (impl) {
+                    auto mit = methodFns_.find(impl);
+                    if (mit != methodFns_.end()) {
+                        llvm::Function* real = mit->second;
+                        llvm::FunctionType* fnTy = real->getFunctionType();
+                        // Build a thunk: box ptr → record bytes (+2 words).
+                        auto* thunk = llvm::Function::Create(
+                            fnTy, llvm::Function::InternalLinkage,
+                            "bz$boxthunk$" + std::string(ts->name) + "$" +
+                                std::string(im->name),
+                            module_.get());
+                        auto* bb = llvm::BasicBlock::Create(llvm_, "entry",
+                                                            thunk);
+                        llvm::IRBuilder<> tb(bb);
+                        std::vector<llvm::Value*> callArgs;
+                        auto ai = thunk->arg_begin();
+                        llvm::Value* recThis = tb.CreateGEP(
+                            ptrTy(), &*ai,
+                            {llvm::ConstantInt::get(i32(), 2)}, "boxthis");
+                        callArgs.push_back(recThis);
+                        ++ai;
+                        for (; ai != thunk->arg_end(); ++ai)
+                            callArgs.push_back(&*ai);
+                        llvm::Value* r = tb.CreateCall(fnTy, real, callArgs);
+                        if (fnTy->getReturnType()->isVoidTy()) tb.CreateRetVoid();
+                        else tb.CreateRet(r);
+                        fp = thunk;
+                    }
+                }
+                itabElems.push_back(fp);
+            }
+            auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
+            auto* itabGV = new llvm::GlobalVariable(
+                *module_, itabArrTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantArray::get(itabArrTy, itabElems),
+                "itab$box$" + std::string(ts->name) + "$" +
+                    std::string(iface->name));
+
+            auto dit2 = descArray_.find(iface);
+            if (dit2 != descArray_.end()) {
+                itmapElems.push_back(
+                    llvm::cast<llvm::Constant>(dit2->second));
+                itmapElems.push_back(
+                    llvm::ConstantExpr::getPointerCast(itabGV, ptrTy()));
+            }
+        }
+        // Null terminator.
+        itmapElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+        auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), itmapElems.size());
+        auto* boxItmapGV = new llvm::GlobalVariable(
+            *module_, itmapArrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(itmapArrTy, itmapElems),
+            "itmap$box$" + std::string(ts->name));
+
+        // Vtable: [0]=td, [1]=itmap$box$C, [2]=Dispose (no-op).
+        std::vector<llvm::Constant*> elems(3,
                                            llvm::ConstantPointerNull::get(
                                                ptrTy()));
         elems[0] = descArray_[ts];
-        if (builtinDisposeFn_) elems[1] = builtinDisposeFn_;
-        // §9.6 / §8.6: fill the interface-method slots this record implements.
-        // The real record method takes `this` = a pointer to the bare record
-        // bytes (field indices from 0). A boxed record's receiver, however, is
-        // the BOX pointer { vtable*, i64 rc, record-bytes } (#422); the record
-        // bytes start TWO words in (past the vtable word and the rc word). So the
-        // box vtable stores a small THUNK that advances `this` past both words,
-        // then tail-calls the real method. This keeps the class-dispatch
-        // convention (this at offset 0) untouched.
-        std::unordered_set<const sema::TypeSymbol*> superSet(supers.begin(),
-                                                             supers.end());
-        for (const auto& [im, slot] : ifaceMethodSlot_) {
-            if (!im->parent || !superSet.count(im->parent)) continue;
-            sema::MethodSymbol* impl = findMethodByName(ts, im->name);
-            if (!impl) continue;
-            auto mit = methodFns_.find(impl);
-            if (mit == methodFns_.end()) continue;
-            llvm::Function* real = mit->second;
-            llvm::FunctionType* fnTy = real->getFunctionType();
-            auto* thunk = llvm::Function::Create(
-                fnTy, llvm::Function::InternalLinkage,
-                "bz$boxthunk$" + std::string(ts->name) + "$" +
-                    std::string(im->name),
-                module_.get());
-            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", thunk);
-            llvm::IRBuilder<> tb(bb);
-            std::vector<llvm::Value*> callArgs;
-            auto ai = thunk->arg_begin();
-            // this (arg 0): box ptr → record bytes (+2 words: past vtable + rc).
-            llvm::Value* recThis = tb.CreateGEP(
-                ptrTy(), &*ai, {llvm::ConstantInt::get(i32(), 2)}, "boxthis");
-            callArgs.push_back(recThis);
-            ++ai;
-            for (; ai != thunk->arg_end(); ++ai) callArgs.push_back(&*ai);
-            llvm::Value* r = tb.CreateCall(fnTy, real, callArgs);
-            if (fnTy->getReturnType()->isVoidTy()) tb.CreateRetVoid();
-            else tb.CreateRet(r);
-            elems[slot] = thunk;
-        }
+        elems[1] = llvm::ConstantExpr::getPointerCast(boxItmapGV, ptrTy());
+        if (builtinDisposeFn_) elems[2] = builtinDisposeFn_;
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         boxVtable_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,

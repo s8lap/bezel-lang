@@ -1,8 +1,8 @@
-// Codegen slice CG35 — interface method dispatch (§11.2). Each interface
-// method gets a fixed vtable slot shared across all implementers; a call
-// through an interface-typed value indexes the runtime object's vtable at
-// that slot, so the implementing class's method runs. Observable via the
-// int exit code.
+// Codegen slice CG35-itable — per-interface itable dispatch (§12 / §13).
+// A class's vtable[1] = itmap$C (null-terminated [td$I, itab$C$I, …]).
+// Dispatch through an interface-typed value calls bz_itable_lookup to find
+// the itable, then GEPs to the method's position within it.
+// Observable via the int exit code.
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -87,4 +87,78 @@ BEZEL_TEST(codegen_cg35, two_interface_methods) {
         "    var p := new P(); return Sum(p); "
         "  end Main; "
         "end C;"), 42);
+}
+
+// CG35-itable new tests: verify per-interface itable dispatch (§12 / §13).
+
+BEZEL_TEST(codegen_cg35_itable, class_two_interfaces_dispatch_each) {
+    // §13: a class implementing two unrelated interfaces; dispatch through
+    // each interface reaches the correct implementing method. Exercises two
+    // separate itabs in itmap$C.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IFoo method FooVal(): int; end IFoo; "
+        "interface IBar method BarVal(): int; end IBar; "
+        "class Impl : IFoo, IBar "
+        "  public method FooVal(): int => 7; "
+        "  public method BarVal(): int => 11; "
+        "end Impl; "
+        "class C "
+        "  public static method GetFoo(x: IFoo): int => x.FooVal(); "
+        "  public static method GetBar(x: IBar): int => x.BarVal(); "
+        "  public static method Main(): int "
+        "    var o := new Impl(); return GetFoo(o) + GetBar(o); "
+        "  end Main; "
+        "end C;"), 18);
+}
+
+BEZEL_TEST(codegen_cg35_itable, interface_inheritance_dispatch_both) {
+    // §13 / §12: interface I2 extends I1; a class implementing I2 must be
+    // dispatchable through both I1 and I2 (separate itabs in itmap).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IBase method BaseVal(): int; end IBase; "
+        "interface IDerived : IBase method DerivedVal(): int; end IDerived; "
+        "class Both : IDerived "
+        "  public method BaseVal(): int => 3; "
+        "  public method DerivedVal(): int => 5; "
+        "end Both; "
+        "class C "
+        "  public static method ViaBase(x: IBase): int => x.BaseVal(); "
+        "  public static method ViaDerived(x: IDerived): int => x.DerivedVal(); "
+        "  public static method Main(): int "
+        "    var o := new Both(); return ViaBase(o) + ViaDerived(o); "
+        "  end Main; "
+        "end C;"), 8);
+}
+
+BEZEL_TEST(codegen_cg35_itable, record_interface_box_itable) {
+    // §8.6 / §9.6 / §13: a record boxed to an interface uses the box itable.
+    // Dispatch via the interface on the boxed record must reach the record's
+    // method (via the box thunk that adjusts `this` past vtable+rc words).
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IArea method Area(): int; end IArea; "
+        "record Rect(w: int, h: int): IArea "
+        "  public method Area(): int => w * h; "
+        "end Rect; "
+        "class C "
+        "  public static method Measure(s: IArea): int => s.Area(); "
+        "  public static method Main(): int "
+        "    var r := new Rect(3, 4); return Measure(r); "
+        "  end Main; "
+        "end C;"), 12);
+}
+
+BEZEL_TEST(codegen_cg35_itable, is_interface_check_still_works) {
+    // §19.5 / §12.7: `x is I` must still work after the itable ABI change.
+    // `is` uses td$ (vtable[0]) unchanged — this test guards the is/as path.
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IShape method Area(): int; end IShape; "
+        "class Square : IShape public method Area(): int => 9; end Square; "
+        "class C public static method Main(): int "
+        "  var s: IShape := new Square(); "
+        "  return (1 if s is Square else 0); "
+        "end Main; end C;"), 1);
 }

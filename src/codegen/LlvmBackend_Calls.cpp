@@ -4852,15 +4852,20 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             return false;
         return isUnsignedTargetExpr(*(*argExprs)[ai]);
     };
+    // Is this an interface method dispatch? Check if the declaring type is
+    // an interface (CG35-itable, §13).
+    bool isIfaceMethod = ms->parent &&
+                         ms->parent->kind == ast::TypeDeclKind::Interface;
     bool canDispatch = !baseQualified && !isStaticMethod(ms);
-    unsigned dispatchSlot = 0;
+    unsigned vtSlot = 0;  // used only for class-virtual dispatch
     if (canDispatch) {
-        auto ifIt = ifaceMethodSlot_.find(ms);
-        if (ifIt != ifaceMethodSlot_.end()) {
-            dispatchSlot = ifIt->second;
+        if (isIfaceMethod) {
+            // Interface dispatch: ifaceMethodIndex_ must have an entry.
+            auto ifIt = ifaceMethodIndex_.find(ms);
+            if (ifIt == ifaceMethodIndex_.end()) canDispatch = false;
         } else {
             auto slotIt = vtableSlot_.find(ms);
-            if (slotIt != vtableSlot_.end()) dispatchSlot = slotIt->second;
+            if (slotIt != vtableSlot_.end()) vtSlot = slotIt->second;
             else canDispatch = false;
         }
     }
@@ -4908,9 +4913,35 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                                            argUnsigned(ai));
         llvm::Value* recv = args[0];
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
-        llvm::Value* slotPtr = builder_.CreateGEP(
-            ptrTy(), vptr, {builder_.getInt32(dispatchSlot)});
-        llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+        llvm::Value* fnPtr = nullptr;
+        if (isIfaceMethod) {
+            // CG35-itable (§13): per-interface itable dispatch.
+            // vptr[1] = itmap$C; call bz_itable_lookup(itmap, td$I) → itab$C$I;
+            // fnPtr = itab$C$I[k] where k = positional index of ms in I.
+            auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
+                                      {ptrTy(), ptrTy()});
+            llvm::Value* itmapPtr = builder_.CreateLoad(
+                ptrTy(), builder_.CreateGEP(ptrTy(), vptr,
+                                            {builder_.getInt32(1)}));
+            // td$I is the descriptor global for the interface.
+            const sema::TypeSymbol* iface = ms->parent;
+            auto descIt = descArray_.find(iface);
+            if (descIt == descArray_.end()) { return nullptr; }
+            llvm::Value* ifaceTd = descIt->second;
+            llvm::Value* itab = builder_.CreateCall(
+                llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+                lookupFn, {itmapPtr, ifaceTd}, "itab");
+            unsigned k = ifaceMethodIndex_.at(ms);
+            fnPtr = builder_.CreateLoad(
+                ptrTy(),
+                builder_.CreateGEP(ptrTy(), itab, {builder_.getInt32(k)}),
+                "ifn");
+        } else {
+            // Class virtual dispatch: vtSlot is the vtable index (base 3).
+            llvm::Value* slotPtr = builder_.CreateGEP(
+                ptrTy(), vptr, {builder_.getInt32(vtSlot)});
+            fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+        }
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
         emitPendingCheck();  // CG20: a callee may have thrown
         return r;
