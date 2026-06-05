@@ -420,6 +420,38 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                              tt->genericArgs[1])
                         ctx_.setExprType(&e, tt->genericArgs[1]);
                 }
+                // §23.4: USER-DEFINED indexer `obj[i]` on a class/record/
+                // interface type. The result type is the indexer property's
+                // declared type. The ordinary member-lookup path types named
+                // properties (resolveMemberAccess) but never reaches an indexer
+                // (it has no member name — `obj[i]` is an IndexExpr, not a
+                // MemberAccess), so the IndexExpr was left untyped. Type it here
+                // by finding the indexer property (stored under `.this`, walked
+                // transitively over base types) and resolving its declared type,
+                // substituting generic-param result types against the receiver's
+                // concrete args (#361 / §14.1) — exactly as resolveMemberAccess
+                // does for a named property. This matters downstream: the
+                // ownership pass's borrow-vs-copy predicate (§28.3) consults the
+                // IndexExpr's type — a VALUE-typed indexer result is a copy, not
+                // a borrow, so returning it from an owned `using var` local is
+                // not a borrow escape (a CLASS/borrow-typed result still is).
+                else if (tt->kind == TypeRef::Kind::Named && tt->declaration) {
+                    if (auto* ps = dynamic_cast<PropertySymbol*>(
+                            lookupMember(tt->declaration, ".this"))) {
+                        if (ps->isIndexer) {
+                            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
+                                    ps->decl)) {
+                                if (pd->type) {
+                                    if (auto* rt = ctx_.resolvedType(*pd->type))
+                                        ctx_.setExprType(
+                                            &e, substituteMemberType(
+                                                    rt, ix->target.get(),
+                                                    ps->parent));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
