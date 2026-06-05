@@ -563,6 +563,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
                         return true;
                     }
+                    // stdlib §5 Set-like lazy: Union/Intersect/Except(other)
+                    // preserve the source element type T (lazy IEnumerable<T>).
+                    if (m == "Union" || m == "Intersect" || m == "Except") {
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                        return true;
+                    }
+                    // stdlib §5 Ordering: ThenBy/ThenByDescending preserve T,
+                    // return IOrderedEnumerable<T> (same lazy sentinel).
+                    if (m == "ThenBy" || m == "ThenByDescending") {
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                        return true;
+                    }
+                    // stdlib §5 *OrNull: return nullable T. Use a nullable copy
+                    // of srcElem (set nullable flag on a fresh TypeRef copy).
+                    if ((m == "FirstOrNull" || m == "LastOrNull" ||
+                         m == "SingleOrNull") && ce.args.empty()) {
+                        if (srcElem) {
+                            auto* nullTy = ctx_.makeTypeRef();
+                            *nullTy = *srcElem;
+                            nullTy->nullable = true;
+                            ctx_.setExprType(&ce, nullTy);
+                        }
+                        return true;
+                    }
                     return false;
                 };
                 // stdlib §5: chained LINQ on a lazy IEnumerable<T> receiver.
@@ -591,12 +615,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     else if (m == "First" || m == "Last" || m == "Single" ||
                              m == "ElementAt")
                         ctx_.setExprType(&ce, srcElem);
+                    // stdlib §5 *OrNull (lazy receiver): return nullable T.
+                    else if ((m == "FirstOrNull" || m == "LastOrNull" ||
+                              m == "SingleOrNull") && ce.args.empty()) {
+                        if (srcElem) {
+                            auto* nullTy = ctx_.makeTypeRef();
+                            *nullTy = *srcElem;
+                            nullTy->nullable = true;
+                            ctx_.setExprType(&ce, nullTy);
+                        }
+                    }
                     else if (m == "ToArray" || m == "ToSet")
                         // Materializers (stdlib §5). Typed as the lazy sentinel
                         // carrying the element type; codegen builds the concrete
                         // owned Array<T>/Set<T>. The result is bound to an
                         // explicitly-typed local in practice, which supplies the
                         // collection type for downstream member access.
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                    // stdlib §5 ToDictionary — typed as lazy sentinel (same
+                    // convention as ToArray/ToSet: codegen builds the concrete dict).
+                    else if (m == "ToDictionary" && !ce.args.empty())
+                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                    // stdlib §5 Ordering: Reverse() on a lazy receiver — preserves T.
+                    // NOT added to typeLinqOperator (would clash with Array.Reverse
+                    // in-place). Only typed here, where the receiver is already lazy.
+                    else if (m == "Reverse" && ce.args.empty())
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
                     else if (typeLinqOperator(srcElem)) { /* typed */ }
                 }
@@ -676,6 +719,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         else if ((m == "ToArray" || m == "ToSet") &&
                                  !recvTy->genericArgs.empty())
                             ctx_.setExprType(&ce, makeLazyEnumerable(recvTy->genericArgs[0]));
+                        // stdlib §5 ToDictionary — typed as lazy sentinel.
+                        else if (m == "ToDictionary" && !ce.args.empty() &&
+                                 !recvTy->genericArgs.empty())
+                            ctx_.setExprType(&ce, makeLazyEnumerable(recvTy->genericArgs[0]));
+                        // stdlib §5 *OrNull (Array receiver): return nullable T.
+                        else if ((m == "FirstOrNull" || m == "LastOrNull" ||
+                                  m == "SingleOrNull") && ce.args.empty() &&
+                                 !recvTy->genericArgs.empty() &&
+                                 recvTy->genericArgs[0]) {
+                            auto* nullTy = ctx_.makeTypeRef();
+                            *nullTy = *recvTy->genericArgs[0];
+                            nullTy->nullable = true;
+                            ctx_.setExprType(&ce, nullTy);
+                        }
                         // per §5 LINQ: Where/Select/Skip/Take/Distinct/OrderBy
                         // are LAZY — they return a deferred IEnumerable<T>, not
                         // a materialized Array<T> (stdlib §5).
@@ -1391,7 +1448,11 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
         m == "OrderBy" || m == "OrderByDescending" || m == "ForEach" ||
         m == "Min" || m == "Max" || m == "Sum" ||
         m == "TakeWhile" || m == "SkipWhile" || m == "SelectMany" ||
-        m == "Average";
+        m == "Average" ||
+        // stdlib §5 Ordering secondary key (this milestone): ThenBy / ThenByDescending
+        // take a `(T) -> TKey` lambda over the same source element T. The receiver is
+        // IOrderedEnumerable<T> (the lazy sentinel); genericArgs[0] = T.
+        m == "ThenBy" || m == "ThenByDescending";
     if (!elemLambda) return nullptr;
     auto* recvTy = ctx_.exprType(*ma->target);
     if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||

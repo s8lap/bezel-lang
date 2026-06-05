@@ -2730,6 +2730,13 @@ private:
     llvm::Function* buildZipTrampoline(llvm::Type* aTy, llvm::Type* bTy,
                                        llvm::Type* outTy);
 
+    // stdlib §5 Set-like: hash trampoline `uint64_t(const void* key)` for the
+    // Union/Intersect/Except membership dict. Reuses buildValueHashTrampoline
+    // for a non-null elemRef; falls back to a memhash for pointer-sized elements.
+    llvm::Function* buildLinqHashTrampoline(llvm::Type* elemTy,
+                                            const sema::TypeRef* elemRef,
+                                            const sema::TypeSymbol* elemRec);
+
     // Detect Convert.ToInt32(s) / Convert.ToInt64(s) / Math.Abs(n) etc.
     // as intrinsic static class method calls. Returns a lowered value or null.
     llvm::Value* tryLowerBuiltinClassCall(const ast::CallExpr& call);
