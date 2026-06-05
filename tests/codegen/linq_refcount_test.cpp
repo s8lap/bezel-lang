@@ -518,3 +518,82 @@ BEZEL_TEST(linq_refcount, lazy_borrowed_predicate_reused_no_uaf_spec_28_3) {
     for (int rep = 0; rep < 3; ++rep)
         BEZEL_EXPECT_TRUE(runNoCorruption(kBorrowedPredicateLazyReuse, 0));
 }
+
+// ---- stdlib §5 gaps milestone: ThenBy inline-lambda closure release ----------
+//
+// ThenBy stores a secondary key closure into the THENBY enumerator node. When
+// the closure is an INLINE LAMBDA, codegen calls bz_lazy_own_closure2, which
+// sets own_closure2 := 1 so bz_lazy_dispose releases it. Churned 100000× to
+// detect any leak (closure cell + env are released on dispose). Returns 0
+// (composite sort is correct and the result Count is 4). LSan-clean after.
+
+const char* kLazyThenByToArrayChurn =
+    "module M; record Point(x: int, y: int); "
+    "class C "
+    "  public static method Main(): int "
+    "    using var a := new Array<Point>(); "
+    "    a.Add(new Point(2, 4)); a.Add(new Point(1, 5)); "
+    "    a.Add(new Point(2, 1)); a.Add(new Point(1, 3)); "
+    "    var i: int := 0; var ok: int := 1; "
+    "    while i < 100000 do "
+    "      using var r: Array<Point> := a.OrderBy((p) => p.x)"
+    "                                    .ThenBy((p) => p.y)"
+    "                                    .ToArray(); "
+    "      if r.Length <> 4 then ok := 0; end; "
+    "      if r.Get(0).y <> 3 then ok := 0; end; "  // (1,3) first
+    "      i := i + 1; "
+    "    end; "
+    "    if ok = 1 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, lazy_thenby_toarray_inline_lambda_leak_free_spec_28_9) {
+    expectValueAndLeakFree(kLazyThenByToArrayChurn, 0);
+}
+
+// ThenBy with a VARIABLE secondary key closure (borrowed) — must NOT release
+// on dispose, else the second iteration causes a UAF. Returns 0 (correct sort,
+// no corruption).
+const char* kLazyThenByBorrowedKey =
+    "module M; record Point(x: int, y: int); "
+    "class C "
+    "  public static method Main(): int "
+    "    using var a := new Array<Point>(); "
+    "    a.Add(new Point(2, 4)); a.Add(new Point(1, 5)); "
+    "    a.Add(new Point(2, 1)); a.Add(new Point(1, 3)); "
+    "    var secKey: (Point) -> int := (p: Point) => p.y; "
+    "    using var r1: Array<Point> := a.OrderBy((p) => p.x)"
+    "                                   .ThenBy(secKey).ToArray(); "
+    "    using var r2: Array<Point> := a.OrderBy((p) => p.x)"
+    "                                   .ThenBy(secKey).ToArray(); "
+    "    if r1.Length = 4 and r2.Length = 4 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, lazy_thenby_borrowed_key_no_uaf_spec_28_3) {
+    BEZEL_EXPECT_EQ(compileAndRun(kLazyThenByBorrowedKey), 0);
+    for (int rep = 0; rep < 3; ++rep)
+        BEZEL_EXPECT_TRUE(runNoCorruption(kLazyThenByBorrowedKey, 0));
+}
+
+// Union with Where: the `other` enumerator is consumed at construction (no
+// closure per se, but the dict is heap-allocated → must be freed at dispose).
+// Churned 100000× for leak detection. Returns 0 ({1,2,3,4} union = 4 elements).
+const char* kLazyUnionToArrayChurn =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); "
+    "    using var b := new Array<int>(); b.Add(2); b.Add(3); b.Add(4); "
+    "    var i: int := 0; var ok: int := 1; "
+    "    while i < 100000 do "
+    "      using var r: Array<int> := a.Union(b).ToArray(); "
+    "      if r.Length <> 4 then ok := 0; end; "
+    "      i := i + 1; "
+    "    end; "
+    "    if ok = 1 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(linq_refcount, lazy_union_toarray_leak_free_spec_5) {
+    expectValueAndLeakFree(kLazyUnionToArrayChurn, 0);
+}

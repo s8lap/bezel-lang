@@ -256,6 +256,7 @@ set(BEZEL_TEST_SOURCES
     codegen/set_algebra_complete_test.cpp
     codegen/linq_test.cpp
     codegen/linq_completeness_test.cpp
+    codegen/linq_gaps_test.cpp
     codegen/event_test.cpp
     codegen/cancellation_token_test.cpp
     codegen/datetime_timespan_test.cpp

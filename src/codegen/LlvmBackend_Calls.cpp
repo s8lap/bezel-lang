@@ -561,7 +561,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         m == "Count" || m == "Sum" || m == "Aggregate" || m == "Average" ||
         m == "Min" || m == "Max" || m == "First" || m == "Single" ||
         m == "Last" || m == "ElementAt" || m == "Any" || m == "All" ||
-        m == "ForEach" || m == "Contains" || m == "IndexOf";
+        m == "ForEach" || m == "Contains" || m == "IndexOf" ||
+        // stdlib §5 *OrNull variants (lazy source → materialize, then check):
+        m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull";
     bool lazyTerminal = lazyRecv && isArrTerminal;
 
     if (!isArr && !isDict && !isStrBld && !lazyTerminal) return nullptr;
@@ -1210,6 +1212,86 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* eav = builder_.CreateLoad(retTy, out, "elemat.r");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return eav;
+        }
+        // stdlib §5: FirstOrNull() / FirstOrNull(predicate): return the first
+        // element as T? (null if empty). For value-type T, the result is the
+        // tagged {i8 hasValue; T value} struct; for class/string T it is a
+        // nullable pointer (null on empty).
+        // stdlib §5: FirstOrNull() — first element as T?, null if empty.
+        // stdlib §5: LastOrNull()  — last element as T?, null if empty.
+        // stdlib §5: SingleOrNull() — single element as T?, null if not exactly one.
+        // These are materializing terminals (lazy sources were pre-materialized
+        // above into `recv`). The result is T? — for int/record/enum: the tagged
+        // {i8 hasValue; T value} struct; for string/class: a nullable pointer.
+        if ((m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull") &&
+            call.args.empty()) {
+            llvm::Type* retTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            llvm::Value* condV;
+            if (m == "SingleOrNull")
+                condV = builder_.CreateICmpEQ(len, builder_.getInt64(1));
+            else
+                condV = builder_.CreateICmpSGT(len, builder_.getInt64(0));
+            auto* loadBB = llvm::BasicBlock::Create(llvm_, "on.load", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "on.cont", currentFn_);
+            llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+            builder_.CreateCondBr(condV, loadBB, contBB);
+
+            builder_.SetInsertPoint(loadBB);
+            llvm::AllocaInst* slot = entryAlloca(retTy);
+            auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            llvm::Value* idx64;
+            if (m == "LastOrNull") {
+                idx64 = builder_.CreateSub(len, builder_.getInt64(1));
+            } else {
+                idx64 = builder_.getInt64(0);
+            }
+            builder_.CreateCall(getFn, {recv, idx64, slot, builder_.getInt64(esz)});
+            llvm::Value* loaded = builder_.CreateLoad(retTy, slot, "on.v");
+            builder_.CreateBr(contBB);
+
+            builder_.SetInsertPoint(contBB);
+
+            // Build T? result — check element ref for nullable value type.
+            // In the isArr section, elemRef is not local — use recvTy->genericArgs[0].
+            sema::TypeRef* elemRefNN = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            // Make a nullable copy of the element type for the return struct.
+            sema::TypeRef nullRT;
+            if (elemRefNN) { nullRT = *elemRefNN; nullRT.nullable = true; }
+            bool isValTy = elemRefNN && isNullableValueTy(&nullRT);
+
+            // IMPORTANT: PHI nodes must be the FIRST instructions in contBB.
+            // Create all PHI nodes before calling freeLazyTemp() (which emits
+            // a bz_array_free call in contBB and would violate the "PHI at top"
+            // LLVM invariant if called first).
+            llvm::Value* resultV = nullptr;
+            if (isValTy) {
+                auto* nst = nullableValueStructTy(&nullRT);
+                auto* valPhi = builder_.CreatePHI(retTy, 2, "on.val");
+                valPhi->addIncoming(loaded, loadBB);
+                valPhi->addIncoming(llvm::Constant::getNullValue(retTy), preBB);
+                auto* hvPhi = builder_.CreatePHI(nullablePrimHasValTy(), 2, "on.hv");
+                hvPhi->addIncoming(
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1), loadBB);
+                hvPhi->addIncoming(
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 0), preBB);
+                // Free AFTER the PHI nodes.
+                freeLazyTemp();
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst), hvPhi, {0u});
+                resultV = builder_.CreateInsertValue(res, valPhi, {1u});
+            } else {
+                // Pointer / class / string: null pointer = null.
+                auto* ptrPhi = builder_.CreatePHI(retTy, 2, "on.ptr");
+                ptrPhi->addIncoming(loaded, loadBB);
+                ptrPhi->addIncoming(llvm::Constant::getNullValue(retTy), preBB);
+                freeLazyTemp();  // Free AFTER the PHI node.
+                resultV = ptrPhi;
+            }
+            return resultV;
         }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
 
@@ -6111,6 +6193,44 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
     return fn;
 }
 
+// stdlib §5 Set-like (Union/Intersect/Except): hash trampoline for the
+// membership dict. Matches the runtime's `uint64_t(*)(const void*)` function
+// pointer slot in bz_dict_t. Reuses buildValueHashTrampoline for non-null
+// elemRef (record / scalar / string — all equality-bearing types). Falls back
+// to a simple identity hash on the raw element bytes for pointer-sized elements
+// (class pointers) where content equality is reference equality.
+llvm::Function* Emitter::buildLinqHashTrampoline(llvm::Type* elemTy,
+                                                  const sema::TypeRef* elemRef,
+                                                  const sema::TypeSymbol* elemRec) {
+    // For an equality-bearing value type (record, primitive, enum) reuse the
+    // existing value-hash trampoline (tested path; string hashes by content).
+    if (elemRef && (elemRec || (elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                                elemRef->primitive != sema::PrimitiveType::Object)))
+        return buildValueHashTrampoline(elemRef);
+    // Fallback: hash the element bytes by loading the pointer-width value and
+    // returning its bit pattern as a uint64. For a class pointer `T*` this is
+    // identity hash (pointer value), consistent with reference equality.
+    auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$linq$hash", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* v = builder_.CreateLoad(elemTy, fn->getArg(0), "hash.v");
+    llvm::Value* h = elemTy->isIntegerTy(64) ? v
+                   : elemTy->isIntegerTy(32)
+                       ? builder_.CreateZExt(v, i64())
+                       : elemTy->isPointerTy()
+                           ? builder_.CreatePtrToInt(v, i64())
+                           : builder_.CreateZExtOrBitCast(v, i64());
+    builder_.CreateRet(h);
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
 // stdlib §5 Combination: Zip combine trampoline `void(closure, a, b, out)`.
 // Loads the left (aTy) and right (bTy) elements, calls the closure
 // `(env, a, b) -> outTy`, and stores the projected result through `out`.
@@ -6203,11 +6323,87 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         return builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)}, "linq.toarr");
     }
 
+    // ----- ToSet: materialize the (lazy) pipeline into an owned Set<T> -------
+    // stdlib §5: ToSet() → owned Set<T>. The Set is dict-backed (generic-key
+    // path); element hash and equality trampolines are the same as Distinct uses.
+    if (m == "ToSet" && call.args.empty()) {
+        sema::TypeRef* elemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
+        if (!lazy) return nullptr;
+        llvm::Type* elemTy2 = elemLlvmOf(elemRef);
+        int64_t esz = lazyElemSize(elemTy2);
+        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy2, elemRef, elemRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec);
+        auto* toSet = declareC("bz_lazy_to_set", ptrTy(),
+                               {ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(toSet,
+            {lazy, builder_.getInt64(esz), hashTramp, eqTramp}, "linq.toset");
+    }
+
+    // ----- ToDictionary: materialize into an owned Dictionary<TKey, T> -------
+    // stdlib §5: ToDictionary<TKey>(key: (T)->TKey): owned Dictionary<TKey, T>.
+    // The one-arg overload uses the element itself as the value; the two-arg form
+    // (key, value: (T)->TValue) is not modeled in this JIT milestone (the second
+    // arg would require a value-selector lambda).
+    if (m == "ToDictionary" && call.args.size() >= 1 && call.args[0].value) {
+        sema::TypeRef* elemRef = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
+        if (!lazy) return nullptr;
+        llvm::Type* elemTy2 = elemLlvmOf(elemRef);
+        int64_t valEsz = lazyElemSize(elemTy2);
+
+        // Key type: the lambda (T)->TKey; TKey is its return type.
+        sema::TypeRef* keyRefSema = nullptr;
+        llvm::Type* keyTy = i32();
+        if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
+                keyRefSema = lamTy->funcReturn;
+                if (auto* t = lowerTypeRef(keyRefSema)) keyTy = t;
+            }
+        int64_t keyEsz = lazyElemSize(keyTy);
+
+        // Key closure + trampoline (kind 2 = key: i64(closure, elem_ptr)).
+        // Note: lowerLinqLambda is not in scope here (defined later in the isOp
+        // section). For ToDictionary the user always annotates the lambda key
+        // type explicitly, so lowerExpr suffices.
+        llvm::Value* keyClosure = lowerExpr(*call.args[0].value);
+        if (!keyClosure) return nullptr;
+        llvm::Function* keyTramp = buildLinqTrampoline(2, elemTy2, nullptr);
+
+        // Key hash + equality trampolines for the dict backing.
+        const sema::TypeSymbol* keyRec = recordTypeOfRef(keyRefSema);
+        llvm::Function* hashTramp = buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, keyTy, nullptr, keyRec);
+
+        auto* toDict = declareC("bz_lazy_to_dict", ptrTy(),
+            {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        llvm::Value* result = builder_.CreateCall(toDict,
+            {lazy, builder_.getInt64(valEsz), builder_.getInt64(keyEsz),
+             keyTramp, keyClosure, hashTramp, eqTramp}, "linq.todict");
+        // Release the inline-lambda key closure if we own it (eager materialization
+        // — the closure is fully consumed during bz_lazy_to_dict, same as eager
+        // LINQ terminals like Count/Sum).
+        bool inlineLambda = !call.args.empty() && call.args[0].value &&
+            dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()) != nullptr;
+        if (inlineLambda) emitClosureRelease(keyClosure);
+        return result;
+    }
+
     // The deferred operators. Lower the source to a lazy enumerator first.
+    // NOTE: Reverse is intercepted ONLY on a lazy receiver — on a concrete
+    // collection (Array) it falls through to the in-place Array.Reverse()
+    // handler in tryLowerCollectionInstanceCall (§3).
     bool isOp = (m == "Where" || m == "Select" || m == "Take" || m == "Skip" ||
                  m == "Distinct" || m == "OrderBy" || m == "OrderByDescending" ||
                  m == "Concat" || m == "TakeWhile" || m == "SkipWhile" ||
-                 m == "SelectMany" || m == "Zip");
+                 m == "SelectMany" || m == "Zip" ||
+                 // stdlib §5 Set-like lazy ops (this milestone):
+                 m == "Union" || m == "Intersect" || m == "Except" ||
+                 // stdlib §5 Ordering secondary key:
+                 m == "ThenBy" || m == "ThenByDescending" ||
+                 // stdlib §5 lazy Reverse — only on a lazy receiver (not Array):
+                 (m == "Reverse" && lazyRecv));
     if (!isOp) return nullptr;
 
     sema::TypeRef* elemRef = nullptr;
@@ -6411,6 +6607,60 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* e = builder_.CreateCall(zipFn,
             {src, down, builder_.getInt64(outEsz), closure, tramp}, "linq.zip");
         return ownClosureIf(e, argIsInlineLambda(1));  // #422: combine is args[1]
+    }
+    // stdlib §5 Set-like lazy: Union/Intersect/Except(other: IEnumerable<T>).
+    // Each builds a membership dict from `other` at construction, then yields
+    // unique elements (Union: self∪other; Intersect: self∩other; Except: self∖other).
+    // Element dedup uses the generic-dict hash/equality trampolines (same as
+    // Distinct, but also needs a hash function for the O(1) dict path).
+    if ((m == "Union" || m == "Intersect" || m == "Except") &&
+        call.args.size() == 1 && call.args[0].value) {
+        sema::TypeRef* otherElem = nullptr;
+        llvm::Value* down = lowerToLazyEnumerator(*call.args[0].value, otherElem);
+        if (!down) return nullptr;
+        // Build element hash + equality trampolines for the membership dict.
+        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy, elemRef, elemRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy, nullptr, elemRec);
+        const char* rtFn = (m == "Union")     ? "bz_lazy_union"
+                         : (m == "Intersect") ? "bz_lazy_intersect"
+                                              : "bz_lazy_except";
+        auto* fn = declareC(rtFn, ptrTy(), {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {src, down, hashTramp, eqTramp},
+                                   "linq." + std::string(m == "Union" ? "union"
+                                                        : m == "Intersect" ? "intersect"
+                                                                           : "except"));
+    }
+    // stdlib §5 Ordering: ThenBy / ThenByDescending(key: (T)->TKey) secondary sort.
+    // The receiver is an IOrderedEnumerable<T> (lazy sentinel carrying T at [0]).
+    // The primary key is already baked into the upstream ORDERBY node; ThenBy
+    // reaches into it via the runtime (bz_lazy_thenby reads up->keyfn/closure).
+    if ((m == "ThenBy" || m == "ThenByDescending") &&
+        call.args.size() == 1 && call.args[0].value) {
+        int32_t desc2 = (m == "ThenByDescending") ? 1 : 0;
+        llvm::Value* closure2 = lowerLinqLambda(
+            call.args[0].value.get(),
+            ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+        if (!closure2) return nullptr;
+        llvm::Function* tramp2 = buildLinqTrampoline(2, elemTy, nullptr);
+        auto* tbFn = declareC("bz_lazy_thenby", ptrTy(),
+                              {ptrTy(), ptrTy(), ptrTy(), i32()});
+        llvm::Value* e = builder_.CreateCall(tbFn,
+            {src, closure2, tramp2, builder_.getInt32(desc2)}, "linq.thenby");
+        // Mark closure2 as owned by the THENBY enumerator if it was an inline
+        // lambda — disposed via own_closure2 at bz_lazy_dispose.
+        if (argIsInlineLambda(0) && e) {
+            auto* fn = declareC("bz_lazy_own_closure2", ptrTy(), {ptrTy()});
+            e = builder_.CreateCall(fn, {e}, "linq.owncl2");
+        }
+        return e;
+    }
+    // stdlib §5 Ordering: Reverse() on an IEnumerable<T> receiver — lazy
+    // materialize + yield backwards. (The in-place Array Reverse is lowered
+    // separately before tryLowerLazyLinqCall is reached.)
+    if (m == "Reverse" && call.args.empty()) {
+        auto* revFn = declareC("bz_lazy_reverse", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(revFn, {src}, "linq.reverse");
     }
     return nullptr;
 }
