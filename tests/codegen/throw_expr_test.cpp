@@ -82,3 +82,77 @@ BEZEL_TEST(codegen_cg40, bare_throw_expression_statement) {
         "  try throw new E(); return 1; catch E => return 4; end; "
         "end Main; end C;"), 4);
 }
+
+// --- expression-bodied method whose ENTIRE body is a `throw` ----------------
+// §17.12 (throw is an expression, valid in any expression position) + §22
+// (expression-bodied methods `=> expr`). FINDING [3]: `=> throw E` segfaulted
+// bezelc — lowerExpr of the ThrowExpr terminated the block (and set diverged_),
+// then the expr-body path unconditionally appended a `ret` into the now-
+// terminated block, giving the function two terminators (malformed IR that
+// crashed the optimizer). The fix checks diverged_ after lowering the body
+// expression and skips the implicit return when the block is already ended.
+
+BEZEL_TEST(codegen_cg40, expr_body_method_throw_caught) {
+    // The whole body is `throw E`. Calling it inside a try/catch must (a) NOT
+    // crash the compiler and (b) propagate the exception to the handler.
+    BEZEL_EXPECT_EQ(runProg(std::string(kE) +
+        "class C "
+        "  public static method Bad(): int => throw new E(); "
+        "  public static method Main(): int "
+        "    var caught := 0; "
+        "    try var x := Bad(); catch E => caught := 42; end; "
+        "    return caught; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+BEZEL_TEST(codegen_cg40, expr_body_method_throw_not_called_returns_other) {
+    // The diverging expr-bodied method is declared but never called; the rest of
+    // the program must compile and run normally (regression guard: the throwing
+    // method's body must still emit valid IR even when unused).
+    BEZEL_EXPECT_EQ(runProg(std::string(kE) +
+        "class C "
+        "  public static method Bad(): int => throw new E(); "
+        "  public static method Main(): int => 7; "
+        "end C;"), 7);
+}
+
+// --- CONTROL: a normal expression-bodied method still returns correctly -----
+// The termination check must be FALSE for a non-diverging body, so emitReturn
+// runs exactly as before. These pin that the fix is scoped to the throw case.
+
+BEZEL_TEST(codegen_cg40, expr_body_method_const_returns) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kE) +
+        "class C "
+        "  public static method Zero(): int => 0; "
+        "  public static method Main(): int => Zero(); "
+        "end C;"), 0);
+}
+
+BEZEL_TEST(codegen_cg40, expr_body_method_arith_returns) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kE) +
+        "class C "
+        "  public static method Add(a: int, b: int): int => a + b; "
+        "  public static method Main(): int => Add(40, 2); "
+        "end C;"), 42);
+}
+
+// --- expression-bodied PROPERTY getter whose body is a `throw` --------------
+// §23.3 (block-form / expression-form property accessors) + §17.12. Property-
+// accessor exception PROPAGATION correctness is a separate lane (FINDING [4]);
+// this test's contract is narrower: the compiler must NOT CRASH lowering an
+// expr-body getter whose whole body is a throw. `ran` (compiled + JIT-executed
+// without crashing) is the assertion; the exit value is not pinned here.
+BEZEL_TEST(codegen_cg40, expr_body_property_getter_throw_no_compiler_crash) {
+    auto r = runJit(std::string(kE) +
+        "class C "
+        "  public property Bad: int "
+        "    get => throw new E(); "
+        "  end Bad; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    // The defining program never reads C.Bad, so Main runs to completion; the
+    // point is that emitting the getter body did not produce malformed IR.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}

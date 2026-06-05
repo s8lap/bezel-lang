@@ -82,6 +82,24 @@ BEZEL_TEST(codegen_uncaught_exit, explicit_throw_out_of_main_nonzero) {
         kUnhandledExceptionExit);
 }
 
+// §17.12 / §22 / FINDING [3]: an expression-bodied method whose ENTIRE body is a
+// bare `throw` (`=> throw E`), called with no enclosing handler, escapes Main.
+// This is the exact crash repro: FINDING [3] segfaulted bezelc in the OPTIMIZER
+// chewing on malformed IR (two terminators in the throwing method's block) —
+// which only the NATIVE compile path (this harness, addPassesToEmitFile) runs,
+// not the in-process JIT. So this test both (a) proves the compiler no longer
+// crashes lowering+optimizing the throwing expr-body method and (b) confirms the
+// throw propagates out of Main as an uncaught exception (non-zero exit).
+BEZEL_TEST(codegen_uncaught_exit, expr_body_method_throw_out_of_main_nonzero) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class Boom end Boom; "
+        "class C "
+        "  public static method Bad(): int => throw new Boom(); "
+        "  public static method Main(): int => Bad(); "
+        "end C;"),
+        kUnhandledExceptionExit);
+}
+
 // §22.13 / FINDING [2]: a DivideByZeroException raised by `a / b` (b == 0) with
 // no handler escapes Main → non-zero exit (was 0).
 BEZEL_TEST(codegen_uncaught_exit, divide_by_zero_out_of_main_nonzero) {

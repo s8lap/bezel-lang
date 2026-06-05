@@ -1664,12 +1664,25 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     bool terminated = false;
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
         llvm::Value* v = lowerExpr(*ci.exprBody);
-        // §8.6: box a value-typed `=> expr` result returned through an
-        // Object/interface return type (so the caller's is/as/dispatch works).
-        if (v && currentReturnTypeNode_)
-            v = boxForTarget(v, ctx_.resolvedType(*currentReturnTypeNode_),
-                             ci.exprBody);
-        terminated = emitReturn(fn, v);
+        // CG40 / §17.12: an expression body whose whole expression diverges
+        // (`=> throw E`, or any expr that branches to the unwind/propagate
+        // target) has already terminated the current block — lowerExpr returns
+        // a non-null poison placeholder and sets diverged_. Emitting a return
+        // into the already-terminated block would give it two terminators
+        // (malformed IR that crashes the optimizer). Mirror the ReturnStmt path
+        // (LlvmBackend_Stmts.cpp): if diverged_, the block is already correctly
+        // ended — skip emitReturn (and boxForTarget, which must not add
+        // instructions to a terminated block).
+        if (diverged_) {
+            terminated = true;
+        } else {
+            // §8.6: box a value-typed `=> expr` result returned through an
+            // Object/interface return type (so the caller's is/as/dispatch works).
+            if (v && currentReturnTypeNode_)
+                v = boxForTarget(v, ctx_.resolvedType(*currentReturnTypeNode_),
+                                 ci.exprBody);
+            terminated = emitReturn(fn, v);
+        }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
         terminated = lowerScopedBlock(*ci.stmts);
     }

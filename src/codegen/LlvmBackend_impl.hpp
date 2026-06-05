@@ -36,6 +36,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace bezel::codegen {
@@ -158,6 +159,20 @@ public:
         for (const auto& sym : ctx_.symbols()) {
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
             if (ts && initFns_.count(ts)) emitInstanceInitFunction(ts);
+        }
+        // FINDING [3]: malformed IR (e.g. a block with two terminators) reached
+        // the optimizer as a segfault because nothing checked the IR after
+        // emission. The module verifier turns such a defect into a printed
+        // report instead of a crash deep in an LLVM pass. It is OPT-IN via
+        // BEZEL_VERIFY_IR (mirroring the BEZEL_DUMP_IR knob above) rather than
+        // always-on: the verifier currently flags several PRE-EXISTING, unrelated
+        // codegen defects in other paths (a separate concern from this fix), so
+        // running it unconditionally would spam every build/test with noise from
+        // bugs this change does not own. Non-fatal — it reports and continues.
+        if (module_ && std::getenv("BEZEL_VERIFY_IR") &&
+            llvm::verifyModule(*module_, &llvm::errs())) {
+            llvm::errs() << "bezel codegen: IR verification failed "
+                            "(malformed IR emitted; see report above)\n";
         }
         return std::move(module_);
     }
