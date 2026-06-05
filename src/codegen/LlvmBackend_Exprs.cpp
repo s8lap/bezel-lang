@@ -3022,16 +3022,43 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         }
         builder_.SetInsertPoint(bodyBB);
         llvm::Value* v = lowerExpr(*arm.exprBody);
-        if (!v) return nullptr;
-        incomings.push_back({v, builder_.GetInsertBlock()});
-        builder_.CreateBr(endBB);
+        // CG40 (§17.12 / §19): an arm body that diverges (`throw E`, or a
+        // body that branches to the unwind/propagate target) has already
+        // terminated its block via the throw — mirroring lowerConditional's
+        // per-branch diverged_ handling. Such an arm never reaches endBB, so
+        // it is excluded from the result PHI and emits no `br` to endBB
+        // (which would give the block two terminators). A non-diverging arm
+        // is coerced to the case's §20 common result type IN THIS arm's block
+        // (so the coerced value dominates its PHI edge) before joining; this
+        // is what makes a numeric-widening case (`5` int vs `9L` long, common
+        // `long`) build an i64 PHI instead of crashing on an i32/i64
+        // mismatch — the same fix lowerConditional applies to `if` branches.
+        bool armDiv = diverged_;
+        if (!armDiv) {
+            if (!v) return nullptr;
+            if (resultTy)
+                v = coerceNumericToType(v, resultTy,
+                                        isUnsignedTargetExpr(*arm.exprBody));
+            incomings.push_back({v, builder_.GetInsertBlock()});
+            builder_.CreateBr(endBB);
+        }
+        // Reset for the next arm's pattern-test / body: a prior arm's
+        // divergence must not bleed into the next arm.
+        diverged_ = false;
         builder_.SetInsertPoint(nextBB);
     }
     // No arm matched → MatchFailureException (§19.6).
     emitThrowBuiltin("MatchFailureException");
 
     builder_.SetInsertPoint(endBB);
-    if (incomings.empty()) return llvm::Constant::getNullValue(resultTy);
+    // CG40: if EVERY arm diverged, no arm reaches endBB — the whole case
+    // diverges (like a conditional whose both branches throw). Report it via
+    // diverged_ so the enclosing return/decl/expr context skips emitting code
+    // into the (predecessorless) endBB, exactly as lowerConditional does.
+    if (incomings.empty()) {
+        diverged_ = true;
+        return llvm::PoisonValue::get(resultTy);
+    }
     auto* phi = builder_.CreatePHI(incomings[0].first->getType(),
                                    incomings.size());
     for (auto& [v, bb] : incomings) phi->addIncoming(v, bb);

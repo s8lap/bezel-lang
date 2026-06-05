@@ -355,18 +355,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             }
         }
     }
-    // §19: a `case` expression's type is the common type of its arm
-    // bodies — take the first expression-bodied arm's type. Without it,
-    // member access on a case result (`(case … end).M`) fails to
-    // resolve.
+    // §19 + §20: a `case` expression's type is the COMMON type of its
+    // (non-diverging) arm bodies — folded through the same common-type rule
+    // as the `if` expression. A bottom-typed (`throw`/diverging) arm imposes
+    // no constraint; arms with no common type get a clean §20 error rather
+    // than crashing codegen's result PHI. Recorded on `e` so member access on
+    // a case result (`(case … end).M`) resolves.
     if (auto* cse = dynamic_cast<const ast::CaseExpr*>(&e)) {
-        for (const auto& arm : cse->arms) {
-            if (!arm.exprBody) continue;
-            if (TypeRef* at = ctx_.exprType(*arm.exprBody)) {
-                ctx_.setExprType(&e, at);
-                break;
-            }
-        }
+        typeCase(*cse, e);
     }
     // §15.1: IndexExpr `a[i]` — the expression type is the array's
     // element type, so member access on array elements (`a[i].field`)

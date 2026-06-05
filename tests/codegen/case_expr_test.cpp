@@ -8,6 +8,7 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::JitResult;
 using bezel::test::runJit;
 
 namespace {
@@ -273,4 +274,137 @@ BEZEL_TEST(codegen_cg28_destructure, both_const_no_match) {
         "    _ => 0 "
         "  end; "
         "end Main; end C;"), 0);
+}
+
+// ── §19 + §20 + §17.12: `case` EXPRESSION with a diverging arm ───────────
+// A `throw` arm (§17.12: `throw` is an expression, valid in any expression
+// position) is bottom-typed: it imposes no §20 common-type constraint, and
+// at codegen it terminates its block via the throw's unwind so it must be
+// excluded from the result PHI. This is the case-expression analog of the
+// conditional `x if c else throw E` fix (conditional_test.cpp). Before the
+// fix, the result PHI mixed the value arm's i32 with the throw arm's poison
+// ptr and tripped LLVM's "all operands to PHI must be the same type"
+// assertion. The non-diverging arm is also coerced to the §20 common type
+// before the PHI (the numeric-widening tests below).
+
+// Value path: the value arm is selected; the throw arm never executes.
+BEZEL_TEST(codegen_cg28, throw_arm_value_path) {
+    BEZEL_EXPECT_EQ(run(
+        "var c := true; "
+        "var x := case c true => 7, _ => throw new Exception(\"e\") end; "
+        "return x;"), 7);
+}
+
+// Throw path: the discard arm's `throw` fires; an enclosing try/catch in
+// the caller catches it. Exercises the diverging-arm lowering at run time.
+BEZEL_TEST(codegen_cg28, throw_arm_throw_path) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Helper(c: bool): int "
+        "    return case c true => 7, _ => throw new Exception(\"e\") end; "
+        "  end Helper; "
+        "  public static method Main(): int "
+        "    try return Helper(false); "
+        "    catch Exception => return 99; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 99);
+}
+
+// A `throw` arm appearing FIRST (before a value arm). The value arm is
+// reached on the non-matching scrutinee; the throw arm is excluded from the
+// PHI just the same regardless of arm order.
+BEZEL_TEST(codegen_cg28, throw_arm_first_value_path) {
+    BEZEL_EXPECT_EQ(run(
+        "var c := false; "
+        "var x := case c true => throw new Exception(\"e\"), _ => 8 end; "
+        "return x;"), 8);
+}
+
+// NOTE on `return` arms: §19.2 admits a single-STATEMENT arm body
+// (`=> return E;`) only in STATEMENT-position `case`, and that statement-form
+// arm body is not yet parsed (Parser_Exprs.cpp parseCaseArm produces only
+// Expression-bodied arms; the statement-form / `do…end` arm body lands with
+// the statement-position-case slice). So a `return`-arm case is not yet
+// constructible to test. The codegen fix here keys on the same `diverged_`
+// flag the conditional fix uses, so it will exclude a `return` arm from the
+// result PHI for free once statement-form arms parse — but no test can
+// exercise that path until then. The `throw` arm above is the reproducible
+// diverging-arm case (throw IS an expression, §17.12) and is covered.
+
+// EVERY arm diverges (all `throw`): the whole case diverges. It must
+// compile (no orphaned/ill-typed PHI) and the selected arm's throw fires,
+// caught by the caller's try/catch.
+BEZEL_TEST(codegen_cg28, all_arms_throw_diverges) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Helper(c: bool): int "
+        "    return case c "
+        "      true => throw new Exception(\"a\"), "
+        "      _ => throw new Exception(\"b\") "
+        "    end; "
+        "  end Helper; "
+        "  public static method Main(): int "
+        "    try return Helper(true); "
+        "    catch Exception => return 42; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §20: arms of differing-but-common numeric type. `5` is an int arm and
+// `9000000000L` is a long arm; the §20 common type is `long`. Codegen must
+// coerce the int arm to i64 in its own block before the result PHI (else an
+// i32/i64 PHI mismatch crashes LLVM — the same defect the throw arm hit).
+// Verify the long value survives (an i32 PHI would truncate the high bits).
+BEZEL_TEST(codegen_cg28, numeric_widening_long_arm) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var c := false; "
+        "    var hi: long := case c true => 5, _ => 9000000000L end; "
+        "    return 1 if hi = 9000000000L else 0; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// The selected-int direction of the same widened case still yields the int
+// value (widened to long, not truncated).
+BEZEL_TEST(codegen_cg28, numeric_widening_int_arm) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var c := true; "
+        "    var v: long := case c true => 5, _ => 9000000000L end; "
+        "    return 1 if v = 5L else 0; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// §20: arms with no common type are rejected with a clean diagnostic, not a
+// codegen crash. Here one value arm is `int` and the other is a class value
+// `N` — neither is implicitly convertible to the other. (The bottom-typed
+// throw arm imposes no constraint, so it is the two value arms that conflict.)
+BEZEL_TEST(codegen_cg28, incompatible_value_arms_is_type_error) {
+    JitResult r = runJit(
+        "module M; class N end N; class C "
+        "  public static method Main(): int "
+        "    var x := new N(); "
+        "    var y := case 1 "
+        "      1 => 5, "
+        "      _ => x "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// CONTROL: a normal value-only case (all arms the same type) still works
+// after the fix — no diverging arm, no widening, a plain int result PHI.
+BEZEL_TEST(codegen_cg28, control_all_value_arms_same_type) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 2; "
+        "var r := case x 1 => 10, 2 => 20, _ => 30 end; return r;"), 20);
 }

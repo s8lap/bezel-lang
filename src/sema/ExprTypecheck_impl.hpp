@@ -238,6 +238,27 @@ private:
     // common TypeRef (already set on `e`), or null when none exists.
     void typeConditional(const ast::ConditionalExpr& cnd, const ast::Expr& e);
 
+    // §19 + §20: type a `case` EXPRESSION with the COMMON type of its
+    // (non-diverging) arm bodies and record it on `e`. Mirrors
+    // typeConditional but folds over N arms: a bottom-typed (`throw` /
+    // diverging) arm leaves its body's type null and imposes no constraint;
+    // the result is the common type of the value-producing arms. When two
+    // value arms have no common type (neither widens/subtypes into the
+    // other), a clean §20 error is reported instead of letting codegen build
+    // an ill-typed result PHI and crash. When EVERY arm diverges, the case
+    // produces no value and no type is recorded.
+    void typeCase(const ast::CaseExpr& cse, const ast::Expr& e);
+
+    // §20: the pairwise common type of two branch/arm types — the one the
+    // other widens (§5.1) or subtypes (§12) into. Returns null when neither
+    // converts to the other (no common type). Shared by typeConditional and
+    // typeCase so the `if`-expression and `case`-expression common-type
+    // rules stay identical. Conservative (mirrors checkAssignable) so it
+    // never false-positives while the type lattice is incomplete; an
+    // Error-kind input yields the other operand (don't cascade), and an
+    // `Object` operand is the universal common supertype.
+    TypeRef* commonTypeOf(TypeRef* a, TypeRef* b);
+
     // Slice S7: diagnose assignment to a readonly field outside the
     // declaring class's constructor. Tracks only the `this.<field>`
     // target shape; `other.f := X` would need cross-object readonly
