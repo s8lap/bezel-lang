@@ -1030,7 +1030,32 @@ llvm::BasicBlock* Emitter::propagateBB() {
         propagateBB_ = llvm::BasicBlock::Create(llvm_, "propagate",
                                                 currentFn_);
         builder_.SetInsertPoint(propagateBB_);
-        emitImplicitReturn(currentFn_);
+        // per §33.3 / §22.13 (line 3845): propagateBB is the per-function
+        // fallback when an exception reaches a frame with no enclosing handler
+        // (unwindTarget_ unset). For an inner frame the exception is still live
+        // in bz$exc, so propagating == returning (emitImplicitReturn leaves
+        // bz$exc set and the caller's emitPendingCheck continues the unwind).
+        // For `main` (the entry point — the only function named "main", §33.2),
+        // this block IS the process boundary: the exception is genuinely
+        // uncaught. §33.3 reserves exit code 0 for NORMAL completion (and a
+        // legitimate `return 0`); §22.13 distinguishes "Main returning normally"
+        // from "Main returning by an uncaught exception that the runtime
+        // intercepts". Emitting `ret i32 0` here (the old emitImplicitReturn for
+        // an i32 function) conflated the two — every uncaught exception reported
+        // success. Instead, hand off to the runtime's abnormal-termination
+        // interceptor, which writes to stderr and exits non-zero. This fires
+        // ONLY for main's no-handler boundary: inner frames and every
+        // caught/handled path (unwindTarget_ set → not propagateBB) are
+        // untouched, so finally + owned-local unwind disposal still run.
+        if (currentFn_->getName() == "main") {
+            auto* fn = declareC("bz_unhandled_exception",
+                                llvm::Type::getVoidTy(llvm_), {});
+            fn->setDoesNotReturn();
+            builder_.CreateCall(fn, {});
+            builder_.CreateUnreachable();
+        } else {
+            emitImplicitReturn(currentFn_);
+        }
         if (save) builder_.SetInsertPoint(save);
     }
     return propagateBB_;
