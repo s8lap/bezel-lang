@@ -1228,6 +1228,12 @@ struct bz_lazy_t {
     int32_t phase;      // CONCAT: 0 = draining `up`, 1 = draining `down`
     int32_t stopped;    // TAKEWHILE: predicate has failed; sequence ended
     bz_lazy_t* inner;   // SELECTMANY: current inner enumerator (null = none)
+    // #422 / §28.9 / §28.3: when the operator's closure was produced INLINE (a
+    // lambda literal — a +1 transient this enumerator owns), codegen sets
+    // own_closure := 1 so bz_lazy_dispose releases it; a closure arriving via a
+    // variable/field is a BORROW (own_closure stays 0 from calloc) and is never
+    // freed here. Mirrors the GetOrAdd factoryIsInlineLambda guard.
+    int32_t own_closure;
 };
 
 // Advance the upstream enumerator and return a pointer to its current element,
@@ -1240,6 +1246,8 @@ static const void* bz_lazy_up_next(bz_lazy_t* up) {
     return ((cur_t)vt[3])(up);
 }
 
+extern "C" void bz_closure_release(void* c);  // defined below; released on dispose
+
 static int32_t bz_lazy_movenext(bz_lazy_t* e);
 static void*   bz_lazy_current(bz_lazy_t* e) { return e->cur; }
 static void    bz_lazy_dispose(bz_lazy_t* e) {
@@ -1250,6 +1258,13 @@ static void    bz_lazy_dispose(bz_lazy_t* e) {
     if (e->cur) free(e->cur);
     if (e->seen) bz_array_free(e->seen, nullptr);
     if (e->sorted) bz_array_free(e->sorted, nullptr);
+    // #422 / §28.9 / §28.3: release the operator's closure ONLY when it was an
+    // inline lambda we own (own_closure set by codegen). The closure BORROWS its
+    // captures, so this frees only the cell + env, never a capture — sound, no
+    // double-dispose. A borrowed (variable-form) closure has own_closure == 0 and
+    // is left untouched. Dispose runs exactly once per enumerator (cascaded from
+    // the for-loop / ToArray drain), so this is a single release, no double-free.
+    if (e->own_closure && e->closure) bz_closure_release(e->closure);
     free(e);
 }
 
@@ -1275,6 +1290,17 @@ extern "C" void* bz_lazy_from_array(void* arr, int64_t esz) {
     auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
     e->arr = arr;
     return e;
+}
+
+// #422 / §28.9 / §28.3: mark a freshly-built lazy enumerator as the OWNER of its
+// operator closure, so bz_lazy_dispose releases it (frees the +1 inline-lambda
+// cell + env once the pipeline is disposed). Codegen calls this immediately
+// after a lazy-operator constructor ONLY when the closure argument is an inline
+// lambda literal — never for a borrowed (variable-form) closure. Returns the
+// enumerator so the call can be threaded inline at the lowering site. Null-safe.
+extern "C" void* bz_lazy_own_closure(void* lazy) {
+    if (lazy) ((bz_lazy_t*)lazy)->own_closure = 1;
+    return lazy;
 }
 
 // issue #389 / stdlib §5 / §4.10: a dict-backed Set<T> as a lazy source. Snapshot
