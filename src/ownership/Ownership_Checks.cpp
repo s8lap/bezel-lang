@@ -593,6 +593,33 @@ bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
             ma->member == "IsEmpty")
             return false;  // value-typed projection → copy, not a borrow
     }
+    // §23.4 / §28.3 (FINDING [6]) defense-in-depth: a USER-DEFINED indexer read
+    // `obj[i]` whose element type is value-typed is a copy, not a borrow of the
+    // target (the same rule as a value-typed field/method projection above).
+    // Sema now types such an IndexExpr (so the typed branch above usually
+    // decides it), but if it is still untyped here, resolve the indexer's
+    // declared return type directly and gate on isBorrowableType: a value-typed
+    // element (int/record/enum/…) is a copy → not a borrow; a CLASS/borrow-typed
+    // element (e.g. an OwnedArray<R> slot, §28.3) stays a borrow and is still
+    // rejected. Built-in collection indexers carry a null `declaration`, so they
+    // do not reach this user-type branch — their element typing is handled in
+    // sema's IndexExpr path and consumed by the typed branch above.
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) {
+            if (const sema::TypeRef* tt = ctx_.exprType(*ix->target)) {
+                if (tt->kind == sema::TypeRef::Kind::Named && tt->declaration) {
+                    for (const sema::Symbol* m : tt->declaration->members) {
+                        auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
+                        if (!ps || !ps->isIndexer) continue;
+                        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                        if (pd && pd->type)
+                            return isBorrowableType(ctx_.resolvedType(*pd->type));
+                        break;
+                    }
+                }
+            }
+        }
+    }
     return true;  // unknown → conservative (still a borrow candidate)
 }
 

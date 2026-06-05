@@ -140,3 +140,108 @@ BEZEL_TEST(own_escape, return_reference_field_on_using_var_still_diagnosed) {
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §23.4 / §28.3 (FINDING [6]): reading a VALUE-typed USER-DEFINED indexer
+// `c[5]` (element type `int`) of a `using var` local and returning the bound
+// result is a value copy, not a borrow — accepted. Sema now types the
+// user-indexer IndexExpr (§23.4 result type = the indexer property's declared
+// type), so the borrow-vs-copy predicate (§28.3) recognizes the `int` result
+// as a copy. The whole-program FINDING-[6] repro: `var v := c[5]; return v;`.
+BEZEL_TEST(own_escape, return_value_user_indexer_on_using_var_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public property [i: int]: int "
+        "    get => i * 2; "
+        "  end; "
+        "  public static method Main(): int "
+        "    using var c := new C(); "
+        "    var v := c[5]; "
+        "    return v; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §23.4 / §28.3 (FINDING [6]): the direct-return form `return c[5];` of the
+// value-typed user-indexer read is likewise a value copy — accepted.
+BEZEL_TEST(own_escape, return_value_user_indexer_direct_on_using_var_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public property [i: int]: int "
+        "    get => i * 2; "
+        "  end; "
+        "  public static method Main(): int "
+        "    using var c := new C(); "
+        "    return c[5]; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 GUARD (cardinal risk — must NOT be over-accepted by the FINDING-[6]
+// fix): a USER-DEFINED indexer whose element type is a CLASS returns a borrow
+// of the receiver (§28.3 — a class-typed projection of an owned local aliases
+// it). Reading it from a `using var` local and returning the bound result lets
+// the borrow outlive its source — still rejected. The fix narrows acceptance
+// to VALUE-typed indexer results only.
+BEZEL_TEST(own_escape, return_reference_user_indexer_on_using_var_diagnosed) {
+    auto r = parseAndCheckOwnership(
+        "module M; class R public V: int := 0; end R; "
+        "class C "
+        "  public _slot: R := null; "
+        "  public property [i: int]: R "
+        "    get => _slot; "
+        "  end; "
+        "  public static method Leak(): R "
+        "    using var c := new C(); "
+        "    var v := c[0]; "
+        "    return v; "
+        "  end Leak; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.3 / §28.11 GUARD (cardinal risk): a built-in `OwnedArray<R>` slot read
+// `owner[0]` (R a class) produces a BORROW of the slot (spec §28.3: "the
+// indexer-get produces a borrow"). Reading it from a `using var` owned-array
+// local and returning the bound result is still rejected — the FINDING-[6]
+// fix must not over-accept this. The element type `R` is class-typed →
+// isBorrowableType is true → kept a borrow.
+BEZEL_TEST(own_escape, return_owned_array_slot_on_using_var_diagnosed) {
+    auto r = parseAndCheckOwnership(
+        "module M; class R public V: int := 0; destructor end destructor; end R; "
+        "class C public static method Leak(): R "
+        "  using var owner := new OwnedArray<R>(); "
+        "  owner.Add(move (new R())); "
+        "  var v := owner[0]; "
+        "  return v; "
+        "end Leak; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.3 (D15): a VALUE-typed built-in collection indexer `a[0]` (`Array<int>`,
+// element `int`) read from a `using var` local and returned is a value copy —
+// accepted. (Sema types this via the built-in-collection IndexExpr path; the
+// FINDING-[6] user-indexer branch is distinct and leaves it unaffected.)
+BEZEL_TEST(own_escape, return_value_builtin_indexer_on_using_var_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    using var a := new Array<int>(); a.Add(42); "
+        "    return a[0]; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL (FINDING [6]): the indexer read of a BORROWED PARAM (not an owned
+// local) returned is accepted regardless — the param outlives the caller's
+// frame. Preserved here as a guard that the fix did not perturb the param
+// path.
+BEZEL_TEST(own_escape, return_value_user_indexer_on_param_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public property [i: int]: int "
+        "    get => i * 2; "
+        "  end; "
+        "  public static method Use(c: C): int "
+        "    return c[5]; "
+        "  end Use; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
