@@ -168,6 +168,8 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    id->name == "LinkedList" || id->name == "OwnedLinkedList" ||
                    id->name == "StringBuilder" || id->name == "Encoding" ||
                    id->name == "DateTime" || id->name == "TimeSpan" ||
+                   // stdlib §2.6: Guid is auto-imported (a builtin value type).
+                   id->name == "Guid" ||
                    // §7 System.IO:
                    id->name == "File" || id->name == "Directory" ||
                    id->name == "Path" ||

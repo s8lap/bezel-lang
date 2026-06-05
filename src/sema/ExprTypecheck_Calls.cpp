@@ -746,10 +746,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "Exists")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     }
-                    // §2.5: DateTime static properties/methods → DateTime type.
-                    // DateTime and TimeSpan are scalar i64 value types; we
-                    // use builtinClassSym to carry the type name through sema so
-                    // subsequent member accesses (Year, Month, etc.) are typed.
+                    // §2.5: DateTime/TimeSpan static properties/methods. Scalar
+                    // i64 value types; builtinClassSym carries the name so later
+                    // member accesses (Year, Month, ...) are typed.
                     auto makeDTType = [&]() -> TypeRef* {
                         auto* t = ctx_.makeTypeRef();
                         t->kind = TypeRef::Kind::Named;
@@ -772,6 +771,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "FromDays" || m == "FromHours" || m == "FromMinutes" ||
                             m == "FromSeconds" || m == "FromMilliseconds" || m == "Zero")
                             ctx_.setExprType(&ce, makeTSType());
+                    }
+                    // stdlib §2.6: Guid static method return types.
+                    if (colName == "Guid") {
+                        if (m == "NewGuid" || m == "Parse") {
+                            auto* gTy = ctx_.makeTypeRef();
+                            gTy->kind = TypeRef::Kind::Named;
+                            gTy->declaration = builtinClassSym("Guid");
+                            ctx_.setExprType(&ce, gTy);
+                        }
+                        if (m == "TryParse") {
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        }
                     }
                     // §6.1 / §30.8: CancellationToken instance method return types.
                     // ThrowIfCancellationRequested() → unit (void); Register(cb) →
@@ -2261,6 +2272,29 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 return {};
             };
             std::string_view cn = builtinTyName(tt);
+            // stdlib §2.6: Guid instance member access types.
+            if (cn == "Guid") {
+                // ToString(): string (canonical form)
+                if (ma.member == "ToString") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                    return;
+                }
+                // Equals(other: Guid): bool — structural equality
+                if (ma.member == "Equals") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
+            }
+            // stdlib §2.6: Guid.Empty — static readonly property on the Guid type name.
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+                if (tid->name == "Guid" && ma.member == "Empty") {
+                    auto* gTy = ctx_.makeTypeRef();
+                    gTy->kind = TypeRef::Kind::Named;
+                    gTy->declaration = builtinClassSym("Guid");
+                    ctx_.setExprType(&ma, gTy);
+                    return;
+                }
+            }
             if (cn == "CancellationToken") {
                 // IsCancellationRequested: bool property (§6.1)
                 if (ma.member == "IsCancellationRequested") {
@@ -2453,6 +2487,27 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 else if (m == "NextDouble" || m == "NextFloat")
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
                 // Seed → unit (leave untyped)
+            }
+            // stdlib §2.6: Guid static member types (reached via declaration lookup
+            // path where the target is the Guid TypeSymbol with null decl).
+            if (cls == "Guid") {
+                if (m == "NewGuid" || m == "Parse") {
+                    auto* gTy = ctx_.makeTypeRef();
+                    gTy->kind = TypeRef::Kind::Named;
+                    gTy->declaration = builtinClassSym("Guid");
+                    ctx_.setExprType(&ma, gTy);
+                } else if (m == "TryParse") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                } else if (m == "Empty") {
+                    auto* gTy = ctx_.makeTypeRef();
+                    gTy->kind = TypeRef::Kind::Named;
+                    gTy->declaration = builtinClassSym("Guid");
+                    ctx_.setExprType(&ma, gTy);
+                } else if (m == "ToString") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                } else if (m == "Equals") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                }
             }
             // §6.1 / §30.8: CancellationToken instance property reads.
             // Reached when tok was bound via `cts.Token` (builtinClassSym decl).

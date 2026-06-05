@@ -2199,6 +2199,51 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || !ma->target) return nullptr;
+
+    // ---------------------------------------------------------------------------
+    // stdlib §2.6: Guid instance methods — handled before the IdentifierExpr
+    // guard below because the receiver may be a chained expression (e.g.
+    // Guid.Empty.ToString()) whose target is not a bare identifier.
+    // ---------------------------------------------------------------------------
+    {
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isGuid = recvTy &&
+            recvTy->kind == sema::TypeRef::Kind::Named &&
+            builtinTypeName(recvTy) == "Guid";
+        if (isGuid) {
+            llvm::StructType* gst = guidStructType();
+            const auto& mname = ma->member;
+
+            llvm::Value* recvVal = lowerExpr(*ma->target);
+            if (!recvVal) return nullptr;
+
+            // Ensure we have a ptr to the Guid struct for the runtime call.
+            llvm::AllocaInst* slot = entryAlloca(gst);
+            if (recvVal->getType()->isPointerTy())
+                recvVal = builder_.CreateLoad(gst, recvVal, "guid.load");
+            builder_.CreateStore(recvVal, slot);
+
+            // stdlib §2.6: ToString(): string — canonical 36-char dashed form.
+            if (mname == "ToString" && call.args.empty()) {
+                auto* fn = declareC("bz_guid_to_string", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {slot}, "guid.tostr");
+            }
+
+            // stdlib §2.6: Equals(other: Guid): bool — bytewise compare.
+            if (mname == "Equals" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* otherVal = lowerExpr(*call.args[0].value);
+                if (!otherVal) return nullptr;
+                llvm::AllocaInst* otherSlot = entryAlloca(gst);
+                if (otherVal->getType()->isPointerTy())
+                    otherVal = builder_.CreateLoad(gst, otherVal, "guid.other.load");
+                builder_.CreateStore(otherVal, otherSlot);
+                auto* fn = declareC("bz_guid_equals", i32(), {ptrTy(), ptrTy()});
+                llvm::Value* r = builder_.CreateCall(fn, {slot, otherSlot}, "guid.eq.r");
+                return builder_.CreateICmpNE(r, builder_.getInt32(0), "guid.eq");
+            }
+        }
+    }
+
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
     if (!id) return nullptr;
     const auto cls = id->name;
@@ -2961,6 +3006,70 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 seed = builder_.CreateTrunc(seed, i32());
             builder_.CreateCall(srandFn, {seed});
             return nullptr;  // unit
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // stdlib §2.6: Guid — static members and methods via bz_guid_* runtime.
+    // Guid is a 128-bit value type stored as { i64 lo, i64 hi }.  All runtime
+    // functions take a bz_guid_t* (ptr) so the value is passed by reference.
+    // ---------------------------------------------------------------------------
+    if (cls == "Guid") {
+        llvm::StructType* gst = guidStructType();
+
+        // Helper: allocate a Guid-sized alloca slot and return its address (ptr).
+        auto makeGuidSlot = [&]() -> llvm::AllocaInst* {
+            return entryAlloca(gst);
+        };
+
+        // Guid.Empty — the all-zero Guid (static readonly property §2.6).
+        // Returns a zero-initialised { i64 0, i64 0 } struct value.
+        if (m == "Empty" && call.args.empty()) {
+            llvm::AllocaInst* slot = makeGuidSlot();
+            builder_.CreateStore(llvm::ConstantAggregateZero::get(gst), slot);
+            return builder_.CreateLoad(gst, slot, "guid.empty");
+        }
+
+        // Guid.NewGuid() — fill a Guid from OS entropy (RFC 4122 v4).
+        if (m == "NewGuid" && call.args.empty()) {
+            llvm::AllocaInst* slot = makeGuidSlot();
+            auto* fn = declareC("bz_guid_new", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {slot});
+            return builder_.CreateLoad(gst, slot, "guid.new");
+        }
+
+        // Guid.Parse(s: string): Guid — parse canonical form; trap on failure.
+        if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::AllocaInst* slot = makeGuidSlot();
+            auto* fn = declareC("bz_guid_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "guid.parse.ok");
+            // Trap (unreachable) on parse failure — the spec makes Parse throw;
+            // until exception support for this path is in, trap is the safe choice.
+            llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0), "guid.parse.chk");
+            auto* okBB   = llvm::BasicBlock::Create(llvm_, "guid.parse.ok", currentFn_);
+            auto* badBB  = llvm::BasicBlock::Create(llvm_, "guid.parse.bad", currentFn_);
+            builder_.CreateCondBr(isOk, okBB, badBB);
+            builder_.SetInsertPoint(badBB);
+            builder_.CreateUnreachable();
+            builder_.SetInsertPoint(okBB);
+            return builder_.CreateLoad(gst, slot, "guid.parsed");
+        }
+
+        // Guid.TryParse(s: string, out result: Guid): bool
+        if (m == "TryParse" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Type* et = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+            if (!outAddr) return nullptr;
+            // If the out slot is not a guid-struct slot (different elem type),
+            // use our own slot and copy.  Normally outAddr is already the right size.
+            auto* fn = declareC("bz_guid_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(fn, {strVal, outAddr}, "guid.tryp.ok");
+            return builder_.CreateICmpNE(ok, builder_.getInt32(0), "guid.tryp.bool");
         }
     }
 

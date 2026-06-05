@@ -499,6 +499,8 @@ private:
     // Literals are materialized as private global constants; concatenation
     // allocates via malloc/memcpy. All string variables are ptr-typed (§4.6).
     llvm::StructType* stringStructTy_ = nullptr;
+    // per stdlib §2.6: Guid value-type struct { i64 lo, i64 hi }.
+    llvm::StructType* guidStructTy_ = nullptr;
     // #422 / §27.5 / §28.9: the closure-cell type { ptr fn, ptr env, i64 rc }.
     llvm::StructType* closureCellTy_ = nullptr;
     unsigned stringLiteralIdx_ = 0;
@@ -673,6 +675,17 @@ private:
                 llvm_, {ptrTy(), i64(), llvm::Type::getInt8Ty(llvm_), i64()},
                 "bz.string");
         return stringStructTy_;
+    }
+
+    // per stdlib §2.6: Guid is a 128-bit value type represented as { i64 lo, i64 hi }.
+    // Passed by pointer to runtime functions (bz_guid_t*); in LLVM IR a Guid-typed
+    // local is stored in an alloca of guidStructType(), and the address is passed to
+    // the runtime call.
+    llvm::StructType* guidStructType() {
+        if (!guidStructTy_)
+            guidStructTy_ = llvm::StructType::create(
+                llvm_, {i64(), i64()}, "bz.guid");
+        return guidStructTy_;
     }
 
     // #422: the sentinel rc value for static/literal strings (matches the

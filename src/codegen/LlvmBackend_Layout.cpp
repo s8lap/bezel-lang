@@ -292,6 +292,13 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             }
             // §3 stdlib: collection and IO built-in classes (no user TypeDecl).
             // All are heap-allocated opaque pointers to runtime structs.
+            // per stdlib §2.6: Guid is a 128-bit value type — { i64 lo, i64 hi }.
+            // Unlike collections (heap pointers), a Guid lowers to the inline struct.
+            if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty() &&
+                rt->astNode->name->parts[0] == "Guid") {
+                return guidStructType();
+            }
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty()) {
                 auto n = rt->astNode->name->parts[0];
@@ -339,6 +346,12 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 (rt->declaration->name == "CancellationToken" ||
                  rt->declaration->name == "CancellationTokenSource")) {
                     return ptrTy();
+            }
+            // per stdlib §2.6: Guid typed via builtinClassSym (declaration->name ==
+            // "Guid", null decl) → value struct { i64, i64 }.
+            if (rt->declaration && !rt->declaration->decl &&
+                rt->declaration->name == "Guid") {
+                return guidStructType();
             }
             // #405 / §31.1 / §31.4: a built-in exception type (Exception or a
             // §31.4 subtype) has no user TypeDecl but IS a reference type — a

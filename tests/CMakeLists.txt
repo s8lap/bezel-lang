@@ -259,6 +259,7 @@ set(BEZEL_TEST_SOURCES
     codegen/event_test.cpp
     codegen/cancellation_token_test.cpp
     codegen/datetime_timespan_test.cpp
+    codegen/guid_test.cpp
     codegen/owned_collection_ops_test.cpp
     codegen/owned_dict_disposal_test.cpp
     codegen/dict_clear_test.cpp
