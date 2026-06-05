@@ -5139,7 +5139,28 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
 
 llvm::FunctionType* Emitter::methodFnType(const sema::MethodSymbol* ms) {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-    if (!md) return nullptr;
+    if (!md) {
+        // §2.5 / §12 (issue #328 item 2): an IMPORTED method has no AST decl;
+        // reconstruct its function type from the loader-recorded signature, the
+        // same shape declareImportedFunctions uses, so a VIRTUAL call through an
+        // imported object's vtable types its dispatch correctly.
+        if (!ctx_.isImported(ms)) return nullptr;
+        sema::TypeRef* retRef = ctx_.importedReturnType(ms);
+        llvm::Type* retTy = retRef ? lowerTypeRef(retRef)
+                                   : llvm::Type::getVoidTy(llvm_);
+        std::vector<llvm::Type*> paramTys;
+        if (!isStaticMethod(const_cast<sema::MethodSymbol*>(ms)))
+            paramTys.push_back(ptrTy());
+        for (sema::Symbol* p : ms->params) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
+            sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
+            paramTys.push_back(
+                isByRefMod(ps ? ps->modifier : std::string_view())
+                    ? ptrTy()
+                    : (pt ? lowerTypeRef(pt) : i32()));
+        }
+        return llvm::FunctionType::get(retTy, paramTys, /*isVarArg=*/false);
+    }
     llvm::Type* retTy = lowerType(md->returnType.get());
     std::vector<llvm::Type*> paramTys;
     if (!isStaticMethod(const_cast<sema::MethodSymbol*>(ms)))

@@ -444,6 +444,23 @@ void Emitter::declareFunctions() {
             fnType, llvm::Function::InternalLinkage,
             "bz$" + std::string(ts->name) + "$DisposeCore", module_.get());
         disposerCoreFns_[ts] = coreFn;
+
+        // §2.5 / §2.6 / §22.8 (issue #328 item 2+3): a PUBLIC, non-generic class
+        // gets an EXPORTED `bz$<Type>$init(ptr this)` — the §22.8 step-1+2
+        // initializer (vtable install + field initializers) an importer calls
+        // cross-module. (Item 2's vtable install + item 3's non-foldable field
+        // init both ride this single exported symbol.) A generic template's
+        // initialization is per-instantiation (no stable linkable symbol) and a
+        // non-public type is not part of the importable construction surface, so
+        // neither is exported — single-module codegen and private types are
+        // unchanged, and only genuinely-exported types widen the link surface.
+        if (ts->visibility == ast::Visibility::Public &&
+            ts->genericParams.empty()) {
+            auto* initFn = llvm::Function::Create(
+                fnType, llvm::Function::ExternalLinkage,
+                "bz$" + std::string(ts->name) + "$init", module_.get());
+            initFns_[ts] = initFn;
+        }
     }
 
     // §2.5 / §2.6 step 4 (issue #328 inc 3): declare each IMPORTED method as an
@@ -455,6 +472,31 @@ void Emitter::declareFunctions() {
     // which both declare AND emit bodies — never touched them; this is the only
     // codegen path that engages imports, and only when imports were loaded.
     if (ctx_.hasImports()) declareImportedFunctions();
+
+    // §2.5 / §2.6 / §28.4 (issue #328 item 1): declare each IMPORTED class's
+    // external `bz$<Type>$Dispose` and register it in disposerFns_, so a `using
+    // var`/owned local of an imported type is RECOGNIZED as disposable (the
+    // disposal-registration and disposal-emit gates both consult disposerFns_)
+    // and discharged at scope end. The registered function is only a membership
+    // gate + a linkable declaration: the actual scope-end disposal dispatches
+    // DYNAMICALLY through the object's vtable slot 1 (emitDisposeAndReclaim),
+    // which the imported vtable (installed by bz$<Type>$init) routes to the
+    // exporter's real Dispose — so the destructor runs cross-module exactly once.
+    // Imported entries are NEVER emitted a body (the run() loop skips imported
+    // types; this is a declaration only).
+    if (ctx_.hasImports()) {
+        for (sema::Symbol* sym : ctx_.importedSymbols()) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);
+            if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+            if (disposerFns_.count(ts)) continue;
+            auto* fnType = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnType, llvm::Function::ExternalLinkage,
+                "bz$" + std::string(ts->name) + "$Dispose", module_.get());
+            disposerFns_[ts] = fn;
+        }
+    }
 }
 
 // §2.5 (issue #328 inc 3): see the call site in declareFunctions(). One external
@@ -571,6 +613,24 @@ void Emitter::declareVtables() {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (ts && ts->kind == ast::TypeDeclKind::Class) buildVtable(ts);
     }
+    // §2.5 / §2.6 / §12 (issue #328 item 2): assign vtable slots for IMPORTED
+    // classes too, so a VIRTUAL method call on an imported object dispatches
+    // through the object's vtable to the correct override (vtableSlot_ /
+    // vtableMethods_ gain entries for the imported methods). buildVtable reads
+    // each type's members (carrying reconstructed `virtual`/`override` modifiers,
+    // §12) and base chain — both reconstructed by the loader — so it computes the
+    // SAME slot numbering the exporter used, provided neither module introduces
+    // interface slots into the shared region (a cross-module interface-dispatch
+    // limitation that predates this change; class-virtual dispatch — the item-2
+    // soundness fix — is correct). No vtable GLOBAL is emitted for an imported
+    // type (Pass D below iterates only local symbols); the importer installs the
+    // EXTERNAL `vt$<Type>` via the exporter's bz$<Type>$init.
+    if (ctx_.hasImports()) {
+        for (sema::Symbol* sym : ctx_.importedSymbols()) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);
+            if (ts && ts->kind == ast::TypeDeclKind::Class) buildVtable(ts);
+        }
+    }
     // Pass B: declare a descriptor-array global (correctly sized, no
     // initializer yet) for every class/interface, so descriptors can
     // cross-reference each other in pass C.
@@ -639,10 +699,24 @@ void Emitter::declareVtables() {
         }
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         auto* init = llvm::ConstantArray::get(arrTy, elems);
+        // §2.5 / §2.6 / §12 (issue #328 item 2): a PUBLIC class's vtable is part
+        // of its cross-module instance surface. An importer constructing the type
+        // (or dispatching a virtual method on an instance of it) must install
+        // this exact vtable, so it carries EXTERNAL linkage under the same
+        // deterministic mangling (`vt$<Type>`) the imported method/ctor externs
+        // already use. A non-public type (or a generic template, whose vtable is
+        // per-instantiation and not part of the importable surface) keeps the old
+        // INTERNAL linkage, so single-module codegen and private types are
+        // unchanged — and only the genuinely-exported types widen the link
+        // surface, bounding the duplicate-symbol risk to the same name-collision
+        // case the existing method/ctor mangling already has.
+        bool exported = ts->visibility == ast::Visibility::Public &&
+                        ts->genericParams.empty();
         vtables_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage, init,
-            "vt$" + std::string(ts->name));
+            exported ? llvm::GlobalValue::ExternalLinkage
+                     : llvm::GlobalValue::InternalLinkage,
+            init, "vt$" + std::string(ts->name));
     }
 }
 
@@ -1724,6 +1798,169 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
 
     bool terminated = lowerScopedBlock(cd->body, startIdx);
     if (!terminated) builder_.CreateRetVoid();
+}
+
+
+// §22.8 step 1+2 (issue #328 item 2+3): the shared instance-initialization
+// sequence, factored out of lowerNew so it runs identically at the in-module
+// `new` site and inside the cross-module `bz$<Type>$init` function. Installs the
+// most-derived vtable into slot 0, then runs the full-hierarchy field
+// initializers (base-first, own last; calloc already zeroed the rest, so an
+// uninitialized field is left zero), the collection-literal initializers, and
+// the §24.1 event-source initializers. NOTE: this is the in-module form — it
+// reads each field's AST initializer via `m->decl`, so it is NEVER called for an
+// imported type (whose symbols carry no decl); the importer instead calls the
+// linked init function (declareImportedInit). The old constant-foldable replay
+// is therefore gone: a foldable OR non-foldable initializer now crosses the
+// boundary by running the exporter's real initializer here.
+void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
+                               llvm::StructType* st) {
+    // CG17: install the vtable pointer (instance slot 0) before field
+    // initializers / the constructor, so virtual dispatch on the new object
+    // resolves to its own class.
+    //
+    // §28.5: for a generic instantiation whose class has an `owned` type-
+    // parameter field, install the PER-INSTANTIATION vtable instead of the
+    // shared `vt$<T>` (its slot-1 Dispose disposes that field by the concrete
+    // substituted type, §28.4 step 2 / §28.5). specializedVtableFor falls back
+    // to the shared vtable when no specialization is needed. genericSubst_ is
+    // active here when called from lowerNew for a generic instantiation.
+    if (llvm::GlobalVariable* vt = specializedVtableFor(t)) {
+        builder_.CreateStore(vt, builder_.CreateStructGEP(st, obj, 0));
+    }
+
+    // Run field initializers, inherited (base-first) then own, so a
+    // `new Derived()` initializes base fields too. CG16's base-ctor chaining
+    // runs ctor *bodies*, not these initializers, so there is no double-init.
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(t, storage);
+    for (const sema::Symbol* m : storage) {
+        const ast::Expr* init = nullptr;
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+            init = fd->initializer.get();
+        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+            init = pd->autoInitializer.get();  // CG33: `property X := v;`
+        if (!init) continue;  // no initializer → calloc-zeroed
+        auto idxIt = fieldIndex_.find(m);
+        if (idxIt == fieldIndex_.end()) continue;
+        // §15.1 / §16: collection literal `[e1, e2, …]` initializer.
+        // Build the array in-place via GEP into the field slot.
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
+            cl && !cl->isDict && !cl->elements.empty()) {
+            llvm::Value* fieldGep =
+                builder_.CreateStructGEP(st, obj, idxIt->second);
+            llvm::Type* fieldTy = st->getElementType(idxIt->second);
+            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(fieldTy)) {
+                llvm::Type* elemTy = aty->getElementType();
+                for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+                    if (!cl->elements[i]) continue;
+                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                    if (!ev) continue;
+                    if (ev->getType() != elemTy &&
+                        ev->getType()->isIntegerTy() &&
+                        elemTy->isIntegerTy()) {
+                        unsigned eb = ev->getType()->getIntegerBitWidth();
+                        unsigned db = elemTy->getIntegerBitWidth();
+                        ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                     : builder_.CreateTrunc(ev, elemTy);
+                    }
+                    builder_.CreateStore(
+                        ev, builder_.CreateGEP(fieldTy, fieldGep,
+                            {builder_.getInt32(0), builder_.getInt32(i)}));
+                }
+            }
+            continue;
+        }
+        llvm::Value* v = lowerExpr(*init);
+        if (!v) continue;
+        // §5.1: an int initializer for a wider numeric field is implicitly
+        // widened — convert before the store so the field holds the value, not
+        // the int's raw bits (issue #408 / #410).
+        v = coerceNumericToType(v, st->getElementType(idxIt->second),
+                                isUnsignedTargetExpr(*init));
+        builder_.CreateStore(
+            v, builder_.CreateStructGEP(st, obj, idxIt->second));
+    }
+
+    // per §24.1: initialize each instance event's backing EventSource<T> slot
+    // to a fresh, empty source during construction.
+    for (const sema::Symbol* m : storage) {
+        if (!dynamic_cast<const sema::EventSymbol*>(m)) continue;
+        auto idxIt = fieldIndex_.find(m);
+        if (idxIt == fieldIndex_.end()) continue;
+        auto* newFn = declareC("bz_event_source_new", ptrTy(), {});
+        llvm::Value* esrc = builder_.CreateCall(newFn, {});
+        builder_.CreateStore(
+            esrc, builder_.CreateStructGEP(st, obj, idxIt->second));
+    }
+}
+
+
+// §2.5 / §2.6 / §22.8 (issue #328 item 2+3): emit the exported
+// `bz$<Type>$init(ptr this)` for a public, non-generic class. Its body just runs
+// emitInstanceInit on the incoming `this`, so a cross-module `new` of this type
+// performs §22.8 step-1+2 (vtable install + field initializers, foldable or not)
+// by linking to this function. Only public non-generic classes are emitted: a
+// generic template's initialization is per-instantiation (not a stable linkable
+// symbol) and a non-public type is not part of the importable construction
+// surface, so neither needs (or gets) an exported init. The in-module `new` site
+// keeps inlining emitInstanceInit directly, so this function is dead code within
+// a single-module build (no double-init) — it exists only for cross-module
+// callers.
+void Emitter::emitInstanceInitFunction(const sema::TypeSymbol* ts) {
+    auto it = initFns_.find(ts);
+    if (it == initFns_.end()) return;  // not an exported init
+    llvm::Function* fn = it->second;
+    if (!fn->empty()) return;  // already emitted
+
+    // Save/restore the per-function emitter state (mirrors emitDisposerBody).
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto* savedInsert = builder_.GetInsertBlock();
+
+    currentFn_ = fn;
+    currentThis_ = &*fn->args().begin();
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    disposeStack_.clear();
+    loopStack_.clear();
+    finallyStack_.clear();
+    propagateBB_ = nullptr;
+    unwindTarget_ = nullptr;
+    currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
+    unwindScopeDepth_ = 0;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+
+    emitInstanceInit(ts, currentThis_, classStruct(ts));
+    builder_.CreateRetVoid();
+
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParams);
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+}
+
+
+// §2.5 (issue #328 item 2+3): declare the external `bz$<Type>$init(ptr)` for an
+// IMPORTED type so the importer's `new` calls the linked initializer. The
+// signature is `void(ptr this)`, matching emitInstanceInitFunction's emitter.
+// Cached in initFns_ so repeated `new`s of the same imported type share one
+// declaration.
+llvm::Function* Emitter::declareImportedInit(const sema::TypeSymbol* ts) {
+    auto it = initFns_.find(ts);
+    if (it != initFns_.end()) return it->second;
+    auto* fnType = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage,
+                                      "bz$" + std::string(ts->name) + "$init",
+                                      module_.get());
+    initFns_[ts] = fn;
+    return fn;
 }
 
 
