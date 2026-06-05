@@ -1287,11 +1287,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // tryLowerLazyLinqCall (the sorted snapshot is built on first
         // enumeration, after which iteration is deferred per element).
 
-        // per §3: .IndexOf(item): int — index of first match, -1 if not found
+        // per §3/§25.2: .IndexOf(item): int — index of first match, -1 if not
+        // found. Match semantics (issue #424 / §25.2): dispatched per element
+        // type by emitRemoveElementEquality — record structural equality (§8.3),
+        // class user Equals/reference (§8.3/§8.4), string content (§4.6), value
+        // type `==`. The query `target` is a PURE BORROW — not consumed or
+        // disposed by IndexOf (§4.4/§4.5).
         if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
             llvm::Type* elemTy = getElemTy();
+            bool elemIsClass = collectionElemIsClass(recvTy, 0);
+            const sema::TypeRef* elemRef =
+                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                         : nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             auto* idxSlot = entryAlloca(i64());
@@ -1309,21 +1318,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            llvm::Value* eq;
-            if (el->getType()->isPointerTy() && target->getType()->isPointerTy())
-                eq = emitStringEq(el, target);
-            else {
-                llvm::Value* elN = el, *tN = target;
-                if (el->getType() != target->getType() &&
-                    el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
-                    unsigned ew = el->getType()->getIntegerBitWidth();
-                    unsigned tw = target->getType()->getIntegerBitWidth();
-                    llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
-                    elN = builder_.CreateSExt(el, wide);
-                    tN = builder_.CreateSExt(target, wide);
-                }
-                eq = builder_.CreateICmpEQ(elN, tN);
-            }
+            llvm::Value* eq =
+                emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+            if (!eq) return nullptr;
             builder_.CreateCondBr(eq, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
             llvm::Value* result64 = idx;
@@ -1579,11 +1576,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             return llvm::ConstantInt::get(i32(), 0);
         }
-        // per §3: .Contains(item: T): bool (for int/value types only)
+        // per §3/§25.2: .Contains(item: T): bool — first element that Equals
+        // the query. Match semantics (issue #424 / §25.2): dispatched per
+        // element type by emitRemoveElementEquality — record structural
+        // equality (§8.3), class user Equals/reference (§8.3/§8.4), string
+        // content (§4.6), value type `==`. The query `target` is a PURE BORROW
+        // — not consumed or disposed by Contains (§4.4/§4.5).
         if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
             llvm::Type* elemTy = getElemTy();
+            bool elemIsClass = collectionElemIsClass(recvTy, 0);
+            const sema::TypeRef* elemRef =
+                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                         : nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             auto* idxSlot = entryAlloca(i64());
@@ -1601,23 +1607,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            // Compare: for integers use icmp eq; for pointers use string eq
-            llvm::Value* eq;
-            if (el->getType()->isPointerTy() && target->getType()->isPointerTy()) {
-                eq = emitStringEq(el, target);  // string comparison
-            } else {
-                llvm::Value* elNorm = el, *tNorm = target;
-                if (el->getType() != target->getType()) {
-                    if (el->getType()->isIntegerTy() && target->getType()->isIntegerTy()) {
-                        unsigned ew = el->getType()->getIntegerBitWidth();
-                        unsigned tw = target->getType()->getIntegerBitWidth();
-                        llvm::Type* wide = ew >= tw ? el->getType() : target->getType();
-                        elNorm = builder_.CreateSExt(el, wide);
-                        tNorm = builder_.CreateSExt(target, wide);
-                    }
-                }
-                eq = builder_.CreateICmpEQ(elNorm, tNorm);
-            }
+            llvm::Value* eq =
+                emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+            if (!eq) return nullptr;
             builder_.CreateCondBr(eq, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
             builder_.CreateBr(endBB);
