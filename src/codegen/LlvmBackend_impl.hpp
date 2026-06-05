@@ -1072,6 +1072,17 @@ private:
     llvm::Function* ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
                                               const ast::PropertyAccessor* acc);
 
+    // §23.4: emit (or retrieve cached) a standalone LLVM function for a
+    // BLOCK-form indexer getter body (`property [i: …]: T get => do…end;`).
+    // The signature is (this, index-params…) → T; calling it returns the
+    // getter's value. As with the block-form property getter (§22.9) this
+    // keeps a `return` inside the getter body from prematurely terminating the
+    // enclosing method, and lets a record (aggregate) result flow back by
+    // value through the function's return type (§9.4).
+    llvm::Function* ensureIndexerBlockGetter(
+        const ast::PropertyDecl* pd, const ast::PropertyAccessor* acc,
+        const sema::PropertySymbol* ps);
+
     // §22.9: the block-form setter accessor of the property `target` names,
     // or null (auto-properties have backing storage and use the normal
     // store path; a non-property target is not one). Used to run a custom
