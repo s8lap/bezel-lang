@@ -3031,11 +3031,14 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                             bool isStr) {
     if (dynamic_cast<const ast::DiscardPattern*>(pat))
         return builder_.getInt1(true);
-    // CG38b: a BindingPattern always matches (it binds the scrutinee
-    // value unconditionally); the slot registration happens in the
-    // arm-body preamble after this function returns true.
-    if (dynamic_cast<const ast::BindingPattern*>(pat))
-        return builder_.getInt1(true);
+    // §19.5: a BindingPattern's match condition depends on whether it is
+    // typed. An unconstrained `var x` always matches; a typed `var x: T`
+    // is a type test (`scrut is-a T`) and must NOT match a value of an
+    // unrelated type. The typed-vs-unconstrained logic lives in the
+    // BindingPattern handler below (it needs `bp->type`); do not short-
+    // circuit to `true` here, or `var c: Circle` would wrongly match a
+    // non-Circle scrutinee and the arm's member accesses would read it as
+    // a Circle. (Slot registration still happens in the arm-body preamble.)
     // CG43: a bare qualified name `E.Red` parses as a NamedPattern; when
     // the scrutinee is an enum, resolve it to that enum's constant and
     // test equality. (A name denoting a type — a type-test pattern — is
