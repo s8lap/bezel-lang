@@ -242,6 +242,73 @@ const char* kOwnedArray =
     "  end; return R._n; "
     "end Main; end C;";
 
+// §28.4 + §7.1: an owner with a NULLABLE owned reference field (`owned _r: Res?`)
+// assigned NON-null. A reference `T?` is represented as a nullable pointer
+// (§7.1) — `null` means "no value", not a tagged struct — so the field's
+// resolved type is the inner class with the `nullable` flag set on the SAME
+// Named TypeRef. `isOwnedReferenceField` therefore classifies it as an owned
+// reference field, and the generated Dispose disposes the (non-null) referent
+// exactly once at scope end → destructor count 1. (Pre-fix premise: if a
+// nullable type resolved to a distinct wrapper, the field would be misclassified
+// and leak — this pins that it does not.)
+const char* kNullableOwnedFieldAssigned =
+    "module M; class Res "
+    "  public static count: int := 0; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Owner "
+    "  private owned _r: Res?; "
+    "  public constructor() this._r := new Res(); end constructor; "
+    "  destructor end destructor; "
+    "end Owner; "
+    "class C public static method Main(): int "
+    "  do using var o := new Owner(); end; return Res.count; "  // 1
+    "end Main; end C;";
+
+// §28.4 + §7.1: the same nullable owned field LEFT NULL. The disposal path
+// loads the slot and null-guards before dispatching Dispose; a calloc-zeroed
+// (never-assigned) nullable field is null, so nothing is disposed and nothing
+// crashes → destructor count 0. Complements the assigned case above.
+const char* kNullableOwnedFieldNull =
+    "module M; class Res "
+    "  public static count: int := 0; "
+    "  destructor Res.count := Res.count + 1; end destructor; "
+    "end Res; "
+    "class Owner "
+    "  private owned _r: Res?; "
+    "  public constructor() end constructor; "
+    "  destructor end destructor; "
+    "end Owner; "
+    "class C public static method Main(): int "
+    "  do using var o := new Owner(); end; return Res.count; "  // 0
+    "end Main; end C;";
+
+// §28.4 step 2: an owner mixing a NULLABLE owned field and a NON-NULLABLE owned
+// field — both disposed exactly once, in REVERSE declaration order. Each Res
+// carries an id whose destructor folds it into a base-10 accumulator
+// (seq := seq*10 + id). `_n` (non-nullable, declared SECOND, id 2) disposes
+// first → seq 2; `_r` (nullable, declared FIRST, id 1) disposes second →
+// seq 2*10 + 1 = 21. The value 21 (not 12) proves reverse order AND that BOTH
+// kinds of owned field — nullable and non-nullable — participate.
+const char* kMixedNullableNonNullableReverse =
+    "module M; class Res "
+    "  public static seq: int := 0; "
+    "  public id: int; "
+    "  public constructor(i: int) id := i; end constructor; "
+    "  destructor Res.seq := Res.seq * 10 + id; end destructor; "
+    "end Res; "
+    "class Owner "
+    "  private owned _r: Res?; "
+    "  private owned _n: Res; "
+    "  public constructor() "
+    "    this._r := new Res(1); this._n := new Res(2); "
+    "  end constructor; "
+    "  destructor end destructor; "
+    "end Owner; "
+    "class C public static method Main(): int "
+    "  do using var o := new Owner(); end; return Res.seq; "  // 21
+    "end Main; end C;";
+
 }  // namespace
 
 BEZEL_TEST(codegen_free_on_dispose_380, simple_object_disposed_and_freed) {
@@ -279,4 +346,23 @@ BEZEL_TEST(codegen_free_on_dispose_380, disposed_and_freed_on_exception_path) {
 BEZEL_TEST(codegen_free_on_dispose_380, owning_collection_elements_freed) {
     // Three owned elements disposed+freed exactly once each.
     expectDisposedAndLeakFree(kOwnedArray, 3);
+}
+
+BEZEL_TEST(codegen_free_on_dispose_380, nullable_owned_field_assigned_disposed_once) {
+    // §28.4 + §7.1: a non-null nullable owned reference field is disposed exactly
+    // once at scope end (count 1) and its block reclaimed (LSan-clean).
+    expectDisposedAndLeakFree(kNullableOwnedFieldAssigned, 1);
+}
+
+BEZEL_TEST(codegen_free_on_dispose_380, nullable_owned_field_null_disposes_nothing) {
+    // §28.4 + §7.1: a null nullable owned field disposes nothing (count 0) and
+    // does not crash — the null-guard skips the absent referent. LSan-clean.
+    expectDisposedAndLeakFree(kNullableOwnedFieldNull, 0);
+}
+
+BEZEL_TEST(codegen_free_on_dispose_380, mixed_nullable_nonnullable_reverse_order) {
+    // §28.4 step 2: a nullable and a non-nullable owned field are BOTH disposed
+    // exactly once, in reverse declaration order (_n then _r) → seq 21; both
+    // blocks reclaimed (LSan-clean).
+    expectDisposedAndLeakFree(kMixedNullableNonNullableReverse, 21);
 }
