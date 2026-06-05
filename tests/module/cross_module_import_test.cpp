@@ -1113,4 +1113,161 @@ BEZEL_TEST(cross_module_import, imported_enum_implicit_values_spec_10_1) {
     BEZEL_EXPECT_EQ(code, 102);
 }
 
+// §14 / §2.5 / §2.6 (issue #328 FINDING [2]): constructing an IMPORTED GENERIC
+// class is NOT yet supported and must produce a CLEAN COMPILE ERROR — not a
+// dangling-symbol link failure. Generics are monomorphized per-instantiation
+// (§14), so a generic template exports no stable `bz$<Type>$init`/`$ctor` symbol
+// the importer could link against; and the dependency metadata carries only the
+// type's PUBLIC SIGNATURE (no constructor body, no field initializers), so the
+// importer cannot monomorphize `Box<int>` at its use site the way a LOCAL
+// `new Box<int>(...)` does. Before the fix the importer emitted an external
+// `bz$Box$init` reference that no object defined → `undefined reference to
+// bz$Box$init` at link time. After: sema rejects the construction up front with
+// a diagnostic that names the limitation.
+BEZEL_TEST(cross_module_import, imported_generic_new_rejected_spec_14) {
+    ModuleMetadata dep = buildMetaFor(
+        "module BoxLib; "
+        "public class Box<T> "
+        "  public value: T; "
+        "  public constructor(v: T) value := v; end constructor; "
+        "  destructor end destructor; "
+        "end Box;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import BoxLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(42); "
+        "    return b.value; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    // The diagnostic must name the imported-generic-construction limitation, so
+    // the failure is an honest compile error rather than a cryptic linker error.
+    bool sawLimitation = false;
+    for (const Diagnostic& d : r->diags.diagnostics()) {
+        if (d.message.find("imported generic") != std::string::npos &&
+            d.message.find("\xC2\xA7""14") != std::string::npos)
+            sawLimitation = true;
+    }
+    BEZEL_EXPECT_TRUE(sawLimitation);
+}
+
+// §14 / §2.5 (FINDING [2]): a NON-generic imported `new` is unaffected by the
+// imported-generic carve-out — the regression guard. A's non-generic `Holder`
+// with a one-arg ctor type-checks cleanly cross-module (no diagnostic).
+BEZEL_TEST(cross_module_import, imported_nongeneric_new_still_ok_spec_2_5) {
+    ModuleMetadata dep = buildMetaFor(
+        "module HoldLib; "
+        "public class Holder "
+        "  public v: int; "
+        "  public constructor(start: int) v := start; end constructor; "
+        "  destructor end destructor; "
+        "end Holder;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import HoldLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var h := new Holder(7); "
+        "    return h.v; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// §14 / §2.6 (FINDING [2]): the end-to-end native build of an imported-generic
+// `new` must end in a CLEAN COMPILE FAILURE (rc != 0, a diagnostic) rather than
+// a confusing linker error or a crash. The library compiles fine (a generic
+// template's `bz$<Type>$ctor`/`$Dispose` are emitted; its per-instantiation init
+// is not a stable symbol); the importer's compile fails at sema before any
+// dangling `bz$<Type>$init` reference is emitted.
+BEZEL_TEST(cross_module_import, imported_generic_new_native_clean_failure_spec_14) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_genbox_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module BoxLib; "
+        "public class Box<T> "
+        "  public value: T; "
+        "  public constructor(v: T) value := v; end constructor; "
+        "  destructor end destructor; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import BoxLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(42); "
+        "    return b.value; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    // The library compiles (a generic template is emittable single-module).
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    // The importer must FAIL CLEANLY (a compile error from sema), not link.
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(!rb.success);
+    // No executable should have been produced (the build aborted before link).
+    BEZEL_EXPECT_TRUE(!std::filesystem::exists(bExe.path));
+}
+
+// §14 / §2.5 (FINDING [2]): an imported generic STATIC method with type
+// inference is UNAFFECTED by the imported-generic-`new` carve-out — only
+// generic-TYPE construction is rejected. `Util.Echo<T>(x)` called as
+// `Util.Echo(42)` (T inferred = int) compiles, links, and returns 42.
+BEZEL_TEST(cross_module_import, imported_generic_static_method_still_ok_spec_14) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_xm_genecho_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module UtilLib; "
+        "public class Util "
+        "  public static method Echo<T>(x: T): T => x; "
+        "end Util;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import UtilLib; "
+        "public class Program "
+        "  public static method Main(): int => Util.Echo(42); "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
 }  // namespace bezel::module
