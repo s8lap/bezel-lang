@@ -286,6 +286,12 @@ private:
         // keys are value-like"; keys are freed by bz_dict_free's own free(e.key)).
         bool dict = false;
         llvm::Value* dictValueDisposer = nullptr;
+        // per §4.6/§4.7: a `using var` bound to a LinkedList<T> or
+        // OwnedLinkedList<T>. At scope end it is freed via bz_llist_free.
+        // `collectionElemDisposer` (reused) is the per-element dispose callback
+        // for an OwnedLinkedList<T> of class elements (null for LinkedList<T>
+        // or value elements — only the node chain is freed, not the values).
+        bool linkedList = false;
         // #383 / §28: a `using var` that owns a class/interface object but
         // whose concrete class is not statically known here (an interface-
         // typed slot, or a call/`move` initializer). Disposed via DYNAMIC
@@ -1833,7 +1839,12 @@ private:
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return nullptr;
         auto* rt = ctx_.resolvedType(*fd->type);
-        return isCollectionTypeName(rt) ? rt : nullptr;
+        if (isCollectionTypeName(rt)) return rt;
+        // per §4.6/§4.7: owned LinkedList<T>/OwnedLinkedList<T> fields are also
+        // heap collections — freed via bz_llist_free, not bz_array_free; but
+        // they are identified here so emitOwnedFieldDisposals handles them.
+        if (isLinkedListTypeName(rt)) return rt;
+        return nullptr;
     }
 
     // ====================================================================
@@ -2403,6 +2414,10 @@ private:
     // null if the local is not a heap collection.
     const sema::TypeRef* collectionTypeOfLocal(const ast::LocalDecl* ld);
 
+    // per §4.6/§4.7: the resolved LinkedList<T>/OwnedLinkedList<T> TypeRef of
+    // a local, or null if the local is not a linked list.
+    const sema::TypeRef* linkedListTypeOfLocal(const ast::LocalDecl* ld);
+
     // #394 / stdlib §4.9: the resolved Dictionary/OwnedDictionary TypeRef of a
     // local (declared type, then `new` initializer type, then inferred
     // initializer type), or null if the local is not a hash-backed dictionary.
@@ -2767,6 +2782,8 @@ private:
 
     // Check if the named type (TypeRef with null declaration) is a collection.
     static bool isCollectionTypeName(const sema::TypeRef* rt);
+    // per §4.6/§4.7: true for LinkedList<T> / OwnedLinkedList<T> (bz_llist_t-backed).
+    static bool isLinkedListTypeName(const sema::TypeRef* rt);
     // §6.1 / §30.8: extract the builtin type name from a Named TypeRef that has
     // no user TypeDecl.  Two shapes exist:
     //   a) !rt->declaration: the name lives in rt->astNode->name->parts[0].
@@ -2837,6 +2854,10 @@ private:
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
+    // per §4.6/§4.7: lower LinkedList<T>/OwnedLinkedList<T> instance calls
+    // (Add*/Remove*/Find/Count/First/Last/etc.) and LinkedListNode<T> property
+    // accesses (.Value/.Next/.Previous) via the bz_llist_* runtime.
+    llvm::Value* tryLowerLinkedListInstanceCall(const ast::CallExpr& call);
 
     // stdlib §4.10 (#351): lower a dict-backed Set's set-algebra op
     // (UnionWith/ExceptWith/IsSubsetOf/IsSupersetOf) when `otherExpr` is a

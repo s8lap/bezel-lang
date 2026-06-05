@@ -1,0 +1,352 @@
+// Codegen tests for LinkedList<T> / OwnedLinkedList<T> node-based API.
+// Derives from stdlib §4.6 / §4.7 (Bezel_Standard_Library_0_129.md §4.6–§4.7).
+//
+// Covers:
+//   §4.6: AddFirst, AddLast, AddBefore, AddAfter, RemoveFirst, RemoveLast,
+//         RemoveNode, Find, Count, FirstNode, LastNode, First, Last,
+//         node.Value, node.Next, node.Previous
+//   §4.7: OwnedLinkedList<T> disposal (RemoveFirst/RemoveLast/RemoveNode/
+//         Clear disposes the value exactly once; scope-end disposes all).
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// Wrapper that prepends a resource class R with a static disposal counter.
+int runResource(const std::string& mainBody) {
+    return run(
+        "module M; "
+        "class R "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end R; "
+        "class C public static method Main(): int " + mainBody + " end Main; "
+        "end C;");
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// §4.6 LinkedList<T> — AddFirst / AddLast / Count
+// ---------------------------------------------------------------------------
+
+// per §4.6: AddLast appends; AddFirst prepends; Count reflects both.
+BEZEL_TEST(linked_list_4_6, add_last_order_and_count) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
+        "  return l.Count; "   // 3
+        "end Main; end C;"), 3);
+}
+
+BEZEL_TEST(linked_list_4_6, add_first_prepends) {
+    // Verify AddFirst prepends by reading FirstNode.Value via null-guard.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(20); l.AddFirst(10); "
+        "  var n := l.FirstNode; "
+        "  if n = null then return -1; end; "
+        "  return n.Value; "   // 10 (head)
+        "end Main; end C;"), 10);
+}
+
+// per §4.6: First and Last properties return the element value.
+// Access via FirstNode/LastNode node handles to satisfy nullability.
+BEZEL_TEST(linked_list_4_6, first_last_values) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
+        "  var fn := l.FirstNode; "
+        "  var ln := l.LastNode; "
+        "  if fn = null then return -1; end; "
+        "  if ln = null then return -2; end; "
+        "  return fn.Value + ln.Value; "   // 10 + 30 = 40
+        "end Main; end C;"), 40);
+}
+
+// ---------------------------------------------------------------------------
+// §4.6: node.Value / node.Next / node.Previous
+// ---------------------------------------------------------------------------
+
+// per §4.6: AddLast returns a node; node.Value reads the element.
+BEZEL_TEST(linked_list_4_6, node_value) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  var n := l.AddLast(42); "
+        "  return n.Value; "
+        "end Main; end C;"), 42);
+}
+
+// per §4.6: node.Next links to the subsequent node.
+// Uses explicit null-guards on node vars (spec §7.4: nullable variable requires
+// narrowing before member access).
+BEZEL_TEST(linked_list_4_6, node_next_chain) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(1); l.AddLast(2); l.AddLast(3); "
+        "  var n := l.FirstNode; "
+        "  if n = null then return -1; end; "
+        "  var s := n.Value; "
+        "  var n2 := n.Next; "
+        "  if n2 = null then return -2; end; "
+        "  s := s + n2.Value; "
+        "  var n3 := n2.Next; "
+        "  if n3 = null then return -3; end; "
+        "  s := s + n3.Value; "
+        "  return s; "   // 1 + 2 + 3 = 6
+        "end Main; end C;"), 6);
+}
+
+// per §4.6: node.Previous links to the prior node.
+BEZEL_TEST(linked_list_4_6, node_previous) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); "
+        "  var tail := l.LastNode; "
+        "  if tail = null then return -1; end; "
+        "  var prev := tail.Previous; "
+        "  if prev = null then return -2; end; "
+        "  return prev.Value; "   // 10
+        "end Main; end C;"), 10);
+}
+
+// ---------------------------------------------------------------------------
+// §4.6: AddBefore / AddAfter
+// ---------------------------------------------------------------------------
+
+// per §4.6: AddAfter inserts a new node immediately after the given node.
+// List: 10 → 20 → 30 after AddAfter(firstNode, 20). Count becomes 3.
+BEZEL_TEST(linked_list_4_6, add_after_found_node) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(30); "
+        "  var n := l.FirstNode; "
+        "  if n = null then return -1; end; "
+        "  l.AddAfter(n, 20); "
+        // List should now be: 10 -> 20 -> 30; Count = 3
+        "  return l.Count; "
+        "end Main; end C;"), 3);
+}
+
+// per §4.6: AddBefore inserts immediately before the given node.
+BEZEL_TEST(linked_list_4_6, add_before_found_node) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(30); "
+        "  var n := l.LastNode; "
+        "  l.AddBefore(n, 20); "
+        // List: 10 -> 20 -> 30
+        "  return l.Count; "   // 3
+        "end Main; end C;"), 3);
+}
+
+// ---------------------------------------------------------------------------
+// §4.6: Find — present and absent
+// ---------------------------------------------------------------------------
+
+// per §4.6: Find returns a non-null node for a present element.
+BEZEL_TEST(linked_list_4_6, find_present) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
+        "  var n := l.Find(20); "
+        "  if n = null then return 0; end; "
+        "  return n.Value; "   // 20
+        "end Main; end C;"), 20);
+}
+
+// per §4.6: Find returns null for an absent element.
+BEZEL_TEST(linked_list_4_6, find_absent) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); "
+        "  var n := l.Find(99); "
+        "  if n = null then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// §4.6: RemoveFirst / RemoveLast / RemoveNode
+// ---------------------------------------------------------------------------
+
+// per §4.6: RemoveFirst removes the head and decrements Count.
+BEZEL_TEST(linked_list_4_6, remove_first_decrements_count) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
+        "  l.RemoveFirst(); "
+        "  return l.Count * 10 + l.First; "   // 2*10 + 20 = 40
+        "end Main; end C;"), 40);
+}
+
+// per §4.6: RemoveLast removes the tail and decrements Count.
+BEZEL_TEST(linked_list_4_6, remove_last_decrements_count) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
+        "  l.RemoveLast(); "
+        "  return l.Count * 10 + l.Last; "   // 2*10 + 20 = 40
+        "end Main; end C;"), 40);
+}
+
+// per §4.6: RemoveNode removes a specific node by pointer.
+BEZEL_TEST(linked_list_4_6, remove_node_by_pointer) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
+        "  var n := l.Find(20); "
+        "  l.RemoveNode(n); "
+        "  return l.Count * 10 + l.First + l.Last; "   // 2*10 + 10 + 30 = 60
+        "end Main; end C;"), 60);
+}
+
+// ---------------------------------------------------------------------------
+// §4.6: FirstNode / LastNode properties return node handles.
+// ---------------------------------------------------------------------------
+
+// per §4.6: FirstNode/LastNode return node handles; access .Value after null-guard.
+BEZEL_TEST(linked_list_4_6, first_node_last_node) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); "
+        "  var fn := l.FirstNode; "
+        "  var ln := l.LastNode; "
+        "  if fn = null then return -1; end; "
+        "  if ln = null then return -2; end; "
+        "  return fn.Value * 10 + ln.Value; "   // 10*10 + 20 = 120
+        "end Main; end C;"), 120);
+}
+
+// ---------------------------------------------------------------------------
+// §4.7: OwnedLinkedList<T> — disposal semantics
+// ---------------------------------------------------------------------------
+
+// per §4.7: OwnedLinkedList.RemoveFirst disposes the removed element exactly once;
+// scope-end disposes the remaining elements.
+// Encoded: afterRemove*10 + afterScopeEnd (counts of disposals).
+BEZEL_TEST(owned_linked_list_4_7, remove_first_disposes_element) {
+    BEZEL_EXPECT_EQ(runResource(
+        "var afterRemove := -1; "
+        "do "
+        "  using var l := new OwnedLinkedList<R>(); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "  l.RemoveFirst(); "
+        "  afterRemove := R._n; "   // 1 disposed
+        "end; "
+        "return afterRemove * 10 + R._n;"),   // 1*10 + 3 = 13
+        13);
+}
+
+// per §4.7: OwnedLinkedList.RemoveLast disposes the removed element exactly once.
+BEZEL_TEST(owned_linked_list_4_7, remove_last_disposes_element) {
+    BEZEL_EXPECT_EQ(runResource(
+        "var afterRemove := -1; "
+        "do "
+        "  using var l := new OwnedLinkedList<R>(); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "  l.RemoveLast(); "
+        "  afterRemove := R._n; "   // 1 disposed
+        "end; "
+        "return afterRemove * 10 + R._n;"),   // 1*10 + 2 = 12
+        12);
+}
+
+// per §4.7: OwnedLinkedList.RemoveNode disposes the targeted element exactly once.
+BEZEL_TEST(owned_linked_list_4_7, remove_node_disposes_element) {
+    BEZEL_EXPECT_EQ(runResource(
+        "var afterRemove := -1; "
+        "do "
+        "  using var l := new OwnedLinkedList<R>(); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "  var fn := l.FirstNode; "
+        "  if fn = null then return -1; end; "
+        "  var n := fn.Next; "
+        "  if n = null then return -2; end; "
+        "  l.RemoveNode(n); "
+        "  afterRemove := R._n; "   // 1 disposed
+        "end; "
+        "return afterRemove * 10 + R._n;"),   // 1*10 + 3 = 13
+        13);
+}
+
+// per §4.7: scope-end of OwnedLinkedList<T> disposes ALL remaining elements.
+BEZEL_TEST(owned_linked_list_4_7, scope_end_disposes_all) {
+    BEZEL_EXPECT_EQ(runResource(
+        "do "
+        "  using var l := new OwnedLinkedList<R>(); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "end; "
+        "return R._n;"),   // 3 disposed
+        3);
+}
+
+// per §4.7: borrowing LinkedList<T> does NOT dispose elements on scope-end.
+BEZEL_TEST(linked_list_4_6, borrowing_list_does_not_dispose_elements) {
+    BEZEL_EXPECT_EQ(runResource(
+        "var r1 := new R(); "
+        "var r2 := new R(); "
+        "do "
+        "  using var l := new LinkedList<R>(); "
+        "  l.AddLast(r1); l.AddLast(r2); "
+        "end; "
+        // LinkedList<R> scope-end should NOT dispose r1/r2.
+        "var disposed_in_list_scope := R._n; "
+        "r1.Dispose(); r2.Dispose(); "
+        "return disposed_in_list_scope;"),   // 0 (list did not dispose)
+        0);
+}
+
+// per §4.7: OwnedLinkedList.Clear disposes every element exactly once.
+BEZEL_TEST(owned_linked_list_4_7, clear_disposes_all_elements) {
+    BEZEL_EXPECT_EQ(runResource(
+        "var afterClear := -1; "
+        "do "
+        "  using var l := new OwnedLinkedList<R>(); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "  l.AddLast(move (new R())); "
+        "  l.Clear(); "
+        "  afterClear := R._n; "   // all 3 disposed
+        "end; "
+        "return afterClear;"),
+        3);
+}
+
+// per §4.6: Count is correct after multiple operations.
+BEZEL_TEST(linked_list_4_6, count_after_operations) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(1); l.AddLast(2); l.AddLast(3); "
+        "  l.RemoveFirst(); l.RemoveLast(); "
+        "  return l.Count; "   // 1
+        "end Main; end C;"), 1);
+}

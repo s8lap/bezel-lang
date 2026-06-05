@@ -583,6 +583,188 @@ int32_t bz_set_algebra_gen(void* selfp, void** keys, int64_t n, int32_t op) {
 }
 
 // ---------------------------------------------------------------------------
+// bz_llist_t — doubly-linked list (stdlib §4.6 / §4.7)
+// ---------------------------------------------------------------------------
+
+// Node layout: prev*, next*, then elem_size bytes of element value inline.
+// The list header tracks head, tail, count, and the fixed elem_size used to
+// allocate nodes (so remove/free don't need a separately-passed elem_size).
+struct bz_llist_node_t {
+    bz_llist_node_t* prev;
+    bz_llist_node_t* next;
+    // element bytes follow immediately — flexible array trick via alloc
+};
+
+struct bz_llist_t {
+    bz_llist_node_t* head;
+    bz_llist_node_t* tail;
+    int64_t          count;
+    int64_t          elem_size;
+};
+
+// Allocate a node with elem_size bytes of value storage.
+static bz_llist_node_t* llist_node_alloc(int64_t elem_size, const void* elem) {
+    auto* n = (bz_llist_node_t*)calloc(
+        1, sizeof(bz_llist_node_t) + (size_t)elem_size);
+    if (elem && elem_size > 0)
+        memcpy((char*)n + sizeof(bz_llist_node_t), elem, (size_t)elem_size);
+    return n;
+}
+
+void* bz_llist_alloc(int64_t elem_size) {
+    auto* l = (bz_llist_t*)calloc(1, sizeof(bz_llist_t));
+    l->elem_size = elem_size;
+    return l;
+}
+
+int64_t bz_llist_count(void* listp) {
+    return listp ? ((bz_llist_t*)listp)->count : 0;
+}
+
+void* bz_llist_add_first(void* listp, const void* elem, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l) return nullptr;
+    bz_llist_node_t* n = llist_node_alloc(elem_size, elem);
+    n->next = l->head;
+    n->prev = nullptr;
+    if (l->head) l->head->prev = n;
+    l->head = n;
+    if (!l->tail) l->tail = n;
+    l->count++;
+    return n;
+}
+
+void* bz_llist_add_last(void* listp, const void* elem, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l) return nullptr;
+    bz_llist_node_t* n = llist_node_alloc(elem_size, elem);
+    n->prev = l->tail;
+    n->next = nullptr;
+    if (l->tail) l->tail->next = n;
+    l->tail = n;
+    if (!l->head) l->head = n;
+    l->count++;
+    return n;
+}
+
+void* bz_llist_add_before(void* listp, void* nodep, const void* elem,
+                           int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    auto* node = (bz_llist_node_t*)nodep;
+    if (!l || !node) return nullptr;
+    if (node == l->head) return bz_llist_add_first(listp, elem, elem_size);
+    bz_llist_node_t* n = llist_node_alloc(elem_size, elem);
+    n->next = node;
+    n->prev = node->prev;
+    if (node->prev) node->prev->next = n;
+    node->prev = n;
+    l->count++;
+    return n;
+}
+
+void* bz_llist_add_after(void* listp, void* nodep, const void* elem,
+                          int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    auto* node = (bz_llist_node_t*)nodep;
+    if (!l || !node) return nullptr;
+    if (node == l->tail) return bz_llist_add_last(listp, elem, elem_size);
+    bz_llist_node_t* n = llist_node_alloc(elem_size, elem);
+    n->prev = node;
+    n->next = node->next;
+    if (node->next) node->next->prev = n;
+    node->next = n;
+    l->count++;
+    return n;
+}
+
+// Internal: unlink and free `node`, calling dispose_elem if non-null.
+static void llist_unlink(bz_llist_t* l, bz_llist_node_t* node,
+                         void (*dispose_elem)(void*)) {
+    if (node->prev) node->prev->next = node->next;
+    else l->head = node->next;
+    if (node->next) node->next->prev = node->prev;
+    else l->tail = node->prev;
+    l->count--;
+    if (dispose_elem) {
+        void* vp = (char*)node + sizeof(bz_llist_node_t);
+        // For OwnedLinkedList<T: class>, element bytes hold a pointer; load it.
+        void* obj = *(void**)vp;
+        if (obj) dispose_elem(obj);
+    }
+    free(node);
+}
+
+void bz_llist_remove_first(void* listp, void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->head) return;
+    llist_unlink(l, l->head, dispose_elem);
+}
+
+void bz_llist_remove_last(void* listp, void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->tail) return;
+    llist_unlink(l, l->tail, dispose_elem);
+}
+
+void bz_llist_remove_node(void* listp, void* nodep,
+                           void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    auto* node = (bz_llist_node_t*)nodep;
+    if (!l || !node) return;
+    llist_unlink(l, node, dispose_elem);
+}
+
+// Find by memcmp equality on the inline element bytes.
+// For class-typed elements (pointer-sized), elem points to a pointer; we
+// compare the pointer value (reference identity, per §8.3 / §4.6).
+void* bz_llist_find(void* listp, const void* elem, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !elem) return nullptr;
+    for (bz_llist_node_t* n = l->head; n; n = n->next) {
+        void* vp = (char*)n + sizeof(bz_llist_node_t);
+        if (memcmp(vp, elem, (size_t)elem_size) == 0) return n;
+    }
+    return nullptr;
+}
+
+void* bz_llist_first_node(void* listp) {
+    return listp ? ((bz_llist_t*)listp)->head : nullptr;
+}
+
+void* bz_llist_last_node(void* listp) {
+    return listp ? ((bz_llist_t*)listp)->tail : nullptr;
+}
+
+void* bz_llist_node_value_ptr(void* nodep) {
+    return nodep ? (char*)nodep + sizeof(bz_llist_node_t) : nullptr;
+}
+
+void* bz_llist_node_next(void* nodep) {
+    return nodep ? ((bz_llist_node_t*)nodep)->next : nullptr;
+}
+
+void* bz_llist_node_prev(void* nodep) {
+    return nodep ? ((bz_llist_node_t*)nodep)->prev : nullptr;
+}
+
+void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l) return;
+    bz_llist_node_t* n = l->head;
+    while (n) {
+        bz_llist_node_t* nxt = n->next;
+        if (dispose_elem) {
+            void* vp = (char*)n + sizeof(bz_llist_node_t);
+            void* obj = *(void**)vp;
+            if (obj) dispose_elem(obj);
+        }
+        free(n);
+        n = nxt;
+    }
+    free(l);
+}
+
+// ---------------------------------------------------------------------------
 // Random
 // ---------------------------------------------------------------------------
 

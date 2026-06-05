@@ -308,6 +308,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "Queue" || n == "OwnedQueue" ||
                     n == "Set" || n == "OwnedSet" ||
                     n == "LinkedList" || n == "OwnedLinkedList" ||
+                    // §4.6: a LinkedListNode<T> variable holds a pointer to the
+                    // bz_llist_node_t; it is the node handle / borrow from the list.
+                    n == "LinkedListNode" ||
                     n == "StringBuilder" || n == "Random" ||
                     // §29: iteration interfaces are heap-allocated objects.
                     n == "IEnumerable" || n == "IEnumerator" ||
