@@ -320,6 +320,28 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         for (const auto& p : pd->indexerParams) {
             if (p.type) resolveType(*p.type, parent);
         }
+        // §23.2/§23.3 (FINDING [4]): resolve types embedded in accessor
+        // bodies — `new T()`, LocalDecl `: Type`, etc. — exactly as method
+        // bodies are resolved above (line 283). Without this a getter/setter
+        // body's `new Exception(...)` (the §23.3 throwing-setter idiom) has no
+        // resolved type, so it is typed null and codegen elides the
+        // construction, leaving the throw with a null exception value.
+        Scope propScope;
+        propScope.parent = parent;
+        // The expression-body property form (`property P: T => expr;`).
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression && pd->exprBody)
+            resolveTypesInExpr(*pd->exprBody, &propScope);
+        // The auto-property initializer (`property P: T := expr;`).
+        if (pd->autoInitializer)
+            resolveTypesInExpr(*pd->autoInitializer, &propScope);
+        // The block-form property accessors (`get => expr;` / `get => do … end;`).
+        for (const auto& acc : pd->accessors) {
+            if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+                acc.exprBody)
+                resolveTypesInExpr(*acc.exprBody, &propScope);
+            else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                resolveTypesInBody(acc.stmts, &propScope);
+        }
     } else if (auto* ed = dynamic_cast<const ast::EventDecl*>(&m)) {
         if (ed->type) resolveType(*ed->type, parent);
     } else if (auto* cd2 = dynamic_cast<const ast::ConstDecl*>(&m)) {

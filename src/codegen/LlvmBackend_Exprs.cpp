@@ -1226,8 +1226,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 dynamic_cast<sema::PropertySymbol*>(
                     ctx_.exprSymbol(*ma))->decl);
             llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc);
-            return builder_.CreateCall(getterFn->getFunctionType(),
-                                       getterFn, {obj});
+            llvm::Value* res = builder_.CreateCall(getterFn->getFunctionType(),
+                                                   getterFn, {obj});
+            // §31.1/§31.2 (FINDING [4]): a block-form getter is a standalone
+            // function; a `throw` inside it (the §23.3 idiom) leaves the
+            // pending-exception global set and returns. The caller must test
+            // that flag and route to the enclosing unwind target — exactly as
+            // an ordinary method call does (emitMethodCall → emitPendingCheck).
+            // Without this the throw is swallowed and `res` is a garbage value.
+            emitPendingCheck();
+            return res;
         }
     }
     // CG8: field read `obj.f`.
@@ -1263,7 +1271,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e));
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             llvm::Function* fn = ensurePropertyBlockGetter(pd, acc);
-            return builder_.CreateCall(fn->getFunctionType(), fn, {currentThis_});
+            llvm::Value* res =
+                builder_.CreateCall(fn->getFunctionType(), fn, {currentThis_});
+            // §31.1/§31.2 (FINDING [4]): see the qualified block-getter read
+            // above — a throw inside the standalone getter must propagate.
+            emitPendingCheck();
+            return res;
         }
         // CG12: a bare identifier resolving to a static field reads
         // its backing global.
