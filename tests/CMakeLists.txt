@@ -86,6 +86,7 @@ set(BEZEL_TEST_SOURCES
     sema/readonly_field_test.cpp
     sema/private_visibility_test.cpp
     sema/sealed_class_test.cpp
+    sema/case_exhaustiveness_test.cpp
     sema/multi_base_test.cpp
     sema/abstract_instantiation_test.cpp
     sema/inheritance_cycle_test.cpp
