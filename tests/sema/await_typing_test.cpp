@@ -325,3 +325,80 @@ BEZEL_TEST(sema_await, non_async_int_method_ok) {
     BEZEL_EXPECT_FALSE(hasAsyncReturnTypeError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §30.2 / Appendix C.7 (#444): `await` of a non-Task primitive (e.g. `await 5`)
+// is a compile error. The operand type `int` is not Task / Task<T> / OwnedTask<T>.
+// This is the general guard that turns any await-of-non-task into a clean diagnostic.
+BEZEL_TEST(sema_await_444, await_non_task_int_literal_diagnosed) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public async method F(): Task "
+        "    await 5; return; "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`await` requires") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §30.2 / Appendix C.7 (#444): `await` of a bool (the type produced by the
+// chained-comparison misparse of `Task.FromResult<int>(42)`, per §A.7 — no
+// call-site generic type argument syntax) is a compile error. This is the
+// core #444 repro at sema level: the misparse makes `await bool`, which is
+// now rejected cleanly instead of crashing codegen with a SIGSEGV.
+BEZEL_TEST(sema_await_444, await_bool_literal_diagnosed) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public async method F(): Task "
+        "    await true; return; "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`await` requires") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §A.7 / §17.1 (#444): a genuine chained comparison `a < b` produces bool and
+// must still compile (not over-rejected). The comparison itself is valid; only
+// `await`-ing the result is the error.
+BEZEL_TEST(sema_await_444, comparison_bool_result_compiles) {
+    // `3 < 5` is a valid bool expression; assigning to a bool local must work.
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public method F(): bool "
+        "    var b := 3 < 5; return b; "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §30.3 (#444): `await Task<int>` (inference form — the correct idiom matching
+// `Task.FromResult(42)`) still works and types the result as `int`. This
+// verifies the guard does NOT over-reject the valid Task typed form.
+BEZEL_TEST(sema_await_444, await_task_int_inference_form_ok) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static async method Producer(): Task<int> "
+        "    return 42; "
+        "  end Producer; "
+        "  public async method F(): Task<int> "
+        "    var n := await Producer(); "
+        "    return n; "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // The await must type as int.
+    auto* aw = firstAwait(r);
+    BEZEL_EXPECT_TRUE(aw != nullptr);
+    if (aw) {
+        auto* ty = r.ctx->exprType(*aw);
+        BEZEL_EXPECT_TRUE(ty && ty->kind == TypeRef::Kind::Primitive &&
+                          ty->primitive == PrimitiveType::Int);
+    }
+}

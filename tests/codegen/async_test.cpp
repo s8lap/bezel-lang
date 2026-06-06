@@ -1576,3 +1576,59 @@ BEZEL_TEST(async_30_5_445, two_plain_var_tasks_awaited_cross_thread_clean) {
         "  end Main; end C;",
         30);
 }
+
+// ===========================================================================
+// §30.2 / §A.7 (#444): `await` requires a Task / Task<T> / OwnedTask<T>
+// operand. Without the guard, `Task.FromResult<int>(42)` — misparsed by §A.7
+// (no call-site generic type argument syntax) as a chained comparison yielding
+// bool — was silently compiled to `await bool` (i1), which caused a SIGSEGV
+// in lowerAwait (the bool value was stored into a pointer-typed task field).
+// The guard converts the crash to a clean compile error.
+// ===========================================================================
+
+// §30.2 / §A.7 (#444) repro: `Task.FromResult<int>(42)` misparsed as
+// `(Task.FromResult < int) > (42)` → bool. `await bool` must be a clean
+// compile error (no crash, exit non-zero = compile failed).
+BEZEL_TEST(async_444, await_call_site_type_arg_misparsed_as_comparison_is_error) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    var x := await Task.FromResult<int>(42); "
+        "    return x; "
+        "  end Main; end C;"));
+}
+
+// §30.2 / §A.7 (#444): `await` on a plain integer literal is also rejected
+// with a clean error (the general guard for await-of-non-task).
+BEZEL_TEST(async_444, await_int_literal_non_task_is_error) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    var x := await 42; "
+        "    return x; "
+        "  end Main; end C;"));
+}
+
+// §30.3 (#444) no-over-rejection: `Task.FromResult(42)` (inference form, no
+// type args) still compiles and produces the correct value.
+BEZEL_TEST(async_444, await_task_from_result_inference_form_works) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    var x := await Task.FromResult(42); "
+        "    return x; "
+        "  end Main; end C;",
+        42);
+}
+
+// §17.1 / §A.7 (#444) no-over-rejection: a genuine comparison `3 < 5`
+// assigns to a bool local and still compiles and runs correctly.
+BEZEL_TEST(async_444, genuine_comparison_bool_still_works) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    var b := 3 < 5; "
+        "    if b then return 1; else return 0; end; "
+        "  end Main; end C;",
+        1);
+}
