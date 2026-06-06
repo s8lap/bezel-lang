@@ -391,6 +391,16 @@ void* bz_task_alloc(void);
 void  bz_task_schedule(void* task, void (*fn)(void* task, void* state),
                        void* state);
 
+// stdlib §6.7 / language spec §30.10: Task.Delay(milliseconds). Returns a fresh
+// task that is NOT yet complete; a thread-pool worker sleeps `ms` milliseconds
+// then completes it with no result. This is the genuinely-incomplete task that
+// drives the cross-thread suspend/resume path (§30.13): `await Task.Delay(...)`
+// in a generated async method registers its continuation via bz_task_then and
+// returns to the caller; the worker fires the continuation on the pool when the
+// sleep elapses. The scheduler is started lazily if not already running. A
+// non-positive `ms` completes the task essentially immediately (still off-thread).
+void* bz_task_delay(int64_t milliseconds);
+
 // Mark the task as done with a result (result_size bytes copied from result).
 // Wakes any blocked awaiter and runs registered continuations.
 void  bz_task_complete(void* task, const void* result, int64_t result_size);

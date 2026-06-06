@@ -104,16 +104,21 @@ std::string runtimeSourcePath() {
     return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
 }
 
-// LeakSanitizer verification for a single program. Returns:
-//   0  — ran clean: no leak, no use-after-free / double-free.
+// Sanitizer verification for a single program under the given -fsanitize=<san>
+// (e.g. "address" for ASan/LSan, "thread" for TSan/#439). Returns:
+//   0  — ran clean: no leak / UAF / double-free / data race reported.
 //   1  — sanitizer reported a problem: test failure.
 //  -1  — toolchain unavailable / build step failed: SKIP (not a failure).
-int runUnderLeakSanitizer(const std::string& source) {
+// The runtime is rebuilt under the same sanitizer and linked with the program's
+// object so the sanitizer instruments both the generated code and the runtime
+// (where the thread pool, refcounts, and task state live).
+int runUnderSanitizer(const std::string& source, const std::string& san,
+                      const char* runOpts) {
     if (std::system("clang++ --version > /dev/null 2>&1") != 0) return -1;
 
     static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_async_lsan_" + std::to_string(counter++);
+    std::string stem = "bezel_async_san_" + san + "_" + std::to_string(counter++);
     std::string objPath = (dir / (stem + ".o")).string();
     std::string rtObj   = (dir / (stem + "_rt.o")).string();
     std::string exe     = (dir / stem).string();
@@ -144,22 +149,33 @@ int runUnderLeakSanitizer(const std::string& source) {
         std::remove(exe.c_str());
     };
     std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
+        "clang++ -std=c++20 -g -fsanitize=" + san + " -pthread -c " +
         runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
     if (std::system(rtCmd.c_str()) != 0) { cleanup(); return -1; }
 
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+    std::string linkCmd = "clang++ -fsanitize=" + san + " -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
     if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
 
     std::string runCmd =
-        "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
+        std::string(runOpts) + " " + exe + " > /dev/null 2>&1";
     int status = std::system(runCmd.c_str());
     cleanup();
     if (status == -1) return -1;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer
     return 0;                                                      // clean
+}
+
+// LeakSanitizer verification (ASan exitcode=99 on any leak/UAF/double-free).
+int runUnderLeakSanitizer(const std::string& source) {
+    return runUnderSanitizer(source, "address",
+                             "ASAN_OPTIONS=detect_leaks=1:exitcode=99");
+}
+
+// ThreadSanitizer verification (#439): exit 99 on any reported data race.
+int runUnderThreadSanitizer(const std::string& source) {
+    return runUnderSanitizer(source, "thread", "TSAN_OPTIONS=exitcode=99");
 }
 
 // Assert correctness (exit code) AND, when the toolchain is present, that LSan
@@ -169,6 +185,22 @@ void expectValueLeakFree(const std::string& source, int expectedExitCode) {
     int lsan = runUnderLeakSanitizer(source);
     if (lsan == -1) return;       // toolchain unavailable: skip the LSan leg
     BEZEL_EXPECT_EQ(lsan, 0);     // 0 == LSan clean
+}
+
+// #439 cross-thread assertion: a program whose await suspends on a genuinely-
+// incomplete task (Task.Delay) and resumes on a thread-pool worker. Run the
+// program 3x to catch nondeterministic cross-thread bugs (the result must be
+// stable), then — when the toolchain is present — verify it is ASan-clean (no
+// leak / UAF / double-free across the thread boundary) AND TSan-clean (no data
+// race in the scheduler / task state / atomic refcounts). The 3x repetition + the
+// two sanitizers together are the bar for the cross-thread path (§30.13 / #439).
+void expectValueCrossThread(const std::string& source, int expectedExitCode) {
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(source), expectedExitCode);
+    int lsan = runUnderLeakSanitizer(source);
+    if (lsan != -1) BEZEL_EXPECT_EQ(lsan, 0);   // 0 == ASan/LSan clean
+    int tsan = runUnderThreadSanitizer(source);
+    if (tsan != -1) BEZEL_EXPECT_EQ(tsan, 0);   // 0 == TSan clean (no race)
 }
 
 }  // namespace
@@ -616,4 +648,116 @@ BEZEL_TEST(async_30_9, await_in_finally_is_rejected) {
         "    try x := 1; finally x := await Producer(5); end; "
         "    return x; "
         "  end Main; end C;"));
+}
+
+// ===========================================================================
+// #439 — TRULY CONCURRENT async: the scheduler runs, continuations run on a
+// thread pool, and `await Task.Delay(...)` is a GENUINELY-incomplete task whose
+// resume fires on a worker thread (§30.13). These tests use Task.Delay — the
+// real stdlib §6.7 / §30.10 primitive (Task.Run does NOT exist in the Bezel
+// spec, so it is not used). Each verifies the cross-thread suspend/resume path:
+// the await registers its continuation and returns to the caller; a pool worker
+// completes the delay and re-enters the state machine; the outer task completes;
+// the top-level (async Main / bz_task_await_sync) blocks until done; the
+// scheduler shuts down so the process exits without hung threads. expectValue-
+// CrossThread runs each 3x (determinism) and verifies ASan- and TSan-clean.
+// ===========================================================================
+
+// §30.13 (#439): the simplest cross-thread suspend. `await Task.Delay(ms)` is a
+// no-value await on a task that is NOT done at the await point — the worker
+// sleeps then completes it, firing the resume on the pool. Main returns 7 to
+// prove control flowed through the suspend and back across the thread boundary.
+BEZEL_TEST(async_30_13, await_task_delay_then_value) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    await Task.Delay(5); "
+        "    return 7; "
+        "  end Main; end C;",
+        7);
+}
+
+// §30.13 (#439): a value computed AFTER a genuinely-async suspend. `Compute`
+// delays then returns 42 (the value is produced on the worker that resumed it);
+// Main awaits it and adds 1. The named result local `x` round-trips through the
+// heap frame across the cross-thread suspend. 42 + 1 = 43.
+BEZEL_TEST(async_30_13, await_delayed_compute_returns_value) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(): Task<int> "
+        "    await Task.Delay(5); "
+        "    return 42; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var x := await Compute(); "
+        "    return x + 1; "
+        "  end Main; end C;",
+        43);
+}
+
+// §30.13 (#439): NESTED async on the pool — a task whose body itself awaits
+// another genuinely-incomplete task. `Outer` awaits `Inner` (which delays and
+// returns 5), then delays again, then returns v + 10. Each suspend resumes on a
+// worker; the frame carries `v` across both thread boundaries. 5 + 10 = 15.
+BEZEL_TEST(async_30_13, nested_async_on_pool) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Inner(): Task<int> "
+        "    await Task.Delay(5); "
+        "    return 5; "
+        "  end Inner; "
+        "  public static async method Outer(): Task<int> "
+        "    var v := await Inner(); "
+        "    await Task.Delay(5); "
+        "    return v + 10; "
+        "  end Outer; "
+        "  public static async method Main(): Task<int> "
+        "    var r := await Outer(); "
+        "    return r; "
+        "  end Main; end C;",
+        15);
+}
+
+// §30.10 (#439): Task.Delay(TimeSpan) overload. TimeSpan.FromMilliseconds(5)
+// yields a tick count the runtime converts back to ms. Confirms the second Delay
+// overload resolves and drives the same cross-thread path. Returns 8.
+BEZEL_TEST(async_30_10, await_task_delay_timespan) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    await Task.Delay(TimeSpan.FromMilliseconds(5)); "
+        "    return 8; "
+        "  end Main; end C;",
+        8);
+}
+
+// §30.13 (#439) STRESS: spawn many genuinely-async pool tasks and await them,
+// accumulating the sum. The loop awaits 20 Task.Delay-backed producers in
+// sequence; each suspends and resumes on a worker, so the state machine
+// re-enters the loop 20 times across thread boundaries. The result must be the
+// stable total (1+2+...+20 = 210) on every one of the 3 runs, ASan-clean (no
+// leak / UAF / double-free as 20 frames + tasks are allocated and reclaimed
+// across threads) and TSan-clean (no data race in the pool / task state /
+// atomic refcounts under repeated cross-thread completion). The await result is
+// bound to a NAMED local (`r`) which round-trips through the heap frame — the
+// cross-thread-correct shape; an await embedded in a larger expression
+// (`total + await ...`) relies on stack-slot dominance repair that does not yet
+// survive a real cross-thread suspend (a deferred increment).
+BEZEL_TEST(async_30_13, concurrency_stress_sum_of_pool_tasks) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(2); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 0; var i := 1; "
+        "    while i <= 20 do "
+        "      var r := await Compute(i); "
+        "      total := total + r; "
+        "      i := i + 1; "
+        "    end; "
+        "    return total; "
+        "  end Main; end C;",
+        210);
 }

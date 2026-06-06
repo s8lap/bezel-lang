@@ -919,6 +919,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctTy);
                         }
                     }
+                    // §30.10 / stdlib §6.7: Task static helpers. `Task.Delay(...)`
+                    // returns a (non-generic) `Task` — a genuinely-incomplete task
+                    // the awaiter suspends on. The result TypeRef carries an
+                    // ast::Type named "Task" (no generic args) so the `await`
+                    // typer (ExprTypecheck_Exprs.cpp) recognizes it as `await Task`
+                    // → unit. The four Delay overloads (int / TimeSpan, each with
+                    // an optional CancellationToken) all yield a bare `Task`.
+                    if (colName == "Task") {
+                        if (m == "Delay") {
+                            auto* tt = ctx_.makeTypeRef();
+                            tt->kind = TypeRef::Kind::Named;
+                            tt->nullable = false;
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("Task");
+                            ann->name.reset(nm);
+                            tt->astNode = ann;
+                            ctx_.setExprType(&ce, tt);
+                        }
+                    }
                 }
                 // §2.5: DateTime instance method return types.
                 // The receiver's TypeRef uses builtinClassSym (non-null declaration,

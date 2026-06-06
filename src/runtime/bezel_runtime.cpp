@@ -28,6 +28,7 @@
 #include <queue>
 #include <vector>
 #include <thread>
+#include <chrono>
 #include <functional>
 #include <unordered_set>
 
@@ -1445,17 +1446,46 @@ void bz_task_schedule(void* tp, void (*fn)(void* task, void* state), void* state
     g_scheduler->submit([task, fn, state]() { fn(task, state); });
 }
 
+// stdlib §6.7 / §30.10: Task.Delay(ms). Allocate a fresh (incomplete) task and
+// post a worker that sleeps `ms` then completes it with no value. The task is
+// genuinely incomplete at return, so an `await Task.Delay(...)` hits the suspend
+// path (bz_task_then) and resumes on the pool when the sleep elapses (§30.13).
+void* bz_task_delay(int64_t milliseconds) {
+    if (!g_scheduler) bz_scheduler_init(4);   // ensure a pool exists
+    auto* task = new bz_task_t();
+    int64_t ms = milliseconds < 0 ? 0 : milliseconds;
+    g_scheduler->submit([task, ms]() {
+        if (ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        bz_task_complete(task, nullptr, 0);
+    });
+    return task;
+}
+
 static void task_notify(bz_task_t* task) {
-    // Run continuations, then wake any sync-awaiter
+    // §30.13 (#439): wake any sync-awaiter FIRST, then dispatch continuations.
+    //
+    // Ordering is load-bearing for cross-thread safety. A continuation may FREE
+    // the task (the await-resume that fired it frees an anonymous producer task —
+    // e.g. `await Task.Delay(...)` — via bz_task_free). Once a continuation is
+    // submitted to the pool, another worker can run it and free `task` at any
+    // moment, so task_notify must not touch `task` (its mutex / cv) AFTER the
+    // submit. We therefore: (1) snapshot the continuation list under the lock,
+    // (2) notify the cv while `task` is still guaranteed live (no continuation has
+    // been handed off yet), then (3) submit the continuations and return without
+    // touching `task` again. `done` was already set by the caller before
+    // task_notify, so a sync-awaiter that wakes re-checks the predicate and
+    // proceeds; the awaiter never frees the task it awaits (the awaiting side owns
+    // that), so the cv stays valid for the duration of the notify.
     std::vector<bz_task_t::Cont> conts;
     {
         std::lock_guard<std::mutex> lk(task->mtx);
         conts = task->continuations;
     }
+    task->cv.notify_all();
     for (auto& c : conts)
         if (g_scheduler) g_scheduler->submit([c, task](){ c.fn(task, c.state); });
         else c.fn(task, c.state);
-    task->cv.notify_all();
 }
 
 void bz_task_complete(void* tp, const void* result, int64_t result_size) {
@@ -3076,9 +3106,18 @@ extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
 // counting is sound and sufficient: a value's data buffer and header are freed
 // exactly when the last reference goes away, with no cycle to leak.
 //
-// The count is a plain (non-atomic) int64 today; this becomes an atomic
-// fetch-add/sub when async (multiple threads sharing a string) lands. A single
-// inline retain/release keeps the hot path cheap.
+// §28.9 / #439: the count is ATOMIC now that async lands. Async continuations
+// resume on any thread-pool thread (§30.13), and a runtime-managed string may be
+// captured into an async frame and released on a different thread than the one
+// that retained it, so retain/release must be a data-race-free atomic
+// read-modify-write. The cheapest sound choice (correctness-first per §28.9) is
+// a single __atomic_add_fetch / __atomic_sub_fetch with acq_rel ordering on the
+// rc word: the increment publishes the new reference; the final decrement
+// synchronizes-with all prior releases so the freeing thread observes every
+// writer's stores before it frees. The rc field sits at an 8-byte-aligned offset
+// in a malloc/calloc'd header (max-aligned base), so the reinterpreted int64* is
+// suitably aligned for a lock-free atomic op. The SENTINEL check is a relaxed
+// load (a literal's rc is a compile-time constant, never mutated concurrently).
 //
 // SENTINEL: literal/global strings (emitted as constant LLVM globals by
 // codegen, never heap-allocated) carry rc == BZ_STRING_RC_SENTINEL; retain and
@@ -3088,23 +3127,19 @@ extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
 
 extern "C" void bz_string_retain(void* s) {
     if (!s) return;
-    int64_t rc;
-    memcpy(&rc, (uint8_t*)s + BZ_STRING_RC_OFFSET, sizeof(int64_t));
-    if (rc == BZ_STRING_RC_SENTINEL) return;  // static/literal — never counted
-    rc += 1;
-    memcpy((uint8_t*)s + BZ_STRING_RC_OFFSET, &rc, sizeof(int64_t));
+    int64_t* rcp = (int64_t*)((uint8_t*)s + BZ_STRING_RC_OFFSET);
+    if (__atomic_load_n(rcp, __ATOMIC_RELAXED) == BZ_STRING_RC_SENTINEL)
+        return;                                // static/literal — never counted
+    __atomic_add_fetch(rcp, 1, __ATOMIC_ACQ_REL);
 }
 
 extern "C" void bz_string_release(void* s) {
     if (!s) return;
-    int64_t rc;
-    memcpy(&rc, (uint8_t*)s + BZ_STRING_RC_OFFSET, sizeof(int64_t));
-    if (rc == BZ_STRING_RC_SENTINEL) return;  // static/literal — never freed
-    rc -= 1;
-    if (rc > 0) {
-        memcpy((uint8_t*)s + BZ_STRING_RC_OFFSET, &rc, sizeof(int64_t));
+    int64_t* rcp = (int64_t*)((uint8_t*)s + BZ_STRING_RC_OFFSET);
+    if (__atomic_load_n(rcp, __ATOMIC_RELAXED) == BZ_STRING_RC_SENTINEL)
+        return;                                // static/literal — never freed
+    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
         return;
-    }
     // Last reference gone: free the data buffer, then the header. Read the data
     // pointer at offset 0 (the layout's first field). free(NULL) is safe (the
     // empty-string case may carry a null data pointer).
@@ -3141,8 +3176,12 @@ extern "C" void bz_string_release(void* s) {
 // Acyclic reference counting is therefore sound: no owning edge out of a closure
 // means no cycle to leak and no captured destructor to run on free.
 //
-// The count is a plain (non-atomic) int64 today; this becomes an atomic
-// fetch-add/sub when async (closures shared across threads) lands.
+// §28.9 / #439: the count is ATOMIC now that async lands — a closure may be
+// captured into an async frame (or passed to a worker that runs it) and released
+// on a different thread than the one that retained it (§30.13). A single
+// __atomic_add_fetch / __atomic_sub_fetch (acq_rel) on the 8-byte-aligned rc
+// word is the cheapest sound read-modify-write; the final decrement
+// synchronizes-with prior releases before the env block + cell are freed.
 //
 // null is a no-op for both (a nullable `((...) -> ...)?` slot may hold null).
 
@@ -3153,21 +3192,15 @@ static const int64_t BZ_CLOSURE_ENV_OFFSET = 8;
 
 extern "C" void bz_closure_retain(void* c) {
     if (!c) return;
-    int64_t rc;
-    memcpy(&rc, (uint8_t*)c + BZ_CLOSURE_RC_OFFSET, sizeof(int64_t));
-    rc += 1;
-    memcpy((uint8_t*)c + BZ_CLOSURE_RC_OFFSET, &rc, sizeof(int64_t));
+    int64_t* rcp = (int64_t*)((uint8_t*)c + BZ_CLOSURE_RC_OFFSET);
+    __atomic_add_fetch(rcp, 1, __ATOMIC_ACQ_REL);
 }
 
 extern "C" void bz_closure_release(void* c) {
     if (!c) return;
-    int64_t rc;
-    memcpy(&rc, (uint8_t*)c + BZ_CLOSURE_RC_OFFSET, sizeof(int64_t));
-    rc -= 1;
-    if (rc > 0) {
-        memcpy((uint8_t*)c + BZ_CLOSURE_RC_OFFSET, &rc, sizeof(int64_t));
+    int64_t* rcp = (int64_t*)((uint8_t*)c + BZ_CLOSURE_RC_OFFSET);
+    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
         return;
-    }
     // Last reference gone: free the env block (if any), then the cell. The env
     // block is uniquely owned by this cell (each lowerLambda / makeMethodThunk
     // allocates a fresh env for the one cell it builds), so freeing it here is a
@@ -3215,8 +3248,12 @@ extern "C" void bz_closure_release(void* c) {
 // class instance's bytes ({ vtable, i8 disposed-flag@1, fields }) are therefore
 // never read as an rc and never freed here.
 //
-// The count is a plain (non-atomic) int64 today; this becomes an atomic
-// fetch-add/sub when async (boxes shared across threads) lands.
+// §28.9 / #439: the count is ATOMIC now that async lands — a boxed value may be
+// captured into an async frame and released on a different thread than the one
+// that retained it (§30.13). A single __atomic_add_fetch / __atomic_sub_fetch
+// (acq_rel) on the 8-byte-aligned rc word is the cheapest sound read-modify-
+// write; the final decrement synchronizes-with prior releases before the wrapper
+// is freed.
 //
 // null is a no-op for both (a null T? boxes to a null Object reference, §8.6).
 
@@ -3225,21 +3262,15 @@ static const int64_t BZ_BOX_RC_OFFSET = 8;
 
 extern "C" void bz_box_retain(void* b) {
     if (!b) return;
-    int64_t rc;
-    memcpy(&rc, (uint8_t*)b + BZ_BOX_RC_OFFSET, sizeof(int64_t));
-    rc += 1;
-    memcpy((uint8_t*)b + BZ_BOX_RC_OFFSET, &rc, sizeof(int64_t));
+    int64_t* rcp = (int64_t*)((uint8_t*)b + BZ_BOX_RC_OFFSET);
+    __atomic_add_fetch(rcp, 1, __ATOMIC_ACQ_REL);
 }
 
 extern "C" void bz_box_release(void* b) {
     if (!b) return;
-    int64_t rc;
-    memcpy(&rc, (uint8_t*)b + BZ_BOX_RC_OFFSET, sizeof(int64_t));
-    rc -= 1;
-    if (rc > 0) {
-        memcpy((uint8_t*)b + BZ_BOX_RC_OFFSET, &rc, sizeof(int64_t));
+    int64_t* rcp = (int64_t*)((uint8_t*)b + BZ_BOX_RC_OFFSET);
+    if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
         return;
-    }
     // Last reference gone: free the box wrapper. The boxed value is a value type
     // (a leaf — no owned sub-objects), so nothing else is freed; the single
     // calloc'd cell is released exactly once. The box was proven non-escaping by

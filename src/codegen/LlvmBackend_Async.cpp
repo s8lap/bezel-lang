@@ -342,14 +342,26 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // captures (this + params)
         emitFrameCaptureStores(frame, st);
 
-        // §30.13: the runtime scheduler is NOT eagerly started here. For the
-        // synchronous / already-done cut every await hits the fast path and runs
-        // inline (bz_task_then and bz_task_complete both run continuations
-        // inline when no scheduler exists), so no thread pool is needed and none
-        // is spawned — keeping the process leak-free under LSan. A real
-        // cross-thread suspend (bz_task_schedule on a producer that has not yet
-        // completed) lazily initializes the pool in the runtime; that path is the
-        // deferred concurrency increment.
+        // §30.13 (#439): start the runtime thread pool before driving an async
+        // Main. The pool's worker threads run the continuations of genuinely-
+        // incomplete tasks (Task.Delay, and any task whose producer suspends),
+        // resuming the state machine across the thread boundary. Starting it in
+        // the Main prologue (a single program-wide root, §22.7 / §33.2) means the
+        // pool is up before any await that might suspend. A purely synchronous /
+        // already-done body never touches the pool (each await hits the fast path
+        // and runs inline), so the threads simply idle until shutdown — but
+        // starting them is cheap and keeps the cross-thread path correct. For a
+        // non-Main async method the pool is initialized lazily by the runtime
+        // (bz_task_delay / bz_task_schedule) on first use. bz_scheduler_init is
+        // idempotent (a no-op if already started), so a lazy init that already ran
+        // is harmless.
+        if (isMain(ms)) {
+            auto* schedInitFn = declareC("bz_scheduler_init",
+                                         llvm::Type::getVoidTy(llvm_), {i32()});
+            // A small fixed pool (4 workers) — enough to run nested/concurrent
+            // continuations without unbounded thread growth (§30.13).
+            builder_.CreateCall(schedInitFn, {builder_.getInt32(4)});
+        }
 
         // Drive the state machine once synchronously (§30.1 synchronous prefix).
         builder_.CreateCall(resumeFn, {llvm::ConstantPointerNull::get(ptrTy()), st});
@@ -384,11 +396,23 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 res = builder_.CreateLoad(resultTy, resPtr, "main.result");
                 if (resultTy != i32()) res = builder_.CreateTruncOrBitCast(res, i32());
             }
+            // §30.13 (#439): shut the thread pool down cleanly before Main
+            // returns so the process exits without hung worker threads (and
+            // leak-clean under LSan: the pool's threads + queue are joined and
+            // freed). This runs AFTER bz_task_await_sync(outerTask) above, so the
+            // outer task is already complete — every continuation has either run
+            // or is the one that completed it; shutdown drains the queue and joins
+            // each worker, so no continuation is still in flight when we free the
+            // task below. bz_scheduler_shutdown is a no-op if the pool was never
+            // started (a purely synchronous body that lazily-init'd nothing).
+            auto* schedShutdownFn = declareC("bz_scheduler_shutdown",
+                                             llvm::Type::getVoidTy(llvm_), {});
+            builder_.CreateCall(schedShutdownFn, {});
             // §30.5 (minimal): reclaim the outer task (its result buffer) on the
             // normal completion path so the process is leak-clean. The frame was
             // already freed by the completing resume (emitAsyncComplete). Safe
-            // here: the synchronous cut completes inline, so no continuation is
-            // still in flight referencing the task.
+            // here: the outer task is complete and the pool is shut down, so no
+            // continuation is still in flight referencing the task.
             auto* freeTaskFn = declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
                                         {ptrTy()});
             builder_.CreateCall(freeTaskFn, {outerTask});

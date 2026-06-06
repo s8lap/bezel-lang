@@ -181,7 +181,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    // spec; import-gating not yet enforced (same stance as §4.8
                    // KeyNotFoundException).
                    id->name == "CancellationToken" ||
-                   id->name == "CancellationTokenSource") {
+                   id->name == "CancellationTokenSource" ||
+                   // §30.10 / stdlib §6.7: the `Task` static-helper class is
+                   // auto-imported (Task.Delay, Task.FromResult, …). Only used in
+                   // expression position as the receiver of a static helper call.
+                   id->name == "Task") {
             // §2.3: these System classes are auto-imported and always
             // available without an explicit import. Give them a synthetic
             // TypeSymbol (null decl) so member access can proceed; the
