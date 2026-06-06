@@ -1979,14 +1979,19 @@ private:
     static bool containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     static bool exprContainsAwait(const ast::Expr* e);
 
-    // §30.9 deferred tail (#438): detect an `await` anywhere inside a
-    // try / catch / finally construct. Resuming into the correct handler scope
-    // across a suspend (and re-raising the original exception object) is the
-    // next increment; the emitter rejects it with a clear diagnostic + safe
-    // stub rather than emitting handler-state that the flat resume model can't
-    // re-establish. Recurses into nested loops / ifs / do-blocks so a try
-    // nested inside them is still caught.
-    static bool awaitInTry(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+    // §30.9 / §31.2 (#438): detect an `await` in a try POSITION that is STILL
+    // deferred — i.e. inside a catch arm body, a catch guard, or a `finally`
+    // body. `await` in a try BODY is now supported (the resume block is lowered
+    // inside the try's protected region, so a faulted await re-raises into the
+    // enclosing catch and the finally runs on every path — see emitAsyncMethod /
+    // lowerAwait). Resuming into a catch handler (re-establishing the caught-
+    // exception disposal scope across a suspend) or into a finally (the exit-mode
+    // re-dispatch across a suspend) is the next increment, so those positions are
+    // rejected with a clear diagnostic + safe stub. Recurses into nested loops /
+    // ifs / do-blocks / try-bodies so a deferred position nested in them is still
+    // caught.
+    static bool awaitInDeferredTryPosition(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 
     // §30.1 / §30.2: emit an `async` method (one returning Task / Task<T> /
     // OwnedTask<T>; the async-iterator forms — async + yield — are deferred).

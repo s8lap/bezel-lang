@@ -437,19 +437,169 @@ BEZEL_TEST(async_30_2, await_embedded_in_expression_straight_line) {
         15);
 }
 
-// §30.9 deferred tail (#438): `await` inside a try/catch is NOT yet supported —
-// resuming into the handler scope across a suspend (and re-raising the original
-// exception object) is the next async increment. It must be rejected with a
-// clear diagnostic and must NOT emit malformed IR. This pins the new boundary.
-BEZEL_TEST(async_30_9, await_in_try_is_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// §30.9 / §31.2 (#438): `await` inside a try BODY with a normal (non-faulting)
+// awaited task. The try completes, the catch is NOT entered, and the awaited
+// value is correct. The resume block sits inside the try's protected region so
+// the post-await code keeps the catch dispatch as its unwind target. 5 + 1 = 6.
+BEZEL_TEST(async_30_9, await_in_try_normal_completion) {
+    expectValueLeakFree(
         "module M; class C "
         "  public static async method Producer(n: int): Task<int> "
         "    return n; "
         "  end Producer; "
         "  public static async method Main(): Task<int> "
         "    var x := 0; "
-        "    try x := await Producer(5); catch Exception => x := 1; end; "
+        "    try x := await Producer(5); catch Exception => x := 100; end; "
+        "    return x + 1; "
+        "  end Main; end C;",
+        6);
+}
+
+// §30.9 / §31.2 (#438): awaiting a FAULTED task inside a try BODY is CAUGHT by
+// the enclosing catch — not propagated to the process boundary. `Boom` faults
+// its task with a synchronous throw; the await re-raises (§30.9) into the catch,
+// which sets x := 7. Without the fix the fault would propagate (exit 70).
+BEZEL_TEST(async_30_9, await_faulted_task_caught_by_catch) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); catch Exception => x := 7; end; "
+        "    return x; "
+        "  end Main; end C;"),
+        7);
+}
+
+// §30.9 / §31.4 (#438): a faulted await is matched by a TYPE-SPECIFIC catch arm
+// (InvalidOperationException), confirming the original exception object — not a
+// generic message — is carried through the task so `is`-based arm matching works.
+BEZEL_TEST(async_30_9, await_faulted_task_caught_by_type) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); "
+        "    catch ArgumentException => x := 1; "
+        "    catch InvalidOperationException => x := 9; end; "
+        "    return x; "
+        "  end Main; end C;"),
+        9);
+}
+
+// §30.9 / §31.2 (#438): a faulted await whose type does NOT match any arm
+// re-propagates past the try to the process boundary (exit 70). The mismatched
+// arm leaves the exception in flight; the function fault boundary completes the
+// outer task with the error.
+BEZEL_TEST(async_30_9, await_faulted_task_unmatched_arm_propagates) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); catch ArgumentException => x := 1; end; "
+        "    return x; "
+        "  end Main; end C;"),
+        70);
+}
+
+// §30.9 / §31.2 (#438): `await` inside a try BODY with a `finally`. The awaited
+// value is correct AND the finally runs on the normal completion path. The
+// finally adds 100 to the result via a side effect: 5 then +100 = 105.
+BEZEL_TEST(async_30_9, await_in_try_finally_runs_on_normal) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; var ran := 0; "
+        "    try x := await Producer(5); finally ran := 100; end; "
+        "    return x + ran; "
+        "  end Main; end C;",
+        105);
+}
+
+// §30.9 / §31.2 (#438): try/catch/finally together with an await in the body —
+// normal completion runs the body and the finally (not the catch). 3 + 50 = 53.
+BEZEL_TEST(async_30_9, await_in_try_catch_finally_normal) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; var ran := 0; "
+        "    try x := await Producer(3); "
+        "    catch Exception => x := 999; "
+        "    finally ran := 50; end; "
+        "    return x + ran; "
+        "  end Main; end C;",
+        53);
+}
+
+// §30.9 / §31.2 (#438): a faulted await caught by the catch, with a finally that
+// also runs. The catch sets x := 8, the finally adds 30: 8 + 30 = 38.
+BEZEL_TEST(async_30_9, await_faulted_caught_finally_runs) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; var ran := 0; "
+        "    try x := await Boom(); "
+        "    catch Exception => x := 8; "
+        "    finally ran := 30; end; "
+        "    return x + ran; "
+        "  end Main; end C;"),
+        38);
+}
+
+// §30.9 / §31.2 (#438): a try BODY with an await NESTED inside another try BODY.
+// The inner await faults; the inner catch handles it. Confirms nested protected
+// regions across a suspend. inner sets x := 4, outer adds 20: 24.
+BEZEL_TEST(async_30_9, await_in_nested_try) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try "
+        "      try x := await Boom(); catch Exception => x := 4; end; "
+        "      x := x + 20; "
+        "    catch Exception => x := 999; end; "
+        "    return x; "
+        "  end Main; end C;"),
+        24);
+}
+
+// §30.9 deferred tail (#438): `await` inside a CATCH ARM body is still NOT
+// supported — resuming into a catch handler (re-establishing the caught-exception
+// disposal scope across a suspend) is a further increment. Rejected with a clear
+// diagnostic and no malformed IR.
+BEZEL_TEST(async_30_9, await_in_catch_arm_is_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); "
+        "    catch Exception => do x := await Producer(5); end; end; "
         "    return x; "
         "  end Main; end C;"));
 }

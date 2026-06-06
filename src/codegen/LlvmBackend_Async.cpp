@@ -174,63 +174,69 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
 }
 
 
-// §30.9 deferred tail (#438): detect an `await` anywhere inside a try / catch /
-// finally construct. Resuming into the right handler scope across a suspend —
-// and re-raising the ORIGINAL exception object — is the next async increment;
-// until then the emitter rejects await-in-try with a diagnostic + safe stub
-// rather than emitting handler state the flat resume model can't re-establish.
-// On encountering a TryStmt, an await anywhere in its body, a catch arm
-// (guard or body), or its finally is the deferred case; we also recurse into
-// the other compound statements so a try nested inside a loop / if / do-block is
-// still caught.
-bool Emitter::awaitInTry(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+// §30.9 / §31.2 (#438): detect an `await` in a STILL-DEFERRED try position — a
+// catch arm (guard or body) or a `finally` body. An `await` in the try BODY is
+// now supported: lowerTry lowers the body (and hence the await's resume block)
+// inside the try's protected region, so the resume keeps the catch dispatch /
+// finally as its unwind target — a faulted await (re-raised with the original
+// exception object, §30.9) routes to the enclosing catch, and the finally runs
+// on every completion path. What remains hard is resuming INTO a catch handler
+// (re-establishing the caught-exception disposal scope + currentCaughtExc_
+// across a suspend) or into a finally (the exit-mode re-dispatch across a
+// suspend); those are rejected with a diagnostic + safe stub. We recurse into
+// every compound statement — including a try BODY — so a deferred position
+// nested inside a loop / if / do-block / inner try is still caught.
+bool Emitter::awaitInDeferredTryPosition(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
     for (const auto& s : stmts) {
         if (!s) continue;
         if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
-            // The whole try construct is a handler scope; reuse containsAwait
-            // for the body / finally and check each catch arm explicitly.
-            if (containsAwait(ts->body)) return true;
+            // A catch guard / arm body or a finally with an await is deferred.
+            // A catch arm body is a single Stmt (often a DoEndBlock);
+            // containsAwait operates on a statement list, so inspect the single
+            // statement directly via the common shapes.
             for (const auto& arm : ts->catches) {
                 if (arm.guard && exprContainsAwait(arm.guard.get()))
                     return true;
-                if (arm.body) {
-                    // A catch arm body is a single Stmt (often a DoEndBlock).
-                    // containsAwait operates on a statement list; inspect the
-                    // single statement directly via the common shapes.
-                    if (auto* db =
-                            dynamic_cast<const ast::DoEndBlock*>(arm.body.get())) {
+                const ast::Stmt* ab = arm.body.get();
+                if (ab) {
+                    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(ab)) {
                         if (containsAwait(db->body)) return true;
-                    } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(
-                                   arm.body.get())) {
+                    } else if (auto* es =
+                                   dynamic_cast<const ast::ExpressionStmt*>(ab)) {
                         if (exprContainsAwait(es->expr.get())) return true;
-                    } else if (auto* asn = dynamic_cast<const ast::AssignmentStmt*>(
-                                   arm.body.get())) {
+                    } else if (auto* asn =
+                                   dynamic_cast<const ast::AssignmentStmt*>(ab)) {
                         if (exprContainsAwait(asn->value.get())) return true;
-                    } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
-                                   arm.body.get())) {
+                    } else if (auto* ld =
+                                   dynamic_cast<const ast::LocalDecl*>(ab)) {
                         if (exprContainsAwait(ld->initializer.get())) return true;
-                    } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(
-                                   arm.body.get())) {
+                    } else if (auto* rs =
+                                   dynamic_cast<const ast::ReturnStmt*>(ab)) {
                         if (exprContainsAwait(rs->value.get())) return true;
                     }
                 }
             }
             if (containsAwait(ts->finallyBody)) return true;
+            // The try BODY is supported, but it may itself contain a NESTED try
+            // whose catch / finally awaits — recurse into the body too.
+            if (awaitInDeferredTryPosition(ts->body)) return true;
             continue;
         }
-        // Recurse into other compound statements so a try nested inside a loop,
-        // if, or do-block is still caught.
+        // Recurse into other compound statements so a deferred position nested
+        // inside a loop, if, or do-block is still caught.
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
-            if (awaitInTry(fs->body)) return true;
+            if (awaitInDeferredTryPosition(fs->body)) return true;
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
-            if (awaitInTry(ws->body)) return true;
+            if (awaitInDeferredTryPosition(ws->body)) return true;
         } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
-            if (awaitInTry(ifs->ifBranch.body)) return true;
+            if (awaitInDeferredTryPosition(ifs->ifBranch.body)) return true;
             for (const auto& el : ifs->elifBranches)
-                if (awaitInTry(el.body)) return true;
-            if (ifs->hasElse && awaitInTry(ifs->elseBody)) return true;
+                if (awaitInDeferredTryPosition(el.body)) return true;
+            if (ifs->hasElse && awaitInDeferredTryPosition(ifs->elseBody))
+                return true;
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
-            if (awaitInTry(db->body)) return true;
+            if (awaitInDeferredTryPosition(db->body)) return true;
         }
     }
     return false;
@@ -242,19 +248,21 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     if (!ci.stmts) return;
     smKind_ = SuspendKind::Await;
 
-    // §30.9 deferred tail (#438): `await` inside try / catch / finally needs the
-    // resume to re-establish the handler scope (and re-raise the ORIGINAL
-    // exception object) across a suspend — the flat resume model can't yet do
-    // that. Detect it and emit a safe, well-formed stub rather than malformed IR,
-    // with a clear diagnostic. (await-in-loop is now supported — see
-    // fixupSuspendDominance below.)
-    if (awaitInTry(*ci.stmts)) {
+    // §30.9 / §31.2 (#438): `await` in a try BODY is supported (lowerTry lowers
+    // the await's resume block inside the protected region, so a faulted await
+    // re-raises into the enclosing catch and the finally runs on every path).
+    // `await` in a catch arm or a `finally` is still deferred — resuming INTO a
+    // catch handler / finally across a suspend needs the caught-exception
+    // disposal scope / exit-mode re-dispatch re-established at resume, which the
+    // flat resume model can't yet do. Reject those positions with a clear
+    // diagnostic + safe stub so no malformed IR escapes.
+    if (awaitInDeferredTryPosition(*ci.stmts)) {
         ctx_.diagnostics().report(
             Severity::Error,
             ms->decl ? ms->decl->span.begin : SourceLocation{},
-            "not yet implemented: `await` inside a try/catch/finally — resuming "
-            "into the handler scope across a suspend is a deferred increment "
-            "(§30.9)");
+            "not yet implemented: `await` inside a catch arm or a `finally` — "
+            "resuming into the handler scope across a suspend is a deferred "
+            "increment (`await` in a try BODY is supported) (§30.9)");
         // Emit a minimal well-formed body so no malformed IR escapes: alloc the
         // task, complete it with a zero/default result, and return it (or the
         // exit code for async Main). The diagnostic above fails the compile.
@@ -432,10 +440,18 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // completes the OUTER task with an error so the awaiter observes the
         // fault, then returns from resume. A try/catch in the body installs its
         // own nearer unwindTarget_ via lowerTry, so handled throws never reach
-        // here; only genuinely-uncaught faults do. (Resuming into a handler
-        // scope across an await — await-in-try — is deferred; the minimal cut's
-        // tests do not await inside try.) The original exception's TYPE is not
-        // reconstructed across the task boundary yet — a generic message is used.
+        // here; only genuinely-uncaught faults do.
+        //
+        // §30.9: the in-flight exception object lives in the bz$exc global at this
+        // point (a synchronous `throw` stored it there before branching to the
+        // unwind target; a faulted-await re-raise — lowerAwait below — likewise
+        // restores the awaited task's exception object into bz$exc before
+        // branching here when no nearer handler exists). Carry that ORIGINAL
+        // object through the outer task (bz_task_complete_error_obj) so the next
+        // awaiter — including one inside its own try/catch — re-raises the real
+        // exception type, not a reconstructed message. If bz$exc happens to be
+        // null (a non-object fault), the awaiter's await.fault path falls back to
+        // completing with no object (the unhandled boundary still exits non-zero).
         auto* faultBB = llvm::BasicBlock::Create(llvm_, "async.fault", resumeFn);
         unwindTarget_ = faultBB;
         {
@@ -444,14 +460,17 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* otField = builder_.CreateStructGEP(
                 stateStructTy, self, OUTER_TASK_FIELD);
             llvm::Value* outerTask = builder_.CreateLoad(ptrTy(), otField);
-            auto* completeErrFn = declareC("bz_task_complete_error",
-                                           llvm::Type::getVoidTy(llvm_),
-                                           {ptrTy(), ptrTy()});
-            llvm::Value* msg = lowerStringLiteral("\"async method faulted\"", false);
-            // bz_task_complete_error takes a C string (const char*); pass the
-            // string object's data pointer.
-            llvm::Value* msgData = loadStringData(msg);
-            builder_.CreateCall(completeErrFn, {outerTask, msgData});
+            llvm::Value* excObj =
+                builder_.CreateLoad(ptrTy(), excGlobal(), "async.fault.exc");
+            auto* completeErrObjFn = declareC("bz_task_complete_error_obj",
+                                              llvm::Type::getVoidTy(llvm_),
+                                              {ptrTy(), ptrTy()});
+            builder_.CreateCall(completeErrObjFn, {outerTask, excObj});
+            // The exception object's ownership transfers to the outer task's
+            // awaiter (or the unhandled boundary); clear bz$exc so it is not
+            // double-handled if this resume activation continues elsewhere.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 excGlobal());
             // §30.5: the frame is dead on this terminal (fault) path — free it.
             auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeFn2, {self});
@@ -574,15 +593,20 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
                                          smStateStruct_, smSelf_,
                                          asyncPendingTaskField_));
 
-    // §30.9 (basic): a faulted awaited task propagates the fault. The minimal
-    // cut forwards the fault UP THE AWAIT CHAIN: it completes THIS method's outer
-    // task with the awaited task's error message (bz_task_complete_error) and
-    // returns from resume. Whoever awaits this method's task then observes the
-    // fault and propagates further; at the top (async Main) the entry's
-    // bz_task_await_sync returns null and the process exits non-zero. This does
-    // NOT yet resume into an enclosing try/catch handler scope — await-in-try and
-    // re-raising the ORIGINAL exception object are deferred (§30.9). Emitted
-    // unconditionally so `await Task` (no value) also propagates a fault.
+    // §30.9: awaiting a faulted task RE-RAISES the original exception "with the
+    // original stack trace preserved" (spec §30.9). The state machine routes this
+    // re-raise through the SAME unwind machinery a synchronous `throw` uses:
+    // restore the awaited task's exception object into the bz$exc global, run the
+    // intervening unwind disposals, and branch to the current unwindTarget_.
+    //   - Inside a try BODY, unwindTarget_ is the try's catch.dispatch, so the
+    //     fault is CAUGHT by the enclosing catch (and the finally runs) — §31.2.
+    //   - Outside any try, unwindTarget_ is the resume function's async.fault
+    //     boundary, which completes THIS outer task with the same exception
+    //     object (bz_task_complete_error_obj) so the next awaiter re-raises it in
+    //     turn; at the top (async Main) the process exits non-zero (§33.3).
+    // Carrying the exception OBJECT (not just a message) lets a type-specific
+    // catch arm match it (emitIsA needs the real object). Emitted unconditionally
+    // so `await Task` (no value) re-raises a fault too.
     {
         auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
         llvm::Value* faulted =
@@ -592,26 +616,28 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
         builder_.CreateCondBr(faulted, faultBB, okBB);
 
         builder_.SetInsertPoint(faultBB);
-        // Forward the awaited task's error message into the outer task.
-        auto* errMsgFn = declareC("bz_task_error", ptrTy(), {ptrTy()});
-        llvm::Value* msg = builder_.CreateCall(errMsgFn, {awaitedTask}, "await.errmsg");
-        llvm::Value* otField = builder_.CreateStructGEP(
-            smStateStruct_, smSelf_, asyncOuterTaskField_);
-        llvm::Value* outerTask = builder_.CreateLoad(ptrTy(), otField);
-        auto* completeErrFn = declareC("bz_task_complete_error",
-                                       llvm::Type::getVoidTy(llvm_),
-                                       {ptrTy(), ptrTy()});
-        builder_.CreateCall(completeErrFn, {outerTask, msg});
-        // §30.5: this fault path is terminal — reclaim the awaited task (if it
-        // was an anonymous producer result) and the frame before returning.
-        auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        // Restore the awaited task's exception object into the in-flight slot.
+        // The object is a Bezel heap exception independent of the task's own
+        // buffers, so freeing the task below does not free it.
+        auto* errObjFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+        llvm::Value* excObj =
+            builder_.CreateCall(errObjFn, {awaitedTask}, "await.errobj");
+        builder_.CreateStore(excObj, excGlobal());
+        // §30.5: reclaim the awaited task here when it is an anonymous producer
+        // result (`await Producer()`) — a single-use task with no other owner.
+        // bz_task_free frees the task struct + its result/message buffers but NOT
+        // the exception object, which now lives on in bz$exc for the handler.
         if (dynamic_cast<const ast::CallExpr*>(un.operand.get())) {
             auto* freeTaskFn = declareC("bz_task_free",
                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeTaskFn, {awaitedTask});
         }
-        builder_.CreateCall(freeFn2, {smSelf_});
-        builder_.CreateRetVoid();
+        // §28.3 / CG21: dispose the using-vars unwound between here and the
+        // handler (a caught-exception entry is skipped — it stays in flight), the
+        // same as emitThrowValue's synchronous-throw path, then branch to the
+        // unwind target (catch.dispatch inside a try, or async.fault otherwise).
+        emitUnwindDisposals();
+        builder_.CreateBr(unwindBB());
 
         builder_.SetInsertPoint(okBB);
     }
