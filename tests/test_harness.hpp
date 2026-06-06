@@ -10,6 +10,7 @@
 // real framework later is cheap.
 
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -43,10 +44,23 @@ struct Registrar {
     }
 };
 
+// Run all registered tests, optionally filtered by BEZEL_TEST_FILTER.
+// If the env var is set, only tests whose suite or name contains the substring
+// (case-sensitive) are run; unmatched tests are silently skipped. If unset,
+// all tests are run (unchanged behaviour).
 inline int runAll() {
+    const char* filterEnv = std::getenv("BEZEL_TEST_FILTER");
+    std::string filter = filterEnv ? filterEnv : "";
+
     std::size_t passed = 0;
     std::size_t failed = 0;
+    std::size_t skipped = 0;
     for (const TestCase& test : registry()) {
+        if (!filter.empty()) {
+            bool match = test.suite.find(filter) != std::string::npos ||
+                         test.name.find(filter) != std::string::npos;
+            if (!match) { ++skipped; continue; }
+        }
         currentTestFailed() = false;
         std::cout << "[ RUN  ] " << test.suite << "." << test.name << "\n";
         test.body();
@@ -59,8 +73,9 @@ inline int runAll() {
         }
     }
     std::cout << "\n"
-              << passed << " passed, " << failed << " failed, "
-              << registry().size() << " total\n";
+              << passed << " passed, " << failed << " failed";
+    if (skipped > 0) std::cout << ", " << skipped << " filtered";
+    std::cout << ", " << registry().size() << " total\n";
     return failed == 0 ? 0 : 1;
 }
 

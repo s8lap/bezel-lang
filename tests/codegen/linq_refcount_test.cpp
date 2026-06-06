@@ -56,6 +56,7 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
+#include "native_test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -86,14 +87,6 @@ int compileAndRun(const std::string& source) {
     return code;
 }
 
-std::string runtimeSourcePath() {
-    fs::path here(__FILE__);                       // tests/codegen/<this>
-    fs::path root = here.parent_path()             // tests/codegen
-                        .parent_path()             // tests
-                        .parent_path();            // repo root
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
-}
-
 // Lower `source` to an object via the real pipeline; -1 on any failure (SKIP).
 int lowerToObject(const std::string& source, const std::string& objPath) {
     bezel::DiagnosticEngine diags;
@@ -118,24 +111,20 @@ int lowerToObject(const std::string& source, const std::string& objPath) {
 
 // LeakSanitizer verification. Returns 0 (clean: no leak, no UAF/DF),
 // 1 (sanitizer reported a problem), or -1 (toolchain unavailable: SKIP).
+// Uses the memoized ASan runtime object (compiled once per process).
 int runUnderLeakSanitizer(const std::string& source) {
-    if (std::system("clang++ --version > /dev/null 2>&1") != 0) return -1;
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
     static int counter = 0;
     auto dir = fs::temp_directory_path();
     std::string stem = "bezel_422linq_lsan_" + std::to_string(counter++);
     std::string objPath = (dir / (stem + ".o")).string();
-    std::string rtObj   = (dir / (stem + "_rt.o")).string();
     std::string exe     = (dir / stem).string();
     if (lowerToObject(source, objPath) != 0) return -1;
     auto cleanup = [&] {
         std::remove(objPath.c_str());
-        std::remove(rtObj.c_str());
         std::remove(exe.c_str());
     };
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return -1; }
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
@@ -162,24 +151,20 @@ void expectValueAndLeakFree(const std::string& source, int expectedExitCode) {
 // program exited with `expectedExitCode` (no corruption), or the toolchain is
 // unavailable (SKIP). Used to run a lazy-materialized program multiple times to
 // prove the dispose-path closure release never produces a UAF.
+// Uses the memoized ASan runtime object (compiled once per process).
 bool runNoCorruption(const std::string& source, int expectedExitCode) {
-    if (std::system("clang++ --version > /dev/null 2>&1") != 0) return true;
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return true;  // toolchain unavailable: SKIP
     static int counter = 0;
     auto dir = fs::temp_directory_path();
     std::string stem = "bezel_422linq_safe_" + std::to_string(counter++);
     std::string objPath = (dir / (stem + ".o")).string();
-    std::string rtObj   = (dir / (stem + "_rt.o")).string();
     std::string exe     = (dir / stem).string();
     if (lowerToObject(source, objPath) != 0) return true;  // SKIP
     auto cleanup = [&] {
         std::remove(objPath.c_str());
-        std::remove(rtObj.c_str());
         std::remove(exe.c_str());
     };
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return true; }
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";

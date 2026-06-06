@@ -63,6 +63,7 @@
 #include "support/Diagnostic.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
+#include "native_test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -103,14 +104,6 @@ int compileAndRun(const std::string& source) {
     return code;
 }
 
-std::string runtimeSourcePath() {
-    fs::path here(__FILE__);                       // tests/codegen/<this>
-    fs::path root = here.parent_path()             // tests/codegen
-                        .parent_path()             // tests
-                        .parent_path();            // repo root
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
-}
-
 // LeakSanitizer verification for one program. Lowers to an object file, links
 // against an ASan-instrumented runtime, runs under LSan. Returns:
 //   0  — clean: no leak, no use-after-free / double-free.
@@ -118,13 +111,13 @@ std::string runtimeSourcePath() {
 //  -1  — toolchain unavailable / build step failed: SKIP.
 // Identical mechanism to free_on_dispose_test.cpp.
 int runUnderLeakSanitizer(const std::string& source) {
-    if (std::system("clang++ --version > /dev/null 2>&1") != 0) return -1;
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
 
     static int counter = 0;
     auto dir = fs::temp_directory_path();
     std::string stem = "bezel_excdisp_lsan_" + std::to_string(counter++);
     std::string objPath = (dir / (stem + ".o")).string();
-    std::string rtObj   = (dir / (stem + "_rt.o")).string();
     std::string exe     = (dir / stem).string();
 
     {
@@ -149,13 +142,8 @@ int runUnderLeakSanitizer(const std::string& source) {
 
     auto cleanup = [&] {
         std::remove(objPath.c_str());
-        std::remove(rtObj.c_str());
         std::remove(exe.c_str());
     };
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return -1; }
 
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
