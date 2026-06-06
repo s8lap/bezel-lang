@@ -369,6 +369,16 @@ private:
         // bz_cts_dispose (idempotent — signals surviving tokens and frees the
         // source). Recognised by the local's declared/resolved type name.
         bool cancellationTokenSource = false;
+        // stdlib §6.7 / §30.5: a `using var` bound to a Task / Task<T>.
+        // Tasks have no user TypeSymbol; at scope end the task is disposed via
+        // bz_task_fire_and_forget (non-blocking per §30.5: "does not block waiting
+        // for completion"). FireAndForget registers a continuation that calls
+        // bz_task_free when the task eventually completes — safe for both already-
+        // done and still-running tasks (no UAF). Double-free safety: `await t`
+        // where `t` is a using-var does NOT call bz_task_free (lowerAwait only
+        // frees anonymous CallExpr operands), so the sole free is via the faf
+        // continuation — exactly once.
+        bool task = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -2905,6 +2915,14 @@ private:
     static std::string_view builtinTypeName(const sema::TypeRef* rt);
 
     static bool isDictTypeName(const sema::TypeRef* rt);
+
+    // stdlib §6.7 / §30.5: true when `rt` is a Task / Task<T> or OwnedTask<T>
+    // (bare name "Task" or "OwnedTask", with or without generic args, no user
+    // TypeDecl — these are builtin runtime types, not user-defined classes).
+    static bool isTaskTypeName(const sema::TypeRef* rt);
+    // stdlib §6.7 / §30.5: return a local's resolved Task / Task<T> TypeRef if
+    // it is Task-typed; null otherwise. Used by the using-var registration path.
+    const sema::TypeRef* taskTypeOfLocal(const ast::LocalDecl* ld);
 
     // issue #401 / stdlib §4.1 / §4.2: is `rt` one of the int-indexed list
     // INTERFACES (IReadOnlyList<T>, IList<T>, IOwnedList<T>)? These are the only

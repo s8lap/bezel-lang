@@ -2575,6 +2575,19 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // stdlib §6.7 / §30.5: a `using var` bound to a Task / Task<T> / OwnedTask<T>.
+    // Tasks have no user TypeSymbol; at scope end the task is freed via bz_task_free.
+    // Double-free safety: lowerAwait only frees tasks whose operand is an anonymous
+    // CallExpr (e.g. `await Producer()`), never a named local (`await t`) — so a
+    // using-var-bound task is freed exactly once here at scope end.
+    // Recognised by the initializer's inferred expression type name "Task" or
+    // "OwnedTask", or by the declared type name.
+    if (taskTypeOfLocal(ld)) {
+        Disposal d{it->second, nullptr};
+        d.task = true;
+        disposeStack_.back().push_back(d);
+        return;
+    }
     // #362 / stdlib §4.5: a `using var` bound to a heap collection
     // (Array<T>/OwnedArray<T>/Dictionary/Set/…). These are builtins with no
     // user TypeSymbol, so classOfLocal returns null; recognize them by name and
@@ -2681,6 +2694,9 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
     if (!ld->initializer) return nullptr;
     if (collectionTypeOfLocal(ld) || dictTypeOfLocal(ld) ||
         linkedListTypeOfLocal(ld)) return nullptr;
+    // stdlib §6.7 / §30.5: Task / Task<T> — disposed via bz_task_free, not
+    // class vtable dispatch. Exclude from the owned-class unwind path.
+    if (taskTypeOfLocal(ld)) return nullptr;
     if (ld->type && isSubscriptionType(ctx_.resolvedType(*ld->type)))
         return nullptr;
     if (isSubscriptionExpr(*ld->initializer)) return nullptr;
@@ -4163,6 +4179,53 @@ const sema::TypeRef* Emitter::dictTypeOfLocal(const ast::LocalDecl* ld) {
 }
 
 
+// stdlib §6.7 / §30.5: true when `rt` is a Task / Task<T> or OwnedTask<T> —
+// a builtin runtime-managed async task type with no user TypeDecl. Freed via
+// bz_task_free. Recognises the names "Task" and "OwnedTask" in a TypeRef that
+// has no user declaration (declaration == null or declaration->decl == null
+// with name "Task"/"OwnedTask") and no user TypeDecl entry.
+bool Emitter::isTaskTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    // Path A: no declaration at all — name is in astNode->name->parts[0].
+    if (!rt->declaration) {
+        if (rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty()) {
+            auto& n = rt->astNode->name->parts[0];
+            return n == "Task" || n == "OwnedTask";
+        }
+        return false;
+    }
+    // Path B: builtinClassSym — a declaration with no user-defined decl and
+    // whose name is "Task" or "OwnedTask".
+    if (!rt->declaration->decl) {
+        return rt->declaration->name == "Task" ||
+               rt->declaration->name == "OwnedTask";
+    }
+    return false;
+}
+
+// stdlib §6.7 / §30.5: recover the Task/Task<T>/OwnedTask<T> TypeRef for a
+// local's initializer or declared type. Prefers the inferred expression type
+// (which is set for static calls like `Task.FromResult(42)`, `Task.Delay(10)`)
+// over the declared type (rarely annotated explicitly for task locals). Returns
+// null if the local does not hold a task.
+const sema::TypeRef* Emitter::taskTypeOfLocal(const ast::LocalDecl* ld) {
+    // Prefer the inferred expression type from the initializer — Task.FromResult,
+    // Task.Delay, Task.WhenAll, Task.WhenAny, and async-method calls all set
+    // the type on the initializer expression.
+    if (ld->initializer) {
+        if (auto* rt = ctx_.exprType(*ld->initializer))
+            if (isTaskTypeName(rt)) return rt;
+    }
+    // Fall back to the declared type annotation.
+    if (ld->type) {
+        if (auto* rt = ctx_.resolvedType(*ld->type))
+            if (isTaskTypeName(rt)) return rt;
+    }
+    return nullptr;
+}
+
+
 const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
     if (ld->type) {
         if (auto* rt = ctx_.resolvedType(*ld->type)) {
@@ -4376,6 +4439,37 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_cts_dispose",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {cts});
+            continue;
+        }
+        // stdlib §6.7 / §30.5: a `using var` Task / Task<T>. At scope end, the
+        // task's Dispose() runs "but does not block waiting for completion" (§30.5).
+        // We implement this via bz_task_fire_and_forget, which registers a
+        // continuation that calls bz_task_free when the task eventually completes.
+        // This is safe for both already-complete tasks (the continuation fires
+        // immediately via bz_task_then's fast path) and still-running tasks
+        // (the task struct remains live until the continuation fires). The
+        // alternative of calling bz_task_free directly at scope end would be
+        // unsafe if the task is still running on the thread pool (UAF). Null-
+        // guarded: bz_task_fire_and_forget tolerates a null task gracefully (no
+        // continuation is registered for null). Double-free safety: lowerAwait only
+        // frees tasks whose operand is an anonymous CallExpr (`await Producer()`),
+        // never a named local (`await t`), so a using-var-bound task is fired-
+        // and-forgotten exactly once here at scope end.
+        if (it->task) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* t = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                t, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* fafBB = llvm::BasicBlock::Create(llvm_, "task.faf", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "task.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, fafBB);
+            builder_.SetInsertPoint(fafBB);
+            auto* fn = declareC("bz_task_fire_and_forget",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {t});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // #383 / §28: a `using var` owning a class/interface object whose

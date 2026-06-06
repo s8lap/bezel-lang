@@ -3077,6 +3077,59 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* delayFn = declareC("bz_task_delay", ptrTy(), {i64()});
             return builder_.CreateCall(delayFn, {ms}, "task.delay");
         }
+        // stdlib §6.7 (line 2855): Task.FromResult<T>(value: T): Task<T>.
+        // Allocate a task and immediately complete it with the argument value.
+        // The value is stored through a stack alloca so we have a pointer to pass
+        // to bz_task_from_result. ptr-result types (class objects, task pointers)
+        // are stored as i64 sizeof(void*); integer types are stored at their
+        // natural width. Per the doc, this handles non-class T (value types, int,
+        // bool, etc.) only — OwnedTask<T> for class T is FromOwnedResult (deferred).
+        if (m == "FromResult" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* val = lowerExpr(*call.args[0].value);
+            if (!val) return nullptr;
+            llvm::Type* valTy = val->getType();
+            // Store the value to a stack slot so we can pass a pointer.
+            llvm::AllocaInst* slot = builder_.CreateAlloca(valTy, nullptr,
+                                                            "from_result.slot");
+            builder_.CreateStore(val, slot);
+            int64_t sz = static_cast<int64_t>(
+                module_->getDataLayout().getTypeAllocSize(valTy));
+            auto* fromResultFn = declareC("bz_task_from_result",
+                                          ptrTy(), {ptrTy(), i64()});
+            return builder_.CreateCall(fromResultFn,
+                {builder_.CreateBitCast(slot, ptrTy()),
+                 builder_.getInt64(sz)},
+                "task.from_result");
+        }
+        // stdlib §6.7 (line 2872): Task.WhenAll(tasks: Array<Task>): Task.
+        // The argument is a bz_array_t* of task pointers (Array<Task>).
+        // Returns a new task that completes when all input tasks complete.
+        if (m == "WhenAll" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            if (!arr) return nullptr;
+            auto* whenAllFn = declareC("bz_task_when_all", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(whenAllFn, {arr}, "task.when_all");
+        }
+        // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>): Task<Task>.
+        // Returns a new task that completes (with a ptr-sized result — the first-
+        // done task pointer) as soon as any one input task is done.
+        if (m == "WhenAny" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            if (!arr) return nullptr;
+            auto* whenAnyFn = declareC("bz_task_when_any", ptrTy(), {ptrTy()});
+            return builder_.CreateCall(whenAnyFn, {arr}, "task.when_any");
+        }
+        // stdlib §6.7 (line 2885): Task.FireAndForget(owned task: Task): void.
+        // Registers a continuation that frees the task on completion; ownership
+        // transfers. Returns unit (nullptr from codegen → discarded).
+        if (m == "FireAndForget" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* task = lowerExpr(*call.args[0].value);
+            if (!task) return nullptr;
+            auto* fafFn = declareC("bz_task_fire_and_forget",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fafFn, {task});
+            return nullptr;  // unit
+        }
     }
 
     // §2.x: Random class — pseudorandom numbers via libc rand()/srand().
