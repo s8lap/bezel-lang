@@ -7,6 +7,28 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
         if (diverged_) return true;  // CG40: diverging initializer
         if (ld->isUsing) registerUsingDisposal(ld);
+        // #445 / §30.5: a plain `var` task-typed local is freed at scope end via
+        // bz_task_fire_and_forget — the same disposal a `using var` task gets.
+        // lowerAwait never frees a named-local task (freeTaskAfter is only set for
+        // an anonymous CallExpr operand), so a plain `var t := AsyncMethod();` was
+        // silently leaked. Registering the disposal here closes the gap for both
+        // the awaited case (`var t := M(); await t;`) and the unawaited case
+        // (`var t := M();` with t never awaited). Double-free safety: the await
+        // site does NOT free a named local → fire-and-forget at scope end is the
+        // single free site; using-var takes the `isUsing` branch above, so this
+        // branch never fires for it. (per §30.5 / §28)
+        else if (taskTypeOfLocal(ld) && !disposeStack_.empty()) {
+            auto it = locals_.find(ld);
+            if (it != locals_.end()) {
+                Disposal d{it->second, nullptr};
+                d.task = true;
+                disposeStack_.back().push_back(d);
+            }
+            // Still register the unwind-owned path for any non-task cleanup
+            // (task locals have no owned class under unwindOwnedLocalClass — it
+            // returns null for task types — so this is a no-op; called for safety).
+            registerUnwindOwnedLocal(ld);
+        }
         // §28.3 (line 4910): a plain `var` owned local is auto-disposed only on
         // the exception-unwind path (an `unwindOnly` Disposal); normal exit
         // requires it to reach a discharge point (sema-enforced).

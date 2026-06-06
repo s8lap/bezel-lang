@@ -1426,3 +1426,153 @@ BEZEL_TEST(async_28_12, async_without_await_using_unaffected) {
         "  end Main; end C;",
         42);
 }
+
+// ===========================================================================
+// #445 — plain `var t := AsyncMethod(); await t;` leaks the bz_task.
+//
+// A named-local task bound with a PLAIN `var` (not `using var`) was not freed
+// by either path:
+//   - lowerAwait only freed anonymous CallExpr operands (`await Producer()`),
+//     never a named local (`await t`).
+//   - The using-var disposal path was gated on `ld->isUsing`, which a plain
+//     `var` never sets.
+//
+// Fix: treat a plain `var` local whose type is Task/Task<T>/OwnedTask<T> the
+// same as a `using var` task — register a scope-end `bz_task_fire_and_forget`
+// disposal. The await site NEVER frees a named local (no change there), so
+// exactly-once is guaranteed across all four shapes:
+//   - anonymous producer  → freed at await site (existing, unchanged)
+//   - using var task      → freed at scope end via fire-and-forget (existing)
+//   - plain var task awaited → freed at scope end via fire-and-forget (NEW)
+//   - plain var task NOT awaited → freed at scope end via fire-and-forget (NEW)
+//
+// §30.5 / §28: a Task's Dispose "does not block waiting for completion";
+// bz_task_fire_and_forget implements this (free immediately if done, else
+// registers a continuation to free when the task eventually completes).
+// ===========================================================================
+
+// #445 / §30.5: `var t := Producer(); var x := await t;` — the canonical leak.
+// LSan verifies the task is freed exactly once at scope end (not at the await
+// site). The result must be correct (42) and the program leak-free.
+BEZEL_TEST(async_30_5_445, plain_var_task_awaited_is_freed_at_scope_end) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(): Task<int> "
+        "    return 42; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Producer(); "
+        "    var x := await t; "
+        "    return x; "
+        "  end Main; end C;",
+        42);
+}
+
+// #445 / §30.5: `using var t := Producer(); var x := await t;` — the
+// already-correct case. Verifies no double-free is introduced by the fix:
+// the using-var path still fires exactly once at scope end, and the await
+// site does NOT also free a named-local task. LSan-clean.
+BEZEL_TEST(async_30_5_445, using_var_task_awaited_no_double_free) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(): Task<int> "
+        "    return 7; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    using var t := Producer(); "
+        "    var x := await t; "
+        "    return x; "
+        "  end Main; end C;",
+        7);
+}
+
+// #445 / §30.5: `var x := await Producer();` (anonymous) — the other
+// already-correct case. The task is freed at the await site. No regression:
+// LSan-clean, result correct.
+BEZEL_TEST(async_30_5_445, anonymous_task_freed_at_await_no_regression) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(): Task<int> "
+        "    return 55; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var x := await Producer(); "
+        "    return x; "
+        "  end Main; end C;",
+        55);
+}
+
+// #445 / §30.5: plain `var t := Producer();` created but NEVER awaited —
+// the task must be freed at scope end (fire-and-forget). Without the fix
+// this would also leak. Result 0 (Main returns 0; t is unused beyond binding).
+BEZEL_TEST(async_30_5_445, plain_var_task_never_awaited_freed_at_scope_end) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(): Task<int> "
+        "    return 99; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Producer(); "
+        "    return 0; "
+        "  end Main; end C;",
+        0);
+}
+
+// #445 / §30.5: cross-thread plain-var task — `Producer` delays on the pool,
+// then `var t := Producer(); var x := await t;` awaits it cross-thread. The
+// task must be freed at scope end (not at the await site) and exactly once
+// across the real thread boundary. ASan- and TSan-clean.
+BEZEL_TEST(async_30_5_445, plain_var_task_awaited_cross_thread_clean) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Producer(): Task<int> "
+        "    await Task.Delay(5); "
+        "    return 21; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Producer(); "
+        "    var x := await t; "
+        "    return x; "
+        "  end Main; end C;",
+        21);
+}
+
+// #445 / §30.5: two plain-var tasks, both awaited in sequence. Each must be
+// freed at its own scope end; no double-free, no leak. 10 + 20 = 30.
+BEZEL_TEST(async_30_5_445, two_plain_var_tasks_both_awaited_clean) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var t1 := Compute(10); "
+        "    var t2 := Compute(20); "
+        "    var a := await t1; "
+        "    var b := await t2; "
+        "    return a + b; "
+        "  end Main; end C;",
+        30);
+}
+
+// #445 / §30.5: two plain-var tasks cross-thread — both Producers delay on the
+// pool. `var t1 := Compute(10); var t2 := Compute(20);` then both awaited.
+// Both tasks must be freed at scope end exactly once; the results are correct.
+// ASan- and TSan-clean (two heap frames + tasks across two thread boundaries).
+// This exercises the fix in a cross-thread context with multiple named locals.
+BEZEL_TEST(async_30_5_445, two_plain_var_tasks_awaited_cross_thread_clean) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(3); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var t1 := Compute(10); "
+        "    var t2 := Compute(20); "
+        "    var a := await t1; "
+        "    var b := await t2; "
+        "    return a + b; "
+        "  end Main; end C;",
+        30);
+}
