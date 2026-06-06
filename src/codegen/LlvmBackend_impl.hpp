@@ -2016,6 +2016,13 @@ private:
     // the sm*_ async state to be live (smKind_ == Await).
     void emitAsyncComplete(llvm::Value* value);
 
+    // §30.13 (#439-followup): free the heap spill area pointed to from the
+    // frame's spill-ptr field (asyncSpillPtrField_), if present. Emitted on each
+    // terminal path that frees the frame (emitAsyncComplete + async.fault). The
+    // field is null when no cross-suspend temporary was promoted, and free(null)
+    // is a no-op, so this is safe in every body shape. Must run before free(self).
+    void emitFreeSpillArea(llvm::Value* self);
+
     // §30.2 deferred tail: emit a well-formed but inert async-method entry for a
     // body whose codegen is deferred (await-in-loop), after the diagnostic has
     // failed the compile. Keeps emitted IR valid without lowering the body.
@@ -2032,24 +2039,35 @@ private:
     // through to the normal nullptr — a defensive guard, not a normal path).
     llvm::Value* lowerAwait(const ast::UnaryExpr& un);
 
-    // §30.2 (#438): repair SSA dominance in a resume function after the body is
-    // lowered. An `await` inside a larger expression (e.g. `total + await f()`,
-    // including the loop-carried `total := total + await f(i)` form) leaves an
-    // SSA temporary that is computed BEFORE the suspend but used in the resume
-    // block — which the dispatch switch (and a loop back-edge) re-enters, so the
-    // temporary's def no longer dominates its use ("instruction does not
-    // dominate all uses"). Named locals already round-trip through the frame
-    // (smAllocaToField_); this catches the remaining anonymous temporaries by
-    // demoting every register whose def fails to dominate a use to a stack slot
-    // (llvm::DemoteRegToStack / DemotePHIToStack). On the synchronous /
-    // already-done cut (§30.1) the await fast path falls through to the resume
-    // block within the same activation, so the demoted slot is stored-then-
-    // loaded and the result is correct; the dispatch-switch re-entry edge (a
-    // real cross-activation suspend) is the deferred concurrency increment.
-    // Runs only on async resume functions; iterators (yield) never produce a
-    // cross-suspend temporary (the yielded expression is fully consumed before
-    // the suspend), so this is async-specific.
+    // §30.2 / §30.13 (#438 + #439-followup): repair SSA dominance in a resume
+    // function after the body is lowered, moving the offending temporaries into
+    // the HEAP FRAME so they survive a real cross-thread suspend. An `await`
+    // inside a larger expression (e.g. `total + await f()`, including the
+    // loop-carried `total := total + await f(i)` form) leaves an SSA temporary
+    // computed BEFORE the suspend but used in the resume block — which the
+    // dispatch switch (and a loop back-edge) re-enters, so the temporary's def no
+    // longer dominates its use ("instruction does not dominate all uses"). Named
+    // locals already round-trip through the frame (smAllocaToField_); this
+    // catches the remaining anonymous temporaries by demoting every register
+    // whose def fails to dominate a use (llvm::DemoteRegToStack /
+    // DemotePHIToStack) and then PROMOTING each demoted slot into the heap frame
+    // (promoteDemotedSlotsToFrame). A plain stack slot would be garbage after a
+    // real cross-thread resume (the worker has a fresh stack); the heap spill
+    // area, like named locals, is valid in BOTH the synchronous / already-done
+    // cut and the cross-thread case. Runs only on async resume functions;
+    // iterators (yield) never produce a cross-suspend temporary (the yielded
+    // expression is fully consumed before the suspend), so this is async-specific.
     void fixupSuspendDominance(llvm::Function* fn);
+
+    // §30.2 / §30.13 (#439-followup): move the demoted cross-suspend stack slots
+    // (the allocas fixupSuspendDominance created) into a heap spill area pointed
+    // to from the frame (asyncSpillPtrField_), so the pre-suspend temporaries
+    // survive a REAL cross-thread resume — the worker runs on a fresh stack, so a
+    // function-local slot would be garbage. Lays out a spill struct, lazily
+    // callocs it on the first resume entry, and replaces each demoted alloca with
+    // a GEP into that heap region. Async-only (called from fixupSuspendDominance).
+    void promoteDemotedSlotsToFrame(
+        llvm::Function* fn, const std::vector<llvm::AllocaInst*>& demoted);
 
     // ---- Live suspend/resume state for the in-flight MoveNext / resume fn ----
     // Kind-agnostic frame state. The per-suspend-point spill/restore
@@ -2079,6 +2097,11 @@ private:
     //                            suspend point so the resume can read its result).
     unsigned asyncOuterTaskField_ = 0;
     unsigned asyncPendingTaskField_ = 0;
+    // §30.2 / §30.13 (#439-followup): frame field holding a pointer to the heap
+    // spill area for anonymous cross-suspend temporaries (the pre-suspend
+    // operands of awaits embedded in larger expressions). Lazily calloc'd on the
+    // first resume entry by fixupSuspendDominance; null when the body has none.
+    unsigned asyncSpillPtrField_ = 0;
     // The async resume function (the bz_task_then continuation). The await
     // suspend point registers this on the awaited task.
     llvm::Function* asyncResumeFn_ = nullptr;
