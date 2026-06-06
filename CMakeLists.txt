@@ -45,6 +45,27 @@ if(BEZEL_WERROR)
     target_compile_options(bezel_warnings INTERFACE -Werror)
 endif()
 
+# --- Build accelerators (optional; used only if present) --------------------
+# These speed up the heavy worktree-per-lane workflow without becoming hard
+# dependencies: each is gated on find_program, so a plain checkout still builds.
+#  * ccache: caches object compiles across builds AND across git worktrees
+#    (shared ~/.ccache), so a fresh worktree's "clean" build is mostly cache
+#    hits — the single biggest win for parallel lanes. Install with
+#    `sudo dnf install ccache`; CMake picks it up automatically on reconfigure.
+#  * lld: a much faster linker than the default bfd/gold for the 60M test
+#    binary, which is relinked on every change.
+find_program(BEZEL_CCACHE ccache)
+if(BEZEL_CCACHE)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${BEZEL_CCACHE}")
+    message(STATUS "Bezel: using ccache (${BEZEL_CCACHE})")
+endif()
+find_program(BEZEL_LLD ld.lld)
+if(BEZEL_LLD)
+    add_link_options(-fuse-ld=lld)
+    message(STATUS "Bezel: using lld linker")
+endif()
+
 # --- LLVM (codegen backend) -------------------------------------------------
 # Decision #147: the back-end targets LLVM IR via the C++ API. LLVMConfig.cmake
 # lives under a versioned prefix on Fedora (/usr/lib64/llvmNN/...), so we ask
