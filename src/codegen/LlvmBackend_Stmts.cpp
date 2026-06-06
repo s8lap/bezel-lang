@@ -243,6 +243,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return lowerWhile(*ws);
     }
     if (auto* fors = dynamic_cast<const ast::ForStmt*>(&s)) {
+        // §30.7: `await for var x in asyncSeq do ... end` — async iteration.
+        // Must run before the synchronous for-handlers, which would misread the
+        // async-enumerator source.
+        if (fors->isAwait) {
+            if (lowerAwaitFor(*fors)) return false;
+            ctx_.diagnostics().report(
+                Severity::Error, s.span.begin,
+                "not yet implemented: codegen for this `await for` statement "
+                "(only `await for` over an async-iterator source is supported "
+                "(§30.7); `with` cancellation / owned-async iteration are "
+                "deferred)");
+            return false;
+        }
         if (lowerRangeFor(*fors)) return false;
         // issue #370 / §4.8: `for var k in <dict>.Keys` — iterate dict keys.
         // (`<dict>.Keys` has no sema element type, so this must run before the
@@ -335,7 +348,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     // machinery here with await-specific suspend/resume actions (register a
     // task continuation, return the in-progress Task; resume reads the result).
     if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (smStateStruct_ && smSelf_ && smKind_ == SuspendKind::Yield) {
+        // §29.3 (Yield): a synchronous iterator's `yield` returns a bool from
+        // MoveNext. §30.7 (AsyncYield): an ASYNC iterator's `yield` completes the
+        // per-advance Task<bool> and returns VOID from the Resume continuation
+        // (the same suspend/spill machinery; only the suspend ACTION differs).
+        bool isAsyncYield = (smKind_ == SuspendKind::AsyncYield);
+        if (smStateStruct_ && smSelf_ &&
+            (smKind_ == SuspendKind::Yield || isAsyncYield)) {
             // Save all suspend-locals to the state frame before yielding.
             for (auto& [allocaSlot, fieldIdx] : smAllocaToField_) {
                 llvm::Value* fptr = builder_.CreateStructGEP(
@@ -346,12 +365,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             }
 
             if (ys->isBreak) {
-                // yield break: set state=-1, return false.
+                // yield break: set state=-1; sync → ret false, async → complete
+                // the per-advance task with false (exhausted) + ret void.
                 builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
-                builder_.CreateRet(builder_.getFalse());
+                if (isAsyncYield) {
+                    emitAsyncIterComplete(/*hasValue=*/false);
+                    builder_.CreateRetVoid();
+                } else {
+                    builder_.CreateRet(builder_.getFalse());
+                }
                 return true;
             }
-            // yield return expr: store to current_val, set next state, return true.
+            // yield return expr: store to current_val, set next state; sync →
+            // ret true, async → complete the per-advance task with true + ret void.
             if (ys->value) {
                 llvm::Value* v = lowerExpr(*ys->value);
                 if (v) {
@@ -367,7 +393,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             }
             unsigned nextState = ++smNextSuspendState_;
             builder_.CreateStore(builder_.getInt32((int)nextState), smStateGEP_);
-            builder_.CreateRet(builder_.getTrue());
+            if (isAsyncYield) {
+                emitAsyncIterComplete(/*hasValue=*/true);
+                builder_.CreateRetVoid();
+            } else {
+                builder_.CreateRet(builder_.getTrue());
+            }
             // Continue emitting code after this yield in the next state block.
             if (nextState < smStateBBs_.size()) {
                 builder_.SetInsertPoint(smStateBBs_[nextState]);
@@ -1531,6 +1562,108 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     if (!term) builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(endBB);
+    return true;
+}
+
+
+// §30.7: lower `await for var x in src do ... end`. The source is an
+// IAsyncEnumerable<T> / IAsyncEnumerator<T>; for an async-iterator method call
+// (`Gen()`) the value IS the enumerator (the generated frame, whose vtable has
+// [1]=Dispose, [2]=MoveNextAsync, [3]=Current). Each iteration: call
+// MoveNextAsync → Task<bool>, AWAIT it (a real suspend point in the consuming
+// async method's own state machine, reusing emitAwaitSuspend), and on a true
+// result read Current and run the body. The enumerator is disposed at loop exit.
+//
+// The enumerator pointer is kept as an SSA value computed once before the loop;
+// because the loop head (which uses it) is re-entered by the consuming method's
+// resume dispatch across each iteration's await suspend, fixupSuspendDominance
+// promotes it into the heap frame so it survives a real cross-thread resume —
+// exactly the mechanism the embedded-await pre-suspend operands already rely on.
+bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
+    if (!fs.isAwait || !fs.iterable) return false;
+    // §30.8 cancellation (`await for ... with token`) is deferred — the token
+    // would be passed to GetAsyncEnumerator(token); our minimal cut iterates an
+    // async-iterator-method result directly. Fall through to the diagnostic.
+    if (fs.withExpr) return false;
+    // The consuming context must be an async state machine (the await suspend
+    // lives in its Resume function). sema rejects `await for` outside async; this
+    // is a defensive guard so a stray case produces a diagnostic, not bad IR.
+    if ((smKind_ != SuspendKind::Await && smKind_ != SuspendKind::AsyncYield) ||
+        !smStateStruct_ || !smSelf_ || !asyncResumeFn_)
+        return false;
+
+    auto* iterTy = ctx_.exprType(*fs.iterable);
+    if (!iterTy) return false;
+    // Element type T from the source's first generic arg (IAsyncEnumerable<T>).
+    llvm::Type* elemTy = i32();
+    if (!iterTy->genericArgs.empty() && iterTy->genericArgs[0])
+        elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+
+    // Evaluate the source to the enumerator pointer (an SSA value, used directly
+    // below — see the function comment on why it must NOT be a stack slot).
+    llvm::Value* enumPtr = lowerExpr(*fs.iterable);
+    if (!enumPtr) return false;
+
+    // Loop variable slot — the body sees `x` here.
+    auto* varSlot = entryAlloca(elemTy);
+    // §30.7: if the loop variable is live across an await in the BODY, it is a
+    // suspend-local — frame-back it like range-for does.
+    if (smStateStruct_ && smSelf_) {
+        auto fit = smLocalFields_.find(&fs);
+        if (fit != smLocalFields_.end())
+            smAllocaToField_[varSlot] = fit->second;
+    }
+    locals_[&fs] = varSlot;
+
+    // Vtable-dispatched MoveNextAsync (slot 2) / Current (slot 3) / Dispose
+    // (slot 1) on the enumerator frame.
+    auto* moveNextTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+    auto* disposeTy =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "afor.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "afor.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "afor.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    // cond: task = MoveNextAsync(enum); hasValue = await task.
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* vt = builder_.CreateLoad(ptrTy(), enumPtr);
+    llvm::Value* mnSlotPtr =
+        builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(2)});
+    llvm::Value* mnFnPtr = builder_.CreateLoad(ptrTy(), mnSlotPtr);
+    llvm::Value* task =
+        builder_.CreateCall(moveNextTy, mnFnPtr, {enumPtr}, "afor.task");
+    // §30.7: await the per-advance task (a single-use producer task — free it
+    // after its bool is read). This is a suspend point in the consuming method.
+    llvm::Value* hasValue =
+        emitAwaitSuspend(task, i1(), /*freeTaskAfter=*/true);
+    if (!hasValue) return false;
+    builder_.CreateCondBr(hasValue, bodyBB, endBB);
+
+    // body: x := Current(enum); run the user body.
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* vt2 = builder_.CreateLoad(ptrTy(), enumPtr);
+    llvm::Value* curSlotPtr =
+        builder_.CreateGEP(ptrTy(), vt2, {builder_.getInt32(3)});
+    llvm::Value* curFnPtr = builder_.CreateLoad(ptrTy(), curSlotPtr);
+    llvm::Value* curVal =
+        builder_.CreateCall(currentTy, curFnPtr, {enumPtr}, "afor.cur");
+    builder_.CreateStore(curVal, varSlot);
+
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+    bool term = lowerScopedBlock(fs.body);
+    loopStack_.pop_back();
+    if (!term) builder_.CreateBr(condBB);
+
+    // end: dispose the enumerator (vtable slot 1) — frees the iterator frame.
+    builder_.SetInsertPoint(endBB);
+    llvm::Value* vt3 = builder_.CreateLoad(ptrTy(), enumPtr);
+    llvm::Value* dispSlotPtr =
+        builder_.CreateGEP(ptrTy(), vt3, {builder_.getInt32(1)});
+    llvm::Value* dispFnPtr = builder_.CreateLoad(ptrTy(), dispSlotPtr);
+    builder_.CreateCall(disposeTy, dispFnPtr, {enumPtr});
     return true;
 }
 

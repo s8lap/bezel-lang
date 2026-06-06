@@ -1730,21 +1730,24 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return;
 
-    // §29.3: detect iterator methods BEFORE creating the entry block.
-    // emitIteratorMethod handles its own entry block creation + bindParameters.
-    // The iterator check stays FIRST: an async-iterator (async + yield) is an
-    // iterator at codegen for now — its async-suspend handling is deferred.
+    // §29.3 / §30.7: detect iterator methods BEFORE creating the entry block
+    // (emitIteratorMethod / emitAsyncIteratorMethod handle their own entry block
+    // + bindParameters). The yield check stays FIRST; within it, an ASYNC
+    // iterator (async + yield, returning IAsyncEnumerable<T>) goes to the fused
+    // yield+await state machine (§30.7), and a plain iterator to the sync one.
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts &&
         containsYield(*ci.stmts)) {
-        emitIteratorMethod(ms, fn, ci);
+        if (isAsyncMethod(ms))
+            emitAsyncIteratorMethod(ms, fn, ci);
+        else
+            emitIteratorMethod(ms, fn, ci);
         return;
     }
 
     // §30.1 / §30.2: detect (non-yield) async methods. emitAsyncMethod builds
     // the entry + Resume functions itself (mirrors emitIteratorMethod). Gated to
     // the Task / Task<T> / OwnedTask<T> forms; the async-iterator forms (async +
-    // yield) are handled by the iterator path above and their await-suspend
-    // semantics are deferred.
+    // yield) are handled by the iterator path above.
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts &&
         isAsyncMethod(ms)) {
         emitAsyncMethod(ms, fn, ci);
