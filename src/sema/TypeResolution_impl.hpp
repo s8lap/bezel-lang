@@ -347,6 +347,16 @@ private:
     // caller defers; otherwise sets `decided=true` and returns the verdict.
     bool argSatisfiesNew(const TypeRef* arg, bool& decided);
 
+    // §12.9 / issue #431: for each interface with variant generic parameters
+    // (`out T` or `in T`), verify that every direct occurrence of those
+    // parameters in the interface's member signatures (method return types,
+    // method parameter types, property types) is in the correct position.
+    // `out T` (covariant) must appear only in output positions; `in T`
+    // (contravariant) must appear only in input positions. Nested positions
+    // (T inside a function-type parameter or inside another generic's args)
+    // are deferred — the composition rules are sound but handled separately.
+    void checkVariancePositions();
+
     // §32.5: validate that the AST type `t`, appearing in an `extern` method
     // signature, is an FFI-compatible type. `returnPosition` permits the unit
     // type `()` (valid as a return type only). `declSpelling` names the
