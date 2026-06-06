@@ -30,15 +30,24 @@ namespace bezel::codegen {
 //
 // #438: `await` inside a loop body (while / range-for / nested) is supported.
 // Loop-carried and pre-/post-loop locals are frame-backed allocas (the iterator
-// path's spill/restore machinery, reused), and fixupSuspendDominance demotes the
+// path's spill/restore machinery, reused), and fixupSuspendDominance handles the
 // remaining anonymous cross-suspend temporaries (e.g. the left operand of
-// `total + await f()`) to stack slots so the resume function verifies.
+// `total + await f()`).
+//
+// #439-followup: those anonymous cross-suspend temporaries now live in the HEAP
+// FRAME, not a function-local stack slot, so they survive a REAL cross-thread
+// suspend. fixupSuspendDominance demotes the offending values and then
+// promoteDemotedSlotsToFrame moves each into a side spill area pointed to from
+// the frame (asyncSpillPtrField_) — reached through the single `state` pointer
+// bz_task_then carries to the worker — and freed on the terminal paths
+// (emitFreeSpillArea). This makes `var x := total + await f()` (and the
+// loop-carried / multi-await variants) correct across a thread hop, where a
+// stack slot held garbage on the worker's fresh stack.
 //
 // Deferred to later increments (not emitted here): await inside try/catch/
 // finally (resuming into the right handler scope — rejected with a §30.9
-// diagnostic), §30.9 faulting re-raise beyond the basic check, atomic refcounts
-// (§30 2c), async iterators (IAsyncEnumerable / `await for`),
-// Task.FireAndForget, and `await using`.
+// diagnostic), §30.9 faulting re-raise beyond the basic check, async iterators
+// (IAsyncEnumerable / `await for`), Task.FireAndForget, and `await using`.
 // ===========================================================================
 
 bool Emitter::exprContainsAwait(const ast::Expr* e) {
@@ -282,18 +291,32 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     }
     asyncResultTy_ = resultTy;
 
-    // Build the kind-agnostic frame with two trailing async fields:
-    //   [.. ] outerTask (ptr), [.. ] pendingTask (ptr).
-    // Layout: { ptr vtable, i32 state, captures..., locals..., ptr outer, ptr pending }
+    // Build the kind-agnostic frame with three trailing async fields:
+    //   [.. ] outerTask (ptr), [.. ] pendingTask (ptr), [.. ] spillArea (ptr).
+    // Layout: { ptr vtable, i32 state, captures..., locals...,
+    //           ptr outer, ptr pending, ptr spill }
+    // §30.2 / §30.13 (#439-followup): `spill` points at a SEPARATELY-calloc'd
+    // heap region holding the anonymous cross-suspend temporaries that
+    // fixupSuspendDominance would otherwise leave in function-local stack slots
+    // (e.g. the pre-suspend operand of `total + await f()`). Those slots are
+    // garbage after a real cross-thread resume (the worker has a fresh stack), so
+    // such temporaries must round-trip the HEAP frame like named locals do. The
+    // spill area is appended as a side region (rather than grown into this struct,
+    // whose body is already finalized) and pointed-to from a frame field so the
+    // single `state` pointer that bz_task_then carries across the thread boundary
+    // reaches it. It is lazily calloc'd on the first resume entry (see
+    // fixupSuspendDominance) and stays null when the body has no such temporary.
     StateMachineFrame frame = buildStateMachineFrame(
-        ms, *ci.stmts, {ptrTy(), ptrTy()},
+        ms, *ci.stmts, {ptrTy(), ptrTy(), ptrTy()},
         std::string("async.") + std::string(ms->name));
     auto* stateStructTy = frame.structTy;
     const unsigned STATE_FIELD = frame.stateField;
-    const unsigned OUTER_TASK_FIELD = frame.currentValField;      // first trailing
+    const unsigned OUTER_TASK_FIELD = frame.currentValField;        // first trailing
     const unsigned PENDING_TASK_FIELD = frame.currentValField + 1;  // second trailing
+    const unsigned SPILL_PTR_FIELD = frame.currentValField + 2;     // third trailing
     asyncOuterTaskField_ = OUTER_TASK_FIELD;
     asyncPendingTaskField_ = PENDING_TASK_FIELD;
+    asyncSpillPtrField_ = SPILL_PTR_FIELD;
 
     bool isInstance = !isStaticMethod(ms);
     std::string prefix = std::string("bz$async$") + std::string(ms->name) + "$";
@@ -496,6 +519,9 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
                                  excGlobal());
             // §30.5: the frame is dead on this terminal (fault) path — free it.
+            // §30.13 (#439-followup): free the cross-suspend spill area first (if
+            // any) — it is a side allocation pointed to from the frame.
+            emitFreeSpillArea(self);
             auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeFn2, {self});
             builder_.CreateRetVoid();
@@ -700,26 +726,42 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
 }
 
 
-// §30.2 (#438): repair SSA dominance in a resume function. After the body is
-// lowered, every value computed before a suspend and used in a resume block (the
-// dispatch switch / loop back-edge re-enters those blocks) must not assume its
-// def dominates the use. Named locals already round-trip through the frame
-// (smAllocaToField_); the remaining offenders are anonymous temporaries — e.g.
-// the left operand of `total + await f()` loaded before the await, used after.
-// We demote every register whose def fails to dominate a use to a stack slot
-// (llvm::DemoteRegToStack), and every PHI with a mismatched incoming edge via
-// DemotePHIToStack, iterating to a fixpoint (a demote can expose a new offender
-// when one demoted value fed another). On the synchronous / already-done cut
-// the await fast path falls through to the resume block within the same
-// activation, so each demoted slot is stored-then-loaded and the result is
-// correct; a real cross-activation suspend (the dispatch-switch re-entry edge)
-// is the deferred concurrency increment.
+// §30.2 / §30.13 (#438 + #439-followup): repair SSA dominance in a resume
+// function, moving the offending cross-suspend temporaries into the HEAP FRAME
+// so they survive a REAL cross-thread suspend.
+//
+// After the body is lowered, every value computed before a suspend and used in a
+// resume block (the dispatch switch / loop back-edge re-enters those blocks)
+// must not assume its def dominates the use ("instruction does not dominate all
+// uses"). Named locals already round-trip through the frame (smAllocaToField_);
+// the remaining offenders are anonymous temporaries — e.g. the left operand of
+// `total + await f()` loaded before the await, used after.
+//
+// We demote every register whose def fails to dominate a use (DemoteRegToStack),
+// and every PHI with a mismatched incoming edge (DemotePHIToStack), iterating to
+// a fixpoint (a demote can expose a new offender when one demoted value fed
+// another). Each demotion creates a function-local stack alloca. A plain stack
+// slot is WRONG across a real thread hop: the resume runs on a worker thread
+// with a fresh stack, so the slot holding the pre-suspend value is garbage. We
+// therefore PROMOTE every demoted slot into the heap state-machine frame: a
+// SEPARATELY-calloc'd spill area, pointed to from a frame field
+// (asyncSpillPtrField_), reached through the single `state` pointer that
+// bz_task_then carries across the thread boundary — exactly how named locals
+// (smAllocaToField_) already survive. The demoted alloca is replaced by a GEP
+// into that heap spill area (computed in the resume entry, so it dominates every
+// use); the store-before-suspend and load-after-resume that DemoteRegToStack
+// emitted then read/write the persistent heap slot. This is valid in BOTH the
+// synchronous / already-done cut (the await fast path falls through inline) and a
+// real cross-thread suspend (the frame is shared across the activation), the
+// same property named locals already rely on.
 void Emitter::fixupSuspendDominance(llvm::Function* fn) {
     if (!fn || fn->isDeclaration()) return;
 
     // Iterate to a fixpoint: each pass recomputes the dominator tree, finds the
-    // first instruction with a non-dominated use, and demotes it. Bounded by the
-    // instruction count (each instruction is demoted at most once).
+    // first instruction with a non-dominated use, and demotes it. Collect the
+    // alloca each demotion creates so we can promote them into the heap frame.
+    // Bounded by the instruction count (each instruction is demoted at most once).
+    std::vector<llvm::AllocaInst*> demoted;
     bool changed = true;
     unsigned guard = 0;
     const unsigned cap = 100000;  // safety bound; never expected to be hit
@@ -752,15 +794,112 @@ void Emitter::fixupSuspendDominance(llvm::Function* fn) {
                 }
                 if (!offends) continue;
 
+                llvm::AllocaInst* slot = nullptr;
                 if (auto* phi = llvm::dyn_cast<llvm::PHINode>(&inst))
-                    llvm::DemotePHIToStack(phi);
+                    slot = llvm::DemotePHIToStack(phi);
                 else
-                    llvm::DemoteRegToStack(inst);
+                    slot = llvm::DemoteRegToStack(inst);
+                if (slot) demoted.push_back(slot);
                 changed = true;
                 break;  // dominator tree is now stale; recompute next pass
             }
             if (changed) break;
         }
+    }
+
+    // No cross-suspend temporary → nothing to move into the frame; the spill-ptr
+    // frame field stays null (harmless).
+    if (demoted.empty()) return;
+
+    // Promote the demoted stack slots into a heap spill area reached through the
+    // frame, so they survive a cross-thread resume (§30.13 / #439-followup).
+    promoteDemotedSlotsToFrame(fn, demoted);
+}
+
+
+// §30.2 / §30.13 (#439-followup): move the demoted cross-suspend stack slots
+// into a heap spill area pointed to from the frame, so a real cross-thread
+// resume reads the persisted values rather than garbage on the worker's fresh
+// stack. `demoted` are the allocas fixupSuspendDominance created (one per
+// cross-suspend temporary). We:
+//   1. Lay out a spill struct { temp0, temp1, ... } from the demoted slots.
+//   2. In the resume entry block, before the dispatch switch, lazily calloc the
+//      spill area on the FIRST entry (when the frame's spill-ptr field is null)
+//      and store its pointer back into the frame; on a later resume the existing
+//      pointer is reused. The setup runs on every entry, so the per-field GEPs
+//      it computes dominate all blocks reachable from the switch.
+//   3. Replace each demoted alloca with its GEP into the heap spill area
+//      (replaceAllUsesWith), so the store-before-suspend / load-after-resume
+//      DemoteRegToStack emitted now target the persistent heap slot.
+void Emitter::promoteDemotedSlotsToFrame(
+    llvm::Function* fn, const std::vector<llvm::AllocaInst*>& demoted) {
+    if (demoted.empty() || !smStateStruct_) return;
+
+    // (1) Spill struct layout: one field per demoted slot, in stable order.
+    std::vector<llvm::Type*> spillFields;
+    spillFields.reserve(demoted.size());
+    for (llvm::AllocaInst* a : demoted)
+        spillFields.push_back(a->getAllocatedType());
+    auto* spillStructTy = llvm::StructType::create(
+        llvm_, spillFields, fn->getName().str() + ".spill");
+
+    // (2) Resume entry setup, inserted before the dispatch switch (the entry
+    // block's terminator). The frame pointer is the resume function's 2nd arg.
+    llvm::Value* self = fn->getArg(1);
+    llvm::BasicBlock& entryBB = fn->getEntryBlock();
+    llvm::Instruction* term = entryBB.getTerminator();
+    // The resume entry always ends in the dispatch switch (emitResumeDispatch);
+    // bail defensively if that invariant is ever broken rather than crash.
+    if (!term) return;
+
+    llvm::IRBuilder<> b(term);
+    // Load the current spill-area pointer from the frame.
+    llvm::Value* spillField =
+        b.CreateStructGEP(smStateStruct_, self, asyncSpillPtrField_);
+    llvm::Value* curPtr = b.CreateLoad(ptrTy(), spillField, "spill.cur");
+    llvm::Value* isNull = b.CreateICmpEQ(
+        curPtr, llvm::ConstantPointerNull::get(ptrTy()), "spill.isnull");
+
+    // Split off the dispatch (the terminator) into a continuation block, then
+    // replace entry's fall-through with a null-check that callocs on first entry.
+    llvm::BasicBlock* contBB =
+        entryBB.splitBasicBlock(term, entryBB.getName() + ".spillcont");
+    llvm::BasicBlock* allocBB =
+        llvm::BasicBlock::Create(llvm_, entryBB.getName() + ".spillalloc", fn,
+                                 contBB);
+    // splitBasicBlock left an unconditional br entry->cont; rewrite it to the
+    // null-check branch (the load/icmp above precede this terminator).
+    entryBB.getTerminator()->eraseFromParent();
+    {
+        llvm::IRBuilder<> eb(&entryBB);
+        eb.CreateCondBr(isNull, allocBB, contBB);
+    }
+    // allocBB: calloc(1, sizeof(spillStruct)), store into the frame field, br cont.
+    llvm::Value* freshPtr = nullptr;
+    {
+        llvm::IRBuilder<> ab(allocBB);
+        uint64_t sz = module_->getDataLayout().getTypeAllocSize(spillStructTy);
+        auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+        freshPtr = ab.CreateCall(
+            callocFn, {ab.getInt64(1), ab.getInt64((int64_t)sz)}, "spill.new");
+        ab.CreateStore(freshPtr, spillField);
+        ab.CreateBr(contBB);
+    }
+    // contBB head: PHI the spill pointer (existing vs. fresh), then GEP each
+    // field. These dominate the dispatch switch and hence every state block.
+    llvm::IRBuilder<> cb(&*contBB->getFirstInsertionPt());
+    auto* spillPtr = cb.CreatePHI(ptrTy(), 2, "spill.ptr");
+    spillPtr->addIncoming(curPtr, &entryBB);
+    spillPtr->addIncoming(freshPtr, allocBB);
+
+    // (3) Re-point each demoted alloca at its heap-spill GEP.
+    for (unsigned i = 0; i < demoted.size(); ++i) {
+        llvm::AllocaInst* a = demoted[i];
+        llvm::Value* gep =
+            cb.CreateStructGEP(spillStructTy, spillPtr, i,
+                               a->getName().str() + ".spill");
+        a->replaceAllUsesWith(gep);
+        a->eraseFromParent();
     }
 }
 
@@ -843,7 +982,28 @@ void Emitter::emitAsyncComplete(llvm::Value* value) {
     // free still holds — this runs only on the completing resume. Owned suspend-
     // locals would be disposed before this; the value-typed minimal cut has none.)
     auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    // §30.13 (#439-followup): free the cross-suspend spill area (if any) before
+    // the frame. It is a side allocation pointed to from the frame's spill-ptr
+    // field; the field is null when the body had no cross-suspend temporary, and
+    // free(null) is a no-op, so this is unconditional and safe in every shape.
+    emitFreeSpillArea(self);
     builder_.CreateCall(freeFn2, {self});
+}
+
+
+// §30.13 (#439-followup): free the heap spill area pointed to from the frame's
+// spill-ptr field, if present. Emitted on each terminal path that frees the
+// frame (emitAsyncComplete + the async.fault boundary). The field is null when
+// fixupSuspendDominance allocated no spill area, and free(null) is a no-op, so
+// this is safe regardless of body shape. Must run BEFORE free(self) (it reads
+// the field through the frame pointer).
+void Emitter::emitFreeSpillArea(llvm::Value* self) {
+    if (!self || !smStateStruct_) return;
+    llvm::Value* spillField =
+        builder_.CreateStructGEP(smStateStruct_, self, asyncSpillPtrField_);
+    llvm::Value* spillPtr = builder_.CreateLoad(ptrTy(), spillField, "spill.free");
+    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    builder_.CreateCall(freeFn, {spillPtr});
 }
 
 

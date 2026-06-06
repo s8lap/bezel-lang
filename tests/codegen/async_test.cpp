@@ -740,9 +740,8 @@ BEZEL_TEST(async_30_10, await_task_delay_timespan) {
 // across threads) and TSan-clean (no data race in the pool / task state /
 // atomic refcounts under repeated cross-thread completion). The await result is
 // bound to a NAMED local (`r`) which round-trips through the heap frame — the
-// cross-thread-correct shape; an await embedded in a larger expression
-// (`total + await ...`) relies on stack-slot dominance repair that does not yet
-// survive a real cross-thread suspend (a deferred increment).
+// cross-thread-correct shape; the embedded-expression shape (`total + await ...`)
+// is exercised cross-thread by the #439-followup tests below.
 BEZEL_TEST(async_30_13, concurrency_stress_sum_of_pool_tasks) {
     expectValueCrossThread(
         "module M; class C "
@@ -760,4 +759,102 @@ BEZEL_TEST(async_30_13, concurrency_stress_sum_of_pool_tasks) {
         "    return total; "
         "  end Main; end C;",
         210);
+}
+
+// ===========================================================================
+// #439-FOLLOWUP — cross-thread embedded-await temporaries (§30.2 / §30.13).
+//
+// An `await` embedded in a LARGER expression (`var x := total + await f();`)
+// loads its pre-suspend operand (`total`) BEFORE the suspend and consumes it
+// AFTER the resume. Across a REAL cross-thread suspend the resume runs on a
+// worker thread with a fresh stack, so the pre-suspend temporary must live in
+// the HEAP FRAME (the calloc'd state-machine frame, shared across the suspend),
+// not in a function-local stack slot. These tests use Task.Delay-backed
+// producers so the awaited task is GENUINELY incomplete at the await point —
+// the suspend path is taken and the resume fires on the pool. Before the
+// cross-suspend-temp-to-frame fix the pre-suspend operand is garbage after the
+// thread hop; after it the value is correct and stable across 3 runs, ASan- and
+// TSan-clean.
+// ===========================================================================
+
+// #439-followup: the canonical case. `total` (10) is loaded before the await;
+// `Compute(5)` delays then returns 5 on a worker; the `+` runs after the
+// cross-thread resume. The pre-suspend `total` must survive the thread hop via
+// the heap frame. 10 + 5 = 15.
+BEZEL_TEST(async_30_13, embedded_await_preserves_operand_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 10; "
+        "    var x := total + await Compute(5); "
+        "    return x; "
+        "  end Main; end C;",
+        15);
+}
+
+// #439-followup: MULTIPLE awaits embedded in one expression cross-thread. Both
+// `Compute(3)` and `Compute(4)` are genuinely-incomplete; the running sum
+// (`seed` + first result) is a pre-suspend temporary across the SECOND await's
+// thread hop and must round-trip the frame. 100 + 3 + 4 = 107.
+BEZEL_TEST(async_30_13, multiple_embedded_awaits_one_expr_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var seed := 100; "
+        "    var x := seed + await Compute(3) + await Compute(4); "
+        "    return x; "
+        "  end Main; end C;",
+        107);
+}
+
+// #439-followup: a pre-await LOCAL used AFTER the await in an expression, across
+// a cross-thread suspend. `lhs` (40) is a named local set before the await, and
+// the await result is added to it. Even though `lhs` is named, the partial
+// expression value (the loaded `lhs`) is a pre-suspend temporary in the resumed
+// `+`; the frame round-trip must keep it correct across the thread hop. 40+2=42.
+BEZEL_TEST(async_30_13, preawait_local_used_after_await_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var lhs := 40; "
+        "    var r := lhs + await Compute(2); "
+        "    return r; "
+        "  end Main; end C;",
+        42);
+}
+
+// #439-followup: a loop-carried accumulator with the await EMBEDDED in the
+// loop-body expression, across cross-thread suspends. Each iteration loads
+// `total` (pre-suspend), awaits a genuinely-incomplete `Compute(i)` (resumes on
+// a worker), then adds. The pre-suspend `total` operand must survive each
+// thread hop via the frame (the loop-carried local already does; the loaded
+// partial is the anonymous cross-suspend temp). 1+2+3 = 6.
+BEZEL_TEST(async_30_13, embedded_await_in_loop_accumulates_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(2); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var total := 0; var i := 1; "
+        "    while i <= 3 do "
+        "      total := total + await Compute(i); "
+        "      i := i + 1; "
+        "    end; "
+        "    return total; "
+        "  end Main; end C;",
+        6);
 }
