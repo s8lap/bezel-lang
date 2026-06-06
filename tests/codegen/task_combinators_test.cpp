@@ -356,3 +356,91 @@ BEZEL_TEST(task_combinators_30_5, using_var_when_all_not_awaited_no_leak) {
         "  end Main; end C;"),
         12);
 }
+
+// ===========================================================================
+// §30.9 / #443 (WhenAll fault propagation): bz_task_when_all must propagate
+// faults from any input task to the aggregate. Before the fix the completion
+// lambda always called bz_task_complete(aggregate, null, 0) (success) even
+// when an input task was faulted, so awaiting the aggregate appeared to succeed
+// and any fault was silently swallowed.
+// ===========================================================================
+
+// §30.9 / #443: WhenAll where ONE input task faults and the other succeeds.
+// Awaiting the aggregate should re-raise the fault. With no enclosing handler
+// the process exits 70 (unhandled exception boundary, §33.3). Before the fix
+// this exited 5 (success — the fault was swallowed).
+BEZEL_TEST(task_combinators_443, when_all_one_faulted_raises) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new Array<Task>(); "
+        "    tasks.Add(Task.FromResult(1)); "
+        "    tasks.Add(Boom()); "
+        "    using var wa := Task.WhenAll(tasks); "
+        "    await wa; "
+        "    return 5; "
+        "  end Main; end C;"),
+        70);
+}
+
+// §30.9 / #443: WhenAll where the fault is CAUGHT by a try around the await.
+// The catch should fire; x := 9.
+BEZEL_TEST(task_combinators_443, when_all_one_faulted_caught) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Boom(): Task "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    using var tasks := new Array<Task>(); "
+        "    tasks.Add(Task.FromResult(1)); "
+        "    tasks.Add(Boom()); "
+        "    using var wa := Task.WhenAll(tasks); "
+        "    try await wa; catch Exception => x := 9; end; "
+        "    return x; "
+        "  end Main; end C;"),
+        9);
+}
+
+// §30.9 / #443: WhenAll all-success is unaffected by the fault-propagation fix
+// (regression guard). Two already-completed tasks; WhenAll completes with
+// success; await returns normally; Main exits 5.
+BEZEL_TEST(task_combinators_443, when_all_all_success_unaffected) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new Array<Task>(); "
+        "    tasks.Add(Task.FromResult(1)); "
+        "    tasks.Add(Task.FromResult(2)); "
+        "    using var wa := Task.WhenAll(tasks); "
+        "    await wa; "
+        "    return 5; "
+        "  end Main; end C;"),
+        5);
+}
+
+// §30.9 / #443: WhenAll with a genuinely-async (Task.Delay) faulted input, run
+// cross-thread. The fault propagates to the aggregate and the process exits 70.
+// Run 3x for nondeterminism stability.
+BEZEL_TEST(task_combinators_443, when_all_delay_then_fault_cross_thread) {
+    const std::string src =
+        "module M; class C "
+        "  public static async method BoomAfterDelay(): Task "
+        "    await Task.Delay(5); "
+        "    throw new InvalidOperationException(); "
+        "  end BoomAfterDelay; "
+        "  public static async method Main(): Task<int> "
+        "    using var tasks := new Array<Task>(); "
+        "    tasks.Add(Task.FromResult(1)); "
+        "    tasks.Add(BoomAfterDelay()); "
+        "    using var wa := Task.WhenAll(tasks); "
+        "    await wa; "
+        "    return 5; "
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 70);
+}

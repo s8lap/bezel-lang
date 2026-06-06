@@ -1993,6 +1993,37 @@ private:
         return false;
     }
 
+    // §30.7 / #442: true when the method's DECLARED return type is
+    // IAsyncEnumerable<T> or IAsyncEnumerator<T> — the two interfaces that
+    // must be routed to emitAsyncIteratorMethod regardless of whether the body
+    // actually contains a `yield`. Without this, an async method declared to
+    // return IAsyncEnumerable<T> but whose body has NO yield (e.g. empty or
+    // await-only) is misrouted to emitAsyncMethod (which emits a bz_task*
+    // result), and an `await for` that loads the vtable from the returned
+    // bz_task* pointer crashes (SIGSEGV).
+    bool returnsAsyncIteratorType(sema::MethodSymbol* ms) const {
+        if (!ms->decl) return false;
+        const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md || !md->returnType) return false;
+        const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        // Path A: no declaration — name is in astNode->name->parts.
+        if (!rt->declaration) {
+            if (rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty()) {
+                auto& n = rt->astNode->name->parts[0];
+                return n == "IAsyncEnumerable" || n == "IAsyncEnumerator";
+            }
+            return false;
+        }
+        // Path B: builtinClassSym (non-null declaration with no user decl).
+        if (!rt->declaration->decl) {
+            return rt->declaration->name == "IAsyncEnumerable" ||
+                   rt->declaration->name == "IAsyncEnumerator";
+        }
+        return false;
+    }
+
     // §30.2: detect whether a block of statements contains an `await`. Used to
     // decide if an async method needs a real suspending state machine, or can
     // complete synchronously (no await → run-to-completion fast emit). Recurses

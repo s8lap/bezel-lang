@@ -188,6 +188,29 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             if (ifs->hasElse) n += countAwaits(ifs->elseBody);
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
             n += countAwaits(db->body);
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // §30.9 / #441: count awaits in the try BODY (the only position where
+            // await is lowered — awaitInDeferredTryPosition rejects catch arms and
+            // finally). Recurse into the try body so a nested compound statement
+            // containing an await is counted; also recurse into catch/finally for
+            // future-proofness (counting them is harmless — if they are ever
+            // rejected by awaitInDeferredTryPosition the compile fails before
+            // emitting the resume switch, so the extra states are never reached).
+            // This fixes a HANG: without this case the try-body await is uncounted,
+            // numAwaits is too small, the resume switch lacks the state for the
+            // in-try await, and when a pool worker fires the continuation with that
+            // state the switch hits its default (return) — bz_task_complete is
+            // never called, so the outer Task never completes and
+            // bz_task_await_sync hangs forever.
+            n += countAwaits(ts->body);
+            for (const auto& arm : ts->catches) {
+                if (arm.guard) n += countAwaitsInExpr(arm.guard.get());
+                if (arm.body) {
+                    if (auto* db2 = dynamic_cast<const ast::DoEndBlock*>(arm.body.get()))
+                        n += countAwaits(db2->body);
+                }
+            }
+            if (ts->hasFinally) n += countAwaits(ts->finallyBody);
         }
     }
     return n;

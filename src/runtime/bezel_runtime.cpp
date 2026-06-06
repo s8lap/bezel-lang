@@ -1601,10 +1601,22 @@ void* bz_task_from_result(const void* result, int64_t result_size) {
 // the completion counter; the last completion (counter → 0) fires the aggregate.
 // The context is heap-allocated once and shared across all continuations via a
 // raw pointer (no C++ shared_ptr to stay extern "C" compatible).
+//
+// §30.9 / #443: fault propagation. If ANY input task is faulted (is_error),
+// the aggregate completes with the FIRST observed fault (error_obj), so the
+// awaiter's await.fault path re-raises the original exception. A separate
+// atomic bool `any_fault` tracks whether a fault was seen; a second atomic
+// `first_error_obj` (void*) records the error object of the first faulted
+// task. The first faulted continuation wins via a CAS on `any_fault`
+// (false → true); subsequent faults are discarded (the aggregate carries one
+// representative error, per §30.9). When remaining hits 0, if any_fault is
+// set the aggregate completes with error; otherwise it completes with success.
 struct BzWhenAllCtx {
     bz_task_t* aggregate;
-    std::atomic<int64_t> remaining;  // pending completion count
-    std::atomic<int64_t> refcount;   // continuation refcount (= n at init)
+    std::atomic<int64_t> remaining;      // pending completion count
+    std::atomic<int64_t> refcount;       // continuation refcount (= n at init)
+    std::atomic<bool> any_fault;         // true once a faulted input is seen
+    std::atomic<void*> first_error_obj;  // error_obj of the first faulted task
 };
 
 void* bz_task_when_all(void* task_arr) {
@@ -1615,15 +1627,40 @@ void* bz_task_when_all(void* task_arr) {
         aggregate->done = true;
         return aggregate;
     }
-    auto* ctx = new BzWhenAllCtx{aggregate, {n}, {n}};
+    auto* ctx = new BzWhenAllCtx{aggregate, {n}, {n}, {false}, {nullptr}};
     for (int64_t i = 0; i < n; ++i) {
         void* t = nullptr;
         bz_array_get(arr, i, &t, sizeof(void*));
         bz_task_then(t,
-            [](void* /*completedTask*/, void* state) {
+            [](void* completedTask, void* state) {
                 auto* c = (BzWhenAllCtx*)state;
-                if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
-                    bz_task_complete(c->aggregate, nullptr, 0);
+                // §30.9 / #443: if this input faulted, attempt a CAS on
+                // any_fault (false → true). Only the first faulted continuation
+                // wins and records the error object; subsequent faults are
+                // discarded. The error object is read here while the task is
+                // complete and its fields are stable (no race).
+                if (bz_task_is_error(completedTask)) {
+                    bool expected = false;
+                    if (c->any_fault.compare_exchange_strong(
+                            expected, true,
+                            std::memory_order_acq_rel,
+                            std::memory_order_relaxed)) {
+                        // We won the CAS: record the error object.
+                        void* errObj = bz_task_error_obj(completedTask);
+                        c->first_error_obj.store(errObj, std::memory_order_release);
+                    }
+                }
+                // When ALL inputs are done (remaining → 0), complete the
+                // aggregate: success if no fault was recorded, error otherwise.
+                if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    if (c->any_fault.load(std::memory_order_acquire)) {
+                        void* errObj = c->first_error_obj.load(
+                            std::memory_order_acquire);
+                        bz_task_complete_error_obj(c->aggregate, errObj);
+                    } else {
+                        bz_task_complete(c->aggregate, nullptr, 0);
+                    }
+                }
                 if (c->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
                     delete c;
             },

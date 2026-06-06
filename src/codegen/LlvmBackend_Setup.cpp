@@ -1730,24 +1730,39 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return;
 
-    // §29.3 / §30.7: detect iterator methods BEFORE creating the entry block
-    // (emitIteratorMethod / emitAsyncIteratorMethod handle their own entry block
-    // + bindParameters). The yield check stays FIRST; within it, an ASYNC
-    // iterator (async + yield, returning IAsyncEnumerable<T>) goes to the fused
-    // yield+await state machine (§30.7), and a plain iterator to the sync one.
+    // §29.3 / §30.7 / #442: detect iterator and async-iterator methods BEFORE
+    // creating the entry block (emitIteratorMethod / emitAsyncIteratorMethod
+    // handle their own entry block + bindParameters).
+    //
+    // Routing rules (applied in order):
+    //   1. async + yield in body  → emitAsyncIteratorMethod (fused).
+    //   2. async + return type is IAsyncEnumerable<T>/IAsyncEnumerator<T>
+    //      (even with NO yield — empty or await-only body) →
+    //      emitAsyncIteratorMethod. Fix #442: without this check a body with
+    //      no yield is misrouted to emitAsyncMethod, which emits a bz_task*
+    //      result; an `await for` that loads a vtable from the task pointer
+    //      then crashes (SIGSEGV).
+    //   3. non-async + yield in body  → emitIteratorMethod (sync).
+    //   4. async (non-iterator return type, no rule above matched) →
+    //      emitAsyncMethod.
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts &&
+        isAsyncMethod(ms) &&
+        (containsYield(*ci.stmts) || returnsAsyncIteratorType(ms))) {
+        emitAsyncIteratorMethod(ms, fn, ci);
+        return;
+    }
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts &&
+        !isAsyncMethod(ms) &&
         containsYield(*ci.stmts)) {
-        if (isAsyncMethod(ms))
-            emitAsyncIteratorMethod(ms, fn, ci);
-        else
-            emitIteratorMethod(ms, fn, ci);
+        emitIteratorMethod(ms, fn, ci);
         return;
     }
 
-    // §30.1 / §30.2: detect (non-yield) async methods. emitAsyncMethod builds
-    // the entry + Resume functions itself (mirrors emitIteratorMethod). Gated to
-    // the Task / Task<T> / OwnedTask<T> forms; the async-iterator forms (async +
-    // yield) are handled by the iterator path above.
+    // §30.1 / §30.2: detect (non-yield, non-async-iterator) async methods.
+    // emitAsyncMethod builds the entry + Resume functions itself (mirrors
+    // emitIteratorMethod). Gated to the Task / Task<T> / OwnedTask<T> forms;
+    // the async-iterator forms (async + yield, or async + IAsyncEnumerable
+    // return type) are handled by the iterator path above.
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts &&
         isAsyncMethod(ms)) {
         emitAsyncMethod(ms, fn, ci);
