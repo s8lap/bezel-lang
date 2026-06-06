@@ -3044,6 +3044,41 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // §6.1: CancellationTokenSource static methods.
     // WithCancelAfter(delay) — deferred (needs timer/scheduler infra).
 
+    // §30.10 / stdlib §6.7: Task static helpers. `Task.Delay(...)` produces a
+    // genuinely-incomplete Task that a thread-pool worker completes after the
+    // delay elapses (bz_task_delay). This is the primitive that exercises the
+    // cross-thread suspend/resume path (§30.13): `await Task.Delay(...)` registers
+    // its continuation via bz_task_then and resumes on the pool when the timer
+    // fires. The Delay(int) overload's arg is milliseconds; Delay(TimeSpan)'s arg
+    // is an i64 tick count (100-ns units) converted to ms. The CancellationToken
+    // overloads are accepted but the token is not yet honored for an in-flight
+    // delay (cancelling a running delay is a deferred refinement — the delay still
+    // completes normally); the first argument selects the duration either way.
+    if (cls == "Task") {
+        if (m == "Delay" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            // Determine ms. An `int` (i32) arg is milliseconds directly; a
+            // TimeSpan arg is an i64 tick count (100-ns units) → ms = ticks/10000.
+            llvm::Value* ms = nullptr;
+            auto* argTy = ctx_.exprType(*call.args[0].value);
+            bool isTimeSpan = argTy && argTy->kind == sema::TypeRef::Kind::Named &&
+                              builtinTypeName(argTy) == "TimeSpan";
+            if (isTimeSpan) {
+                if (!arg->getType()->isIntegerTy(64))
+                    arg = builder_.CreateSExtOrTrunc(arg, i64());
+                ms = builder_.CreateSDiv(arg, builder_.getInt64(10000),
+                                         "delay.ms");
+            } else {
+                ms = arg->getType()->isIntegerTy(64)
+                         ? arg
+                         : builder_.CreateSExtOrTrunc(arg, i64());
+            }
+            auto* delayFn = declareC("bz_task_delay", ptrTy(), {i64()});
+            return builder_.CreateCall(delayFn, {ms}, "task.delay");
+        }
+    }
+
     // §2.x: Random class — pseudorandom numbers via libc rand()/srand().
     if (cls == "Random") {
         auto* randFn = module_->getFunction("rand");
