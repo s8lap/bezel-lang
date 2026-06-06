@@ -221,8 +221,15 @@ void Emitter::collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
                            std::vector<const ast::YieldStmt*>& out) {
     for (const auto& s : stmts) {
         if (!s) continue;
-        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s.get()))
-            { out.push_back(ys); continue; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s.get())) {
+            // §29.3: only `yield return` consumes a resume-state slot; `yield break`
+            // is a terminal that unconditionally returns false from MoveNext without
+            // advancing the state counter. Counting it here would create a dangling
+            // state block (mn.sN) with no predecessor and no terminator, which the
+            // IR verifier rejects. (#437 fix)
+            if (!ys->isBreak) out.push_back(ys);
+            continue;
+        }
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get()))
             collectYields(fs->body, out);
         else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get()))
