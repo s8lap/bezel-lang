@@ -1870,7 +1870,18 @@ private:
     // ====================================================================
 
     // Which suspending construct the in-flight state machine lowers.
-    enum class SuspendKind { Yield, Await };
+    //   Yield      — a synchronous iterator (§29.3): MoveNext/Current, suspend
+    //                points are `yield return` (store current_val, ret true).
+    //   Await      — a plain async method (§30.1): a Task driver, suspend points
+    //                are `await` (register a continuation, return).
+    //   AsyncYield — an ASYNC ITERATOR (§30.7): both at once. The MoveNextAsync
+    //                resume drives the body until the next `yield return` (store
+    //                current_val, complete the per-advance Task<bool> with true,
+    //                return) and `await` suspends on a task between yields. The
+    //                frame carries both the `current_val` field and the async
+    //                task slots; the per-advance task is re-allocated each
+    //                MoveNextAsync call (the frame persists across calls).
+    enum class SuspendKind { Yield, Await, AsyncYield };
 
     // Layout of a suspend/resume frame (the heap struct a suspended method
     // spills into). Field order, kind-independent:
@@ -1993,6 +2004,19 @@ private:
     static bool awaitInDeferredTryPosition(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 
+    // §30.7 (#440): detect a suspend point (yield / await) inside ANY try region
+    // (body, catch arm, or finally) in an async iterator body. Resuming the fused
+    // yield+await state machine into a protected scope across a suspend is
+    // unimplemented; such a shape is rejected with a diagnostic + safe stub.
+    // Stricter than awaitInDeferredTryPosition (which permits `await` in a try
+    // body): an iterator's `yield` in a try body is itself a cross-region suspend.
+    bool suspendInTryPosition(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+
+    // §30.7 (#440): does a single statement (e.g. a catch-arm body) contain a
+    // suspend point (yield / await)? Helper for suspendInTryPosition.
+    static bool stmtContainsSuspend(const ast::Stmt* s);
+
     // §30.1 / §30.2: emit an `async` method (one returning Task / Task<T> /
     // OwnedTask<T>; the async-iterator forms — async + yield — are deferred).
     // Mirrors emitIteratorMethod with smKind_ == Await. Layers the task-driver
@@ -2038,6 +2062,45 @@ private:
     // enclosing function is not an async state machine (so the await falls
     // through to the normal nullptr — a defensive guard, not a normal path).
     llvm::Value* lowerAwait(const ast::UnaryExpr& un);
+
+    // §30.2 / §30.7: the reusable await suspend mechanism, shared by lowerAwait
+    // and the `await for` desugaring (lowerAwaitFor). `task` is the awaited task
+    // pointer; `resultTy` the lowered await-result type (null for a no-value
+    // `await Task`); `freeTaskAfter` reclaims the task once its result is read.
+    // Emits the already-done fast path inline, the slow path (register the resume
+    // continuation + return), and the resume / fast-path convergence that reads
+    // the result and re-raises a faulted task (§30.9). Returns the result value.
+    llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
+                                  bool freeTaskAfter);
+
+    // §30.7: emit an ASYNC ITERATOR method (declared `async`, contains `yield`,
+    // returns IAsyncEnumerable<T> / IAsyncEnumerator<T>). Combines the iterator
+    // driver (MoveNextAsync/Current/Dispose vtable, current_val field) with the
+    // async state machine (Task-completing suspend points, await continuations).
+    // smKind_ == AsyncYield. The original method becomes the construction entry
+    // (calloc the frame, store captures, return it as the enumerator). MoveNextAsync
+    // allocates a fresh per-advance Task<bool>, drives the Resume once, and returns
+    // it; Resume runs the body — `yield return v` stores current_val and completes
+    // the per-advance task with true; `await t` suspends on t (emitAwaitSuspend);
+    // exhaustion / `yield break` completes with false. Current reads current_val.
+    void emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
+                                 const CallableInfo& ci);
+
+    // §30.7: complete the in-flight async iterator's PER-ADVANCE Task<bool> with
+    // `hasValue` (true = a value was yielded into current_val; false = exhausted).
+    // Unlike emitAsyncComplete, it does NOT free the frame (the frame persists
+    // across MoveNextAsync calls until Dispose). Requires AsyncYield sm*_ state.
+    void emitAsyncIterComplete(bool hasValue);
+
+    // §30.7: lower `await for var x in src do ... end`. Drives an IAsyncEnumerator
+    // (the async-iterator frame returned by a CallExpr source): each iteration
+    // calls MoveNextAsync (vtable slot 2) → Task<bool>, awaits it (a suspend point
+    // in the consuming async method's own state machine — emitAwaitSuspend), reads
+    // Current (vtable slot 3) on a true result and runs the body, and disposes the
+    // enumerator (vtable slot 1) at loop exit. Returns true when it handled the
+    // statement. Only the borrowing IAsyncEnumerable<T> / CallExpr-source shape is
+    // supported; other shapes fall through to a diagnostic.
+    bool lowerAwaitFor(const ast::ForStmt& fs);
 
     // §30.2 / §30.13 (#438 + #439-followup): repair SSA dominance in a resume
     // function after the body is lowered, moving the offending temporaries into

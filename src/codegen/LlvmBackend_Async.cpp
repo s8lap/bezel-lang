@@ -95,6 +95,8 @@ bool Emitter::containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
         } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get())) {
             if (exprContainsAwait(rs->value.get())) return true;
         } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
+            // §30.7: an `await for` itself contains an await (MoveNextAsync).
+            if (fs->isAwait) return true;
             if (containsAwait(fs->body)) return true;
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
             if (exprContainsAwait(ws->condition.get())) return true;
@@ -162,8 +164,17 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             n += countAwaitsInExpr(es->expr.get());
         else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get()))
             n += countAwaitsInExpr(rs->value.get());
-        else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get()))
+        else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
+            // §30.7: `await for` desugars to a loop whose head awaits the
+            // enumerator's MoveNextAsync() each iteration — one suspend point
+            // (the loop re-enters the same await.resume block). Count it so the
+            // consuming method's resume switch has a state block for it. Skip the
+            // deferred `await for ... with token` form (§30.8): it is not lowered
+            // (a diagnostic fails the compile), so reserving a state block for it
+            // would leave an unterminated orphan block.
+            if (fs->isAwait && !fs->withExpr) n += 1;
             n += countAwaits(fs->body);
+        }
         else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
             n += countAwaitsInExpr(ws->condition.get());
             n += countAwaits(ws->body);
@@ -246,6 +257,68 @@ bool Emitter::awaitInDeferredTryPosition(
                 return true;
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
             if (awaitInDeferredTryPosition(db->body)) return true;
+        }
+    }
+    return false;
+}
+
+
+// §30.7 (#440): does a SINGLE statement contain a suspend point (a `yield` or an
+// `await`)? Used by suspendInTryPosition to inspect a catch-arm body (which is a
+// single Stmt, possibly a DoEndBlock). Recurses into the common compound shapes.
+bool Emitter::stmtContainsSuspend(const ast::Stmt* s) {
+    if (!s) return false;
+    if (dynamic_cast<const ast::YieldStmt*>(s)) return true;
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s))
+        return containsYield(db->body) || containsAwait(db->body);
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s))
+        return exprContainsAwait(ld->initializer.get());
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s))
+        return exprContainsAwait(es->expr.get());
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s))
+        return exprContainsAwait(as->value.get());
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s))
+        return exprContainsAwait(rs->value.get());
+    return false;
+}
+
+
+// §30.7 (#440): detect a suspend point (yield / await) inside ANY try region —
+// the try body, a catch arm (guard or body), or a `finally` — in an async
+// iterator body. Resuming the fused state machine INTO a try/catch/finally scope
+// across a suspend (re-establishing the protected region / caught-exception
+// disposal / exit-mode dispatch at the resume entry) is unimplemented, so such a
+// shape is rejected with a diagnostic + a safe stub rather than emitting code
+// that crashes at runtime. Recurses into nested compound statements so a try
+// nested in a loop / if / do-block / outer try is still caught.
+bool Emitter::suspendInTryPosition(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // A suspend anywhere in the try body, a catch arm, or the finally.
+            if (containsYield(ts->body) || containsAwait(ts->body)) return true;
+            for (const auto& arm : ts->catches) {
+                if (arm.guard && exprContainsAwait(arm.guard.get())) return true;
+                if (stmtContainsSuspend(arm.body.get())) return true;
+            }
+            if (containsYield(ts->finallyBody) || containsAwait(ts->finallyBody))
+                return true;
+            // Recurse into the try body for a NESTED try.
+            if (suspendInTryPosition(ts->body)) return true;
+            continue;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
+            if (suspendInTryPosition(fs->body)) return true;
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
+            if (suspendInTryPosition(ws->body)) return true;
+        } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+            if (suspendInTryPosition(ifs->ifBranch.body)) return true;
+            for (const auto& el : ifs->elifBranches)
+                if (suspendInTryPosition(el.body)) return true;
+            if (ifs->hasElse && suspendInTryPosition(ifs->elseBody)) return true;
+        } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+            if (suspendInTryPosition(db->body)) return true;
         }
     }
     return false;
@@ -560,11 +633,313 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 }
 
 
+// §30.7: emit an async iterator (declared `async`, contains `yield`, returns
+// IAsyncEnumerable<T> / IAsyncEnumerator<T>). This is the iterator state machine
+// (§29.3) and the async state machine (§30.1) fused: the body both YIELDs values
+// and AWAITs tasks between them. The driver is an IAsyncEnumerator<T> whose
+// MoveNextAsync returns a Task<bool> — each advance drives the body to the next
+// `yield return` (Task<bool> = true) or to exhaustion (false), suspending on any
+// `await` encountered along the way.
+//
+// Layout reuses the kind-agnostic frame with FOUR trailing fields (the iterator's
+// `current_val` + the three async slots):
+//   { ptr vtable, i32 state, captures..., locals...,
+//     T current_val, ptr perAdvanceTask, ptr pendingTask, ptr spill }
+// The frame persists for the whole iteration; MoveNextAsync re-allocates the
+// per-advance Task<bool> each call. Dispose frees the frame (and any spill area).
+void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
+                                      const CallableInfo& ci) {
+    if (!ci.stmts) return;
+    smKind_ = SuspendKind::AsyncYield;
+
+    // §30.7 (#440): a suspend point (yield / await) inside ANY try region — the
+    // try body, a catch arm, or a `finally` — in an async iterator is deferred.
+    // Resuming the fused yield+await state machine INTO a try scope across a
+    // suspend (re-establishing the protected region / caught-exception disposal /
+    // exit-mode dispatch at the resume entry) is unimplemented. Reject with a
+    // clear diagnostic + a safe stub so no crashing code (or malformed IR) escapes.
+    // This is stricter than the plain-async rule (awaitInDeferredTryPosition,
+    // which allows `await` in a try BODY) because an iterator's `yield` in a try
+    // body is itself a suspend across the protected region.
+    if (suspendInTryPosition(*ci.stmts)) {
+        ctx_.diagnostics().report(
+            Severity::Error,
+            ms->decl ? ms->decl->span.begin : SourceLocation{},
+            "not yet implemented: `yield` or `await` inside a try / catch / "
+            "finally in an async iterator — resuming the state machine into the "
+            "protected scope across a suspend is a deferred increment (§30.7)");
+        emitAsyncStub(ms, fn, ci);
+        return;
+    }
+
+    // Element type T from the return type's first generic arg
+    // (IAsyncEnumerable<T> / IAsyncEnumerator<T>).
+    llvm::Type* elemTy = i32();
+    if (ci.returnType) {
+        auto* retRef = ctx_.resolvedType(*ci.returnType);
+        if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0])
+            elemTy = lowerTypeRef(retRef->genericArgs[0]);
+    }
+    // The per-advance MoveNextAsync result is Task<bool>; the await-result type
+    // the Resume completes is bool (i1). asyncResultTy_ sizes bz_task_complete.
+    asyncResultTy_ = i1();
+
+    // Frame: locals + [ T current_val, ptr perAdvanceTask, ptr pendingTask,
+    //                   ptr spill ].
+    StateMachineFrame frame = buildStateMachineFrame(
+        ms, *ci.stmts, {elemTy, ptrTy(), ptrTy(), ptrTy()},
+        std::string("asynciter.") + std::string(ms->name));
+    auto* stateStructTy = frame.structTy;
+    const unsigned VTABLE_FIELD = frame.vtableField;
+    const unsigned STATE_FIELD = frame.stateField;
+    const unsigned CURRENT_VAL_FIELD = frame.currentValField;       // first trailing
+    const unsigned PER_ADVANCE_TASK_FIELD = frame.currentValField + 1;
+    const unsigned PENDING_TASK_FIELD = frame.currentValField + 2;
+    const unsigned SPILL_PTR_FIELD = frame.currentValField + 3;
+    // The Resume completes the per-advance task; reuse asyncOuterTaskField_ for it.
+    asyncOuterTaskField_ = PER_ADVANCE_TASK_FIELD;
+    asyncPendingTaskField_ = PENDING_TASK_FIELD;
+    asyncSpillPtrField_ = SPILL_PTR_FIELD;
+
+    bool isInstance = !isStaticMethod(ms);
+    std::string prefix = std::string("bz$asynciter$") + std::string(ms->name) + "$";
+
+    // --- MoveNextAsync(ptr self) -> ptr (Task<bool>) ---
+    auto* moveNextTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    auto* moveNextFn = llvm::Function::Create(
+        moveNextTy, llvm::Function::InternalLinkage,
+        prefix + "MoveNextAsync", module_.get());
+
+    // --- get$Current(ptr self) -> T ---
+    auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+    auto* currentFn = llvm::Function::Create(
+        currentTy, llvm::Function::InternalLinkage,
+        prefix + "Current", module_.get());
+
+    // --- Resume(ptr completedTask, ptr frame) -> void --- (bz_task_then ABI) ---
+    auto* resumeTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false);
+    auto* resumeFn = llvm::Function::Create(
+        resumeTy, llvm::Function::InternalLinkage, prefix + "Resume",
+        module_.get());
+    asyncResumeFn_ = resumeFn;
+
+    // --- Dispose(ptr self) -> void: free the spill area + the frame ---
+    // §30.7: `await for` disposes the enumerator at loop exit. Our generated
+    // enumerator has no async cleanup work, so Dispose is a synchronous free of
+    // the heap frame (and any cross-suspend spill area). (Awaiting DisposeAsync —
+    // genuine async cleanup across a suspend — is deferred; a synchronous free is
+    // sound here because the frame is plain heap memory.)
+    auto* disposeFn = llvm::Function::Create(
+        llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+        llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
+    {
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", disposeFn);
+        llvm::IRBuilder<> db(bb);
+        llvm::Value* self = &*disposeFn->arg_begin();
+        // Free the spill area (null when there was no cross-suspend temporary).
+        llvm::Value* spillField =
+            db.CreateStructGEP(stateStructTy, self, SPILL_PTR_FIELD);
+        llvm::Value* spillPtr = db.CreateLoad(ptrTy(), spillField);
+        auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        db.CreateCall(freeFn, {spillPtr});
+        db.CreateCall(freeFn, {self});
+        db.CreateRetVoid();
+    }
+
+    // --- Vtable: [0]=self, [1]=Dispose, [2]=MoveNextAsync, [3]=Current ---
+    const unsigned VT_SIZE = 4;
+    std::vector<llvm::Constant*> vtElems(
+        VT_SIZE, llvm::ConstantPointerNull::get(ptrTy()));
+    auto* vtGVType = llvm::ArrayType::get(ptrTy(), VT_SIZE);
+    auto* vtGV = new llvm::GlobalVariable(
+        *module_, vtGVType, true, llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(vtGVType, vtElems), prefix + "vtable");
+    vtElems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+    vtElems[1] = disposeFn;
+    vtElems[2] = moveNextFn;
+    vtElems[3] = currentFn;
+    vtGV->setInitializer(llvm::ConstantArray::get(vtGVType, vtElems));
+
+    // --- Construction entry (= the original method): calloc + fill frame ---
+    {
+        currentFn_ = fn;
+        currentThis_ = nullptr;
+        locals_.clear(); paramSlots_.clear(); refParams_.clear();
+        disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+        propagateBB_ = nullptr; unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+        builder_.SetInsertPoint(entry);
+        bindParameters(fn, isInstance, &ms->params);
+
+        uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stateStructTy);
+        auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+        llvm::Value* st = builder_.CreateCall(
+            callocFn2, {builder_.getInt64(1), builder_.getInt64(stSz)},
+            "asynciter.frame");
+        llvm::Value* vtField =
+            builder_.CreateStructGEP(stateStructTy, st, VTABLE_FIELD);
+        builder_.CreateStore(vtGV, vtField);
+        llvm::Value* stateField =
+            builder_.CreateStructGEP(stateStructTy, st, STATE_FIELD);
+        builder_.CreateStore(builder_.getInt32(0), stateField);
+        emitFrameCaptureStores(frame, st);
+        builder_.CreateRet(st);
+    }
+
+    // --- Current: load current_val from the frame ---
+    {
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", currentFn);
+        llvm::IRBuilder<> cb(entry);
+        llvm::Value* self = &*currentFn->arg_begin();
+        llvm::Value* cvField =
+            cb.CreateStructGEP(stateStructTy, self, CURRENT_VAL_FIELD);
+        cb.CreateRet(cb.CreateLoad(elemTy, cvField));
+    }
+
+    // --- MoveNextAsync: alloc a fresh per-advance Task<bool>, drive Resume ---
+    {
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
+        llvm::IRBuilder<> mb(entry);
+        llvm::Value* self = &*moveNextFn->arg_begin();
+        auto* allocFn = declareC("bz_task_alloc", ptrTy(), {});
+        llvm::Value* task = mb.CreateCall(allocFn, {}, "advance.task");
+        llvm::Value* taskField =
+            mb.CreateStructGEP(stateStructTy, self, PER_ADVANCE_TASK_FIELD);
+        mb.CreateStore(task, taskField);
+        // Drive the state machine once synchronously (§30.1 synchronous prefix).
+        mb.CreateCall(resumeFn,
+                      {llvm::ConstantPointerNull::get(ptrTy()), self});
+        mb.CreateRet(task);
+    }
+
+    // --- Resume: the fused yield/await state machine body ---
+    {
+        currentFn_ = resumeFn;
+        currentThis_ = nullptr;
+        locals_.clear(); paramSlots_.clear(); refParams_.clear();
+        disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+        propagateBB_ = nullptr; unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
+        builder_.SetInsertPoint(entry);
+
+        llvm::Value* self = resumeFn->getArg(1);
+        emitFrameCaptureRestores(frame, self);
+
+        llvm::Value* stateGEP =
+            builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
+
+        // The resume switch state count = #yields + #awaits (every suspend point
+        // is a state). collectYields / countAwaits count each kind.
+        std::vector<const ast::YieldStmt*> yields;
+        collectYields(*ci.stmts, yields);
+        unsigned numSuspends = (unsigned)yields.size() + countAwaits(*ci.stmts);
+
+        // Yield-specific live state for the YieldStmt handler (lowerStmt).
+        iterCurrentValField_ = CURRENT_VAL_FIELD;
+        iterElemTy_ = elemTy;
+
+        // Publish the live sm*_ state BEFORE emitResumeDispatch so the emitDone
+        // lambda below (which emitResumeDispatch runs before it itself publishes
+        // these) can use emitAsyncIterComplete. emitResumeDispatch re-publishes
+        // the same values, so this is harmless.
+        smStateStruct_ = stateStructTy;
+        smSelf_ = self;
+        smStateGEP_ = stateGEP;
+
+        // "Done" (exhausted / fall-off / state -1): complete the per-advance task
+        // with FALSE and return. The frame is NOT freed here (it persists for the
+        // next MoveNextAsync / until Dispose).
+        std::vector<llvm::BasicBlock*> stateBBs = emitResumeDispatch(
+            frame, self, stateGEP, numSuspends,
+            [&]() {
+                emitAsyncIterComplete(/*hasValue=*/false);
+                // Mark state -1 so a further MoveNextAsync stays exhausted.
+                builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
+                builder_.CreateRetVoid();
+            });
+
+        // §30.9: the fault boundary for an uncaught throw / faulted await in the
+        // iterator body — complete the per-advance task with the error object so
+        // the consuming `await for` re-raises it, then return. (No nearer try
+        // handler installs a closer unwindTarget_.)
+        auto* faultBB =
+            llvm::BasicBlock::Create(llvm_, "asynciter.fault", resumeFn);
+        unwindTarget_ = faultBB;
+        {
+            llvm::IRBuilder<>::InsertPointGuard guard(builder_);
+            builder_.SetInsertPoint(faultBB);
+            llvm::Value* taskField = builder_.CreateStructGEP(
+                stateStructTy, self, PER_ADVANCE_TASK_FIELD);
+            llvm::Value* task = builder_.CreateLoad(ptrTy(), taskField);
+            llvm::Value* excObj = builder_.CreateLoad(
+                ptrTy(), excGlobal(), "asynciter.fault.exc");
+            auto* completeErrObjFn = declareC(
+                "bz_task_complete_error_obj", llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), ptrTy()});
+            builder_.CreateCall(completeErrObjFn, {task, excObj});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 excGlobal());
+            // Stay exhausted on any later advance.
+            builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
+            builder_.CreateRetVoid();
+        }
+
+        builder_.SetInsertPoint(stateBBs[0]);
+        disposeStack_.emplace_back();
+        bool term = lowerBody(*ci.stmts);
+        disposeStack_.pop_back();
+        if (!term && !builder_.GetInsertBlock()->getTerminator()) {
+            emitAsyncIterComplete(/*hasValue=*/false);
+            builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
+            builder_.CreateRetVoid();
+        }
+
+        // Repair SSA dominance for awaits embedded in larger expressions (e.g.
+        // `yield return await Compute()`), promoting cross-suspend temporaries
+        // into the heap spill area so they survive a real cross-thread suspend.
+        fixupSuspendDominance(resumeFn);
+
+        smStateStruct_ = nullptr;
+        smSelf_ = nullptr;
+        smLocalFields_.clear();
+        smAllocaToField_.clear();
+        asyncResumeFn_ = nullptr;
+        asyncResultTy_ = nullptr;
+    }
+}
+
+
+// §30.7: complete the in-flight async iterator's PER-ADVANCE Task<bool> with the
+// given boolean (true = a value was yielded and is in current_val; false =
+// exhausted). Unlike emitAsyncComplete (plain async), this does NOT free the
+// frame — the frame persists across MoveNextAsync calls until Dispose. The bool
+// is copied by the runtime (1 byte).
+void Emitter::emitAsyncIterComplete(bool hasValue) {
+    llvm::Value* self = smSelf_;
+    if (!self || !smStateStruct_) return;
+    llvm::Value* taskField =
+        builder_.CreateStructGEP(smStateStruct_, self, asyncOuterTaskField_);
+    llvm::Value* task = builder_.CreateLoad(ptrTy(), taskField);
+    auto* completeFn = declareC("bz_task_complete", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), i64()});
+    llvm::AllocaInst* slot = entryAlloca(i1());
+    builder_.CreateStore(
+        hasValue ? builder_.getTrue() : builder_.getFalse(), slot);
+    uint64_t sz = module_->getDataLayout().getTypeAllocSize(i1());
+    builder_.CreateCall(completeFn, {task, slot, builder_.getInt64((int64_t)sz)});
+}
+
+
 llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     // Defensive: `await` outside an async state machine is rejected by sema; if
     // we somehow reach here without the async frame live, produce nothing.
-    if (smKind_ != SuspendKind::Await || !smStateStruct_ || !smSelf_ ||
-        !asyncResumeFn_)
+    // §30.7: an async iterator (AsyncYield) also lowers `await` suspend points
+    // in its MoveNextAsync resume function, so both kinds are valid here.
+    if ((smKind_ != SuspendKind::Await && smKind_ != SuspendKind::AsyncYield) ||
+        !smStateStruct_ || !smSelf_ || !asyncResumeFn_)
         return nullptr;
     if (!un.operand) return nullptr;
 
@@ -579,6 +954,28 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
         if (rt->kind != sema::TypeRef::Kind::Unit)
             resultTy = lowerTypeRef(rt);
     }
+
+    // §30.5: reclaim the awaited task at the await site when its operand is an
+    // anonymous producer result (`await Producer()`) — a single-use task with no
+    // other owner. A task bound to a local is left to its binder's disposal.
+    bool freeTaskAfter =
+        dynamic_cast<const ast::CallExpr*>(un.operand.get()) != nullptr;
+    return emitAwaitSuspend(task, resultTy, freeTaskAfter);
+}
+
+
+// §30.2 / §30.7: the reusable await suspend mechanism — shared by `lowerAwait`
+// (an `await <task>` expression) and the `await for` desugaring (each iteration
+// awaits the enumerator's MoveNextAsync() task). `task` is the awaited task
+// pointer; `resultTy` is the lowered await-result type (null for a no-value
+// `await Task`); `freeTaskAfter` reclaims the task once its result is read (true
+// for anonymous single-use producers, e.g. `await Producer()` or a per-advance
+// MoveNextAsync task). Emits the already-done fast path inline and the slow path
+// that registers the resume continuation + returns; the resume / fast-path
+// convergence reads the result and re-raises a faulted task (§30.9).
+llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
+                                       bool freeTaskAfter) {
+    if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
     // state can read its result (the local `task` value does not survive a
@@ -677,7 +1074,7 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
         // result (`await Producer()`) — a single-use task with no other owner.
         // bz_task_free frees the task struct + its result/message buffers but NOT
         // the exception object, which now lives on in bz$exc for the handler.
-        if (dynamic_cast<const ast::CallExpr*>(un.operand.get())) {
+        if (freeTaskAfter) {
             auto* freeTaskFn = declareC("bz_task_free",
                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeTaskFn, {awaitedTask});
@@ -717,7 +1114,7 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     // `await SomeAsyncCall()` chain leak-clean without risking the bound-task
     // case. (Multi-await Pattern A on a class-typed Task<T> is deferred; the
     // value-typed minimal cut's anonymous producer results are single-consumer.)
-    if (dynamic_cast<const ast::CallExpr*>(un.operand.get())) {
+    if (freeTaskAfter) {
         auto* freeTaskFn = declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
                                     {ptrTy()});
         builder_.CreateCall(freeTaskFn, {awaitedTask});

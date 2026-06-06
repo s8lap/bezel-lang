@@ -858,3 +858,209 @@ BEZEL_TEST(async_30_13, embedded_await_in_loop_accumulates_cross_thread) {
         "  end Main; end C;",
         6);
 }
+
+// ===========================================================================
+// §30.7 (#440) — ASYNC ITERATORS (IAsyncEnumerable<T> + `await for`).
+//
+// An async iterator is BOTH `async` and contains `yield`, returning
+// IAsyncEnumerable<T>. Its state machine can YIELD a value AND AWAIT a task
+// between yields: MoveNextAsync returns a Task<bool> (the consuming `await for`
+// awaits it each iteration). The fused yield+await machine reuses the §29/§30
+// suspend/resume scaffolding (SuspendKind::AsyncYield). These tests use
+// Task.Delay so the awaits GENUINELY suspend on the pool — the cross-thread
+// path. expectValueCrossThread runs each 3x and verifies ASan- and TSan-clean
+// (the enumerator frame + per-advance Task<bool> are reclaimed across threads).
+// ===========================================================================
+
+// §30.7 (#440): the core case — an async iterator yields 1,2,3 with
+// `await Task.Delay(...)` between yields; consumed by `await for ... sum += x`.
+// The awaits actually suspend on the pool; MoveNextAsync returns a Task<bool>
+// the consuming Main awaits each iteration. 1+2+3 = 6.
+BEZEL_TEST(async_30_7, async_iterator_yield_with_await_between) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    yield return 1; "
+        "    await Task.Delay(5); "
+        "    yield return 2; "
+        "    await Task.Delay(5); "
+        "    yield return 3; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do "
+        "      sum := sum + x; "
+        "    end; "
+        "    return sum; "
+        "  end Main; end C;",
+        6);
+}
+
+// §30.7 (#440): an async iterator whose yielded value is COMPUTED via an await
+// (`var v := await Compute(i); yield return v;`). Each Compute delays then
+// returns i*10 on a worker; the named result `v` round-trips the heap frame
+// across the cross-thread suspend before being yielded. (1+2+3)*10 = 60.
+BEZEL_TEST(async_30_7, async_iterator_value_computed_via_await) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n * 10; "
+        "  end Compute; "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    var i := 1; "
+        "    while i <= 3 do "
+        "      var v := await Compute(i); "
+        "      yield return v; "
+        "      i := i + 1; "
+        "    end; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do "
+        "      sum := sum + x; "
+        "    end; "
+        "    return sum; "
+        "  end Main; end C;",
+        60);
+}
+
+// §30.7 (#440): `yield return await Compute(i)` — the await is EMBEDDED in the
+// yielded expression, so its pre-suspend temporary lives in the iterator's heap
+// spill area (fixupSuspendDominance), surviving the cross-thread resume. A
+// `yield break` terminates early (i > 3). Yields 1,2,3 → 6.
+BEZEL_TEST(async_30_7, async_iterator_embedded_await_and_yield_break) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    for var i in 1..5 do "
+        "      if i > 3 then yield break; end; "
+        "      yield return await Compute(i); "
+        "    end; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do "
+        "      sum := sum + x; "
+        "    end; "
+        "    return sum; "
+        "  end Main; end C;",
+        6);
+}
+
+// §30.7 (#440): the iterator's yielded values feed a computation in the
+// `await for` body that ITSELF awaits — the loop variable `x` is live across the
+// body's await (a frame-backed suspend-local). Gen yields 1,2,3 (sync, no inner
+// await); the body awaits Double(x) and accumulates. (1+2+3)*2 = 12.
+BEZEL_TEST(async_30_7, await_for_body_awaits_uses_loop_var) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Double(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n * 2; "
+        "  end Double; "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    yield return 1; yield return 2; yield return 3; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do "
+        "      sum := sum + await Double(x); "
+        "    end; "
+        "    return sum; "
+        "  end Main; end C;",
+        12);
+}
+
+// §30.7 (#440): an async iterator parameterized + with a longer run (stress the
+// per-advance Task<bool> alloc/free + frame reuse across many advances). Gen(n)
+// yields 1..n each after a delay; the body sums them. n=10 → 55. The 3x repeat +
+// ASan/TSan legs verify no leak / race as 10 advances allocate and free a
+// per-advance task each, with the single frame reused throughout.
+BEZEL_TEST(async_30_7, async_iterator_parameterized_stress) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Gen(n: int): IAsyncEnumerable<int> "
+        "    var i := 1; "
+        "    while i <= n do "
+        "      await Task.Delay(2); "
+        "      yield return i; "
+        "      i := i + 1; "
+        "    end; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen(10) do "
+        "      sum := sum + x; "
+        "    end; "
+        "    return sum; "
+        "  end Main; end C;",
+        55);
+}
+
+// §30.8 / §30.7 (#440): `await for ... with token` (cancellation) is DEFERRED —
+// the token would be passed to GetAsyncEnumerator(token); the minimal cut
+// iterates the async-iterator result directly. Pin the boundary with a clean
+// diagnostic (compile FAILS) rather than emitting wrong code.
+BEZEL_TEST(async_30_8, await_for_with_cancellation_token_deferred) {
+    BEZEL_EXPECT_EQ(compileFails(
+        "module M; class C "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    yield return 1; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var ct := CancellationToken.None; "
+        "    var sum := 0; "
+        "    await for var x in Gen() with ct do "
+        "      sum := sum + x; "
+        "    end; "
+        "    return sum; "
+        "  end Main; end C;"),
+        true);
+}
+
+// §30.7 (#440) DEFERRED: a `yield` inside a try region in an async iterator —
+// resuming the fused state machine into the protected scope across a suspend is
+// unimplemented. Rejected with a clean diagnostic (compile FAILS) rather than
+// emitting code that crashes at runtime.
+BEZEL_TEST(async_30_7, yield_in_try_in_async_iterator_deferred) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    try "
+        "      yield return 1; "
+        "    catch Exception => yield return 2; "
+        "    end; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do sum := sum + x; end; "
+        "    return sum; "
+        "  end Main; end C;"));
+}
+
+// §30.7 (#440) DEFERRED: an `await` inside a try region in an async iterator is
+// likewise rejected (the catch-arm await needs the handler scope re-established
+// at resume).
+BEZEL_TEST(async_30_7, await_in_try_in_async_iterator_deferred) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static async method Compute(): Task<int> "
+        "    return 1; "
+        "  end Compute; "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    try "
+        "      yield return 1; "
+        "    catch Exception => yield return await Compute(); "
+        "    end; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do sum := sum + x; end; "
+        "    return sum; "
+        "  end Main; end C;"));
+}

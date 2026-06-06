@@ -196,6 +196,22 @@ bool Emitter::containsYield(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
         }
         if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get()))
             if (containsYield(db->body)) return true;
+        // §30.7 (#440): recurse into a try / catch / finally so a `yield` inside a
+        // protected region still classifies the method as an iterator. The async
+        // iterator path then rejects that shape (suspendInTryPosition); a sync
+        // iterator's yield-in-try is already rejected earlier by sema flow checks.
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            if (containsYield(ts->body)) return true;
+            for (const auto& arm : ts->catches) {
+                const ast::Stmt* ab = arm.body.get();
+                if (auto* db = dynamic_cast<const ast::DoEndBlock*>(ab)) {
+                    if (containsYield(db->body)) return true;
+                } else if (dynamic_cast<const ast::YieldStmt*>(ab)) {
+                    return true;
+                }
+            }
+            if (containsYield(ts->finallyBody)) return true;
+        }
     }
     return false;
 }
