@@ -1064,3 +1064,118 @@ BEZEL_TEST(async_30_7, await_in_try_in_async_iterator_deferred) {
         "    return sum; "
         "  end Main; end C;"));
 }
+
+// ===========================================================================
+// §30.9 / #441 (countAwaits TryStmt fix): cross-thread await inside a try body.
+// These tests use a GENUINELY-incomplete producer (Task.Delay) so the await
+// ACTUALLY suspends cross-thread; the resume fires on a pool worker into the
+// try-protected region. Before the fix, countAwaits missed TryStmt so numAwaits
+// was too small, the resume switch lacked the in-try state, the default branch
+// (return) fired, bz_task_complete was never called, and bz_task_await_sync
+// hung forever. After the fix each test COMPLETES with the right value.
+// ===========================================================================
+
+// §30.9 / #441: try + cross-thread await (normal completion). Producer delays
+// then returns 42; the await suspends, resumes on a worker inside the try body,
+// and x is set to 42. The catch is NOT entered. Result 43 proves the resume
+// reached the post-await return. Was a hang before the fix.
+BEZEL_TEST(async_30_9_441, await_in_try_cross_thread_normal) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Producer(42); catch Exception => x := 999; end; "
+        "    return x + 1; "
+        "  end Main; end C;",
+        43);
+}
+
+// §30.9 / #441: try/finally + cross-thread await (normal completion). Producer
+// delays then returns 5; the finally runs after the try body. x=5, ran=100:
+// result 105. Verifies the finally runs even when the resume is cross-thread.
+// Was a hang before the fix.
+BEZEL_TEST(async_30_9_441, await_in_try_finally_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; var ran := 0; "
+        "    try x := await Producer(5); finally ran := 100; end; "
+        "    return x + ran; "
+        "  end Main; end C;",
+        105);
+}
+
+// ===========================================================================
+// §30.7 / #442 (IAsyncEnumerable routing by return type): an async method
+// declared to return IAsyncEnumerable<T> but whose body has NO `yield` must be
+// routed to emitAsyncIteratorMethod (not emitAsyncMethod). Before the fix such
+// a method was emitted as a bz_task* result; an `await for` that loaded a vtable
+// from the task pointer crashed with SIGSEGV.
+// ===========================================================================
+
+// §30.7 / #442: empty async IAsyncEnumerable body (no yield, no await). The
+// iterator is immediately exhausted; `await for` runs zero iterations. Main
+// returns 0. Before the fix this was a SIGSEGV.
+BEZEL_TEST(async_30_7_442, async_iasyncenumerable_empty_body_zero_iters) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do sum := sum + x; end; "
+        "    return sum; "
+        "  end Main; end C;",
+        0);
+}
+
+// §30.7 / #442: async IAsyncEnumerable body with an await but no yield (the
+// await completes before exhaustion). The iterator produces zero values but
+// the await itself must not crash. sum stays 0; Main returns 7.
+// Before the fix the routing to emitAsyncMethod caused a SIGSEGV on the await.
+BEZEL_TEST(async_30_7_442, async_iasyncenumerable_await_only_no_yield) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Noop(): Task "
+        "    return; "
+        "  end Noop; "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    await Noop(); "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do sum := sum + x; end; "
+        "    return sum + 7; "
+        "  end Main; end C;",
+        7);
+}
+
+// §30.7 / #442: async IAsyncEnumerable with a yield AFTER an await — this has
+// a yield so would have been routed correctly pre-fix, but is included as a
+// regression guard to ensure the return-type routing doesn't break the normal
+// path (yield after await emitted correctly). sum = 42.
+BEZEL_TEST(async_30_7_442, async_iasyncenumerable_yield_after_await_regression) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Produce(n: int): Task<int> "
+        "    return n; "
+        "  end Produce; "
+        "  public static async method Gen(): IAsyncEnumerable<int> "
+        "    var v := await Produce(42); "
+        "    yield return v; "
+        "  end Gen; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    await for var x in Gen() do sum := sum + x; end; "
+        "    return sum; "
+        "  end Main; end C;",
+        42);
+}
