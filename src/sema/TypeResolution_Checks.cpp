@@ -1674,4 +1674,226 @@ bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// §12.9 — Variance position enforcement (issue #431).
+//
+// For each interface's `out`-annotated (covariant) or `in`-annotated
+// (contravariant) generic type parameters, verify that every direct
+// occurrence of that parameter in the interface's member signatures is in
+// the appropriate position:
+//   out T (covariant)     → allowed only in OUTPUT positions:
+//                              method return types, readonly-property types,
+//                              `out`-parameter positions.
+//   in T (contravariant)  → allowed only in INPUT positions:
+//                              ordinary method parameters (not `out`-params).
+//
+// Nested positions (T inside a function-type parameter, T inside another
+// generic's type arguments) are NOT checked here — position composition is
+// deferred to a later slice. This keeps the check sound (no false positives)
+// while eliminating the most common unsound declarations (direct param misuse).
+//
+// The check is purely over the raw AST (`ast::Type` nodes), because TypeRefs
+// for generic param references carry no name (declaration == nullptr), and
+// the AST-level `QualifiedName` is the only way to identify which parameter
+// is referenced at each occurrence.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Return true iff the ast::Type `t` is a bare reference to the generic
+// parameter named `paramName` — a single-part QualifiedName with no generic
+// args, not nullable (nullable doesn't affect the position check, but the
+// bare-name test is sufficient to isolate direct occurrences).
+//
+// This deliberately does NOT recurse into function-type params, return
+// types, or generic type arguments — those compose positions in ways this
+// check defers (see comment above).
+bool isDirectParamRef(const ast::Type& t, std::string_view paramName) {
+    if (t.kind != ast::TypeKind::Named) return false;
+    if (!t.name || t.name->parts.size() != 1) return false;
+    if (!t.genericArgs.empty()) return false;  // e.g. T<U> — not a bare param ref
+    return t.name->parts.front() == paramName;
+}
+
+// Check whether `t` contains a direct reference to `paramName` AND that
+// reference is in an invalid position given the declared variance.
+//
+// `paramVariance`  — "out" (covariant) or "in" (contravariant).
+// `isOutputPos`    — true when `t` occurs in an output position (method
+//                    return, readonly property, `out` parameter).
+//
+// Returns true iff a violation was detected at this direct level.
+// (Nested positions inside function types or generic args are skipped.)
+bool directVarianceViolation(const ast::Type& t,
+                              std::string_view paramVariance,
+                              bool isOutputPos,
+                              std::string_view paramName) {
+    if (!isDirectParamRef(t, paramName)) return false;
+    if (paramVariance == "out" && !isOutputPos) return true;   // out T in input
+    if (paramVariance == "in"  &&  isOutputPos) return true;   // in T in output
+    return false;
+}
+
+}  // anonymous namespace
+
+void Resolver::checkVariancePositions() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->kind != ast::TypeDeclKind::Interface) continue;
+        // Collect variant generic params (those with "in" or "out").
+        // For each, perform the member-by-member position check.
+        for (Symbol* gp : t->genericParams) {
+            auto* gps = dynamic_cast<GenericParamSymbol*>(gp);
+            if (!gps || gps->variance.empty()) continue;  // invariant — skip
+            const std::string_view paramName = gps->name;
+            const std::string_view variance  = gps->variance;  // "in" or "out"
+
+            // Walk each member of the interface.
+            auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+            if (!td) continue;
+
+            for (const auto& mem : td->members) {
+                if (!mem) continue;
+
+                // --- MethodDecl ---
+                if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem.get())) {
+                    // Return type is an output position.
+                    if (md->returnType &&
+                        directVarianceViolation(*md->returnType, variance,
+                                                /*isOutputPos=*/true, paramName)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, md->returnType->span.begin,
+                            std::string("type parameter `") +
+                            std::string(paramName) + "` is " +
+                            (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
+                            " but appears in an " +
+                            (variance == "out" ? "input (parameter)" : "output (return)") +
+                            " position in method `" + std::string(md->name) +
+                            "` (§12.9)");
+                    }
+                    // Each parameter: check modifier for out-param vs. input.
+                    for (const auto& p : md->params) {
+                        if (!p.type) continue;
+                        // `out` and `out owned` parameters are output positions.
+                        bool paramIsOutput = (p.modifier == "out" ||
+                                              p.modifier == "out owned");
+                        if (directVarianceViolation(*p.type, variance,
+                                                    paramIsOutput, paramName)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, p.type->span.begin,
+                                std::string("type parameter `") +
+                                std::string(paramName) + "` is " +
+                                (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
+                                " but appears in an " +
+                                (paramIsOutput ? "output (out-param)" : "input (parameter)") +
+                                " position in parameter `" + std::string(p.name) +
+                                "` of method `" + std::string(md->name) +
+                                "` (§12.9)");
+                        }
+                    }
+                    continue;
+                }
+
+                // --- PropertyDecl ---
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(mem.get())) {
+                    if (!pd->type) continue;
+                    // A readonly property is a pure output position.
+                    // A read-write property is both input and output — only
+                    // `in T` is safe in the setter's implied input; `out T`
+                    // is unsafe because the setter accepts T as input.
+                    // We detect "readonly" by checking the `readonly` modifier.
+                    bool isReadonly = false;
+                    for (auto mod : pd->modifiers) {
+                        if (mod == "readonly") { isReadonly = true; break; }
+                    }
+                    // A readonly property is an output position.
+                    // A read-write property is an input+output position —
+                    // treat it as an input position check only (the output
+                    // direction is always safe for `out T`; the input
+                    // direction blocks `out T`).
+                    if (!isReadonly) {
+                        // Read-write: setter is an input position — `out T` is unsafe.
+                        if (variance == "out" &&
+                            directVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/false, paramName)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, pd->type->span.begin,
+                                std::string("type parameter `") +
+                                std::string(paramName) +
+                                "` is covariant (`out`) but appears in a "
+                                "read-write property `" + std::string(pd->name) +
+                                "`, which has a setter (input position) (§12.9)");
+                        }
+                        // `in T` in read-write property: the getter is an
+                        // output position — flag as violation.
+                        if (variance == "in" &&
+                            directVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/true, paramName)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, pd->type->span.begin,
+                                std::string("type parameter `") +
+                                std::string(paramName) +
+                                "` is contravariant (`in`) but appears in a "
+                                "read-write property `" + std::string(pd->name) +
+                                "`, which has a getter (output position) (§12.9)");
+                        }
+                    } else {
+                        // Readonly property: pure output.
+                        if (directVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/true, paramName)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, pd->type->span.begin,
+                                std::string("type parameter `") +
+                                std::string(paramName) + "` is " +
+                                (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
+                                " but appears in a readonly property `" +
+                                std::string(pd->name) +
+                                "` — readonly properties are output positions (§12.9)");
+                        }
+                    }
+                    continue;
+                }
+
+                // --- FieldDecl: fields are input+output (invariant requirement).
+                // An interface field would be unusual but is not expressly banned
+                // by §11.2 (interface methods have no body; fields are not methods).
+                // For safety, treat interface fields as invariant positions — flag
+                // any directly-referenced variant param.
+                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(mem.get())) {
+                    if (!fd->type) continue;
+                    // A field is both readable and writable → both input and output.
+                    // `out T` in an input context is a violation.
+                    if (variance == "out" &&
+                        directVarianceViolation(*fd->type, variance,
+                                                /*isOutputPos=*/false, paramName)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, fd->type->span.begin,
+                            std::string("type parameter `") +
+                            std::string(paramName) +
+                            "` is covariant (`out`) but appears in field `" +
+                            std::string(fd->name) +
+                            "` (invariant position — §12.9)");
+                    }
+                    // `in T` in an output context is a violation.
+                    if (variance == "in" &&
+                        directVarianceViolation(*fd->type, variance,
+                                                /*isOutputPos=*/true, paramName)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, fd->type->span.begin,
+                            std::string("type parameter `") +
+                            std::string(paramName) +
+                            "` is contravariant (`in`) but appears in field `" +
+                            std::string(fd->name) +
+                            "` (invariant position — §12.9)");
+                    }
+                    continue;
+                }
+                // Other member kinds (event, constructor, nested type, etc.)
+                // don't carry T in positions we need to check for interfaces.
+            }
+        }
+    }
+}
+
 }  // namespace bezel::sema
