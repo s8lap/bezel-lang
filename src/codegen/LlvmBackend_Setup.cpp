@@ -2546,6 +2546,44 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (disposeStack_.empty()) return;
     auto it = locals_.find(ld);
     if (it == locals_.end()) return;
+
+    // §28.12 / §30: `await using var` — the resource implements IAsyncDisposable.
+    // On the normal-exit path: call DisposeAsync() directly, await the returned
+    // Task (a proper suspend point), then free the block (physical reclamation).
+    // On the unwind path: synchronous Dispose fallback (the class should have a
+    // destructor for the synchronous fallback per §28.12; awaiting across an
+    // active unwind is a deferred increment).
+    //
+    // Resolve the DisposeAsync LLVM Function* from the concrete class (via
+    // findMethodByName + methodFns_). If the static class is not known
+    // (interface-typed local / call returning owned IAsyncDisposable) or the
+    // method is not in methodFns_ yet, leave disposeAsyncFn null — emitDisposals
+    // will use the sync fallback.
+    if (ld->isAwaitUsing) {
+        Disposal d{it->second, nullptr};
+        d.asyncDispose = true;
+        // Attempt to resolve the direct DisposeAsync function pointer.
+        const sema::TypeSymbol* cls = classOfLocal(ld);
+        if (!cls && ld->initializer) {
+            // inferred: try the initializer's resolved type.
+            if (auto* rt = ctx_.exprType(*ld->initializer)) {
+                if (rt->kind == sema::TypeRef::Kind::Named)
+                    cls = rt->declaration;
+            }
+        }
+        if (cls && cls->kind == ast::TypeDeclKind::Class) {
+            sema::MethodSymbol* dams = findMethodByName(cls, "DisposeAsync");
+            if (dams) {
+                auto fnIt = methodFns_.find(dams);
+                if (fnIt != methodFns_.end())
+                    d.disposeAsyncFn = fnIt->second;
+            }
+        }
+        // disposeAsyncFn == null → sync fallback (emitDisposals handles it).
+        disposeStack_.back().push_back(d);
+        return;
+    }
+
     // per §2.11: a `using var` of type `Subscription` auto-disposes at scope
     // end by removing its registration (bz_subscription_dispose), not via a
     // class vtable. A Subscription has no user TypeSymbol, so it never appears
@@ -4483,6 +4521,33 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_task_fire_and_forget",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {t});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §28.12 / §30 (`await using var`): async disposal path. On the NORMAL
+        // exit (not isUnwind): call DisposeAsync() directly, await the returned
+        // Task (a proper suspend point), then free the block (physical reclamation).
+        // On the UNWIND path (exception in flight): synchronous Dispose() fallback —
+        // the resource is reclaimed on every exit path.
+        if (it->asyncDispose) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "awaitusing.dispose",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "awaitusing.cont",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            // Pass the direct function pointer; null means sync fallback.
+            // On the unwind path, always use sync fallback (pass null).
+            emitAsyncDisposeAwaitAndFree(
+                obj, isUnwind ? nullptr : it->disposeAsyncFn);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

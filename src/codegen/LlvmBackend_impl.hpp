@@ -379,6 +379,19 @@ private:
         // frees anonymous CallExpr operands), so the sole free is via the faf
         // continuation — exactly once.
         bool task = false;
+        // §28.12 / §30 (`await using var`): the resource implements
+        // IAsyncDisposable. On the NORMAL exit path (not unwind) we call
+        // DisposeAsync() and await the returned Task (a proper suspend point),
+        // then free the block (physical reclamation — §28.12 step 2). On the
+        // UNWIND (exception) path we fall back to the synchronous Dispose() +
+        // free (the class should have a destructor for the synchronous fallback
+        // per §28.12; awaiting across an already-active unwind is a deferred
+        // increment). `disposeAsyncFn` is the directly-resolved DisposeAsync
+        // llvm::Function* for the concrete class (found via findMethodByName +
+        // methodFns_ at registration time); null means "use synchronous Dispose
+        // fallback" (class not statically known, or DisposeAsync not found).
+        bool asyncDispose = false;
+        llvm::Function* disposeAsyncFn = nullptr;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -2113,6 +2126,16 @@ private:
     // the result and re-raises a faulted task (§30.9). Returns the result value.
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                   bool freeTaskAfter);
+
+    // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
+    // via `disposeAsyncFn` (the direct LLVM function pointer resolved at
+    // registration time), await the returned Task (a proper suspend point), then
+    // free the block (physical reclamation). Used by emitDisposals on the non-
+    // unwind path when asyncDispose is set. When `disposeAsyncFn` is null (sync
+    // fallback: class not statically known, or not in async SM context), falls back
+    // to emitDisposeAndReclaim (synchronous Dispose + free).
+    void emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
+                                      llvm::Function* disposeAsyncFn);
 
     // §30.7: emit an ASYNC ITERATOR method (declared `async`, contains `yield`,
     // returns IAsyncEnumerable<T> / IAsyncEnumerator<T>). Combines the iterator

@@ -1179,3 +1179,250 @@ BEZEL_TEST(async_30_7_442, async_iasyncenumerable_yield_after_await_regression) 
         "  end Main; end C;",
         42);
 }
+
+// ===========================================================================
+// §28.12 / §30 — `await using var` (async resource disposal).
+//
+// `await using var r := <expr>;` binds `r` and, at scope end on EVERY exit
+// path, invokes `r.DisposeAsync()` (which returns a Task), awaits that Task
+// (a proper suspend point), then reclaims the block (physical reclamation,
+// §28.12 step 2). This section tests:
+//
+//   - Normal path (sync and cross-thread DisposeAsync): disposed == 1 after scope.
+//   - Scope timing: DisposeAsync NOT called inside scope, called at scope exit.
+//   - Fault path (exception in body): sync-dispose fallback (destructor runs,
+//     disposed == 1 via the sync path — §28.12: class should have a destructor
+//     for the synchronous fallback; the async await-across-active-unwind path is
+//     a deferred increment, reported as the sync-dispose fallback decision).
+//   - Body with explicit awaits: `await using` + explicit awaits in the body both
+//     work; the dispose-await is a properly counted suspend point (#441 analogue).
+//   - Regression: synchronous `using var` and async-without-using are unaffected.
+//
+// The test class AsyncRes:
+//   - `disposed` static counter: DisposeAsync increments by 10; destructor by 1.
+//   - DisposeAsync (the async path) is distinguishable from Dispose (sync, +1) vs
+//     DisposeAsync (+10), so we can tell which path ran.
+//   - For cross-thread tests DisposeAsync awaits Task.Delay so it genuinely
+//     suspends and resumes on the pool.
+//
+// Implementation note: DisposeAsync is found via findMethodByName + methodFns_ at
+// registration time (the concrete class `AsyncRes` is known from `new AsyncRes()`).
+// The fault-path fallback uses the synchronous Dispose() (spec §28.12: "class
+// should have a destructor for the synchronous fallback"). The dispose-await's
+// state block is counted by countAwaits (+1 per `isAwaitUsing` LocalDecl) and
+// any unreached blocks (sync-fallback path) are terminated after lowerBody.
+// ===========================================================================
+
+// Shared class bodies for the await-using tests. All classes are inline in
+// the program strings for simplicity; the counter is a static int so the
+// exit code can carry the disposal count.
+
+// §28.12 (#443): the simplest case — `await using var r` in an async method,
+// synchronous DisposeAsync (no actual await inside it). The scope ends, the
+// compiler emits `await r.DisposeAsync()` followed by `free(r)`. DisposeAsync
+// increments the static counter by 10; destructor by 1. On the normal path
+// DisposeAsync is called → disposed == 10; exit code 10 proves the ASYNC path
+// ran (not the sync/destructor path which would give 1).
+BEZEL_TEST(async_28_12, await_using_disposes_via_disposeasync_sync) {
+    expectValueLeakFree(
+        "module M; "
+        "class AsyncRes: IAsyncDisposable "
+        "  public static disposed: int := 0; "
+        "  public async method DisposeAsync(): Task "
+        "    AsyncRes.disposed := AsyncRes.disposed + 10; "
+        "  end DisposeAsync; "
+        "  destructor AsyncRes.disposed := AsyncRes.disposed + 1; end destructor; "
+        "end AsyncRes; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    do "
+        "      await using var r := new AsyncRes(); "
+        "    end; "
+        "    return AsyncRes.disposed; "
+        "  end Main; "
+        "end C;",
+        10);
+}
+
+// §28.12 (#443): scope timing — DisposeAsync is NOT called inside the scope
+// (the counter is 0 during the body), and IS called exactly once at scope exit
+// (the counter is 10 after). `during_scope` captures the counter mid-body;
+// `after_scope` captures it post-disposal. Exit code = during_scope * 100 +
+// after_scope; 10 proves the async path ran once and not during the body.
+BEZEL_TEST(async_28_12, await_using_disposal_timing) {
+    expectValueLeakFree(
+        "module M; "
+        "class AsyncRes: IAsyncDisposable "
+        "  public static disposed: int := 0; "
+        "  public async method DisposeAsync(): Task "
+        "    AsyncRes.disposed := AsyncRes.disposed + 10; "
+        "  end DisposeAsync; "
+        "  destructor AsyncRes.disposed := AsyncRes.disposed + 1; end destructor; "
+        "end AsyncRes; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    var during_scope := -1; "
+        "    do "
+        "      await using var r := new AsyncRes(); "
+        "      during_scope := AsyncRes.disposed; "
+        "    end; "
+        "    var after_scope := AsyncRes.disposed; "
+        "    if during_scope <> 0 then return 99; end; "
+        "    return after_scope; "
+        "  end Main; "
+        "end C;",
+        10);
+}
+
+// §28.12 (#443): cross-thread DisposeAsync. The DisposeAsync method uses
+// `await Task.Delay(5)` so it genuinely suspends on the pool. Main awaits the
+// DisposeAsync Task cross-thread; the resume fires on a worker. Disposed == 10
+// proves the async path ran. Run 3x, ASan-clean, TSan-clean.
+BEZEL_TEST(async_28_12, await_using_crossthread_disposes_via_disposeasync) {
+    expectValueCrossThread(
+        "module M; "
+        "class AsyncRes: IAsyncDisposable "
+        "  public static disposed: int := 0; "
+        "  public async method DisposeAsync(): Task "
+        "    await Task.Delay(5); "
+        "    AsyncRes.disposed := AsyncRes.disposed + 10; "
+        "  end DisposeAsync; "
+        "  destructor AsyncRes.disposed := AsyncRes.disposed + 1; end destructor; "
+        "end AsyncRes; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    do "
+        "      await using var r := new AsyncRes(); "
+        "    end; "
+        "    return AsyncRes.disposed; "
+        "  end Main; "
+        "end C;",
+        10);
+}
+
+// §28.12 (#443): fault path — a synchronous throw inside an `await using` scope.
+// Per §28.12, the class should have a destructor for the synchronous fallback;
+// the awaiting-across-active-unwind path is a deferred increment. The sync
+// Dispose (destructor, +1) runs on the unwind path; DisposeAsync (+10) does NOT.
+// The caught exception leaves the destructor running once → disposed == 1.
+// Exit code 1 proves the SYNC path ran (not the async path which would give 10).
+BEZEL_TEST(async_28_12, await_using_fault_path_sync_dispose_fallback) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class AsyncRes: IAsyncDisposable "
+        "  public static disposed: int := 0; "
+        "  public async method DisposeAsync(): Task "
+        "    AsyncRes.disposed := AsyncRes.disposed + 10; "
+        "  end DisposeAsync; "
+        "  destructor AsyncRes.disposed := AsyncRes.disposed + 1; end destructor; "
+        "end AsyncRes; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    var result := 0; "
+        "    try "
+        "      do "
+        "        await using var r := new AsyncRes(); "
+        "        throw new InvalidOperationException(); "
+        "      end; "
+        "    catch Exception => "
+        "      result := AsyncRes.disposed; "
+        "    end; "
+        "    return result; "
+        "  end Main; "
+        "end C;"),
+        1);
+}
+
+// §28.12 (#443): `await using var` scope body also contains explicit awaits.
+// The dispose-await is a properly-counted suspend point (countAwaits +1 per
+// isAwaitUsing); the body's explicit awaits are also counted. All suspend
+// points resume correctly. Sum = 5+3 = 8; disposed (async, +10) == 10.
+// Exit code = sum * 10 + disposed/10 = 80 + 1 = 81.
+BEZEL_TEST(async_28_12, await_using_with_awaits_in_scope_body) {
+    expectValueCrossThread(
+        "module M; "
+        "class AsyncRes: IAsyncDisposable "
+        "  public static disposed: int := 0; "
+        "  public async method DisposeAsync(): Task "
+        "    await Task.Delay(2); "
+        "    AsyncRes.disposed := AsyncRes.disposed + 10; "
+        "  end DisposeAsync; "
+        "  destructor AsyncRes.disposed := AsyncRes.disposed + 1; end destructor; "
+        "end AsyncRes; "
+        "class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    await Task.Delay(2); "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var sum := 0; "
+        "    do "
+        "      await using var r := new AsyncRes(); "
+        "      var x := await Producer(5); "
+        "      var y := await Producer(3); "
+        "      sum := x + y; "
+        "    end; "
+        "    return sum * 10 + AsyncRes.disposed / 10; "
+        "  end Main; "
+        "end C;",
+        81);
+}
+
+// §28.12 (#443): two `await using var` in the same scope — both disposed, in
+// reverse declaration order, each via their own DisposeAsync call. Total
+// disposed == 20 (two resources * 10 each). ASan-clean.
+BEZEL_TEST(async_28_12, two_await_using_vars_both_disposed) {
+    expectValueLeakFree(
+        "module M; "
+        "class AsyncRes: IAsyncDisposable "
+        "  public static disposed: int := 0; "
+        "  public async method DisposeAsync(): Task "
+        "    AsyncRes.disposed := AsyncRes.disposed + 10; "
+        "  end DisposeAsync; "
+        "  destructor AsyncRes.disposed := AsyncRes.disposed + 1; end destructor; "
+        "end AsyncRes; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    do "
+        "      await using var a := new AsyncRes(); "
+        "      await using var b := new AsyncRes(); "
+        "    end; "
+        "    return AsyncRes.disposed; "
+        "  end Main; "
+        "end C;",
+        20);
+}
+
+// §28.12 (#443) regression: synchronous `using var` in an async method is
+// unaffected by the `await using` changes — disposed via the sync Dispose path.
+// Destructor increments by 1; disposed == 1. No async path taken.
+BEZEL_TEST(async_28_12, sync_using_var_in_async_method_unaffected) {
+    expectValueLeakFree(
+        "module M; "
+        "class Res "
+        "  public static disposed: int := 0; "
+        "  destructor Res.disposed := Res.disposed + 1; end destructor; "
+        "end Res; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    do using var r := new Res(); end; "
+        "    return Res.disposed; "
+        "  end Main; "
+        "end C;",
+        1);
+}
+
+// §28.12 (#443) regression: async method without `await using` is unaffected.
+// Plain awaits still work; no disposal side-effects.
+BEZEL_TEST(async_28_12, async_without_await_using_unaffected) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var x := await Producer(42); "
+        "    return x; "
+        "  end Main; end C;",
+        42);
+}

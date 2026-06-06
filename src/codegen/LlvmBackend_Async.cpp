@@ -154,8 +154,14 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
     unsigned n = 0;
     for (const auto& s : stmts) {
         if (!s) continue;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get()))
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
             n += countAwaitsInExpr(ld->initializer.get());
+            // §28.12 / §30: `await using var` carries an implicit scope-end
+            // `await DisposeAsync()` suspend point (counted here so the resume
+            // switch has a state block for it — omitting it would leave the
+            // dispose-await's state unreachable and hang cross-thread like #441).
+            if (ld->isAwaitUsing) n += 1;
+        }
         else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s.get()))
             n += countAwaitsInExpr(lc->value.get());
         else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get()))
@@ -637,6 +643,26 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.CreateRetVoid();
         }
 
+        // §28.12 / §30 (`await using` state-block cleanup): any `await using var`
+        // whose DisposeAsync was not found at registration time (sync fallback;
+        // disposeAsyncFn == null) did NOT consume its pre-allocated state block.
+        // countAwaits counted each `isAwaitUsing` as +1, so smStateBBs_ may have
+        // blocks at indices > smNextSuspendState_ that are unterminated. Terminate
+        // each with `br smDoneBB_` so the function is IR-valid (an unterminated
+        // block fails LLVM's IR verifier). These blocks are dead code — the switch
+        // has a case for each state, but the state is never stored in the frame
+        // (the sync-fallback path never called bz_task_then with that state), so
+        // the block is unreachable at runtime. `br smDoneBB_` makes it well-formed.
+        if (smDoneBB_) {
+            for (unsigned s = smNextSuspendState_ + 1; s < smStateBBs_.size(); ++s) {
+                auto* orphanBB = smStateBBs_[s];
+                if (orphanBB && !orphanBB->getTerminator()) {
+                    llvm::IRBuilder<> tmp(orphanBB);
+                    tmp.CreateBr(smDoneBB_);
+                }
+            }
+        }
+
         // §30.2 (#438): repair SSA dominance broken by awaits embedded in larger
         // expressions (e.g. the loop-carried `total := total + await f(i)`): a
         // temporary computed before the suspend but used in the resume block,
@@ -918,6 +944,19 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             emitAsyncIterComplete(/*hasValue=*/false);
             builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRetVoid();
+        }
+
+        // §28.12 / §30: terminate any orphaned await-using state blocks (same as
+        // emitAsyncMethod above — sync-fallback `await using` that did not consume
+        // its pre-allocated block).
+        if (smDoneBB_) {
+            for (unsigned s = smNextSuspendState_ + 1; s < smStateBBs_.size(); ++s) {
+                auto* orphanBB = smStateBBs_[s];
+                if (orphanBB && !orphanBB->getTerminator()) {
+                    llvm::IRBuilder<> tmp(orphanBB);
+                    tmp.CreateBr(smDoneBB_);
+                }
+            }
         }
 
         // Repair SSA dominance for awaits embedded in larger expressions (e.g.
@@ -1424,6 +1463,71 @@ void Emitter::emitFreeSpillArea(llvm::Value* self) {
     llvm::Value* spillPtr = builder_.CreateLoad(ptrTy(), spillField, "spill.free");
     auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
     builder_.CreateCall(freeFn, {spillPtr});
+}
+
+
+// §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
+// via `disposeAsyncFn` (the direct LLVM function pointer resolved at
+// registration time), await the returned Task (a proper suspend point), then
+// free the block (physical reclamation — §28.12 step 2).
+//
+// When `disposeAsyncFn` is null (concrete class not statically known at
+// registration time — interface-typed local or class not yet emitted) OR the
+// async state machine is not active (smKind_ not Await/AsyncYield), we fall
+// back to synchronous emitDisposeAndReclaim (Dispose() + free). This is sound
+// because every IAsyncDisposable implementor should have a destructor for the
+// synchronous fallback (§28.12). The sync fallback is also used on the UNWIND
+// path (emitDisposals passes null when isUnwind is true), because awaiting
+// across an already-active unwind is a deferred increment.
+//
+// `obj` is assumed NON-NULL here (the caller null-guards before branching).
+// DisposeAsync's function type is: ptr(ptr) — takes `this`, returns Task*.
+void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
+                                           llvm::Function* disposeAsyncFn) {
+    bool inAsyncSM = (smKind_ == SuspendKind::Await ||
+                      smKind_ == SuspendKind::AsyncYield) &&
+                     smStateStruct_ && smSelf_ && asyncResumeFn_;
+    if (!disposeAsyncFn || !inAsyncSM) {
+        // Sync fallback: synchronous Dispose() + free.
+        // per §28.12: the class should have a destructor for the synchronous
+        // fallback path; Dispose() runs it idempotently. Physical reclamation
+        // (free) follows. Reported in the commit as the sync-dispose fallback
+        // for: (a) unwind path (disposeAsyncFn is null on the unwind path per
+        // the emitDisposals call above), (b) interface-typed local where the
+        // concrete class is not statically known at registration, (c) non-async
+        // context.
+        // NOTE: we do NOT advance smNextSuspendState_ here. The orphaned state
+        // block (pre-allocated by countAwaits for the implicit dispose-await) is
+        // terminated as a post-body step in emitAsyncMethod — after lowerBody
+        // completes, any unreached state blocks in smStateBBs_ are terminated
+        // with `br smDoneBB_` (a well-formed but dead block).
+        emitDisposeAndReclaim(obj);
+        return;
+    }
+
+    // Call DisposeAsync() directly through the resolved function pointer.
+    // DisposeAsync is an async method entry: returns a Task* immediately (the
+    // async body runs synchronously until the first genuine suspension); the
+    // result Task is completed either inline (already-done path) or via a
+    // continuation when the async body's own awaits complete.
+    // Function type: ptr DisposeAsync(ptr this).
+    auto* dispAsyncTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* task = builder_.CreateCall(
+        dispAsyncTy, disposeAsyncFn, {obj}, "dispasync.task");
+
+    // Await the Task returned by DisposeAsync() — a proper suspend point
+    // inside the enclosing async method's Resume function. emitAwaitSuspend
+    // spills suspend-locals, registers the resume continuation on the task,
+    // and returns; the resume block reads the result and re-raises any fault.
+    // freeTaskAfter=true: the task is anonymous/single-use (no other owner).
+    // Result type is null (DisposeAsync returns Task, not Task<T>).
+    emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true);
+
+    // Physical reclamation: free the object block (§28.12 step 2). The
+    // logical disposal (DisposeAsync) has already completed above; the
+    // destructor body is NOT re-run (DisposeAsync supersedes it per §28.12).
+    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    builder_.CreateCall(freeFn, {obj});
 }
 
 
