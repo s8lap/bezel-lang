@@ -170,6 +170,15 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             n += countAwaitsInExpr(es->expr.get());
         else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get()))
             n += countAwaitsInExpr(rs->value.get());
+        else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s.get())) {
+            // §30.7 (#437): `yield return await Expr` in an async iterator body
+            // contains an `await` in its value expression. Count it so the resume
+            // switch has the correct number of state blocks — omitting it would
+            // leave the yield-return's post-yield state block missing, causing the
+            // for-loop continuation (br incBB) to be emitted into the still-current
+            // await.ok block (after its ret void terminator → IR verifier error).
+            if (!ys->isBreak) n += countAwaitsInExpr(ys->value.get());
+        }
         else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
             // §30.7: `await for` desugars to a loop whose head awaits the
             // enumerator's MoveNextAsync() each iteration — one suspend point

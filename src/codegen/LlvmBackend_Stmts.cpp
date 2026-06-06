@@ -1305,17 +1305,34 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         isArrayBacked = false;  // new C() → vtable
     } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
         sema::Symbol* sym = ctx_.exprSymbol(*id);
-        // If typed as a concrete user class (not builtin IEnumerable), use vtable.
+        // Helper: is `rt` a concrete user class (has a declaration pointer)?
         auto checkNamed = [&](sema::TypeRef* rt) {
             return rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration;
+        };
+        // §29.2 (#437): a parameter/local typed as the pure `IEnumerable<T>`
+        // interface uses vtable dispatch. buildOrderedArgs wraps any Array<T>
+        // argument in a vtable-backed enumerator at the call site, so the
+        // callee sees a uniform vtable-backed object regardless of whether
+        // the caller passed an Array or an iterator state machine. Richer
+        // interfaces (IReadOnlyList etc.) also support indexer access and are
+        // NOT wrapped at the call site; they keep the array-backed protocol.
+        auto checkPureIEnumerable = [&](sema::TypeRef* rt) -> bool {
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+            if (rt->declaration) return false;  // user class → handled by checkNamed
+            if (!rt->astNode || !rt->astNode->name ||
+                rt->astNode->name->parts.empty())
+                return false;
+            return rt->astNode->name->parts[0] == "IEnumerable";
         };
         if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (par->declType) {
                 auto* rt = ctx_.resolvedType(*par->declType);
-                if (checkNamed(rt)) isArrayBacked = false;
+                if (checkNamed(rt) || checkPureIEnumerable(rt))
+                    isArrayBacked = false;
             }
         } else if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
-            if (checkNamed(loc->declType)) isArrayBacked = false;
+            if (checkNamed(loc->declType) || checkPureIEnumerable(loc->declType))
+                isArrayBacked = false;
         }
     }
 

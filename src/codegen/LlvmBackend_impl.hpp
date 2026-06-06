@@ -1526,6 +1526,13 @@ private:
     llvm::Value* boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                               const ast::Expr* init);
 
+    // §29.2 (#437): wrap a raw bz_array_t* in a type-specific vtable-backed
+    // enumerator whose MoveNext → i1 and Current → T match the iterator state
+    // machine's vtable protocol exactly.  Used when Array<T> is passed where
+    // IEnumerable<T> is expected; the callee uses vtable dispatch uniformly.
+    llvm::Value* wrapArrayAsIEnumerable(llvm::Value* arr,
+                                        const sema::TypeRef* iEnumTy);
+
     // CG13: the class's user destructor body, if it declares one.
     const ast::DestructorDecl* findDestructor(const sema::TypeSymbol* ts);
 

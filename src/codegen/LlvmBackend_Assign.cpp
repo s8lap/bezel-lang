@@ -906,6 +906,142 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 }
 
 
+// §29.2 (#437): generate a type-specific, vtable-backed array enumerator.
+// Layout:  { ptr vtable, ptr arr, i64 idx, i64 esz }
+// Vtable:  [0]=td(self), [1]=Dispose, [2]=MoveNext→i1, [3]=Current→T
+// The Current function returns the element VALUE directly (not a void*
+// pointer), matching the iterator state machine's vtable protocol so that
+// lowerIEnumerableBuiltinFor's vtable dispatch can be used uniformly for
+// both Array<T> and iterator-method IEnumerable<T> sources.
+llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
+                                             const sema::TypeRef* iEnumTy) {
+    // Determine element type and size.
+    llvm::Type* elemTy = i32();
+    int64_t esz = 8;
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0]) {
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+        if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
+        else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
+        else if (elemTy->isIntegerTy(16)) esz = 2;
+        else esz = 8;
+    }
+
+    // Enumerator struct: { ptr vtable, ptr arr, i64 idx, i64 esz }
+    // We use a unique struct name keyed on the element type to allow caching.
+    std::string elemName = elemTy->isIntegerTy() ?
+        ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
+        (elemTy->isPointerTy() ? "ptr" : "f");
+    std::string stName = "arrenum." + elemName;
+    auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
+    if (!stTy) {
+        stTy = llvm::StructType::create(llvm_,
+            {ptrTy(), ptrTy(), i64(), i64()}, stName);
+    }
+
+    // Generate (or reuse) the three method functions.
+    std::string prefix = "bz$arrenum$" + elemName + "$";
+    auto getOrCreate = [&](const std::string& name, llvm::FunctionType* ft,
+                           std::function<void(llvm::Function*)> fill)
+        -> llvm::Function* {
+        if (auto* f = module_->getFunction(name)) return f;
+        auto* f = llvm::Function::Create(ft, llvm::Function::InternalLinkage,
+                                         name, module_.get());
+        fill(f);
+        return f;
+    };
+
+    // Dispose: free(self)
+    auto* dispFn = getOrCreate(prefix + "Dispose",
+        llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            auto* freeFn2 = module_->getOrInsertFunction(
+                "free", llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+            b.CreateCall(llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+                freeFn2, {f->arg_begin()});
+            b.CreateRetVoid();
+        });
+
+    // MoveNext: e->idx++; return idx < bz_array_len(arr)
+    auto* mnFn = getOrCreate(prefix + "MoveNext",
+        llvm::FunctionType::get(i1(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* idxF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* idx = b.CreateLoad(i64(), idxF);
+            llvm::Value* next = b.CreateAdd(idx, llvm::ConstantInt::get(i64(), 1));
+            b.CreateStore(next, idxF);
+            llvm::Value* arrF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* arrPtr = b.CreateLoad(ptrTy(), arrF);
+            auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+            auto* lenFn2 = module_->getOrInsertFunction("bz_array_len", lenFT).getCallee();
+            llvm::Value* len = b.CreateCall(lenFT, lenFn2, {arrPtr});
+            b.CreateRet(b.CreateICmpSLT(next, len));
+        });
+
+    // Current: load element at idx and return by value
+    auto* curFn = getOrCreate(prefix + "Current",
+        llvm::FunctionType::get(elemTy, {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* arrF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* arrPtr = b.CreateLoad(ptrTy(), arrF);
+            llvm::Value* idxF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* idx = b.CreateLoad(i64(), idxF);
+            auto* ptrAtFT = llvm::FunctionType::get(ptrTy(), {ptrTy(), i64(), i64()}, false);
+            auto* ptrAtFn = module_->getOrInsertFunction("bz_array_ptr_at", ptrAtFT).getCallee();
+            llvm::Value* ep = b.CreateCall(ptrAtFT, ptrAtFn,
+                {arrPtr, idx, llvm::ConstantInt::get(i64(), esz)});
+            b.CreateRet(b.CreateLoad(elemTy, ep));
+        });
+
+    // Build the vtable (4-pointer constant).
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 4);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()), // slot 0: self-ptr (filled below)
+            dispFn,
+            mnFn,
+            curFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        // Slot 0: the vtable's own address (self-referential td sentinel).
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate and fill the enumerator struct.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64(stSz)}, "arrenum");
+    // [0] vtable
+    builder_.CreateStore(vtGV,
+        builder_.CreateStructGEP(stTy, en, 0));
+    // [1] arr
+    builder_.CreateStore(arr,
+        builder_.CreateStructGEP(stTy, en, 1));
+    // [2] idx = -1 (calloc zeroed it, but -1 means "before first")
+    builder_.CreateStore(builder_.getInt64(-1),
+        builder_.CreateStructGEP(stTy, en, 2));
+    // [3] esz
+    builder_.CreateStore(builder_.getInt64(esz),
+        builder_.CreateStructGEP(stTy, en, 3));
+    return en;
+}
+
+
 bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       const std::vector<ast::CallArgument>& args,
                       std::vector<llvm::Value*>& out,
@@ -970,6 +1106,34 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // object's first word) sees a real box rather than the raw value
             // bytes. boxForTarget is a no-op for reference arguments (#399).
             v = boxForTarget(v, formalTy, a.value.get());
+            // §29.2 (#437): when an Array<T> is passed to a formal parameter
+            // typed as `IEnumerable<T>` (the pure iteration-only interface),
+            // wrap the raw bz_array_t* in a type-specific vtable-backed
+            // enumerator whose MoveNext/Current have the SAME protocol as an
+            // iterator state machine (Current returns elemTy directly, not a
+            // void* pointer).  Only `IEnumerable<T>` is wrapped — the richer
+            // interfaces (IReadOnlyList, ICollection, etc.) also support
+            // indexer access, which the wrapped enumerator does NOT provide,
+            // so wrapping them would break callee indexer operations.
+            // Without wrapping, a callee iterating an IEnumerable<T> parameter
+            // with vtable dispatch would interpret the bz_array_t layout as a
+            // vtable-backed object → crash.
+            if (formalTy && formalTy->kind == sema::TypeRef::Kind::Named &&
+                !formalTy->declaration &&
+                formalTy->astNode && formalTy->astNode->name &&
+                !formalTy->astNode->name->parts.empty() &&
+                formalTy->astNode->name->parts[0] == "IEnumerable") {
+                // Check if the ACTUAL argument type is Array<T>.
+                sema::TypeRef* actualTy = ctx_.exprType(*a.value);
+                bool actualIsArray = actualTy &&
+                    actualTy->kind == sema::TypeRef::Kind::Named &&
+                    actualTy->astNode && actualTy->astNode->name &&
+                    !actualTy->astNode->name->parts.empty() &&
+                    actualTy->astNode->name->parts[0] == "Array";
+                if (actualIsArray) {
+                    v = wrapArrayAsIEnumerable(v, formalTy);
+                }
+            }
         }
         ordered[idx] = v;
         orderedExprs[idx] = a.value.get();
