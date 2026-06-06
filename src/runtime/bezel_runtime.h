@@ -398,6 +398,11 @@ void  bz_task_complete(void* task, const void* result, int64_t result_size);
 // Mark the task as failed with an error message.
 void  bz_task_complete_error(void* task, const char* error_msg);
 
+// §30.9: mark the task as failed with the ORIGINAL exception object (a Bezel
+// heap object with a leading vtable word). The awaiter re-raises this exact
+// object into its enclosing handler. The task does not own the object.
+void  bz_task_complete_error_obj(void* task, void* error_obj);
+
 // Check completion without blocking.
 bool  bz_task_is_done(void* task);
 bool  bz_task_is_error(void* task);
@@ -408,6 +413,10 @@ void* bz_task_await_sync(void* task);
 
 // Retrieve the error message (valid after bz_task_is_error returns true).
 const char* bz_task_error(void* task);
+
+// §30.9: retrieve the original exception object (valid after bz_task_is_error).
+// Null when the fault carried only a message.
+void* bz_task_error_obj(void* task);
 
 // Register a continuation to run when the task completes (on the thread pool).
 void  bz_task_then(void* task, void (*cont)(void* task, void* state), void* state);

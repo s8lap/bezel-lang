@@ -1371,6 +1371,15 @@ struct bz_task_t {
     bool done = false;
     bool is_error = false;
     char* error_msg = nullptr;
+    // §30.9: the ORIGINAL exception object that faulted this task (a Bezel heap
+    // object with a leading vtable word). Preserved across the task boundary so
+    // an awaiting `try`/`catch` can re-raise it into the handler with the real
+    // type (emitIsA needs the object, not just a message). Null when the fault
+    // carries only a message (e.g. a runtime-builtin error string). The task
+    // does NOT own this object's lifetime: a Bezel exception's ownership
+    // transfers to whichever handler catches it (or the unhandled boundary), so
+    // bz_task_free must not free it.
+    void* error_obj = nullptr;
     void* result = nullptr;
     int64_t result_size = 0;
     // Continuation chain
@@ -1470,6 +1479,26 @@ void bz_task_complete_error(void* tp, const char* error_msg) {
       task->is_error = true;
       task->done = true; }
     task_notify(task);
+}
+
+// §30.9: fault the task with the ORIGINAL exception object (a Bezel heap object).
+// The awaiter re-raises this exact object into its enclosing handler so the
+// catch arm's type test sees the real exception type. The task does not own the
+// object (see bz_task_t::error_obj); ownership stays with the exception itself,
+// transferring to the catching handler / unhandled boundary.
+void bz_task_complete_error_obj(void* tp, void* error_obj) {
+    auto* task = (bz_task_t*)tp;
+    { std::lock_guard<std::mutex> lk(task->mtx);
+      task->error_obj = error_obj;
+      task->is_error = true;
+      task->done = true; }
+    task_notify(task);
+}
+
+// §30.9: retrieve the original exception object (valid after bz_task_is_error).
+// Null when the fault carried only a message.
+void* bz_task_error_obj(void* tp) {
+    return ((bz_task_t*)tp)->error_obj;
 }
 
 bool bz_task_is_done(void* tp) {
