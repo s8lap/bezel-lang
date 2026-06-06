@@ -434,6 +434,33 @@ void  bz_task_then(void* task, void (*cont)(void* task, void* state), void* stat
 // Free the task object. Must be called after the result has been consumed.
 void  bz_task_free(void* task);
 
+// stdlib §6.7 / §30.10: Task.FromResult<T>(value). Allocate a task and
+// immediately complete it with the `result_size` bytes at `result`. The
+// returned task is already-done; `await` on it takes the fast path. For
+// value-typed T the bytes are the value; result_size == 0 is also valid
+// (produces an already-completed no-value task, like CompletedTask).
+void* bz_task_from_result(const void* result, int64_t result_size);
+
+// stdlib §6.7 / §30.10: Task.WhenAll(tasks: Array<Task>). Takes a
+// bz_array_t* of `n` task pointers (ptr-sized elements), returns a NEW
+// task that completes (with no value) once ALL input tasks are done.
+// Caller owns the returned task. The input array is BORROWED; the caller
+// is responsible for its lifetime.
+void* bz_task_when_all(void* task_arr);
+
+// stdlib §6.7 / §30.10: Task.WhenAny(tasks: Array<Task>): Task<Task>.
+// Takes a bz_array_t* of task pointers, returns a NEW task that completes
+// (with a ptr-sized result — the pointer to the FIRST task that finishes)
+// as soon as any one input task is done. Caller owns the returned task.
+// The input array is BORROWED.
+void* bz_task_when_any(void* task_arr);
+
+// stdlib §6.7 / §30.10: Task.FireAndForget(owned task). Registers a
+// continuation on `task` that frees it when done (after discarding any
+// result or logging any error). Ownership of `task` transfers; the
+// caller must not use or free the pointer again.
+void  bz_task_fire_and_forget(void* task);
+
 // ---------------------------------------------------------------------------
 // Array enumerator (Part B2): wraps bz_array_t* as a vtable-based IEnumerator<T>.
 // The returned object has vtable slots: [0]=td/self, [1]=Dispose, [2]=MoveNext,

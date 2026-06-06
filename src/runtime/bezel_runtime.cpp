@@ -1575,6 +1575,129 @@ void bz_task_free(void* tp) {
     delete task;
 }
 
+// stdlib §6.7 / §30.10: Task.FromResult<T>(value). Allocate a fresh task and
+// immediately complete it with the `result_size` bytes at `result`. The task is
+// already-done at return; `await` on it takes the already-done fast path (no
+// thread-pool submission). result == null / result_size == 0 produces an
+// already-completed no-value task (the primitive behind Task.CompletedTask).
+void* bz_task_from_result(const void* result, int64_t result_size) {
+    auto* task = new bz_task_t();
+    if (result_size > 0 && result) {
+        task->result = malloc((size_t)result_size);
+        memcpy(task->result, result, (size_t)result_size);
+        task->result_size = result_size;
+    }
+    task->done = true;
+    // No continuations to notify — no one registered yet; the task is complete
+    // at allocation time.
+    return task;
+}
+
+// stdlib §6.7 / §30.10: Task.WhenAll(tasks: Array<Task>): Task.
+// Returns a new task that completes (with no value) once ALL input tasks are
+// done. Uses a shared context with a refcount (number of registered
+// continuations) and a completion counter. Every continuation decrements
+// the refcount on exit (freeing the context when it reaches 0) and decrements
+// the completion counter; the last completion (counter → 0) fires the aggregate.
+// The context is heap-allocated once and shared across all continuations via a
+// raw pointer (no C++ shared_ptr to stay extern "C" compatible).
+struct BzWhenAllCtx {
+    bz_task_t* aggregate;
+    std::atomic<int64_t> remaining;  // pending completion count
+    std::atomic<int64_t> refcount;   // continuation refcount (= n at init)
+};
+
+void* bz_task_when_all(void* task_arr) {
+    auto* arr = (bz_array_t*)task_arr;
+    int64_t n = bz_array_len(arr);
+    auto* aggregate = new bz_task_t();
+    if (n == 0) {
+        aggregate->done = true;
+        return aggregate;
+    }
+    auto* ctx = new BzWhenAllCtx{aggregate, {n}, {n}};
+    for (int64_t i = 0; i < n; ++i) {
+        void* t = nullptr;
+        bz_array_get(arr, i, &t, sizeof(void*));
+        bz_task_then(t,
+            [](void* /*completedTask*/, void* state) {
+                auto* c = (BzWhenAllCtx*)state;
+                if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                    bz_task_complete(c->aggregate, nullptr, 0);
+                if (c->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                    delete c;
+            },
+            ctx);
+    }
+    return aggregate;
+}
+
+// stdlib §6.7 / §30.10: Task.WhenAny(tasks: Array<Task>): Task<Task>.
+// Returns a new task that completes with a ptr-sized result (the pointer to the
+// FIRST task that finishes). Uses a shared context with a once-flag and a
+// refcount. Every continuation decrements the refcount on exit; the first to
+// fire completes the aggregate via CAS on the once-flag.
+struct BzWhenAnyCtx {
+    bz_task_t* aggregate;
+    std::atomic<bool> fired;         // once-flag: only the first winner fires
+    std::atomic<int64_t> refcount;   // continuation refcount (= n at init)
+};
+
+void* bz_task_when_any(void* task_arr) {
+    auto* arr = (bz_array_t*)task_arr;
+    int64_t n = bz_array_len(arr);
+    auto* aggregate = new bz_task_t();
+    if (n == 0) {
+        aggregate->done = true;
+        return aggregate;
+    }
+    auto* ctx = new BzWhenAnyCtx{aggregate, {false}, {n}};
+    for (int64_t i = 0; i < n; ++i) {
+        void* t = nullptr;
+        bz_array_get(arr, i, &t, sizeof(void*));
+        bz_task_then(t,
+            [](void* completedTask, void* state) {
+                auto* c = (BzWhenAnyCtx*)state;
+                bool expected = false;
+                if (c->fired.compare_exchange_strong(expected, true,
+                        std::memory_order_acq_rel))
+                    bz_task_complete(c->aggregate, &completedTask, sizeof(void*));
+                if (c->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                    delete c;
+            },
+            ctx);
+    }
+    return aggregate;
+}
+
+// stdlib §6.7 / §30.10: Task.FireAndForget(owned task). Ownership of `task`
+// transfers; the caller must not free or reference it again. For already-
+// complete tasks, free them immediately (inline) without going through the
+// scheduler — this avoids a race where the scheduler is shut down before the
+// continuation runs. For incomplete tasks (still running on a worker), register
+// a continuation via bz_task_then so the memory is freed when the task completes
+// (safe: the continuation runs on the pool before or after shutdown drains the
+// queue, and the task struct remains live until then).
+void  bz_task_fire_and_forget(void* tp) {
+    if (!tp) return;
+    auto* task = (bz_task_t*)tp;
+    // Check if already done under the lock (same as bz_task_is_done).
+    bool already_done;
+    { std::lock_guard<std::mutex> lk(task->mtx); already_done = task->done; }
+    if (already_done) {
+        // Fast path: task is complete; free immediately without the scheduler.
+        bz_task_free(tp);
+    } else {
+        // Slow path: task still running; register a continuation so the worker
+        // frees it when it eventually completes.
+        bz_task_then(tp,
+            [](void* completedTask, void* /*state*/) {
+                bz_task_free(completedTask);
+            },
+            nullptr);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StringBuilder helper
 // ---------------------------------------------------------------------------

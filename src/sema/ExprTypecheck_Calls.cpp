@@ -919,26 +919,64 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctTy);
                         }
                     }
-                    // §30.10 / stdlib §6.7: Task static helpers. `Task.Delay(...)`
-                    // returns a (non-generic) `Task` — a genuinely-incomplete task
-                    // the awaiter suspends on. The result TypeRef carries an
-                    // ast::Type named "Task" (no generic args) so the `await`
-                    // typer (ExprTypecheck_Exprs.cpp) recognizes it as `await Task`
-                    // → unit. The four Delay overloads (int / TimeSpan, each with
-                    // an optional CancellationToken) all yield a bare `Task`.
+                    // §30.10 / stdlib §6.7: Task static helpers.
+                    // Helper: build a bare `Task` TypeRef (astNode name="Task",
+                    // no generic args). Used by Delay, WhenAll, and as the base
+                    // for Task<T> (genericArgs set separately).
+                    auto makeTaskTypeRef = [&]() -> TypeRef* {
+                        auto* tt = ctx_.makeTypeRef();
+                        tt->kind = TypeRef::Kind::Named;
+                        tt->nullable = false;
+                        auto* ann = new ast::Type();
+                        ann->kind = ast::TypeKind::Named;
+                        auto* nm = new ast::QualifiedName();
+                        nm->parts.push_back("Task");
+                        ann->name.reset(nm);
+                        tt->astNode = ann;
+                        return tt;
+                    };
                     if (colName == "Task") {
+                        // `Task.Delay(...)` returns a (non-generic) `Task` — a
+                        // genuinely-incomplete task the awaiter suspends on. The
+                        // result TypeRef carries an ast::Type named "Task" (no
+                        // generic args) so the `await` typer recognizes it as
+                        // `await Task` → unit. The four Delay overloads (int /
+                        // TimeSpan, each with an optional CancellationToken) all
+                        // yield a bare `Task`.
                         if (m == "Delay") {
-                            auto* tt = ctx_.makeTypeRef();
-                            tt->kind = TypeRef::Kind::Named;
-                            tt->nullable = false;
-                            auto* ann = new ast::Type();
-                            ann->kind = ast::TypeKind::Named;
-                            auto* nm = new ast::QualifiedName();
-                            nm->parts.push_back("Task");
-                            ann->name.reset(nm);
-                            tt->astNode = ann;
+                            ctx_.setExprType(&ce, makeTaskTypeRef());
+                        }
+                        // stdlib §6.7 (line 2855): Task.FromResult<T>(value: T):
+                        // Task<T>. Returns an already-completed task carrying the
+                        // argument value. The result type is Task<T> where T is
+                        // inferred from the argument.
+                        if (m == "FromResult" && !ce.args.empty() && ce.args[0].value) {
+                            TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+                            auto* tt = makeTaskTypeRef();
+                            if (argTy) tt->genericArgs.push_back(argTy);
                             ctx_.setExprType(&ce, tt);
                         }
+                        // stdlib §6.7 (line 2872): Task.WhenAll(tasks: Array<Task>):
+                        // Task. Completes when all input tasks complete; no result
+                        // value (bare Task). The Array<Task> argument shape is already
+                        // expressible (Array<T> is array-backed, T=Task).
+                        if (m == "WhenAll") {
+                            ctx_.setExprType(&ce, makeTaskTypeRef());
+                        }
+                        // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>):
+                        // Task<Task>. Completes with the first-done task pointer as
+                        // the result. Typed as Task<Task> so the await result is the
+                        // winning task pointer (ptr-sized).
+                        if (m == "WhenAny") {
+                            auto* tt = makeTaskTypeRef();
+                            // genericArgs[0] = Task (the inner Task type)
+                            tt->genericArgs.push_back(makeTaskTypeRef());
+                            ctx_.setExprType(&ce, tt);
+                        }
+                        // stdlib §6.7 (line 2885): Task.FireAndForget(owned task):
+                        // void/unit. Ownership of the task transfers; the caller
+                        // does not need the return value. No TypeRef set → unit.
+                        // (FireAndForget return type is untyped/unit in sema.)
                     }
                 }
                 // §2.5: DateTime instance method return types.
