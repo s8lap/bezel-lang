@@ -33,6 +33,7 @@
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
+#include "native_test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -48,23 +49,18 @@ int run(const std::string& program) {
     return r.ran ? r.exitCode : -999;
 }
 
-std::string runtimeSourcePath() {
-    fs::path here(__FILE__);  // tests/codegen/<this>
-    fs::path root = here.parent_path().parent_path().parent_path();
-    return (root / "src" / "runtime" / "bezel_runtime.cpp").string();
-}
-
 // Lower `source` to an object file, link against an ASan-instrumented runtime,
 // run under LeakSanitizer. Returns 0 (clean), 1 (sanitizer reported a leak),
 // or -1 (toolchain unavailable → SKIP). Mirrors undisposed_leak_test.cpp.
+// Uses the memoized ASan runtime object (compiled once per process).
 int runUnderLeakSanitizer(const std::string& source) {
-    if (std::system("clang++ --version > /dev/null 2>&1") != 0) return -1;
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
 
     static int counter = 0;
     auto dir = fs::temp_directory_path();
     std::string stem = "bezel_421_lsan_" + std::to_string(counter++);
     std::string objPath = (dir / (stem + ".o")).string();
-    std::string rtObj = (dir / (stem + "_rt.o")).string();
     std::string exe = (dir / stem).string();
 
     {
@@ -89,13 +85,8 @@ int runUnderLeakSanitizer(const std::string& source) {
 
     auto cleanup = [&] {
         std::remove(objPath.c_str());
-        std::remove(rtObj.c_str());
         std::remove(exe.c_str());
     };
-    std::string rtCmd =
-        "clang++ -std=c++20 -g -fsanitize=address -pthread -c " +
-        runtimeSourcePath() + " -o " + rtObj + " > /dev/null 2>&1";
-    if (std::system(rtCmd.c_str()) != 0) { cleanup(); return -1; }
     std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
                           rtObj + " -lm -lpthread -lstdc++ -o " + exe +
                           " > /dev/null 2>&1";
