@@ -3269,9 +3269,14 @@ private:
     llvm::Value* lowerCaseExpr(const ast::CaseExpr& ce);
 
     // CG28: does `pattern` match `scrut`? Returns an i1.
+    // scrutTy: the resolved TypeRef of the scrutinee, used to detect nullable
+    // value types ({i8 hasValue; T value} struct — per §7 / issues #447/#448).
+    // When scrutTy is a nullable value type the function extracts hasValue/value
+    // and applies struct-based pattern comparison instead of pointer operations.
     llvm::Value* patternMatches(const ast::Pattern* pat, llvm::Value* scrut,
                                 const sema::TypeSymbol* enumTy = nullptr,
-                                bool isStr = false);
+                                bool isStr = false,
+                                const sema::TypeRef* scrutTy = nullptr);
 
     // CG28: equality of two same-typed scalars (int or FP).
     llvm::Value* emitEquals(llvm::Value* a, llvm::Value* b,

@@ -581,9 +581,25 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         }
     }
     if (!targetDesc) return nullptr;
-    // emitIsA expects a pointer operand (the box / object). An Object/interface
-    // operand already lowers to ptr; guard defensively.
-    if (!obj->getType()->isPointerTy()) return nullptr;
+    // §12.7 / §7 / issues #447 + #448: a nullable VALUE type operand is a
+    // tagged {i8 hasValue; T value} struct, NOT a pointer. emitIsA walks a
+    // vtable descriptor chain and requires a pointer operand; calling it on a
+    // struct produces illegal IR (SIGILL). For `x is T` where x: T? the
+    // semantics per §12.7 reduce to "is the value present?" — i.e. hasValue.
+    // Handle the three nullable-value subtypes (prim/enum/record) together:
+    // the operand type is the scrutinee's TypeRef, obtained from sema.
+    if (!obj->getType()->isPointerTy()) {
+        // Only the nullable-VALUE-type struct case is handled here (nullable
+        // CLASS types lower to ptr and never reach this branch).
+        const sema::TypeRef* operandTy = ctx_.exprType(*te.operand);
+        if (operandTy && isNullableValueTy(operandTy) &&
+            obj->getType()->isStructTy()) {
+            llvm::Value* hasVal = nullablePrimHasValue(obj);  // i1
+            if (te.op == "is") return hasVal;
+            if (te.op == "is not") return builder_.CreateNot(hasVal);
+        }
+        return nullptr;
+    }
     llvm::Value* isA = emitIsA(obj, targetDesc);
     if (te.op == "is") return isA;
     if (te.op == "is not")

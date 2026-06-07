@@ -1781,11 +1781,15 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     if (!scrut) return false;
     const sema::TypeSymbol* enumTy = enumTypeOf(*cs.scrutinee);
     bool isStr = isStringExprType(*cs.scrutinee);
+    // §7 / issue #447: pass the scrutinee's resolved TypeRef so patternMatches
+    // can detect a nullable VALUE type ({i8 hasValue; T value} struct) and
+    // apply hasValue-based matching instead of the pointer-based paths.
+    const sema::TypeRef* scrutTy = ctx_.exprType(*cs.scrutinee);
     auto* endBB =
         llvm::BasicBlock::Create(llvm_, "casestmt.end", currentFn_);
     for (const auto& arm : cs.arms) {
         llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy,
-                                         isStr);
+                                         isStr, scrutTy);
         if (!pm) {  // deferred pattern kind — degrade to no-op
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
