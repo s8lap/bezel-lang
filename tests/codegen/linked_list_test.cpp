@@ -350,3 +350,70 @@ BEZEL_TEST(linked_list_4_6, count_after_operations) {
         "  return l.Count; "   // 1
         "end Main; end C;"), 1);
 }
+
+// ---------------------------------------------------------------------------
+// fix #450: LINQ aggregate/terminal operators on LinkedList<T> — stdlib §5 / §4.6
+// LinkedList<T> implements IEnumerable<T> (§4.6); LINQ aggregates must enumerate
+// nodes head-to-tail via bz_lazy_from_llist, NOT treat the list pointer as a
+// bz_array_t* (which misread bz_llist_t.tail as bz_array_t.count → garbage/0).
+// ---------------------------------------------------------------------------
+
+// §5 + §4.6 fix #450: Sum on a LinkedList<int> returns the correct total.
+BEZEL_TEST(linked_list_4_6, linq_sum_spec_5_fix450) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
+        "  return l.Sum((x: int) => x); "   // 10+20+30 = 60
+        "end Main; end C;"), 60);
+}
+
+// §5 + §4.6 fix #450: Min on a LinkedList<int> returns the minimum element.
+BEZEL_TEST(linked_list_4_6, linq_min_spec_5_fix450) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(5); l.AddLast(2); l.AddLast(8); l.AddLast(1); "
+        "  return l.Min((x: int) => x); "   // min = 1
+        "end Main; end C;"), 1);
+}
+
+// §5 + §4.6 fix #450: Max on a LinkedList<int> returns the maximum element.
+BEZEL_TEST(linked_list_4_6, linq_max_spec_5_fix450) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(5); l.AddLast(2); l.AddLast(8); l.AddLast(1); "
+        "  return l.Max((x: int) => x); "   // max = 8
+        "end Main; end C;"), 8);
+}
+
+// §5 + §4.6 fix #450: Count(pred) on a LinkedList<int> counts matching elements.
+BEZEL_TEST(linked_list_4_6, linq_count_pred_spec_5_fix450) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(1); l.AddLast(2); l.AddLast(3); l.AddLast(4); l.AddLast(5); "
+        "  return l.Count((x: int) => x mod 2 = 0); "  // even: 2,4 → 2
+        "end Main; end C;"), 2);
+}
+
+// §5 + §4.6 fix #450: Any(pred) on a LinkedList<int> — true when a match exists.
+BEZEL_TEST(linked_list_4_6, linq_any_pred_spec_5_fix450) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(1); l.AddLast(3); l.AddLast(5); "
+        "  return int(l.Any((x: int) => x > 4)); "  // 5 > 4 → true → 1
+        "end Main; end C;"), 1);
+}
+
+// §5 + §4.6 fix #450: regression — Sum on a single-element LinkedList.
+BEZEL_TEST(linked_list_4_6, linq_sum_single_element_spec_5_fix450) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var l := new LinkedList<int>(); "
+        "  l.AddLast(42); "
+        "  return l.Sum((x: int) => x); "  // 42
+        "end Main; end C;"), 42);
+}

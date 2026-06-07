@@ -482,6 +482,10 @@ void* bz_array_enum_alloc(void* arr, int64_t elem_size);
 // are invoked through codegen trampolines (fixed C signatures, see .cpp).
 // ---------------------------------------------------------------------------
 void* bz_lazy_from_array(void* arr, int64_t elem_size);
+// per §4.6/§4.7 + §5: wrap a bz_llist_t* (LinkedList<T>/OwnedLinkedList<T>) as a
+// lazy source so LINQ aggregate/terminal operators can enumerate it. Walks nodes
+// head-to-tail; does not own the list (caller still responsible for disposal).
+void* bz_lazy_from_llist(void* llist, int64_t elem_size);
 void* bz_lazy_where(void* up, void* closure, void* pred);            // pred: i32(closure, elem)
 void* bz_lazy_select(void* up, int64_t out_elem_size,
                      void* closure, void* sel);                      // sel: void(closure, elem, out)
