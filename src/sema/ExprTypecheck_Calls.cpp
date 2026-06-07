@@ -3255,8 +3255,16 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     ctx_.setExprSymbol(&nm, member);
     TypeRef* memberTy = nullptr;
     if (auto* fs = dynamic_cast<FieldSymbol*>(member)) {
-        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
             if (fd->type) memberTy = ctx_.resolvedType(*fd->type);
+        } else if (fs->posParam && fs->posParam->type) {
+            // §9 / #464: positional record field — type lives on the Param,
+            // not on a FieldDecl. resolveNullCondMember previously missed this
+            // path and left memberTy null, so the NullCondMemberExpr's TypeRef
+            // was never set. lowerCoalesce then saw no TypeRef on `b?.x` and
+            // fell through to `return nullptr`, silently producing 0.
+            memberTy = ctx_.resolvedType(*fs->posParam->type);
+        }
     } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
         if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
             if (pd->type) memberTy = ctx_.resolvedType(*pd->type);
