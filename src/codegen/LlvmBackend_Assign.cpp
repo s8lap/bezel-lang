@@ -282,6 +282,27 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         llvm::Value* oor = builder_.CreateICmpUGE(idx, len, "ix.oor");
         emitGuardThrow(oor, "IndexOutOfRangeException");
         int64_t esz = collectionElemSize(recvTy);
+        // fix #455 / §4.5: when the element type is a nullable value type
+        // (int?, bool?, enum?, record?) the lowered val may be the inner
+        // primitive rather than the full tagged {i8 hasValue; T} struct.
+        // Lift it to the tagged struct before allocating the slot so the
+        // alloca matches the esz that collectionElemSize computed.
+        // A null pointer val (from an untyped `null` literal) maps to the
+        // tagged null struct; an inner scalar maps to {hasValue=1, val}.
+        {
+            const sema::TypeRef* elemTyRef =
+                (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            if (elemTyRef && isNullableValueTy(elemTyRef)) {
+                llvm::StructType* expected = nullableValueStructTy(elemTyRef);
+                if (expected && val->getType() != expected) {
+                    if (val->getType()->isPointerTy())
+                        val = nullableValueNull(elemTyRef);  // null → tagged null
+                    else
+                        val = wrapNullableValue(elemTyRef, val);  // scalar → {1, val}
+                }
+            }
+        }
         llvm::AllocaInst* slot = entryAlloca(val->getType());
         builder_.CreateStore(val, slot);
         // §4.5 / §4.2: an OWNING array's set(owned) — whether reached through the
