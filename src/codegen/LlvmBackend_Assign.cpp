@@ -830,6 +830,24 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
     if (!setter || !v) return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    // per §23.3 / §13 / #476: a STATIC property has no receiver (`this`).
+    // Mirrors the static-getter path in LlvmBackend_Exprs.cpp (the
+    // "isStaticProp" branch). For static properties, skip receiver resolution
+    // entirely — both bare `X := v` and qualified `C.X := v` just bind
+    // `value` and execute the setter body in the current static context.
+    bool isStaticProp = std::any_of(ps->modifiers.begin(), ps->modifiers.end(),
+                                    [](const auto& m){ return m == "static"; });
+    if (isStaticProp) {
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        locals_[pd] = slot;
+        if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+            setter->exprBody)
+            lowerExpr(*setter->exprBody);
+        else
+            lowerScopedBlock(setter->stmts);
+        return true;
+    }
     llvm::Value* recv = currentThis_;
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target))
         recv = ma->target ? lowerExpr(*ma->target) : currentThis_;
