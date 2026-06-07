@@ -281,6 +281,7 @@ set(BEZEL_TEST_SOURCES
     codegen/is_narrow_receiver_test.cpp
     codegen/null_narrow_member_test.cpp
     codegen/generic_record_return_test.cpp
+    codegen/generic_record_field_460_test.cpp
     codegen/iterator_native_test.cpp
     codegen/extension_method_test.cpp
     codegen/bug_457_458_test.cpp

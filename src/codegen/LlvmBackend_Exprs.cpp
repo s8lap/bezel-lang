@@ -2811,16 +2811,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     }
     const sema::TypeSymbol* t = rt->declaration;
 
-    // §9 / §9.5: `new Record(args)` builds a value-type struct directly —
-    // no heap allocation, vtable, constructor chain, or disposal. This is
-    // the spec's record construction form (records use `new`, like classes,
-    // but produce a value).
-    if (t->kind == ast::TypeDeclKind::Record)
-        return buildRecordValue(t, ne.args);
-
     // CG-generic: if this is a generic instantiation (e.g. Box<int>),
-    // set up the type-parameter substitution before classStruct so that
-    // field types are computed with the concrete type arguments.
+    // set up the type-parameter substitution before classStruct / recordStruct
+    // so that field types are computed with the concrete type arguments.
     auto savedSubst = genericSubst_;  // save outer subst (nested generics)
     auto savedSemaTy = genericSubstSemaTy_;
     if (!rt->genericArgs.empty() && t->decl) {
@@ -2842,6 +2835,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             genericSubst_ = std::move(newSubst);
             genericSubstSemaTy_ = std::move(newSema);
         }
+    }
+
+    // §9 / §9.5 / issue #460: `new Record(args)` builds a value-type struct
+    // directly — no heap allocation, vtable, constructor chain, or disposal.
+    // For a GENERIC record (`new Box<string>(...)`) the substitution set up
+    // above MUST be active across buildRecordValue so recordStruct lays the
+    // T-typed fields out as the concrete specialized types (the same way the
+    // class path below carries the subst through classStruct + the inline
+    // constructor). Restore the outer substitution afterward.
+    if (t->kind == ast::TypeDeclKind::Record) {
+        llvm::Value* rec = buildRecordValue(t, ne.args);
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        return rec;
     }
 
     llvm::StructType* st = classStruct(t);
