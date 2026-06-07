@@ -328,6 +328,7 @@ set(BEZEL_TEST_SOURCES
     codegen/lambda_codegen_fixes_test.cpp
     codegen/indexer_compound_assign_test.cpp
     codegen/nameof_charrepeat_test.cpp
+    codegen/blockform_property_itable_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
