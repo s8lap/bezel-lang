@@ -70,6 +70,7 @@ set(BEZEL_TEST_SOURCES
     parser/index_arglist_test.cpp
     parser/e2e_kitchen_sink_test.cpp
     parser/node_spans_test.cpp
+    parser/bug_468_ne_operator_test.cpp
     sema/symbol_collection_test.cpp
     sema/type_resolution_test.cpp
     sema/expr_literal_types_test.cpp

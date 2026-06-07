@@ -369,8 +369,17 @@ Token Lexer::next() {
 
     switch (static_cast<char>(b)) {
     case '(': case ')': case '[': case ']': case '{': case '}':
-    case ',': case ';': case '!': case '~':
+    case ',': case ';': case '~':
         puLen = 1;
+        break;
+    case '!':
+        // §17.8: `!` alone is the postfix null-forgiving operator (e.g. `x!`,
+        // `x!.member`). `!=` is NOT in the Bezel grammar (Appendix A); the
+        // inequality operator is `<>` (§17.3). We lex `!=` as a single
+        // two-character Punctuator token so the parser can report a clear
+        // "use '<>'" diagnostic rather than silently miscompiling it as
+        // PostfixBang followed by the equality operator `=`. per §17.3 / #468.
+        puLen = (c1 == '=') ? 2 : 1;             // != (error) or ! (valid)
         break;
     case ':':
         puLen = (c1 == '=') ? 2 : 1;             // := or :
