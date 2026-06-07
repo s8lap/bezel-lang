@@ -1134,6 +1134,10 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
                                              const sema::TypeRef* iEnumTy) {
     // Determine element type and size.
+    // per §9 (bug D): a record element type lowers to an LLVM StructType whose
+    // allocation size may exceed 8 bytes; use DataLayout for structs so the
+    // esz stored in the enumerator frame matches the stride used by
+    // bz_array_ptr_at (same fix as collectionElemSize in Calls.cpp).
     llvm::Type* elemTy = i32();
     int64_t esz = 8;
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0]) {
@@ -1141,6 +1145,8 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
         if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
         else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
         else if (elemTy->isIntegerTy(16)) esz = 2;
+        else if (elemTy->isStructTy())
+            esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
         else esz = 8;
     }
 

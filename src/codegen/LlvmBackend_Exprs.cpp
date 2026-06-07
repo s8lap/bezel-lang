@@ -2879,6 +2879,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // Determine element size from the first generic arg (if present).
             // For pointer-typed elements (class, string) → sizeof(ptr) = 8.
             // For int → 4, long → 8, double → 8, bool → 1, etc.
+            // per §9 (bug D): a record element type lowers to an LLVM
+            // StructType whose allocation size may exceed 8 bytes — use the
+            // DataLayout for structs so bz_array_alloc sizes the backing
+            // buffer correctly (same fix as collectionElemSize in Calls.cpp).
             int64_t elemSize = 8;  // default: pointer
             if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
                 llvm::Type* et = lowerTypeRef(rt->genericArgs[0]);
@@ -2886,7 +2890,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (et->isIntegerTy(32) || et->isFloatTy()) elemSize = 4;
                     else if (et->isIntegerTy(1) || et->isIntegerTy(8)) elemSize = 1;
                     else if (et->isIntegerTy(16)) elemSize = 2;
-                    else elemSize = 8;  // ptr, i64, double, struct
+                    else if (et->isStructTy())
+                        elemSize = (int64_t)module_->getDataLayout().getTypeAllocSize(et);
+                    else elemSize = 8;  // ptr, i64, double
                 }
             }
             // issues #343 / D8 / §4.10: a Set<T> (or OwnedSet<T>) is backed by

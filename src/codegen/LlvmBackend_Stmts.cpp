@@ -1494,10 +1494,16 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
 
     if (isArrayBacked) {
         // Use direct bz_array_t protocol.
+        // per §9: a record element type lowers to an LLVM StructType whose
+        // allocation size may exceed 8 bytes; use DataLayout for structs
+        // so the bz_array_ptr_at stride matches the actual element layout
+        // (same fix as collectionElemSize in LlvmBackend_Calls.cpp).
         int64_t esz = 8;
         if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
         else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
         else if (elemTy->isIntegerTy(16)) esz = 2;
+        else if (elemTy->isStructTy())
+            esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
         auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
         llvm::Value* len = builder_.CreateCall(lenFn, {enumObj});
