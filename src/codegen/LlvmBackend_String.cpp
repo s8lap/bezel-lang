@@ -2133,8 +2133,11 @@ llvm::Value* Emitter::emitRecordToString(llvm::Value* recVal,
         acc = emitStringConcat(acc, lowerStringLiteral(
             std::string("\"") + std::string(m->name) + ": \"", false));
         llvm::Value* fieldVal = builder_.CreateExtractValue(recVal, {idx});
-        acc = emitStringConcat(acc,
-                               emitValueToString(fieldVal, recordMemberType(m)));
+        // issue #462 / §14.1: a generic record's `T`-typed field formats by its
+        // CONCRETE type under the active subst (a string renders its value, a
+        // record recurses) — not the type-erased shape fallback.
+        acc = emitStringConcat(
+            acc, emitValueToString(fieldVal, recordMemberTypeResolved(m)));
         ++idx;
     }
     acc = emitStringConcat(acc, lowerStringLiteral("\")\"", false));
@@ -2277,7 +2280,11 @@ llvm::Value* Emitter::emitRecordHashCode(llvm::Value* recVal,
     unsigned idx = 0;
     for (const sema::Symbol* m : storage) {
         llvm::Value* fieldVal = builder_.CreateExtractValue(recVal, {idx});
-        llvm::Value* fh = emitValueHashCode(fieldVal, recordMemberType(m));
+        // issue #462 / §14.1: a generic record's `T`-typed field hashes by its
+        // CONCRETE type under the active subst (a string hashes by CONTENT, so
+        // the hash-equality invariant holds for content-equal values) — not by
+        // pointer bits via the type-erased shape fallback.
+        llvm::Value* fh = emitValueHashCode(fieldVal, recordMemberTypeResolved(m));
         llvm::Value* h = builder_.CreateLoad(i32(), hashSlot);
         h = builder_.CreateAdd(builder_.CreateMul(h, builder_.getInt32(31)), fh);
         builder_.CreateStore(h, hashSlot);
