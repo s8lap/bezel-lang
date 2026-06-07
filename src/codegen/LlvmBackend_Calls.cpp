@@ -3076,7 +3076,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
     // §6.1: CancellationTokenSource static methods.
-    // WithCancelAfter(delay) — deferred (needs timer/scheduler infra).
+    if (cls == "CancellationTokenSource") {
+        // WithCancelAfter(delay: TimeSpan): owned CancellationTokenSource.
+        // Allocates a new CancellationTokenSource via bz_cts_alloc (the same
+        // allocation as `new CancellationTokenSource()`).  The timer that
+        // triggers cancellation after `delay` is DEFERRED pending scheduler
+        // infra (bz_task_delay already schedules work on the thread pool;
+        // CancelAfter needs an analogous bz_cts_cancel_after helper).  Until
+        // that helper exists, the source is allocated normally and no
+        // cancellation is scheduled — programs compile and run cleanly with
+        // well-formed IR; the timer simply does not fire.  (#463: the bug was
+        // that the source was never even allocated because sema gave the call
+        // expression no type, which caused IR verification failure downstream.)
+        if (m == "WithCancelAfter" && !call.args.empty()) {
+            // Evaluate the delay argument for any side-effects (TimeSpan.FromMilliseconds
+            // etc.) even though we do not yet pass it to a timer.
+            if (call.args[0].value) lowerExpr(*call.args[0].value);
+            auto* allocFn = declareC("bz_cts_alloc", ptrTy(), {});
+            return builder_.CreateCall(allocFn, {}, "cts.wca");
+        }
+    }
 
     // §30.10 / stdlib §6.7: Task static helpers. `Task.Delay(...)` produces a
     // genuinely-incomplete Task that a thread-pool worker completes after the

@@ -970,9 +970,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // ThrowIfCancellationRequested() returns unit (void/untyped).
                         // Register — deferred (needs closure-list infra).
                     }
-                    // §6.1: CancellationTokenSource instance method return types.
-                    // Token is a property; Cancel() and CancelAfter() → unit;
-                    // IsCancellationRequested property → handled in resolveMemberAccess.
+                    // §6.1: CancellationTokenSource instance and static method
+                    // return types. Token is a property; Cancel() and CancelAfter()
+                    // → unit; IsCancellationRequested → handled in resolveMemberAccess.
+                    // WithCancelAfter is a STATIC factory (stdlib §6.1) returning
+                    // owned CancellationTokenSource.
                     if (colName == "CancellationTokenSource") {
                         if (m == "Token") {
                             // Token property returns CancellationToken.  Set the
@@ -983,6 +985,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctTy->kind = TypeRef::Kind::Named;
                             ctTy->declaration = builtinClassSym("CancellationToken");
                             ctx_.setExprType(&ce, ctTy);
+                        }
+                        // §6.1 / #463: WithCancelAfter(delay: TimeSpan) is a static
+                        // factory returning owned CancellationTokenSource.  Without this
+                        // entry, `var cts := CancellationTokenSource.WithCancelAfter(…)`
+                        // had no sema type → codegen erased cts to i32 → cts.Token
+                        // lowered as i32 → MALFORMED IR when passed to Task.Delay as
+                        // a CancellationToken (ptr-wide, §6.1).  Using builtinClassSym
+                        // produces the same TypeRef shape as the `new CancellationTokenSource()`
+                        // path so all downstream checks (builtinTypeName, using-var
+                        // disposal, lowerTypeRef) see an identical type.
+                        if (m == "WithCancelAfter") {
+                            auto* ctsTy = ctx_.makeTypeRef();
+                            ctsTy->kind = TypeRef::Kind::Named;
+                            ctsTy->declaration = builtinClassSym("CancellationTokenSource");
+                            ctx_.setExprType(&ce, ctsTy);
                         }
                     }
                     // §30.10 / stdlib §6.7: Task static helpers.
