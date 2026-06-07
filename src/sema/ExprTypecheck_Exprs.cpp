@@ -98,6 +98,24 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 "reference `") +
                     std::string(id->name) + "` (§22.8)");
             }
+            // per §26.1 / fix #456: inside a PRIMITIVE/builtin extension body
+            // (currentType_ is null — no TypeSymbol for the extended type), set
+            // `this`'s exprType to the extension's target TypeRef so that
+            // resolveMemberAccess can call ctx_.exprType(*ma.target) and then
+            // lookupExtensionMember on it. Without this, `this.OtherExtMethod()`
+            // from inside `extension int` leaves `this` untyped → the extension
+            // member lookup is never reached → codegen emits ret i32 0.
+            // Named-type extensions (class/record/enum) already work because
+            // resolveMemberAccess reads currentType_ directly — not exprType.
+            if (id->name == "this" && !currentType_ && currentExtension_) {
+                if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                        currentExtension_->decl)) {
+                    if (ed->targetType) {
+                        if (TypeRef* extTy = ctx_.resolvedType(*ed->targetType))
+                            ctx_.setExprType(&e, extTy);
+                    }
+                }
+            }
             return;
         }
         Symbol* sym = lookupName(id->name);

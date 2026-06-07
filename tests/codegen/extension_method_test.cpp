@@ -157,6 +157,60 @@ BEZEL_TEST(codegen_extension, instance_member_wins_over_extension_spec_26_5) {
 }
 
 // ===========================================================================
+// BUG #456 / §26.1 — extension method on a PRIMITIVE calling another extension
+// method via `this.OtherMethod()`. Inside an `extension int` body, `this` must
+// carry the extended type (int) so that `resolveMemberAccess` can resolve the
+// extension member on `this`. Without the fix, `this` has no exprType, so
+// lookupExtensionMember is never reached and codegen emits `ret i32 0`.
+// ===========================================================================
+
+// §26.1 / #456: `this.OtherMethod()` inside a primitive extension dispatches
+// to the other extension method — the callee sees the right `this` value.
+BEZEL_TEST(codegen_extension, ext_this_call_primitive_456) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension int "
+        "  public method Double(): int => this * 2; "
+        "  public method Quadruple(): int => this.Double() * 2; "
+        "end; "
+        "class P public static method Main(): int "
+        "  var x := 7; "
+        "  return x.Quadruple(); "   // 7 * 2 * 2 = 28
+        "end Main; end P;"), 28);
+}
+
+// §26.1 / #456: chain of three primitive extension methods, each calling the
+// next via `this.M()`. Verifies transitivity and correct `this` threading.
+BEZEL_TEST(codegen_extension, ext_this_chain_primitive_456) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension int "
+        "  public method Inc(): int => this + 1; "
+        "  public method Inc2(): int => this.Inc() + 1; "
+        "  public method Inc4(): int => this.Inc2() + this.Inc2(); "
+        "end; "
+        "class P public static method Main(): int "
+        "  var x := 10; "
+        "  return x.Inc4(); "   // (10+1+1) + (10+1+1) = 24
+        "end Main; end P;"), 24);
+}
+
+// §26.1 / #456: `extension int` with an extra arg, calling another extension
+// method via `this.M()` — verifies `this` threads correctly into the callee.
+BEZEL_TEST(codegen_extension, ext_this_call_with_arg_456) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension int "
+        "  public method AddSelf(): int => this + this; "
+        "  public method Scaled(n: int): int => this.AddSelf() * n; "
+        "end; "
+        "class P public static method Main(): int "
+        "  var x := 5; "
+        "  return x.Scaled(3); "  // (5+5)*3 = 30
+        "end Main; end P;"), 30);
+}
+
+// ===========================================================================
 // REGRESSION — a program with NO extensions is unaffected (a class method
 // call resolves and runs exactly as before).
 // ===========================================================================
