@@ -406,8 +406,23 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 if (tt->kind == TypeRef::Kind::InlineArray && tt->arrayElement)
                     ctx_.setExprType(&e, tt->arrayElement);
                 else if (tt->kind == TypeRef::Kind::Primitive &&
-                         tt->primitive == PrimitiveType::String)
-                    ctx_.setExprType(&e, ctx_.primitiveTypeRef(PrimitiveType::Char));
+                         tt->primitive == PrimitiveType::String) {
+                    // §3.4 / §4.6 / issue #474: a string indexer distinguishes
+                    // the index kind. `s[i]` (a single int) returns the i-th
+                    // `char` (code point); `s[r]` for a `Range<int>` value `r`
+                    // returns the SUBSTRING spanning `r` — a fresh `string`.
+                    // Detect the Range form by the index being a range literal
+                    // (`s[a..b]`, `s[..b]`, `s[a..]`, `s[..]`) so the access is
+                    // typed `string`; otherwise it is `char`.
+                    bool rangeIndex =
+                        !ix->indices.empty() && ix->indices[0].value &&
+                        dynamic_cast<const ast::RangeExpr*>(
+                            ix->indices[0].value.get()) != nullptr;
+                    ctx_.setExprType(
+                        &e, rangeIndex
+                                ? ctx_.primitiveTypeRef(PrimitiveType::String)
+                                : ctx_.primitiveTypeRef(PrimitiveType::Char));
+                }
                 // issue #388: heap-collection indexer `a[i]` / `dict[key]`. The
                 // built-in collections resolve to a Named TypeRef with a null
                 // declaration (TypeResolution_Names) and carry their type

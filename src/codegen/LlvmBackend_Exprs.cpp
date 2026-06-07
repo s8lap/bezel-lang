@@ -533,6 +533,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
             if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
                 tt->primitive == sema::PrimitiveType::String) {
+                // §3.4 / issue #474: a Range index `s[a..b]` returns the
+                // SUBSTRING spanning the range — a fresh `string` — rather than
+                // a single `char`. Intercept the range form before the
+                // code-point path (the index is a RangeExpr, not a value).
+                if (auto* range = dynamic_cast<const ast::RangeExpr*>(
+                        ix->indices[0].value.get())) {
+                    llvm::Value* strPtr = lowerExpr(*ix->target);
+                    if (!strPtr) return nullptr;
+                    return emitStringRangeSlice(strPtr, *range);
+                }
+                // §4.6: a single int index `s[i]` returns the i-th char.
                 llvm::Value* strPtr = lowerExpr(*ix->target);
                 llvm::Value* idx = lowerExpr(*ix->indices[0].value);
                 if (!strPtr || !idx) return nullptr;
