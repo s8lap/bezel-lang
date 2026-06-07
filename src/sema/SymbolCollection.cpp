@@ -261,6 +261,11 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
                 if (auto* ms = dynamic_cast<MemberSymbol*>(member)) {
                     ms->parent = nullptr; // patched by slice 2
                 }
+                // §26 (#433): tag an extension METHOD with its declaring
+                // block so codegen can recover the extended (receiver) type.
+                if (auto* methSym = dynamic_cast<MethodSymbol*>(member)) {
+                    methSym->extensionDecl = ext;
+                }
                 sym->members.push_back(member);
             }
         }

@@ -1987,6 +1987,49 @@ void ExprTC::reportNoTargetInferenceIfNeeded(const ast::CallExpr& ce) {
             "return type (§14.1, §A.7)");
 }
 
+void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
+                                    Symbol* member) {
+    if (!member) return;
+    ctx_.setExprSymbol(&ma, member);
+    if (auto* ms = dynamic_cast<MethodSymbol*>(member)) {
+        // §27.6: a bare `x.M` in value position is a method reference of type
+        // `(paramTypes) -> returnType`. The CallExpr handler (typeCall) reads
+        // the MethodSymbol's decl directly for `x.M(...)`, so this Function
+        // type only affects the bare-reference case. No receiver substitution:
+        // an extension member is not generic over the receiver in this slice.
+        auto* ft = ctx_.makeTypeRef();
+        ft->kind = TypeRef::Kind::Function;
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        for (auto* psym : ms->params) {
+            auto* par = dynamic_cast<ParameterSymbol*>(psym);
+            if (!par) continue;
+            TypeRef::FuncParam fp;
+            fp.modifier = par->modifier;
+            fp.name = par->name;
+            if (par->declType) fp.type = ctx_.resolvedType(*par->declType);
+            ft->funcParams.push_back(fp);
+        }
+        if (md && md->returnType) {
+            ft->funcReturn = ctx_.resolvedType(*md->returnType);
+            ft->funcReturnOwned = md->returnOwned;
+        } else {
+            auto* unit = ctx_.makeTypeRef();
+            unit->kind = TypeRef::Kind::Unit;
+            ft->funcReturn = unit;
+        }
+        ctx_.setExprType(&ma, ft);
+    } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
+        // §26.1: a computed read-only extension property — its type is the
+        // declared `: T`. (Property codegen is DEFERRED, #433; this types the
+        // access so a `var x := recv.P` use site is well-formed for diagnosis.)
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (pd && pd->type) {
+            if (auto* rt = ctx_.resolvedType(*pd->type))
+                ctx_.setExprType(&ma, rt);
+        }
+    }
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // per §24.3: the event visibility fence. When the access target resolves
     // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
@@ -2687,12 +2730,42 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // §26.5: a user extension on a PRIMITIVE/builtin receiver (e.g.
+        // `extension int`). Consulted last — after every builtin/intrinsic
+        // member above — so a real builtin member always wins (no shadow).
+        // The receiver's compile-time type is `ma.target`'s exprType.
+        if (ma.target) {
+            if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
+                if (Symbol* ext = lookupExtensionMember(recvTy, ma.member)) {
+                    resolveExtensionMember(ma, ext);
+                    return;
+                }
+            }
+        }
         return;
     }
     // Lookup member by name. Slice S5: walks own members first,
     // then transitively each base type — first match wins (no
     // ambiguity resolution between base interfaces yet).
     Symbol* member = lookupMember(targetType, ma.member);
+    // §26.5: extension members are consulted ONLY when no instance member
+    // matched (instance members win — an extension never shadows a real
+    // member, #433). The receiver's compile-time type is the access target's
+    // type (a Named user type here); fall back to a TypeRef synthesized from
+    // the resolved TypeSymbol when the target carried no exprType.
+    if (!member && ma.target) {
+        const TypeRef* recvTy = ctx_.exprType(*ma.target);
+        TypeRef synth;
+        if (!recvTy) {
+            synth.kind = TypeRef::Kind::Named;
+            synth.declaration = targetType;
+            recvTy = &synth;
+        }
+        if (Symbol* ext = lookupExtensionMember(recvTy, ma.member)) {
+            resolveExtensionMember(ma, ext);
+            return;
+        }
+    }
     if (!member) {
         // §2.3: built-in class TypeSymbols (Console, Math, Convert, …)
         // have null `decl` and empty members. Assign return types for

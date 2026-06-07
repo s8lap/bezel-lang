@@ -140,6 +140,7 @@ set(BEZEL_TEST_SOURCES
     sema/flow_narrowing_test.cpp
     sema/unknown_member_test.cpp
     sema/method_ref_type_test.cpp
+    sema/extension_resolution_test.cpp
     sema/variance_position_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
@@ -279,6 +280,7 @@ set(BEZEL_TEST_SOURCES
     codegen/null_narrow_member_test.cpp
     codegen/generic_record_return_test.cpp
     codegen/iterator_native_test.cpp
+    codegen/extension_method_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

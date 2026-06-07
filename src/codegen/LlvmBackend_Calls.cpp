@@ -5254,6 +5254,23 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             recv = currentThis_;
         }
         if (!recv) return nullptr;
+        // §26.1 (#433): shape the receiver to the extension method's declared
+        // `this` type. For a class/interface receiver `this` is the object
+        // pointer (recv already is one); for a primitive/enum receiver it is
+        // the value (recv already is one). For a RECORD receiver `this` is a
+        // pointer to a spilled copy of the value (so the body's `this.field`
+        // reuses record field access) — spill if recv came through as a value.
+        if (isExtensionMethod(ms)) {
+            bool byPtr = false;
+            llvm::Type* thisTy = extensionThisType(ms, &byPtr);
+            if (byPtr && thisTy && !recv->getType()->isPointerTy()) {
+                // Record receiver passed as a value — spill to a stack slot
+                // and hand over its address (the declared `this` is a ptr).
+                llvm::Value* tmp = entryAlloca(recv->getType());
+                builder_.CreateStore(recv, tmp);
+                recv = tmp;
+            }
+        } else
         // CG29: a record method receives `this` as a pointer to the record
         // value; if the receiver is a struct value (the usual case), spill
         // it to a stack slot and pass its address.
