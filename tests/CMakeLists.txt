@@ -315,6 +315,7 @@ set(BEZEL_TEST_SOURCES
     codegen/record_generic_constraint_test.cpp
     codegen/nested_enum_cast_482_test.cpp
     codegen/generic_constraint_property_dispatch_test.cpp
+    codegen/constraint_dispatch_gaps_test.cpp
     codegen/array_record_element_test.cpp
     codegen/owned_collection_remove_test.cpp
     codegen/lambda_codegen_fixes_test.cpp
