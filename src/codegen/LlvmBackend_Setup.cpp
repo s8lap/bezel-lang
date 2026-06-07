@@ -3295,6 +3295,19 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }
+    // §3.4 / §4.6 / issue #474: a string Range slice `s[a..b]` is a fresh +1
+    // runtime-managed string (emitStringRangeSlice allocates with rc := 1), so a
+    // `var sub := s[a..b]` local owns the producer reference and must release it
+    // at scope end. Recognize it by the IndexExpr's target being a string and
+    // the index being a RangeExpr (the same shape codegen lowers to a slice).
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(init)) {
+        if (ix->target && !ix->indices.empty() && ix->indices[0].value &&
+            dynamic_cast<const ast::RangeExpr*>(ix->indices[0].value.get())) {
+            auto* tt = ctx_.exprType(*ix->target);
+            return tt && tt->kind == sema::TypeRef::Kind::Primitive &&
+                   tt->primitive == sema::PrimitiveType::String;
+        }
+    }
     return false;
 }
 

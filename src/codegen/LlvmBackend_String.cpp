@@ -29,6 +29,107 @@ llvm::Value* Emitter::loadCodePoint(llvm::Value* strPtr, llvm::Value* idx) {
            builder_.CreateSelect(is2, val2, val1), "cp.result");
 }
 
+// §3.4 / §4.6 / issue #474: `s[range]` — a Range index over a string — returns
+// the substring spanning the range as a FRESH, runtime-managed `string`
+// (rc := 1). Bound semantics follow §16.1: `a..b` is inclusive on both ends,
+// `a..<b` excludes the upper bound, and the open-ended forms (`..b`, `a..`,
+// `..`) extend to the start/end of the string. Out-of-range endpoints raise
+// IndexOutOfRangeException; an empty range produces the empty string. The
+// result preserves the source's per-code-point width (§4.6), copying
+// `width * length` bytes so multi-byte strings slice correctly.
+llvm::Value* Emitter::emitStringRangeSlice(llvm::Value* self,
+                                           const ast::RangeExpr& range) {
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    llvm::Value* selfLen = loadStringLen(self);                          // i64
+    llvm::Value* width   = builder_.CreateZExt(loadStringWidth(self),    // i64
+                                               i64(), "slc.w");
+
+    // start64: the lower endpoint (0 when open on the low side).
+    llvm::Value* start64 = builder_.getInt64(0);
+    if (range.lo) {
+        llvm::Value* lo = lowerExpr(*range.lo);
+        if (!lo) return nullptr;
+        start64 = lo->getType() == i64()
+                      ? lo
+                      : builder_.CreateSExt(lo, i64(), "slc.start");
+    }
+
+    // endExcl: the EXCLUSIVE upper index into the code-point sequence.
+    // A present inclusive upper bound `b` covers index b → endExcl = b + 1;
+    // a half-open upper bound `<b` excludes b → endExcl = b; an absent upper
+    // bound runs to the end of the string → endExcl = selfLen.
+    llvm::Value* endExcl = selfLen;
+    if (range.hi) {
+        llvm::Value* hi = lowerExpr(*range.hi);
+        if (!hi) return nullptr;
+        llvm::Value* hi64 = hi->getType() == i64()
+                                ? hi
+                                : builder_.CreateSExt(hi, i64(), "slc.hi");
+        endExcl = range.inclusive
+                      ? builder_.CreateAdd(hi64, builder_.getInt64(1),
+                                           "slc.endexcl")
+                      : hi64;
+    }
+
+    // §3.4 bounds checks (out-of-range endpoints raise IndexOutOfRangeException):
+    //   * a negative lower endpoint is invalid;
+    //   * a lower endpoint past the string length is invalid (start == len is
+    //     the empty tail, which is admitted);
+    //   * an upper endpoint past the string length is invalid (endExcl > len);
+    //     for an inclusive `..b` this rejects b >= len, for a half-open `..<b`
+    //     it rejects b > len while admitting b == len.
+    // An empty range (endExcl <= start) is NOT an error — it yields "".
+    llvm::Value* startNeg = builder_.CreateICmpSLT(start64, builder_.getInt64(0),
+                                                   "slc.startneg");
+    llvm::Value* startBig = builder_.CreateICmpSGT(start64, selfLen,
+                                                   "slc.startbig");
+    llvm::Value* endBig   = builder_.CreateICmpSGT(endExcl, selfLen,
+                                                   "slc.endbig");
+    llvm::Value* oor = builder_.CreateOr(startNeg,
+                       builder_.CreateOr(startBig, endBig), "slc.oor");
+    emitGuardThrow(oor, "IndexOutOfRangeException");
+
+    // subLen = max(endExcl - start, 0). After the guard, both endpoints are in
+    // [0, len], so a non-positive difference means an empty range.
+    llvm::Value* rawLen = builder_.CreateSub(endExcl, start64, "slc.rawlen");
+    llvm::Value* isEmpty = builder_.CreateICmpSLE(rawLen, builder_.getInt64(0),
+                                                  "slc.empty");
+    llvm::Value* subLen = builder_.CreateSelect(isEmpty, builder_.getInt64(0),
+                                                rawLen, "slc.len");
+
+    // Byte sizes (width-aware): copy `subLen * width` bytes from the source data
+    // at byte offset `start * width`. Allocate `bytes + width` so there is room
+    // for a width-sized zero terminator (the existing string builders NUL-pad).
+    llvm::Value* byteLen   = builder_.CreateMul(subLen, width, "slc.bytelen");
+    llvm::Value* srcOffset = builder_.CreateMul(start64, width, "slc.srcoff");
+
+    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+    auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+    auto* memsetFn = declareC("memset", ptrTy(), {ptrTy(), i32(), i64()});
+
+    llvm::Value* dataSize = builder_.CreateAdd(byteLen, width, "slc.datasize");
+    llvm::Value* newData  = builder_.CreateCall(mallocFn, {dataSize}, "slc.data");
+    llvm::Value* srcPtr   = builder_.CreateGEP(i8Ty, loadStringData(self),
+                                               srcOffset, "slc.src");
+    builder_.CreateCall(memcpyFn, {newData, srcPtr, byteLen});
+    // Zero a width-sized terminator so a width=2/4 result has a clean tail.
+    llvm::Value* termPtr = builder_.CreateGEP(i8Ty, newData, byteLen, "slc.term");
+    builder_.CreateCall(memsetFn, {termPtr, builder_.getInt32(0), width});
+
+    uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
+    llvm::Value* newStr =
+        builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "slc.obj");
+    builder_.CreateStore(newData,
+                         builder_.CreateStructGEP(stringType(), newStr, 0));
+    builder_.CreateStore(subLen,
+                         builder_.CreateStructGEP(stringType(), newStr, 1));
+    // Preserve the source width (§4.6 per-string storage width).
+    builder_.CreateStore(builder_.CreateTrunc(width, i8Ty, "slc.w8"),
+                         builder_.CreateStructGEP(stringType(), newStr, 2));
+    initStringRc(newStr);  // #422: producer's reference, rc := 1
+    return newStr;
+}
+
 
 std::vector<uint32_t> Emitter::processStringCodePoints(
         std::string_view text, bool verbatim) {

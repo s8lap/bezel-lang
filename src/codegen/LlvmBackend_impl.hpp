@@ -866,6 +866,16 @@ private:
     // width so that all three widths are handled correctly.
     llvm::Value* loadCodePoint(llvm::Value* strPtr, llvm::Value* idx);
 
+    // §3.4 / §4.6 / issue #474: lower `s[range]` — a Range index over a string —
+    // to a fresh, width-preserving `%bz.string` substring (rc := 1, the
+    // producer's reference). `self` is the source bz_string*; `range` supplies
+    // the bounds. Inclusive (`a..b`) includes both ends; half-open (`a..<b`)
+    // excludes the upper; open-ended forms (`..b`, `a..`, `..`) extend to the
+    // start/end of the string. Out-of-range endpoints raise
+    // IndexOutOfRangeException; an empty range produces the empty string.
+    llvm::Value* emitStringRangeSlice(llvm::Value* self,
+                                      const ast::RangeExpr& range);
+
     // CG27a: lazily declare an external C function (for memcmp, malloc, memcpy).
     llvm::Function* declareC(const char* name, llvm::Type* ret,
                              std::vector<llvm::Type*> args) {
