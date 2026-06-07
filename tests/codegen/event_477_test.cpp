@@ -1,0 +1,286 @@
+// Codegen for two event miscompiles, issue #477 (language spec §24).
+//
+// B6 — STATIC events (§24.1): "For static events, the backing field is a
+//   static owned field with program-exit disposal (§22.13)." The static
+//   backing EventSource must be allocated at program start (the single static
+//   root, alongside the static constructors run at Main's prologue, §22.7),
+//   so a static `.Subscribe()` / in-class `+=` registers handlers that fire
+//   on a later `.Raise()`. Before the fix the static backing source was never
+//   allocated, so `eventSourcePtr` returned null and every Subscribe/Raise was
+//   silently dropped (handlers never called).
+//
+// B7 — interface-typed access (§24.3 / §24.7): subscribing through a receiver
+//   whose static type is an interface that declares the event must reach the
+//   SAME backing EventSource the implementing class raises on. Per §24.7 the
+//   compiler-generated `EventSource<T>` backing field satisfies the interface
+//   contract (`EventSource<T>: IEvent<T>`). Before the fix, an interface-typed
+//   receiver resolved the event to the interface's own EventSymbol — which has
+//   no backing field — so the Subscribe was dropped (registered on nothing),
+//   while a concrete-typed receiver worked. The handler fired on Raise only
+//   for the concrete subscription, never the interface one.
+//
+// Scope: synchronous events only (async deferred, as in event_test.cpp).
+// Observation: handlers mutate a shared class instance captured by value
+// (the pointer is shared, §28), read back by Main as the int exit code, so
+// the asserted value proves WHICH source actually fired and HOW MANY times.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+
+int run(const std::string& program) {
+    auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+
+}  // namespace
+
+// =====================================================================
+// B6 — static events
+// =====================================================================
+
+// §24.1 / §24.4 / §24.5: a STATIC no-payload event. Subscribe from outside the
+// declaring class (IEvent<()>.Subscribe), Raise twice from inside — the handler
+// runs once per Raise (n == 2). Repro shape from issue #477 B6.
+BEZEL_TEST(codegen_events_477, static_event_subscribe_then_raise_twice_b6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class App "
+        "  public static event Signal; "
+        "  public static method Raise() Signal.Raise(); end Raise; "
+        "end App; "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Bump() V := V + 1; end Bump; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var box := new Box(); "
+        "  var sub := App.Signal.Subscribe(() => do box.Bump(); end); "
+        "  App.Raise(); App.Raise(); "
+        "  sub.Dispose(); "
+        "  return box.V; "                                // expect 2
+        "end Main; end C;"), 2);
+}
+
+// §24.1 / §2.11: disposing the static-event Subscription unsubscribes — a Raise
+// after Dispose is a no-op. Proves the static source is a real shared source
+// (not a fresh one per access) and that Dispose reaches it.
+BEZEL_TEST(codegen_events_477, static_event_dispose_unsubscribes_b6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class App "
+        "  public static event Signal; "
+        "  public static method Fire() Signal.Raise(); end Fire; "
+        "end App; "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Bump() V := V + 1; end Bump; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var box := new Box(); "
+        "  var sub := App.Signal.Subscribe(() => do box.Bump(); end); "
+        "  App.Fire(); "                                  // box.V = 1
+        "  sub.Dispose(); "
+        "  App.Fire(); "                                  // handler gone — no-op
+        "  return box.V; "                                // expect 1
+        "end Main; end C;"), 1);
+}
+
+// §24.3 / §24.4: inside the declaring class, `event += handler` is the fixed
+// desugaring to Add on the EventSource<T> face. On a STATIC event the added
+// handler must fire on Raise. Hook is a static method; the static backing
+// source is shared with the static Raise.
+BEZEL_TEST(codegen_events_477, static_event_plus_equals_inside_class_b6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class App "
+        "  public static event Signal: Ev; "
+        "  public static method Hook(target: Box) "
+        "    Signal += (e) => target.Add(e.N); "          // += desugars to Add
+        "  end Hook; "
+        "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
+        "end App; "
+        "class C public static method Main(): int "
+        "  var box := new Box(); "
+        "  App.Hook(box); App.Fire(7); App.Fire(3); "
+        "  return box.V; "                                // expect 10
+        "end Main; end C;"), 10);
+}
+
+// §24.1 / §24.2 / §24.5: a STATIC event WITH a payload record. The handler
+// reads payload fields; two raises accumulate. Proves payload threading works
+// for the static-backing path too.
+BEZEL_TEST(codegen_events_477, static_event_with_payload_b6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class App "
+        "  public static event Signal: Ev; "
+        "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
+        "end App; "
+        "class C public static method Main(): int "
+        "  var box := new Box(); "
+        "  var sub := App.Signal.Subscribe((e) => do box.Add(e.N); end); "
+        "  App.Fire(5); App.Fire(7); "
+        "  return box.V; "                                // expect 12
+        "end Main; end C;"), 12);
+}
+
+// §24.1: a static event's subscriber list is shared across all access points —
+// two separate Subscribe calls both fire on a single Raise (a static source is
+// program-wide, not per-access).
+BEZEL_TEST(codegen_events_477, static_event_multiple_subscribers_b6) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class App "
+        "  public static event Signal: Ev; "
+        "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
+        "end App; "
+        "class C public static method Main(): int "
+        "  var box := new Box(); "
+        "  var s1 := App.Signal.Subscribe((e) => do box.Add(e.N); end); "
+        "  var s2 := App.Signal.Subscribe((e) => do box.Add(e.N * 10); end); "
+        "  App.Fire(2); "
+        "  return box.V; "                                // expect 22 (2 + 20)
+        "end Main; end C;"), 22);
+}
+
+// =====================================================================
+// B7 — interface-typed event access
+// =====================================================================
+
+// §24.3 / §24.7: subscribing through an interface-typed LOCAL must reach the
+// SAME backing EventSource the implementing class raises on. Repro shape from
+// issue #477 B7: concrete-ref sub fires +V, interface-local sub fires +V*10;
+// a single Trigger(1) → total == 11.
+BEZEL_TEST(codegen_events_477, interface_local_event_subscribe_b7) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record EvType(V: int); "
+        "interface ISource "
+        "  event Ready: EvType; "
+        "end ISource; "
+        "class Source: ISource "
+        "  public event Ready: EvType; "
+        "  public method Trigger(v: int) Ready.Raise(new EvType(v)); end Trigger; "
+        "end Source; "
+        "class Acc "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Acc; "
+        "class C public static method Main(): int "
+        "  var acc := new Acc(); "
+        "  var src := new Source(); "
+        "  var sub1 := src.Ready.Subscribe((e) => do acc.Add(e.V); end); "
+        "  var i: ISource := src; "
+        "  var sub2 := i.Ready.Subscribe((e) => do acc.Add(e.V * 10); end); "
+        "  src.Trigger(1); "
+        "  return acc.V; "                                // expect 11
+        "end Main; end C;"), 11);
+}
+
+// §24.3 / §24.7: subscribing through an interface-typed PARAMETER must also
+// reach the real backing source. The helper receives `i: ISource` and
+// subscribes a handler (+V*10); the concrete sub adds +V. Trigger(1) → 11.
+BEZEL_TEST(codegen_events_477, interface_parameter_event_subscribe_b7) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record EvType(V: int); "
+        "interface ISource "
+        "  event Ready: EvType; "
+        "end ISource; "
+        "class Source: ISource "
+        "  public event Ready: EvType; "
+        "  public method Trigger(v: int) Ready.Raise(new EvType(v)); end Trigger; "
+        "end Source; "
+        "class Acc "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Acc; "
+        "class Helper "
+        "  public static method Wire(i: ISource, acc: Acc): Subscription "
+        "    return i.Ready.Subscribe((e) => do acc.Add(e.V * 10); end); "
+        "  end Wire; "
+        "end Helper; "
+        "class C public static method Main(): int "
+        "  var acc := new Acc(); "
+        "  var src := new Source(); "
+        "  var sub2 := Helper.Wire(src, acc); "
+        "  var sub1 := src.Ready.Subscribe((e) => do acc.Add(e.V); end); "
+        "  src.Trigger(1); "
+        "  return acc.V; "                                // expect 11
+        "end Main; end C;"), 11);
+}
+
+// §24.3 (regression): the concrete-typed receiver path keeps working — a
+// subscribe on the concrete `Source` reference fires on Raise.
+BEZEL_TEST(codegen_events_477, concrete_event_subscribe_regression_b7) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record EvType(V: int); "
+        "interface ISource "
+        "  event Ready: EvType; "
+        "end ISource; "
+        "class Source: ISource "
+        "  public event Ready: EvType; "
+        "  public method Trigger(v: int) Ready.Raise(new EvType(v)); end Trigger; "
+        "end Source; "
+        "class Acc "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Acc; "
+        "class C public static method Main(): int "
+        "  var acc := new Acc(); "
+        "  var src := new Source(); "
+        "  var sub1 := src.Ready.Subscribe((e) => do acc.Add(e.V); end); "
+        "  src.Trigger(5); "
+        "  return acc.V; "                                // expect 5
+        "end Main; end C;"), 5);
+}
+
+// §24.3 / §24.7 / §2.11: disposing an interface-local Subscription unsubscribes
+// from the real backing source — a later Trigger fires only the surviving
+// concrete sub.
+BEZEL_TEST(codegen_events_477, interface_local_dispose_unsubscribes_b7) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record EvType(V: int); "
+        "interface ISource "
+        "  event Ready: EvType; "
+        "end ISource; "
+        "class Source: ISource "
+        "  public event Ready: EvType; "
+        "  public method Trigger(v: int) Ready.Raise(new EvType(v)); end Trigger; "
+        "end Source; "
+        "class Acc "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Acc; "
+        "class C public static method Main(): int "
+        "  var acc := new Acc(); "
+        "  var src := new Source(); "
+        "  var i: ISource := src; "
+        "  var sub2 := i.Ready.Subscribe((e) => do acc.Add(e.V * 10); end); "
+        "  src.Trigger(1); "                              // acc.V = 10
+        "  sub2.Dispose(); "                              // unsubscribe via interface-local sub
+        "  src.Trigger(1); "                              // handler gone — no-op
+        "  return acc.V; "                                // expect 10
+        "end Main; end C;"), 10);
+}

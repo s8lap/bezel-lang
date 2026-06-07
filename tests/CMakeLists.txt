@@ -270,6 +270,7 @@ set(BEZEL_TEST_SOURCES
     codegen/linq_throw_469_test.cpp
     codegen/array_reverse_chain_466_test.cpp
     codegen/event_test.cpp
+    codegen/event_477_test.cpp
     codegen/cancellation_token_test.cpp
     codegen/datetime_timespan_test.cpp
     codegen/guid_test.cpp

@@ -545,6 +545,16 @@ private:
     std::unordered_map<const sema::Symbol*, llvm::GlobalVariable*>
         staticGlobals_;
 
+    // §24.1 (#477 B6): each STATIC event's compiler-generated backing
+    // EventSource<T> field — a static owned field, modeled as a `ptr` global
+    // initialized to null at module load and allocated (bz_event_source_new)
+    // at program start, alongside the static constructors run in Main's
+    // prologue (§22.7 / §22.13). Keyed by the event's EventSymbol. An instance
+    // event's backing source lives in the class struct (fieldIndex_); a static
+    // event's lives here instead.
+    std::unordered_map<const sema::Symbol*, llvm::GlobalVariable*>
+        staticEventGlobals_;
+
     // CG17: virtual dispatch. Each class's vtable is a constant array of
     // function pointers: [0]=td$C, [1]=itmap$C, [2]=Dispose, [3..]=virtual
     // methods (override reuses the base method's slot). The hidden vtable
@@ -602,11 +612,23 @@ private:
     // runtime helper bz_itable_lookup(itmap, td$I) → itab$C$I, then GEPs
     // to position k within the itable to find the function pointer.
     std::unordered_map<const sema::MethodSymbol*, unsigned> ifaceMethodIndex_;
+    // §24.7 (#477 B7): an interface EVENT also occupies an itab slot — its
+    // position is APPENDED after the interface's non-static methods (so method
+    // indices are unchanged). The slot holds a per-class accessor `ptr(this)`
+    // returning the implementing object's backing EventSource<T>; interface-
+    // typed event access dispatches through it like an interface method call.
+    // Synchronous events only (async deferred). Keyed by the interface's
+    // EventSymbol.
+    std::unordered_map<const sema::EventSymbol*, unsigned> ifaceEventIndex_;
     // Per (class × interface): the itab$C$I global (array of fn ptrs in
     // interface declaration order). Key: (cls, iface).
     std::map<std::pair<const sema::TypeSymbol*, const sema::TypeSymbol*>,
              llvm::GlobalVariable*>
         itables_;
+    // §24.7 (#477 B7): per-class event-accessor functions (emit-once cache),
+    // keyed by the class's own instance EventSymbol.
+    std::unordered_map<const sema::EventSymbol*, llvm::Function*>
+        eventAccessorFns_;
     // Per class: the itmap$C global ([td$I1, itab$C$I1, …, null]).
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         itmaps_;
@@ -1456,6 +1478,32 @@ private:
         }
         return nullptr;
     }
+
+    // §24.7 (#477 B7): the instance EventSymbol named `name` declared on `cls`
+    // (or an inherited base class) — the concrete backing-field owner an
+    // interface event resolves to on the implementing class. Sync events only.
+    const sema::EventSymbol* classEventByName(const sema::TypeSymbol* cls,
+                                              std::string_view name) {
+        for (const sema::TypeSymbol* t = cls; t;) {
+            for (sema::Symbol* m : t->members) {
+                auto* es = dynamic_cast<sema::EventSymbol*>(m);
+                if (!es || es->name != name) continue;
+                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+                if (ed && !ed->isStatic && !ed->isAsync &&
+                    fieldIndex_.count(es))
+                    return es;
+            }
+            t = baseClassOf(t);
+        }
+        return nullptr;
+    }
+
+    // §24.7 (#477 B7): emit (once, cached) a per-class accessor function
+    // `ptr bz$<Class>$<Event>$get(ptr this)` that returns the object's backing
+    // EventSource<T>. Placed in the class's itab so interface-typed event
+    // access reaches the real source. `es` is the class's own instance event.
+    llvm::Function* emitEventAccessor(const sema::TypeSymbol* cls,
+                                      const sema::EventSymbol* es);
 
     void declareVtables();
 

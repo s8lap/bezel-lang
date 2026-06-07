@@ -295,6 +295,29 @@ void Emitter::declareStatics() {
         staticGlobals_[fs] = gv;
     }
 
+    // §24.1 (#477 B6): a STATIC event's backing EventSource<T> is a static
+    // owned field — give it a `ptr` global, null until program start. It is
+    // allocated (bz_event_source_new) in Main's prologue alongside the static
+    // constructors (§22.7) and read by eventSourcePtr. Synchronous events only
+    // (async deferred, mirroring collectInstanceStorage). The global is
+    // INTERNAL: a static event's backing source is not part of the cross-module
+    // surface (external code reaches it only through the declaring class's
+    // static accessor methods, not the field), and program-start init is
+    // single-module here.
+    for (const auto& sym : ctx_.symbols()) {
+        auto* es = dynamic_cast<const sema::EventSymbol*>(sym.get());
+        if (!es) continue;
+        auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+        if (!ed || !ed->isStatic || ed->isAsync) continue;
+        std::string cls = es->parent ? std::string(es->parent->name) : "";
+        auto* gv = new llvm::GlobalVariable(
+            *module_, ptrTy(), /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantPointerNull::get(ptrTy()),
+            "bz$" + cls + "$" + std::string(es->name) + "$evt");
+        staticEventGlobals_[es] = gv;
+    }
+
     // §2.5 / §2.6 step 4 (issue #328 FINDING [3] BUG B): declare each IMPORTED
     // static field as an EXTERNAL global (declaration, no initializer) bound to
     // the dependency's exact mangled name (`bz$<Class>$<field>`, matching the
@@ -692,6 +715,44 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
 }
 
 
+// §24.7 (#477 B7): emit a per-class event accessor `ptr get(ptr this)` that
+// returns the object's backing EventSource<T> (the event's instance field).
+// Cached per EventSymbol. Self-contained: saves/restores the builder so it may
+// run during declareVtables (before method bodies are emitted).
+llvm::Function* Emitter::emitEventAccessor(const sema::TypeSymbol* cls,
+                                           const sema::EventSymbol* es) {
+    if (auto it = eventAccessorFns_.find(es); it != eventAccessorFns_.end())
+        return it->second;
+    auto idxIt = fieldIndex_.find(es);
+    if (idxIt == fieldIndex_.end()) return nullptr;  // no backing slot
+
+    auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    std::string name = "bz$" + std::string(cls->name) + "$" +
+                       std::string(es->name) + "$evtget";
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, name, module_.get());
+    eventAccessorFns_[es] = fn;
+
+    // Save/restore the per-function emitter state (mirrors other synthesized
+    // function bodies, e.g. emitInstanceInitFunction).
+    llvm::Function* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* thisArg = &*fn->args().begin();
+    llvm::StructType* st = classStruct(cls);
+    llvm::Value* slot = builder_.CreateStructGEP(st, thisArg, idxIt->second);
+    llvm::Value* src = builder_.CreateLoad(ptrTy(), slot, "evt.src");
+    builder_.CreateRet(src);
+
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    return fn;
+}
+
+
 void Emitter::declareVtables() {
     // Pass 0 (CG35-itable): assign each interface method its 0-based position
     // within that interface's non-static method declaration order. This index
@@ -707,6 +768,15 @@ void Emitter::declareVtables() {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
             if (ms && !isStaticMethod(ms))
                 ifaceMethodIndex_[ms] = idx++;
+        }
+        // §24.7 (#477 B7): interface events follow the methods in the itab,
+        // each holding a per-class EventSource accessor. Indices continue from
+        // the method count so method positions are unchanged. Sync events only.
+        for (sema::Symbol* m : ts->members) {
+            auto* es = dynamic_cast<sema::EventSymbol*>(m);
+            if (!es) continue;
+            auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+            if (ed && !ed->isAsync) ifaceEventIndex_[es] = idx++;
         }
     }
     // §13 / §2.5 / §2.6 (issue #426 / #328): populate ifaceMethodIndex_ for
@@ -867,7 +937,17 @@ void Emitter::declareVtables() {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
                 if (ms && !isStaticMethod(ms)) ifaceMethods.push_back(ms);
             }
-            if (ifaceMethods.empty()) continue;  // skip empty interfaces
+            // §24.7 (#477 B7): collect iface's sync events in declaration order
+            // (after the methods, matching ifaceEventIndex_'s numbering).
+            std::vector<sema::EventSymbol*> ifaceEvents;
+            for (sema::Symbol* m : iface->members) {
+                auto* es = dynamic_cast<sema::EventSymbol*>(m);
+                if (!es) continue;
+                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+                if (ed && !ed->isAsync) ifaceEvents.push_back(es);
+            }
+            // Skip a wholly empty interface (no methods, no events).
+            if (ifaceMethods.empty() && ifaceEvents.empty()) continue;
 
             // Build itab$C$I: array of function pointers (C's impl of each
             // method of I, in I's declaration order). Missing impls → null.
@@ -879,6 +959,18 @@ void Emitter::declareVtables() {
                     if (mit != methodFns_.end())
                         fp = llvm::cast<llvm::Constant>(mit->second);
                 }
+                itabElems.push_back(fp);
+            }
+            // §24.7 (#477 B7): append a per-class accessor for each interface
+            // event. The accessor returns the implementing object's backing
+            // EventSource<T> (the class's own event field). Interface-typed
+            // event access dispatches here to reach the real source.
+            for (sema::EventSymbol* ie : ifaceEvents) {
+                llvm::Constant* fp = llvm::ConstantPointerNull::get(ptrTy());
+                if (const sema::EventSymbol* impl =
+                        classEventByName(ts, ie->name))
+                    if (llvm::Function* acc = emitEventAccessor(ts, impl))
+                        fp = llvm::cast<llvm::Constant>(acc);
                 itabElems.push_back(fp);
             }
             auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
@@ -1956,6 +2048,22 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // its start runs them before any user code (§22.7).
     if (isMain(ms)) {
         for (auto& [cs, sfn] : staticCtors_) builder_.CreateCall(sfn, {});
+        // §24.1 / §22.13 (#477 B6): allocate each static event's backing
+        // EventSource<T> at program start (the single static root), so a
+        // subscribe/raise on a static event reaches a real shared source.
+        // Mirrors the per-instance allocation done during construction
+        // (emitInstanceInit), but at the program-wide static-init point.
+        // bz_static_event_source_new also registers the source for program-exit
+        // disposal (§22.13) via atexit — a static owned field is disposed at
+        // program exit, not by any instance disposer.
+        if (!staticEventGlobals_.empty()) {
+            auto* newFn =
+                declareC("bz_static_event_source_new", ptrTy(), {});
+            for (auto& [es, gv] : staticEventGlobals_) {
+                llvm::Value* esrc = builder_.CreateCall(newFn, {});
+                builder_.CreateStore(esrc, gv);
+            }
+        }
     }
 
     // CG30: for enum instance methods, record the enum type so that
