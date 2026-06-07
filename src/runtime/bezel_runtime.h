@@ -448,6 +448,13 @@ void* bz_task_from_result(const void* result, int64_t result_size);
 // is responsible for its lifetime.
 void* bz_task_when_all(void* task_arr);
 
+// stdlib §6.7 / §30.10: Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
+// Variant of bz_task_when_all that collects each Task<T>'s result into a new
+// bz_array_t. `elem_size` is sizeof(T) in bytes. The aggregate task completes
+// with a ptr-sized result (the Array<T>* pointer). Fault propagation matches
+// bz_task_when_all. Caller owns the returned task.
+void* bz_task_when_all_results(void* task_arr, int64_t elem_size);
+
 // stdlib §6.7 / §30.10: Task.WhenAny(tasks: Array<Task>): Task<Task>.
 // Takes a bz_array_t* of task pointers, returns a NEW task that completes
 // (with a ptr-sized result — the pointer to the FIRST task that finishes)
@@ -777,6 +784,14 @@ int32_t bz_ctoken_is_cancelled(void* token);
 // The codegen emits:
 //   if (bz_ctoken_throw_if_cancelled(token)) goto unwind;
 int32_t bz_ctoken_throw_if_cancelled(void* token);
+
+// stdlib §6.7 (line 2868) / spec §30.8: Task.Delay with cancellation.
+// Token-aware Task.Delay: checks the token before and after the sleep.
+// If cancelled (before or after sleep), completes the task as faulted with
+// an OperationCanceledException constructed from oce_vtable. Otherwise,
+// completes normally. oce_vtable is the vtable pointer for
+// OperationCanceledException, supplied by codegen.
+void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtable);
 
 // ---------------------------------------------------------------------------
 // per §33.3 / §22.13 (line 3845): abnormal-termination handler for an exception
