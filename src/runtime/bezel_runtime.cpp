@@ -348,6 +348,25 @@ bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
     return true;
 }
 
+// issue M1 / stdlib §4.9: OwnedDictionary<string,V>.Remove(key) must dispose
+// the removed owned value (exactly-once disposal), then unlink the entry.
+// Mirrors bz_dict_clear's per-entry dispose pattern. The non-owning
+// Dictionary.Remove still calls bz_dict_remove_str (no disposer).
+bool bz_dict_remove_str_disposing(void* dp, const char* k, int64_t k_len,
+                                  void (*dispose_val)(void*)) {
+    auto* d = (bz_dict_t*)dp;
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx < 0) return false;
+    if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    return true;
+}
+
 bool bz_dict_contains_str(void* dp, const char* k, int64_t k_len) {
     return bz_dict_try_get_str(dp, k, k_len, nullptr);
 }
@@ -472,6 +491,26 @@ bool bz_dict_remove_gen(void* dp, const void* key) {
     if (idx < 0) return false;
     free(d->buckets[idx].key);
     d->buckets[idx].key = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    return true;
+}
+
+// issue M1 / stdlib §4.9: OwnedDictionary<K,V>.Remove(key) for generic keys —
+// dispose the removed owned value (exactly-once), then unlink. Mirrors the
+// string-key bz_dict_remove_str_disposing; the non-owning Dict uses
+// bz_dict_remove_gen (no disposer).
+bool bz_dict_remove_gen_disposing(void* dp, const void* key,
+                                  void (*dispose_val)(void*)) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
     d->buckets[idx].deleted = true;
     d->count--;
     return true;

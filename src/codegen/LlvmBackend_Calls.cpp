@@ -1972,15 +1972,38 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, kd, kl, vPtr});
             return llvm::ConstantInt::get(i32(), 0);
         }
-        // .Remove(k): bool
+        // .Remove(k): bool — per §4.9: OwnedDictionary.Remove disposes the
+        // removed value (exactly once) before unlinking; a non-owning
+        // Dictionary.Remove unlinks without disposal (§4.8, borrows).
         if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
+            // For an OwnedDictionary<K, class> get the value disposer thunk
+            // (same helper Clear uses, so the dispose logic is exactly-once
+            // and consistent). For borrowing Dict or non-class values, disp
+            // is null and we fall back to the plain non-disposing remove.
+            llvm::Function* valDisp = owningDictValueDisposer(recvTy);
             if (keyTy) {
+                if (valDisp) {
+                    // OwnedDictionary with generic key: dispose then unlink.
+                    auto* fn = declareC("bz_dict_remove_gen_disposing", i1(),
+                                        {ptrTy(), ptrTy(), ptrTy()});
+                    return builder_.CreateCall(
+                        fn, {recv, genKeyPtr(k), llvm::cast<llvm::Value>(valDisp)},
+                        "dict.remove");
+                }
                 auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.remove");
             }
             auto [kd, kl] = strDataLen(k);
+            if (valDisp) {
+                // OwnedDictionary with string key: dispose then unlink.
+                auto* fn = declareC("bz_dict_remove_str_disposing", i1(),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                return builder_.CreateCall(
+                    fn, {recv, kd, kl, llvm::cast<llvm::Value>(valDisp)},
+                    "dict.remove");
+            }
             auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
         }
@@ -7369,6 +7392,45 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(endBB);
         return llvm::ConstantInt::get(i32(), 0);
+    }
+    // --- Remove(item): bool — per §4.6/§4.3 IOwnedCollection ---
+    // Find the first node whose element matches `item` (by memcmp / pointer
+    // identity for class elements, per §8.3), unlink it, dispose the owned
+    // element (OwnedLinkedList only), and return true. Returns false if no
+    // matching node is found and disposes nothing in that case.
+    // Pattern: Find → if found, RemoveNode (with disposer) → return bool.
+    // A NON-owning LinkedList.Remove unlinks without disposing (§4.6, borrows).
+    if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        llvm::AllocaInst* slot = entryAlloca(v->getType());
+        builder_.CreateStore(v, slot);
+        // Find the first matching node (nullptr if absent).
+        auto* findFn = declareC("bz_llist_find", ptrTy(),
+                                {ptrTy(), ptrTy(), i64()});
+        llvm::Value* node = builder_.CreateCall(findFn,
+            {recv, slot, builder_.getInt64(esz)}, "ll.find");
+        // found = (node != null)
+        llvm::Value* found = builder_.CreateICmpNE(
+            node, llvm::ConstantPointerNull::get(ptrTy()), "ll.found");
+        // If found, call RemoveNode (which unlinks + optionally disposes).
+        llvm::Function* elemDisp =
+            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        llvm::Value* disp = elemDisp
+            ? llvm::cast<llvm::Value>(elemDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* remBB  = llvm::BasicBlock::Create(llvm_, "ll.rem.do", currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "ll.rem.cont", currentFn_);
+        builder_.CreateCondBr(found, remBB, contBB);
+        builder_.SetInsertPoint(remBB);
+        auto* remFn = declareC("bz_llist_remove_node",
+                               llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(remFn, {recv, node, disp});
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+        // Return i1 bool — the branch condition MUST be i1 (M3 fix).
+        return found;
     }
     // --- Contains(item): bool — find by value equality, return true if found ---
     if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
