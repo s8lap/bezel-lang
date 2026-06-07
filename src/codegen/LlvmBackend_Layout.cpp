@@ -1668,6 +1668,21 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
     }
     llvm::Value* obj = lowerExpr(*ma.target);
     if (!obj) return nullptr;
+    // issue #486 / §14.2: guard against emitting a StructGEP from a
+    // non-pointer receiver.  This arises when the unspecialized body of a
+    // generic method (e.g. `GetName<T>(x: T) where T: IHasName`) is lowered
+    // with T's LLVM fallback type `i32`.  In that body `x` lowers to i32;
+    // a StructGEP on i32 is malformed IR ("GEP base pointer is not a vector").
+    // lowerVirtualPropertyGet already returned nullptr for the same receiver
+    // (its !isPointerTy guard at line 1657), so we reach here only for
+    // interface/abstract auto-properties that also live in fieldIndex_
+    // (bodyKind==Auto for both interface and abstract class declarations).
+    // Return nullptr here so the unspecialized stub emits `ret i32 0` — the
+    // same safe no-op as emitMethodCall's #484 guard.  The specialized
+    // monomorphized body (T = Person, T = Square, …) has a real ptr receiver
+    // and is dispatched correctly by lowerVirtualPropertyGet before reaching
+    // this path.
+    if (!obj->getType()->isPointerTy()) return nullptr;
     elemTy = st->getElementType(idxIt->second);
     return builder_.CreateStructGEP(st, obj, idxIt->second);
 }

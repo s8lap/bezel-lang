@@ -308,6 +308,7 @@ set(BEZEL_TEST_SOURCES
     codegen/bug_483_nested_type_test.cpp
     codegen/generic_constraint_dispatch_484_test.cpp
     codegen/nested_enum_cast_482_test.cpp
+    codegen/generic_constraint_property_dispatch_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
