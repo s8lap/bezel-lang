@@ -2017,6 +2017,32 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 std::string_view lastName = dp->typeName->parts.empty()
                     ? std::string_view{}
                     : dp->typeName->parts.back();
+                // §19.3: "Destructuring applies to records only — classes do
+                // not have a positional-destructuring surface … use a
+                // type-test pattern (`Dog`, `var d: Dog`) instead."
+                // Emit a compile error when the named type is a class.
+                if (ctx_.module()) {
+                    for (Symbol* child : ctx_.module()->children) {
+                        if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                            if (ts->name == lastName &&
+                                ts->kind == ast::TypeDeclKind::Class) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, dp->span.begin,
+                                    "positional destructuring pattern `" +
+                                    std::string(lastName) +
+                                    "(...)` is not valid on a class type — "
+                                    "classes do not have a positional-"
+                                    "destructuring surface (§19.3); use a "
+                                    "type-test pattern (`" +
+                                    std::string(lastName) +
+                                    "` or `var x: " +
+                                    std::string(lastName) +
+                                    "`) instead");
+                                break;
+                            }
+                        }
+                    }
+                }
                 if (ctx_.module()) {
                     for (Symbol* child : ctx_.module()->children) {
                         if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {

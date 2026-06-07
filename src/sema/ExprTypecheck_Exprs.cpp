@@ -1254,6 +1254,33 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 std::string_view lastName = dp->typeName->parts.empty()
                     ? std::string_view{}
                     : dp->typeName->parts.back();
+                // §19.3: "Destructuring applies to records only — classes do
+                // not have a positional-destructuring surface … To match a
+                // class hierarchy, use a type-test pattern (`Dog`, `var d:
+                // Dog`) and access fields through the bound name."
+                // Detect whether the named type is a class and, if so, emit
+                // a compile error. We check BEFORE the record search so that
+                // a class whose name happens to shadow a record is caught.
+                for (const auto& sym : ctx_.symbols()) {
+                    if (auto* ts = dynamic_cast<TypeSymbol*>(sym.get())) {
+                        if (ts->name == lastName &&
+                            ts->kind == ast::TypeDeclKind::Class) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, dp->span.begin,
+                                "positional destructuring pattern `" +
+                                std::string(lastName) +
+                                "(...)` is not valid on a class type — "
+                                "classes do not have a positional-"
+                                "destructuring surface (§19.3); use a "
+                                "type-test pattern (`" +
+                                std::string(lastName) +
+                                "` or `var x: " +
+                                std::string(lastName) +
+                                "`) instead");
+                            break;
+                        }
+                    }
+                }
                 // Search ctx_.symbols() for the record TypeSymbol by name.
                 // This is more robust than searching only module children
                 // since symbols may be nested or added during synthesis.
