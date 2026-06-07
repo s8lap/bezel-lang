@@ -133,6 +133,18 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
     // takes a regular expression on the right.
     auto left = parseUnaryExpression();
     for (;;) {
+        // §17.3 / #468: `!=` is NOT a Bezel operator (Appendix A). The lexer
+        // emits it as a single two-character Punctuator so we can catch it here
+        // and emit a helpful diagnostic rather than letting it drift through as
+        // a miscompiled PostfixBang followed by the `=` equality operator.
+        if (current_.kind == TokenKind::Punctuator && current_.text == "!=") {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "'!=' is not a Bezel operator; "
+                                "use '<>' for inequality (§17.3)");
+            advance();  // consume `!=` so recovery can continue
+            (void)parseUnaryExpression();  // consume the RHS to reduce cascades
+            break;
+        }
         const int prec = binaryPrecedence(current_);
         if (prec < minPrecedence) break;
         const Token opTok = current_;
