@@ -574,6 +574,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             }
         }
     }
+    // §17.9: nameof(QualifiedName) → string. The result is the rightmost
+    // identifier of the operand, as a compile-time string constant. No
+    // runtime resolution is performed; sema just types the expression as
+    // string (codegen emits the name text as a string literal global).
+    if (auto* no = dynamic_cast<const ast::NameOfExpr*>(&e)) {
+        (void)no; // name is resolved at codegen from the AST node
+        ctx_.setExprType(&e, ctx_.primitiveTypeRef(PrimitiveType::String));
+    }
     if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
         if (de->type) {
             if (auto* rt = ctx_.resolvedType(*de->type)) {
