@@ -4853,8 +4853,27 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
             dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
         if (ne->type) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
-                if (rt->kind == sema::TypeRef::Kind::Named)
-                    return rt->declaration;
+                if (rt->kind == sema::TypeRef::Kind::Named) {
+                    // Concrete class: return its declaration directly.
+                    if (rt->declaration) return rt->declaration;
+                    // §28.3 / §14.2: `new T()` where T is a generic type
+                    // parameter — declaration is null. Resolve T through the
+                    // active instantiation's genericSubstSemaTy_ to the
+                    // concrete class so that registerUsingDisposal can push a
+                    // disposal entry. Without this the using-var local is never
+                    // disposed (destructor never runs, block leaks). This
+                    // mirrors how ownedTypeParamConcreteType resolves type-param
+                    // fields for per-instantiation specialized disposers.
+                    if (!genericSubstSemaTy_.empty() && rt->astNode &&
+                        rt->astNode->name &&
+                        rt->astNode->name->parts.size() == 1) {
+                        auto it = genericSubstSemaTy_.find(
+                            rt->astNode->name->parts[0]);
+                        if (it != genericSubstSemaTy_.end() && it->second &&
+                            it->second->kind == sema::TypeRef::Kind::Named)
+                            return it->second->declaration;
+                    }
+                }
             }
         }
     }
