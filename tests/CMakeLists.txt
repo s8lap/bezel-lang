@@ -313,6 +313,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_constraint_property_dispatch_test.cpp
     codegen/array_record_element_test.cpp
     codegen/owned_collection_remove_test.cpp
+    codegen/indexer_compound_assign_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

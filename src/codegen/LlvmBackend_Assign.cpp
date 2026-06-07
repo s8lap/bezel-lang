@@ -590,6 +590,163 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
 }
 
 
+// §20 / §23.4: compound assignment `a[i] OP= v` through a user-defined indexer
+// property (a `property [i: T]: U` with get/set accessors). Per §23.4, this
+// desugars to `a[i] := a[i] OP v`: read via the getter, compute the new value,
+// then write via the setter. The receiver and each index expression are evaluated
+// ONCE and reused for both calls, avoiding double side-effects.
+//
+// This mirrors lowerPropertyCompound (§22.9 non-indexer properties) but for the
+// indexer case: lowerPropertyCompound short-circuits early on `ps->isIndexer`,
+// and the generic lvalueAddr fallback returns null for user-indexer targets (it
+// only handles the built-in inline-array case via llvm::ArrayType). Without this
+// function the compound assign was silently a no-op (returns old value, no store).
+bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
+    if (!as.target || !as.value) return false;
+    auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
+    if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
+        return false;
+    // Check that this is a user-defined indexer (class/record with a property
+    // [i]: T declaration). Built-in arrays fall through to lvalueAddr instead.
+    auto* targetTy = ctx_.exprType(*ix->target);
+    if (!targetTy || targetTy->kind != sema::TypeRef::Kind::Named ||
+        !targetTy->declaration)
+        return false;
+    auto* ps = findIndexer(targetTy->declaration);
+    if (!ps) return false;
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd) return false;
+
+    // --- Locate getter body. ---
+    const ast::Expr* getterExpr = nullptr;
+    const ast::PropertyAccessor* getterBlock = nullptr;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression && pd->exprBody)
+        getterExpr = pd->exprBody.get();
+    for (const auto& a : pd->accessors) {
+        if (!a.isSet) {
+            if (a.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                getterBlock = &a;
+            else if (a.exprBody)
+                getterExpr = a.exprBody.get();
+            break;
+        }
+    }
+    if (!getterExpr && !getterBlock) return false;
+
+    // --- Locate setter body. ---
+    const ast::Expr* setterExpr = nullptr;
+    const std::vector<std::unique_ptr<ast::Stmt>>* setterStmts = nullptr;
+    for (const auto& a : pd->accessors) {
+        if (a.isSet) {
+            if (a.exprBody) setterExpr = a.exprBody.get();
+            else if (!a.stmts.empty()) setterStmts = &a.stmts;
+            break;
+        }
+    }
+    if (!setterExpr && !setterStmts) return false;
+
+    // --- Evaluate receiver and all index params ONCE. ---
+    // Both the getter and setter share the resulting slots so neither expression
+    // is re-evaluated. This avoids observable double side-effects on the receiver
+    // and/or index sub-expressions (per §23.4's single-evaluation contract).
+    llvm::Value* obj = lowerExpr(*ix->target);
+    if (!obj) return false;
+
+    // Spill each index param into a slot; the getter and setter bodies will
+    // read back from paramSlots_ which we rebuild identically for each call.
+    std::vector<llvm::AllocaInst*> idxSlots;
+    idxSlots.reserve(ps->indexerParams.size());
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         k < ix->indices.size(); ++k) {
+        if (!ix->indices[k].value) { idxSlots.push_back(nullptr); continue; }
+        llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+        if (!argVal) { idxSlots.push_back(nullptr); continue; }
+        llvm::AllocaInst* slot = entryAlloca(argVal->getType());
+        builder_.CreateStore(argVal, slot);
+        idxSlots.push_back(slot);
+    }
+
+    // --- Call getter (inline expr-body or standalone block-body function). ---
+    llvm::Value* cur = nullptr;
+    if (getterBlock) {
+        // Block-form getter: call the standalone function, sharing the already-
+        // lowered obj (as a pointer) and pre-computed index values.
+        llvm::Value* objPtr = obj;
+        if (!objPtr->getType()->isPointerTy()) {
+            llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+            builder_.CreateStore(obj, tmp);
+            objPtr = tmp;
+        }
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(objPtr);
+        for (llvm::AllocaInst* slot : idxSlots) {
+            if (!slot) return false;
+            llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
+            callArgs.push_back(v);
+        }
+        llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
+        cur = builder_.CreateCall(fn->getFunctionType(), fn, callArgs);
+        emitPendingCheck();
+    } else {
+        // Expression-body getter: inline against obj and pre-computed params.
+        llvm::Value* savedThis = currentThis_;
+        auto savedLocals = locals_;
+        auto savedParams = paramSlots_;
+        auto savedSubst = setupReceiverGenericSubst(ix->target.get(), ps->parent);
+        currentThis_ = obj;
+        locals_.clear();
+        paramSlots_.clear();
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < idxSlots.size(); ++k) {
+            if (!idxSlots[k]) continue;
+            paramSlots_[ps->indexerParams[k]] = idxSlots[k];
+        }
+        cur = lowerExpr(*getterExpr);
+        currentThis_ = savedThis;
+        locals_ = std::move(savedLocals);
+        paramSlots_ = std::move(savedParams);
+        genericSubst_ = std::move(savedSubst);
+    }
+    if (!cur) return false;
+
+    // --- Apply the compound operator. ---
+    llvm::Value* rhs = lowerExpr(*as.value);
+    if (!rhs) return false;
+    std::string op(as.op);
+    if (!op.empty() && op.back() == '=') op.pop_back();
+    llvm::Value* newVal = emitCompoundOp(
+        op, cur, rhs, cur->getType()->isFloatingPointTy(),
+        isUnsignedTargetExpr(*as.target));
+    if (!newVal) return false;
+
+    // --- Call setter with the new value and the pre-computed receiver/params. ---
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    currentThis_ = obj;
+    locals_.clear();
+    paramSlots_.clear();
+    // Bind each index param from its pre-computed slot.
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         k < idxSlots.size(); ++k) {
+        if (!idxSlots[k]) continue;
+        paramSlots_[ps->indexerParams[k]] = idxSlots[k];
+    }
+    // Bind `value` (anchored on the PropertyDecl, per §22.10 / lowerIndexerSet).
+    {
+        llvm::AllocaInst* vslot = entryAlloca(newVal->getType());
+        builder_.CreateStore(newVal, vslot);
+        locals_[pd] = vslot;
+    }
+    if (setterExpr) lowerExpr(*setterExpr);
+    else if (setterStmts) lowerScopedBlock(*setterStmts);
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParams);
+    return true;
+}
+
+
 const ast::Expr* Emitter::computedGetterOf(sema::Symbol* sym) {
     auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
     if (!ps || ps->isIndexer) return nullptr;

@@ -1213,6 +1213,13 @@ private:
     // Returns true if the setter was handled.
     bool lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val);
 
+    // §20 / §23.4: compound assignment `a[i] OP= v` through a user-defined
+    // indexer — evaluates the receiver and each index param ONCE, calls the
+    // getter to read the current value, applies OP, then calls the setter to
+    // write the result back. Returns true if handled (user-defined indexer
+    // target); false to let the caller fall through to other paths.
+    bool lowerIndexerCompound(const ast::AssignmentStmt& as);
+
     // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer read
     // `a[i]` / `dict[key]` against the runtime backing (bz_array_* / bz_dict_*).
     // Returns the loaded element/value, or null if `ix`'s target is not a
