@@ -481,6 +481,76 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             if (ma->target) {
                 auto* recvTy = ctx_.exprType(*ma->target);
+                // #466 / §26.5 / §3: reject chaining a member call/access onto the
+                // VOID result of an in-place collection method. Per §26.5
+                // ("instance members win"), `a.Reverse()` on a concrete Array<T>
+                // resolves to the in-place void `Array<T>.Reverse()` (§3), which
+                // SHADOWS the LINQ extension `Reverse(): IEnumerable<T>` (§5) —
+                // so `a.Reverse().ToArray()` calls `.ToArray()` on `unit`, which
+                // is not a member-bearing value. Without this gate codegen lowers
+                // the chained call to no value, leaving the `using var` slot
+                // uninitialized and then disposing it → free()-invalid-pointer
+                // heap corruption (#466). The same applies to Sort/Add/Push/etc.
+                // The fix is the spec-faithful one: a clear compile error, not a
+                // silently-different lazy Reverse (which would violate §26.5).
+                if (auto* tgtCall =
+                        dynamic_cast<const ast::CallExpr*>(ma->target.get())) {
+                    if (!ctx_.exprType(*tgtCall)) {  // inner call typed unit/void
+                        if (auto* innerMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                                tgtCall->callee.get())) {
+                            if (innerMa->target) {
+                                auto* innerRecvTy = ctx_.exprType(*innerMa->target);
+                                // Inner receiver must be a concrete Array-family
+                                // collection (a lazy/IEnumerable receiver would
+                                // bind the §5 Reverse and is fine).
+                                bool innerIsColl =
+                                    innerRecvTy &&
+                                    innerRecvTy->kind == TypeRef::Kind::Named &&
+                                    !innerRecvTy->declaration && innerRecvTy->astNode &&
+                                    innerRecvTy->astNode->name &&
+                                    !innerRecvTy->astNode->name->parts.empty() &&
+                                    [&] {
+                                        const auto& cn =
+                                            innerRecvTy->astNode->name->parts[0];
+                                        return cn == "Array" || cn == "OwnedArray" ||
+                                               cn == "Stack" || cn == "OwnedStack" ||
+                                               cn == "Queue" || cn == "OwnedQueue";
+                                    }();
+                                const auto& im = innerMa->member;
+                                // In-place void collection mutators (§3). These
+                                // return unit; chaining on their result is illegal.
+                                bool isVoidInPlace =
+                                    im == "Reverse" || im == "Sort" || im == "Add" ||
+                                    im == "Push" || im == "Enqueue" || im == "Set" ||
+                                    im == "Insert" || im == "RemoveAt" || im == "Clear";
+                                if (innerIsColl && isVoidInPlace) {
+                                    std::string msg =
+                                        std::string("`.") + std::string(im) +
+                                        "()` on this collection returns nothing "
+                                        "(it modifies the collection in place, §3), "
+                                        "so `." + std::string(ma->member) +
+                                        "` cannot be chained onto it.";
+                                    // `Reverse` is the one method here with BOTH an
+                                    // in-place form (§3) and a LINQ extension (§5);
+                                    // per §26.5 the instance form shadows the
+                                    // extension. Give the lazy-pipeline workaround
+                                    // only for Reverse — the others (Add/Sort/Clear/
+                                    // …) have no lazy counterpart.
+                                    if (im == "Reverse")
+                                        msg += " Per §26.5 the in-place instance "
+                                               "method shadows the LINQ `Reverse` "
+                                               "extension (§5); to build a reversed "
+                                               "copy, drive the LINQ `Reverse()` from "
+                                               "a lazy IEnumerable<T> receiver (e.g. "
+                                               "`a.Where(...).Reverse().ToArray()`).";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ma->span.begin, msg);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 auto colName = [&]() -> std::string_view {
                     if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                         !recvTy->declaration && recvTy->astNode &&
