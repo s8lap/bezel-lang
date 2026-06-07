@@ -1470,19 +1470,37 @@ static void task_notify(bz_task_t* task) {
     // e.g. `await Task.Delay(...)` — via bz_task_free). Once a continuation is
     // submitted to the pool, another worker can run it and free `task` at any
     // moment, so task_notify must not touch `task` (its mutex / cv) AFTER the
-    // submit. We therefore: (1) snapshot the continuation list under the lock,
-    // (2) notify the cv while `task` is still guaranteed live (no continuation has
-    // been handed off yet), then (3) submit the continuations and return without
-    // touching `task` again. `done` was already set by the caller before
-    // task_notify, so a sync-awaiter that wakes re-checks the predicate and
-    // proceeds; the awaiter never frees the task it awaits (the awaiting side owns
-    // that), so the cv stays valid for the duration of the notify.
+    // submit. We therefore: (1) snapshot the continuation list and (2) notify the
+    // cv INSIDE the lock, then (3) submit the continuations (and never touch
+    // `task` or its fields again) after releasing the lock.
+    //
+    // notify_all() must be called while holding task->mtx (#445 / §30.5 race fix):
+    // a sync-awaiter (bz_task_await_sync) may call bz_task_free immediately on
+    // waking, which destroys the condition_variable. POSIX pthread_cond_broadcast
+    // is not instantaneous — if the awaiter destroys the cond_t before broadcast
+    // finishes its internal bookkeeping, the result is undefined behaviour (TSan
+    // reports a data race on the cond_t internals). Holding the mutex during
+    // notify_all ensures the awaiter cannot re-acquire the mutex and proceed to
+    // free the task until AFTER notify_all returns, by which point this thread is
+    // done with the cv. The awaiter's cv.wait() releases the mutex atomically
+    // while it sleeps and re-acquires it upon waking before returning, so
+    // notify_all-under-lock does not deadlock. Submitting continuations is still
+    // done AFTER releasing the lock (scheduler->submit acquires the scheduler
+    // mutex; the lock ordering task->mtx then scheduler->mtx is consistent with
+    // the worker path which holds scheduler->mtx only while dequeuing and then
+    // releases it before running the work item, so no cycle).
     std::vector<bz_task_t::Cont> conts;
     {
         std::lock_guard<std::mutex> lk(task->mtx);
         conts = task->continuations;
+        task->cv.notify_all();
     }
-    task->cv.notify_all();
+    // task may be freed by a woken sync-awaiter from this point on; do not
+    // touch task->mtx or task->cv again. The pointer `task` itself is still
+    // alive long enough to read conts (which we already snapshotted above) and
+    // to pass to the scheduler lambda (the lambda captures the pointer value,
+    // not a field of task; the continuation fn is responsible for task's
+    // lifetime on the continuation path).
     for (auto& c : conts)
         if (g_scheduler) g_scheduler->submit([c, task](){ c.fn(task, c.state); });
         else c.fn(task, c.state);
