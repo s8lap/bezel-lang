@@ -1569,6 +1569,25 @@ void Emitter::emitUnwindDisposals() {
 }
 
 
+void Emitter::emitUnwindDisposalsInRange(std::size_t lo, std::size_t hi) {
+    // #467 / §28.3 (lines 4914, 4922): dispose the scopes in disposeStack_
+    // indices [lo, hi), innermost (higher index) first — the reverse-declaration,
+    // inner-before-outer order the §28.3 exception-path discharge requires. Used
+    // when a `try`-with-`finally` re-propagates an exception to its enclosing
+    // handler after running its own finally: the throw site only disposed scopes
+    // down to the inner try's depth (unwindScopeDepth_), so any scope that lies
+    // BETWEEN the inner try and the enclosing handler (e.g. an outer `using var`
+    // declared in the same block as, but textually before, the inner try) is
+    // still live and must be disposed here — AFTER the explicit finally body, as
+    // the scope unwinds further outward (§28.3: "the explicit finally runs first
+    // ... then the implicit auto-dispose runs as the scope unwinds further").
+    // All entries are disposed on the isUnwind path; caughtException entries are
+    // skipped — they stay in flight for the enclosing handler.
+    for (std::size_t i = hi; i-- > lo;)
+        emitDisposals(disposeStack_[i], /*isUnwind=*/true);
+}
+
+
 void Emitter::emitPendingCheck() {
     llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
     llvm::Value* pending = builder_.CreateICmpNE(
