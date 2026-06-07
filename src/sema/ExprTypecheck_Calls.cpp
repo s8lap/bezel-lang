@@ -636,12 +636,52 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (valElem) tr->genericArgs.push_back(valElem);
                     return tr;
                 };
+                // per §5 + §14: build a concrete Array<T> or Set<T> TypeRef
+                // for ToArray/ToSet materializers so that un-annotated inferred
+                // locals (`var b := seq.ToArray()`) carry the right concrete
+                // type for downstream member access (`.Get(i)`, `.Length`, for-
+                // in, etc.). Uses the same static-synthetic-astNode pattern as
+                // makeDictResult. Without this, sema was returning the lazy
+                // sentinel (no astNode), so colName was empty and downstream
+                // calls on the inferred local silently fell through → wrong
+                // element layout (int→0) or ICmp crash (record field).
+                // The static ast nodes are program-lifetime (intentionally
+                // leaked), consistent with all other synthetic nodes here.
+                auto makeConcreteCollectionResult =
+                    [&](std::string_view collName,
+                        TypeRef* elemTy) -> TypeRef* {
+                    // One static astNode per collection name; indexed below.
+                    // kArray / kSet cover the two materializers we expose.
+                    static const ast::Type* kArrayAstNode = []() -> ast::Type* {
+                        auto* qn = new ast::QualifiedName;
+                        qn->parts.push_back("Array");
+                        auto* t = new ast::Type;
+                        t->kind = ast::TypeKind::Named;
+                        t->name.reset(qn);
+                        return t;
+                    }();
+                    static const ast::Type* kSetAstNode = []() -> ast::Type* {
+                        auto* qn = new ast::QualifiedName;
+                        qn->parts.push_back("Set");
+                        auto* t = new ast::Type;
+                        t->kind = ast::TypeKind::Named;
+                        t->name.reset(qn);
+                        return t;
+                    }();
+                    const ast::Type* node =
+                        (collName == "Set") ? kSetAstNode : kArrayAstNode;
+                    auto* tr = ctx_.makeTypeRef();
+                    tr->kind = TypeRef::Kind::Named;
+                    tr->declaration = nullptr;
+                    tr->astNode = node;
+                    if (elemTy) tr->genericArgs.push_back(elemTy);
+                    return tr;
+                };
                 // stdlib §5: type a deferred LINQ operator `m` whose source
                 // element type is `srcElem`. ToArray materializes to Array<T>
-                // (modeled here as the lazy element type carried on the call;
-                // codegen builds the concrete owned Array<T>). Returns true if
-                // `m` was a LINQ operator (typed) — caller falls through
-                // otherwise.
+                // (typed as a concrete Array<T> so inferred locals resolve
+                // downstream member access). Returns true if `m` was a LINQ
+                // operator (typed) — caller falls through otherwise.
                 auto typeLinqOperator = [&](TypeRef* srcElem) -> bool {
                     if (m == "Where" || m == "Skip" || m == "Take" ||
                         m == "Distinct") {
@@ -755,12 +795,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     }
                     else if (m == "ToArray" || m == "ToSet")
-                        // Materializers (stdlib §5). Typed as the lazy sentinel
-                        // carrying the element type; codegen builds the concrete
-                        // owned Array<T>/Set<T>. The result is bound to an
-                        // explicitly-typed local in practice, which supplies the
-                        // collection type for downstream member access.
-                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                        // Materializers (stdlib §5 + §14 inference fix).
+                        // Return a concrete Array<T>/Set<T> TypeRef so that
+                        // an un-annotated inferred local (`var b :=
+                        // seq.ToArray()`) carries the right type for downstream
+                        // `.Get(i)`, `.Length`, for-in, etc. Previously this
+                        // returned the lazy sentinel (no astNode), causing:
+                        //   • int element → wrong slot layout → wrong value
+                        //   • record element → ICmp type mismatch → SIGABRT
+                        // Codegen already knows to materialise via
+                        // bz_lazy_to_array (via tryLowerLazyLinqCall); the
+                        // concrete TypeRef here is only for sema inference.
+                        ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                            m == "ToSet" ? "Set" : "Array", srcElem));
                     // stdlib §5 ToDictionary — typed as Dictionary<K,V> sentinel
                     // (fix #459 / §5 / §22): use makeDictResult so that inferred
                     // locals (`var d := seq.ToDictionary(keyFn)`) produce a type
@@ -853,12 +900,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (auto* st = ctx_.exprType(*ce.args[0].value))
                                 ctx_.setExprType(&ce, st);
                         }
-                        // per §5 LINQ: ToArray/ToSet materialize the (already
-                        // eager, for an Array source) collection. Typed as the
-                        // lazy sentinel carrying the element type.
+                        // per §5 LINQ + §14 inference fix: ToArray/ToSet on a
+                        // concrete Array/Set receiver. Return a concrete
+                        // Array<T>/Set<T> TypeRef so that un-annotated inferred
+                        // locals resolve downstream `.Get(i)`, `.Length`, etc.
                         else if ((m == "ToArray" || m == "ToSet") &&
                                  !recvTy->genericArgs.empty())
-                            ctx_.setExprType(&ce, makeLazyEnumerable(recvTy->genericArgs[0]));
+                            ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                                m == "ToSet" ? "Set" : "Array",
+                                recvTy->genericArgs[0]));
                         // stdlib §5 ToDictionary — typed as Dictionary<K,V> sentinel
                         // (fix #459 / §5 / §22): same as the lazy-source path above.
                         else if (m == "ToDictionary" && !ce.args.empty() &&
