@@ -6078,14 +6078,31 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
 llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
                                        std::vector<llvm::Value*>& args,
                                        const CallableInfo& ci) {
-    // Build the substitution key for caching.
+    // Build the substitution key for caching. per §14.2 (monomorphization): the
+    // key must distinguish instantiations whose specialized bodies differ. The
+    // erased LLVM type vector alone is not enough — every class/interface type
+    // erases to `ptr`, so `Maker<A>.Run` and `Maker<B>.Run` would collide on
+    // `[ptr]` and the second would reuse the first's body (wrong when the body
+    // disposes a concrete class via `using var a := new T()`). Pair each LLVM
+    // type with a stable per-type identity token from the parallel
+    // genericSubstSemaTy_ (TypeSymbol* for a Named type, tagged primitive id
+    // otherwise), iterated in lockstep so the two vectors stay order-aligned.
     std::vector<llvm::Type*> substKey;
-    for (auto& [name, ty] : genericSubst_) substKey.push_back(ty);
+    std::vector<const void*> idKey;
+    for (auto& [name, ty] : genericSubst_) {
+        substKey.push_back(ty);
+        auto sit = genericSubstSemaTy_.find(name);
+        idKey.push_back(
+            sit != genericSubstSemaTy_.end()
+                ? typeRefIdentityToken(sit->second)
+                : nullptr);
+    }
 
-    auto cacheKey = std::make_pair(ms, substKey);
+    auto cacheKey = std::make_tuple(ms, substKey, idKey);
     auto cit = specializedMethods_.find(cacheKey);
     if (cit != specializedMethods_.end()) {
-        // Already compiled — just call it.
+        // Already compiled — just call it (identical instantiations share one
+        // specialization: same ms + same LLVM types + same type identities).
         llvm::Function* fn = cit->second;
         if (args.size() != fn->arg_size()) return nullptr;
         llvm::Value* r = builder_.CreateCall(fn, args);
@@ -6105,9 +6122,18 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
     }
     auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
 
-    // Create the specialized function.
+    // Create the specialized function. Append a per-type-arg discriminator so
+    // distinct instantiations get distinct, readable IR names (e.g.
+    // Maker$Run$spec$A vs Maker$Run$spec$B). InternalLinkage names need not be
+    // unique — LLVM uniquifies them — but a meaningful suffix aids debugging and
+    // makes the type-aware key visible in the emitted IR. Genuinely-identical
+    // instantiations never reach here (they hit the cache above).
     std::string fname = std::string(ms->parent ? ms->parent->name : "")
                         + "$" + std::string(ms->name) + "$spec";
+    for (auto& [name, sty] : genericSubstSemaTy_) {
+        if (sty && sty->kind == sema::TypeRef::Kind::Named && sty->declaration)
+            fname += "$" + std::string(sty->declaration->name);
+    }
     llvm::Function* specFn = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage, fname, module_.get());
     specializedMethods_[cacheKey] = specFn;

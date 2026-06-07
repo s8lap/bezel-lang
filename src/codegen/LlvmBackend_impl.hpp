@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <map>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -474,9 +475,21 @@ private:
     std::map<const sema::TypeSymbol*,
              std::map<std::vector<llvm::Type*>, llvm::StructType*>>
         specializedStructs_;
-    // specializedMethods_[(ms, subst_key)] = specialized LLVM function
-    std::map<std::pair<const sema::MethodSymbol*,
-                       std::vector<llvm::Type*>>,
+    // specializedMethods_[(ms, llvm_subst_key, sema_id_key)] = specialized
+    // LLVM function. per §14.2 (generics are monomorphized): the cache key must
+    // distinguish instantiations that produce DIFFERENT specialized bodies. The
+    // LLVM type vector alone is insufficient because every class/interface type
+    // erases to `ptr` in IR, so `Maker<A>.Run` and `Maker<B>.Run` would share a
+    // key `[ptr]` and the second would reuse the first's body — wrong when the
+    // body contains a concrete-class-specific disposer (`using var a := new
+    // T()`). The third element carries a stable per-type identity token (the
+    // sema TypeSymbol* for a Named type, a tagged primitive id otherwise) for
+    // each substituted type parameter, in the SAME deterministic order as the
+    // LLVM type vector, so distinct concrete type args get distinct entries and
+    // genuinely-identical instantiations still share one.
+    std::map<std::tuple<const sema::MethodSymbol*,
+                        std::vector<llvm::Type*>,
+                        std::vector<const void*>>,
              llvm::Function*>
         specializedMethods_;
     // localGenericSubst_[decl] = concrete subst when local was created.
@@ -2091,6 +2104,31 @@ private:
             return nullptr;
         auto it = genericSubstSemaTy_.find(rt->astNode->name->parts[0]);
         return it != genericSubstSemaTy_.end() ? it->second : nullptr;
+    }
+
+    // per §14.2: a stable identity token for a resolved concrete type, used to
+    // make the generic-specialization cache key TYPE-AWARE. Two concrete types
+    // that erase to the same LLVM type (every class/interface erases to `ptr`)
+    // must still map to DIFFERENT tokens so their specializations don't collide.
+    //  * Named (class/interface/record/enum): the TypeSymbol* declaration — a
+    //    stable per-type pointer; nullable variants share a token (the LLVM type
+    //    is identical and class-typed bodies don't branch on a subst's
+    //    nullability).
+    //  * Primitive: a small tagged integer cast to a pointer, distinct from any
+    //    real heap pointer (low values are never valid TypeSymbol addresses).
+    //  * anything else (Unit/Function/InlineArray/Error or an unresolved param):
+    //    nullptr — these are already distinguished by the LLVM type vector that
+    //    sits alongside this token in the key.
+    static const void* typeRefIdentityToken(const sema::TypeRef* rt) {
+        if (!rt) return nullptr;
+        if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration)
+            return static_cast<const void*>(rt->declaration);
+        if (rt->kind == sema::TypeRef::Kind::Primitive)
+            // Tag primitives into a tiny address range that cannot alias a real
+            // TypeSymbol*; +1 so PrimitiveType::None (0) is still non-null.
+            return reinterpret_cast<const void*>(
+                static_cast<std::uintptr_t>(rt->primitive) + 1);
+        return nullptr;
     }
 
     // per §14.1 (generics are monomorphized): install `genericSubst_` for a
