@@ -5338,7 +5338,68 @@ void Emitter::setupBoxDescriptors() {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
                 if (ms && !isStaticMethod(ms)) ifaceMethods.push_back(ms);
             }
-            if (ifaceMethods.empty()) continue;
+            // §24.7 (#477 B7): collect iface's sync events in declaration order
+            // (after the methods, matching ifaceEventIndex_'s numbering). Even
+            // though records cannot declare events themselves, an interface that
+            // a record implements may declare events; their slots must be
+            // present (as null entries) to keep the property-slot offsets
+            // consistent with ifacePropertyGetIndex_.
+            std::vector<sema::EventSymbol*> ifaceEvents;
+            for (sema::Symbol* m : iface->members) {
+                auto* es = dynamic_cast<sema::EventSymbol*>(m);
+                if (!es) continue;
+                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+                if (ed && !ed->isAsync) ifaceEvents.push_back(es);
+            }
+            // #481 / §13 / §23: collect iface's properties in declaration order
+            // (after the events, matching ifacePropertyGetIndex_'s numbering).
+            // This was the root cause of the block-form-getter SIGSEGV: Pass C
+            // only handled methods, so property slots were absent from the
+            // record's box itable and bz_itable_lookup + GEP reached null.
+            std::vector<sema::PropertySymbol*> ifaceProps;
+            for (sema::Symbol* m : iface->members) {
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                if (ps && !ps->isIndexer) ifaceProps.push_back(ps);
+            }
+            // Skip a wholly empty interface (no methods, events, or properties).
+            if (ifaceMethods.empty() && ifaceEvents.empty() &&
+                ifaceProps.empty())
+                continue;
+
+            // Helper lambda: build a box→record thunk that GEPs past the two
+            // header words (vtable*, rc) in the box and tail-calls `realFn`.
+            // Signature: (box ptr, extra params…) → return type of realFn.
+            // Records are never enums, so only the GEP path is needed here.
+            auto makeBoxThunk = [&](llvm::Function* realFn,
+                                    const std::string& thunkName) -> llvm::Function* {
+                llvm::FunctionType* realFnTy = realFn->getFunctionType();
+                // Replace the first param (record ptr) with ptrTy() (box ptr).
+                std::vector<llvm::Type*> thunkParamTys;
+                thunkParamTys.push_back(ptrTy());  // box ptr
+                for (unsigned pi = 1; pi < realFnTy->getNumParams(); ++pi)
+                    thunkParamTys.push_back(realFnTy->getParamType(pi));
+                auto* thunkFnTy = llvm::FunctionType::get(
+                    realFnTy->getReturnType(), thunkParamTys, /*isVarArg=*/false);
+                auto* thunk = llvm::Function::Create(
+                    thunkFnTy, llvm::Function::InternalLinkage,
+                    thunkName, module_.get());
+                auto* bb = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+                llvm::IRBuilder<> tb(bb);
+                // GEP to the record bytes: box + 2 * sizeof(ptr) = +16.
+                auto ai = thunk->arg_begin();
+                llvm::Value* valSlot = tb.CreateGEP(
+                    ptrTy(), &*ai,
+                    {llvm::ConstantInt::get(i32(), 2)}, "box.valptr");
+                std::vector<llvm::Value*> callArgs{valSlot};
+                ++ai;
+                for (; ai != thunk->arg_end(); ++ai) callArgs.push_back(&*ai);
+                llvm::Value* r = tb.CreateCall(realFnTy, realFn, callArgs);
+                if (realFnTy->getReturnType()->isVoidTy())
+                    tb.CreateRetVoid();
+                else
+                    tb.CreateRet(r);
+                return thunk;
+            };
 
             std::vector<llvm::Constant*> itabElems;
             for (sema::MethodSymbol* im : ifaceMethods) {
@@ -5421,6 +5482,57 @@ void Emitter::setupBoxDescriptors() {
                     }
                 }
                 itabElems.push_back(fp);
+            }
+            // §24.7 (#477 B7): append null slots for interface events. Records
+            // cannot declare or back interface events; the slots must be present
+            // so property GEP offsets (ifacePropertyGetIndex_) stay correct.
+            for (sema::EventSymbol* ie : ifaceEvents) {
+                (void)ie;  // slot present for index consistency; record has no event backing
+                itabElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+            }
+            // #481 / §13 / §23 (block-form getter fix): append getter (and
+            // setter) box-thunks for each interface property. The thunk GEPs
+            // past the box header to reach the record bytes, then calls the
+            // uniform accessor function (ensurePropertyAccessorFn) which handles
+            // arrow, block, and auto-property bodies. This mirrors Pass D (class
+            // itable) but adapted for the record-box receiver shape.
+            //
+            // Ensure the record struct layout (and fieldIndex_) is populated
+            // before calling ensurePropertyAccessorFn: block/arrow getter
+            // bodies access fields via fieldIndex_, which recordStruct()
+            // populates lazily. Pass C runs before method bodies are emitted,
+            // so fieldIndex_ may not yet exist for this record type.
+            // classStruct routes to recordStruct for records (§9.4).
+            classStruct(ts);
+            for (sema::PropertySymbol* ip : ifaceProps) {
+                sema::PropertySymbol* impl =
+                    classPropertyByName(ts, ip->name);
+                llvm::Constant* getFp =
+                    llvm::ConstantPointerNull::get(ptrTy());
+                if (impl) {
+                    if (llvm::Function* acc =
+                            ensurePropertyAccessorFn(ts, impl, /*isSet=*/false)) {
+                        std::string thunkName =
+                            "bz$boxpropget$" + std::string(ts->name) + "$" +
+                            std::string(ip->name);
+                        getFp = makeBoxThunk(acc, thunkName);
+                    }
+                }
+                itabElems.push_back(getFp);
+                if (propertyHasSetter(ip)) {
+                    llvm::Constant* setFp =
+                        llvm::ConstantPointerNull::get(ptrTy());
+                    if (impl) {
+                        if (llvm::Function* acc = ensurePropertyAccessorFn(
+                                ts, impl, /*isSet=*/true)) {
+                            std::string thunkName =
+                                "bz$boxpropset$" + std::string(ts->name) +
+                                "$" + std::string(ip->name);
+                            setFp = makeBoxThunk(acc, thunkName);
+                        }
+                    }
+                    itabElems.push_back(setFp);
+                }
             }
             auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
             auto* itabGV = new llvm::GlobalVariable(
