@@ -5040,6 +5040,31 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     }
     auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
     if (!ms) {
+        // §8.5 / §8.6 (#417): `o.ToString()` where o: Object / interface (the
+        // universal Object.ToString, no MethodSymbol — the receiver's static
+        // type has no `declaration`). Dispatch through the uniform vtable
+        // ToString slot; a string operand (no vtable) returns itself. Gated on
+        // an Object- or interface-typed receiver so a record/enum/primitive
+        // receiver (handled by tryLowerValueSemanticsCall above) and a typed
+        // class receiver (resolved to a real MethodSymbol) never reach here.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "ToString" && ma->target && call.args.empty()) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                using K = sema::TypeRef::Kind;
+                using P = sema::PrimitiveType;
+                bool isObjectRecv =
+                    recvTy && recvTy->kind == K::Primitive &&
+                    recvTy->primitive == P::Object;
+                bool isIfaceRecv =
+                    recvTy && recvTy->kind == K::Named && recvTy->declaration &&
+                    recvTy->declaration->kind == ast::TypeDeclKind::Interface;
+                if (isObjectRecv || isIfaceRecv) {
+                    llvm::Value* recv = lowerExpr(*ma->target);
+                    if (llvm::Value* r = lowerObjectToString(recv)) return r;
+                }
+            }
+        }
         // CG13/CG18: explicit `obj.Dispose()` call where Dispose is a
         // compiler-generated method (no MethodSymbol in sema). Emit a
         // dynamic vtable dispatch to the object's Dispose function (slot 1).
@@ -5559,7 +5584,8 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 builder_.CreateGEP(ptrTy(), itab, {builder_.getInt32(k)}),
                 "ifn");
         } else {
-            // Class virtual dispatch: vtSlot is the vtable index (base 3).
+            // Class virtual dispatch: vtSlot is the vtable index (virtuals
+            // base at slot 4 after td/itmap/Dispose/ToString — §8.6/§8.5 #417).
             llvm::Value* slotPtr = builder_.CreateGEP(
                 ptrTy(), vptr, {builder_.getInt32(vtSlot)});
             fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);

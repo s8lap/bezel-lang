@@ -345,11 +345,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             if (auto* v = tryLowerStringMethod(*call, *ma))
                                 return v;
                         }
-                        // CG27c: ToString() on any primitive (no arg).
-                        if (call->args.empty() && ma->member == "ToString") {
+                        // CG27c: ToString() on any primitive (no arg). §8.5/§8.6
+                        // (#417): an OBJECT-typed receiver is NOT a value
+                        // primitive — `o.ToString()` dispatches through the
+                        // uniform vtable ToString slot (a boxed value / class) or
+                        // returns a contained string. emitPrimitiveToString on an
+                        // Object pointer would snprintf the pointer as "%d".
+                        if (call->args.empty() && ma->member == "ToString" &&
+                            tt->primitive != sema::PrimitiveType::Object) {
                             llvm::Value* recv = lowerExpr(*ma->target);
                             if (recv)
                                 return emitPrimitiveToString(recv, tt->primitive);
+                        }
+                        if (call->args.empty() && ma->member == "ToString" &&
+                            tt->primitive == sema::PrimitiveType::Object) {
+                            llvm::Value* recv = lowerExpr(*ma->target);
+                            if (llvm::Value* r = lowerObjectToString(recv))
+                                return r;
                         }
                         // §6.3: FP predicates as instance methods (x.IsNaN(), x.IsFinite()).
                         if (call->args.empty()) {

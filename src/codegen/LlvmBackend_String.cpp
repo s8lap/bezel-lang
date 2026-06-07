@@ -2041,6 +2041,63 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
     return lowerStringLiteral("\"\"", false);
 }
 
+// §8.5 / §8.6 (#417): lower `o.ToString()` where o: Object / interface (no
+// resolved MethodSymbol — the receiver's static type has no `declaration`). The
+// dynamic value is either a string (a bare bz_string*, NO vtable) or a
+// class/box/exception (vtable at word 0, ToString at the fixed slot 3). Branch
+// on bz_obj_is_string: a string returns itself (§9.6 string.ToString = this); a
+// class/box dispatches through vtable[kToStringSlot]. A null receiver renders as
+// the literal "null" (the same rendering null interpolation uses).
+llvm::Value* Emitter::lowerObjectToString(llvm::Value* recv) {
+    if (!recv || !recv->getType()->isPointerTy()) return nullptr;
+
+    auto* nullBB   = llvm::BasicBlock::Create(llvm_, "ts.obj.null", currentFn_);
+    auto* liveBB   = llvm::BasicBlock::Create(llvm_, "ts.obj.live", currentFn_);
+    auto* strBB    = llvm::BasicBlock::Create(llvm_, "ts.obj.str", currentFn_);
+    auto* vtBB     = llvm::BasicBlock::Create(llvm_, "ts.obj.vt", currentFn_);
+    auto* endBB    = llvm::BasicBlock::Create(llvm_, "ts.obj.end", currentFn_);
+
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        recv, llvm::ConstantPointerNull::get(ptrTy()), "ts.obj.isnull");
+    builder_.CreateCondBr(isNull, nullBB, liveBB);
+
+    // null → "null".
+    builder_.SetInsertPoint(nullBB);
+    llvm::Value* nullStr = lowerStringLiteral("\"null\"", false);
+    builder_.CreateBr(endBB);
+
+    // non-null: string or vtable-bearing?
+    builder_.SetInsertPoint(liveBB);
+    auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+    llvm::Value* isStr = builder_.CreateCall(
+        isStrFn, {recv, vtableTablePtr()}, "ts.obj.isstr");
+    llvm::Value* isStrBit = builder_.CreateICmpNE(isStr, builder_.getInt32(0));
+    builder_.CreateCondBr(isStrBit, strBB, vtBB);
+
+    // string: ToString is identity (§9.6).
+    builder_.SetInsertPoint(strBB);
+    llvm::Value* strResult = recv;
+    builder_.CreateBr(endBB);
+
+    // class/box: dispatch vtable[kToStringSlot](recv).
+    builder_.SetInsertPoint(vtBB);
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+    llvm::Value* slotPtr = builder_.CreateGEP(
+        ptrTy(), vptr, {builder_.getInt32(kToStringSlot)}, "ts.obj.slot");
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+    auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    llvm::Value* vtResult = builder_.CreateCall(fnTy, fnPtr, {recv}, "ts.obj.r");
+    builder_.CreateBr(endBB);
+
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(ptrTy(), 3, "ts.obj.res");
+    phi->addIncoming(nullStr, nullBB);
+    phi->addIncoming(strResult, strBB);
+    phi->addIncoming(vtResult, vtBB);
+    return phi;
+}
+
+
 // §8.5 / §9.1 / §9.2: build `"TypeName(Prop1: value1, Prop2: value2)"` from the
 // record's storage members in declaration order — positional/body fields for a
 // positional record (§9.1), the auto-properties for an eligible body record

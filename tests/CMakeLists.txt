@@ -183,6 +183,7 @@ set(BEZEL_TEST_SOURCES
     codegen/type_test_test.cpp
     codegen/value_boxing_test.cpp
     codegen/object_downcast_test.cpp
+    codegen/boxing_tostring_test.cpp
     codegen/exceptions_test.cpp
     codegen/exception_dispose_test.cpp
     codegen/exception_disposal_test.cpp

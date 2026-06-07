@@ -668,9 +668,11 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
         slots = vtableMethods_[base];
         nameSlot = vtableNameSlot_[base];
     }
-    // Vtable (CG35-itable): [0]=td$C, [1]=itmap$C, [2]=Dispose, [3..]=virtual
-    // methods. So a virtual method's slot is its position in `slots` + 3.
-    const unsigned base = 3;
+    // Vtable (CG35-itable + §8.6 #417): [0]=td$C, [1]=itmap$C, [2]=Dispose,
+    // [3]=ToString, [4..]=virtual methods. So a virtual method's slot is its
+    // position in `slots` + 4 (ToString occupies the fixed slot 3, like Dispose
+    // occupies the fixed slot 2). See declareVtables Pass D for the slot fill.
+    const unsigned base = 4;
     for (sema::Symbol* m : t->members) {
         auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
         if (!ms || isStaticMethod(ms) || !isVirtual(ms)) continue;
@@ -907,9 +909,10 @@ void Emitter::declareVtables() {
             "itmap$" + std::string(ts->name));
         itmaps_[ts] = itmapGV;
 
-        // Build vtable: [0]=td$C, [1]=itmap$C, [2]=Dispose, [3..]=virtuals.
+        // Build vtable (CG35-itable + §8.6/§8.5 #417): [0]=td$C, [1]=itmap$C,
+        // [2]=Dispose, [3]=ToString, [4..]=virtuals.
         const auto& slots = vtableMethods_[ts];
-        std::vector<llvm::Constant*> elems(3 + slots.size(),
+        std::vector<llvm::Constant*> elems(kToStringSlot + 1 + slots.size(),
                                            llvm::ConstantPointerNull::get(
                                                ptrTy()));
         elems[0] = descArray_[ts];
@@ -917,11 +920,15 @@ void Emitter::declareVtables() {
         auto dit = disposerFns_.find(ts);
         if (dit != disposerFns_.end())
             elems[2] = llvm::cast<llvm::Constant>(dit->second);
-        // Virtual methods at [3..].
+        // §8.5 / §8.6 (#417): uniform ToString at the fixed slot 3 — the user
+        // override (via the class chain) or the type-name default.
+        elems[kToStringSlot] = classToStringThunk(ts);
+        // Virtual methods at [4..] (kToStringSlot + 1 + i).
         for (std::size_t i = 0; i < slots.size(); ++i) {
             auto mit = methodFns_.find(slots[i]);
             if (mit != methodFns_.end())
-                elems[3 + i] = llvm::cast<llvm::Constant>(mit->second);
+                elems[kToStringSlot + 1 + i] =
+                    llvm::cast<llvm::Constant>(mit->second);
         }
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         auto* init = llvm::ConstantArray::get(arrTy, elems);
@@ -943,6 +950,7 @@ void Emitter::declareVtables() {
             exported ? llvm::GlobalValue::ExternalLinkage
                      : llvm::GlobalValue::InternalLinkage,
             init, "vt$" + std::string(ts->name));
+        allVtables_.push_back(vtables_[ts]);  // §8.6 #417: string discriminator
     }
 }
 
@@ -1038,11 +1046,14 @@ void Emitter::setupBuiltinExceptions() {
         builtinDesc_[name]->setInitializer(
             llvm::ConstantArray::get(arrTy, elems));
     }
-    // Pass 3: vtable per built-in = [descriptor, itmap (null=empty), Dispose].
-    // Built-in exceptions implement no user interfaces, so the itmap is a
-    // single-null array. Layout matches the new CG35-itable class vtable prefix:
-    //   [0]=td, [1]=itmap (null-terminated, empty), [2]=Dispose.
+    // Pass 3: vtable per built-in = [descriptor, itmap (null=empty), Dispose,
+    // ToString]. Built-in exceptions implement no user interfaces, so the itmap
+    // is a single-null array. Layout matches the new CG35-itable + §8.6/§8.5
+    // (#417) class vtable prefix:
+    //   [0]=td, [1]=itmap (null-terminated, empty), [2]=Dispose, [3]=ToString.
     // A common empty itmap (just a null ptr) is shared across all builtins.
+    // Each exception's ToString is the type-name default (§8.5: a class's
+    // default ToString is the type's qualified name).
     auto* emptyItmapTy = llvm::ArrayType::get(ptrTy(), 1);
     auto* emptyItmap = new llvm::GlobalVariable(
         *module_, emptyItmapTy, /*isConstant=*/true,
@@ -1051,10 +1062,28 @@ void Emitter::setupBuiltinExceptions() {
                                  {llvm::ConstantPointerNull::get(ptrTy())}),
         "itmap$bz$empty");
     for (const auto& [name, par] : hier) {
+        // §8.5 / §8.6 (#417): a per-exception ToString thunk `ptr(ptr this)`
+        // returning the type-name literal (the §8.5 class default). Emitted at
+        // setup time; lowerStringLiteral only allocates module globals, so it is
+        // safe before declareFunctions runs.
+        auto* tsFnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+        auto* tsThunk = llvm::Function::Create(
+            tsFnTy, llvm::Function::InternalLinkage,
+            std::string("bz$extostr$") + name, module_.get());
+        {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", tsThunk);
+            llvm::IRBuilder<> tb(bb);
+            // lowerStringLiteral returns a constant global pointer (no builder
+            // use), so we can return it directly.
+            llvm::Value* nameStr = lowerStringLiteral(
+                std::string("\"") + name + "\"", false);
+            tb.CreateRet(nameStr);
+        }
         std::vector<llvm::Constant*> v = {
             builtinDesc_[name],
             llvm::ConstantExpr::getPointerCast(emptyItmap, ptrTy()),
-            builtinDisposeFn_
+            builtinDisposeFn_,
+            tsThunk
         };
         auto* arrTy = llvm::ArrayType::get(ptrTy(), v.size());
         builtinVtable_[name] = new llvm::GlobalVariable(
@@ -1062,6 +1091,7 @@ void Emitter::setupBuiltinExceptions() {
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantArray::get(arrTy, v),
             std::string("bvt$") + name);
+        allVtables_.push_back(builtinVtable_[name]);  // §8.6 #417
     }
 }
 
@@ -1591,7 +1621,8 @@ void Emitter::emitDynamicDispose(llvm::Value* obj) {
     // dispatch's vtable load would read freed memory (use-after-free) regardless
     // of any flag. Splitting "dispatch" (idempotent, repeatable) from "reclaim"
     // (done once, by the owning slot's auto-dispose) keeps repeated disposal
-    // safe. vtable layout (CG35-itable): [0]=td$, [1]=itmap$, [2]=Dispose, [3+]=virtuals.
+    // safe. vtable layout (CG35-itable + §8.6/§8.5 #417): [0]=td$, [1]=itmap$,
+    // [2]=Dispose, [3]=ToString, [4+]=virtuals. Dispose stays at the FIXED slot 2.
     llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
     llvm::Value* slot = builder_.CreateGEP(ptrTy(), vptr,
                                            {builder_.getInt32(2)});
@@ -4897,27 +4928,34 @@ void Emitter::setupBoxDescriptors() {
             llvm::ConstantArray::get(itmapArrTy, itmapElems),
             "itmap$box$" + std::string(ts->name));
 
-        // Vtable: [0]=td, [1]=itmap$box$C, [2]=Dispose (no-op).
-        std::vector<llvm::Constant*> elems(3,
+        // Vtable (§8.6/§8.5 #417): [0]=td, [1]=itmap$box$C, [2]=Dispose (no-op),
+        // [3]=ToString (synthesized record/enum form, or user override).
+        std::vector<llvm::Constant*> elems(kToStringSlot + 1,
                                            llvm::ConstantPointerNull::get(
                                                ptrTy()));
         elems[0] = descArray_[ts];
         elems[1] = llvm::ConstantExpr::getPointerCast(boxItmapGV, ptrTy());
         if (builtinDisposeFn_) elems[2] = builtinDisposeFn_;
+        elems[kToStringSlot] = boxToStringThunk(ts);
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         boxVtable_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
             llvm::GlobalValue::InternalLinkage,
             llvm::ConstantArray::get(arrTy, elems),
             "bvt$box$" + std::string(ts->name));
+        allVtables_.push_back(boxVtable_[ts]);  // §8.6 #417
     }
 
-    // --- Primitives: descriptor + 1-word box vtable -----------------------
+    // --- Primitives: descriptor + box vtable ------------------------------
     // Each boxable value primitive gets a 2-element descriptor [self, null] and
-    // a 1-element vtable [descriptor]. `emitIsA` reads only vtable[0], so one
-    // word suffices for `o is int`. (string is included so a boxed-value box
-    // could in principle carry it, but `is string` itself is deferred — see
-    // lowerTypeTest: a raw string operand has no vtable to walk.)
+    // a vtable matching the uniform class/box prefix (§8.6/§8.5 #417):
+    //   [0]=descriptor (read by emitIsA for `o is int`),
+    //   [1]=itmap (null — primitives implement no user interface),
+    //   [2]=Dispose (no-op — boxed primitives are runtime-managed, §28.9),
+    //   [3]=ToString (loads the box payload, formats it).
+    // (string is included so the descriptor exists for `o is string`'s target,
+    // but a string is NOT boxed — it stays a bare bz_string* in an Object slot,
+    // recognized via bz_obj_is_string; see lowerTypeTest / lowerObjectToString.)
     using P = sema::PrimitiveType;
     static const P prims[] = {P::Bool, P::Char, P::String, P::Byte, P::SByte,
                               P::Short, P::UShort, P::Int, P::UInt, P::Long,
@@ -4933,13 +4971,215 @@ void Emitter::setupBoxDescriptors() {
         desc->setInitializer(llvm::ConstantArray::get(
             descTy, {desc, llvm::ConstantPointerNull::get(ptrTy())}));
         primBoxDesc_[nm] = desc;
-        auto* vtTy = llvm::ArrayType::get(ptrTy(), 1);
+        // ToString thunk for every boxable primitive (not string — string has
+        // no box payload; its ToString-through-Object is identity, handled
+        // separately). The null at slot 3 for string keeps the prefix uniform.
+        llvm::Constant* tostr =
+            (p == P::String)
+                ? static_cast<llvm::Constant*>(
+                      llvm::ConstantPointerNull::get(ptrTy()))
+                : primBoxToStringThunk(p, nm);
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), kToStringSlot + 1);
         primBoxVtable_[nm] = new llvm::GlobalVariable(
             *module_, vtTy, /*isConstant=*/true,
             llvm::GlobalValue::InternalLinkage,
-            llvm::ConstantArray::get(vtTy, {desc}),
+            llvm::ConstantArray::get(
+                vtTy, {desc,
+                       llvm::ConstantPointerNull::get(ptrTy()),  // itmap
+                       builtinDisposeFn_
+                           ? llvm::cast<llvm::Constant>(builtinDisposeFn_)
+                           : llvm::ConstantPointerNull::get(ptrTy()),  // Dispose
+                       tostr}),
             std::string("pvt$") + nm);
+        allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
     }
+}
+
+
+// §8.5 / §8.6 (#417): RAII helper to emit a function body at SETUP time (no
+// active Bezel function). Saves/restores currentFn_ + the builder's insert
+// point, and positions the builder at a fresh "entry" block of `fn`. The body
+// emitters (emitRecordToString, emitPrimitiveToString, …) use the member
+// builder_ and currentFn_ (e.g. via entryAlloca), so a thunk must set them up.
+namespace {
+struct ThunkScope {
+    llvm::Function*& curFn;
+    llvm::IRBuilder<>& b;
+    llvm::Function* saved;
+    llvm::BasicBlock* savedBB;
+    llvm::BasicBlock::iterator savedIt;
+    bool hadInsert;
+    ThunkScope(llvm::Function*& cf, llvm::IRBuilder<>& bb, llvm::Function* fn,
+               llvm::BasicBlock* entry)
+        : curFn(cf), b(bb), saved(cf), hadInsert(b.GetInsertBlock() != nullptr) {
+        if (hadInsert) { savedBB = b.GetInsertBlock(); savedIt = b.GetInsertPoint(); }
+        curFn = fn;
+        b.SetInsertPoint(entry);
+    }
+    ~ThunkScope() {
+        curFn = saved;
+        if (hadInsert) b.SetInsertPoint(savedBB, savedIt);
+        else b.ClearInsertionPoint();
+    }
+};
+}  // namespace
+
+
+// §8.5 / §8.6 (#417): the uniform ToString thunk for a CLASS. Returns the user
+// `ToString()` override if one exists anywhere on the class chain (§8.5 "via
+// virtual dispatch"); otherwise a default that returns the class's name (§8.5
+// "For classes: the type's qualified name"). The thunk's signature is the
+// vtable-uniform `ptr(ptr this)`.
+llvm::Constant* Emitter::classToStringThunk(const sema::TypeSymbol* ts) {
+    auto it = classToStringFns_.find(ts);
+    if (it != classToStringFns_.end()) return it->second;
+
+    // Walk the class chain for a user `ToString(): string` (no params). The
+    // most-derived override wins; vtableSlot_ already routes virtual overrides,
+    // but the thunk is what slot 3 points at for THIS exact class's vtable, so
+    // resolve the override visible from `ts`.
+    sema::MethodSymbol* userToStr = nullptr;
+    for (const sema::TypeSymbol* cur = ts; cur && !userToStr;) {
+        for (sema::Symbol* sym : cur->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+            if (ms && !isStaticMethod(ms) && ms->name == "ToString" &&
+                ms->params.empty()) { userToStr = ms; break; }
+        }
+        const sema::TypeSymbol* nxt = nullptr;
+        for (const sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+        cur = nxt;
+    }
+
+    auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$tostr$" + std::string(ts->name), module_.get());
+    classToStringFns_[ts] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* result = nullptr;
+        if (userToStr) {
+            auto fit = methodFns_.find(userToStr);
+            if (fit != methodFns_.end()) {
+                // Call the real user ToString non-virtually (the thunk IS the
+                // dispatch target; calling it directly avoids re-entry).
+                result = builder_.CreateCall(fit->second->getFunctionType(),
+                                             fit->second, {thunk->getArg(0)});
+            }
+        }
+        if (!result)
+            result = lowerStringLiteral(
+                std::string("\"") + std::string(ts->name) + "\"", false);
+        builder_.CreateRet(result);
+    }
+    return thunk;
+}
+
+
+// §8.5 / §8.6 (#417): the uniform ToString thunk for a boxed RECORD or boxed
+// ENUM. The receiver is the BOX pointer { vtable*, i64 rc, payload }; the
+// payload starts two words in (offset 16, BZ_BOX layout). For a record the
+// thunk prefers a user `ToString()` override and otherwise emits the
+// synthesized §8.5/§9.1/§9.2 property-listing form. For an enum the thunk
+// returns the type name (§8.5).
+llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
+    auto it = boxToStringFns_.find(ts);
+    if (it != boxToStringFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$boxtostr$" + std::string(ts->name), module_.get());
+    boxToStringFns_[ts] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* result = nullptr;
+        if (ts->kind == ast::TypeDeclKind::Enum) {
+            // §8.5: enum default ToString is the type's qualified name.
+            result = lowerStringLiteral(
+                std::string("\"") + std::string(ts->name) + "\"", false);
+        } else {
+            // Record: payload is the bare record struct two words into the box.
+            llvm::Value* boxPtr = thunk->getArg(0);
+            llvm::Value* payload = builder_.CreateGEP(
+                ptrTy(), boxPtr, {builder_.getInt32(2)}, "box.valptr");
+            // Prefer a user `ToString()` override (§8.5 via dispatch); the
+            // synthesized property-listing form is the default (§9.1/§9.2).
+            sema::MethodSymbol* userToStr = nullptr;
+            for (sema::Symbol* sym : ts->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+                if (ms && !isStaticMethod(ms) && ms->name == "ToString" &&
+                    ms->params.empty()) { userToStr = ms; break; }
+            }
+            if (userToStr) {
+                auto fit = methodFns_.find(userToStr);
+                if (fit != methodFns_.end())
+                    result = builder_.CreateCall(fit->second->getFunctionType(),
+                                                 fit->second, {payload});
+            }
+            if (!result) {
+                // Load the record value and build the §9.1/§9.2 form.
+                llvm::StructType* recTy = recordStruct(ts);
+                llvm::Value* recVal = builder_.CreateLoad(recTy, payload, "rec");
+                result = emitRecordToString(recVal, ts);
+            }
+        }
+        builder_.CreateRet(result);
+    }
+    return thunk;
+}
+
+
+// §8.5 / §8.6 (#417): the uniform ToString thunk for a boxed PRIMITIVE. The
+// receiver is the BOX pointer; the scalar value lives two words in. The thunk
+// loads the value and formats it via emitPrimitiveToString (int → decimal,
+// bool → "true"/"false", etc.).
+llvm::Constant* Emitter::primBoxToStringThunk(sema::PrimitiveType prim,
+                                              const char* name) {
+    auto it = primBoxToStringFns_.find(name);
+    if (it != primBoxToStringFns_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        std::string("bz$primtostr$") + name, module_.get());
+    primBoxToStringFns_[name] = thunk;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        llvm::Value* boxPtr = thunk->getArg(0);
+        llvm::Value* payload = builder_.CreateGEP(
+            ptrTy(), boxPtr, {builder_.getInt32(2)}, "box.valptr");
+        llvm::Type* valTy = lowerPrimitive(prim);
+        llvm::Value* val = builder_.CreateLoad(valTy, payload, "boxval");
+        llvm::Value* result = emitPrimitiveToString(val, prim);
+        builder_.CreateRet(result);
+    }
+    return thunk;
+}
+
+
+// §8.6 / §12.7 (#417): publish (once) the null-terminated `bz$vtable$table`
+// listing every vtable / box-vtable / exception-vtable global codegen emitted.
+// bz_obj_is_string scans it: an Object holding a string has `char* data` (not a
+// listed vtable) at word 0, so it is not found → recognized as a string. The
+// table is built lazily on the first `is/as/ToString string-through-Object`
+// site; all vtable globals already exist by the time any function body emits.
+llvm::Value* Emitter::vtableTablePtr() {
+    if (vtableTableGV_) return vtableTableGV_;
+    std::vector<llvm::Constant*> entries;
+    for (llvm::GlobalVariable* gv : allVtables_)
+        entries.push_back(llvm::ConstantExpr::getPointerCast(gv, ptrTy()));
+    entries.push_back(llvm::ConstantPointerNull::get(ptrTy()));  // terminator
+    auto* arrTy = llvm::ArrayType::get(ptrTy(), entries.size());
+    vtableTableGV_ = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(arrTy, entries), "bz$vtable$table");
+    return vtableTableGV_;
 }
 
 

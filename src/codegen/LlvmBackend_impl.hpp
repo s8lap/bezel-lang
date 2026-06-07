@@ -555,18 +555,35 @@ private:
     // enum) is a heap wrapper `{ vtable*, value-bytes… }`; its first word
     // points to this vtable so `emitIsA` (`*obj` → vtable, `vtable[0]` →
     // descriptor array) recognizes it uniformly with a class instance. The
-    // vtable layout matches the class vtable prefix:
-    //   [0]=td, [1]=itmap, [2]=Dispose
+    // vtable layout matches the class vtable prefix (CG35-itable + §8.6/§8.5
+    // #417):
+    //   [0]=td, [1]=itmap, [2]=Dispose, [3]=ToString
     // Interface dispatch on a boxed record goes through bz_itable_lookup.
     // The descriptor (vtable[0]) is the type's descArray_ entry.
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         boxVtable_;
     // §8.6: per-primitive box descriptor + vtable (int/bool/string/… have no
     // user TypeSymbol). The descriptor is the 2-element array [self, null] used
-    // by `o is int` / `o is string`; the vtable is the 1-element [descriptor]
-    // word every box carries at offset 0. Keyed by the primitive's name.
+    // by `o is int`; the vtable matches the uniform prefix
+    // [descriptor, itmap(null), Dispose(no-op), ToString] (§8.6/§8.5 #417), so a
+    // boxed primitive dispatches ToString through slot 3 like any other box.
+    // Keyed by the primitive's name.
     std::unordered_map<std::string, llvm::GlobalVariable*> primBoxDesc_;
     std::unordered_map<std::string, llvm::GlobalVariable*> primBoxVtable_;
+    // §8.5 / §8.6 (#417): per-type ToString thunk caches (vtable slot 3). One
+    // thunk per class / boxed value type, reused across modules-internal sites.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> classToStringFns_;
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*> boxToStringFns_;
+    std::unordered_map<std::string, llvm::Function*> primBoxToStringFns_;
+    // §8.6 / §12.7 (#417): every vtable / box-vtable / exception-vtable global
+    // emitted, collected so emitVtableTable() can publish a null-terminated
+    // array `bz$vtable$table` that bz_obj_is_string scans to tell a string (no
+    // vtable at word 0) from a class/box (vtable at word 0) in an Object slot.
+    std::vector<llvm::GlobalVariable*> allVtables_;
+    // The published null-terminated vtable table (lazily emitted).
+    llvm::GlobalVariable* vtableTableGV_ = nullptr;
+    // §8.6 / §12.7 (#417): emit (once) and return the bz$vtable$table global.
+    llvm::Value* vtableTablePtr();
     // Per-class slot→method (vector index i = vtable slot i+3; slots 0..2 are
     // td$, itmap$, Dispose) and the virtual-method-name→slot map used to
     // inherit slots.
@@ -1501,6 +1518,38 @@ private:
     // CG19: emit a runtime is-a test — is `targetDesc` present in `obj`'s
     // type-descriptor array (vtable[0])? Null operand → false. Returns i1.
     llvm::Value* emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc);
+
+    // §8.6 / §8.5 (#417): the fixed vtable slot index of the uniform virtual
+    // ToString method-pointer. Layout: [0]=td, [1]=itmap, [2]=Dispose,
+    // [3]=ToString, [4..]=virtuals. A dispatch `o.ToString()` on an Object /
+    // interface receiver loads vtable[3] and calls it.
+    static constexpr unsigned kToStringSlot = 3u;
+
+    // §8.5 / §8.6 (#417): emit (once) a ToString thunk `ptr(ptr this)` for a
+    // CLASS — the user override if present (walking the class chain), else a
+    // default returning the type's name (§8.5 "For classes: the type's
+    // qualified name"). Returned as a Constant for the class vtable's slot 3.
+    llvm::Constant* classToStringThunk(const sema::TypeSymbol* ts);
+
+    // §8.5 / §8.6 (#417): emit (once) a ToString thunk `ptr(ptr boxPtr)` for a
+    // boxed RECORD or boxed ENUM. The thunk GEPs past the box header (vtable +
+    // rc, two words) to the payload, then builds the §8.5/§9.1/§9.2 string:
+    // a record's synthesized property-listing form, an enum's type name.
+    llvm::Constant* boxToStringThunk(const sema::TypeSymbol* ts);
+
+    // §8.5 / §8.6 (#417): emit (once) a ToString thunk `ptr(ptr boxPtr)` for a
+    // boxed PRIMITIVE (int/bool/char/…). Loads the value from the box payload
+    // (two words in) and formats it via emitPrimitiveToString. Keyed by the
+    // primitive's stable name (primBoxName).
+    llvm::Constant* primBoxToStringThunk(sema::PrimitiveType prim,
+                                         const char* name);
+
+    // §8.5 / §8.6 (#417): lower `o.ToString()` where `o` is Object/interface
+    // (no resolved MethodSymbol). A string operand has no vtable, so the
+    // emitted code branches on bz_obj_is_string: a string returns itself, a
+    // class/box dispatches through vtable[kToStringSlot]. Returns the result
+    // string, or nullptr if the receiver cannot be lowered.
+    llvm::Value* lowerObjectToString(llvm::Value* recv);
 
     // §8.6: build box descriptor + vtable globals for boxable value types
     // (records, enums) and for the boxable primitives + string. Called once
