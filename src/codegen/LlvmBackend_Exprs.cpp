@@ -1654,6 +1654,73 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
     auto* fnTy = llvm::FunctionType::get(valTy, {ptrTy()}, false);
 
     llvm::Value* recv = recvExpr ? lowerExpr(*recvExpr) : currentThis_;
+    // §14.2 (record-conforms-to-interface) + §9.4 (record = value type) /
+    // §23 (properties): when a generic method `M<T>(x: T) where T: IFoo` is
+    // monomorphized with T = a RECORD and the body reads `x.Prop` (an
+    // interface property), sema resolves `x.Prop` to the INTERFACE property
+    // `IFoo.Prop`. The receiver `x` is a record VALUE (a struct, not a
+    // pointer), so the itable-dispatch path below would either need a pointer
+    // receiver or return nullptr at the `!recv->getType()->isPointerTy()`
+    // guard — and the fallback paths (computedGetterOf/blockGetterOf) see the
+    // INTERFACE property symbol (which has no body) and also return nullptr →
+    // the property access silently returns 0. This is the property analog of
+    // the record-method devirtualization in lowerCall (commit 738a3aa, §14.2
+    // record constraint fix). Since T is concretely known at the
+    // monomorphization site, devirtualize: resolve the receiver's concrete
+    // type through the active generic substitution; if it is a record, redirect
+    // `ps` to the record's own property via classPropertyByName and lower the
+    // getter directly (spilling the record value as needed — the same path a
+    // non-generic `square.Area` uses). Records are sealed (§9.6), so the
+    // implementation is exactly the one declared on the record.
+    if (isIfaceProp && recv && !recv->getType()->isPointerTy() && recvExpr) {
+        const sema::TypeRef* recvTy = ctx_.exprType(*recvExpr);
+        // Resolve a bare type-parameter receiver (`T`, no declaration) through
+        // the active substitution to its concrete sema type.
+        const sema::TypeRef* concrete = recvTy;
+        if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+            !recvTy->declaration && recvTy->astNode &&
+            recvTy->astNode->name &&
+            recvTy->astNode->name->parts.size() == 1) {
+            auto sit = genericSubstSemaTy_.find(
+                recvTy->astNode->name->parts[0]);
+            if (sit != genericSubstSemaTy_.end() && sit->second)
+                concrete = sit->second;
+        }
+        if (concrete && concrete->declaration &&
+            concrete->declaration->kind == ast::TypeDeclKind::Record) {
+            // Redirect ps to the record's own implementing property.
+            if (sema::PropertySymbol* impl = classPropertyByName(
+                    concrete->declaration, ps->name)) {
+                // Spill the record value to a stack slot so the getter body
+                // can access fields via `this` pointer (§9.2 record storage).
+                llvm::Value* obj = recv;
+                if (!obj->getType()->isPointerTy()) {
+                    llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+                    builder_.CreateStore(obj, tmp);
+                    obj = tmp;
+                }
+                // Evaluate the record's own getter with `this` = spilled ptr.
+                if (const ast::Expr* getter = computedGetterOf(impl)) {
+                    llvm::Value* saved = currentThis_;
+                    currentThis_ = obj;
+                    llvm::Value* v = lowerExpr(*getter);
+                    currentThis_ = saved;
+                    return v;
+                }
+                if (const ast::PropertyAccessor* acc = blockGetterOf(impl)) {
+                    auto* ipd = dynamic_cast<const ast::PropertyDecl*>(impl->decl);
+                    if (ipd) {
+                        llvm::Function* getterFn =
+                            ensurePropertyBlockGetter(ipd, acc);
+                        llvm::Value* res = builder_.CreateCall(
+                            getterFn->getFunctionType(), getterFn, {obj});
+                        emitPendingCheck();
+                        return res;
+                    }
+                }
+            }
+        }
+    }
     if (!recv || !recv->getType()->isPointerTy()) return nullptr;
 
     llvm::Value* fnPtr = nullptr;

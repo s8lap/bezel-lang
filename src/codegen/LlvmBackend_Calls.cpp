@@ -5964,6 +5964,26 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     if (it == methodFns_.end()) return nullptr;
     llvm::Function* callee = it->second;
     if (args.size() != callee->arg_size()) return nullptr;
+    // §14.2 / issue #484 (non-virtual complement): guard against a direct call
+    // to a method whose first parameter is `ptr` (the class/record `this`) when
+    // the receiver arg is NOT a pointer. This happens when the UNSPECIALIZED
+    // generic template body is emitted with type param T erased to i32: the
+    // receiver `args[0]` is `i32`, but the callee's first param is `ptr`. The
+    // virtual-dispatch branch already has this guard (line ~5925); without it
+    // here the compiler emits a malformed IR instruction
+    //   call i32 @bz$Helper$Add(i32 recv, ...)
+    // that the IR verifier rejects. Returning nullptr lets emitImplicitReturn
+    // emit `ret i32 0` for the stub — the same safe no-op as the virtual path.
+    // The specialized invocation (emitInlineGenericMethod / emitGenericSpec
+    // with a concrete `ptr` receiver) reaches this code correctly and is
+    // unaffected, because its receiver arg IS a pointer.
+    if (!isStaticMethod(ms) && !args.empty()) {
+        llvm::FunctionType* calleeTy = callee->getFunctionType();
+        if (!args[0]->getType()->isPointerTy() &&
+            calleeTy->getNumParams() > 0 &&
+            calleeTy->getParamType(0)->isPointerTy())
+            return nullptr;
+    }
     // CG-generic: if the generic substitution is active and the method
     // is on a class that has generic parameters, we must specialize the
     // call — even for methods with non-generic param/return types (like
