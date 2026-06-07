@@ -139,3 +139,30 @@ BEZEL_TEST(codegen_cg38b, binding_pattern_with_guard) {
         "end; "
         "return r;"), 11);
 }
+
+// ── §19 / §7 / issues #447 + #448: statement-position case over nullable VALUE
+// types. The null-pattern fix in patternMatches must not crash in stmt-position
+// (which takes the same code path). Both the value arm and the null arm must
+// route correctly.
+
+BEZEL_TEST(codegen_cg38_nullable_value_case, int_nullable_value_arm_stmt_spec_19_issue_447) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := 5; var r := 0; "
+        "case x "
+        "  5 => do r := 1; end, "
+        "  null => do r := 2; end, "
+        "  _ => do r := 3; end, "
+        "end; "
+        "return r;"), 1);
+}
+
+BEZEL_TEST(codegen_cg38_nullable_value_case, int_nullable_null_arm_stmt_spec_19_issue_447) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := null; var r := 0; "
+        "case x "
+        "  5 => do r := 1; end, "
+        "  null => do r := 2; end, "
+        "  _ => do r := 3; end, "
+        "end; "
+        "return r;"), 2);
+}

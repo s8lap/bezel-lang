@@ -3287,6 +3287,10 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     if (!scrut) return nullptr;
     const sema::TypeSymbol* enumTy = enumTypeOf(*ce.scrutinee);
     bool isStr = isStringExprType(*ce.scrutinee);
+    // §7 / issue #447: pass the scrutinee's resolved TypeRef so patternMatches
+    // can detect a nullable VALUE type ({i8 hasValue; T value} struct) and
+    // apply hasValue-based matching instead of the pointer-based paths.
+    const sema::TypeRef* scrutTy = ctx_.exprType(*ce.scrutinee);
     llvm::Type* resultTy = i32();
     if (auto* rt = ctx_.exprType(ce)) resultTy = lowerTypeRef(rt);
 
@@ -3298,7 +3302,7 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             !arm.exprBody)
             return nullptr;  // block-body arms deferred
         llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy,
-                                         isStr);
+                                         isStr, scrutTy);
         if (!pm) return nullptr;
         auto* bodyBB =
             llvm::BasicBlock::Create(llvm_, "case.arm", currentFn_);
@@ -3380,9 +3384,62 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
 
 llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut,
                             const sema::TypeSymbol* enumTy,
-                            bool isStr) {
+                            bool isStr,
+                            const sema::TypeRef* scrutTy) {
     if (dynamic_cast<const ast::DiscardPattern*>(pat))
         return builder_.getInt1(true);
+
+    // §7 / §19 / issues #447 + #448: a nullable VALUE type scrutinee is a
+    // tagged {i8 hasValue; T value} struct, NOT a pointer. All pointer-based
+    // pattern tests (null-check via ConstantPointerNull, emitEquals on the
+    // full struct) produce illegal IR on this operand. Instead extract the two
+    // fields and route each pattern through hasValue-based tests:
+    //   NullPattern      → !hasValue (the null slot is absent)
+    //   ConstantPattern  → hasValue AND value == const
+    //   NamedPattern     → hasValue AND innerValue == enumConst
+    //   DiscardPattern   → true (handled above, no change)
+    // The non-nullable path is taken for all other scrutinee kinds.
+    bool isNullableVal = scrutTy && isNullableValueTy(scrutTy) &&
+                         scrut->getType()->isStructTy();
+    if (isNullableVal) {
+        llvm::Value* hasVal = nullablePrimHasValue(scrut);  // i1
+        llvm::Value* innerVal = nullablePrimValue(scrut);   // the T field
+
+        // §19: NullPattern matches when hasValue == 0.
+        if (dynamic_cast<const ast::NullPattern*>(pat))
+            return builder_.CreateNot(hasVal, "null.match");
+
+        // §19.8: NamedPattern on a nullable enum — hasValue AND enum == const.
+        if (auto* np = dynamic_cast<const ast::NamedPattern*>(pat)) {
+            if (enumTy && np->name && !np->name->parts.empty()) {
+                if (llvm::Value* cv =
+                        enumConstantByName(enumTy, np->name->parts.back())) {
+                    llvm::Value* eq = emitEquals(innerVal, cv, /*isStr=*/false);
+                    return builder_.CreateAnd(hasVal, eq, "nv.enum.match");
+                }
+            }
+            return nullptr;  // type-test pattern deferred
+        }
+
+        // §19: ConstantPattern on a nullable value — hasValue AND value == c.
+        if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(pat)) {
+            llvm::Value* any = builder_.getInt1(false);
+            for (const auto& c : cp->constants) {
+                if (!c) continue;
+                llvm::Value* cv = lowerExpr(*c);
+                if (!cv) cv = enumConstantOfPatternExpr(*c, enumTy);
+                if (!cv) return nullptr;
+                llvm::Value* eq = emitEquals(innerVal, cv, /*isStr=*/false);
+                llvm::Value* match = builder_.CreateAnd(hasVal, eq, "nv.val.match");
+                any = builder_.CreateOr(any, match);
+            }
+            return any;
+        }
+
+        // Other pattern kinds on a nullable value are deferred.
+        return nullptr;
+    }
+
     // §19.5: a BindingPattern's match condition depends on whether it is
     // typed. An unconstrained `var x` always matches; a typed `var x: T`
     // is a type test (`scrut is-a T`) and must NOT match a value of an

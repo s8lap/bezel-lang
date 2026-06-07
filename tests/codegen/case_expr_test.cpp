@@ -408,3 +408,112 @@ BEZEL_TEST(codegen_cg28, control_all_value_arms_same_type) {
         "var x := 2; "
         "var r := case x 1 => 10, 2 => 20, _ => 30 end; return r;"), 20);
 }
+
+// ── §19 / §7 / issues #447 + #448: case over nullable VALUE types ─────────────
+// A nullable value type lowers to {i8 hasValue; T value}. The existing case
+// lowering passes the struct scrutinee to patternMatches, which previously tried
+// to emit pointer comparisons (null pattern) or scalar comparisons with the full
+// struct (constant/enum patterns) — both generate illegal IR / SIGILL (#447).
+// The fix checks the scrutinee's TypeRef: when it is a nullable value type, null
+// arms test !hasValue, constant arms test hasValue AND value==const, and _ is
+// unchanged (always true).
+
+// #447: case over int? — value arm (42), null arm, _ arm (no crash, correct sel).
+BEZEL_TEST(codegen_cg28_nullable_value_case, int_nullable_value_arm_spec_19_7_issue_447) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := 42; "
+        "var r := case x "
+        "  42 => 1, "
+        "  null => 2, "
+        "  _ => 3 "
+        "end; return r;"), 1);
+}
+
+// #447: null arm selected when x: int? = null
+BEZEL_TEST(codegen_cg28_nullable_value_case, int_nullable_null_arm_spec_19_7_issue_447) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := null; "
+        "var r := case x "
+        "  42 => 1, "
+        "  null => 2, "
+        "  _ => 3 "
+        "end; return r;"), 2);
+}
+
+// #447: _ arm fires when no constant or null arm matches
+BEZEL_TEST(codegen_cg28_nullable_value_case, int_nullable_discard_arm_spec_19_7_issue_447) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := 7; "
+        "var r := case x "
+        "  42 => 1, "
+        "  _ => 99 "
+        "end; return r;"), 99);
+}
+
+// #447: nullable enum case — value arm selected (Color.Green)
+BEZEL_TEST(codegen_cg28_nullable_value_case, enum_nullable_value_arm_spec_19_8_issue_447) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color? := Color.Green; "
+        "  return case c "
+        "    Color.Green => 10, "
+        "    Color.Red => 20, "
+        "    null => 30, "
+        "    _ => 40 "
+        "  end; "
+        "end Main; end C;"), 10);
+}
+
+// #447: nullable enum case — null arm selected when c: Color? = null
+BEZEL_TEST(codegen_cg28_nullable_value_case, enum_nullable_null_arm_spec_19_8_issue_447) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color? := null; "
+        "  return case c "
+        "    Color.Green => 10, "
+        "    null => 30, "
+        "    _ => 40 "
+        "  end; "
+        "end Main; end C;"), 30);
+}
+
+// #447: nullable enum — _ (discard) arm fires when no value arm matches
+BEZEL_TEST(codegen_cg28_nullable_value_case, enum_nullable_discard_arm_spec_19_8_issue_447) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color? := Color.Blue; "
+        "  return case c "
+        "    Color.Green => 10, "
+        "    null => 30, "
+        "    _ => 99 "
+        "  end; "
+        "end Main; end C;"), 99);
+}
+
+// REGRESSION: non-nullable int case still works after the fix
+BEZEL_TEST(codegen_cg28_nullable_value_case, nonnull_int_case_regression) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; "
+        "var r := case x 5 => 1, _ => 0 end; return r;"), 1);
+}
+
+// REGRESSION: non-nullable enum case still works after the fix
+BEZEL_TEST(codegen_cg28_nullable_value_case, nonnull_enum_case_regression) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
+        "class C public static method Main(): int "
+        "  var c: Color := Color.Red; "
+        "  return case c "
+        "    Color.Green => 10, "
+        "    Color.Red => 20, "
+        "    _ => 30 "
+        "  end; "
+        "end Main; end C;"), 20);
+}
