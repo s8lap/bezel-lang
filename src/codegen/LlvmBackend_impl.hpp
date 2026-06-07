@@ -1470,6 +1470,11 @@ private:
     llvm::GlobalVariable* descriptorForTypeName(const sema::TypeRef* rt,
                                                 const ast::Type* tyNode);
 
+    // #473 / §19.3: descriptor global for a NamedPattern type-test name
+    // (`Dog`, `M.Dog`), resolved by name against the local type symbols.
+    llvm::GlobalVariable* descriptorForPatternName(
+        const ast::QualifiedName* name);
+
     // Returns true if `tt` is a Named type with no user declaration, i.e.,
     // one of the built-in exception types (Exception, ArgumentException, …).
     bool isBuiltinExceptionType(const sema::TypeRef* tt) const {

@@ -1111,6 +1111,43 @@ llvm::GlobalVariable* Emitter::descriptorForTypeName(const sema::TypeRef* rt,
 }
 
 
+// #473 / §19.3: resolve a NamedPattern's QualifiedName (`Dog`, `M.Dog`) to a
+// type descriptor for a type-test pattern (`emitIsA`). A bare type name in a
+// pattern carries no `Type` node and thus no `resolvedType` entry, so we
+// resolve it by its last name part against the local type symbols (mirroring
+// the sema exhaustiveness check, ExprTypecheck.cpp, and the
+// DestructuringPattern record-by-name lookup).
+//
+// Only CLASS and INTERFACE names resolve here: §19.3 type-test patterns
+// match a reference scrutinee against a class/interface hierarchy via the
+// runtime type tag. Records and enums ALSO have descArray_ entries (for
+// boxing, setupBoxDescriptors), but a bare record/enum name is NOT a
+// reference type test — emitIsA on an unboxed value-type struct is illegal
+// IR (the type-tag walk assumes a pointer). Record matching uses the
+// destructuring form `Pt(...)` (DestructuringPattern); enum constants are
+// matched as ConstantPattern/NamedPattern equality. So we skip Record/Enum
+// here and leave those shapes to their own handlers (returning null →
+// deferred). A built-in exception class used as a pattern falls back to
+// builtinDesc_.
+llvm::GlobalVariable* Emitter::descriptorForPatternName(
+        const ast::QualifiedName* name) {
+    if (!name || name->parts.empty()) return nullptr;
+    std::string_view last = name->parts.back();
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->name != last) continue;
+        if (ts->kind != ast::TypeDeclKind::Class &&
+            ts->kind != ast::TypeDeclKind::Interface)
+            return nullptr;  // record/enum name — not a reference type test
+        auto it = descArray_.find(ts);
+        if (it != descArray_.end()) return it->second;
+    }
+    auto bit = builtinDesc_.find(std::string(last));
+    if (bit != builtinDesc_.end()) return bit->second;
+    return nullptr;
+}
+
+
 void Emitter::emitThrowBuiltin(const char* name) {
     auto vit = builtinVtable_.find(name);
     if (vit == builtinVtable_.end()) return;

@@ -3357,6 +3357,16 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             return nullptr;  // block-body arms deferred
         llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy,
                                          isStr, scrutTy);
+        // #473: with type-test (`Dog`), primitive-type (`int`), typed-binding
+        // (`var x: Dog`/`var v: int`), and the existing constant/range/null/
+        // destructure patterns all lowered, the #473 repros no longer reach
+        // here. A null result now means a genuinely unsupported pattern shape
+        // (e.g. a bare record name `Pt` with no parens). Returning null bails
+        // out of lowerCaseExpr; the half-built `case.end` is left
+        // unterminated, which the always-on IR verifier reports as a
+        // COMPILE-TIME error — the correct, visible failure for a not-yet-
+        // implemented pattern (better than emitting a binary that traps at
+        // run time). The #473 fix is in patternMatches above, not here.
         if (!pm) return nullptr;
         auto* bodyBB =
             llvm::BasicBlock::Create(llvm_, "case.arm", currentFn_);
@@ -3504,16 +3514,43 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     // a Circle. (Slot registration still happens in the arm-body preamble.)
     // CG43: a bare qualified name `E.Red` parses as a NamedPattern; when
     // the scrutinee is an enum, resolve it to that enum's constant and
-    // test equality. (A name denoting a type — a type-test pattern — is
-    // still deferred.)
+    // test equality.
+    //
+    // #473 / §19.3 + §19.5: a bare type name `Dog` is *also* a NamedPattern
+    // (the parser emits NamedPattern for any non-primitive identifier and
+    // lets sema/codegen disambiguate Constant-vs-Type-test per §A.7). When
+    // the name resolves to a class/interface type, the pattern is a
+    // **type-test pattern**: it matches when the scrutinee is-a that type
+    // ("Subtypes match: a Dog value matches an Animal pattern", §19.3) and,
+    // per §19.5, only when the scrutinee is non-null — emitIsA returns false
+    // for a null object pointer (its type-tag walk dereferences the vtable
+    // only on a non-null pointer), so the is-a test embeds the non-null
+    // requirement for reference scrutinees. Without this handler `Dog =>`
+    // returned nullptr → lowerCaseExpr bailed leaving `case.end`
+    // unterminated (the #473 malformed-IR / crash).
     if (auto* np = dynamic_cast<const ast::NamedPattern*>(pat)) {
         if (enumTy && np->name && !np->name->parts.empty()) {
             if (llvm::Value* cv =
                     enumConstantByName(enumTy, np->name->parts.back()))
                 return emitEquals(scrut, cv, isStr);
         }
-        return nullptr;  // type-test pattern deferred
+        // §19.3/§19.5: type-test pattern on a class/interface scrutinee.
+        if (llvm::GlobalVariable* desc =
+                descriptorForPatternName(np->name.get()))
+            return emitIsA(scrut, desc);
+        return nullptr;  // unresolved name — deferred
     }
+    // #473 / §19.3: a primitive type pattern `int`, `string`, … (TypePattern).
+    // The parser routes primitive-type-keyword patterns here (Parser_Exprs
+    // parsePattern). When the scrutinee's static type already IS that
+    // primitive (the well-typed case — sema requires the pattern type be
+    // compatible with the scrutinee), the value is present and the type test
+    // is statically satisfied: a non-nullable primitive is never null, so
+    // §19.5's "matches only non-null values" holds trivially. (A nullable
+    // VALUE-type scrutinee is handled by the isNullableVal branch above,
+    // which never falls through to here.)
+    if (dynamic_cast<const ast::TypePattern*>(pat))
+        return builder_.getInt1(true);
     if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(pat)) {
         llvm::Value* any = builder_.getInt1(false);
         for (const auto& c : cp->constants) {
@@ -3584,13 +3621,28 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // TODO: wire binding symbol → alloca and store scrut into it.
         // For the type-constrained form (`var x: T`), emit a type test:
         if (bp->type) {
-            // Type-test pattern: matches if scrutinee is-a T.
+            // §19.3/§19.5: `var x: T` is a type-test + binding — it matches
+            // if the scrutinee is-a T and (§19.5) is non-null.
             if (auto* rt = ctx_.resolvedType(*bp->type)) {
                 if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
                     auto dit = descArray_.find(rt->declaration);
                     if (dit != descArray_.end())
                         return emitIsA(scrut, dit->second);
+                    // #473: a named class with no descArray_ entry can still
+                    // be resolved by name (mirrors the bare-NamedPattern path).
+                    if (llvm::GlobalVariable* desc =
+                            descriptorForPatternName(bp->type->name.get()))
+                        return emitIsA(scrut, desc);
                 }
+                // #473 / §19.3: `var v: P` where P is a primitive type. When
+                // the scrutinee's static type already IS that primitive (the
+                // well-typed case), the value is present and the type test is
+                // statically satisfied — a non-nullable primitive is never
+                // null (§19.5 holds trivially). The nullable VALUE-type
+                // scrutinee path is handled by the isNullableVal branch above
+                // and never reaches here.
+                if (rt->kind == sema::TypeRef::Kind::Primitive)
+                    return builder_.getInt1(true);
             }
             return nullptr;  // type not found — deferred
         }
