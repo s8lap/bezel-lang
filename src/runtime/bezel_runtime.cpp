@@ -2879,6 +2879,36 @@ extern "C" void* bz_event_source_new(void) {
     return s;
 }
 
+// §24.1 / §22.13 (#477 B6): a STATIC event's backing EventSource is a static
+// owned field with PROGRAM-EXIT disposal. Track the static sources in a global
+// list and free them (handlers + struct) via an atexit handler installed once,
+// so the program-exit-disposal obligation is met across every exit path
+// (normal return, early return, or an unhandled-exception interceptor that
+// still drains atexit). Allocated once per static event at program start.
+static std::vector<bz_event_source_t*>* g_static_event_sources = nullptr;
+
+static void bz_free_static_event_sources(void) {
+    if (!g_static_event_sources) return;
+    for (bz_event_source_t* s : *g_static_event_sources) {
+        if (!s) continue;
+        free(s->handlers);
+        free(s);
+    }
+    delete g_static_event_sources;
+    g_static_event_sources = nullptr;
+}
+
+extern "C" void* bz_static_event_source_new(void) {
+    auto* s = (bz_event_source_t*)calloc(1, sizeof(bz_event_source_t));
+    s->next_token = 1;
+    if (!g_static_event_sources) {
+        g_static_event_sources = new std::vector<bz_event_source_t*>();
+        atexit(bz_free_static_event_sources);
+    }
+    g_static_event_sources->push_back(s);
+    return s;
+}
+
 extern "C" int64_t bz_event_add(void* srcp, void* closure) {
     auto* s = (bz_event_source_t*)srcp;
     if (!s) return 0;

@@ -4605,8 +4605,53 @@ const sema::EventSymbol* Emitter::eventSymbolOf(const ast::Expr& e) {
 llvm::Value* Emitter::eventSourcePtr(const ast::Expr& e) {
     const sema::EventSymbol* es = eventSymbolOf(e);
     if (!es || !es->parent) return nullptr;
+
+    // §24.1 / §22.13 (#477 B6): a STATIC event has no per-instance slot — its
+    // backing EventSource<T> is a program-wide global, allocated in Main's
+    // prologue. Load it directly (no receiver).
+    if (auto sit = staticEventGlobals_.find(es);
+        sit != staticEventGlobals_.end())
+        return builder_.CreateLoad(ptrTy(), sit->second, "static.event.src");
+
+    // §24.3 / §24.7 (#477 B7): the event was resolved on an INTERFACE that
+    // declares it (`i.Ready` where `i: ISource`). The interface has no backing
+    // field — the EventSource<T> lives in the implementing OBJECT's struct, at
+    // a class-specific offset unknown statically through the interface. Dispatch
+    // through the object's itable (exactly as an interface METHOD call, §13):
+    // each implementing class contributes an accessor `ptr get(this)` returning
+    // its backing source; the itab slot for this event holds that accessor.
     auto idxIt = fieldIndex_.find(es);
-    if (idxIt == fieldIndex_.end()) return nullptr;  // static event (deferred)
+    if (idxIt == fieldIndex_.end() &&
+        es->parent->kind == ast::TypeDeclKind::Interface) {
+        auto kIt = ifaceEventIndex_.find(es);
+        auto dIt = descArray_.find(es->parent);
+        if (kIt == ifaceEventIndex_.end() || dIt == descArray_.end())
+            return nullptr;
+        llvm::Value* recv = nullptr;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (ma->target) recv = lowerExpr(*ma->target);
+        }
+        if (!recv) return nullptr;
+        // vptr[1] = itmap$C; bz_itable_lookup(itmap, td$I) → itab$C$I;
+        // accessor = itab$C$I[k]; src = accessor(recv).
+        auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
+                                  {ptrTy(), ptrTy()});
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+        llvm::Value* itmapPtr = builder_.CreateLoad(
+            ptrTy(), builder_.CreateGEP(ptrTy(), vptr,
+                                        {builder_.getInt32(1)}));
+        llvm::Value* itab = builder_.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+            lookupFn, {itmapPtr, dIt->second}, "itab");
+        llvm::Value* accFn = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), itab,
+                               {builder_.getInt32(kIt->second)}),
+            "evt.acc");
+        auto* accTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+        return builder_.CreateCall(accTy, accFn, {recv}, "event.src");
+    }
+    if (idxIt == fieldIndex_.end()) return nullptr;
     // Receiver: implicit `this` for a bare identifier; the target object for
     // `obj.Clicked` / `this.Clicked`.
     llvm::Value* recv = nullptr;
