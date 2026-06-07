@@ -1024,10 +1024,61 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // stdlib §6.7 (line 2872): Task.WhenAll(tasks: Array<Task>):
                         // Task. Completes when all input tasks complete; no result
-                        // value (bare Task). The Array<Task> argument shape is already
-                        // expressible (Array<T> is array-backed, T=Task).
+                        // value (bare Task).
+                        //
+                        // stdlib §6.7 (line 2875):
+                        // Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
+                        // When the input is Array<Task<T>> (the element Task has a
+                        // generic arg T), the result is Task<Array<T>>. Detect this
+                        // by inspecting the first argument's element type.
                         if (m == "WhenAll") {
-                            ctx_.setExprType(&ce, makeTaskTypeRef());
+                            // Check if the arg is Array<Task<T>> (generic variant).
+                            TypeRef* resultTy = makeTaskTypeRef();
+                            if (!ce.args.empty() && ce.args[0].value) {
+                                TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+                                // argTy should be Named("Array", [Named("Task", [T])]).
+                                if (argTy && argTy->kind == TypeRef::Kind::Named &&
+                                    !argTy->genericArgs.empty() &&
+                                    argTy->genericArgs[0]) {
+                                    TypeRef* elemTy = argTy->genericArgs[0];
+                                    // elemTy is Task<T> when it has a generic arg.
+                                    // Check: elemTy.name == "Task" and has genericArgs.
+                                    bool elemIsTask = false;
+                                    if (elemTy->kind == TypeRef::Kind::Named &&
+                                        !elemTy->genericArgs.empty() &&
+                                        elemTy->genericArgs[0]) {
+                                        // Resolve name: may be !declaration astNode or builtin.
+                                        std::string_view ename;
+                                        if (!elemTy->declaration && elemTy->astNode &&
+                                            elemTy->astNode->name &&
+                                            !elemTy->astNode->name->parts.empty())
+                                            ename = elemTy->astNode->name->parts[0];
+                                        else if (elemTy->declaration && !elemTy->declaration->decl)
+                                            ename = elemTy->declaration->name;
+                                        if (ename == "Task" || ename == "OwnedTask")
+                                            elemIsTask = true;
+                                    }
+                                    if (elemIsTask) {
+                                        // T is elemTy->genericArgs[0].
+                                        TypeRef* T = elemTy->genericArgs[0];
+                                        // Build Array<T> TypeRef.
+                                        auto* arrTy = ctx_.makeTypeRef();
+                                        arrTy->kind = TypeRef::Kind::Named;
+                                        arrTy->nullable = false;
+                                        auto* arrAnn = new ast::Type();
+                                        arrAnn->kind = ast::TypeKind::Named;
+                                        auto* arrNm = new ast::QualifiedName();
+                                        arrNm->parts.push_back("Array");
+                                        arrAnn->name.reset(arrNm);
+                                        arrTy->astNode = arrAnn;
+                                        arrTy->genericArgs.push_back(T);
+                                        // Build Task<Array<T>> TypeRef.
+                                        resultTy = makeTaskTypeRef();
+                                        resultTy->genericArgs.push_back(arrTy);
+                                    }
+                                }
+                            }
+                            ctx_.setExprType(&ce, resultTy);
                         }
                         // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>):
                         // Task<Task>. Completes with the first-done task pointer as

@@ -3084,10 +3084,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // cross-thread suspend/resume path (§30.13): `await Task.Delay(...)` registers
     // its continuation via bz_task_then and resumes on the pool when the timer
     // fires. The Delay(int) overload's arg is milliseconds; Delay(TimeSpan)'s arg
-    // is an i64 tick count (100-ns units) converted to ms. The CancellationToken
-    // overloads are accepted but the token is not yet honored for an in-flight
-    // delay (cancelling a running delay is a deferred refinement — the delay still
-    // completes normally); the first argument selects the duration either way.
+    // is an i64 tick count (100-ns units) converted to ms.
+    //
+    // stdlib §6.7 (line 2868) / spec §30.8: Delay(ms, token) and Delay(span, token)
+    // overloads now honor the CancellationToken: if the token is already cancelled
+    // at call time OR becomes cancelled during the sleep, the returned task is
+    // faulted with OperationCanceledException (bz_task_delay_cancelable, #451).
+    // Mid-delay polling checks the token after the sleep elapses; sub-millisecond
+    // interrupt is a deferred refinement (future increment).
     if (cls == "Task") {
         if (m == "Delay" && !call.args.empty() && call.args[0].value) {
             llvm::Value* arg = lowerExpr(*call.args[0].value);
@@ -3107,6 +3111,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 ms = arg->getType()->isIntegerTy(64)
                          ? arg
                          : builder_.CreateSExtOrTrunc(arg, i64());
+            }
+            // Token-aware overloads: Delay(ms, token) and Delay(span, token).
+            // If a second argument is provided and it is a CancellationToken
+            // (not None — the None sentinel is a null pointer and disables
+            // cancellation checks), dispatch to bz_task_delay_cancelable.
+            if (call.args.size() >= 2 && call.args[1].value) {
+                llvm::Value* tokArg = lowerExpr(*call.args[1].value);
+                if (tokArg) {
+                    // Retrieve the OperationCanceledException vtable for the
+                    // runtime to construct the OCE object if cancelled.
+                    llvm::Value* oceVtable =
+                        llvm::ConstantPointerNull::get(ptrTy());  // fallback
+                    auto vit = builtinVtable_.find("OperationCanceledException");
+                    if (vit != builtinVtable_.end())
+                        oceVtable = builder_.CreateBitCast(vit->second, ptrTy());
+                    auto* delayFn = declareC("bz_task_delay_cancelable",
+                                             ptrTy(), {i64(), ptrTy(), ptrTy()});
+                    return builder_.CreateCall(delayFn,
+                        {ms, tokArg, oceVtable}, "task.delay.cancel");
+                }
             }
             auto* delayFn = declareC("bz_task_delay", ptrTy(), {i64()});
             return builder_.CreateCall(delayFn, {ms}, "task.delay");
@@ -3136,13 +3160,52 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 "task.from_result");
         }
         // stdlib §6.7 (line 2872): Task.WhenAll(tasks: Array<Task>): Task.
-        // The argument is a bz_array_t* of task pointers (Array<Task>).
-        // Returns a new task that completes when all input tasks complete.
+        // stdlib §6.7 (line 2875): Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
+        //
+        // Dispatch: if the arg is Array<Task<T>> (the element type is Task<T>,
+        // i.e. Task with a generic arg), call bz_task_when_all_results which
+        // collects each task's T-typed result into an Array<T> and completes
+        // the aggregate with the array pointer. Otherwise (Array<Task>, no
+        // generic arg on Task), call the plain bz_task_when_all.
         if (m == "WhenAll" && !call.args.empty() && call.args[0].value) {
             llvm::Value* arr = lowerExpr(*call.args[0].value);
             if (!arr) return nullptr;
-            auto* whenAllFn = declareC("bz_task_when_all", ptrTy(), {ptrTy()});
-            return builder_.CreateCall(whenAllFn, {arr}, "task.when_all");
+            // Check if the arg is Array<Task<T>> (generic result variant).
+            // arrTy is the sema TypeRef for the argument expression.
+            auto* arrTy = ctx_.exprType(*call.args[0].value);
+            // arrTy should be Named("Array", [Named("Task", [T])]).
+            // If Task<T> has a non-empty genericArgs, we use the typed variant.
+            bool isTyped = false;
+            int64_t elemSz = 8;
+            if (arrTy && arrTy->kind == sema::TypeRef::Kind::Named &&
+                !arrTy->genericArgs.empty() && arrTy->genericArgs[0]) {
+                auto* elemTaskTy = arrTy->genericArgs[0];
+                // elemTaskTy should be Task<T>.
+                auto elemName = builtinTypeName(elemTaskTy);
+                if ((elemName == "Task" || elemName == "OwnedTask") &&
+                    !elemTaskTy->genericArgs.empty() &&
+                    elemTaskTy->genericArgs[0]) {
+                    // T is elemTaskTy->genericArgs[0].
+                    auto* T = elemTaskTy->genericArgs[0];
+                    llvm::Type* tLlvmTy = lowerTypeRef(T);
+                    if (tLlvmTy) {
+                        elemSz = static_cast<int64_t>(
+                            module_->getDataLayout().getTypeAllocSize(tLlvmTy));
+                    }
+                    isTyped = true;
+                }
+            }
+            if (isTyped) {
+                // Task.WhenAll<T>: collect results into Array<T>.
+                auto* whenAllResFn = declareC("bz_task_when_all_results",
+                                              ptrTy(), {ptrTy(), i64()});
+                return builder_.CreateCall(whenAllResFn,
+                    {arr, builder_.getInt64(elemSz)},
+                    "task.when_all_results");
+            } else {
+                auto* whenAllFn = declareC("bz_task_when_all", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(whenAllFn, {arr}, "task.when_all");
+            }
         }
         // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>): Task<Task>.
         // Returns a new task that completes (with a ptr-sized result — the first-

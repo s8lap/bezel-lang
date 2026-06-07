@@ -1687,6 +1687,120 @@ void* bz_task_when_all(void* task_arr) {
     return aggregate;
 }
 
+// stdlib §6.7 / §30.10: Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
+// Variant of bz_task_when_all that collects each input task's result (elem_size
+// bytes) into a new bz_array_t and completes the aggregate with a ptr-sized
+// result (the Array<T> pointer). Fault propagation matches bz_task_when_all:
+// the first faulted input's exception propagates; the result array is freed.
+//
+// Thread safety: each continuation writes to a distinct results[] slot (no
+// aliasing), so no mutex is needed for slot stores. The acq_rel fetch_sub on
+// `remaining` provides the ordering: the last decrement acquires all prior
+// result stores (via the release from each preceding thread's fetch_sub), so
+// the final continuation sees the complete results[] before building the array.
+struct BzWhenAllResultsCtx {
+    bz_task_t* aggregate;
+    std::atomic<int64_t> remaining;      // pending completion count
+    std::atomic<int64_t> refcount;       // continuation refcount (= n at init)
+    std::atomic<bool> any_fault;         // true once a faulted input is seen
+    std::atomic<void*> first_error_obj;  // error_obj of the first faulted task
+    int64_t n;                           // total task count
+    int64_t elem_size;                   // sizeof(T) — bytes per result element
+    void** result_bufs;                  // result_bufs[i]: malloc'd copy of task i's result
+};
+
+struct BzWhenAllResultsSlot {
+    BzWhenAllResultsCtx* ctx;
+    int64_t idx;
+};
+
+void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
+    auto* arr = (bz_array_t*)task_arr;
+    int64_t n = bz_array_len(arr);
+    auto* aggregate = new bz_task_t();
+    if (n == 0) {
+        // Empty array: complete immediately with an empty Array<T>.
+        void* emptyArr = bz_array_alloc(elem_size, 0);
+        aggregate->result = malloc(sizeof(void*));
+        memcpy(aggregate->result, &emptyArr, sizeof(void*));
+        aggregate->result_size = (int64_t)sizeof(void*);
+        aggregate->done = true;
+        return aggregate;
+    }
+    // Allocate result buffer slots (one per task). Each slot holds a malloc'd
+    // copy of the task's raw result bytes (elem_size bytes).
+    void** result_bufs = (void**)calloc((size_t)n, sizeof(void*));
+    auto* ctx = new BzWhenAllResultsCtx{
+        aggregate, {n}, {n}, {false}, {nullptr}, n, elem_size, result_bufs};
+    for (int64_t i = 0; i < n; ++i) {
+        void* t = nullptr;
+        bz_array_get(arr, i, &t, sizeof(void*));
+        // Per-slot: allocate a BzWhenAllResultsSlot to carry (ctx, idx) into
+        // the continuation. The slot is freed by the continuation itself.
+        auto* slot = new BzWhenAllResultsSlot{ctx, i};
+        bz_task_then(t,
+            [](void* completedTask, void* state) {
+                auto* slot = (BzWhenAllResultsSlot*)state;
+                auto* c  = slot->ctx;
+                int64_t i = slot->idx;
+                delete slot;
+
+                // §30.9 / #443: fault propagation — first faulted task wins.
+                if (bz_task_is_error(completedTask)) {
+                    bool expected = false;
+                    if (c->any_fault.compare_exchange_strong(
+                            expected, true,
+                            std::memory_order_acq_rel,
+                            std::memory_order_relaxed)) {
+                        void* errObj = bz_task_error_obj(completedTask);
+                        c->first_error_obj.store(errObj, std::memory_order_release);
+                    }
+                } else {
+                    // Copy this task's result bytes into results[i].
+                    void* resPtr = bz_task_await_sync(completedTask);
+                    if (resPtr && c->elem_size > 0) {
+                        void* buf = malloc((size_t)c->elem_size);
+                        memcpy(buf, resPtr, (size_t)c->elem_size);
+                        c->result_bufs[i] = buf;
+                    }
+                }
+
+                // When ALL inputs done (remaining → 0): build the result array.
+                if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    if (c->any_fault.load(std::memory_order_acquire)) {
+                        // Free any collected result bufs (we won't use them).
+                        for (int64_t j = 0; j < c->n; ++j) free(c->result_bufs[j]);
+                        free(c->result_bufs);
+                        void* errObj = c->first_error_obj.load(std::memory_order_acquire);
+                        bz_task_complete_error_obj(c->aggregate, errObj);
+                    } else {
+                        // Build Array<T> from collected result bufs.
+                        void* resultArr = bz_array_alloc(c->elem_size, c->n);
+                        for (int64_t j = 0; j < c->n; ++j) {
+                            if (c->result_bufs[j])
+                                bz_array_add(resultArr, c->result_bufs[j],
+                                             c->elem_size);
+                            else {
+                                // Zero-result slot (task had 0-byte result).
+                                void* zero = calloc(1, (size_t)c->elem_size);
+                                bz_array_add(resultArr, zero, c->elem_size);
+                                free(zero);
+                            }
+                            free(c->result_bufs[j]);
+                        }
+                        free(c->result_bufs);
+                        // Complete the aggregate with the Array<T> pointer.
+                        bz_task_complete(c->aggregate, &resultArr, sizeof(void*));
+                    }
+                }
+                if (c->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                    delete c;
+            },
+            slot);
+    }
+    return aggregate;
+}
+
 // stdlib §6.7 / §30.10: Task.WhenAny(tasks: Array<Task>): Task<Task>.
 // Returns a new task that completes with a ptr-sized result (the pointer to the
 // FIRST task that finishes). Uses a shared context with a once-flag and a
@@ -3655,4 +3769,56 @@ extern "C" int32_t bz_ctoken_throw_if_cancelled(void* token) {
     auto* s = (bz_cancel_state_t*)token;
     if (!s) return 0;   // None — never cancels
     return s->cancelled ? 1 : 0;
+}
+
+// stdlib §6.7 / spec §30.8: task helpers for CancellationToken-aware Delay.
+//
+// bz_task_make_oce(oce_vtable): allocate a 16-byte OperationCanceledException
+// object (format: {void* vtable, void* msg}; calloc zeros msg). The vtable
+// pointer is supplied by codegen so the runtime does not need to know the LLVM
+// vtable global's address.
+static void* bz_task_make_oce(void* oce_vtable) {
+    void* obj = calloc(1, 16);
+    memcpy(obj, &oce_vtable, sizeof(void*));  // slot 0 = vtable
+    return obj;
+}
+
+// stdlib §6.7 (line 2868) / spec §30.8:
+// Task.Delay(milliseconds: int, token: CancellationToken): Task.
+//
+// Token-aware Delay. If the token is already cancelled at call time, returns an
+// immediately-faulted task (OperationCanceledException). Otherwise, starts the
+// timer worker but also polls the token at the WAKE point: if the sleep elaps
+// and the token is still not cancelled, complete normally; if the token was
+// cancelled during the sleep, complete with OCE. Mid-sleep polling (shorter
+// sleep intervals) is deferred — only the pre-delay and post-delay checks are
+// done here. oce_vtable is the vtable pointer for OperationCanceledException,
+// supplied by codegen so the runtime can construct the exception object.
+void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtable) {
+    auto* s = (bz_cancel_state_t*)token;
+    auto* task = new bz_task_t();
+    // Pre-check: if already cancelled, fault immediately.
+    if (s && s->cancelled) {
+        void* excObj = bz_task_make_oce(oce_vtable);
+        { std::lock_guard<std::mutex> lk(task->mtx);
+          task->error_obj = excObj;
+          task->is_error = true;
+          task->done = true; }
+        return task;
+    }
+    // Not cancelled: schedule the delay worker.
+    if (!g_scheduler) bz_scheduler_init(4);
+    int64_t ms = milliseconds < 0 ? 0 : milliseconds;
+    g_scheduler->submit([task, ms, s, oce_vtable]() {
+        if (ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        // Post-sleep check: if token was cancelled while sleeping, fault.
+        if (s && s->cancelled) {
+            void* excObj = bz_task_make_oce(oce_vtable);
+            bz_task_complete_error_obj(task, excObj);
+        } else {
+            bz_task_complete(task, nullptr, 0);
+        }
+    });
+    return task;
 }
