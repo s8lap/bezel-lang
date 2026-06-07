@@ -1481,6 +1481,9 @@ private:
     // (starting at 0). Only integer-literal initializers are evaluated;
     // other constant expressions are deferred.
     void computeEnumValues();
+    // §10 / #482 fix A: helper — populate enumValue_ for a single enum
+    // TypeSymbol (both module-level and nested-in-class).
+    void populateEnumValuesFromDecl(const sema::TypeSymbol* ts);
 
     // CG30: if `e` resolves to an enum constant, its integer value (i32).
     llvm::Value* enumConstant(const ast::Expr& e);

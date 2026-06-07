@@ -372,6 +372,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // call-constructible: per §9.5 a record is built with `new Record(...)`
     // like a class, so a bare `Record(...)` call is not construction and is
     // left untyped here — it surfaces as an error at the use site.)
+    // §10 / #482 fix B: also accept a NestedTypeSymbol whose ->type is an enum
+    // — calling `Outer.Inner(i)` where `Inner` is a nested enum reaches here as
+    // a NestedTypeSymbol; it does NOT inherit TypeSymbol, so the branch below
+    // would miss it without this extra check. per §10 the result type is the
+    // inner enum's TypeSymbol.
+    if (auto* nts = dynamic_cast<NestedTypeSymbol*>(calleeSym)) {
+        if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum) {
+            TypeRef* et = ctx_.makeTypeRef();
+            et->kind = TypeRef::Kind::Named;
+            et->declaration = nts->type;
+            ctx_.setExprType(&ce, et);
+            return;
+        }
+    }
     if (auto* ts = dynamic_cast<TypeSymbol*>(calleeSym)) {
         if (ts->kind == ast::TypeDeclKind::Enum) {
             TypeRef* et = ctx_.makeTypeRef();
@@ -2622,6 +2636,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // static-vs-instance correctness of the member is
                 // enforced by the static-context checks, not here.)
                 targetType = ts;
+            } else if (auto* nts = dynamic_cast<NestedTypeSymbol*>(sym)) {
+                // §11.3 / #482 fix B: a NestedTypeSymbol (e.g. `Container.Status`
+                // resolves to a NestedTypeSymbol for `Status`) is used as the
+                // target of a further member access — e.g. `Container.Status.Inactive`.
+                // NestedTypeSymbol does NOT inherit TypeSymbol, so the branch above
+                // misses it. Extract the inner TypeSymbol so enum-constant lookup
+                // (and other member-access paths) work correctly.
+                if (nts->type) targetType = nts->type;
             }
         }
     }

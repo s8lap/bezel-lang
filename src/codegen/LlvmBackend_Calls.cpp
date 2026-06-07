@@ -5008,6 +5008,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // CG44: an enum cast `E(i)` (§5.4) — the callee is an enum type
     // name. An enum is represented by its underlying integer (i32), so
     // the argument, width-adjusted to i32, is the enum value.
+    // §10 / #482 fix B: also accept a NestedTypeSymbol whose ->type is an
+    // enum — a nested enum `Outer.Inner(i)` reaches here as a NestedTypeSymbol;
+    // NestedTypeSymbol does NOT inherit TypeSymbol, so the dynamic_cast below
+    // would miss it without the extra branch.
+    if (auto* nts = dynamic_cast<sema::NestedTypeSymbol*>(calleeSym)) {
+        if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum)
+            return lowerEnumCast(call);
+    }
     if (auto* ets = dynamic_cast<sema::TypeSymbol*>(calleeSym)) {
         if (ets->kind == ast::TypeDeclKind::Enum)
             return lowerEnumCast(call);
