@@ -1109,6 +1109,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 "catch arm body (§31.5)");
         }
     } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // per §30.6: an `async` lambda requires full async state-machine
+        // lowering in codegen, which is not yet implemented. Without the guard
+        // the codegen path (lowerLambda) reuses the outer async method's
+        // frame/blocks/args inside the lambda's own LLVM function, producing
+        // cross-function basic-block references → malformed IR → SIGILL.
+        // Emit a clean compile error here so the program never reaches codegen.
+        // (Decline-with-reasons: full §30.6 async-lambda state-machine codegen
+        // is a separate milestone.)
+        if (lam->isAsync) {
+            ctx_.diagnostics().report(
+                Severity::Error, lam->span.begin,
+                "async lambdas are not yet supported (§30.6); "
+                "use a named async method instead");
+            return;
+        }
         // §A.7 / §21.7: lambdas create their own scope with parameter
         // symbols. Each parameter becomes a ParameterSymbol whose
         // declType is inferred from the explicit type annotation (untyped
