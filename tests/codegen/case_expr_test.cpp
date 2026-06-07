@@ -517,3 +517,243 @@ BEZEL_TEST(codegen_cg28_nullable_value_case, nonnull_enum_case_regression) {
         "  end; "
         "end Main; end C;"), 20);
 }
+
+// ── #473 / §19.3 + §19.5: value-producing `case` EXPRESSION with type-test
+// and typed-binding pattern arms ─────────────────────────────────────────────
+// A bare type name `Dog` parses as a NamedPattern; a typed binding `var x: T`
+// is a BindingPattern with a type annotation. Both are TYPE-TEST patterns
+// (§19.3: "Subtypes match: a Dog value matches an Animal pattern"; §19.5: a
+// type pattern matches only non-null values). Before the fix, the codegen
+// `patternMatches` returned null for these on a class scrutinee, so
+// `lowerCaseExpr` bailed and left `case.end` (or an intermediate block) with
+// no terminator — the always-on IR verifier rejected it (and earlier could
+// crash bezelc with SIGILL/assert). Each test asserts the RETURNED value, so
+// it proves the result PHI / merge is correct, not merely that it compiles.
+
+// #473 B1: a bare type-pattern arm (`Dog => 1, _ => 0`) selects the type arm
+// when the (statically Animal) scrutinee is a Dog at run time. Returns 1.
+BEZEL_TEST(codegen_cg28_473, type_pattern_arm_hit_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal end Dog; "
+        "class C public static method Main(): int "
+        "  using var d := new Dog(); "
+        "  var a: Animal := d; "
+        "  return case a "
+        "    Dog => 1, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// #473 B1 no-match path: a Cat scrutinee does NOT match `Dog =>`, so the `_`
+// arm yields 0. Confirms emitIsA's type test is exact (subtype, not any-ref).
+BEZEL_TEST(codegen_cg28_473, type_pattern_arm_no_match_falls_to_discard) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal end Dog; "
+        "class Cat : Animal end Cat; "
+        "class C public static method Main(): int "
+        "  using var c := new Cat(); "
+        "  var a: Animal := c; "
+        "  return case a "
+        "    Dog => 1, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 0);
+}
+
+// #473 B1 subtype matching (§19.3): a `Dog` value matches an `Animal` pattern.
+BEZEL_TEST(codegen_cg28_473, type_pattern_subtype_matches_base_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal end Dog; "
+        "class C public static method Main(): int "
+        "  using var d := new Dog(); "
+        "  var a: Animal := d; "
+        "  return case a "
+        "    Animal => 1, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 1);
+}
+
+// #473 B2: a typed-binding arm (`var x: Dog`) followed by a bare type-pattern
+// arm. The binding arm matches and binds x; the body uses x. Returns 1.
+BEZEL_TEST(codegen_cg28_473, binding_then_type_pattern_bound_value_used_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal "
+        "  public method Tag(): int return 11; end Tag; "
+        "end Dog; "
+        "class C public static method Main(): int "
+        "  using var d := new Dog(); "
+        "  var a: Animal := d; "
+        "  return case a "
+        "    var x: Dog => x.Tag(), "
+        "    Dog => 2, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 11);
+}
+
+// #473 B2 variant: binding + `when` guard then another arm. The guard FAILS,
+// so the arm is skipped and the next (bare `Dog`) arm matches → 2. Exercises
+// the guard block + merge from a subsequent arm.
+BEZEL_TEST(codegen_cg28_473, binding_with_guard_false_falls_through_spec_19_4) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal "
+        "  public method Size(): int return 3; end Size; "
+        "end Dog; "
+        "class C public static method Main(): int "
+        "  using var d := new Dog(); "
+        "  var a: Animal := d; "
+        "  return case a "
+        "    var x: Dog when x.Size() > 5 => 1, "
+        "    Dog => 2, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 2);
+}
+
+// #473 B2 variant: binding + `when` guard that PASSES — selects the guarded
+// arm and the bound name is usable in the body. Returns 13 (3 + 10).
+BEZEL_TEST(codegen_cg28_473, binding_with_guard_true_selects_arm_spec_19_4) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal "
+        "  public method Size(): int return 3; end Size; "
+        "end Dog; "
+        "class C public static method Main(): int "
+        "  using var d := new Dog(); "
+        "  var a: Animal := d; "
+        "  return case a "
+        "    var x: Dog when x.Size() < 5 => x.Size() + 10, "
+        "    Dog => 2, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 13);
+}
+
+// #473 B2 variant: null pattern then a typed-binding arm on a NULLABLE
+// reference scrutinee. The scrutinee is a non-null Dog → the null arm is
+// skipped and the `var x: Dog` arm matches (§19.5: a type pattern matches
+// only non-null values, which holds here). Returns 7.
+BEZEL_TEST(codegen_cg28_473, null_then_binding_nonnull_ref_spec_19_5) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal end Dog; "
+        "class C public static method Main(): int "
+        "  using var d := new Dog(); "
+        "  var a: Animal? := d; "
+        "  return case a "
+        "    null => 5, "
+        "    var x: Dog => 7, "
+        "    _ => 9 "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+// #473 B2 variant: same shape but the scrutinee IS null → the null arm fires
+// (§19.5: the type pattern does NOT match null). Returns 5.
+BEZEL_TEST(codegen_cg28_473, null_then_binding_null_ref_spec_19_5) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal end Dog; "
+        "class C public static method Main(): int "
+        "  var a: Animal? := null; "
+        "  return case a "
+        "    null => 5, "
+        "    var x: Dog => 7, "
+        "    _ => 9 "
+        "  end; "
+        "end Main; end C;"), 5);
+}
+
+// #473 B2 variant: constant pattern then a typed-binding to a primitive type
+// (`0 => .., var v: int => v`). `var v: int` on an int scrutinee is a
+// statically-satisfied type test that binds the value (§19.3). The constant
+// arm misses (scrutinee 5 != 0), the binding arm catches it → 5.
+BEZEL_TEST(codegen_cg28_473, constant_then_primitive_binding_spec_19_3) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: int := 5; "
+        "var r := case a 0 => 100, var v: int => v end; return r;"), 5);
+}
+
+// #473 B2 variant: the constant arm HITS (scrutinee 0) — the primitive
+// binding arm is not reached. Returns 100.
+BEZEL_TEST(codegen_cg28_473, constant_then_primitive_binding_const_hit_spec_19_3) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: int := 0; "
+        "var r := case a 0 => 100, var v: int => v end; return r;"), 100);
+}
+
+// #473: a bare primitive type pattern `int` (TypePattern) on an int scrutinee.
+// §19.3: a type pattern without binding matches the value; on a non-nullable
+// int it always matches. The constant arm misses → the `int` arm yields 42.
+BEZEL_TEST(codegen_cg28_473, bare_primitive_type_pattern_spec_19_3) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: int := 9; "
+        "var r := case a 0 => 1, int => 42, _ => 0 end; return r;"), 42);
+}
+
+// #473 mixed: 3+ arms with a TYPE pattern in the MIDDLE — exercises the merge
+// (PHI edge) from a middle arm whose pattern emitted a type test. The middle
+// `Cat` arm matches a Cat scrutinee → 2.
+BEZEL_TEST(codegen_cg28_473, type_pattern_in_middle_arm_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal end Dog; "
+        "class Cat : Animal end Cat; "
+        "class Fish : Animal end Fish; "
+        "class C public static method Main(): int "
+        "  using var c := new Cat(); "
+        "  var a: Animal := c; "
+        "  return case a "
+        "    Dog => 1, "
+        "    Cat => 2, "
+        "    Fish => 3, "
+        "    _ => 4 "
+        "  end; "
+        "end Main; end C;"), 2);
+}
+
+// #473 REGRESSION: a value-only case (constant + discard arms) still works
+// after the fix — a plain int result PHI, no type tests.
+BEZEL_TEST(codegen_cg28_473, regression_constant_discard_case_still_works) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 2; "
+        "var r := case x 1 => 10, 2 => 20, _ => 30 end; return r;"), 20);
+}
+
+// #473 REGRESSION: the case STATEMENT form with a type-test pattern still
+// works (the statement form is what the `is`/exhaustiveness paths use). A
+// type-test arm dispatches and a side effect records the selected branch.
+BEZEL_TEST(codegen_cg28_473, regression_case_statement_type_pattern_still_works) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "class Animal end Animal; "
+        "class Dog : Animal end Dog; "
+        "class Cat : Animal end Cat; "
+        "class C public static method Main(): int "
+        "  using var d := new Dog(); "
+        "  var a: Animal := d; "
+        "  var r: int := 0; "
+        "  case a "
+        "    Cat => do r := 1; end, "
+        "    Dog => do r := 2; end, "
+        "    _ => do r := 3; end "
+        "  end; "
+        "  return r; "
+        "end Main; end C;"), 2);
+}
