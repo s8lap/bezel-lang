@@ -193,7 +193,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // The return value is evaluated first, then in-scope `using
         // var`s are disposed (§28.3), then control leaves — so the
         // returned value reflects pre-disposal state.
-        llvm::Value* v = rs->value ? lowerExpr(*rs->value) : nullptr;
+        // #465 / §15.4: `return [e1, …]` whose declared return type is a HEAP
+        // collection (`Array<T>` etc., §15.2). lowerExpr returns null for a
+        // CollectionLiteralExpr, so the return would otherwise yield a null/zero
+        // array (caller crashes). Materialize a real heap collection here (same
+        // bz_array_alloc + bz_array_add as `new`/`.Add`); ownership transfers to
+        // the caller as the §28.3 owned result.
+        llvm::Value* v = nullptr;
+        if (rs->value) {
+            if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    rs->value.get())) {
+                if (!cl->isDict && currentReturnTypeNode_)
+                    if (const sema::TypeRef* rrt =
+                            ctx_.resolvedType(*currentReturnTypeNode_))
+                        v = materializeHeapCollectionLiteral(cl, rrt);
+            }
+            if (!v) v = lowerExpr(*rs->value);
+        }
         if (diverged_) return true;  // CG40: the value expression threw
         // §30.1: inside an async method's Resume function, `return expression;`
         // completes the OUTER task with the value (and `return;` / fall-off

@@ -2126,7 +2126,27 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
         // §15.1 / §16: collection literal `[e1, e2, …]` initializer.
         // Build the array in-place via GEP into the field slot.
         if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
-            cl && !cl->isDict && !cl->elements.empty()) {
+            cl && !cl->isDict) {
+            // #465 / §15.4: a HEAP-collection field (`Array<T>` etc.) lowers to a
+            // bare `ptr` slot, not an inline `[N x elem]` ArrayType — the flat GEP
+            // below would be malformed (or, when the dyn_cast misses, the field is
+            // silently left null → crash on first use). Materialize a real heap
+            // collection (same bz_array_alloc + bz_array_add as `new`/`.Add`) and
+            // store the pointer into the field slot.
+            const sema::TypeRef* fieldRt = nullptr;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
+            if (fieldRt) {
+                if (llvm::Value* arr =
+                        materializeHeapCollectionLiteral(cl, fieldRt)) {
+                    builder_.CreateStore(
+                        arr, builder_.CreateStructGEP(st, obj, idxIt->second));
+                    continue;
+                }
+            }
+            if (cl->elements.empty()) continue;
             llvm::Value* fieldGep =
                 builder_.CreateStructGEP(st, obj, idxIt->second);
             llvm::Type* fieldTy = st->getElementType(idxIt->second);
@@ -2439,6 +2459,27 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // initializer.  lowerExpr returns null for CollectionLiteralExpr (not a
     // general expression), so handle it here where we have the slot.
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init)) {
+        // #465 / §15.4: a collection literal whose declared target is a HEAP
+        // collection (`Array<T>` / `OwnedArray<T>` / Stack / Queue, §15.2) must
+        // materialize a real heap object — NOT the inline-array flat store below.
+        // The inline path emits a 2-index GEP into `arrTy`, but a heap collection
+        // lowers `arrTy` to a bare `ptr` (a pointer to the runtime bz_array_t),
+        // so that GEP is malformed IR ("Invalid indices for GEP pointer type")
+        // and the verifier aborts. Materialize via the runtime instead (same
+        // bz_array_alloc + bz_array_add the `new`/`.Add` paths use) and store the
+        // resulting pointer. Handles the empty literal `[]` too (§15.4: admitted
+        // for every collection target — an empty heap array of Count 0).
+        if (!cl->isDict && declType) {
+            if (const sema::TypeRef* collTy = ctx_.resolvedType(*declType)) {
+                if (llvm::Value* arr =
+                        materializeHeapCollectionLiteral(cl, collTy)) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    locals_[declNode] = slot;
+                    builder_.CreateStore(arr, slot);
+                    return;
+                }
+            }
+        }
         if (!cl->isDict && !cl->elements.empty()) {
             llvm::Type* arrTy = declType ? lowerType(declType) : nullptr;
             if (!arrTy) {
@@ -4300,6 +4341,90 @@ const sema::TypeRef* Emitter::collectionTypeOfLocal(const ast::LocalDecl* ld) {
             if (isCollectionTypeName(rt)) return rt;
     }
     return nullptr;
+}
+
+
+// #465 / §15.4 / stdlib §4.4–§4.5: materialize a sequence collection literal
+// `[e1, …, en]` into a fresh heap collection whose target type is an array-backed
+// heap collection (Array<T> / OwnedArray<T> / Stack / OwnedStack / Queue /
+// OwnedQueue). Reuses the SAME runtime construction the `new Array<T>()` path
+// emits (bz_array_alloc) and the SAME element store the `.Add(...)` path emits
+// (bz_array_add) — so a literal-built array is byte-for-byte identical to one
+// built by `new` + `.Add`. Textual element order maps to the array's natural
+// construction order (§15.4): Array/OwnedArray index 0 = first element; Stack
+// last element on top; Queue first element at the front — all achieved by adding
+// in textual order to the bz_array_t (which append-stores), matching each type's
+// runtime Pop/Dequeue contract. Set/OwnedSet are NOT handled here (they are
+// hash-backed with dedup, allocated via bz_dict_alloc_generic — a separate
+// path); this helper returns null for them so the caller can fall back.
+llvm::Value* Emitter::materializeHeapCollectionLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy) {
+    if (!cl || cl->isDict || !collTy) return nullptr;
+    if (!isCollectionTypeName(collTy)) return nullptr;
+    // Restrict to the array-backed sequence family. Set/OwnedSet are array-typed
+    // by name but hash-backed at runtime (dedup) — not materializable via the
+    // plain bz_array_add path. Leave them to a future slice.
+    std::string_view name = collTy->astNode && collTy->astNode->name &&
+                            !collTy->astNode->name->parts.empty()
+                                ? collTy->astNode->name->parts[0]
+                                : std::string_view{};
+    if (name == "Set" || name == "OwnedSet") return nullptr;
+
+    // Element type + byte size, computed exactly as the `new` / `.Add` paths do
+    // (collectionElemSize reads genericArgs[0]); both sides agree on the layout.
+    const sema::TypeRef* elemRef =
+        (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
+    llvm::Type* elemLlvmTy = elemRef ? lowerTypeRef(elemRef) : i32();
+    int64_t esz = collectionElemSize(collTy);
+
+    // Allocate the bz_array_t (same call lowerNew emits for `new Array<T>()`).
+    // Capacity is sized to the literal length (min 16, matching the default).
+    int64_t cap = std::max<int64_t>(16, (int64_t)cl->elements.size());
+    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+    llvm::Value* arr = builder_.CreateCall(
+        allocFn, {builder_.getInt64(esz), builder_.getInt64(cap)}, "clit.arr");
+
+    // Store each element in textual order via bz_array_add (same as `.Add`).
+    auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                           {ptrTy(), ptrTy(), i64()});
+    for (const auto& elemPtr : cl->elements) {
+        if (!elemPtr) continue;
+        llvm::Value* ev = nullptr;
+        // #465 / §15.4: a NESTED sequence literal element (`Array<Array<int>>`
+        // := [[1,2],[3,4]]) — lowerExpr returns null for a CollectionLiteralExpr,
+        // so materialize the inner heap collection here (recursively) against the
+        // outer element type (genericArgs[0]). The inner array is a fresh owned
+        // heap object stored (as a ptr) into the outer's slot, exactly as an
+        // `inner` named local added via `.Add(inner)` would be.
+        if (auto* nested =
+                dynamic_cast<const ast::CollectionLiteralExpr*>(elemPtr.get())) {
+            if (!nested->isDict && elemRef)
+                ev = materializeHeapCollectionLiteral(nested, elemRef);
+        }
+        if (!ev) ev = lowerExpr(*elemPtr);
+        if (!ev) continue;
+        // fix #455 parity: a nullable VALUE element (int?/bool?/enum?/record?)
+        // may lower to its inner value; lift it to the tagged {hasValue, T}
+        // struct the runtime stores (matching esz).
+        if (elemRef && isNullableValueTy(elemRef)) {
+            llvm::StructType* expected = nullableValueStructTy(elemRef);
+            if (expected && ev->getType() != expected) {
+                ev = ev->getType()->isPointerTy() ? nullableValueNull(elemRef)
+                                                  : wrapNullableValue(elemRef, ev);
+            }
+        } else if (ev->getType() != elemLlvmTy) {
+            // §5.1: widen/narrow a numeric element to the declared element type
+            // (e.g. `Array<long> := [1, 2]` — i32 literals → i64 slots), honoring
+            // the element expression's signedness. Mirrors lowerLocalDecl's
+            // inline-array element coercion; a no-op for already-matching types.
+            ev = coerceNumericToType(ev, elemLlvmTy,
+                                     isUnsignedTargetExpr(*elemPtr));
+        }
+        llvm::AllocaInst* slot = entryAlloca(ev->getType());
+        builder_.CreateStore(ev, slot);
+        builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});
+    }
+    return arr;
 }
 
 

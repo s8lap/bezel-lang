@@ -290,6 +290,7 @@ set(BEZEL_TEST_SOURCES
     codegen/extension_method_test.cpp
     codegen/bug_457_458_test.cpp
     codegen/bug_464_test.cpp
+    codegen/bug_465_test.cpp
     codegen/async_451_test.cpp
 
     module/module_metadata_test.cpp

@@ -2724,6 +2724,18 @@ private:
     // null if the local is not a heap collection.
     const sema::TypeRef* collectionTypeOfLocal(const ast::LocalDecl* ld);
 
+    // #465 / §15.4 / stdlib §4.4–§4.5: materialize a sequence collection literal
+    // `[e1, e2, …]` into a freshly-allocated heap collection (Array<T> /
+    // OwnedArray<T> / Stack / Queue and their owning variants), reusing the exact
+    // `new Array<T>()` allocation (bz_array_alloc) + `.Add(...)` element-store
+    // (bz_array_add) codegen. `collTy` is the resolved heap-collection target
+    // TypeRef (carrying the element type in genericArgs[0]). Returns a `ptr` to
+    // the bz_array_t, matching the variable's lowered type. Returns null when the
+    // target is not an array-backed heap collection (caller falls back to the
+    // inline-array path).
+    llvm::Value* materializeHeapCollectionLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy);
+
     // per §4.6/§4.7: the resolved LinkedList<T>/OwnedLinkedList<T> TypeRef of
     // a local, or null if the local is not a linked list.
     const sema::TypeRef* linkedListTypeOfLocal(const ast::LocalDecl* ld);
