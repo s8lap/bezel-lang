@@ -5587,6 +5587,50 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             recv = currentThis_;
         }
         if (!recv) return nullptr;
+        // §14.2 (record-conforms-to-interface) + §9.4 (record = value type):
+        // when a generic method `M<T>(x: T) where T: IFoo` is monomorphized with
+        // T = a RECORD, the body's `x.Foo()` was resolved by sema to the
+        // INTERFACE method `IFoo.Foo` (member look-up went through the constraint
+        // — §14.2's "T's surface includes IFoo's members"). The receiver `x` is a
+        // record VALUE (a struct, not a pointer), so the itable-dispatch path in
+        // emitMethodCall would either need a pointer receiver or hit the #484
+        // non-pointer guard (returning nullptr → a malformed direct call to the
+        // i32-typed generic template). Since T is concretely known at this
+        // monomorphization, devirtualize: redirect `ms` to the record's own
+        // implementing method (records are sealed — §9.6 — so the implementation
+        // is exactly the one declared on the record). The receiver-shaping block
+        // below then spills the record value and the call becomes a direct call
+        // to `Point.Foo`, matching the non-generic `point.Foo()` path (control
+        // (f) of record_generic_constraint_test).
+        if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface &&
+            !recv->getType()->isPointerTy()) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get())) {
+                if (const sema::TypeRef* recvTy =
+                        ma->target ? ctx_.exprType(*ma->target) : nullptr) {
+                    // Resolve a bare type-parameter receiver (`T`, no
+                    // declaration) through the active substitution to its
+                    // concrete sema type, then take its record declaration.
+                    const sema::TypeRef* concrete = recvTy;
+                    if (recvTy->kind == sema::TypeRef::Kind::Named &&
+                        !recvTy->declaration && recvTy->astNode &&
+                        recvTy->astNode->name &&
+                        recvTy->astNode->name->parts.size() == 1) {
+                        auto sit = genericSubstSemaTy_.find(
+                            recvTy->astNode->name->parts[0]);
+                        if (sit != genericSubstSemaTy_.end() && sit->second)
+                            concrete = sit->second;
+                    }
+                    if (concrete && concrete->declaration &&
+                        concrete->declaration->kind ==
+                            ast::TypeDeclKind::Record) {
+                        if (sema::MethodSymbol* impl = findMethodByName(
+                                concrete->declaration, ms->name))
+                            ms = impl;  // devirtualize to the record's method
+                    }
+                }
+            }
+        }
         // §26.1 (#433): shape the receiver to the extension method's declared
         // `this` type. For a class/interface receiver `this` is the object
         // pointer (recv already is one); for a primitive/enum receiver it is
