@@ -2895,6 +2895,29 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         v = coerceNumericToType(v, declaredTy,
                                 init && isUnsignedTargetExpr(*init));
     llvm::Type* slotTy = v ? v->getType() : (declaredTy ? declaredTy : i32());
+    // issue #490 / §14.2: in an INFERRED-TYPE local (`var n := x.Member`) in a
+    // generic method body, the initializer may return nullptr in the
+    // UNSPECIALIZED template stub (e.g. a constraint-bound method call on a
+    // T-erased i32 receiver returns nullptr per the #484 guard). In that case
+    // both v and declaredTy are null, so slotTy defaults to i32 above. When the
+    // initializer's sema-typed return is a REFERENCE type (string, class, or
+    // interface — all lower to ptr), an i32 slot causes the next use of the
+    // local (e.g. n.Length or n.SomeMethod()) to emit a string/class GEP or
+    // call with an i32 base → malformed IR → LLVM assertion crash.
+    //
+    // Fix: when v=null AND declaredTy=null (unannotated inferred-type local)
+    // AND init carries a sema exprType that lowers to something other than i32,
+    // prefer the sema type for the slot. This keeps the slot correctly typed in
+    // the unspecialized stub so subsequent uses emit valid (if undef-valued) IR.
+    // The SPECIALIZED body (emitGenericSpecialization) sees a concrete recv ptr
+    // and returns a real value — it is unaffected by this guard.
+    if (!v && !declaredTy && init) {
+        if (const sema::TypeRef* initTy = ctx_.exprType(*init)) {
+            llvm::Type* inferredTy = lowerTypeRef(initTy);
+            if (inferredTy && inferredTy != i32())
+                slotTy = inferredTy;
+        }
+    }
     // Prefer the declared type when the value's type is less specific —
     // e.g. `var arr: [N]T := null` produces a ptr null literal but the
     // slot must be [N x ptr], not just ptr.
