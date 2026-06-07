@@ -147,6 +147,7 @@ set(BEZEL_TEST_SOURCES
     sema/entry_point_test.cpp
     sema/flow_narrowing_test.cpp
     sema/unknown_member_test.cpp
+    sema/unknown_primitive_method_test.cpp
     sema/method_ref_type_test.cpp
     sema/extension_resolution_test.cpp
     sema/variance_position_test.cpp

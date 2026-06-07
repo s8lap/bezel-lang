@@ -2493,6 +2493,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                 }
+                // per §3.4: the primitive-static handler above recognises a
+                // fixed, closed set of names.  Any name that reached this
+                // point is NOT in that set — emit a diagnostic and return so
+                // the callee node is left untyped-but-diagnosed rather than
+                // untyped-and-silent, which would otherwise crash codegen
+                // (issue #491).
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    "type '" + std::string(id2->name) +
+                        "' has no static method or property '" +
+                        std::string(mbr) + "' (§3.4)");
+                return;
             }
         }
     }
