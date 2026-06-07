@@ -108,6 +108,10 @@ private:
     // that a bare `throw;` / `throw` re-raise is valid only in a catch
     // arm body.
     int catchDepth_ = 0;
+    // per §31.2: `return` inside a `finally` block is a compile error.
+    // Appendix A grammar: "`return` does not appear in `finally` blocks."
+    // Tracks finally-block nesting so visitStmt can reject ReturnStmt there.
+    int finallyDepth_ = 0;
     // Slice S29: true while walking a field/auto-property initializer,
     // for the §22.8 rule that initializers may not observe instance
     // state (`this`, `base`, instance members).

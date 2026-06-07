@@ -1528,6 +1528,23 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         std::string(ld->name) + "`");
                 }
             } else if (ld->initializer) {
+                // per §15.4: a collection literal has no standalone type; a
+                // `var x := [...]` with no type annotation gives no target type
+                // and is a compile error. Must be checked BEFORE visitExpr so
+                // we diagnose on the LocalDecl's position (and return early to
+                // avoid cascaded inference errors).
+                if (dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        ld->initializer.get())) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ld->initializer->span.begin,
+                        "collection literal has no determinable target type — "
+                        "add a type annotation (`var " + std::string(ld->name) +
+                        ": <CollectionType> := [...]`) (§15.4)");
+                    // Still visit sub-expressions so inner errors are found.
+                    visitExpr(*ld->initializer);
+                    currentScope_->names[ld->name] = lsym;
+                    return;  // early-return: lsym->declType intentionally null
+                }
                 lsym->declType = ctx_.exprType(*ld->initializer);
                 // per §14.1 + §A.7 (issue #391): a `var x := Generic.Create();`
                 // without a type annotation gives the call no target, so a
@@ -1575,6 +1592,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
     } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         if (rs->value) visitExpr(*rs->value);
+        // per §31.2: `return` inside a `finally` block is a compile error.
+        // Appendix A: "`return` does not appear in `finally` blocks."
+        if (finallyDepth_ > 0) {
+            ctx_.diagnostics().report(
+                Severity::Error, rs->span.begin,
+                "`return` inside a `finally` block is a compile error (§31.2)");
+            return;
+        }
         checkReturnForm(*rs);
         // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
         // type-argument inference. `return Generic.Create();` in a method with
@@ -1677,6 +1702,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
     } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        // per §15.4: `_ := [...]` has no target type — a compile error.
+        // The discard position never provides a target type for a collection
+        // literal, since there is no type annotation or parameter context.
+        if (ds->value) {
+            if (dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    ds->value.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ds->value->span.begin,
+                    "collection literal has no determinable target type in "
+                    "discard position — add a type annotation (§15.4)");
+                visitExpr(*ds->value);
+                return;
+            }
+        }
         if (ds->value) visitExpr(*ds->value);
         // per §14.1 + §A.7 (issue #391): `_ := Generic.Create();` discards the
         // result, so a return-only type parameter has no target. Diagnose.
@@ -1915,7 +1954,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             --catchDepth_;
             currentScope_ = saveScope;
         }
+        // per §31.2: `return` inside a `finally` block is a compile error.
+        // Track finally-body nesting so the ReturnStmt handler can reject it.
+        ++finallyDepth_;
         for (const auto& bs : trys->finallyBody) if (bs) visitStmt(*bs);
+        --finallyDepth_;
     } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         if (ys->value) visitExpr(*ys->value);
     } else if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
