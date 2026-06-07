@@ -3989,13 +3989,17 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // Without this the i32/i64 mismatch crashes LLVM's PHI verifier.
     // Same-type branches pass through coerceNumericToType unchanged.
     llvm::Type* resultTy = nullptr;
-    if (const sema::TypeRef* rt = ctx_.exprType(c)) resultTy = lowerTypeRef(rt);
+    const sema::TypeRef* resultSemaType = ctx_.exprType(c);
+    if (resultSemaType) resultTy = lowerTypeRef(resultSemaType);
 
     auto* thenBB = llvm::BasicBlock::Create(llvm_, "cond.then", currentFn_);
     auto* elseBB = llvm::BasicBlock::Create(llvm_, "cond.else", currentFn_);
     auto* endBB = llvm::BasicBlock::Create(llvm_, "cond.end", currentFn_);
     builder_.CreateCondBr(cond, thenBB, elseBB);
 
+    // Lower the then branch. Do NOT emit the branch-to-endBB terminator yet —
+    // nullable widening (below) may need to emit instructions in this block
+    // after we've seen both branches' LLVM types.
     builder_.SetInsertPoint(thenBB);
     llvm::Value* tv = lowerExpr(*c.thenValue);
     bool thenDiv = diverged_;  // CG40: e.g. `cond ? throw E : b`
@@ -4003,7 +4007,7 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
         tv = coerceNumericToType(tv, resultTy,
                                  isUnsignedTargetExpr(*c.thenValue));
     llvm::BasicBlock* thenEnd = builder_.GetInsertBlock();
-    if (!thenDiv) builder_.CreateBr(endBB);
+    // (terminator CreateBr(endBB) deferred — emitted after widening below)
 
     builder_.SetInsertPoint(elseBB);
     llvm::Value* ev = lowerExpr(*c.elseValue);
@@ -4012,7 +4016,128 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
         ev = coerceNumericToType(ev, resultTy,
                                  isUnsignedTargetExpr(*c.elseValue));
     llvm::BasicBlock* elseEnd = builder_.GetInsertBlock();
-    if (!elseDiv) builder_.CreateBr(endBB);
+    // (terminator CreateBr(endBB) deferred — emitted after widening below)
+
+    // §17 / §7: nullable value-type widening.
+    //
+    // A conditional `(V if C else null)` whose result is a nullable value
+    // type (int?, bool?, double?, enum?, nullable record) produces a PHI
+    // with a type mismatch: the non-null branch emits a bare T (e.g. i32)
+    // while the null-literal branch emits a ConstantPointerNull (because
+    // sema types the `null` literal as nullable Object — a reference type —
+    // rather than the specific nullable value type). Both PHI operands must
+    // share the tagged {i8 hasValue; T value} struct type.
+    //
+    // Two complementary paths reconcile this:
+    //
+    // Path A — sema result type IS a nullable value type (e.g. the sema
+    // conditional type is already int?). Widen each branch to the sema-
+    // provided nullable struct, reusing the existing helpers.
+    //   • bare T → wrapNullableValue (hasValue=1, T)
+    //   • ConstantPointerNull → nullableValueNull (hasValue=0, T=0)
+    //   • already the nullable struct → pass through.
+    //
+    // Path B — sema result type is a REFERENCE type (e.g. Object? from the
+    // null-literal's default type) but the branch values are mismatched:
+    // one is a ConstantPointerNull and the other is a non-ptr value (bare T
+    // or an existing nullable struct). Derive the nullable struct from the
+    // non-null branch's LLVM type and widen both.
+    //   • ConstantPointerNull → ConstantAggregateZero({i8, T}) — no instrs.
+    //   • bare T → InsertValue({i8 1, T}) — emitted in that branch's block.
+    //   • already a {i8, T} struct → pass through unchanged.
+    //
+    // In both paths, widening instructions for the non-null branch are
+    // emitted INSIDE THAT BRANCH'S BLOCK (before its terminator), so the
+    // result dominates the PHI edge. The branch terminators (CreateBr) are
+    // therefore deferred until after widening.
+    //
+    // Nullable REFERENCE type branches (non-null ptr + null ptr) already
+    // share the pointer type — neither path fires for them.
+    //
+    // per §17 (conditional expression) / §7.1 (nullable types) / §7.2 (null).
+    if (tv && ev && !thenDiv && !elseDiv) {
+        bool needPathA = resultSemaType && isNullableValueTy(resultSemaType);
+        if (needPathA) {
+            // Path A: sema-guided widening to the nullable struct.
+            llvm::StructType* nst = nullableValueStructTy(resultSemaType);
+
+            // Widen a single branch value to nst. Instructions (if any) are
+            // emitted into the block that is current when this is called, so
+            // call inside the branch's own block.
+            auto widenOne = [&](llvm::Value* v) -> llvm::Value* {
+                if (!v) return v;
+                if (v->getType() == nst) return v;  // already the struct
+                if (v->getType()->isPointerTy() &&
+                    llvm::isa<llvm::ConstantPointerNull>(v))
+                    return nullableValueNull(resultSemaType);  // constant
+                if (v->getType() == nst->getElementType(1))
+                    return wrapNullableValue(resultSemaType, v);  // inserts
+                return v;  // unrecognised — leave, mismatch caught elsewhere
+            };
+
+            // Widen thenEnd (emit in thenEnd's block).
+            builder_.SetInsertPoint(thenEnd);
+            tv = widenOne(tv);
+            // Widen elseEnd (emit in elseEnd's block).
+            builder_.SetInsertPoint(elseEnd);
+            ev = widenOne(ev);
+
+        } else if (tv->getType() != ev->getType()) {
+            // Path B: no sema-supplied nullable struct; detect ptr-null vs
+            // non-ptr mismatch and reconcile using the non-null branch's type.
+            auto isNullPtr = [](llvm::Value* v) {
+                return v->getType()->isPointerTy() &&
+                       llvm::isa<llvm::ConstantPointerNull>(v);
+            };
+
+            // widenPair: widen nullBranch (ptr null) and valBranch (the
+            // non-null side) to a common {i8, T} struct. Wrapping instrs
+            // are emitted into valBlock (the branch block for valBranch).
+            auto widenPair = [&](llvm::Value*& nullBranch,
+                                 llvm::Value*& valBranch,
+                                 llvm::BasicBlock* valBlock) {
+                llvm::Type* innerTy = valBranch->getType();
+                llvm::StructType* nst;
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(innerTy);
+                    st && st->getNumElements() == 2 &&
+                    st->getElementType(0) == nullablePrimHasValTy()) {
+                    // valBranch is already a nullable struct — use it directly.
+                    nst = st;
+                } else {
+                    // valBranch is a bare T — wrap into {i8 1, T}.
+                    nst = llvm::StructType::get(
+                        llvm_, {nullablePrimHasValTy(), innerTy});
+                    builder_.SetInsertPoint(valBlock);
+                    llvm::Value* res = builder_.CreateInsertValue(
+                        llvm::UndefValue::get(nst),
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                        {0u});
+                    valBranch = builder_.CreateInsertValue(res, valBranch, {1u});
+                }
+                // Null branch: all-zero constant — no instruction needed.
+                nullBranch = llvm::ConstantAggregateZero::get(nst);
+            };
+
+            if (isNullPtr(ev) && !isNullPtr(tv)) {
+                widenPair(ev, tv, thenEnd);   // then=value, else=null
+            } else if (isNullPtr(tv) && !isNullPtr(ev)) {
+                widenPair(tv, ev, elseEnd);   // then=null, else=value
+            }
+            // Both ptr nulls or neither: leave them — the PHI mismatch
+            // reflects a pre-existing sema error and is not our concern.
+        }
+    }
+
+    // Emit branch terminators now that widening (if any) is complete.
+    // SetInsertPoint restores the correct block before each CreateBr.
+    if (!thenDiv) {
+        builder_.SetInsertPoint(thenEnd);
+        builder_.CreateBr(endBB);
+    }
+    if (!elseDiv) {
+        builder_.SetInsertPoint(elseEnd);
+        builder_.CreateBr(endBB);
+    }
 
     builder_.SetInsertPoint(endBB);
     if (!tv || !ev) return nullptr;

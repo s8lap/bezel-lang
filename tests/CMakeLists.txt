@@ -157,6 +157,7 @@ set(BEZEL_TEST_SOURCES
     codegen/int_arithmetic_test.cpp
     codegen/locals_test.cpp
     codegen/conditional_test.cpp
+    codegen/conditional_nullable_test.cpp
     codegen/control_flow_test.cpp
     codegen/static_call_test.cpp
     codegen/native_exe_test.cpp
