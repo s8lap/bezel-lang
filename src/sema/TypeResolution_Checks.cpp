@@ -436,6 +436,30 @@ void Resolver::checkRecordRestrictions() {
                 }
             }
         }
+        // §9.6: a record may not derive from a class or from another record.
+        // It may only implement interfaces. Walk the resolved baseTypes list
+        // (populated by TypeResolution pass S5) and reject any base whose
+        // kind is Class or Record. Interfaces are allowed; unresolved (null)
+        // bases are skipped here — unresolved-name errors were already emitted
+        // during the base-type resolution pass.
+        for (TypeSymbol* base : t->baseTypes) {
+            if (!base) continue;
+            if (base->kind == ast::TypeDeclKind::Class) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("record `") + std::string(t->name) +
+                    "` cannot derive from class `" +
+                    std::string(base->name) +
+                    "` (§9.6); records may only implement interfaces");
+            } else if (base->kind == ast::TypeDeclKind::Record) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("record `") + std::string(t->name) +
+                    "` cannot derive from record `" +
+                    std::string(base->name) +
+                    "` (§9.6); records may only implement interfaces");
+            }
+        }
         // IDisposable implementation: name-based check on the AST
         // base-type list (the built-in IDisposable has no user
         // TypeSymbol to resolve against).
