@@ -2346,7 +2346,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                         return;
                     }
-                    if (mbr == "IsNaN" || mbr == "IsInfinity") {
+                    // stdlib §9.2: all five FP predicates return bool.
+                    if (mbr == "IsNaN" || mbr == "IsInfinity" ||
+                        mbr == "IsPositiveInfinity" ||
+                        mbr == "IsNegativeInfinity" || mbr == "IsFinite") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }
@@ -2949,8 +2952,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                     return;
                 } else if (ma.member == "IsNaN" || ma.member == "IsInfinity" ||
-                           ma.member == "IsFinite") {
-                    // §6.3: FP predicates — bool result.
+                           ma.member == "IsFinite" ||
+                           ma.member == "IsPositiveInfinity" ||
+                           ma.member == "IsNegativeInfinity") {
+                    // §6.3 / stdlib §9.2: all five FP predicates — bool result.
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                     return;

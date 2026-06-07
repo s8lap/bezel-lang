@@ -293,6 +293,7 @@ set(BEZEL_TEST_SOURCES
     codegen/bug_457_458_test.cpp
     codegen/bug_464_test.cpp
     codegen/bug_465_test.cpp
+    codegen/bug_475_fp_predicates_test.cpp
     codegen/async_451_test.cpp
 
     module/module_metadata_test.cpp
