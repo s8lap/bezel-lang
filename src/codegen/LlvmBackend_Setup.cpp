@@ -684,30 +684,51 @@ llvm::Function* Emitter::declareImportedCtor(const sema::ConstructorSymbol* cs) 
 
 void Emitter::buildVtable(const sema::TypeSymbol* t) {
     if (vtableMethods_.count(t)) return;
-    std::vector<sema::MethodSymbol*> slots;
-    std::unordered_map<std::string_view, unsigned> nameSlot;
+    std::vector<VSlot> slots;
+    std::unordered_map<std::string, unsigned> nameSlot;
     if (const sema::TypeSymbol* base = baseClassOf(t)) {
         buildVtable(base);
         slots = vtableMethods_[base];
         nameSlot = vtableNameSlot_[base];
     }
     // Vtable (CG35-itable + §8.6 #417): [0]=td$C, [1]=itmap$C, [2]=Dispose,
-    // [3]=ToString, [4..]=virtual methods. So a virtual method's slot is its
+    // [3]=ToString, [4..]=virtual members. So a virtual member's slot is its
     // position in `slots` + 4 (ToString occupies the fixed slot 3, like Dispose
     // occupies the fixed slot 2). See declareVtables Pass D for the slot fill.
+    //
+    // #481 / §12.1 / §12.5 / §23: virtual METHODS and virtual PROPERTY accessors
+    // are enumerated together in member declaration order, each getting its own
+    // slot. An `override` (method or property accessor) reuses the base member's
+    // slot, matched by name (a setter uses "name$set" so get/set are distinct).
+    // For a method-only class the layout is exactly the pre-#481 one (a property
+    // just appends/interleaves additional slots); the IR verifier + the existing
+    // virtual/interface dispatch tests guard against a perturbed method index.
     const unsigned base = 4;
-    for (sema::Symbol* m : t->members) {
-        auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-        if (!ms || isStaticMethod(ms) || !isVirtual(ms)) continue;
-        auto it = nameSlot.find(ms->name);
+    auto assignSlot = [&](const std::string& key, VSlot vs) -> unsigned {
+        auto it = nameSlot.find(key);
         if (it != nameSlot.end()) {       // override: reuse base slot
-            slots[it->second - base] = ms;
-            vtableSlot_[ms] = it->second;
-        } else {                          // new virtual: fresh slot
-            unsigned slot = static_cast<unsigned>(slots.size()) + base;
-            slots.push_back(ms);
-            nameSlot[ms->name] = slot;
-            vtableSlot_[ms] = slot;
+            slots[it->second - base] = vs;
+            return it->second;
+        }
+        unsigned slot = static_cast<unsigned>(slots.size()) + base;
+        slots.push_back(vs);
+        nameSlot[key] = slot;
+        return slot;
+    };
+    for (sema::Symbol* m : t->members) {
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(m)) {
+            if (isStaticMethod(ms) || !isVirtual(ms)) continue;
+            vtableSlot_[ms] = assignSlot(std::string(ms->name),
+                                         VSlot{ms, nullptr, false});
+            continue;
+        }
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(m)) {
+            if (!isVirtualProperty(ps)) continue;
+            propGetSlot_[ps] = assignSlot(std::string(ps->name),
+                                          VSlot{nullptr, ps, false});
+            if (propertyHasSetter(ps))
+                propSetSlot_[ps] = assignSlot(std::string(ps->name) + "$set",
+                                              VSlot{nullptr, ps, true});
         }
     }
     vtableMethods_[t] = std::move(slots);
@@ -777,6 +798,16 @@ void Emitter::declareVtables() {
             if (!es) continue;
             auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
             if (ed && !ed->isAsync) ifaceEventIndex_[es] = idx++;
+        }
+        // #481 / §13 / §23: interface properties follow the events in the itab,
+        // each holding a per-class accessor function (getter, then setter if the
+        // interface property declares one). Indices continue from the running
+        // count so method/event positions are unchanged.
+        for (sema::Symbol* m : ts->members) {
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+            if (!ps || ps->isIndexer) continue;
+            ifacePropertyGetIndex_[ps] = idx++;
+            if (propertyHasSetter(ps)) ifacePropertySetIndex_[ps] = idx++;
         }
     }
     // §13 / §2.5 / §2.6 (issue #426 / #328): populate ifaceMethodIndex_ for
@@ -946,8 +977,17 @@ void Emitter::declareVtables() {
                 auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
                 if (ed && !ed->isAsync) ifaceEvents.push_back(es);
             }
-            // Skip a wholly empty interface (no methods, no events).
-            if (ifaceMethods.empty() && ifaceEvents.empty()) continue;
+            // #481 / §13 / §23: collect iface's properties in declaration order
+            // (after the events, matching ifacePropertyGetIndex_'s numbering).
+            std::vector<sema::PropertySymbol*> ifaceProps;
+            for (sema::Symbol* m : iface->members) {
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                if (ps && !ps->isIndexer) ifaceProps.push_back(ps);
+            }
+            // Skip a wholly empty interface (no methods, events, or properties).
+            if (ifaceMethods.empty() && ifaceEvents.empty() &&
+                ifaceProps.empty())
+                continue;
 
             // Build itab$C$I: array of function pointers (C's impl of each
             // method of I, in I's declaration order). Missing impls → null.
@@ -972,6 +1012,31 @@ void Emitter::declareVtables() {
                     if (llvm::Function* acc = emitEventAccessor(ts, impl))
                         fp = llvm::cast<llvm::Constant>(acc);
                 itabElems.push_back(fp);
+            }
+            // #481 / §13 / §23: append a per-class accessor function for each
+            // interface property (getter, then setter if the interface property
+            // declares one) — the same accessor shape installed in the class's
+            // vtable. Interface-typed property access dispatches here to reach
+            // the implementing class's get/set body.
+            for (sema::PropertySymbol* ip : ifaceProps) {
+                sema::PropertySymbol* impl =
+                    classPropertyByName(ts, ip->name);
+                llvm::Constant* getFp =
+                    llvm::ConstantPointerNull::get(ptrTy());
+                if (impl)
+                    if (llvm::Function* acc =
+                            ensurePropertyAccessorFn(ts, impl, /*isSet=*/false))
+                        getFp = llvm::cast<llvm::Constant>(acc);
+                itabElems.push_back(getFp);
+                if (propertyHasSetter(ip)) {
+                    llvm::Constant* setFp =
+                        llvm::ConstantPointerNull::get(ptrTy());
+                    if (impl)
+                        if (llvm::Function* acc = ensurePropertyAccessorFn(
+                                ts, impl, /*isSet=*/true))
+                            setFp = llvm::cast<llvm::Constant>(acc);
+                    itabElems.push_back(setFp);
+                }
             }
             auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
             auto* itabGV = new llvm::GlobalVariable(
@@ -1015,12 +1080,31 @@ void Emitter::declareVtables() {
         // §8.5 / §8.6 (#417): uniform ToString at the fixed slot 3 — the user
         // override (via the class chain) or the type-name default.
         elems[kToStringSlot] = classToStringThunk(ts);
-        // Virtual methods at [4..] (kToStringSlot + 1 + i).
+        // Virtual members at [4..] (kToStringSlot + 1 + i). A method slot holds
+        // the most-derived method (already resolved in slots[]); a property
+        // accessor slot (#481) holds the most-derived accessor FUNCTION for that
+        // property, found by name on `ts`'s chain (so a derived override fills a
+        // base-introduced slot, and an abstract base's slot is filled by the
+        // concrete override).
         for (std::size_t i = 0; i < slots.size(); ++i) {
-            auto mit = methodFns_.find(slots[i]);
-            if (mit != methodFns_.end())
-                elems[kToStringSlot + 1 + i] =
-                    llvm::cast<llvm::Constant>(mit->second);
+            const VSlot& vs = slots[i];
+            if (vs.method) {
+                auto mit = methodFns_.find(vs.method);
+                if (mit != methodFns_.end())
+                    elems[kToStringSlot + 1 + i] =
+                        llvm::cast<llvm::Constant>(mit->second);
+            } else if (vs.prop) {
+                // #481 / §12.5: resolve the most-derived accessor on `ts`'s
+                // chain. classPropertyByName returns the override if present,
+                // else the base declaration (abstract → no body → null fn).
+                sema::PropertySymbol* impl =
+                    classPropertyByName(ts, vs.prop->name);
+                if (impl)
+                    if (llvm::Function* fn =
+                            ensurePropertyAccessorFn(ts, impl, vs.isSet))
+                        elems[kToStringSlot + 1 + i] =
+                            llvm::cast<llvm::Constant>(fn);
+            }
         }
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
         auto* init = llvm::ConstantArray::get(arrTy, elems);

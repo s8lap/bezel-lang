@@ -700,6 +700,185 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
 }
 
 
+// #481 / §12.1 / §12.5 / §23: emit (once, cached) a uniform-signature accessor
+// FUNCTION for a virtual property, suitable for a vtable/itable slot. The body
+// is the property's concrete accessor implementation on `cls` (arrow, block, or
+// auto-property backing-field access). Getter: `T get(ptr this)`. Setter:
+// `void set(ptr this, T value)`. An ABSTRACT accessor (no body) returns nullptr
+// so its slot stays null on the abstract base and is filled by the override's
+// function. Mirrors the body-emitting structure of ensurePropertyBlockGetter:
+// it saves/restores the whole emitter state and may run during declareVtables
+// (before ordinary method bodies are emitted).
+llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
+                                                  const sema::PropertySymbol* ps,
+                                                  bool isSet) {
+    auto key = std::make_pair(ps, isSet);
+    if (auto it = propAccessorFns_.find(key); it != propAccessorFns_.end())
+        return it->second;
+
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd) return nullptr;
+
+    llvm::Type* valTy = lowerType(pd->type.get());
+    if (!valTy) valTy = i32();
+
+    // Determine the concrete accessor body. Returns null fn (no slot fill) for
+    // an abstract accessor; the override supplies the real one.
+    const ast::Expr* getterExpr = nullptr;   // arrow getter
+    const ast::PropertyAccessor* blockGet = nullptr;
+    const ast::PropertyAccessor* setAcc = nullptr;
+    bool isAuto = (pd->bodyKind == ast::PropertyBodyKind::Auto);
+    if (!isSet) {
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+            getterExpr = pd->exprBody.get();
+        else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            for (const auto& a : pd->accessors) {
+                if (a.isSet) continue;
+                if (a.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                    blockGet = &a;
+                else if (a.bodyKind == ast::PropertyAccessorBodyKind::Expression)
+                    getterExpr = a.exprBody.get();
+                break;
+            }
+        }
+        // Abstract (no get body) and not auto → no implementation here.
+        if (!isAuto && !getterExpr && !blockGet &&
+            pd->bodyKind != ast::PropertyBodyKind::Block)
+            return nullptr;
+        if (pd->bodyKind == ast::PropertyBodyKind::Block && !getterExpr &&
+            !blockGet)
+            return nullptr;  // abstract/interface block with no get body
+    } else {
+        if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            for (const auto& a : pd->accessors) {
+                if (a.isSet &&
+                    a.bodyKind != ast::PropertyAccessorBodyKind::Abstract) {
+                    setAcc = &a;
+                    break;
+                }
+            }
+            if (!setAcc) return nullptr;  // abstract/interface setter, no body
+        } else if (!isAuto) {
+            return nullptr;  // expression-bodied property has no setter
+        }
+    }
+
+    // Signature: getter (this)->T, setter (this, value:T)->void.
+    std::vector<llvm::Type*> paramTys{ptrTy()};
+    if (isSet) paramTys.push_back(valTy);
+    auto* fnTy = llvm::FunctionType::get(
+        isSet ? llvm::Type::getVoidTy(llvm_) : valTy, paramTys, false);
+    std::string mangled = "bz$" + std::string(cls->name) + "$" +
+                          std::string(ps->name) +
+                          (isSet ? "$propset" : "$propget");
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, mangled, *module_);
+    propAccessorFns_[key] = fn;
+
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+
+    // --- Save entire emitter state (mirrors ensurePropertyBlockGetter). ---
+    auto* savedFn        = currentFn_;
+    auto  savedBB        = builder_.GetInsertBlock();
+    auto  savedBBOffset  = savedBB ? builder_.GetInsertPoint()
+                                   : decltype(savedBB->begin()){};
+    auto* savedThis      = currentThis_;
+    auto  savedLocals    = locals_;
+    auto  savedParams    = paramSlots_;
+    auto  savedRef       = refParams_;
+    auto  savedDispose   = disposeStack_;
+    auto  savedLoop      = loopStack_;
+    auto* savedUnwind    = unwindTarget_;
+    auto* savedProp      = propagateBB_;
+    auto* savedCaught    = currentCaughtExc_;
+    auto  savedUD        = unwindScopeDepth_;
+    auto  savedDiv       = diverged_;
+    auto  savedGSubst    = genericSubst_;
+
+    currentFn_          = fn;
+    builder_.SetInsertPoint(entryBB);
+    auto argIt = fn->args().begin();
+    currentThis_        = &*argIt;
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    disposeStack_.clear();
+    loopStack_.clear(); finallyStack_.clear();
+    unwindTarget_       = nullptr;
+    propagateBB_        = nullptr;
+    currentCaughtExc_   = nullptr;
+    unwindScopeDepth_   = 0;
+    diverged_           = false;
+
+    if (!isSet) {
+        // --- Getter body. ---
+        if (isAuto) {
+            // §23.1: auto-property backing field read.
+            llvm::StructType* st = classStruct(cls);
+            auto idxIt = fieldIndex_.find(ps);
+            if (idxIt != fieldIndex_.end()) {
+                llvm::Value* slot = builder_.CreateStructGEP(
+                    st, currentThis_, idxIt->second);
+                builder_.CreateRet(builder_.CreateLoad(valTy, slot));
+            } else {
+                builder_.CreateRet(llvm::Constant::getNullValue(valTy));
+            }
+        } else if (getterExpr) {
+            llvm::Value* v = lowerExpr(*getterExpr);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateRet(v ? v
+                                     : llvm::Constant::getNullValue(valTy));
+        } else if (blockGet) {
+            lowerScopedBlock(blockGet->stmts);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                emitImplicitReturn(fn);
+        }
+    } else {
+        // --- Setter body: bind the implicit `value` param (anchored on pd). ---
+        llvm::Argument& valArg = *std::next(fn->args().begin());
+        llvm::AllocaInst* vslot = entryAlloca(valArg.getType());
+        builder_.CreateStore(&valArg, vslot);
+        locals_[pd] = vslot;
+        if (isAuto) {
+            // §23.1: auto-property backing field write.
+            llvm::StructType* st = classStruct(cls);
+            auto idxIt = fieldIndex_.find(ps);
+            if (idxIt != fieldIndex_.end()) {
+                llvm::Value* slot = builder_.CreateStructGEP(
+                    st, currentThis_, idxIt->second);
+                builder_.CreateStore(&valArg, slot);
+            }
+        } else if (setAcc) {
+            if (setAcc->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+                setAcc->exprBody)
+                lowerExpr(*setAcc->exprBody);
+            else
+                lowerScopedBlock(setAcc->stmts);
+        }
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateRetVoid();
+    }
+
+    // --- Restore state. ---
+    currentFn_          = savedFn;
+    currentThis_        = savedThis;
+    locals_             = std::move(savedLocals);
+    paramSlots_         = std::move(savedParams);
+    refParams_          = std::move(savedRef);
+    disposeStack_       = std::move(savedDispose);
+    loopStack_          = std::move(savedLoop);
+    unwindTarget_       = savedUnwind;
+    propagateBB_        = savedProp;
+    currentCaughtExc_   = savedCaught;
+    unwindScopeDepth_   = savedUD;
+    diverged_           = savedDiv;
+    genericSubst_       = std::move(savedGSubst);
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
+
+    return fn;
+}
+
+
 // §23.4 / §22.9: emit a standalone function for a BLOCK-form indexer getter
 // (`property [i: …]: T get => do…end;`). Mirrors ensurePropertyBlockGetter but
 // the signature carries the index parameters after `this`, and the body binds
