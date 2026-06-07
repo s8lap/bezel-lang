@@ -275,6 +275,7 @@ set(BEZEL_TEST_SOURCES
     codegen/event_test.cpp
     codegen/event_477_test.cpp
     codegen/event_479_test.cpp
+    codegen/event_leak_480_test.cpp
     codegen/cancellation_token_test.cpp
     codegen/datetime_timespan_test.cpp
     codegen/guid_test.cpp
