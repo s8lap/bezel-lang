@@ -113,6 +113,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                 }
                 if (lowerPropertyCompound(*as)) return false;
+                // §20 / §23.4: user-defined indexer compound assignment
+                // `a[i] OP= v`. Must come after lowerPropertyCompound (which
+                // handles non-indexer computed properties) and before the generic
+                // lvalueAddr fallback (which handles only built-in inline arrays
+                // and returns null for user-indexer targets, silently dropping
+                // the write). The getter and setter are called with the receiver
+                // and index evaluated exactly once.
+                if (lowerIndexerCompound(*as)) return false;
             }
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = lvalueAddr(*as->target, elemTy);
