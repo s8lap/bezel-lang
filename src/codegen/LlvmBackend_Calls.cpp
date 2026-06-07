@@ -269,6 +269,15 @@ int64_t Emitter::collectionElemSize(const sema::TypeRef* collTy) {
     if (et->isIntegerTy(32) || et->isFloatTy()) return 4;
     if (et->isIntegerTy(1) || et->isIntegerTy(8)) return 1;
     if (et->isIntegerTy(16)) return 2;
+    // §9: a record element type lowers to an LLVM StructType whose allocation
+    // size may exceed 8 bytes (e.g. {ptr, i32} for a ref+value record = 16
+    // bytes with padding).  Returning the hardcoded 8 here was the root cause
+    // of bug D: bz_array_add/bz_array_get used an 8-byte stride for a 16-byte
+    // element, so only the first 8 bytes were stored/loaded and the second
+    // field (Age) was read from the wrong offset.  Use the DataLayout to get
+    // the exact allocation size for any non-scalar element type.
+    if (et->isStructTy())
+        return (int64_t)module_->getDataLayout().getTypeAllocSize(et);
     return 8;  // ptr, i64, double
 }
 
@@ -6306,11 +6315,14 @@ bool Emitter::isStringExprType(const ast::Expr& e) {
 
 // The byte size of an element of LLVM type `ty` as stored in a type-erased
 // array slot (mirrors collectionElemSize's element-size choices).
-static int64_t lazyElemSize(llvm::Type* ty) {
+// per §9 (bug D): pass the DataLayout so that a record StructType returns its
+// actual allocation size instead of the hardcoded 8.
+static int64_t lazyElemSize(llvm::Type* ty, const llvm::DataLayout& dl) {
     if (!ty) return 8;
     if (ty->isIntegerTy(32) || ty->isFloatTy()) return 4;
     if (ty->isIntegerTy(1) || ty->isIntegerTy(8)) return 1;
     if (ty->isIntegerTy(16)) return 2;
+    if (ty->isStructTy()) return (int64_t)dl.getTypeAllocSize(ty);
     return 8;  // i64 / double / pointer (string, class)
 }
 
@@ -6833,7 +6845,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         sema::TypeRef* elemRef = nullptr;
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
         if (!lazy) return nullptr;
-        int64_t esz = lazyElemSize(elemLlvmOf(elemRef));
+        int64_t esz = lazyElemSize(elemLlvmOf(elemRef), module_->getDataLayout());
         auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
         return builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)}, "linq.toarr");
     }
@@ -6846,7 +6858,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
         if (!lazy) return nullptr;
         llvm::Type* elemTy2 = elemLlvmOf(elemRef);
-        int64_t esz = lazyElemSize(elemTy2);
+        int64_t esz = lazyElemSize(elemTy2, module_->getDataLayout());
         const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
         llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy2, elemRef, elemRec);
         llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec);
@@ -6866,7 +6878,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
         if (!lazy) return nullptr;
         llvm::Type* elemTy2 = elemLlvmOf(elemRef);
-        int64_t valEsz = lazyElemSize(elemTy2);
+        int64_t valEsz = lazyElemSize(elemTy2, module_->getDataLayout());
 
         // Key type: the lambda (T)->TKey; TKey is its return type.
         sema::TypeRef* keyRefSema = nullptr;
@@ -6876,7 +6888,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                 keyRefSema = lamTy->funcReturn;
                 if (auto* t = lowerTypeRef(keyRefSema)) keyTy = t;
             }
-        int64_t keyEsz = lazyElemSize(keyTy);
+        int64_t keyEsz = lazyElemSize(keyTy, module_->getDataLayout());
 
         // Key closure + trampoline (kind 2 = key: i64(closure, elem_ptr)).
         // Note: lowerLinqLambda is not in scope here (defined later in the isOp
@@ -6987,7 +6999,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
         if (!closure) return nullptr;
         llvm::Function* tramp = buildLinqTrampoline(1, elemTy, outTy);
-        int64_t outEsz = lazyElemSize(outTy);
+        int64_t outEsz = lazyElemSize(outTy, module_->getDataLayout());
         auto* selFn = declareC("bz_lazy_select", ptrTy(),
                                {ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(selFn,
@@ -7077,7 +7089,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             }
         llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
         if (!closure) return nullptr;
-        int64_t innerEsz = lazyElemSize(innerElemTy);
+        int64_t innerEsz = lazyElemSize(innerElemTy, module_->getDataLayout());
         llvm::Function* tramp = buildSelectManyTrampoline(elemTy, innerEsz);
         auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
                               {ptrTy(), i64(), ptrTy(), ptrTy()});
@@ -7116,7 +7128,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         expectedFunctionType_ = savedExp;
         if (!closure) return nullptr;
         llvm::Function* tramp = buildZipTrampoline(elemTy, bTy, outTy);
-        int64_t outEsz = lazyElemSize(outTy);
+        int64_t outEsz = lazyElemSize(outTy, module_->getDataLayout());
         auto* zipFn = declareC("bz_lazy_zip", ptrTy(),
                                {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(zipFn,
