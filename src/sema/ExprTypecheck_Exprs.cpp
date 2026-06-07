@@ -157,6 +157,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             ctx_.setExprType(&e, rt);
                         }
                     }
+                } else if (fs->posParam && fs->posParam->type) {
+                    // §9.1: a positional record field's type comes from the
+                    // Param node, not a FieldDecl (fs->decl is the TypeDecl).
+                    // Without this, a bare identifier `Data` inside a record
+                    // method body (implicit this.Data where Data: Inner) has no
+                    // exprType, so `Data.Val` — a MemberAccessExpr on Data —
+                    // cannot resolve targetType and `Val`'s symbol is never set.
+                    // Codegen's fieldAddr then finds no symbol → returns nullptr
+                    // → the method body emits `ret i32 0` (wrong result).
+                    if (auto* rt = ctx_.resolvedType(*fs->posParam->type)) {
+                        ctx_.setExprType(&e, rt);
+                    }
                 }
             }
             // §12.7: flow narrowing. Inside the controlled block of `if x is T`
