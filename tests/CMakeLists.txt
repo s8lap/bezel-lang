@@ -250,6 +250,7 @@ set(BEZEL_TEST_SOURCES
     codegen/inline_array_equality_test.cpp
     codegen/string_test.cpp
     codegen/string_compare_test.cpp
+    codegen/nullable_string_compare_test.cpp
     codegen/string_tostring_test.cpp
     codegen/interpolated_string_test.cpp
     codegen/string_indexer_test.cpp

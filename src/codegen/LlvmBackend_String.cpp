@@ -283,13 +283,35 @@ llvm::Value* Emitter::lowerStringLiteral(std::string_view text, bool verbatim) {
 
 
 llvm::Value* Emitter::emitStringEq(llvm::Value* l, llvm::Value* r) {
-    auto* entryBB = builder_.GetInsertBlock();
-    auto* lenBB = llvm::BasicBlock::Create(llvm_, "str.eq.len", currentFn_);
-    auto* cmpBB = llvm::BasicBlock::Create(llvm_, "str.eq.cmp", currentFn_);
-    auto* endBB = llvm::BasicBlock::Create(llvm_, "str.eq.end", currentFn_);
-    // Fast path: same pointer → equal.
+    // per §4.6 / §9.1 / §7.2 / §8.4: null-safe string equality.
+    // `string?` lowers to a plain pointer (null = real null pointer).  We must
+    // never dereference either operand without first confirming it is non-null.
+    //
+    // Control-flow structure (4-incoming PHI at endBB):
+    //   1. samePtr   (l == r)        → true   [covers null == null and same obj]
+    //   2. nullCheckBB (l==null | r==null, but l!=r) → false [null vs. non-null]
+    //   3. lenBB sameLen=false       → false  [both non-null, different lengths]
+    //   4. cmpBB memcmp result       → memcmp==0 [both non-null, same length]
+    auto* entryBB    = builder_.GetInsertBlock();
+    auto* nullCheckBB = llvm::BasicBlock::Create(llvm_, "str.eq.nullchk", currentFn_);
+    auto* lenBB      = llvm::BasicBlock::Create(llvm_, "str.eq.len",     currentFn_);
+    auto* cmpBB      = llvm::BasicBlock::Create(llvm_, "str.eq.cmp",     currentFn_);
+    auto* endBB      = llvm::BasicBlock::Create(llvm_, "str.eq.end",     currentFn_);
+
+    // Fast path 1: same pointer → equal (also handles null == null).
     llvm::Value* samePtr = builder_.CreateICmpEQ(l, r, "str.sameptr");
-    builder_.CreateCondBr(samePtr, endBB, lenBB);
+    builder_.CreateCondBr(samePtr, endBB, nullCheckBB);
+
+    // Null guard: we know l != r here.  If either is null the other must be
+    // non-null (since l != r), so they cannot be equal.
+    builder_.SetInsertPoint(nullCheckBB);
+    auto* null_ = llvm::ConstantPointerNull::get(ptrTy());
+    llvm::Value* lNull = builder_.CreateICmpEQ(l, null_, "str.lnull");
+    llvm::Value* rNull = builder_.CreateICmpEQ(r, null_, "str.rnull");
+    llvm::Value* eitherNull = builder_.CreateOr(lNull, rNull, "str.eithernull");
+    auto* nullCheckEnd = builder_.GetInsertBlock();
+    builder_.CreateCondBr(eitherNull, endBB, lenBB);
+
     // Code-point-count check: must be equal for content equality.
     builder_.SetInsertPoint(lenBB);
     llvm::Value* lenL = loadStringLen(l);
@@ -297,6 +319,7 @@ llvm::Value* Emitter::emitStringEq(llvm::Value* l, llvm::Value* r) {
     llvm::Value* sameLen = builder_.CreateICmpEQ(lenL, lenR, "str.samelen");
     auto* lenEnd = builder_.GetInsertBlock();
     builder_.CreateCondBr(sameLen, cmpBB, endBB);
+
     // Compare byte data: len * width bytes for each string.
     // For equal-width strings: memcmp(dataL, dataR, len*width) == 0.
     // For different-width strings (e.g. width=1 vs width=2): we compare
@@ -314,12 +337,14 @@ llvm::Value* Emitter::emitStringEq(llvm::Value* l, llvm::Value* r) {
         cmpRes, llvm::ConstantInt::get(i32(), 0), "str.cmpeq");
     auto* cmpEnd = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
-    // Merge.
+
+    // Merge: 4 incoming edges.
     builder_.SetInsertPoint(endBB);
-    auto* phi = builder_.CreatePHI(i1(), 3, "str.eq");
-    phi->addIncoming(builder_.getTrue(), entryBB);
-    phi->addIncoming(builder_.getFalse(), lenEnd);
-    phi->addIncoming(cmpEq, cmpEnd);
+    auto* phi = builder_.CreatePHI(i1(), 4, "str.eq");
+    phi->addIncoming(builder_.getTrue(),  entryBB);    // samePtr (incl. null==null)
+    phi->addIncoming(builder_.getFalse(), nullCheckEnd); // one side null
+    phi->addIncoming(builder_.getFalse(), lenEnd);      // different lengths
+    phi->addIncoming(cmpEq,              cmpEnd);       // memcmp result
     return phi;
 }
 
