@@ -107,6 +107,17 @@ void ExprTC::checkNotInstanceMember(const ast::IdentifierExpr& id, Symbol* sym) 
     if (isStatic) return;
     // Only flag members of the type we're initializing.
     if (currentType_ && mem->parent != currentType_) return;
+    // per §22.8 / §22.10: a primary-constructor parameter (a FieldSymbol
+    // whose `posParam` is non-null AND whose parent type is a CLASS, not a
+    // record) is explicitly permitted in field/property initializers. The
+    // parameter's value is guaranteed available before field initializers
+    // run (§22.8 step 0). A record's positional fields are genuine instance
+    // members and remain forbidden. Bug #478.
+    if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
+        if (fs->posParam && mem->parent &&
+            mem->parent->kind == ast::TypeDeclKind::Class)
+            return;
+    }
     ctx_.diagnostics().report(
         Severity::Error, id.span.begin,
         std::string("a field initializer may not reference instance "

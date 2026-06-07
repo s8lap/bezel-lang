@@ -2917,7 +2917,50 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         llvm::Function* initFn = declareImportedInit(t);
         builder_.CreateCall(initFn, {obj});
     } else if (!ctx_.isImported(t)) {
+        // §22.10 / §22.8 (#478): a class with primary-constructor parameters
+        // must have those parameter values stored into their field slots
+        // BEFORE field initializers run (§22.8 step 0), so that initializers
+        // like `property X := x` can load the already-stored value via
+        // implicitFieldAddr. Also set currentThis_ = obj for the duration of
+        // emitInstanceInit so that implicitFieldAddr resolves against the new
+        // object, not the surrounding method's `this`.
+        llvm::Value* savedThisForInit = currentThis_;
+        currentThis_ = obj;
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (td && td->kind == ast::TypeDeclKind::Class &&
+            td->hasPositionalFields && !td->positionalFields.empty()) {
+            // Only the all-positional case: store each arg value directly into
+            // the corresponding primary-ctor-param field slot.
+            bool allPositional = true;
+            for (const auto& a : ne.args)
+                if (!a.name.empty()) { allPositional = false; break; }
+            if (allPositional &&
+                ne.args.size() == td->positionalFields.size()) {
+                for (std::size_t pi = 0; pi < td->positionalFields.size(); ++pi) {
+                    const ast::Param& pf = td->positionalFields[pi];
+                    for (sema::Symbol* m : t->members) {
+                        auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+                        if (!fs || fs->posParam != &pf) continue;
+                        auto idxIt = fieldIndex_.find(fs);
+                        if (idxIt == fieldIndex_.end()) break;
+                        if (!ne.args[pi].value) break;
+                        llvm::Value* v = lowerExpr(*ne.args[pi].value);
+                        if (!v) break;
+                        llvm::Type* fieldTy =
+                            st->getElementType(idxIt->second);
+                        v = coerceNumericToType(
+                            v, fieldTy,
+                            isUnsignedTargetExpr(*ne.args[pi].value));
+                        builder_.CreateStore(
+                            v, builder_.CreateStructGEP(
+                                   st, obj, idxIt->second));
+                        break;
+                    }
+                }
+            }
+        }
         emitInstanceInit(t, obj, st);
+        currentThis_ = savedThisForInit;
     }
     if (importedGeneric) {
         genericSubst_ = std::move(savedSubst);

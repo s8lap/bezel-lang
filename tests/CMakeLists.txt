@@ -119,6 +119,7 @@ set(BEZEL_TEST_SOURCES
     sema/named_arguments_test.cpp
     sema/overload_resolution_test.cpp
     sema/field_init_restrictions_test.cpp
+    sema/primary_ctor_param_init_478_test.cpp
     sema/null_narrowing_test.cpp
     sema/const_type_test.cpp
     sema/local_const_type_test.cpp
@@ -294,6 +295,7 @@ set(BEZEL_TEST_SOURCES
     codegen/bug_464_test.cpp
     codegen/bug_465_test.cpp
     codegen/async_451_test.cpp
+    codegen/primary_ctor_param_init_478_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
