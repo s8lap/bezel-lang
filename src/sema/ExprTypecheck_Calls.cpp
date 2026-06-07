@@ -1465,20 +1465,24 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
 void ExprTC::checkImportedNewExprArgs(
     const ast::NewExpr& ne, TypeSymbol* t,
     const std::vector<ConstructorSymbol*>& ctors) {
-    // §14 / §2.5 / §2.6 (issue #328 FINDING [2]): constructing an IMPORTED
-    // GENERIC type is not yet supported. Generics are monomorphized
+    // §14.1 / §2.5 / §2.6 (issue #328 FINDING [2]; #428): constructing an
+    // IMPORTED GENERIC type is not yet supported. Generics are monomorphized
     // per-instantiation (§14), so a generic template exports NO stable
-    // `bz$<Type>$init`/`$ctor` symbol the importer could link against; and the
-    // dependency metadata carries only the type's PUBLIC SIGNATURE — no
-    // constructor body, no field initializers (see ModuleMetadata) — so the
-    // importer cannot monomorphize `T<Args>` at its use site the way a LOCAL
-    // `new T<Args>(...)` does (which inlines the AST ctor body + field inits).
-    // Reject the construction here with an honest diagnostic instead of letting
-    // codegen emit a dangling external `bz$<Type>$init` reference that yields a
-    // cryptic `undefined reference` at link time. (Full support would require
-    // exporting the generic body in metadata so the importer can monomorphize —
-    // a larger feature, deferred. Imported generic STATIC METHODS and LOCAL
+    // `bz$<Type>$init`/`$ctor` symbol the importer could link against; the
+    // importer would have to monomorphize the generic at each
+    // `new ImportedGeneric<Args>(...)` use site exactly as it does a LOCAL
+    // `new T<Args>(...)`. Sound construction needs importer-side per-instantiation
+    // infrastructure that does not yet exist for imports — a generic CLASS always
+    // carries a §28.3 disposal obligation dispatched through a vtable the importer
+    // would have to emit locally; a generic RECORD needs per-instantiation
+    // record-struct specialization (absent even single-module, so a non-`int`
+    // field would silently miscompile). Both are larger features, deferred to a
+    // follow-up (see #428). Reject the construction here with an honest diagnostic
+    // instead of letting codegen emit a dangling external `bz$<Type>$init`
+    // reference (a cryptic link error). (Imported generic STATIC METHODS and LOCAL
     // generic instantiation are unaffected — only imported generic-type `new`.)
+    // The generic-RECORD case is gated separately at the NewExpr typecheck, since
+    // records are not routed through this constructor check.
     if (!t->genericParams.empty()) {
         ctx_.diagnostics().report(
             Severity::Error, ne.span.begin,

@@ -1654,4 +1654,153 @@ BEZEL_TEST(cross_module_import, interface_inheritance_across_boundary_spec_13) {
     }
 }
 
+// === #428 (follow-up to #328): cross-module generic TYPE instantiation ======
+//
+// §14.1 / §2.5 / §2.6: a generic type is monomorphized PER-INSTANTIATION, so a
+// dependency emits no stable per-type symbol an importer could link against; the
+// importer would have to monomorphize each `new ImportedGeneric<Args>(...)`
+// locally, exactly as it does a LOCAL generic. This lane CLOSES A LATENT
+// MISCOMPILE: an imported generic RECORD construction previously slipped past all
+// front-end checks (records are not routed through constructor checking) and
+// codegen monomorphized it through the record path, which lacks per-instantiation
+// struct specialization — so a non-`int` type argument silently produced the
+// wrong layout. Sound CONSTRUCTION of an imported generic type needs importer-side
+// per-instantiation infrastructure that does not yet exist for imports: a generic
+// CLASS always carries a §28.3 disposal obligation dispatched through a vtable the
+// importer would have to emit locally, and a generic RECORD needs per-instantiation
+// record-struct specialization (absent even single-module). Both are larger
+// features deferred to a follow-up. Until then every imported generic-type `new`
+// is rejected with the honest §14 diagnostic — a clean compile error, NEVER a
+// crash or a miscompile. These tests pin that boundary.
+
+// (1) §14.1 / §2.5: an imported generic RECORD construction is rejected with the
+// clean §14 diagnostic. REGRESSION GUARD for the closed miscompile: before this
+// lane, `new Box<string>("hello")` compiled and returned 0 (the positional field
+// kept the i32 placeholder layout instead of the string pointer). It must now be
+// a clean compile error, not a silent wrong value.
+BEZEL_TEST(cross_module_import, imported_generic_record_new_diagnosed_spec_14_1) {
+    ModuleMetadata dep = buildMetaFor(
+        "module GenRecLib; "
+        "public record Box<T>(value: T); ");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import GenRecLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := new Box<string>(\"hello\"); "
+        "    return b.value.Length; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    // The diagnostic must name the imported-generic-record limitation (so the
+    // failure is an honest §14 compile error, not the prior silent miscompile).
+    bool sawLimitation = false;
+    for (const Diagnostic& d : r->diags.diagnostics()) {
+        if (d.message.find("imported generic record") != std::string::npos &&
+            d.message.find("\xC2\xA7""14") != std::string::npos)
+            sawLimitation = true;
+    }
+    BEZEL_EXPECT_TRUE(sawLimitation);
+}
+
+// (2) §14.1 / §2.6: the imported generic RECORD `new` must also fail CLEANLY in a
+// native build (rc != 0, no executable), not link to a dangling symbol or emit a
+// miscompiled record. The library (a generic record template) compiles fine; the
+// importer's compile aborts at sema before codegen.
+BEZEL_TEST(cross_module_import, imported_generic_record_new_native_clean_failure_spec_14_1) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_428_grecnat_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module GenRecLib2; "
+        "public record Box<T>(value: T); ");
+    writeSource(bSrc.path,
+        "module App; "
+        "import GenRecLib2; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := new Box<string>(\"hello\"); "
+        "    return b.value.Length; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);  // the generic record template compiles
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(!rb.success);  // a clean compile error, not a miscompile
+    BEZEL_EXPECT_TRUE(!std::filesystem::exists(bExe.path));
+}
+
+// (3) §14.1 / §22.8: an imported generic CLASS with a FIELD INITIALIZER (and no
+// explicit ctor) is also rejected with the clean §14 diagnostic — sound
+// construction needs importer-side per-instantiation disposal infrastructure (a
+// generic class carries a §28.3 disposal obligation), which is deferred. Pins the
+// honest compile-error boundary for the field-initializer case named in #428.
+BEZEL_TEST(cross_module_import, imported_generic_field_init_class_diagnosed_spec_22_8) {
+    ModuleMetadata dep = buildMetaFor(
+        "module GenFieldLib; "
+        "public class Holder<T> "
+        "  public n: int := 9; "
+        "  public value: T; "
+        "  destructor end destructor; "
+        "end Holder;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import GenFieldLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var h := new Holder<int>(); "
+        "    return h.n; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    bool sawLimitation = false;
+    for (const Diagnostic& d : r->diags.diagnostics()) {
+        if (d.message.find("imported generic") != std::string::npos &&
+            d.message.find("\xC2\xA7""14") != std::string::npos)
+            sawLimitation = true;
+    }
+    BEZEL_EXPECT_TRUE(sawLimitation);
+}
+
+// (4) NEGATIVE — §14 deferred construct: a generic CLASS with an explicit
+// constructor BODY must still produce the clean §14 diagnostic, NOT a crash or a
+// miscompile. This pins the decline-with-reasons boundary; a follow-up issue
+// tracks lifting these to full generic-type construction.
+BEZEL_TEST(cross_module_import, imported_generic_ctor_body_still_diagnosed_spec_14) {
+    ModuleMetadata dep = buildMetaFor(
+        "module GenLib4; "
+        "public class Wrapper<T> "
+        "  public value: T; "
+        "  public constructor(v: T) value := v; end constructor; "
+        "  destructor end destructor; "
+        "end Wrapper;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import GenLib4; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var w := new Wrapper<int>(3); "  // ctor BODY not yet supported
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    // The construction must be rejected (a diagnostic), not silently miscompiled.
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
 }  // namespace bezel::module
