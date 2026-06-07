@@ -297,6 +297,7 @@ set(BEZEL_TEST_SOURCES
     codegen/bug_475_fp_predicates_test.cpp
     codegen/async_451_test.cpp
     codegen/primary_ctor_param_init_478_test.cpp
+    codegen/static_property_setter_476_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
