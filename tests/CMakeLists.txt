@@ -283,6 +283,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_record_return_test.cpp
     codegen/iterator_native_test.cpp
     codegen/extension_method_test.cpp
+    codegen/bug_457_458_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

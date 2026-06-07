@@ -3136,8 +3136,21 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
 void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     if (!nm.target) return;
     TypeSymbol* targetType = memberTargetType(nm.target.get());
-    if (!targetType) return;
-    Symbol* member = lookupMember(targetType, nm.member);
+    Symbol* member = targetType ? lookupMember(targetType, nm.member) : nullptr;
+    // §7.5 / §26.5 / #458: for a NULLABLE VALUE type receiver (e.g. `int?`,
+    // `bool?`, `enum?`, `record?`) memberTargetType returns null (because the
+    // type is Primitive or Named-record, not a class TypeSymbol). Also fall
+    // back for a Named receiver when lookupMember found nothing. In either
+    // case try lookupExtensionMember — it ignores the `nullable` flag on the
+    // receiver TypeRef (per extensionTargetMatchesReceiver's Primitive branch),
+    // so `extension int` matches an `int?` receiver, matching §26.5 semantics
+    // (extension resolution uses the unwrapped base type).
+    if (!member) {
+        const TypeRef* recvTy = nm.target ? ctx_.exprType(*nm.target) : nullptr;
+        if (recvTy) {
+            member = lookupExtensionMember(recvTy, nm.member);
+        }
+    }
     if (!member) return;
     // §13.1 (issue #432): full visibility check — delegates to the shared
     // checkMemberVisibility helper (same four-level rule as resolveMemberAccess).
