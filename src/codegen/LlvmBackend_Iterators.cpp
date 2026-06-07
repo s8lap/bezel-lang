@@ -45,6 +45,36 @@ void Emitter::collectSuspendLocals(
             if (ifs->hasElse) collectSuspendLocals(ifs->elseBody, out);
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
             collectSuspendLocals(db->body, out);
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // §30.9 / §31.2 (#438): a named local declared in a try BODY, a catch
+            // ARM body, or a FINALLY that lives across an in-region await must be
+            // frame-backed too (the resume re-enters the region across the
+            // suspend). collectSuspendLocals previously skipped try regions because
+            // await-in-catch/finally was deferred; now that those are supported,
+            // recurse so e.g. `catch E => do var a := await f(); var b := await
+            // g(); … end` round-trips `a` through the frame across the cross-thread
+            // hop. The catch-arm exception BINDING is frame-backed separately (it
+            // is not a LocalDecl — lowerTry registers its slot in
+            // asyncHandlerSpillSlots_).
+            collectSuspendLocals(ts->body, out);
+            for (const auto& arm : ts->catches) {
+                const ast::Stmt* ab = arm.body.get();
+                if (auto* adb = dynamic_cast<const ast::DoEndBlock*>(ab))
+                    collectSuspendLocals(adb->body, out);
+                else if (auto* ald = dynamic_cast<const ast::LocalDecl*>(ab)) {
+                    // A one-liner `catch E => var a := await f();` arm body.
+                    llvm::Type* ty = i32();
+                    if (ald->type) {
+                        if (auto* rt = ctx_.resolvedType(*ald->type))
+                            ty = lowerTypeRef(rt);
+                    } else if (ald->initializer) {
+                        if (auto* rt = ctx_.exprType(*ald->initializer))
+                            ty = lowerTypeRef(rt);
+                    }
+                    out.push_back({ald, ty});
+                }
+            }
+            if (ts->hasFinally) collectSuspendLocals(ts->finallyBody, out);
         }
     }
 }

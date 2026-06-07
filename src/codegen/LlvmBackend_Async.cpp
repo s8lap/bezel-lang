@@ -120,6 +120,7 @@ bool Emitter::containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
 // §30.2: count the await suspend points in a body (drives the resume switch's
 // state-block count, exactly like collectYields for the iterator path).
 static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+static unsigned countAwaitsInStmt(const ast::Stmt* s);
 
 static unsigned countAwaitsInExpr(const ast::Expr* e) {
     if (!e) return 0;
@@ -218,17 +219,50 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             // never called, so the outer Task never completes and
             // bz_task_await_sync hangs forever.
             n += countAwaits(ts->body);
+            // §30.9 / §31.2 (#438): count awaits in catch arms (guard + body) and
+            // the finally too — each is now a real suspend point (await-in-catch /
+            // await-in-finally are supported), so each needs a resume-switch state.
+            // A catch arm body is a single Stmt (a DoEndBlock for multi-statement
+            // arms, or a bare expr/assign/local/return for one-liners); count
+            // through any of those shapes. Undercounting here is the #441 hang: a
+            // suspend with no resume state lands the switch on its default
+            // (return), so the outer task never completes.
             for (const auto& arm : ts->catches) {
                 if (arm.guard) n += countAwaitsInExpr(arm.guard.get());
-                if (arm.body) {
-                    if (auto* db2 = dynamic_cast<const ast::DoEndBlock*>(arm.body.get()))
-                        n += countAwaits(db2->body);
-                }
+                n += countAwaitsInStmt(arm.body.get());
             }
-            if (ts->hasFinally) n += countAwaits(ts->finallyBody);
+            // §31.2 (#438): lowerTry emits the finally body TWICE — once in the
+            // normal-exit path (finNormalBB) and once in the exception-unwind path
+            // (finUnwindBB) — because the finally runs on every completion path.
+            // Each lowering of an in-finally `await` consumes its OWN resume state
+            // (++smNextSuspendState_), so a finally with k awaits needs 2*k states.
+            // Counting it once would leave the unwind-path finally's await without
+            // a resume state → #441 hang on the faulted-body path.
+            if (ts->hasFinally) n += 2 * countAwaits(ts->finallyBody);
         }
     }
     return n;
+}
+
+// §30.9 / §31.2 (#438): count awaits in a SINGLE statement — used for a catch
+// arm body, which is one Stmt (a DoEndBlock for the multi-statement form, or a
+// bare expr/assignment/local/return for the one-liner form). Recurses into the
+// common shapes so an await anywhere in the arm body is counted.
+static unsigned countAwaitsInStmt(const ast::Stmt* s) {
+    if (!s) return 0;
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s))
+        return countAwaits(db->body);
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s))
+        return countAwaitsInExpr(ld->initializer.get());
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s))
+        return countAwaitsInExpr(lc->value.get());
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s))
+        return countAwaitsInExpr(as->value.get());
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s))
+        return countAwaitsInExpr(es->expr.get());
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s))
+        return countAwaitsInExpr(rs->value.get());
+    return 0;
 }
 
 
@@ -249,36 +283,27 @@ bool Emitter::awaitInDeferredTryPosition(
     for (const auto& s : stmts) {
         if (!s) continue;
         if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
-            // A catch guard / arm body or a finally with an await is deferred.
-            // A catch arm body is a single Stmt (often a DoEndBlock);
-            // containsAwait operates on a statement list, so inspect the single
-            // statement directly via the common shapes.
+            // §30.9 / §31.2 (#438): `await` in a catch GUARD remains deferred —
+            // a guard runs DURING catch dispatch (before the arm is entered and
+            // before currentCaughtExc_ / the caught-exc disposal scope are set
+            // up), so suspending there would have to re-establish and re-run the
+            // dispatch sequence at resume. `await` in a catch ARM BODY and in a
+            // FINALLY are now supported (lowerTry frame-backs the handler-context
+            // allocas and the in-flight exception across the suspend), so they are
+            // NOT flagged here.
             for (const auto& arm : ts->catches) {
                 if (arm.guard && exprContainsAwait(arm.guard.get()))
                     return true;
-                const ast::Stmt* ab = arm.body.get();
-                if (ab) {
-                    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(ab)) {
-                        if (containsAwait(db->body)) return true;
-                    } else if (auto* es =
-                                   dynamic_cast<const ast::ExpressionStmt*>(ab)) {
-                        if (exprContainsAwait(es->expr.get())) return true;
-                    } else if (auto* asn =
-                                   dynamic_cast<const ast::AssignmentStmt*>(ab)) {
-                        if (exprContainsAwait(asn->value.get())) return true;
-                    } else if (auto* ld =
-                                   dynamic_cast<const ast::LocalDecl*>(ab)) {
-                        if (exprContainsAwait(ld->initializer.get())) return true;
-                    } else if (auto* rs =
-                                   dynamic_cast<const ast::ReturnStmt*>(ab)) {
-                        if (exprContainsAwait(rs->value.get())) return true;
-                    }
-                }
             }
-            if (containsAwait(ts->finallyBody)) return true;
-            // The try BODY is supported, but it may itself contain a NESTED try
-            // whose catch / finally awaits — recurse into the body too.
+            // The try BODY, catch arm bodies, and finally may each contain a
+            // NESTED try whose catch GUARD awaits — recurse into all of them.
             if (awaitInDeferredTryPosition(ts->body)) return true;
+            for (const auto& arm : ts->catches) {
+                const ast::Stmt* ab = arm.body.get();
+                if (auto* db = dynamic_cast<const ast::DoEndBlock*>(ab))
+                    if (awaitInDeferredTryPosition(db->body)) return true;
+            }
+            if (awaitInDeferredTryPosition(ts->finallyBody)) return true;
             continue;
         }
         // Recurse into other compound statements so a deferred position nested
@@ -315,6 +340,29 @@ bool Emitter::stmtContainsSuspend(const ast::Stmt* s) {
         return exprContainsAwait(es->expr.get());
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s))
         return exprContainsAwait(as->value.get());
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s))
+        return exprContainsAwait(rs->value.get());
+    return false;
+}
+
+
+// §30.9 / §31.2 (#438): does a single statement (a catch-arm body) contain an
+// `await`? A catch arm body is one Stmt — a DoEndBlock for the multi-statement
+// form, or a bare expr/assignment/local/return for the one-liner. Recurses into
+// the common shapes. Unlike stmtContainsSuspend it does NOT report `yield`
+// (irrelevant for the plain-async catch/finally path).
+bool Emitter::stmtContainsAwait(const ast::Stmt* s) {
+    if (!s) return false;
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s))
+        return containsAwait(db->body);
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s))
+        return exprContainsAwait(ld->initializer.get());
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s))
+        return exprContainsAwait(lc->value.get());
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s))
+        return exprContainsAwait(as->value.get());
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s))
+        return exprContainsAwait(es->expr.get());
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s))
         return exprContainsAwait(rs->value.get());
     return false;
@@ -368,21 +416,23 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     if (!ci.stmts) return;
     smKind_ = SuspendKind::Await;
 
-    // §30.9 / §31.2 (#438): `await` in a try BODY is supported (lowerTry lowers
-    // the await's resume block inside the protected region, so a faulted await
-    // re-raises into the enclosing catch and the finally runs on every path).
-    // `await` in a catch arm or a `finally` is still deferred — resuming INTO a
-    // catch handler / finally across a suspend needs the caught-exception
-    // disposal scope / exit-mode re-dispatch re-established at resume, which the
-    // flat resume model can't yet do. Reject those positions with a clear
-    // diagnostic + safe stub so no malformed IR escapes.
+    // §30.9 / §31.2 (#438): `await` is now supported in a try BODY, a catch ARM
+    // BODY, and a FINALLY (lowerTry lowers each handler's resume block in place
+    // and frame-backs the handler-context allocas + the in-flight exception so
+    // they survive a cross-thread suspend). The ONE remaining deferred position is
+    // an `await` in a catch GUARD (`catch E when await ...`): the guard runs
+    // during catch DISPATCH, before the arm scope / caught-exception state exist,
+    // so resuming there would have to re-run the dispatch sequence. Reject that
+    // sub-case with a clear diagnostic + safe stub so no malformed IR escapes.
     if (awaitInDeferredTryPosition(*ci.stmts)) {
         ctx_.diagnostics().report(
             Severity::Error,
             ms->decl ? ms->decl->span.begin : SourceLocation{},
-            "not yet implemented: `await` inside a catch arm or a `finally` — "
-            "resuming into the handler scope across a suspend is a deferred "
-            "increment (`await` in a try BODY is supported) (§30.9)");
+            "not yet implemented: `await` inside a catch GUARD (`catch ... when "
+            "await ...`) — the guard runs during catch dispatch, before the "
+            "handler scope exists, so resuming there is a deferred increment "
+            "(`await` in a try BODY, a catch arm body, or a `finally` is "
+            "supported) (§30.9)");
         // Emit a minimal well-formed body so no malformed IR escapes: alloc the
         // task, complete it with a zero/default result, and return it (or the
         // exit code for async Main). The diagnostic above fails the compile.
@@ -565,6 +615,9 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+        // §30.9 / §31.2 (#438): start with no pending handler-context spill slots;
+        // lowerTry registers them as it lowers any in-handler await.
+        asyncHandlerSpillSlots_.clear();
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
         builder_.SetInsertPoint(entry);
 
@@ -1274,6 +1327,20 @@ void Emitter::fixupSuspendDominance(llvm::Function* fn) {
             if (changed) break;
         }
     }
+
+    // §30.9 / §31.2 (#438): FORCE-promote the handler-context allocas registered
+    // by lowerTry (the catch-arm binding / caught-exception disposal slots and
+    // the finally exit-mode / return-value / pending-exception slots). Unlike the
+    // dominance-demoted registers above, these are allocas — they never "fail
+    // dominance" (an alloca's pointer is available everywhere) — so the loop never
+    // touches them. But they are stored BEFORE an in-handler await and read AFTER
+    // it, so on a cross-thread resume a function-local stack slot holds garbage.
+    // Appending them to `demoted` heap-spills them through the frame (the store /
+    // load then target the persistent heap slot), exactly like a demoted register.
+    for (llvm::AllocaInst* a : asyncHandlerSpillSlots_)
+        if (a && a->getParent() && a->getParent()->getParent() == fn)
+            demoted.push_back(a);
+    asyncHandlerSpillSlots_.clear();
 
     // No cross-suspend temporary → nothing to move into the frame; the spill-ptr
     // frame field stays null (harmless).

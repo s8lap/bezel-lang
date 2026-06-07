@@ -443,6 +443,25 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
 
 bool Emitter::lowerTry(const ast::TryStmt& trys) {
     bool hasFin = trys.hasFinally;
+    // §30.9 / §31.2 (#438): in an async state machine, an `await` inside a catch
+    // arm or the finally is a real suspend point. The resume re-enters this
+    // handler scope mid-handler, and a cross-thread resume runs on a worker with
+    // a fresh stack — so any handler-context alloca STORED before the in-handler
+    // await and READ after it (the catch-arm exception binding, the synthetic
+    // caught-exception disposal slot, the finally exit-mode / return-value slots)
+    // must round-trip the HEAP frame, not a function-local stack slot. We register
+    // those slots in asyncHandlerSpillSlots_; fixupSuspendDominance later
+    // force-promotes each into the frame spill area (repointing the alloca to a
+    // heap GEP). Only the slots of a try region that actually contains an
+    // in-handler await are frame-backed (a try whose catch/finally has no await
+    // keeps its handler allocas on the stack, the cheap path).
+    const bool asyncSM = (smKind_ == SuspendKind::Await ||
+                          smKind_ == SuspendKind::AsyncYield) &&
+                         smStateStruct_ && smSelf_;
+    // Whether THIS try's catch arms / finally suspend on an `await` is decided
+    // per-arm below (armAwaits) and, for the finally, here.
+    const bool finallyAwaits =
+        asyncSM && hasFin && containsAwait(trys.finallyBody);
     // CG21b/CG21c: a `finally` runs on every exit from the try.
     // Normal flow-through and return/break/continue all go through
     // finNormalBB; exception exits go through finUnwindBB.
@@ -479,6 +498,14 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         finallyStack_.push_back({finNormalBB, exitModSlot, retValSlot,
                                  retTy, afterBB,
                                  loopBreakBB, loopContBB});
+        // §30.9 / §31.2 (#438): an in-finally await re-enters the finally
+        // mid-body; the exit-mode and return-value slots were set BEFORE the
+        // finally (in the normal-exit path) and are read AFTER the suspend (the
+        // finally.resume dispatch), so frame-back them across the cross-thread hop.
+        if (finallyAwaits) {
+            asyncHandlerSpillSlots_.push_back(exitModSlot);
+            if (retValSlot) asyncHandlerSpillSlots_.push_back(retValSlot);
+        }
     }
 
     llvm::BasicBlock* savedUnwind = unwindTarget_;
@@ -494,6 +521,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     builder_.SetInsertPoint(dispatchBB);
     llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
     for (const auto& arm : trys.catches) {
+        // §30.9 / §31.2 (#438): does THIS arm suspend on an `await` (guard or
+        // body)? If so its handler-context allocas must survive a cross-thread
+        // resume — frame-back them below.
+        const bool armAwaits =
+            asyncSM &&
+            ((arm.guard && exprContainsAwait(arm.guard.get())) ||
+             stmtContainsAwait(arm.body.get()));
         auto* armBB = llvm::BasicBlock::Create(llvm_, "catch.arm",
                                                currentFn_);
         auto* nextBB = llvm::BasicBlock::Create(llvm_, "catch.next",
@@ -518,6 +552,11 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 llvm::AllocaInst* slot = entryAlloca(ptrTy());
                 builder_.CreateStore(exc, slot);
                 locals_[arm.body.get()] = slot;
+                // The binding is read in the arm body, possibly AFTER an in-arm
+                // await (§31.1: the borrow's lifetime is the whole arm body, which
+                // spans the suspend) — frame-back it so the caught object pointer
+                // survives the cross-thread resume.
+                if (armAwaits) asyncHandlerSpillSlots_.push_back(slot);
             }
             if (arm.guard) {
                 llvm::Value* g = lowerExpr(*arm.guard);
@@ -559,6 +598,11 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             Disposal d{excSlot, nullptr};
             d.caughtException = true;
             disposeStack_.back().push_back(d);
+            // §30.9 / §31.2 (#438): the caught-exception disposal runs on the
+            // arm's NORMAL fall-through — which, with an in-arm await, is AFTER the
+            // resume. emitDisposeAndReclaim reads the object pointer from excSlot,
+            // so the slot must survive the cross-thread hop: frame-back it.
+            if (armAwaits) asyncHandlerSpillSlots_.push_back(excSlot);
         }
         // An exception thrown by the arm body must still run finally.
         if (hasFin) { unwindTarget_ = finUnwindBB; unwindScopeDepth_ =
@@ -648,8 +692,46 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
 
         // finUnwindBB: exception exit — run finally, then re-propagate.
         builder_.SetInsertPoint(finUnwindBB);
-        if (!lowerScopedBlock(trys.finallyBody))
+        if (finallyAwaits) {
+            // §30.9 / §31.2 (#438): an `await` in the finally on the EXCEPTION
+            // path suspends with an exception in flight. `bz$exc` is a single
+            // process-global (not thread-local), so it would be clobbered by any
+            // other task that runs on this thread while we are suspended. Capture
+            // the in-flight exception object into a FRAME-BACKED slot (so it
+            // survives the cross-thread resume), clear the global for the duration
+            // of the finally, then restore it before re-propagating to the outer
+            // handler — which expects to read the original object from bz$exc.
+            llvm::AllocaInst* pendingExcSlot = entryAlloca(ptrTy());
+            llvm::Value* inflight = builder_.CreateLoad(ptrTy(), excGlobal());
+            builder_.CreateStore(inflight, pendingExcSlot);
+            asyncHandlerSpillSlots_.push_back(pendingExcSlot);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), excGlobal());
+            bool finUTerm = lowerScopedBlock(trys.finallyBody);
+            if (!finUTerm) {
+                // Restore the captured in-flight exception and re-propagate. If
+                // the finally itself threw (set bz$exc non-null), that NEW
+                // exception supersedes the original (§31.2 finally-throws
+                // semantics); keep it. Otherwise restore the original.
+                llvm::Value* afterFin = builder_.CreateLoad(ptrTy(), excGlobal());
+                llvm::Value* finThrew = builder_.CreateICmpNE(
+                    afterFin, llvm::ConstantPointerNull::get(ptrTy()),
+                    "fin.threw");
+                auto* restoreBB =
+                    llvm::BasicBlock::Create(llvm_, "finally.restore", currentFn_);
+                auto* propBB =
+                    llvm::BasicBlock::Create(llvm_, "finally.reraise", currentFn_);
+                builder_.CreateCondBr(finThrew, propBB, restoreBB);
+                builder_.SetInsertPoint(restoreBB);
+                llvm::Value* orig = builder_.CreateLoad(ptrTy(), pendingExcSlot);
+                builder_.CreateStore(orig, excGlobal());
+                builder_.CreateBr(propBB);
+                builder_.SetInsertPoint(propBB);
+                builder_.CreateBr(outerUnwind);
+            }
+        } else if (!lowerScopedBlock(trys.finallyBody)) {
             builder_.CreateBr(outerUnwind);
+        }
     }
 
     builder_.SetInsertPoint(afterBB);
