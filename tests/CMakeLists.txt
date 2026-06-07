@@ -214,6 +214,7 @@ set(BEZEL_TEST_SOURCES
     codegen/short_circuit_test.cpp
     codegen/integration_test.cpp
     codegen/math_convert_test.cpp
+    codegen/math_sign_test.cpp
     codegen/unsigned_int_test.cpp
     codegen/compound_assign_test.cpp
     codegen/char_literal_test.cpp

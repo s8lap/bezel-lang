@@ -1263,11 +1263,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 ctx_.setExprType(&ce, rt);
             // If Function with null funcReturn: leave untyped (void/unknown)
         }
-        // §6 / stdlib §5: Math.Abs and Math.Sign are polymorphic — the
-        // return type matches the argument type, not always Int. If the
-        // member access was typed as Int but the first argument is
-        // float/double, override with Double so the string formatter and
-        // type inference work correctly.
+        // stdlib §2.2: Math.Abs is polymorphic — its return type matches the
+        // argument type (Abs(int):int, Abs(long):long, Abs(double):double).
+        // Math.Min/Max/Clamp<T> are generic and also return T (same-as-arg).
+        // Math.Sign is NOT polymorphic — every overload (Sign(int), Sign(long),
+        // Sign(double)) always returns int (stdlib §2.2: "Sign(x: double): int").
+        // Including Sign here previously caused Sign(double) to be typed as double,
+        // which then crashed codegen with an ICmp type-mismatch (SIGABRT) when the
+        // double result was compared against an int literal.
         if (auto* rt = ctx_.exprType(ce)) {
             if (rt->kind == TypeRef::Kind::Primitive &&
                 rt->primitive == PrimitiveType::Int &&
@@ -1280,9 +1283,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          argTy->primitive == PrimitiveType::Long)) {
                         // Determine which method this is — only override
                         // for the numeric functions that return same-as-arg.
+                        // Sign is intentionally excluded (always returns int).
                         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                                 ce.callee.get())) {
-                            if (ma->member == "Abs" || ma->member == "Sign" ||
+                            if (ma->member == "Abs" ||
                                 ma->member == "Min" || ma->member == "Max" ||
                                 ma->member == "Clamp") {
                                 ctx_.setExprType(&ce, argTy);
