@@ -269,6 +269,7 @@ set(BEZEL_TEST_SOURCES
     codegen/guid_test.cpp
     codegen/owned_collection_ops_test.cpp
     codegen/linked_list_test.cpp
+    codegen/bug_453_454_455_test.cpp
     codegen/owned_dict_disposal_test.cpp
     codegen/dict_clear_test.cpp
     codegen/dict_get_or_add_test.cpp

@@ -1456,11 +1456,38 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // per §5 LINQ: .Distinct() is LAZY — see tryLowerLazyLinqCall.
 
+        // fix #455 / §4.5: when the element type is a nullable VALUE type
+        // (int?, bool?, enum?, record?) the lowered argument may be the inner
+        // primitive/enum/record value rather than the full tagged struct
+        // {i8 hasValue; T value} that the runtime expects.  If v's LLVM type
+        // is the inner type (not yet the tagged struct), wrap it here so the
+        // alloca matches the esz that collectionElemSize computed.
+        // Two cases arise:
+        //   (a) v is the inner scalar (i32/i1/…) — wrap as {hasValue=1, v}.
+        //   (b) v is a null pointer (from an untyped `null` literal whose sema
+        //       type was not resolved to int?) — produce {hasValue=0, 0}.
+        // If the sema type WAS resolved to int? correctly, lowerExpr already
+        // returns the tagged struct and v->getType() == expected → no-op.
+        auto ensureNullableElem = [&](llvm::Value* v) -> llvm::Value* {
+            const sema::TypeRef* elemTyRef =
+                (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            if (!elemTyRef || !isNullableValueTy(elemTyRef)) return v;
+            llvm::StructType* expected = nullableValueStructTy(elemTyRef);
+            if (!expected || v->getType() == expected) return v;
+            // (b) null pointer → null tagged struct.
+            if (v->getType()->isPointerTy())
+                return nullableValueNull(elemTyRef);
+            // (a) inner scalar/struct value → {hasValue=1, v}.
+            return wrapNullableValue(elemTyRef, v);
+        };
+
         // .Add(v) / .Push(v) / .Enqueue(v)
         if ((m == "Add" || m == "Push" || m == "Enqueue") &&
             call.args.size() == 1 && call.args[0].value) {
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
+            v = ensureNullableElem(v);
             // Store elem to stack alloca, pass pointer to runtime
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
@@ -1480,6 +1507,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* v   = lowerExpr(*call.args[1].value);
             if (!idx || !v) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
+            v = ensureNullableElem(v);
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
             auto* fn = declareC("bz_array_insert_at", llvm::Type::getVoidTy(llvm_),
@@ -1518,6 +1546,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* v   = lowerExpr(*call.args[1].value);
             if (!idx || !v) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
+            v = ensureNullableElem(v);  // fix #455: lift inner type to tagged struct
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
             auto* fn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
@@ -6476,11 +6505,18 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     if (!ma || !ma->target) return nullptr;
     const auto& m = ma->member;
 
-    // Only intercept on a collection or lazy-enumerable receiver.
+    // Only intercept on a collection, lazy-enumerable, or LinkedList receiver.
     auto* recvTy = ctx_.exprType(*ma->target);
     bool collRecv = isCollectionTypeName(recvTy);
     bool lazyRecv = isLazyEnumerableType(recvTy);
-    if (!collRecv && !lazyRecv) return nullptr;
+    // fix #454 / §5 / §4.6: LinkedList<T> implements IEnumerable<T> but is
+    // bz_llist_t*-backed, not bz_array_t*-backed.  lowerToLazyEnumerator already
+    // routes it via bz_lazy_from_llist, but the guard here used to exclude it
+    // (neither isCollectionTypeName nor isLazyEnumerableType is true for a
+    // LinkedList), so Where/Select/ToArray/etc. silently fell through and returned
+    // 0 or crashed.  Include it so the lazy operators wrap it correctly.
+    bool llRecv = isLinkedListTypeName(recvTy);
+    if (!collRecv && !lazyRecv && !llRecv) return nullptr;
 
     // Element LLVM type for the receiver's element TypeRef.
     auto elemLlvmOf = [&](sema::TypeRef* er) -> llvm::Type* {

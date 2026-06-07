@@ -522,6 +522,17 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
     auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
 
+    // §8.6 / #453: Object and interface are pointer-typed — they carry a vtable
+    // (class/box) or are a bare bz_string*.  Dispatch through lowerObjectToString
+    // (the same path used by `o.ToString()` on an Object receiver) instead of
+    // falling to the default `%d` snprintf, which would print the 64-bit pointer
+    // value as a truncated i32. This covers both interpolation and Console.WriteLine.
+    if (prim == P::Object) {
+        if (llvm::Value* r = lowerObjectToString(val)) return r;
+        // Fallback (should not be reached for a well-typed Object): type name.
+        return lowerStringLiteral("\"Object\"", false);
+    }
+
     // Special case: bool → "true" or "false"
     if (prim == P::Bool) {
         // lowerStringLiteral materializes constant globals.
