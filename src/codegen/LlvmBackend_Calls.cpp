@@ -2924,14 +2924,34 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateSelect(isNeg, neg, arg, "abs.result");
             }
             if (m == "Sign") {
-                // Sign: -1 if n<0, 0 if n==0, 1 if n>0.
-                auto* zero = llvm::ConstantInt::get(arg->getType(), 0);
+                // stdlib §2.2: Sign(x: int|long|double): int
+                // Always returns int (-1, 0, or 1), regardless of argument type.
+                // For floating-point args use FCmp; for integer args use ICmp.
+                // The result is always i32 (Bezel int).
+                auto* i32Ty = llvm::Type::getInt32Ty(llvm_);
+                auto* zero32 = llvm::ConstantInt::get(i32Ty, 0);
+                auto* one32  = llvm::ConstantInt::getSigned(i32Ty, 1);
+                auto* neg132 = llvm::ConstantInt::getSigned(i32Ty, -1);
+                if (arg->getType()->isFloatingPointTy()) {
+                    // FP path: use ordered FCmp so NaN → 0 (neither negative nor positive).
+                    auto* zeroFP = llvm::Constant::getNullValue(arg->getType());
+                    llvm::Value* isNeg = builder_.CreateFCmpOLT(arg, zeroFP, "sgn.neg");
+                    llvm::Value* isPos = builder_.CreateFCmpOGT(arg, zeroFP, "sgn.pos");
+                    llvm::Value* s1 = builder_.CreateSelect(isPos, one32, zero32, "sgn.1");
+                    return builder_.CreateSelect(isNeg, neg132, s1, "sgn.result");
+                }
+                // Integer path (int or long): compute in arg's native width then trunc/sext to i32.
+                llvm::Value* zero = llvm::ConstantInt::get(arg->getType(), 0);
                 llvm::Value* isNeg = builder_.CreateICmpSLT(arg, zero, "sgn.neg");
                 llvm::Value* isPos = builder_.CreateICmpSGT(arg, zero, "sgn.pos");
                 llvm::Value* one = llvm::ConstantInt::get(arg->getType(), 1);
                 llvm::Value* negOne = llvm::ConstantInt::getSigned(arg->getType(), -1);
                 llvm::Value* s1 = builder_.CreateSelect(isPos, one, zero, "sgn.1");
-                return builder_.CreateSelect(isNeg, negOne, s1, "sgn.result");
+                llvm::Value* sRes = builder_.CreateSelect(isNeg, negOne, s1, "sgn.pre");
+                // Normalise to i32: no-op for i32 arg, sext/trunc for i64 (long).
+                if (sRes->getType() != i32Ty)
+                    sRes = builder_.CreateSExtOrTrunc(sRes, i32Ty, "sgn.result");
+                return sRes;
             }
             // Math.IsNaN(x): bool — NaN is not equal to itself.
             if (m == "IsNaN") {
