@@ -305,6 +305,7 @@ set(BEZEL_TEST_SOURCES
     codegen/primary_ctor_param_init_478_test.cpp
     codegen/static_property_setter_476_test.cpp
     codegen/bug_483_nested_type_test.cpp
+    codegen/nested_enum_cast_482_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

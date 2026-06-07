@@ -84,28 +84,56 @@ void Emitter::declareExterns() {
 }
 
 
+// §10 / #482 fix A: populate enumValue_ for all constants of a single enum
+// TypeSymbol whose AST TypeDecl is available. Extracted so it can be called
+// both for module-level enums (via the symbols() walk) and for enums nested
+// inside a class (via computeEnumValues's second pass below).
+void Emitter::populateEnumValuesFromDecl(const sema::TypeSymbol* ts) {
+    auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+    if (!td) return;
+    std::int64_t running = 0;
+    for (const auto& ec : td->enumConstants) {
+        std::int64_t val = running;
+        if (ec.value) {
+            if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(
+                    ec.value.get()))
+                val = parseIntLiteral(lit->text);
+        }
+        for (const sema::Symbol* m : ts->members) {
+            if (dynamic_cast<const sema::EnumConstantSymbol*>(m) &&
+                m->name == ec.name) {
+                enumValue_[m] = val;
+                break;
+            }
+        }
+        running = val + 1;
+    }
+}
+
 void Emitter::computeEnumValues() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts || ts->kind != ast::TypeDeclKind::Enum) continue;
-        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-        if (!td) continue;
-        std::int64_t running = 0;
-        for (const auto& ec : td->enumConstants) {
-            std::int64_t val = running;
-            if (ec.value) {
-                if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(
-                        ec.value.get()))
-                    val = parseIntLiteral(lit->text);
-            }
-            for (const sema::Symbol* m : ts->members) {
-                if (dynamic_cast<const sema::EnumConstantSymbol*>(m) &&
-                    m->name == ec.name) {
-                    enumValue_[m] = val;
-                    break;
+        populateEnumValuesFromDecl(ts);
+    }
+    // §10 / #482 fix A: module-level class symbols may contain NESTED enum
+    // types (NestedTypeSymbol members whose ->type->kind == Enum). The loop
+    // above only visits module-level TypeSymbols, so nested enums' constants
+    // were never entered in enumValue_ — making every nested-enum constant
+    // lower to 0 regardless of its declared value. Walk every class TypeSymbol
+    // and populate nested-enum constants exactly like the module-level case.
+    // per §10: a nested enum has the same underlying-integer semantics as a
+    // top-level enum; its constants are accessible as Outer.Inner.Constant.
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind == ast::TypeDeclKind::Enum) continue;
+        for (const sema::Symbol* m : ts->members) {
+            if (auto* nts = dynamic_cast<const sema::NestedTypeSymbol*>(m)) {
+                if (nts->type &&
+                    nts->type->kind == ast::TypeDeclKind::Enum) {
+                    populateEnumValuesFromDecl(nts->type);
                 }
             }
-            running = val + 1;
         }
     }
     // §10/§10.2 (issue #328 FINDING [1]): an IMPORTED enum has no AST TypeDecl,

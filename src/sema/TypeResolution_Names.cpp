@@ -137,22 +137,8 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
 void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     Scope typeScope;
     typeScope.parent = parent;
-    // Register the type's generic params + any nested types so members
-    // can reference them.
-    for (const auto& g : td.genericParams) {
-        typeScope.names[g.name] = nullptr;  // marker for generic-param
-    }
-    for (const auto& m : td.members) {
-        if (auto* nt =
-                dynamic_cast<const ast::NestedTypeMember*>(m.get())) {
-            if (nt->decl) {
-                // Look up the corresponding TypeSymbol by name in the
-                // outer type's members — slice 1 stored them already.
-                // For now we just register the name as visible.
-                typeScope.names[nt->decl->name] = nullptr;
-            }
-        }
-    }
+    // Resolve the outer TypeSymbol FIRST so we can attach NestedTypeSymbol
+    // pointers when registering nested-type names in typeScope (fix C / #482).
     // Base types. Slice S5: cache the resolved TypeSymbols on the
     // declaring TypeSymbol so member lookup can walk them.
     TypeSymbol* tsym = nullptr;
@@ -160,6 +146,44 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
         for (Symbol* child : ctx_.module()->children) {
             if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
                 if (ts->decl == &td) { tsym = ts; break; }
+            }
+        }
+    }
+    // Register the type's generic params + any nested types so members
+    // can reference them.
+    for (const auto& g : td.genericParams) {
+        typeScope.names[g.name] = nullptr;  // marker for generic-param
+    }
+    // §11.3 / #482 fix C: register nested-type names with their actual
+    // NestedTypeSymbol* (not nullptr). Storing nullptr for nested types
+    // collided with the nullptr sentinel for generic params, causing
+    // resolveNamed to mislabel a single-part nested-type reference inside
+    // the outer class body as "generic param" (declaration=null). By storing
+    // the real NestedTypeSymbol*, lookupName returns non-null for nested
+    // types and the resolveNamed caller can distinguish the two cases.
+    for (const auto& m : td.members) {
+        if (auto* nt =
+                dynamic_cast<const ast::NestedTypeMember*>(m.get())) {
+            if (nt->decl && tsym) {
+                // Find the NestedTypeSymbol in the outer type's member list.
+                NestedTypeSymbol* nts = nullptr;
+                for (Symbol* ms : tsym->members) {
+                    if (auto* candidate =
+                            dynamic_cast<NestedTypeSymbol*>(ms)) {
+                        if (candidate->name == nt->decl->name) {
+                            nts = candidate;
+                            break;
+                        }
+                    }
+                }
+                // Store the NestedTypeSymbol* so resolveNamed can extract
+                // ->type. Fall back to nullptr only when the symbol wasn't
+                // found (should not happen after slice 1 ran correctly).
+                typeScope.names[nt->decl->name] = nts;
+            } else if (nt->decl) {
+                // tsym not found (should not happen) — fall back to the
+                // old nullptr marker so at least the name is visible.
+                typeScope.names[nt->decl->name] = nullptr;
             }
         }
     }
@@ -491,7 +515,30 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     // or a module-level alias), fall back to treating the whole name as a
     // single opaque reference with no declaration — the same as the pre-fix
     // `Module.Name`-style handling for any non-TypeSymbol first part.
+    //
+    // §11.3 / #482 fix C: a single-part name may resolve via lookupName to a
+    // NestedTypeSymbol* (now that fix C stores the real pointer instead of
+    // nullptr). NestedTypeSymbol does NOT inherit TypeSymbol, so the
+    // dynamic_cast below would give null and we'd set declaration=nullptr.
+    // Handle it before the cast: a single-part nested-type reference inside
+    // the outer class body is exactly `Inner` — follow NestedTypeSymbol::type
+    // as the resolved TypeSymbol. (A multi-part form `Outer.Inner` reaches
+    // here via the qualified-name walk in the `else` branch with `sym` = the
+    // outer TypeSymbol — that path is unchanged.)
     auto* tsym = dynamic_cast<TypeSymbol*>(sym);
+    if (!tsym) {
+        // §11.3 / #482 fix C: check for NestedTypeSymbol (inner enum/class
+        // referenced by a single unqualified name inside the outer class body).
+        if (auto* nts = dynamic_cast<NestedTypeSymbol*>(sym)) {
+            if (nts->type) {
+                tsym = nts->type;
+                // Fall through into the else branch (tsym now non-null) to
+                // handle any remaining qualified parts and set declaration.
+                // For a single-part name there are no further parts, so the
+                // loop below is a no-op and declaration = tsym is set.
+            }
+        }
+    }
     if (!tsym) {
         // Could be a TypeAliasSymbol or other. For slice 2, treat as
         // a Named pointing to no declaration (sema slice 3+ resolves
