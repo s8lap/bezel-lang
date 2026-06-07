@@ -139,3 +139,74 @@ BEZEL_TEST(codegen_cancellation_6_1, explicit_dispose_source) {
         "cts.Dispose(); "
         "return 3; ")), 3);
 }
+
+// ===========================================================================
+// Bug #463: CancellationTokenSource.WithCancelAfter() return type erasure.
+//
+// Root cause: sema did not assign a type to the WithCancelAfter() CallExpr,
+// so `var cts := CancellationTokenSource.WithCancelAfter(...)` inferred `cts`
+// as an unresolved type (erased to i32 by codegen).  Accessing `cts.Token`
+// then lowered the token as `i32` instead of `ptr`, causing MALFORMED IR when
+// passing the token to Task.Delay(int, CancellationToken).
+//
+// Fix: sema now assigns return type CancellationTokenSource to WithCancelAfter
+// (the same TypeRef shape used by `new CancellationTokenSource()`), so
+// `cts.Token` types correctly as CancellationToken (a ptr-wide value, §6.1).
+//
+// Timer note: WithCancelAfter schedules cancellation after a delay.  The
+// timer is currently DEFERRED (the runtime does not yet schedule the cancel
+// callback).  The source is allocated normally; no cancellation fires during
+// the test.  Programs compile cleanly (no malformed IR) and run to a defined
+// exit — they do NOT see the cancellation (timer not implemented), so they
+// take the "not cancelled" path and return 0, not 8.  Tests assert 0 for
+// now; when the timer is implemented they will need updating to assert 8.
+//
+// Spec reference: stdlib §6.1 (WithCancelAfter signature and return type),
+//                 §6.1 (CancellationToken — a single pointer word).
+// ===========================================================================
+
+// #463 / §6.1: WithCancelAfter() compiles cleanly and the source's token
+// has the right layout (ptr-wide).  IsCancellationRequested is false before
+// the deferred timer fires (timer is currently deferred → not cancelled).
+// Regression for `new CancellationTokenSource()` path also verified.
+BEZEL_TEST(cts_withcancelafter_token_typed_463,
+           withcancelafter_token_is_ptr_not_erased) {
+    BEZEL_EXPECT_EQ(run(prog(
+        // §6.1: WithCancelAfter(TimeSpan) → owned CancellationTokenSource.
+        "using var cts := CancellationTokenSource.WithCancelAfter("
+        "    TimeSpan.FromMilliseconds(10)); "
+        "var token := cts.Token; "
+        // Timer is deferred: token is not yet cancelled (IsCancellationRequested false).
+        "if token.IsCancellationRequested then return 1; end; "
+        "return 0; ")),
+        0);  // timer deferred — cancellation not observed yet
+}
+
+// #463 / §6.1: Cancel() on a WithCancelAfter-created source works (the source
+// is a real CancellationTokenSource, not an i32 phantom).
+BEZEL_TEST(cts_withcancelafter_token_typed_463,
+           withcancelafter_source_cancel_propagates_to_token) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var cts := CancellationTokenSource.WithCancelAfter("
+        "    TimeSpan.FromMilliseconds(100)); "
+        "var tok := cts.Token; "
+        // Explicitly cancel the source (simulating what the timer would do).
+        "cts.Cancel(); "
+        // Token must now reflect cancellation.
+        "if tok.IsCancellationRequested then return 1; end; "
+        "return 0; ")),
+        1);
+}
+
+// #463 / §6.1: Regression — `new CancellationTokenSource()` path still works.
+// Ensures the fix did not disturb the working path.
+BEZEL_TEST(cts_withcancelafter_token_typed_463,
+           new_cts_regression_still_works) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var cts := new CancellationTokenSource(); "
+        "var tok := cts.Token; "
+        "cts.Cancel(); "
+        "if tok.IsCancellationRequested then return 1; end; "
+        "return 0; ")),
+        1);
+}

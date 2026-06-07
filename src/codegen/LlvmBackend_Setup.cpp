@@ -2685,8 +2685,14 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // §6.1 / §30.8: a `using var` bound to a CancellationTokenSource — a
     // builtin owned class with no user TypeSymbol, disposed via bz_cts_dispose
     // (idempotent: cancels surviving token observers, then frees the source).
-    // Recognised by the declared type name or, for inferred `var cts := new
-    // CancellationTokenSource()`, by the NewExpr's type name.
+    // Recognised by three patterns:
+    //   1. Explicit type annotation names CancellationTokenSource (astNode path).
+    //   2. Initializer is `new CancellationTokenSource()` (NewExpr type name).
+    //   3. (#463) Initializer is a CallExpr whose sema exprType is
+    //      CancellationTokenSource — e.g. `CancellationTokenSource.WithCancelAfter(d)`.
+    //      After the sema fix, the call expression carries a TypeRef with
+    //      builtinClassSym("CancellationTokenSource") as declaration (no user
+    //      TypeDecl), so builtinTypeName returns "CancellationTokenSource".
     {
         bool isCTS = false;
         if (ld->type) {
@@ -2703,6 +2709,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                         !ne->type->name->parts.empty() &&
                         ne->type->name->parts[0] == "CancellationTokenSource";
             }
+        }
+        // Pattern 3 (#463): static factory (e.g. WithCancelAfter) whose sema
+        // return type is CancellationTokenSource — identified via builtinTypeName.
+        if (!isCTS && ld->initializer) {
+            if (auto* rt = ctx_.exprType(*ld->initializer))
+                isCTS = builtinTypeName(rt) == "CancellationTokenSource";
         }
         if (isCTS) {
             Disposal d{it->second, nullptr};
