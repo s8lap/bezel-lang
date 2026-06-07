@@ -1557,6 +1557,46 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
     }
+
+    // #480 / §24.1 / §28: free each instance event's backing EventSource.
+    // emitInstanceInit allocated one bz_event_source_new per instance EventSymbol;
+    // those allocations are NOT visited by the FieldSymbol loop above because
+    // EventSymbol does not inherit from FieldSymbol and the dynamic_cast returns
+    // null.  Collect all instance-event symbols that have a fieldIndex_ entry
+    // (synchronous non-static events, the same predicate as collectInstanceStorage)
+    // and emit a null-guarded bz_event_source_free call for each, then store null
+    // back so a re-entrant dispose is a no-op.  Ordering relative to FieldSymbol
+    // disposals is not safety-critical: EventSource.free (handler array + struct)
+    // does not cascade into any owned sub-objects tracked by this class.
+    llvm::StructType* st = classStruct(ts);
+    auto* freeFn = declareC("bz_event_source_free",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    for (const sema::Symbol* m : ts->members) {
+        auto* es = dynamic_cast<const sema::EventSymbol*>(m);
+        if (!es) continue;
+        auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+        if (!ed || ed->isStatic || ed->isAsync) continue;  // instance sync only
+        auto idxIt = fieldIndex_.find(es);
+        if (idxIt == fieldIndex_.end()) continue;
+        unsigned idx = idxIt->second;
+        llvm::Value* addr = builder_.CreateStructGEP(st, currentThis_, idx,
+                                                     "evt.addr");
+        llvm::Value* val  = builder_.CreateLoad(ptrTy(), addr, "evt.src");
+        // Null-guard: calloc zeroes the slot; if the ctor threw before
+        // emitInstanceInit allocated this source the slot is still null.
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            val, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* freeBB = llvm::BasicBlock::Create(llvm_, "evt.free",  currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "evt.cont",  currentFn_);
+        builder_.CreateCondBr(isNull, contBB, freeBB);
+        builder_.SetInsertPoint(freeBB);
+        builder_.CreateCall(freeFn, {val});
+        // Null the slot so a second disposal pass (re-entrant or double-dispose)
+        // finds null and skips, mirroring the FieldSymbol disposal pattern above.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+    }
 }
 
 
@@ -2283,12 +2323,27 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // to propagateBB() when no enclosing handler is set.
     bool hasOwnedToClean = false;
     for (const sema::Symbol* m : cs->parent->members) {
+        // FieldSymbol-based owned fields (class references, collections, etc.)
         auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
         if (fs && (isOwnedReferenceField(fs) ||
                    isOwnedBuiltinExceptionField(fs) ||
                    ownedCollectionFieldType(fs))) {
             hasOwnedToClean = true;
             break;
+        }
+        // #480 / §24.1 / §28: EventSymbol backing fields are also owned — each
+        // instance event's EventSource is allocated by emitInstanceInit BEFORE the
+        // ctor body runs.  If the ctor body throws the source must be freed by the
+        // cleanup block.  Including EventSymbol here ensures the cleanup block is
+        // emitted even when the class has only events and no other owned fields.
+        if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
+            if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
+                if (!ed->isStatic && !ed->isAsync &&
+                    fieldIndex_.find(es) != fieldIndex_.end()) {
+                    hasOwnedToClean = true;
+                    break;
+                }
+            }
         }
     }
     if (hasOwnedToClean || baseClassOf(cs->parent)) {
