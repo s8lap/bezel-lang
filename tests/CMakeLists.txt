@@ -151,6 +151,7 @@ set(BEZEL_TEST_SOURCES
     sema/variance_position_test.cpp
     sema/return_in_finally_test.cpp
     sema/untyped_collection_literal_test.cpp
+    sema/class_destructuring_pattern_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     flow/cfg_suspend_test.cpp
