@@ -4775,6 +4775,25 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
             }
         }
     }
+    // §22.11 / §28: `using var h := new C() with f := v end` — the initializer
+    // is a WithExpr whose source is the NewExpr. classOfLocal must look through
+    // the WithExpr to find the class so that registerUsingDisposal pushes a
+    // disposal entry. Without this, the WithExpr fell through every disposal-
+    // registration path and the object leaked (destructor never ran).
+    if (auto* we =
+            dynamic_cast<const ast::WithExpr*>(ld->initializer.get())) {
+        if (we->source) {
+            if (auto* ne2 =
+                    dynamic_cast<const ast::NewExpr*>(we->source.get())) {
+                if (ne2->type) {
+                    if (auto* rt = ctx_.resolvedType(*ne2->type)) {
+                        if (rt->kind == sema::TypeRef::Kind::Named)
+                            return rt->declaration;
+                    }
+                }
+            }
+        }
+    }
     return nullptr;
 }
 

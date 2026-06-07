@@ -215,6 +215,7 @@ set(BEZEL_TEST_SOURCES
     codegen/char_literal_test.cpp
     codegen/auto_property_test.cpp
     codegen/with_init_test.cpp
+    codegen/objinit_usingvar_disposal_test.cpp
     codegen/interface_dispatch_test.cpp
     codegen/const_member_test.cpp
     codegen/default_expr_test.cpp
