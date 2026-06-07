@@ -1864,6 +1864,8 @@ enum bz_lazy_kind {
     BZ_LAZY_THENBY,    // §5 Ordering: composite (primary, secondary) sort
     // stdlib §5 Lazy Reverse:
     BZ_LAZY_REVERSE,   // §5 Ordering: materialize then yield backwards
+    // per §4.6/§4.7 + §5 fix #450:
+    BZ_LAZY_LLIST,     // source = bz_llist_t*, walk nodes head-to-tail
 };
 
 struct bz_lazy_t {
@@ -1937,7 +1939,8 @@ static void    bz_lazy_dispose(bz_lazy_t* e) {
     if (!e) return;
     if (e->up) bz_lazy_dispose(e->up);
     if (e->down) bz_lazy_dispose(e->down);   // CONCAT/ZIP second source
-    if (e->inner) bz_lazy_dispose(e->inner);  // SELECTMANY current inner
+    // LLIST uses `inner` as a bz_llist_node_t* borrow (not an owned enumerator).
+    if (e->inner && e->kind != BZ_LAZY_LLIST) bz_lazy_dispose(e->inner);  // SELECTMANY
     if (e->cur) free(e->cur);
     // DISTINCT uses `seen` as a bz_array_t*; UNION/INTERSECT/EXCEPT use it as a
     // bz_dict_t* (membership dict). Both are heap-allocated and must be freed.
@@ -2035,6 +2038,18 @@ extern "C" void* bz_lazy_from_set(void* set, int64_t esz) {
         free(keys[i]);
     }
     free(keys);
+    return e;
+}
+
+// per §4.6/§4.7 + §5 fix #450: wrap a bz_llist_t* as a lazy source that walks
+// nodes head-to-tail. `arr` holds the bz_llist_t*; `inner` is reused (distinct
+// kind, no SELECTMANY overlap) to store the current bz_llist_node_t*.
+// On first MoveNext `inner` is null → initialized to head. Does not own the list.
+extern "C" void* bz_lazy_from_llist(void* llist, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_LLIST, esz);
+    e->arr = llist;     // bz_llist_t*
+    e->inner = nullptr; // current node, null = not yet started
+    e->materialized = 0;// 0 = not yet advanced to head
     return e;
 }
 
@@ -2542,6 +2557,22 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
         if (e->idx < 0) return 0;
         memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
         e->idx--;
+        return 1;
+    }
+    case BZ_LAZY_LLIST: {
+        // per §4.6/§4.7 + §5 fix #450: walk bz_llist_t nodes head-to-tail.
+        // `arr` = bz_llist_t*; `inner` = current node (null = not yet started).
+        // On the first call, initialize `inner` to the list's head.
+        if (!e->materialized) {
+            auto* l = (bz_llist_t*)e->arr;
+            e->inner = l ? (bz_lazy_t*)l->head : nullptr;
+            e->materialized = 1;
+        }
+        if (!e->inner) return 0;
+        auto* node = (bz_llist_node_t*)e->inner;
+        const void* vp = (const char*)node + sizeof(bz_llist_node_t);
+        memcpy(e->cur, vp, (size_t)e->esz);
+        e->inner = (bz_lazy_t*)node->next;
         return 1;
     }
     }

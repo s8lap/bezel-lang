@@ -559,3 +559,57 @@ BEZEL_TEST(linq_gaps, intersect_select_sum_chain_spec_5) {
         "  return a.Intersect(b).Select((x: int) => x * 10).Sum(); "
         "end Main; end C;"), 50);
 }
+
+// ===========================================================================
+// fix #449: Array.Reverse() in-place — stdlib §4.4 / §3
+// The in-place void Array.Reverse() on a concrete Array<T> must not crash when
+// chained (e.g. .ToArray() after in-place Reverse returns nothing useful —
+// that is a type error, but must not SIGABRT).  The in-place path itself must
+// correctly reverse the array.
+// ===========================================================================
+
+// §3/§4.4: in-place Reverse on [3,1,2] → [2,1,3]; read back via Get.
+// Verifies the in-place lowering in tryLowerCollectionInstanceCall is correct.
+BEZEL_TEST(linq_gaps_issue449, array_reverse_inplace_basic_spec_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(3); a.Add(1); a.Add(2); "
+        "  a.Reverse(); "    // in-place: [3,1,2] → [2,1,3]
+        "  return a.Get(0) * 100 + a.Get(1) * 10 + a.Get(2); "
+        "end Main; end C;"), 213);
+}
+
+// §3/§4.4: in-place Reverse on [7,8] → [8,7].
+BEZEL_TEST(linq_gaps_issue449, array_reverse_inplace_two_elements_spec_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(7); a.Add(8); "
+        "  a.Reverse(); "    // in-place: [7,8] → [8,7]
+        "  return a.Get(0) * 10 + a.Get(1); "
+        "end Main; end C;"), 87);
+}
+
+// §3/§4.4: in-place Reverse on a single-element array is a no-op.
+BEZEL_TEST(linq_gaps_issue449, array_reverse_inplace_single_element_spec_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); a.Add(42); "
+        "  a.Reverse(); "
+        "  return a.Get(0); "
+        "end Main; end C;"), 42);
+}
+
+// §3/§4.4: lazy Reverse on an IEnumerable<T> receiver (Where pipeline) still
+// works correctly — the lazy path must remain unbroken by the fix.
+BEZEL_TEST(linq_gaps_issue449, lazy_reverse_after_where_still_correct_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
+        "  using var r: Array<int> := a.Where((x) => x mod 2 = 1).Reverse().ToArray(); "
+        // Where(odd) = [1,3,5]; Reverse = [5,3,1]
+        "  return r.Get(0) * 100 + r.Get(1) * 10 + r.Get(2); "
+        "end Main; end C;"), 531);
+}

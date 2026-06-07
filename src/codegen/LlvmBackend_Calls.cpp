@@ -569,6 +569,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // (a borrowing snapshot of the enumerated bytes — it owns no elements) is
     // freed at the terminal's return with bz_array_free(arr, /*disposer=*/null).
     bool lazyRecv = isLazyEnumerableType(recvTy);
+    // per §4.6/§4.7 + §5 fix #450: a concrete LinkedList<T> is IEnumerable<T>
+    // but NOT isCollectionTypeName (bz_array_t*-backed). LINQ aggregate/terminal
+    // operators must enumerate it via bz_lazy_from_llist + bz_lazy_to_array, the
+    // same materialize-and-run path that lazy receivers use.
+    bool isLinkedList = isLinkedListTypeName(recvTy);
     bool isArrTerminal =
         m == "Count" || m == "Sum" || m == "Aggregate" || m == "Average" ||
         m == "Min" || m == "Max" || m == "First" || m == "Single" ||
@@ -576,7 +581,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         m == "ForEach" || m == "Contains" || m == "IndexOf" ||
         // stdlib §5 *OrNull variants (lazy source → materialize, then check):
         m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull";
-    bool lazyTerminal = lazyRecv && isArrTerminal;
+    bool lazyTerminal = (lazyRecv || isLinkedList) && isArrTerminal;
 
     if (!isArr && !isDict && !isStrBld && !lazyTerminal) return nullptr;
 
@@ -6403,6 +6408,19 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 {recv, builder_.getInt64((int64_t)ksz)}, "lazy.set");
         }
     }
+    // per §4.6/§4.7 + §5 fix #450: LinkedList<T>/OwnedLinkedList<T> is
+    // IEnumerable<T> but backed by bz_llist_t*, not bz_array_t*.  Wrap via
+    // bz_lazy_from_llist so LINQ operators can enumerate it correctly.
+    if (isLinkedListTypeName(recvTy)) {
+        int64_t esz = collectionElemSize(recvTy);
+        auto* fn = declareC("bz_lazy_from_llist", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(fn, {recv, builder_.getInt64(esz)}, "lazy.llist");
+    }
+    // fix #449: only Array<T>-family (isCollectionTypeName) collections are
+    // bz_array_t*-backed.  Do NOT fall through for an unrecognised receiver type
+    // (e.g. the i32(0) produced by in-place Array.Reverse()) — that would pass
+    // garbage as a pointer to bz_lazy_from_array, causing SIGABRT.
+    if (!isCollectionTypeName(recvTy)) return nullptr;
     // Concrete collection (Array<T> family): wrap it as a lazy ARRAY source.
     int64_t esz = collectionElemSize(recvTy);
     auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
