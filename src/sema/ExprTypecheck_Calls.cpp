@@ -2348,6 +2348,29 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // here (their concrete GetBytes/GetString semantics are not specified by
     // §3.2 — endianness, surrogate handling, Ascii out-of-range — so a sound
     // implementation is not yet possible: decline-with-reasons per CLAUDE.md §4).
+    // §6.1 / §30.8 (#461): CancellationToken.None — a static readonly property
+    // on the CancellationToken builtin type name. It must be typed HERE, before
+    // the `targetType` resolution below: the `CancellationToken` identifier
+    // resolves to a builtin TypeSymbol, so `targetType` becomes non-null and the
+    // later `if (!targetType)` block (which also contained a None branch) is
+    // skipped — leaving `CancellationToken.None` with NO exprType. An untyped
+    // initializer makes a `var t := CancellationToken.None` async-frame local
+    // default to an `i32` frame slot (collectSuspendLocals) while its alloca is a
+    // `ptr`; the cross-thread suspend then stores 8 bytes into the 4-byte slot,
+    // clobbering the adjacent pending-task field → SIGSEGV on resume. Typing it
+    // as CancellationToken (a ptr-lowered builtin record) gives the frame slot
+    // the correct ptr width so the local round-trips. Mirrors Encoding.Utf8.
+    if (ma.target) {
+        if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            if (cid->name == "CancellationToken" && ma.member == "None") {
+                auto* ctTy = ctx_.makeTypeRef();
+                ctTy->kind = TypeRef::Kind::Named;
+                ctTy->declaration = builtinClassSym("CancellationToken");
+                ctx_.setExprType(&ma, ctTy);
+                return;
+            }
+        }
+    }
     if (ma.target) {
         if (auto* eid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
             if (eid->name == "Encoding") {

@@ -218,10 +218,10 @@ BEZEL_TEST(whenall_generic_results_451, faulted_caught) {
 // §6.7 line 2868 / §30.8: Delay(ms, CancellationToken.None) behaves the same
 // as Delay(ms): the None token never cancels, so the delay runs normally.
 // Awaiting it returns normally; Main exits 5.
-// Note: CancellationToken.None passed INLINE (not as a local variable) to
-// avoid a pre-existing bug where None stored in an async frame local variable
-// with a cross-thread suspend causes a SIGSEGV — that is a separate pre-
-// existing issue in CancellationToken.None's frame-backup handling.
+// Note: this passes CancellationToken.None INLINE. The local-variable form
+// (`var t := CancellationToken.None;`) live across a cross-thread suspend is
+// covered by the #461 regression tests below (it used to SIGSEGV before the
+// fix that types CancellationToken.None as a ptr-wide frame slot).
 BEZEL_TEST(delay_cancel_451, none_token_delay_runs_normally) {
     const std::string src =
         "module M; class C "
@@ -296,6 +296,106 @@ BEZEL_TEST(delay_cancel_451, timespan_overload_none_token) {
         "  end Main; end C;";
     for (int i = 0; i < 3; ++i)
         BEZEL_EXPECT_EQ(compileAndRun(src), 8);
+}
+
+// ===========================================================================
+// (#461) CancellationToken VALUE local live across a CROSS-THREAD suspend
+//        spec §30 (async state-machine frames) / §6 (CancellationToken).
+//
+// Root cause: a `CancellationToken` (§6.1: a value record lowered to a single
+// borrow-pointer word, ptr) bound to a LOCAL whose initializer is
+// `CancellationToken.None` had NO sema exprType — the `CancellationToken`
+// identifier resolves to a builtin TypeSymbol, so the static-property typing
+// path (which set the exprType) was skipped. With no exprType,
+// collectSuspendLocals (§30 frame layout) defaulted the frame SLOT to an i32
+// (4 bytes) while the local's alloca was a ptr (8 bytes). On a real
+// cross-thread suspend (Task.Delay runs on the scheduler), the per-suspend
+// spill stored 8 bytes into the 4-byte slot, clobbering the adjacent
+// pending-task frame field → the restored value was garbage → SIGSEGV on
+// resume. The fix types CancellationToken.None as CancellationToken (a
+// ptr-wide slot) and hardens the frame default to pointer width so an
+// unresolved-type local can never overflow its neighbours.
+//
+// Each test uses async Main (so the scheduler runs) + Task.Delay (a genuine
+// cross-thread suspend that heap-captures + restores the frame). Run 3× for
+// cross-thread nondeterminism stability, matching this file's convention.
+// ===========================================================================
+
+// #461 / §30 / §6.1: the exact repro — `var t := CancellationToken.None;` live
+// across a cross-thread suspend, then RE-USED after the await by passing it to
+// a second Task.Delay. Before the fix this SIGSEGV'd; now it completes and
+// returns 9 (the token is restored as a valid value across both suspends).
+BEZEL_TEST(cancellation_token_local_across_suspend_461, none_local_reused_after_await) {
+    const std::string src =
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    var t := CancellationToken.None; "
+        "    await Task.Delay(5, t); "
+        "    await Task.Delay(1, t); "
+        "    return 9; "
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 9);
+}
+
+// #461 / §30 / §6.1: a CancellationToken.None local that survives MULTIPLE
+// cross-thread awaits and is read AFTER them. §6.1: None.IsCancellationRequested
+// is false, so the `if` is not taken and Main returns 11. Reading the property
+// dereferences the restored token value, so a clobbered restore would crash or
+// return the wrong value.
+BEZEL_TEST(cancellation_token_local_across_suspend_461, none_local_survives_multiple_awaits) {
+    const std::string src =
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    var t := CancellationToken.None; "
+        "    await Task.Delay(5, t); "
+        "    await Task.Delay(3, t); "
+        "    await Task.Delay(1, t); "
+        "    if t.IsCancellationRequested then return 99; end; "
+        "    return 11; "
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 11);
+}
+
+// #461 / §30 / §6.1: a CancellationToken from `cts.Token` (a non-null
+// cancel-state pointer, distinct from None's null) bound to a local live across
+// a cross-thread suspend, re-used afterwards. The token is NOT cancelled, so
+// the delay runs and the token round-trips; Main returns 13. This is the
+// non-None companion: it confirms the frame slot is ptr-wide for BOTH token
+// shapes (None = null ptr, cts.Token = real ptr).
+BEZEL_TEST(cancellation_token_local_across_suspend_461, source_token_local_reused) {
+    const std::string src =
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var cts := new CancellationTokenSource(); "
+        "    var t := cts.Token; "
+        "    await Task.Delay(5, t); "
+        "    await Task.Delay(1, t); "
+        "    return 13; "
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 13);
+}
+
+// #461 / §30 (general value-type-local regression): a NULLABLE VALUE local
+// (`int?` lowers to a {i8, i32} tagged struct — §7.2) live across two
+// cross-thread suspends and read afterwards. This exercises the same
+// frame-capture path for a multi-word value struct and confirms the ptr-wide
+// default does NOT regress a local whose type IS known (it keeps its exact
+// {i8, i32} slot and round-trips). The value 42 must survive both suspends.
+BEZEL_TEST(cancellation_token_local_across_suspend_461, nullable_value_local_round_trips) {
+    const std::string src =
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    var n: int? := 42; "
+        "    await Task.Delay(5); "
+        "    await Task.Delay(1); "
+        "    if n <> null then return n!; end; "
+        "    return 0; "
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 42);
 }
 
 // ===========================================================================
