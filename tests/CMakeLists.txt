@@ -266,6 +266,7 @@ set(BEZEL_TEST_SOURCES
     codegen/linq_test.cpp
     codegen/linq_completeness_test.cpp
     codegen/linq_gaps_test.cpp
+    codegen/linq_throw_469_test.cpp
     codegen/array_reverse_chain_466_test.cpp
     codegen/event_test.cpp
     codegen/cancellation_token_test.cpp

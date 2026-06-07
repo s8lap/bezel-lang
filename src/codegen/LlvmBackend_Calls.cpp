@@ -1114,6 +1114,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!call.args.empty() && !closure) return nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            // per stdlib §5.1 (lines 2528–2529): Min()/Max() throw
+            // InvalidOperationException if the source is empty.
+            llvm::Value* isEmpty = builder_.CreateICmpEQ(len, builder_.getInt64(0));
+            emitGuardThrow(isEmpty, "InvalidOperationException");
             auto* idxSlot  = entryAlloca(i64());
             auto* accSlot  = entryAlloca(i32());
             auto* initSlot = entryAlloca(i1());
@@ -1154,6 +1158,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return builder_.CreateLoad(i32(), accSlot, "mm.r");
         }
         // per §5 LINQ: .First(pred: (T)->bool): T  (throws if empty/not found)
+        // stdlib §5 line 2446 + 2515: throws InvalidOperationException if no
+        // element satisfies the predicate.
         if (m == "First" && call.args.size() == 1 && call.args[0].value) {
             const bool relCl = argIsInlineLambda(0);
             llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
@@ -1163,6 +1169,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             auto* resultSlot = entryAlloca(elemTy);
+            // foundSlot: i1 tracking whether the predicate matched any element.
+            auto* foundSlot = entryAlloca(i1());
+            builder_.CreateStore(builder_.getFalse(), foundSlot);
             auto* idxSlot = entryAlloca(i64());
             builder_.CreateStore(builder_.getInt64(0), idxSlot);
             auto* condBB  = llvm::BasicBlock::Create(llvm_, "fst.c", currentFn_);
@@ -1182,24 +1191,46 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCondBr(ok, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
             builder_.CreateStore(el, resultSlot);
+            builder_.CreateStore(builder_.getTrue(), foundSlot);
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(nextBB);
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
+            // per stdlib §5 line 2515: throw InvalidOperationException if no match.
+            llvm::Value* notFound = builder_.CreateNot(
+                builder_.CreateLoad(i1(), foundSlot));
+            emitGuardThrow(notFound, "InvalidOperationException");
             llvm::Value* fstv = builder_.CreateLoad(elemTy, resultSlot, "fst.r");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return fstv;
         }
         // per §5 LINQ element access (no-predicate forms): First()/Single()
         // return the first element; Last() returns the last; ElementAt(i)
-        // returns the element at index i (stdlib §5 — each `: T`). These read
-        // an element from the eager Array source via bz_array_get. (The
-        // empty/not-exactly-one throwing semantics noted in stdlib §5 are not
-        // modeled in the JIT happy path, consistent with First(pred) above.)
+        // returns the element at index i (stdlib §5 — each `: T`).
+        //
+        // stdlib §5 line 2445: First() throws InvalidOperationException if empty.
+        // stdlib §5 line 2449: Last()  throws InvalidOperationException if empty.
+        // stdlib §5 line 2451: Single() throws InvalidOperationException if not
+        //   exactly one element (empty OR ≥2).
+        // stdlib §5 line 2515: "throw InvalidOperationException … on missing-element;
+        //   IndexOutOfRangeException for ElementAt."
         if ((m == "First" || m == "Single") && call.args.empty()) {
             llvm::Type* retTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            if (m == "First") {
+                // Throw if empty (len == 0).
+                llvm::Value* isEmpty = builder_.CreateICmpEQ(
+                    len, builder_.getInt64(0));
+                emitGuardThrow(isEmpty, "InvalidOperationException");
+            } else {
+                // Single(): throw if len != 1 (covers both empty and multi).
+                llvm::Value* notOne = builder_.CreateICmpNE(
+                    len, builder_.getInt64(1));
+                emitGuardThrow(notOne, "InvalidOperationException");
+            }
             llvm::AllocaInst* out = entryAlloca(retTy);
             auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
                                    {ptrTy(), i64(), ptrTy(), i64()});
@@ -1213,6 +1244,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Type* retTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            // per stdlib §5 line 2449 + 2515: throw InvalidOperationException if empty.
+            llvm::Value* isEmpty = builder_.CreateICmpEQ(len, builder_.getInt64(0));
+            emitGuardThrow(isEmpty, "InvalidOperationException");
             llvm::Value* idx = builder_.CreateSub(len, builder_.getInt64(1));
             llvm::AllocaInst* out = entryAlloca(retTy);
             auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
@@ -1227,6 +1261,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!idx) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
             llvm::Type* retTy = getElemTy();
+            // per stdlib §5 line 2515: ElementAt throws IndexOutOfRangeException
+            // when the index is out of bounds (negative or >= length).
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            llvm::Value* neg = builder_.CreateICmpSLT(idx, builder_.getInt64(0));
+            llvm::Value* oor = builder_.CreateICmpSGE(idx, len);
+            emitGuardThrow(builder_.CreateOr(neg, oor), "IndexOutOfRangeException");
             llvm::AllocaInst* out = entryAlloca(retTy);
             auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
                                    {ptrTy(), i64(), ptrTy(), i64()});
