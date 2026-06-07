@@ -5905,21 +5905,56 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             : static_cast<llvm::Type*>(llvm::StructType::get(
                   llvm_, {nullablePrimHasValTy(), retTy}));
     llvm::Value* recv = lowerExpr(*nm.target);
-    if (!recv || !recv->getType()->isPointerTy()) return nullptr;
+    if (!recv) return nullptr;
+
+    // §7.5 / #458: handle a NULLABLE VALUE type receiver (`int?`, `bool?`,
+    // `enum?`, `record?`). These lower to a tagged {i8 hasValue; T value}
+    // struct, NOT a pointer. Nullness is `hasValue == 0`.
+    const sema::TypeRef* recvTy = ctx_.exprType(*nm.target);
+    bool nullableValueRecv = recvTy && isNullableValueTy(recvTy) &&
+                             recv->getType()->isStructTy();
+    // For a plain reference receiver, fail-fast on non-pointer (old guard).
+    if (!nullableValueRecv && !recv->getType()->isPointerTy()) return nullptr;
 
     auto* entryBB = builder_.GetInsertBlock();
     auto* callBB =
         llvm::BasicBlock::Create(llvm_, "nullcall.do", currentFn_);
     auto* endBB =
         llvm::BasicBlock::Create(llvm_, "nullcall.end", currentFn_);
-    llvm::Value* isNull = builder_.CreateICmpEQ(
-        recv, llvm::ConstantPointerNull::get(ptrTy()));
-    builder_.CreateCondBr(isNull, endBB, callBB);
+    if (nullableValueRecv) {
+        // §7.5 / #458: null-conditional on a nullable VALUE receiver: extract
+        // hasValue and branch; the value slot is only used when hasValue is true.
+        llvm::Value* hasVal = nullablePrimHasValue(recv);  // i1
+        builder_.CreateCondBr(hasVal, callBB, endBB);
+    } else {
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            recv, llvm::ConstantPointerNull::get(ptrTy()));
+        builder_.CreateCondBr(isNull, endBB, callBB);
+    }
 
     builder_.SetInsertPoint(callBB);
     std::vector<llvm::Value*> args;
     std::vector<const ast::Expr*> argExprs;
-    args.push_back(recv);
+    if (nullableValueRecv) {
+        // §7.5 / #458: pass the INNER value (not the tagged struct) as `this`.
+        // For an extension method on a record (byPointer=true) the inner value
+        // must be spilled to a stack slot first; for a primitive/enum it is
+        // passed by value. Mirror the shaping that lowerCall applies
+        // (LlvmBackend_Calls.cpp §26.1 block) so the ABI matches the callee.
+        llvm::Value* innerVal = nullablePrimValue(recv);  // the T in {i8,T}
+        if (isExtensionMethod(ms)) {
+            bool byPtr = false;
+            llvm::Type* thisTy = extensionThisType(ms, &byPtr);
+            if (byPtr && thisTy && !innerVal->getType()->isPointerTy()) {
+                llvm::Value* tmp = entryAlloca(innerVal->getType());
+                builder_.CreateStore(innerVal, tmp);
+                innerVal = tmp;
+            }
+        }
+        args.push_back(innerVal);
+    } else {
+        args.push_back(recv);
+    }
     argExprs.push_back(nullptr);  // receiver has no widening signedness
     for (const auto& a : call.args) {
         if (!a.value) return nullptr;

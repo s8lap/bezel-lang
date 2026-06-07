@@ -1140,8 +1140,20 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     auto argIt = thunk->args().begin();
     llvm::Value* envPtrArg = &*argIt++;  // env_ptr (arg 0)
     if (instMethod) {
-        // Load receiver from env: env_ptr → load ptr.
-        callArgs.push_back(builder_.CreateLoad(ptrTy(), envPtrArg));
+        // §26.1 / #457: Load receiver from env with the CORRECT `this` type.
+        // For a class/interface/record extension method `this` is a ptr (the
+        // env block holds a ptr and we load ptr). For a PRIMITIVE or ENUM
+        // extension method `this` is passed BY VALUE (e.g. i32 for `int`);
+        // the env block holds the raw value bytes and we must load that type.
+        // Always loading ptr (the old code) produces a type mismatch that the
+        // IR verifier catches and that SIGSEGVs at call time.
+        llvm::Type* thisLoadTy = ptrTy();  // default: pointer (class/record)
+        if (isExtensionMethod(ms)) {
+            // The actual `this` type is origFn->getArg(0)->getType().
+            llvm::Type* extThisTy = origFn->getArg(0)->getType();
+            if (!extThisTy->isPointerTy()) thisLoadTy = extThisTy;
+        }
+        callArgs.push_back(builder_.CreateLoad(thisLoadTy, envPtrArg));
     }
     for (; argIt != thunk->args().end(); ++argIt)
         callArgs.push_back(&*argIt);
@@ -1166,9 +1178,10 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // #422 / §27.6 / §28.9: a method reference is a runtime-managed function
     // value backed by the same 24-byte closure cell as a lambda (rc appended
     // after env). The env is null for a static method, or an 8-byte block
-    // holding the receiver pointer for an instance method (a BORROW of the
-    // receiver, §28.3 — the cell does not own it). bz_closure_release frees the
-    // cell + env block, never the receiver.
+    // holding the receiver (a BORROW of the receiver, §28.3 — the cell does
+    // not own it). bz_closure_release frees the cell + env block, never the
+    // receiver. For a primitive/enum extension receiver the env block stores
+    // the raw value bytes (≤ 8 bytes for all supported primitives).
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
@@ -1177,8 +1190,16 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // For instance methods: store a copy of the receiver in env.
     llvm::Value* envObj = llvm::ConstantPointerNull::get(ptrTy());
     if (instMethod && receiverVal) {
+        // §26.1 / #457: size the env block to fit the actual receiver value.
+        // For pointer/record receivers this is always 8 bytes (one ptr).
+        // For primitive/enum receivers (e.g. i32) the data layout gives the
+        // true size; allocate that many bytes so the store + load are safe.
+        uint64_t envSz = module_->getDataLayout()
+                             .getTypeStoreSize(receiverVal->getType())
+                             .getFixedValue();
+        if (envSz < 8) envSz = 8;  // minimum 8 for alignment
         envObj = builder_.CreateCall(
-            callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+            callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)envSz)});
         builder_.CreateStore(receiverVal, envObj);
     }
     builder_.CreateStore(
