@@ -1738,7 +1738,30 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
             }
         }
     }
-    if (!recv || !recv->getType()->isPointerTy()) return nullptr;
+    if (!recv) return nullptr;
+    // issue #490 / §14.2: in the UNSPECIALIZED generic template body a type
+    // parameter T is erased to i32. A constraint property `x.Name` (x: T)
+    // dispatches through an itable/vtable that requires a pointer receiver, but
+    // `recv` is i32 here. The record-devirtualization block above (lines
+    // 1692-1739) already ran and found no concrete record substitution (the
+    // unspecialized body has no active genericSubstSemaTy_), so we fell
+    // through. Returning nullptr propagates to lowerLocalDecl, which then picks
+    // i32 as the slot type for an inferred-type local `var n := x.Name`; a
+    // subsequent `n.Length` or any string/class member call on `n` then emits
+    // a malformed IR instruction (string GEP with an i32 base) → LLVM
+    // assertion / bezelc crash.
+    //
+    // Fix: return llvm::UndefValue::get(valTy) — a properly-typed placeholder.
+    // This gives lowerLocalDecl the correct slot type (ptr for string, ptr for
+    // any class reference) even in the unspecialized stub, so `n.Length` emits
+    // well-formed IR. The stub body is never executed (the specialization path
+    // in emitGenericSpecialization compiles a concrete version with a real ptr
+    // receiver), so the undef value is harmless. This mirrors the #484 guard
+    // in emitMethodCall/emitVirtualDispatch (which returns nullptr for a non-ptr
+    // receiver, but there the nullptr only affects the call return value, not
+    // a local's slot type — the local's slot type is correct because the
+    // property-result path was the gap).
+    if (!recv->getType()->isPointerTy()) return llvm::UndefValue::get(valTy);
 
     llvm::Value* fnPtr = nullptr;
     if (isIfaceProp) {
