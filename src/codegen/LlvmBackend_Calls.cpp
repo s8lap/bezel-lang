@@ -462,6 +462,11 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
     // `el` from the slot and lowers `target` as the record's struct value; an
     // ICmp on a struct is invalid, so this path is mandatory (not an extension).
     if (const sema::TypeSymbol* rec = recordTypeOfRef(elemTy)) {
+        // issue #462 / §14.1: a GENERIC record element (`Array<Box<string>>`)
+        // must use the specialized struct (load size + field offsets) and resolve
+        // each `T`-typed field to its concrete type for per-field equality. A
+        // no-op for a non-generic record element.
+        RecordSubstGuard elemSubst(this, elemTy);
         llvm::StructType* st = recordStruct(rec);
         llvm::Value* l = el, *r = target;
         if (l->getType()->isPointerTy()) l = builder_.CreateLoad(st, l);
@@ -4437,6 +4442,16 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         // user's own override if one exists).
         return nullptr;
 
+    // issue #462 / §14.1: for a GENERIC record receiver (`Box<string>.ToString()`
+    // / `.GetHashCode()` / `.Equals(...)`) install the receiver's concrete type
+    // args so recordStruct returns the SPECIALIZED struct (the right size to load
+    // a `ptr`/8-byte field — the i32 placeholder would truncate it) AND the
+    // synthesized members resolve each `T`-typed field to its concrete type (a
+    // string field compares/formats/hashes by CONTENT). A no-op for a non-generic
+    // record. The receiver value was lowered above under the outer subst with the
+    // specialized shape already (construction is specialized since #460).
+    RecordSubstGuard valSubst(this, recvTy);
+
     // Record: obtain the struct value (a `this` pointer or spill loads it).
     llvm::StructType* st = recordStruct(ts);
     if (recv->getType()->isPointerTy())
@@ -6311,8 +6326,13 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
 // from its bits. The i32 is zero-extended (the runtime keeps the low 32 bits).
 llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
     // A record key reuses the existing record trampoline (tested path).
-    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty))
+    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty)) {
+        // issue #462 / §14.1: a GENERIC record key (`Dictionary<Box<string>, V>`)
+        // needs the specialized struct layout + concrete per-field hashing inside
+        // the trampoline. A no-op for a non-generic record key.
+        RecordSubstGuard keySubst(this, ty);
         return buildRecordHashTrampoline(rec);
+    }
     llvm::Type* lt = lowerTypeRef(ty);
     auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
@@ -6339,8 +6359,13 @@ llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
 // structural record equality (emitStructEquality, §9.1/§9.2 — consistent with
 // the hash), or an integer/float compare for primitives/enums.
 llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
-    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty))
+    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty)) {
+        // issue #462 / §14.1: a GENERIC record key needs the specialized struct
+        // layout + concrete per-field equality inside the trampoline. A no-op for
+        // a non-generic record key.
+        RecordSubstGuard keySubst(this, ty);
         return buildRecordEqTrampoline(rec);
+    }
     llvm::Type* lt = lowerTypeRef(ty);
     auto* fty = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,

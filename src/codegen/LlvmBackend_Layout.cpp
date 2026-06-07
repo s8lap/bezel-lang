@@ -605,6 +605,66 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
 }
 
 
+// issue #460 / #462 / §14.1: install the type-parameter substitution for a
+// concrete generic-record instantiation (`Box<string>`), so a subsequent
+// recordStruct specializes the field layout, and recordMemberTypeResolved maps
+// each `T`-typed field to its concrete type. The OUTER substitution is saved and
+// restored, so nested generics chain. Builds the map from `rt`'s genericArgs
+// resolved under any outer subst (lowerTypeRef honors the active substitution),
+// the identical construction lowerTypeRef's #460 record-annotation branch and
+// fieldAddr already use. A no-op when `rt` is not a concrete generic-record
+// instantiation whose arg count matches the declared param count.
+Emitter::RecordSubstGuard::RecordSubstGuard(Emitter* em, const sema::TypeRef* rt)
+    : e(em) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration ||
+        rt->declaration->kind != ast::TypeDeclKind::Record ||
+        rt->genericArgs.empty())
+        return;
+    auto* rtd = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+    if (!rtd || rtd->genericParams.size() != rt->genericArgs.size()) return;
+    savedSubst = e->genericSubst_;
+    savedSemaTy = e->genericSubstSemaTy_;
+    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+    for (std::size_t gi = 0; gi < rtd->genericParams.size(); ++gi) {
+        newSubst[rtd->genericParams[gi].name] =
+            e->lowerTypeRef(rt->genericArgs[gi]);
+        newSema[rtd->genericParams[gi].name] = rt->genericArgs[gi];
+    }
+    e->genericSubst_ = std::move(newSubst);
+    e->genericSubstSemaTy_ = std::move(newSema);
+    active = true;
+}
+
+Emitter::RecordSubstGuard::~RecordSubstGuard() {
+    if (!active) return;
+    e->genericSubst_ = std::move(savedSubst);
+    e->genericSubstSemaTy_ = std::move(savedSemaTy);
+}
+
+
+// issue #462 / §14.1: resolve a record storage member's declared type through the
+// active generic substitution. A bare type-parameter declared type (`T` — a
+// single-part Named with no `declaration`) bound by `genericSubstSemaTy_` maps to
+// its concrete sema type (`T` → `string`); anything else (a concrete declared
+// type, or no active binding) returns the declared type unchanged. This is the
+// same param-name lookup ownedTypeParamConcreteType / lowerNew's `new T()` path
+// use, applied to the synthesized value-semantics members so a generic record's
+// `T`-typed field compares / formats / hashes by its CONCRETE type's contract.
+const sema::TypeRef* Emitter::recordMemberTypeResolved(const sema::Symbol* m) {
+    const sema::TypeRef* declared = recordMemberType(m);
+    if (!declared || genericSubstSemaTy_.empty()) return declared;
+    if (declared->kind != sema::TypeRef::Kind::Named || declared->declaration)
+        return declared;
+    if (!declared->astNode || !declared->astNode->name ||
+        declared->astNode->name->parts.size() != 1)
+        return declared;
+    auto it = genericSubstSemaTy_.find(declared->astNode->name->parts[0]);
+    if (it != genericSubstSemaTy_.end() && it->second) return it->second;
+    return declared;
+}
+
+
 // The tagged struct for a nullable value type (prim, enum, or record). For an
 // enum the value slot is the underlying integer (i32 — CG44); for a record
 // (§9.4 / issue #416) it is the bare record struct (recordStruct); for a value
@@ -615,9 +675,19 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
         return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), i32()});
     // per §7.2 / §8.6 / issue #416: a nullable record's payload is the bare
     // record struct, so the tag distinguishes null from any record value.
-    if (isNullableRecordTy(rt))
+    // issue #462 / §14.1: a nullable GENERIC record (`Box<int>?` / `Box<string>?`)
+    // must use the SPECIALIZED record struct for its payload — the same struct
+    // the wrapper's construction and `!`/`?.` field access produce. Without the
+    // substitution recordStruct returns the i32 placeholder layout, so the
+    // wrapper's payload offsets disagree with the access side and `b!.value`
+    // reads the wrong slot (garbage for `Box<int>?`; a corrupted 8-byte pointer
+    // for `Box<string>?`). RecordSubstGuard installs `rt`'s concrete type args
+    // for the recordStruct call, then restores the outer subst.
+    if (isNullableRecordTy(rt)) {
+        RecordSubstGuard guard(this, rt);
         return llvm::StructType::get(
             llvm_, {nullablePrimHasValTy(), recordStruct(rt->declaration)});
+    }
     return nullablePrimStructTy(rt->primitive);
 }
 
@@ -1429,8 +1499,11 @@ llvm::Value* Emitter::emitStructEquality(llvm::Value* l, llvm::Value* r,
             if (i >= st->getNumElements()) break;
             llvm::Value* li = builder_.CreateExtractValue(l, {i});
             llvm::Value* ri = builder_.CreateExtractValue(r, {i});
+            // issue #462 / §14.1: resolve a generic record's `T`-typed field to
+            // its concrete type under the active substitution so a string field
+            // compares by CONTENT (not pointer bits) and a record field recurses.
             acc = builder_.CreateAnd(
-                acc, emitValueEquality(li, ri, recordMemberType(m)));
+                acc, emitValueEquality(li, ri, recordMemberTypeResolved(m)));
             ++i;
         }
         return acc;

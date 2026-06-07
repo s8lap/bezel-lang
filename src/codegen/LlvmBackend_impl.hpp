@@ -1278,6 +1278,41 @@ private:
     // Null if it cannot be determined.
     const sema::TypeRef* recordMemberType(const sema::Symbol* m);
 
+    // issue #462 / §14.1: the declared type of a record storage member RESOLVED
+    // through the active generic substitution. When the member's declared type is
+    // a bare type parameter (`T` — a single-part Named with no `declaration`) and
+    // `genericSubstSemaTy_` binds it to a concrete type for THIS instantiation,
+    // return the concrete sema TypeRef (e.g. `T` → `string`); otherwise return
+    // the unresolved declared type. The synthesized value-semantics members
+    // (emitStructEquality / emitRecordToString / emitRecordHashCode over a
+    // GENERIC record) drive per-field equality/format/hash off this, so a
+    // `Box<string>` string field compares by CONTENT (not pointer bits), formats
+    // its value, and hashes by content — instead of falling through to the
+    // type-erased shape fallback. A non-generic record (empty subst, or a
+    // declared type that is not a bound param) keeps its declared type unchanged.
+    const sema::TypeRef* recordMemberTypeResolved(const sema::Symbol* m);
+
+    // issue #460 / #462 / §14.1: a save/restore guard that installs the
+    // type-parameter substitution for a CONCRETE generic-record instantiation
+    // (e.g. `Box<string>`), so a subsequent `recordStruct` lays the T-typed
+    // fields out as the specialized concrete types (the same mechanism #460
+    // added to recordStruct + lowerNew). Constructed from the record's resolved
+    // TypeRef `rt`; a no-op for a non-generic record or a TypeRef whose
+    // genericArgs do not match the declared params. The OUTER substitution is
+    // saved on construction and restored on destruction, so nested generics
+    // chain and the enclosing instantiation is unaffected. RAII so every early
+    // return / exception path restores correctly.
+    struct RecordSubstGuard {
+        Emitter* e;
+        std::unordered_map<std::string_view, llvm::Type*> savedSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> savedSemaTy;
+        bool active = false;
+        RecordSubstGuard(Emitter* em, const sema::TypeRef* rt);
+        ~RecordSubstGuard();
+        RecordSubstGuard(const RecordSubstGuard&) = delete;
+        RecordSubstGuard& operator=(const RecordSubstGuard&) = delete;
+    };
+
     // §33: the entry-point method's LLVM function is named `main`; every
     // other static method gets a mangled, collision-free name.
     std::string functionName(sema::MethodSymbol* ms);

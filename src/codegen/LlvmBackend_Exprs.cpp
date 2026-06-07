@@ -593,6 +593,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 if (!nv || !nv->getType()->isStructTy()) return nullptr;
                 auto* ms = storageMemberOf(ctx_.exprSymbol(e));
                 if (!ms || !ms->parent) return nullptr;
+                // issue #462 / §7.5 / §14.1: for a GENERIC nullable record
+                // (`Box<int>?` / `Box<string>?`) install the receiver's concrete
+                // type args so fieldIndex_ is registered against — and the field
+                // type resolves under — the SPECIALIZED record struct (the same
+                // layout the nullable wrapper's payload uses). recordStruct(ms's
+                // parent) re-registers fieldIndex_ for this instantiation; without
+                // it the placeholder layout's index/type is used. A no-op for a
+                // non-generic nullable record.
+                RecordSubstGuard ncSubst(this, tt);
+                recordStruct(ms->parent);  // register specialized fieldIndex_
                 auto idxIt = fieldIndex_.find(ms);
                 if (idxIt == fieldIndex_.end()) return nullptr;
                 llvm::Value* hasVal = nullablePrimHasValue(nv);       // i1
@@ -606,7 +616,9 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // nullable value (the tagged struct) passes through unwrapped but
                 // forced null when the receiver is null; any other value-typed
                 // field wraps into its tagged {i8 hasValue; field value} `T?`.
-                const sema::TypeRef* fieldTy = recordMemberType(ms);
+                // #462: resolve a generic field's `T` to its concrete type so the
+                // nullable-value detection below classifies it correctly.
+                const sema::TypeRef* fieldTy = recordMemberTypeResolved(ms);
                 if (fieldVal->getType()->isPointerTy()) {
                     // Reference-typed field → null when the receiver is null,
                     // else the field pointer.
@@ -2021,14 +2033,23 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // the Bezel field types (string fields compare by content — per §8.3).
     if ((op == "=" || op == "<>") && l->getType()->isStructTy()) {
         const sema::TypeSymbol* recTy = nullptr;
+        const sema::TypeRef* recTyRef = nullptr;
         for (const ast::Expr* side : {bin.left.get(), bin.right.get()}) {
             if (!side) continue;
             if (auto* t = ctx_.exprType(*side))
                 if (t->kind == sema::TypeRef::Kind::Named && t->declaration &&
                     t->declaration->kind == ast::TypeDeclKind::Record) {
-                    recTy = t->declaration; break;
+                    recTy = t->declaration; recTyRef = t; break;
                 }
         }
+        // issue #462 / §8.3 / §14.1: for a GENERIC record (`Box<string> =
+        // Box<string>`) install the operand's concrete type args so the
+        // synthesized per-field equality resolves `T` → its concrete type (the
+        // string field compares by CONTENT, not pointer identity). A no-op for a
+        // non-generic record. The operand values already carry the specialized
+        // struct shape (construction is specialized since #460), so only the
+        // per-field declared-type resolution needs the subst here.
+        RecordSubstGuard eqSubst(this, recTyRef);
         llvm::Value* eq = emitStructEquality(
             l, r, llvm::cast<llvm::StructType>(l->getType()), recTy);
         return op == "=" ? eq : builder_.CreateNot(eq);
@@ -2596,6 +2617,18 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
         return src;
     const sema::TypeSymbol* t = rt->declaration;
     const bool isRecord = t->kind == ast::TypeDeclKind::Record;
+    // issue #462 / §9.5 / §14.1: a GENERIC record `with`-copy must use the
+    // SPECIALIZED struct layout for the source's instantiation, not the i32
+    // placeholder. With the placeholder the spilled copy (and each replacement
+    // store) is sized/offset wrong — an 8-byte reference field (string / class
+    // ptr) is truncated to 4 bytes, corrupting the pointer (SIGSEGV on the next
+    // dereference); an 8-byte value field (long / double / 2-int record) silently
+    // loses its upper 4 bytes. RecordSubstGuard installs the source TypeRef's
+    // concrete type args so classStruct → recordStruct produces the right layout;
+    // the substitution stays active through the per-field replacement stores
+    // (which use fieldIndex_ as registered by recordStruct) and the final reload.
+    // A no-op for a non-generic record or a class source.
+    RecordSubstGuard withSubst(this, rt);
     // classStruct routes records to recordStruct (no vtable), so this is
     // the right layout for both forms.
     llvm::StructType* st = classStruct(t);
