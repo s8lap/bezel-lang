@@ -689,6 +689,27 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         op == "mod" || op == "&" || op == "|" || op == "^" ||
         op == "<<" || op == ">>") {
         TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+        // §25: arithmetic operators (+, -, *, /, mod) are NOT defined on
+        // user class/record types unless the type declares a matching
+        // `static method operator <op>` in its own body. `findBinaryOperator`
+        // already searched the operand types above and found nothing; if we
+        // arrive here with a Named left-operand type, there is no applicable
+        // overload and the expression is a compile error. (Bitwise/shift ops
+        // have their own guard below; string `+` passes through on a Primitive
+        // String type which is not Named, so this does not affect it.)
+        if (lt && lt->kind == TypeRef::Kind::Named &&
+            (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod")) {
+            std::string typeName =
+                lt->declaration ? std::string(lt->declaration->name) : "?";
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                std::string("operator `") + std::string(op) +
+                "` is not defined for type `" + typeName +
+                "` (§25); declare `static method operator " + std::string(op) +
+                "(a: " + typeName + ", b: " + typeName + ")` inside `" +
+                typeName + "` to overload it");
+            return;
+        }
         // §17.1: bitwise/shift ops (&, |, ^, <<, >>) require integer operands.
         // Reject them on string/reference types to prevent IR corruption.
         if ((op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") && lt) {
