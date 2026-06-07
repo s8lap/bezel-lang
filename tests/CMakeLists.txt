@@ -321,6 +321,7 @@ set(BEZEL_TEST_SOURCES
     codegen/owned_collection_remove_test.cpp
     codegen/lambda_codegen_fixes_test.cpp
     codegen/indexer_compound_assign_test.cpp
+    codegen/nameof_charrepeat_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

@@ -266,6 +266,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
         return llvm::Constant::getNullValue(lowerType(de->type.get()));
     }
+    // §17.9: nameof(QualifiedName) → compile-time string constant equal to
+    // the rightmost identifier of the operand (the only segment for a simple
+    // name, the last segment for a dotted name such as BankAccount.Deposit →
+    // "Deposit"). The QualifiedName is stored verbatim in the AST; no runtime
+    // resolution is needed — we wrap the lexeme in quotes and emit it as a
+    // string literal global via lowerStringLiteral.
+    if (auto* no = dynamic_cast<const ast::NameOfExpr*>(&e)) {
+        std::string_view ident =
+            (no->name && !no->name->parts.empty())
+                ? no->name->parts.back()
+                : std::string_view{};
+        // Synthesise a quoted string that processStringText will accept.
+        std::string quoted = "\"";
+        quoted += ident;
+        quoted += "\"";
+        return lowerStringLiteral(quoted, /*verbatim=*/false);
+    }
     // CG23: postfix `!` (null-forgiving) — raise NullReferenceException
     // if the operand is null, otherwise yield it (§17.12).
     if (auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
