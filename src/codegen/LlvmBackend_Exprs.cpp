@@ -2848,8 +2848,24 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
         if (idxIt == fieldIndex_.end()) continue;
         llvm::Value* v = lowerExpr(*a.value);
         if (!v) continue;
-        builder_.CreateStore(
-            v, builder_.CreateStructGEP(st, base, idxIt->second));
+        llvm::Value* slot = builder_.CreateStructGEP(st, base, idxIt->second);
+        // #429 / §4.6 / §28.9 / §22.11: a CLASS object-initializer store into a
+        // string field/auto-property takes an independent +1 (released on the
+        // instance's disposal), exactly like a plain assignment — retain-new (or
+        // transfer a producer) / release-old. The freshly-`new`'d field already
+        // holds its default-initializer value (retained by emitInstanceInit) or
+        // null, so release the old after storing the new. A RECORD `with`-copy is
+        // a value type whose string fields are borrows (§9) and has no disposer —
+        // it stays a plain store (no retain).
+        if (!isRecord && v->getType()->isPointerTy() && isStringStorageMember(m)) {
+            llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slot, "strf.old");
+            if (!isPlusOneStringProducer(a.value.get()))
+                emitStringRetain(v);
+            builder_.CreateStore(v, slot);
+            emitStringRelease(oldVal);
+            continue;
+        }
+        builder_.CreateStore(v, slot);
     }
     // Record: return the modified copy by value. Class: return the mutated
     // instance pointer.
