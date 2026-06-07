@@ -2857,18 +2857,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     llvm::Value* obj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), sizeofSt});
 
-    // §14 / §2.5 / §2.6 (issue #328 FINDING [2]): an IMPORTED GENERIC type has
-    // NO stable per-type symbols to link against — a generic is monomorphized
-    // per-instantiation (§14), so the dependency emits no `bz$<Type>$init` (the
-    // declareFunctions carve-out exports init only for non-generic public types)
-    // and its `bz$<Type>$ctor` is the template (T→i32), not this instantiation.
-    // Sema rejects `new ImportedGeneric<...>(...)` before codegen runs
-    // (checkImportedNewExprArgs), so this branch is normally unreachable for a
-    // generic imported type; the guard is a BACKSTOP so codegen never emits a
-    // dangling external `bz$<Type>$init`/`$ctor` reference (the FINDING [2] link
-    // failure) even if reached out-of-band. The bare calloc'd object is returned
-    // as-is. Full cross-module generic construction needs the generic body in
-    // metadata so the importer can monomorphize locally — a deferred feature.
+    // §14.1 / §2.5 / §2.6 (issue #328 FINDING [2]; #428): an IMPORTED GENERIC
+    // type has NO stable per-type symbols to link against — a generic is
+    // monomorphized per-instantiation (§14), so the dependency emits no
+    // `bz$<Type>$init` (the declareFunctions carve-out exports init only for
+    // non-generic public types) and its `bz$<Type>$ctor` is the template (T→i32),
+    // not this instantiation. Sema rejects `new ImportedGeneric<...>(...)` before
+    // codegen runs (checkImportedNewExprArgs for a class, the NewExpr record guard
+    // for a record), so this branch is normally unreachable for a generic imported
+    // type; the guard is a BACKSTOP so codegen never emits a dangling external
+    // `bz$<Type>$init`/`$ctor` reference (the FINDING [2] link failure) even if
+    // reached out-of-band. The bare calloc'd object is returned as-is. Sound
+    // cross-module generic construction needs importer-side per-instantiation
+    // infrastructure (a vtable + disposer for a generic class; record-struct
+    // specialization for a generic record) — a larger feature, deferred (#428).
     const bool importedGeneric =
         ctx_.isImported(t) && !t->genericParams.empty();
     if (ctx_.isImported(t) && !importedGeneric) {
