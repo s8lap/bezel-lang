@@ -125,6 +125,7 @@ set(BEZEL_TEST_SOURCES
     sema/local_const_type_test.cpp
     sema/enum_restrictions_test.cpp
     sema/new_expr_args_test.cpp
+    sema/bug_483_nested_type_construction_test.cpp
     sema/method_body_presence_test.cpp
     sema/static_virtual_test.cpp
     sema/async_abstract_test.cpp
@@ -301,6 +302,7 @@ set(BEZEL_TEST_SOURCES
     codegen/async_451_test.cpp
     codegen/primary_ctor_param_init_478_test.cpp
     codegen/static_property_setter_476_test.cpp
+    codegen/bug_483_nested_type_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

@@ -121,3 +121,57 @@ BEZEL_TEST(parser_new_postfix, primitive_conversion_in_arithmetic) {
     BEZEL_EXPECT_EQ(parseInitText("int(d) + 1"),
                     std::string("(int(d) + 1)"));
 }
+
+// --- Nested-type construction (#483) — Grammar A.8 / §11.3 ----------------
+//
+// NewExpr ::= "new" Type "(" ArgList? ")"
+// Type → TypeNoNullable → QualifiedName (A.8 allows "." in type names)
+// QualifiedName ::= Identifier ("." Identifier)*
+//
+// The dotted segments BEFORE the "(" arg list are part of the type name;
+// a "." AFTER the "()" is a member access on the constructed result.
+
+// Bug #483 regression: `new Outer.Inner()` must parse the *full* qualified
+// name `Outer.Inner` as the type, not just `Outer`.
+BEZEL_TEST(parser_new_postfix_483, new_nested_type_no_args_spec_A8) {
+    // Grammar A.8 / §11.3: `new Outer.Inner()` → NewExpr{type=Outer.Inner, args=[]}
+    BEZEL_EXPECT_EQ(parseInitText("new Outer.Inner()"),
+                    std::string("new Outer.Inner()"));
+}
+
+// Two-level nesting with constructor arguments — the args follow the full type name.
+BEZEL_TEST(parser_new_postfix_483, new_nested_type_with_args_spec_A8) {
+    BEZEL_EXPECT_EQ(parseInitText("new Outer.Inner(1, 2)"),
+                    std::string("new Outer.Inner(1, 2)"));
+}
+
+// Disambiguation: dotted segments BEFORE "(" are type; "." AFTER "()" is member access.
+// `new Outer.Inner()._v` → MemberAccess{NewExpr{Outer.Inner, []}, "_v"}
+BEZEL_TEST(parser_new_postfix_483, new_nested_type_then_member_access_spec_A8) {
+    BEZEL_EXPECT_EQ(parseInitText("new Outer.Inner()._v"),
+                    std::string("new Outer.Inner()._v"));
+}
+
+// Chained call on the constructed result — `new Outer.Inner().M()`.
+BEZEL_TEST(parser_new_postfix_483, new_nested_type_then_method_call_spec_A8) {
+    BEZEL_EXPECT_EQ(parseInitText("new Outer.Inner().M()"),
+                    std::string("new Outer.Inner().M()"));
+}
+
+// Regression: single-identifier `new Foo()` must still parse correctly.
+BEZEL_TEST(parser_new_postfix_483, new_simple_regression_spec_A8) {
+    BEZEL_EXPECT_EQ(parseInitText("new Foo()"), std::string("new Foo()"));
+}
+
+// Regression: generic type `new Foo<int>()` must still parse correctly.
+BEZEL_TEST(parser_new_postfix_483, new_generic_regression_spec_A8) {
+    BEZEL_EXPECT_EQ(parseInitText("new Foo<int>()"),
+                    std::string("new Foo<int>()"));
+}
+
+// Three-level nested type name `new A.B.C()` — grammar allows arbitrarily
+// deep QualifiedName.
+BEZEL_TEST(parser_new_postfix_483, new_triple_nested_type_spec_A8) {
+    BEZEL_EXPECT_EQ(parseInitText("new A.B.C()"),
+                    std::string("new A.B.C()"));
+}

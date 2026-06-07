@@ -482,12 +482,15 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         ref.kind = TypeRef::Kind::Error;
         return;
     }
-    // For multi-part QualifiedNames (`Color.Red` style), we'd descend
-    // into the looked-up symbol's members. Slice 2 supports only the
-    // single-identifier case and a one-deep dotted name (e.g.
-    // `System.Object` resolving to Object). For now we accept the
-    // first part and ignore the rest if it's a TypeSymbol (the only
-    // dotted-name case sema slice 2 needs is `Module.Name`-style).
+    // For multi-part QualifiedNames, descend through the looked-up symbol's
+    // nested types for each subsequent part. Per Grammar A.8 / §11.3:
+    // `Outer.Inner` means Inner is a nested type declared inside Outer.
+    // The final resolved TypeSymbol is the one for the last part.
+    //
+    // If the first part resolves to a non-TypeSymbol (e.g. a TypeAliasSymbol
+    // or a module-level alias), fall back to treating the whole name as a
+    // single opaque reference with no declaration — the same as the pre-fix
+    // `Module.Name`-style handling for any non-TypeSymbol first part.
     auto* tsym = dynamic_cast<TypeSymbol*>(sym);
     if (!tsym) {
         // Could be a TypeAliasSymbol or other. For slice 2, treat as
@@ -496,6 +499,30 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         ref.kind = TypeRef::Kind::Named;
         ref.declaration = nullptr;
     } else {
+        // per §11.3 / Grammar A.8: follow each remaining part of the
+        // qualified name as a nested-type lookup within the current TypeSymbol.
+        for (std::size_t pi = 1; pi < t.name->parts.size(); ++pi) {
+            std::string_view part = t.name->parts[pi];
+            TypeSymbol* inner = nullptr;
+            for (Symbol* m : tsym->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->name == part && nt->type) {
+                        inner = nt->type;
+                        break;
+                    }
+                }
+            }
+            if (!inner) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t.span.begin,
+                    std::string("type `") + std::string(tsym->name) +
+                    "` has no nested type named `" + std::string(part) +
+                    "` (§11.3)");
+                ref.kind = TypeRef::Kind::Error;
+                return;
+            }
+            tsym = inner;
+        }
         ref.kind = TypeRef::Kind::Named;
         ref.declaration = tsym;
         // Generic-arity check.
