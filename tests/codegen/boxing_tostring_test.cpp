@@ -45,12 +45,12 @@ BEZEL_TEST(codegen_boxing_tostring_417, boxed_int_tostring_length) {
         "end Main; end C;"), 2);
 }
 
-// var o: Object := true; o.ToString() = "true" (the compiler-default form the
-// interpolation/ToString intrinsic produces — see string_tostring_test).
+// var o: Object := true; o.ToString() = "True" — per stdlib bool.ToString() → "True"/"False"
+// (#452: was incorrectly "true"; stdlib specifies capital first letter).
 BEZEL_TEST(codegen_boxing_tostring_417, boxed_bool_tostring_via_object) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := true; return (1 if o.ToString() = \"true\" else 0); "
+        "  var o: Object := true; return (1 if o.ToString() = \"True\" else 0); "
         "end Main; end C;"), 1);
 }
 

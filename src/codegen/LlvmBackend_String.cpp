@@ -533,11 +533,12 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
         return lowerStringLiteral("\"Object\"", false);
     }
 
-    // Special case: bool → "true" or "false"
+    // Special case: bool → "True" or "False"
+    // per stdlib bool.ToString() → "True" or "False" (capital first letter).
     if (prim == P::Bool) {
         // lowerStringLiteral materializes constant globals.
-        auto* trueStr  = lowerStringLiteral("\"true\"", false);
-        auto* falseStr = lowerStringLiteral("\"false\"", false);
+        auto* trueStr  = lowerStringLiteral("\"True\"", false);
+        auto* falseStr = lowerStringLiteral("\"False\"", false);
         return builder_.CreateSelect(
             builder_.CreateTrunc(val, i1()), trueStr, falseStr,
             "bool.str");

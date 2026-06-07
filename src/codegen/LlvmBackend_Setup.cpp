@@ -5136,7 +5136,7 @@ llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
 // §8.5 / §8.6 (#417): the uniform ToString thunk for a boxed PRIMITIVE. The
 // receiver is the BOX pointer; the scalar value lives two words in. The thunk
 // loads the value and formats it via emitPrimitiveToString (int → decimal,
-// bool → "true"/"false", etc.).
+// bool → "True"/"False" per stdlib bool.ToString(), etc.).
 llvm::Constant* Emitter::primBoxToStringThunk(sema::PrimitiveType prim,
                                               const char* name) {
     auto it = primBoxToStringFns_.find(name);

@@ -72,13 +72,15 @@ BEZEL_TEST(codegen_cg27d, string_expression_part) {
         "end Main; end C;"), 1);
 }
 
-// §18.5: bool expression part.
+// §18.5: bool expression part — per stdlib bool.ToString() → "True"/"False"
+// (#452: was "ok=true"; fixed to "ok=True" because interpolation routes through
+// emitPrimitiveToString which now emits "True"/"False" per the stdlib contract).
 BEZEL_TEST(codegen_cg27d, bool_expression_part) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var b := true; "
         "  var s := $\"ok={b}\"; "
-        "  return (1 if s = \"ok=true\" else 0); "
+        "  return (1 if s = \"ok=True\" else 0); "
         "end Main; end C;"), 1);
 }
 

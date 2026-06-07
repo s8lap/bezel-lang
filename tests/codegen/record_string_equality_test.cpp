@@ -447,7 +447,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_bool_value_semantics_spec_8_3) {
         "             and (new Flag(true) = new Flag(false)) = false "
         "             and new Flag(null) = new Flag(null) "
         "             and new Flag(true).GetHashCode() = new Flag(true).GetHashCode() "
-        "             and new Flag(true).ToString() = \"Flag(b: true)\" "
+        "             and new Flag(true).ToString() = \"Flag(b: True)\" "  // #452: bool.ToString() → "True"/"False" per stdlib
         "             and new Flag(null).ToString() = \"Flag(b: null)\" else 0); "
         "end Main; end C;"), 1);
 }

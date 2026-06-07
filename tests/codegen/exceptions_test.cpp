@@ -384,7 +384,8 @@ BEZEL_TEST(codegen_cg20, type_test_in_interpolated_string) {
         "  using var a := new A(); "
         "  using var b := new B(); "
         "  var s := $\"{a is IA},{b is IA},{a is B}\"; "
-        "  if s = \"true,true,false\" then return 1; else return 0; end; "
+        // #452: bool.ToString() → "True"/"False" per stdlib; is-expressions yield bool.
+        "  if s = \"True,True,False\" then return 1; else return 0; end; "
         "end Main; end C;"),
         1);
 }

@@ -254,11 +254,13 @@ BEZEL_TEST(codegen_console, writeline_interpolated) {
         "end Main; end C;"), std::string("x=7\n"));
 }
 
+// Console.Write(bool) routes through emitPrimitiveToString → bool special case.
+// Per stdlib bool.ToString() → "True"/"False" (#452: was "true", now "True").
 BEZEL_TEST(codegen_console, write_bool) {
     BEZEL_EXPECT_EQ(compileAndCapture(
         "module M; class C public static method Main(): int "
         "  Console.Write(true); return 0; "
-        "end Main; end C;"), std::string("true"));
+        "end Main; end C;"), std::string("True"));
 }
 
 // §2.3 / stdlib §9: Convert.ToInt32 / Math.Abs / Math.Min / Math.Max
