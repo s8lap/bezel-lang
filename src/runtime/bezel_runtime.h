@@ -166,6 +166,10 @@ void    bz_dict_set_str(void* d, const char* k, int64_t k_len, void* val);
 void    bz_dict_set_str_disposing(void* d, const char* k, int64_t k_len,
                                   void* val, void (*dispose_val)(void*));
 bool    bz_dict_remove_str(void* d, const char* k, int64_t k_len);
+// issue M1 / stdlib §4.9: OwnedDictionary<string,V>.Remove — disposes the
+// removed value via dispose_val before unlinking (null-safe: skip if null).
+bool    bz_dict_remove_str_disposing(void* d, const char* k, int64_t k_len,
+                                     void (*dispose_val)(void*));
 bool    bz_dict_contains_str(void* d, const char* k, int64_t k_len);
 int64_t bz_dict_count(void* d);
 
@@ -187,6 +191,10 @@ void  bz_dict_set_gen(void* d, const void* key, void* val);
 void  bz_dict_set_gen_disposing(void* d, const void* key, void* val,
                                 void (*dispose_val)(void*));
 bool  bz_dict_remove_gen(void* d, const void* key);
+// issue M1 / stdlib §4.9: OwnedDictionary<K,V>.Remove for generic keys —
+// disposes the removed value via dispose_val before unlinking (null-safe).
+bool  bz_dict_remove_gen_disposing(void* d, const void* key,
+                                   void (*dispose_val)(void*));
 bool  bz_dict_contains_gen(void* d, const void* key);
 
 // stdlib §4.10 / §4.8: empty a hash table in place (keeps it allocated). Frees

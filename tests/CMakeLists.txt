@@ -312,6 +312,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nested_enum_cast_482_test.cpp
     codegen/generic_constraint_property_dispatch_test.cpp
     codegen/array_record_element_test.cpp
+    codegen/owned_collection_remove_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
