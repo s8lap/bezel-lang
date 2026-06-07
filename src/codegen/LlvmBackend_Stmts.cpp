@@ -163,7 +163,27 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             }
             if (as->op == ":=") {
-                builder_.CreateStore(rhs, addr);
+                // #429 / §4.6 / §28.9: a store into a CLASS string field /
+                // auto-property takes an independent +1 (retain-new or transfer-
+                // producer / release-old), released on the owner's disposal.
+                // Reassigning a string LOCAL slot likewise retains-new / releases-
+                // old so the slot keeps an independent +1 (a later field disposal
+                // that releases the same string cannot then dangle the local — no
+                // UAF). Local reassignment refcounting is gated on the analyzed
+                // function (stringReleaseEligibleFn_) so it matches the bind-time
+                // arming convention; a lambda/thunk body (not analyzed) keeps the
+                // plain store. Both helpers return true when they handled the
+                // store; otherwise fall through to the plain store (array
+                // elements, ref params, static / record fields, string? slots,
+                // and non-string targets are unchanged).
+                bool handled =
+                    lowerStringFieldStore(*as->target, addr, rhs,
+                                          as->value.get());
+                if (!handled && currentFn_ == stringReleaseEligibleFn_)
+                    handled = lowerStringLocalReassign(*as->target, addr, elemTy,
+                                                       rhs, as->value.get());
+                if (!handled)
+                    builder_.CreateStore(rhs, addr);
             } else if (as->op == "??=") {
                 // §4.7: null-coalescing assignment `x ??= e` — store e
                 // into x only when x is currently null.
@@ -195,6 +215,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     auto* endBB = llvm::BasicBlock::Create(llvm_, "coaleq.end", currentFn_);
                     builder_.CreateCondBr(isNull, assignBB, endBB);
                     builder_.SetInsertPoint(assignBB);
+                    // #429 / §4.6 / §28.9: `field ??= e` stores into a (currently
+                    // null) CLASS string field/auto-property only when null, so
+                    // there is no old value to release — but the field still takes
+                    // an INDEPENDENT +1 (transfer a producer / retain a borrow),
+                    // released on the owner's disposal. Without this a borrow `e`
+                    // would be released by disposal without a matching retain (a
+                    // double-free). Restricted to class string field lvalues (a
+                    // string local / record field / array element keeps the plain
+                    // store). The slot is null here, so a plain store is correct
+                    // after the retain.
+                    if (isStringFieldLvalue(*as->target) &&
+                        rhs->getType()->isPointerTy() &&
+                        !isPlusOneStringProducer(as->value.get()))
+                        emitStringRetain(rhs);
                     builder_.CreateStore(rhs, addr);
                     builder_.CreateBr(endBB);
                     builder_.SetInsertPoint(endBB);

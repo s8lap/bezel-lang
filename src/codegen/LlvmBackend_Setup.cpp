@@ -1586,6 +1586,37 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         builder_.SetInsertPoint(contBB);
     }
 
+    // #429 / §4.6 / §28.9: release every STRING field / auto-property of THIS
+    // class (own members only; an inherited slot is released by the base CORE
+    // disposer via emitBaseDisposeChain — so visiting only ts->members avoids a
+    // double-release). A class string field holds an INDEPENDENT +1 (retained at
+    // store via lowerStringFieldStore / armed in emitInstanceInit's initializer
+    // path); on disposal that +1 is released exactly once, freeing the
+    // data+header at rc 0. bz_string_release is null-safe (a never-assigned
+    // string? slot is null in the calloc'd object) and a no-op on a sentinel
+    // (a field holding a literal is never freed). After releasing, NULL the slot
+    // so a re-entrant / double dispose finds null and skips (the #396 slot-null
+    // precedent) — the §28.6 run-once flag already guards the public Dispose, and
+    // this nulling guards any base-core re-entry. A local that aliases this field
+    // value holds its OWN +1 (#429 borrow-retain), so this release never dangles
+    // it (no UAF). A RECORD has no disposer (§9.7) and its string fields are
+    // borrows (§9) — never reached here.
+    {
+        llvm::StructType* sst = classStruct(ts);
+        for (const sema::Symbol* m : ts->members) {
+            bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
+            if (!isField && !isAutoProperty(m)) continue;
+            if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
+            if (!isStringStorageMember(m)) continue;
+            unsigned idx = fieldIndex_[m];
+            llvm::Value* addr = builder_.CreateStructGEP(sst, currentThis_, idx,
+                                                         "strf.addr");
+            llvm::Value* val = builder_.CreateLoad(ptrTy(), addr, "strf.val");
+            emitStringRelease(val);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        }
+    }
+
     // #480 / §24.1 / §28: free each instance event's backing EventSource.
     // emitInstanceInit allocated one bz_event_source_new per instance EventSymbol;
     // those allocations are NOT visited by the FieldSymbol loop above because
@@ -2490,6 +2521,18 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
         // the int's raw bits (issue #408 / #410).
         v = coerceNumericToType(v, st->getElementType(idxIt->second),
                                 isUnsignedTargetExpr(*init));
+        // #429 / §4.6 / §28.9: a CLASS string field / auto-property initializer
+        // gives the field its own reference, like a later assignment. The field
+        // is calloc-zeroed (null) before this, so there is no old value to
+        // release. A fresh +1 producer is TRANSFERRED (no retain); anything else
+        // (a literal sentinel — a no-op retain; a borrow / call) is RETAINED so
+        // the field's count is independent. The disposal release
+        // (emitOwnedFieldDisposals) balances it either way (no UAF, no leak).
+        // emitInstanceInit runs only for CLASS construction (records use the
+        // by-value path in lowerNew, whose string fields are borrows, §9).
+        if (v->getType()->isPointerTy() && isStringStorageMember(m) &&
+            !isPlusOneStringProducer(init))
+            emitStringRetain(v);
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
@@ -2932,29 +2975,33 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     }
     if (v) {
         builder_.CreateStore(v, slot);
+    } else if (slotTy->isPointerTy() && declType &&
+               isStringTypeRefNonNull(ctx_.resolvedType(*declType))) {
+        // #429 / §4.6: a `var s: string;` (no initializer) lowers to a `ptr`
+        // slot. Zero-initialize it to null so a later reassignment's release-old
+        // (lowerStringLocalReassign) reads null (a no-op) rather than garbage —
+        // the slot starts owning "no string". DA (§7.9) still requires assignment
+        // before use, so this null is never observed by user code.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), slot);
     } else if (llvm::dyn_cast<llvm::ArrayType>(slotTy)) {
         // §15.1: inline arrays are zero-initialized when declared
         // without an initializer (like all locals with explicit type).
         builder_.CreateStore(llvm::ConstantAggregateZero::get(slotTy),
                              slot);
     }
-    // #422 / §4.6 / §28.9: if this `var` string local was proven non-escaping
-    // and initialized by a codegen +1 producer (string `+` / interpolation),
-    // register a scope-end bz_string_release of its single producer reference.
-    // The slot holds exactly that one reference (the value `v` just stored, at
-    // rc=1); no other reference exists (proven by the escape walk), so releasing
-    // it at scope end frees the data+header exactly once — no UAF, no
-    // double-free. Gated on currentFn_ matching the analyzed function (a
-    // lambda/thunk body lowered mid-function is not analyzed → its string locals
-    // just leak, never double-freed). disposeStack_ is non-empty inside any
-    // lowered block body.
-    if (v && currentFn_ == stringReleaseEligibleFn_ &&
-        stringReleaseEligible_.count(static_cast<const void*>(declNode)) &&
-        !disposeStack_.empty()) {
-        Disposal d{slot, nullptr};
-        d.stringRelease = true;
-        disposeStack_.back().push_back(d);
-    }
+    // #422 / #429 / §4.6 / §28.9: reference-count this `var` string local. A +1
+    // PRODUCER (string `+` / interpolation / range-slice) transfers its single
+    // reference into the slot; a BORROW (any other string initializer) is
+    // RETAINED so the slot owns an independent +1 (so a later field disposal /
+    // overwrite that releases the same heap string cannot dangle this local — no
+    // UAF). Either way, a NON-escaping local (proven by the escape walk) is
+    // released at scope end. armStringLocalRefcount centralizes the decision and
+    // only acts on the `var` string locals collectStringReleaseEligible
+    // classified for THIS function (so it never fires on a non-string pointer
+    // local). disposeStack_ is non-empty inside any lowered block body.
+    if (v)
+        armStringLocalRefcount(static_cast<const void*>(declNode), slot, v,
+                               init);
     // #422 / §27.5 / §28.9: if this `var` closure (function-typed) local was
     // proven non-escaping and initialized by a codegen +1 producer (a lambda
     // expression or a method reference), register a scope-end
@@ -3586,6 +3633,146 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     return false;
 }
 
+
+// #429 / §4.6 / §28.9: is `target` a string-typed CLASS instance field /
+// auto-property lvalue — `obj.f`, `this.f`, the implicit `f`, or an auto-
+// property of a class — as opposed to a local / parameter / ref-out param /
+// array element / static field / RECORD field? Only such a location outlives the
+// function and is released on the owner's disposal, so only it takes an
+// independent +1 on store. Classification mirrors lvalueAddr's order: NOT a
+// ref-param, NOT a local slot, NOT a static field — then the resolved symbol is
+// a class FieldSymbol or a class auto-property PropertySymbol. A RECORD's
+// reference fields are BORROWS (§9 "the record does not own what they point to")
+// and a record has no disposer (§9.7), so record string fields are excluded
+// (they keep the plain-store / leak behaviour).
+bool Emitter::isStringFieldLvalue(const ast::Expr& target) {
+    if (!isStringExprType(target)) return false;
+    if (localSlot(target)) return false;       // a plain local / parameter
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;  // a ref/out alias
+    }
+    if (staticFieldGlobal(target)) return false;  // program-lifetime storage
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
+        return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
+    if (isAutoProperty(sym)) {
+        auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
+        return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
+    }
+    return false;
+}
+
+
+// #429 / §4.6 / §28.9: store `newVal` into the class string field at `fieldAddr`
+// with retain-new / release-old, giving the field an INDEPENDENT +1. Order:
+// load-old → retain-or-transfer-new → store-new → release-old. Retaining the new
+// value BEFORE releasing the old makes a self-assignment safe (rc dips +1 then
+// back, never transiently 0). A fresh +1 producer is TRANSFERRED (no retain — its
+// single reference becomes the field's), anything else is RETAINED (the field's
+// count is independent of the source's). bz_string_retain/release are null-safe
+// and no-ops on a sentinel/literal.
+bool Emitter::lowerStringFieldStore(const ast::Expr& target,
+                                    llvm::Value* fieldAddr,
+                                    llvm::Value* newVal,
+                                    const ast::Expr* valueExpr) {
+    if (!isStringFieldLvalue(target)) return false;
+    if (!fieldAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "strf.old");
+    if (!isPlusOneStringProducer(valueExpr))
+        emitStringRetain(newVal);
+    builder_.CreateStore(newVal, fieldAddr);
+    emitStringRelease(oldVal);
+    return true;
+}
+
+
+// #429 / §4.6 / §28.9: reassign a string LOCAL/parameter slot with retain-new /
+// release-old, keeping the slot's independent +1 across the overwrite. Without
+// this, `x := h.Name` would make `x` alias the field's heap string WITHOUT a +1,
+// so the field's disposal release (or a later overwrite) would free a value `x`
+// still reads — a use-after-free. Order: load-old → retain-or-transfer-new →
+// store-new → release-old (retain-before-release keeps `x := x` and `x := <alias
+// of x>` safe). A +1 producer is transferred (no retain); a borrow is retained.
+// Restricted to a string-typed LOCAL/parameter slot (NOT a field — that is
+// lowerStringFieldStore; NOT an array element / ref-out param / static field).
+// The reassigned slot keeps owning its value; the escape walk marks a reassigned
+// local as escaped, so its final value is NOT auto-released at scope end and
+// simply leaks (safe — never a UAF, never a double-free).
+bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
+                                       llvm::Value* slotAddr, llvm::Type* elemTy,
+                                       llvm::Value* newVal,
+                                       const ast::Expr* valueExpr) {
+    if (!slotAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    // Must be an actual LOCAL/parameter slot, string-typed, a bare `ptr` slot.
+    if (!localSlot(target)) return false;          // not a local/param
+    if (!elemTy || !elemTy->isPointerTy()) return false;  // not a `ptr` slot
+    if (!isStringExprType(target)) return false;   // not string-typed
+    // A nullable string? target lowers to a `ptr` too; retain/release are
+    // null-safe, so including it is sound — but we keep scope to the same
+    // non-nullable string surface the bind-time arming uses, to avoid surprising
+    // interactions. A string? local is left as a plain store (it just leaks, as
+    // before — safe). Detect nullability via the resolved target type.
+    if (const sema::TypeRef* tt = ctx_.exprType(target))
+        if (tt->nullable) return false;
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "strl.old");
+    if (!isPlusOneStringProducer(valueExpr))
+        emitStringRetain(newVal);
+    builder_.CreateStore(newVal, slotAddr);
+    emitStringRelease(oldVal);
+    return true;
+}
+
+
+// #429 / §4.6 / §28.9: emit the reference-count bookkeeping for a `var` STRING
+// local at bind time and arm its scope-end release. The slot store itself is
+// performed by the caller (lowerLocalDecl). The model gives EVERY string local
+// an independent +1 for its current value, so a later field disposal / field
+// overwrite / collection free that releases the same heap string never dangles a
+// local that still aliases it (no UAF):
+//   * A +1 PRODUCER initializer (`+` / interpolation / range-slice) TRANSFERS its
+//     single reference into the slot (no retain). Released at scope end iff the
+//     local was proven non-escaping (stringReleaseEligible_).
+//   * A BORROW initializer (a field/param/call/identifier read) is RETAINED so
+//     the slot owns a fresh +1. Released at scope end iff non-escaping
+//     (stringBorrowRetainEligible_). An ESCAPING borrow local is retained but NOT
+//     released — its +1 leaks (safe: never dangling, never double-freed).
+// Only fires for an actual `string`-typed `var` local; a non-string / non-pointer
+// value is left to the caller's plain store.
+void Emitter::armStringLocalRefcount(const void* declNode,
+                                     llvm::AllocaInst* slot, llvm::Value* v,
+                                     const ast::Expr* init) {
+    (void)init;
+    if (!v || !v->getType()->isPointerTy() || disposeStack_.empty()) return;
+    // Gated on the analyzed function: a lambda/thunk body lowered mid-function is
+    // not walked, so the eligibility sets are empty for its locals — they just
+    // leak (never double-freed). collectStringReleaseEligible classified THIS
+    // function's `var` string locals into the three sets below; this function
+    // only acts on members of those sets, so it never fires on a non-string
+    // pointer local (a class/interface/box).
+    if (currentFn_ != stringReleaseEligibleFn_) return;
+    // BORROW string local (escaping or not): retain so the slot owns an
+    // independent +1. A literal initializer is a sentinel — the retain is a
+    // no-op. A producer-bound local is NOT in stringBorrowAll_ and so is NOT
+    // retained (its single producer reference is transferred into the slot).
+    if (stringBorrowAll_.count(declNode))
+        emitStringRetain(v);
+    // Release at scope end iff the local was proven NON-escaping — producers via
+    // stringReleaseEligible_ (transfer + release), borrows via
+    // stringBorrowRetainEligible_ (retain + release). An escaping local is in
+    // neither set, so its +1 (the producer's, or the just-emitted borrow retain)
+    // simply leaks — safe (never dangling, never double-freed).
+    if (stringReleaseEligible_.count(declNode) ||
+        stringBorrowRetainEligible_.count(declNode)) {
+        Disposal d{slot, nullptr};
+        d.stringRelease = true;
+        disposeStack_.back().push_back(d);
+    }
+}
+
 namespace {
 // #422: a strict, conservative walk that decides whether a SPECIFIC string
 // `var` local (identified by its LocalDecl node) ever escapes its scope. A
@@ -4196,15 +4383,42 @@ void Emitter::collectClosureReleaseEligible(
 void Emitter::collectStringReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     stringReleaseEligible_.clear();
-    // Find every `var` (non-using) string LocalDecl whose initializer is a
-    // codegen-internal +1 producer, then run the escape walk for each. A decl
-    // survives as eligible iff the walk proves it never escapes.
-    std::vector<const ast::LocalDecl*> candidates;
+    stringBorrowRetainEligible_.clear();
+    stringBorrowAll_.clear();
+    // Find every `var` (non-using) string LocalDecl, classified as a +1 PRODUCER
+    // (`+`/interpolation/range-slice) or a BORROW (any other string initializer:
+    // a field/param/call/identifier read). Run the escape walk for each; a decl
+    // that the walk proves non-escaping is eligible for a scope-end release —
+    // producers TRANSFER (no retain), borrows RETAIN at bind (#429). The two
+    // eligibility sets are disjoint by construction (producer vs borrow).
+    std::vector<const ast::LocalDecl*> producerCandidates;
+    std::vector<const ast::LocalDecl*> borrowCandidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && isPlusOneStringProducer(ld->initializer.get()))
-                candidates.push_back(ld);
+            if (!ld->isUsing && ld->initializer) {
+                if (isPlusOneStringProducer(ld->initializer.get())) {
+                    producerCandidates.push_back(ld);
+                } else {
+                    // #429: a BORROW-initialized string local. Recognized by the
+                    // local's resolved type being `string` (non-nullable; a
+                    // string? borrow is left alone — its null/sentinel handling
+                    // is unchanged and retain/release are null-safe anyway, but
+                    // we keep the conservative scope to non-nullable string
+                    // borrows for this increment). The symbol type comes from the
+                    // initializer's exprType (inference) or the declared type.
+                    const sema::TypeRef* lt = nullptr;
+                    if (ld->type) lt = ctx_.resolvedType(*ld->type);
+                    if (!lt && ld->initializer)
+                        lt = ctx_.exprType(*ld->initializer);
+                    if (lt && !lt->nullable &&
+                        lt->kind == sema::TypeRef::Kind::Primitive &&
+                        lt->primitive == sema::PrimitiveType::String) {
+                        borrowCandidates.push_back(ld);
+                        stringBorrowAll_.insert(static_cast<const void*>(ld));
+                    }
+                }
+            }
         }
         // Recurse into nested blocks so locals declared inside if/while/for/
         // do/try/case bodies are also considered.
@@ -4230,11 +4444,25 @@ void Emitter::collectStringReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
-    for (const ast::LocalDecl* ld : candidates) {
+    for (const ast::LocalDecl* ld : producerCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringReleaseEligible_.insert(static_cast<const void*>(ld));
+    }
+    // #429: a BORROW-bound string local is eligible for retain-at-bind +
+    // scope-end release ONLY if the SAME conservative escape walk proves it never
+    // escapes. The walk is the identical over-approximation used for producers
+    // (any non-safe-read use ⇒ escaped ⇒ excluded ⇒ no release), so releasing an
+    // eligible borrow local's retained +1 at scope end is provably free of UAF
+    // (no escaping alias exists past the scope) and of double-free (once per
+    // exit). An ESCAPING borrow local is still RETAINED (in armStringLocalRefcount)
+    // but NOT released — its +1 leaks, which is safe.
+    for (const ast::LocalDecl* ld : borrowCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
     }
 }
 

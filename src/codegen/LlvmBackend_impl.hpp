@@ -2220,6 +2220,31 @@ private:
         return nullptr;
     }
 
+    // #429 / §4.6 / §28.9: is storage member `m` (a class FieldSymbol, OR a body
+    // auto-property PropertySymbol) one whose static type is `string` (or
+    // `string?`)? Strings are runtime-managed (§4.6): a class field / auto-
+    // property holding a string owns an INDEPENDENT +1 (retained at store /
+    // transferred from a producer, released on the owner's disposal and on
+    // reassignment). Strings cannot be marked `owned` (§4.6), so
+    // isOwnedReferenceField never matches them — this is a separate predicate for
+    // the disposal-release path. recordMemberType reads the type off a positional
+    // Param, a body FieldDecl, OR a PropertyDecl. Nullable string? is included (a
+    // plain `ptr` whose null is null; bz_string_release is null-safe).
+    bool isStringStorageMember(const sema::Symbol* m) {
+        const sema::TypeRef* rt = recordMemberType(m);
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
+
+    // #429: is the resolved TypeRef `rt` a (non-nullable) `string`? Used to
+    // zero-init a no-initializer `var s: string;` slot so reassignment's
+    // release-old is null-safe. Nullable string? is excluded (left untouched).
+    bool isStringTypeRefNonNull(const sema::TypeRef* rt) {
+        return rt && !rt->nullable &&
+               rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
+
     // ====================================================================
     // Suspend/resume state-machine scaffolding (§29 iterators / §30 async).
     //
@@ -2851,6 +2876,55 @@ private:
     // ambiguity, unlike a string-returning call). Used both to gate release
     // eligibility and to release intermediate concat operands.
     bool isPlusOneStringProducer(const ast::Expr* init) const;
+
+    // #429 / §4.6 / §28.9: store `newVal` (a string) into the CLASS string
+    // field/auto-property at `fieldAddr` with retain-new / release-old, giving
+    // the field an INDEPENDENT +1 (released on the owner's disposal). Returns
+    // true (caller must NOT also store); false when `target` is not a class
+    // string field lvalue (caller stores normally). `valueExpr` selects
+    // transfer-vs-retain: a +1 producer is transferred (no retain), anything
+    // else is retained. retain-before-release keeps a self-assignment safe.
+    bool lowerStringFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
+                               llvm::Value* newVal, const ast::Expr* valueExpr);
+    // #429: is `target` a string-typed CLASS instance field / auto-property
+    // lvalue (NOT a local / param / ref-param / array element / static field /
+    // record field)? Only such a location owns an independent +1 released on the
+    // owner's disposal — see lowerStringFieldStore / emitOwnedFieldDisposals.
+    bool isStringFieldLvalue(const ast::Expr& target);
+    // #429 / §4.6 / §28.9: REASSIGNMENT `x := newVal` where `x` is a string-typed
+    // LOCAL/parameter SLOT. Retain-new (transfer a producer) / store / release-
+    // old, so the slot keeps owning an independent +1 across the reassignment and
+    // a later field disposal / overwrite that releases the same string never
+    // dangles this slot (no UAF). Returns true when handled (caller must NOT also
+    // store); false when `target` is not a string local slot. `slotAddr`/`elemTy`
+    // are the lvalue address/type the caller already computed.
+    bool lowerStringLocalReassign(const ast::Expr& target, llvm::Value* slotAddr,
+                                  llvm::Type* elemTy, llvm::Value* newVal,
+                                  const ast::Expr* valueExpr);
+    // #429 / §4.6 / §28.9: the set of `var` string LocalDecl nodes whose
+    // initializer is a BORROW (NOT a +1 producer) and which the escape walk
+    // proved non-escaping — these are RETAINED at bind and RELEASED at scope end
+    // (the local owns an independent +1, so a later field disposal / overwrite
+    // that releases the same string does not dangle the local — no UAF).
+    // Disjoint from the producer-transfer set (stringReleaseEligible_): a
+    // producer-bound local transfers and releases without a retain.
+    std::unordered_set<const void*> stringBorrowRetainEligible_;
+    // #429: ALL borrow-initialized `var` string LocalDecl nodes (escaping AND
+    // non-escaping). Every one is RETAINED at bind so the slot holds an
+    // independent +1 — even an escaping borrow local must hold its own reference
+    // so the returned/stored value is not freed out from under it by a field
+    // disposal / overwrite (no UAF). The NON-escaping subset
+    // (stringBorrowRetainEligible_) is additionally released at scope end; the
+    // escaping ones leak their retained +1 (safe).
+    std::unordered_set<const void*> stringBorrowAll_;
+    // #429: emit retain-or-transfer for a `var`-string local at bind time, and
+    // arm its scope-end release. Returns true if it armed/handled the local's
+    // string reference (the caller still performs the slot store). `init` is the
+    // initializer expr (null when absent). Centralizes the producer-transfer vs
+    // borrow-retain decision and the disposeStack registration so lowerLocalDecl
+    // stays readable.
+    void armStringLocalRefcount(const void* declNode, llvm::AllocaInst* slot,
+                                llvm::Value* v, const ast::Expr* init);
 
     // #422 / §27.5 / §28.9: the set of `var` closure (function-typed) LocalDecl
     // nodes PROVABLY eligible for scope-end bz_closure_release — initialized
