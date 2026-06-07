@@ -125,6 +125,13 @@ struct MethodSymbol : MemberSymbol {
     // op-symbols specially).
     bool isOperator = false;
     std::string_view operatorToken;  // empty unless isOperator
+    // §26 (#433): for an EXTENSION method, the declaring `extension` block's
+    // decl (its `targetType` is the extended type). Null for an ordinary
+    // class/record/enum/interface method. An extension method has no `parent`
+    // TypeSymbol; this is how codegen identifies it and recovers the receiver
+    // (`this`) type — by-value for a value/primitive extended type, by-pointer
+    // for a class.
+    const ast::ExtensionDecl* extensionDecl = nullptr;
 };
 
 struct ConstructorSymbol : MemberSymbol {

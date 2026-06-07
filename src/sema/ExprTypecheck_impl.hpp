@@ -47,6 +47,11 @@ private:
     std::unique_ptr<Scope> moduleScope_;
     Scope* currentScope_ = nullptr;
     TypeSymbol* currentType_ = nullptr;
+    // §26.1: the ExtensionSymbol whose members are being type-checked, or null
+    // outside an extension block. An extension method's params live on the
+    // ExtensionSymbol (not on currentType_, which points at the extended type),
+    // so paramSymbolsOf consults this when set.
+    ExtensionSymbol* currentExtension_ = nullptr;
 
     // §12.7 flow narrowing. When `if x is T` (or the else branch of
     // `if x is not T`) narrows a simple variable `x` to `T`, an entry maps the
@@ -271,6 +276,26 @@ private:
     // them). First match wins; ambiguity resolution between sibling
     // interfaces is a separate slice.
     Symbol* lookupMember(TypeSymbol* type, std::string_view name);
+
+    // §26.5: extension-member lookup. Consulted ONLY when no instance member
+    // matches (instance members win — an extension never shadows a real
+    // member). Searches the module's ExtensionSymbols for one whose target
+    // type equals `receiver` and that declares a member named `name`; returns
+    // that MemberSymbol, or null. `receiver` is the receiver's resolved
+    // TypeRef (its nullability is ignored — §26.2 forbids `extension int?`).
+    // This slice matches the receiver's type EXACTLY (primitive by kind, user
+    // type by declaration + generic args); base/interface/generic-extension
+    // resolution (§26.5 step 2/3) is deferred (#433).
+    Symbol* lookupExtensionMember(const TypeRef* receiver,
+                                  std::string_view name);
+
+    // §26.1 / §26.5: bind a resolved extension member to the member-access
+    // expression — set its exprSymbol and the access's exprType. For a method
+    // this is the §27.6 method-reference function type (the CallExpr handler
+    // reads the MethodSymbol's decl for a call's return type); for a computed
+    // property it is the property's declared type.
+    void resolveExtensionMember(const ast::MemberAccessExpr& ma,
+                                Symbol* member);
 
     Symbol* lookupName(std::string_view name);
 

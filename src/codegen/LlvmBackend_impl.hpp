@@ -1265,6 +1265,20 @@ private:
     // other static method gets a mangled, collision-free name.
     std::string functionName(sema::MethodSymbol* ms);
 
+    // §26 (#433): is `ms` an extension method (declared in an `extension`
+    // block)? Such a method has no `parent` TypeSymbol; its receiver type is
+    // the extension's targetType.
+    static bool isExtensionMethod(const sema::MethodSymbol* ms) {
+        return ms && ms->extensionDecl != nullptr;
+    }
+    // §26.1: the receiver (`this`) representation for an extension method.
+    // Returns the LLVM type of the `this` parameter and sets *byPointer to
+    // true when `this` is passed as a pointer (class receiver, or a record
+    // spilled to a stack slot) versus by value (primitive / enum). Returns
+    // null when the extension's target type is unavailable.
+    llvm::Type* extensionThisType(const sema::MethodSymbol* ms,
+                                  bool* byPointer);
+
     // CG12: a static field becomes an internal global. Its initializer
     // is the literal constant when present (int/bool literal), else the
     // zero value. Non-literal static initializers (which the spec runs in

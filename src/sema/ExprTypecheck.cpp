@@ -914,6 +914,52 @@ Symbol* ExprTC::lookupMember(TypeSymbol* type, std::string_view name) {
     return nullptr;
 }
 
+// §26.5: does an extension declared on `target` apply to a receiver of type
+// `recv`? This slice matches EXACTLY (the receiver's own compile-time type),
+// ignoring nullability on both sides (§26.2 forbids `extension int?`, so an
+// extension on `int` applies to an `int`/`int?` receiver alike). Base-class,
+// interface, and generic-extension matching (§26.5 step 2/3) are deferred
+// (#433): a non-empty genericArgs list on either side disqualifies the match
+// here so an `extension Box<int>` is never mis-applied to a `Box<string>`.
+static bool extensionTargetMatchesReceiver(const TypeRef* target,
+                                           const TypeRef* recv) {
+    if (!target || !recv) return false;
+    if (target->kind != recv->kind) return false;
+    switch (target->kind) {
+        case TypeRef::Kind::Primitive:
+            return target->primitive == recv->primitive;
+        case TypeRef::Kind::Named:
+            // Exact user type: same declaration, no generic args on either
+            // side (generic extensions deferred).
+            if (target->declaration == nullptr ||
+                recv->declaration == nullptr)
+                return false;
+            if (target->declaration != recv->declaration) return false;
+            if (!target->genericArgs.empty() || !recv->genericArgs.empty())
+                return false;
+            return true;
+        default:
+            return false;  // function/array/unit types are not extensible
+    }
+}
+
+Symbol* ExprTC::lookupExtensionMember(const TypeRef* receiver,
+                                      std::string_view name) {
+    if (!receiver || !ctx_.module()) return nullptr;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* ext = dynamic_cast<ExtensionSymbol*>(child);
+        if (!ext) continue;
+        auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
+        if (!decl || !decl->targetType) continue;
+        const TypeRef* target = ctx_.resolvedType(*decl->targetType);
+        if (!extensionTargetMatchesReceiver(target, receiver)) continue;
+        for (Symbol* m : ext->members) {
+            if (m && m->name == name) return m;
+        }
+    }
+    return nullptr;
+}
+
 Symbol* ExprTC::lookupName(std::string_view name) {
     for (Scope* s = currentScope_; s; s = s->parent) {
         auto it = s->names.find(name);
@@ -1095,12 +1141,52 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
         }
         currentType_ = save;
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
+        // §26.1: inside an extension block, `this` is the receiver. For an
+        // extension on a user class/record/enum, point currentType_ at the
+        // target's TypeSymbol so the body's `this.member` and bare-member
+        // references resolve against the extended type (exactly as a real
+        // method body does). For a primitive/builtin extension the target has
+        // no user TypeSymbol; currentType_ stays null (a primitive has no
+        // member set — `this` is used as a value, e.g. `this * 2`).
+        TypeSymbol* targetSym = nullptr;
+        if (ext->targetType) {
+            if (auto* rt = ctx_.resolvedType(*ext->targetType))
+                if (rt->kind == TypeRef::Kind::Named)
+                    targetSym = rt->declaration;
+        }
+        // Find the ExtensionSymbol for this decl so paramSymbolsOf can locate
+        // the extension methods' parameters (they live on the ExtensionSymbol,
+        // not on the extended type).
+        ExtensionSymbol* extSym = nullptr;
+        if (ctx_.module()) {
+            for (Symbol* child : ctx_.module()->children) {
+                if (auto* es = dynamic_cast<ExtensionSymbol*>(child)) {
+                    if (es->decl == ext) { extSym = es; break; }
+                }
+            }
+        }
+        TypeSymbol* save = currentType_;
+        ExtensionSymbol* saveExt = currentExtension_;
+        currentType_ = targetSym;
+        currentExtension_ = extSym;
         for (const auto& m : ext->members) if (m) visitMember(*m);
+        currentType_ = save;
+        currentExtension_ = saveExt;
     }
 }
 
 // Param-symbol lookup for the in-progress method/ctor on currentType_.
 const std::vector<Symbol*>* ExprTC::paramSymbolsOf(const ast::Member& m) const {
+    // §26.1: inside an extension block, the method's params live on the
+    // ExtensionSymbol, not on currentType_ (the extended type). Search there
+    // first when type-checking an extension body.
+    if (currentExtension_) {
+        for (Symbol* child : currentExtension_->members) {
+            if (!child || child->decl != &m) continue;
+            if (auto* ms = dynamic_cast<MethodSymbol*>(child))
+                return &ms->params;
+        }
+    }
     if (!currentType_) return nullptr;
     for (Symbol* child : currentType_->members) {
         if (!child->decl) continue;

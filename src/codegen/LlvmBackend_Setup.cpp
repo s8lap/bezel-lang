@@ -9,12 +9,55 @@ static bool isClassOrInterfaceRef(const sema::TypeRef* rt);
 
 std::string Emitter::functionName(sema::MethodSymbol* ms) {
     if (isMain(ms)) return "main";
+    // §26 (#433): an extension method has no parent type — name it after its
+    // extended (target) type so distinct `extension`s don't collide and a
+    // class method `bz$<Class>$M` never aliases an extension `M`.
+    if (isExtensionMethod(ms)) {
+        std::string tgt = "?";
+        if (const ast::Type* tt = ms->extensionDecl->targetType.get())
+            if (tt->name && !tt->name->parts.empty())
+                tgt = std::string(tt->name->parts.back());
+        return "bz$ext$" + tgt + "$" + std::string(ms->name);
+    }
     std::string cls = ms->parent ? std::string(ms->parent->name) : "";
     // §25: an operator's name is empty; build a unique, collision-free
     // name from its token (a type may declare several operators).
     if (ms->isOperator)
         return "bz$" + cls + "$op$" + std::string(ms->operatorToken);
     return "bz$" + cls + "$" + std::string(ms->name);
+}
+
+
+// §26.1 (#433): the receiver type for an extension method's `this` parameter.
+llvm::Type* Emitter::extensionThisType(const sema::MethodSymbol* ms,
+                                       bool* byPointer) {
+    if (byPointer) *byPointer = false;
+    if (!ms || !ms->extensionDecl || !ms->extensionDecl->targetType)
+        return nullptr;
+    const sema::TypeRef* rt =
+        ctx_.resolvedType(*ms->extensionDecl->targetType);
+    if (!rt) return nullptr;
+    // A class/interface receiver: `this` is the object pointer (like a normal
+    // method). A record receiver: pass a pointer to a spilled value so the
+    // body's `this.field` reuses the record field-access machinery.
+    if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
+        auto k = rt->declaration->kind;
+        if (k == ast::TypeDeclKind::Class ||
+            k == ast::TypeDeclKind::Interface) {
+            if (byPointer) *byPointer = true;
+            return ptrTy();
+        }
+        if (k == ast::TypeDeclKind::Record) {
+            if (byPointer) *byPointer = true;
+            return ptrTy();  // pointer to the record value (spilled at call)
+        }
+        // enum → underlying integer, by value.
+        return lowerTypeRef(rt);
+    }
+    // Primitive / builtin value receiver — by value (e.g. i32 for `int`).
+    // CRITICAL (#433): this is what fixes the `extension int` crash — the
+    // receiver is the VALUE, not a GEP'd pointer.
+    return lowerTypeRef(rt);
 }
 
 
@@ -384,11 +427,20 @@ void Emitter::declareFunctions() {
                                        : lowerType(ci.returnType);
         std::vector<llvm::Type*> paramTys;
         if (!isStaticMethod(ms)) {
-            // CG30: enum instance methods take the enum value (i32) as
-            // `this`, not a pointer — enums are value types.
-            bool isEnumMethod = ms->parent &&
-                ms->parent->kind == ast::TypeDeclKind::Enum;
-            paramTys.push_back(isEnumMethod ? i32() : ptrTy());
+            // §26.1 (#433): an extension method's `this` is the EXTENDED type
+            // — by value for a primitive/value receiver (i32 for `extension
+            // int`, fixing the malformed-IR crash), by pointer for a class
+            // (object pointer) or record (spilled value pointer).
+            if (isExtensionMethod(ms)) {
+                llvm::Type* thisTy = extensionThisType(ms, /*byPointer=*/nullptr);
+                paramTys.push_back(thisTy ? thisTy : ptrTy());
+            } else {
+                // CG30: enum instance methods take the enum value (i32) as
+                // `this`, not a pointer — enums are value types.
+                bool isEnumMethod = ms->parent &&
+                    ms->parent->kind == ast::TypeDeclKind::Enum;
+                paramTys.push_back(isEnumMethod ? i32() : ptrTy());
+            }
         }
         for (const auto& p : *ci.params) {
             paramTys.push_back(isByRefMod(p.modifier)
