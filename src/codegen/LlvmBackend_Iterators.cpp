@@ -19,7 +19,18 @@ void Emitter::collectSuspendLocals(
     for (const auto& s : body) {
         if (!s) continue;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
-            llvm::Type* ty = i32();
+            // #461 (§30 async frames): the frame SLOT type for a suspend-live
+            // local must be at least as wide as its alloca, or the per-suspend
+            // spill (which stores `alloca->getAllocatedType()` bytes into the
+            // slot — see emitAwaitSuspend) overflows into the adjacent frame
+            // field and corrupts it (→ SIGSEGV on resume). When neither an
+            // annotation nor an initializer exprType is available, default to a
+            // POINTER-WIDTH slot (not i32): ptr is large enough to hold any
+            // scalar alloca (i32/i64/bool/ptr) without overflow, so a local with
+            // an unresolved type can never clobber its neighbours. With a known
+            // type the exact lowered type is used (so an `int?`/record/value
+            // struct still gets its precise slot and round-trips correctly).
+            llvm::Type* ty = ptrTy();
             if (ld->type) {
                 if (auto* rt = ctx_.resolvedType(*ld->type)) ty = lowerTypeRef(rt);
             } else if (ld->initializer) {
