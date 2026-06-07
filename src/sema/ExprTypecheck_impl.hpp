@@ -80,6 +80,13 @@ private:
     // Block-scoped the same way `narrowings_` is (saved/restored per block).
     std::unordered_set<Symbol*> nullNarrowed_;
 
+    // issue #484 / §14.2: the MethodDecl currently being type-checked, or null
+    // when outside a method body. Used by resolveMemberAccess to walk the
+    // method's generic constraints when the receiver is a type parameter —
+    // `x: T` where T has `where T: ISome` requires dispatching through the
+    // constraint's member set, not the (null) declaration of T's TypeRef.
+    const ast::MethodDecl* currentMethodDecl_ = nullptr;
+
     // Slice S6: in-progress method static-ness, so visitExpr's
     // IdentifierExpr handling can diagnose `this`/`base` in static
     // member bodies.

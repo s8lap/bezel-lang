@@ -5827,6 +5827,18 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             args[ai] = coerceNumericToType(args[ai], fnTy->getParamType(ai),
                                            argUnsigned(ai));
         llvm::Value* recv = args[0];
+        // issue #484 / §14.2: guard against emitting an itable/vtable load from
+        // a non-pointer receiver. This happens when the compiled (unspecialized)
+        // body of a generic method (e.g. `GenGet<T>(x: T)`) is emitted with T's
+        // LLVM fallback type `i32`. In that body, `x: T` lowered to `i32`, so
+        // `recv` is `i32`. A `load ptr from i32` instruction is invalid IR that
+        // the backend rejects with "Cannot emit physreg copy instruction".
+        // Returning nullptr here causes `emitImplicitReturn` to emit `ret i32 0`
+        // for the unspecialized stub — the same safe no-op as before the sema fix.
+        // The specialized versions (called via emitInlineGenericMethod /
+        // emitGenericSpecialization with concrete `ptr` args) have a real `ptr`
+        // receiver and reach the dispatch correctly.
+        if (!recv->getType()->isPointerTy()) return nullptr;
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
         llvm::Value* fnPtr = nullptr;
         if (isIfaceMethod) {
