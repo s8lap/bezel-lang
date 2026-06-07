@@ -1274,6 +1274,11 @@ void ExprTC::visitMember(const ast::Member& m) {
         }
         bool save = inStaticMember_;
         inStaticMember_ = isStatic;
+        // issue #484 / §14.2: expose the in-progress MethodDecl so that
+        // resolveMemberAccess can walk its generic constraints when the
+        // receiver is a type parameter (e.g. `x: T` where `where T: ISome`).
+        const ast::MethodDecl* saveMD = currentMethodDecl_;
+        currentMethodDecl_ = md;
         ReturnCtx saveRet = returnCtx_;
         TypeRef* saveRetTy = currentReturnType_;
         // async-readiness 3b (§30.2): an `async` method body is an async
@@ -1328,6 +1333,7 @@ void ExprTC::visitMember(const ast::Member& m) {
         returnCtx_ = saveRet;
         inAsyncContext_ = saveAsync;
         inStaticMember_ = save;
+        currentMethodDecl_ = saveMD;  // issue #484 / §14.2
     } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts =
             (od->bodyKind == ast::MethodBodyKind::Block) ? &od->stmts

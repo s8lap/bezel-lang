@@ -2519,6 +2519,80 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         auto* tt = ctx_.exprType(*ma.target);
         if (tt && tt->kind == TypeRef::Kind::Named) {
             targetType = tt->declaration;
+            // issue #484 / §14.2: when the receiver's TypeRef is a bare type
+            // parameter (declaration==null, name is a generic-param name), look
+            // the member up through the parameter's where-constraints.  Both the
+            // enclosing method's genericConstraints (currentMethodDecl_) and the
+            // enclosing class's genericConstraints (currentType_->decl) are
+            // searched; the method's constraints shadow the class's for the same
+            // param name. Guard strictly: declaration==null AND the name is a
+            // single-part name (ast::QualifiedName with exactly one part) that
+            // matches a declared type parameter on the method or the class —
+            // never fires for ordinary named-type receivers (those have non-null
+            // declarations) or for generic stdlib types (Array<T>, etc., which
+            // also have null declarations but whose names are not in the method's
+            // genericParams list).
+            if (!targetType && tt->astNode && tt->astNode->name &&
+                    tt->astNode->name->parts.size() == 1) {
+                std::string_view paramName = tt->astNode->name->parts[0];
+                // Collect applicable constraints from the method and the class.
+                // Method constraints come first so a method-level `where T: X`
+                // shadows a class-level `where T: Y` if both exist (unusual but
+                // per §14.2 method constraints are more specific).
+                auto tryConstraints =
+                    [&](const std::vector<ast::GenericParam>& gps,
+                        const std::vector<ast::GenericConstraint>& gcs) {
+                    // Only act if paramName is actually a declared generic param.
+                    bool isParam = false;
+                    for (const auto& gp : gps)
+                        if (gp.name == paramName) { isParam = true; break; }
+                    if (!isParam) return;
+                    // Walk each where-clause for this param.
+                    for (const auto& gc : gcs) {
+                        if (gc.typeParam != paramName) continue;
+                        for (const auto& item : gc.items) {
+                            // Only "type" items carry a TypeArg that may name a
+                            // class or interface; skip "class"/"value"/"new"/etc.
+                            if (item.kind != "type") continue;
+                            if (!item.typeArg) continue;
+                            TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
+                            if (!ctr || ctr->kind != TypeRef::Kind::Named ||
+                                    !ctr->declaration) continue;
+                            // Try to find the member on this constraint type.
+                            Symbol* cm =
+                                lookupMember(ctr->declaration, ma.member);
+                            if (!cm) continue;
+                            // Found it: resolve via the constraint type, just
+                            // as the normal branch below does for a concrete
+                            // receiver.  Set the exprSymbol on the MemberAccess
+                            // and attach its type.  Use the constraint's
+                            // TypeSymbol as targetType so the visibility check
+                            // and the per-member-kind type-attachment logic
+                            // later in this function fire correctly.
+                            // We set targetType here so the `if (!targetType)`
+                            // block (intrinsic handling) is bypassed entirely.
+                            targetType = ctr->declaration;
+                            return;
+                        }
+                    }
+                };
+                // Try method constraints first (most specific), then class.
+                if (currentMethodDecl_ &&
+                        !currentMethodDecl_->genericParams.empty()) {
+                    tryConstraints(currentMethodDecl_->genericParams,
+                                   currentMethodDecl_->genericConstraints);
+                }
+                // Class-level generic params if the method search didn't resolve.
+                if (!targetType && currentType_ && currentType_->decl) {
+                    if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                            currentType_->decl)) {
+                        if (!td->genericParams.empty()) {
+                            tryConstraints(td->genericParams,
+                                           td->genericConstraints);
+                        }
+                    }
+                }
+            }
         } else if (!tt) {
             // Target had no resolvable type — fall back to the
             // exprSymbol path (e.g. local declared with `var d: D`
