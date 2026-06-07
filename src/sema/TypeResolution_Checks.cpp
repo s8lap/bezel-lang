@@ -1016,18 +1016,43 @@ void Resolver::checkAbstractImplementations() {
 
         std::unordered_set<std::string_view> abstractNames;
         std::unordered_set<std::string_view> concreteNames;
+        // §11.2 / §23: interface property names that require a property
+        // implementation (a field does NOT satisfy a property contract — per
+        // §23, a property is declared with the `property` keyword and
+        // generates accessor functions; a field is a FieldDecl with no
+        // getter/setter surface, so it cannot satisfy itable dispatch).
+        std::unordered_set<std::string_view> ifacePropertyNames;
+        // Property names (PropertySymbol) provided by class or base classes.
+        std::unordered_set<std::string_view> concretePropertyNames;
         // BFS the chain.
         std::vector<TypeSymbol*> frontier{t};
         std::unordered_set<TypeSymbol*> seen{t};
         std::size_t i = 0;
         while (i < frontier.size()) {
             TypeSymbol* cur = frontier[i++];
+            bool curIsIface = (cur->kind == ast::TypeDeclKind::Interface);
             for (Symbol* m : cur->members) {
                 if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
                     if (methodIsAbstract(ms))
                         abstractNames.insert(ms->name);
                     else
                         concreteNames.insert(ms->name);
+                }
+                // §11.2 / §23 (#489): interface properties require a matching
+                // PropertySymbol, not merely a same-named FieldSymbol.
+                if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+                    if (ps->isIndexer) continue;  // indexers are separate
+                    bool isStatic = false;
+                    for (auto mod : ps->modifiers)
+                        if (mod == "static") { isStatic = true; break; }
+                    if (isStatic) continue;
+                    if (curIsIface) {
+                        // Record the interface's required property name.
+                        ifacePropertyNames.insert(ps->name);
+                    } else {
+                        // A class PropertySymbol satisfies the contract.
+                        concretePropertyNames.insert(ps->name);
+                    }
                 }
             }
             for (TypeSymbol* b : cur->baseTypes) {
@@ -1045,6 +1070,24 @@ void Resolver::checkAbstractImplementations() {
                     std::string(t->name) +
                     "` does not implement inherited abstract member `" +
                     std::string(name) + "` (§12.5)");
+            }
+        }
+        // §11.2 / §23 (#489): for each interface property, the implementing
+        // class must provide a property (auto-property or block-form), NOT a
+        // field. A FieldSymbol has no getter/setter function and cannot be
+        // installed in the itable; calling through the interface would invoke a
+        // null function pointer (SIGSEGV). Reject with a clear conformance
+        // error instead.
+        for (auto name : ifacePropertyNames) {
+            if (!concretePropertyNames.count(name)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("class `") + std::string(t->name) +
+                    "` does not implement interface property `" +
+                    std::string(name) +
+                    "` — a field does not satisfy a property contract;"
+                    " declare `public property " + std::string(name) +
+                    ": T` (§11.2 / §23)");
             }
         }
     }
