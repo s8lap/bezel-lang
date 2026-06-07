@@ -594,14 +594,36 @@ private:
     llvm::GlobalVariable* vtableTableGV_ = nullptr;
     // §8.6 / §12.7 (#417): emit (once) and return the bz$vtable$table global.
     llvm::Value* vtableTablePtr();
-    // Per-class slot→method (vector index i = vtable slot i+3; slots 0..2 are
-    // td$, itmap$, Dispose) and the virtual-method-name→slot map used to
-    // inherit slots.
+    // #481 / §12.1 / §12.5 / §23: a virtual vtable slot is either a virtual
+    // METHOD or a virtual PROPERTY accessor (getter or setter). A `virtual`/
+    // `abstract`/`override` property's get (and set, when present) each occupy
+    // their own slot, exactly like a method, so polymorphic property access
+    // dispatches through the vtable. Exactly one of method/prop is non-null.
+    struct VSlot {
+        sema::MethodSymbol* method = nullptr;    // virtual method, or
+        sema::PropertySymbol* prop = nullptr;    // virtual property accessor
+        bool isSet = false;                      // prop only: false=get,true=set
+    };
+    // Per-class slot→member (vector index i = vtable slot i+4; slots 0..3 are
+    // td$, itmap$, Dispose, ToString) and the virtual-member-name→slot map used
+    // to inherit slots. A property getter is keyed by its name; a property
+    // setter by name + "$set" so get/set get distinct slots.
     std::unordered_map<const sema::TypeSymbol*,
-                       std::vector<sema::MethodSymbol*>> vtableMethods_;
+                       std::vector<VSlot>> vtableMethods_;
     std::unordered_map<const sema::TypeSymbol*,
-                       std::unordered_map<std::string_view, unsigned>>
+                       std::unordered_map<std::string, unsigned>>
         vtableNameSlot_;
+    // #481: a virtual property accessor's vtable slot, for dispatch at the
+    // access site. Keyed by the PropertySymbol; the getter slot in propGetSlot_,
+    // the setter slot in propSetSlot_. Absent ⇒ the accessor is non-virtual.
+    std::unordered_map<const sema::PropertySymbol*, unsigned> propGetSlot_;
+    std::unordered_map<const sema::PropertySymbol*, unsigned> propSetSlot_;
+    // #481: a virtual property accessor IS just a method shape — `T get(ptr
+    // this)` / `void set(ptr this, T value)`. Emitted once per (class, prop,
+    // isSet), filled into the vtable slot, and called through the vtable at a
+    // polymorphic access site. Keyed by (prop, isSet).
+    std::map<std::pair<const sema::PropertySymbol*, bool>, llvm::Function*>
+        propAccessorFns_;
     // CG35-itable (§13 / §12): per-interface itable dispatch. For each
     // interface method `ms`, ifaceMethodIndex_[ms] is its 0-based position in
     // the interface's non-static method declaration order. This index is used
@@ -620,6 +642,17 @@ private:
     // Synchronous events only (async deferred). Keyed by the interface's
     // EventSymbol.
     std::unordered_map<const sema::EventSymbol*, unsigned> ifaceEventIndex_;
+    // #481 / §13 / §23: an interface PROPERTY accessor also occupies an itab
+    // slot. The getter index is in ifacePropertyGetIndex_, the setter (when the
+    // interface property declares one) in ifacePropertySetIndex_. Both are
+    // APPENDED after the interface's methods and events (so method/event indices
+    // are unchanged): the getter, then — if present — the setter. Keyed by the
+    // interface's PropertySymbol. Interface-typed property access dispatches
+    // through these like an interface method call.
+    std::unordered_map<const sema::PropertySymbol*, unsigned>
+        ifacePropertyGetIndex_;
+    std::unordered_map<const sema::PropertySymbol*, unsigned>
+        ifacePropertySetIndex_;
     // Per (class × interface): the itab$C$I global (array of fn ptrs in
     // interface declaration order). Key: (cls, iface).
     std::map<std::pair<const sema::TypeSymbol*, const sema::TypeSymbol*>,
@@ -721,6 +754,47 @@ private:
             if (mod == "virtual" || mod == "override" || mod == "abstract")
                 return true;
         }
+        return false;
+    }
+
+    // #481 / §12.1 / §12.5: a PROPERTY participates in virtual dispatch if it
+    // is `virtual`, `override`, or `abstract`. A property declared on an
+    // interface is implicitly virtual (an interface member, like an interface
+    // method — §13 / §23). Static and indexer properties are excluded here
+    // (indexers dispatch via their own §22.10 path; this gates plain
+    // get/set properties). Returns false for a null symbol.
+    bool isVirtualProperty(const sema::PropertySymbol* ps) {
+        if (!ps || ps->isIndexer) return false;
+        for (auto mod : ps->modifiers) {
+            if (mod == "static") return false;
+            if (mod == "virtual" || mod == "override" || mod == "abstract")
+                return true;
+        }
+        // An interface property is implicitly virtual (§13 / §23).
+        return ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
+    }
+
+    // #481 / §23: does this property declare a setter? An auto-property without
+    // a `readonly`/`private set` restriction has both; an expression-bodied or
+    // block getter-only property has only a getter. Checked off the PropertyDecl
+    // so it matches across base/override (the override must match the base's
+    // accessor set per §12.1).
+    static bool propertyHasSetter(const sema::PropertySymbol* ps) {
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd) return false;
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression) return false;
+        if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
+            // Auto-property: read-write unless readonly. (Auto-properties are
+            // not virtual unless on an interface, but interfaces don't carry
+            // an Auto body — they use the abstract/block form — so this branch
+            // is effectively for completeness.)
+            for (auto mod : pd->modifiers)
+                if (mod == "readonly") return false;
+            return true;
+        }
+        // Block form: a set accessor present.
+        for (const auto& a : pd->accessors)
+            if (a.isSet) return true;
         return false;
     }
 
@@ -1196,6 +1270,35 @@ private:
     llvm::Function* ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
                                               const ast::PropertyAccessor* acc);
 
+    // #481 / §12.1 / §12.5 / §23: emit (or retrieve cached) a uniform-signature
+    // accessor FUNCTION for a virtual property, so it can be installed in a
+    // vtable/itable slot and called through the receiver's vtable at a
+    // polymorphic access site. Getter signature: `T get(ptr this)`; setter:
+    // `void set(ptr this, T value)`. Handles arrow, block, and auto-property
+    // accessors uniformly (the bodies reuse the existing inline lowering). An
+    // ABSTRACT accessor (no body) returns nullptr — the slot stays null on the
+    // abstract base and is filled by the override's function. `cls` is the class
+    // whose accessor implementation to emit (the most-derived owner of the
+    // accessor for `ps`).
+    llvm::Function* ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
+                                             const sema::PropertySymbol* ps,
+                                             bool isSet);
+
+    // #481 / §12.1 / §12.5 / §13 / §23: if `e` is a read of a VIRTUAL (or
+    // interface) property through a (potentially) polymorphic receiver, lower it
+    // as a dynamic dispatch through the receiver's vtable (class virtual) or
+    // itable (interface) and return the result. Returns nullptr when `e` is not
+    // a virtual-property read (the caller falls through to the static getter
+    // path). `base.P` (base-qualified) bypasses dispatch like a base method
+    // call (§12.3), so it returns nullptr there too.
+    llvm::Value* lowerVirtualPropertyGet(const ast::Expr& e);
+
+    // #481: companion for `obj.P := v` — dispatch a virtual/interface property
+    // SETTER through the vtable/itable with the already-lowered value `v`.
+    // Returns true when it handled the assignment; false to fall through to the
+    // static setter path.
+    bool lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v);
+
     // §23.4: emit (or retrieve cached) a standalone LLVM function for a
     // BLOCK-form indexer getter body (`property [i: …]: T get => do…end;`).
     // The signature is (this, index-params…) → T; calling it returns the
@@ -1473,6 +1576,27 @@ private:
                 if (ms && !isStaticMethod(ms) && ms->name == name &&
                     methodFns_.count(ms))
                     return ms;
+            }
+            t = baseClassOf(t);
+        }
+        return nullptr;
+    }
+
+    // #481 / §13 / §23: the (non-static, non-indexer) PropertySymbol named
+    // `name` declared on `cls` or an inherited base — the concrete property an
+    // interface property or an inherited virtual property resolves to on the
+    // implementing/most-derived class. Returns the most-derived match (walks
+    // base-last), so a derived override is preferred over the base declaration.
+    sema::PropertySymbol* classPropertyByName(const sema::TypeSymbol* cls,
+                                              std::string_view name) {
+        for (const sema::TypeSymbol* t = cls; t;) {
+            for (sema::Symbol* m : t->members) {
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                if (!ps || ps->isIndexer || ps->name != name) continue;
+                bool isStatic = false;
+                for (auto mod : ps->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (!isStatic) return ps;
             }
             t = baseClassOf(t);
         }

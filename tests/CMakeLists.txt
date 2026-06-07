@@ -182,6 +182,7 @@ set(BEZEL_TEST_SOURCES
     codegen/inherited_fields_test.cpp
     codegen/ctor_chaining_test.cpp
     codegen/virtual_dispatch_test.cpp
+    codegen/virtual_property_481_test.cpp
     codegen/sealed_abstract_test.cpp
     codegen/abstract_dynamic_dispose_test.cpp
     codegen/type_test_test.cpp

@@ -50,6 +50,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // property runs its setter body (with `value` = v); compound
             // assignment is a read-modify-write through getter + setter.
             if (as->op == ":=") {
+                // #481 / §12.1 / §12.5 / §13 / §23: a VIRTUAL or INTERFACE
+                // property setter dispatches dynamically through the receiver's
+                // vtable/itable. Checked before the static setter / auto-property
+                // store paths (which would run the *static* type's setter and
+                // miscompile an override).
+                {
+                    auto* tps = dynamic_cast<sema::PropertySymbol*>(
+                        ctx_.exprSymbol(*as->target));
+                    if (tps && !tps->isIndexer &&
+                        (propSetSlot_.count(tps) ||
+                         ifacePropertySetIndex_.count(tps))) {
+                        llvm::Value* rhsV = lowerExpr(*as->value);
+                        if (lowerVirtualPropertySet(*as->target, rhsV))
+                            return false;
+                    }
+                }
                 if (lowerPropertySet(*as->target, *as->value))
                     return false;
                 // §22.10: indexer setter for `obj[i] := v`.
@@ -73,8 +89,30 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     builder_.CreateStore(rhsOnce, addr2);
                     return false;
                 }
-            } else if (lowerPropertyCompound(*as)) {
-                return false;
+            } else {
+                // #481: a VIRTUAL/INTERFACE property compound assignment
+                // `obj.P OP= v` is a read-modify-write — both the getter read
+                // and the setter write dispatch dynamically.
+                auto* tps = dynamic_cast<sema::PropertySymbol*>(
+                    ctx_.exprSymbol(*as->target));
+                if (tps && !tps->isIndexer &&
+                    (propSetSlot_.count(tps) ||
+                     ifacePropertySetIndex_.count(tps)) &&
+                    (propGetSlot_.count(tps) ||
+                     ifacePropertyGetIndex_.count(tps))) {
+                    llvm::Value* cur = lowerExpr(*as->target);  // dyn getter
+                    llvm::Value* rhs = lowerExpr(*as->value);
+                    if (cur && rhs) {
+                        std::string op(as->op);
+                        if (!op.empty() && op.back() == '=') op.pop_back();
+                        llvm::Value* res = emitCompoundOp(
+                            op, cur, rhs, cur->getType()->isFloatingPointTy(),
+                            isUnsignedTargetExpr(*as->target));
+                        if (res && lowerVirtualPropertySet(*as->target, res))
+                            return false;
+                    }
+                }
+                if (lowerPropertyCompound(*as)) return false;
             }
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = lvalueAddr(*as->target, elemTy);

@@ -1412,6 +1412,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // #481 / §12.1 / §12.5 / §13 / §23: a VIRTUAL or INTERFACE property read
+    // through a (potentially) polymorphic receiver dispatches dynamically — load
+    // the accessor function from the receiver's vtable/itable and call it. This
+    // precedes the static getter paths below (which would bind the *static*
+    // type's accessor and miscompile / crash an override).
+    if (llvm::Value* v = lowerVirtualPropertyGet(e)) return v;
     // CG33b: a computed (arrow-getter) property read `obj.P` evaluates
     // the getter with `this` = obj.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
@@ -1604,6 +1610,139 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         }
     }
     return nullptr;
+}
+
+
+// #481 / §12.1 / §12.5 / §13 / §23: dynamic dispatch of a virtual/interface
+// property GETTER read. Mirrors the virtual/interface METHOD dispatch in
+// LlvmBackend_Calls.cpp::emitMethodCall — load the receiver's vtable (class) or
+// look up the per-interface itable, GEP to the accessor's slot, load the fn ptr,
+// and call `T get(ptr this)`.
+llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
+    // The receiver is either an explicit `obj.P` target, or — for a bare `P`
+    // read inside an instance member — the current `this`. A static-property
+    // read (receiver is a type name) has no `this`; it is excluded below by the
+    // requirement that the lowered receiver be a pointer value.
+    const ast::Expr* recvExpr = nullptr;
+    sema::PropertySymbol* ps = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (!ma->target) return nullptr;
+        ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+        recvExpr = ma->target.get();
+        // `base.P` (§12.3): bypass dispatch — the static getter path handles it.
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(recvExpr))
+            if (tid->name == "base") return nullptr;
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*id));
+        // bare `P` → implicit `this.P`; no recvExpr (currentThis_ is the recv).
+    } else {
+        return nullptr;
+    }
+    if (!ps || ps->isIndexer) return nullptr;
+
+    bool isIfaceProp = ps->parent &&
+                       ps->parent->kind == ast::TypeDeclKind::Interface;
+    auto getIt = propGetSlot_.find(ps);
+    auto ifGetIt = ifacePropertyGetIndex_.find(ps);
+    if (!isIfaceProp && getIt == propGetSlot_.end()) return nullptr;
+    if (isIfaceProp && ifGetIt == ifacePropertyGetIndex_.end()) return nullptr;
+
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd) return nullptr;
+    llvm::Type* valTy = lowerType(pd->type.get());
+    if (!valTy) valTy = i32();
+    auto* fnTy = llvm::FunctionType::get(valTy, {ptrTy()}, false);
+
+    llvm::Value* recv = recvExpr ? lowerExpr(*recvExpr) : currentThis_;
+    if (!recv || !recv->getType()->isPointerTy()) return nullptr;
+
+    llvm::Value* fnPtr = nullptr;
+    if (isIfaceProp) {
+        // CG35-itable (§13): itab lookup then GEP to the property's index.
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+        auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
+                                  {ptrTy(), ptrTy()});
+        llvm::Value* itmapPtr = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}));
+        auto descIt = descArray_.find(ps->parent);
+        if (descIt == descArray_.end()) return nullptr;
+        llvm::Value* itab = builder_.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+            lookupFn, {itmapPtr, descIt->second}, "itab");
+        unsigned k = ifGetIt->second;
+        fnPtr = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), itab, {builder_.getInt32(k)}), "pget");
+    } else {
+        // Class virtual dispatch: vt[slot].
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+        llvm::Value* slotPtr = builder_.CreateGEP(
+            ptrTy(), vptr, {builder_.getInt32(getIt->second)});
+        fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+    }
+    llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, {recv});
+    emitPendingCheck();  // the accessor body may throw (§23.3)
+    return r;
+}
+
+
+// #481: dynamic dispatch of a virtual/interface property SETTER for
+// `obj.P := v`, with the already-lowered value `v`. Mirrors the getter dispatch
+// above; the call is `void set(ptr this, T value)`.
+bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
+    if (!v) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
+    if (!ma || !ma->target) return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+    if (!ps || ps->isIndexer) return false;
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+        if (tid->name == "base") return false;  // §12.3
+
+    bool isIfaceProp = ps->parent &&
+                       ps->parent->kind == ast::TypeDeclKind::Interface;
+    auto setIt = propSetSlot_.find(ps);
+    auto ifSetIt = ifacePropertySetIndex_.find(ps);
+    if (!isIfaceProp && setIt == propSetSlot_.end()) return false;
+    if (isIfaceProp && ifSetIt == ifacePropertySetIndex_.end()) return false;
+
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd) return false;
+    llvm::Type* valTy = lowerType(pd->type.get());
+    if (!valTy) valTy = i32();
+    auto* fnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {ptrTy(), valTy}, false);
+
+    llvm::Value* recv = lowerExpr(*ma->target);
+    if (!recv || !recv->getType()->isPointerTy()) return false;
+    v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
+
+    llvm::Value* fnPtr = nullptr;
+    if (isIfaceProp) {
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+        auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
+                                  {ptrTy(), ptrTy()});
+        llvm::Value* itmapPtr = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}));
+        auto descIt = descArray_.find(ps->parent);
+        if (descIt == descArray_.end()) return false;
+        llvm::Value* itab = builder_.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+            lookupFn, {itmapPtr, descIt->second}, "itab");
+        unsigned k = ifSetIt->second;
+        fnPtr = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), itab, {builder_.getInt32(k)}), "pset");
+    } else {
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
+        llvm::Value* slotPtr = builder_.CreateGEP(
+            ptrTy(), vptr, {builder_.getInt32(setIt->second)});
+        fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
+    }
+    builder_.CreateCall(fnTy, fnPtr, {recv, v});
+    emitPendingCheck();
+    return true;
 }
 
 
