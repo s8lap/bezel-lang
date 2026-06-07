@@ -149,6 +149,24 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
             }
         }
     }
+    // §11.6 / §5.1 fix: for a nested type, the TypeSymbol lives inside the
+    // outer type's member list as a NestedTypeSymbol::type, not in the module
+    // children.  When the module-children scan above yields null, recover the
+    // TypeSymbol from the enclosing type that is currently being resolved.
+    // Without this, tsym stays null for nested types and baseTypes is never
+    // populated, causing the §5.1 assignability walk to fail to find any base
+    // class or interface — producing a spurious "not implicitly convertible"
+    // error for any upcast from a nested class to its base/interface.
+    if (!tsym && currentOuterType_) {
+        for (Symbol* ms : currentOuterType_->members) {
+            if (auto* nts = dynamic_cast<NestedTypeSymbol*>(ms)) {
+                if (nts->type && nts->type->decl == &td) {
+                    tsym = nts->type;
+                    break;
+                }
+            }
+        }
+    }
     // Register the type's generic params + any nested types so members
     // can reference them.
     for (const auto& g : td.genericParams) {

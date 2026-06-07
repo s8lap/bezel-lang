@@ -127,6 +127,7 @@ set(BEZEL_TEST_SOURCES
     sema/enum_restrictions_test.cpp
     sema/new_expr_args_test.cpp
     sema/bug_483_nested_type_construction_test.cpp
+    sema/nested_type_upcast_test.cpp
     sema/method_body_presence_test.cpp
     sema/static_virtual_test.cpp
     sema/async_abstract_test.cpp
