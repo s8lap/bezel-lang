@@ -223,6 +223,7 @@ set(BEZEL_TEST_SOURCES
     codegen/with_init_test.cpp
     codegen/objinit_usingvar_disposal_test.cpp
     codegen/generic_usingvar_disposal_test.cpp
+    codegen/generic_spec_cache_test.cpp
     codegen/interface_dispatch_test.cpp
     codegen/const_member_test.cpp
     codegen/default_expr_test.cpp
