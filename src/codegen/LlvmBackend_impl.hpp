@@ -3075,7 +3075,18 @@ private:
     // through `newSlot` and recorded in `cellVars_` with the value type. The
     // caller rebinds its locals_/paramSlots_ entry to `newSlot`. Returns the
     // cell pointer (the value to store in a closure env).
-    llvm::Value* boxLocalSlot(llvm::AllocaInst* slot, llvm::AllocaInst*& newSlot);
+    //
+    // `forLoopVar` controls the boxing strategy (BUG-L2 / §27.5 / §16.5):
+    //   true  — for-var loop variable, needs a fresh cell per loop iteration
+    //           so each captured closure sees its own iteration's binding;
+    //           the incBB keeps the original slot current so each pass of the
+    //           boxing code reads the correct value.
+    //   false — regular local / param, the original slot goes stale after the
+    //           first boxing (all writes go through the cell); a null-guarded
+    //           single cell is used so the accumulated value is never reset
+    //           by a re-initialisation on subsequent loop iterations.
+    llvm::Value* boxLocalSlot(llvm::AllocaInst* slot, llvm::AllocaInst*& newSlot,
+                              bool forLoopVar = false);
 
     // §27.5: when a `using var` local is boxed for capture its storage slot
     // changes; update any pending disposal entry so scope-end disposal loads

@@ -2484,6 +2484,23 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     if (lam.exprBody) {
         if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody))
             retTy = lowerTypeRef(rt);
+    } else {
+        // BUG-L3 / §27: for block-body lambdas the return type is NOT the
+        // expression-body type (there is none) but the sema-inferred funcReturn
+        // stored in the lambda's own exprType. Sema scans block-body stmts for
+        // `return <expr>` to infer the return type; failing that it falls back
+        // to `int`. If we leave retTy as i32() unconditionally here, a lambda
+        // that explicitly returns `bool` will be typed `i32` by codegen while
+        // lowerScopedBlock emits `ret i1` for `return true` — a type mismatch
+        // the IR verifier flags ("Function return type does not match operand
+        // type of return inst"). Fix: consult the lambda's sema exprType.
+        if (sema::TypeRef* lamTy = ctx_.exprType(lam)) {
+            if (lamTy->kind == sema::TypeRef::Kind::Function &&
+                lamTy->funcReturn) {
+                llvm::Type* inferred = lowerTypeRef(lamTy->funcReturn);
+                if (inferred != i32()) retTy = inferred;
+            }
+        }
     }
     // If return type is still i32 (unresolved generic), try the expected
     // function type's return type (from the call site context).
@@ -2580,13 +2597,27 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         ce.valTy = cellVars_.count(slot) ? cellVars_[slot]
                                          : slot->getAllocatedType();
         llvm::AllocaInst* newSlot = nullptr;
-        ce.envValue = boxLocalSlot(slot, newSlot);  // the shared cell pointer
+        // BUG-L2 / §27.5: for-var loop variables (decl is a ForStmt) use fresh
+        // boxing each iteration — the incBB updates the original slot so each
+        // new cell correctly captures the current iteration's value (§16.5 fresh
+        // binding). For all other captured locals, use guarded boxing that
+        // allocates the cell exactly once (on first capture) and reuses it on
+        // subsequent iterations, so the accumulated value is never overwritten by
+        // a re-initialisation from the (potentially stale) original slot.
+        bool isForVar = dynamic_cast<const ast::ForStmt*>(decl) != nullptr;
+        ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/isForVar);
         locals_[decl] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
         ce.sym = nullptr;
         ce.decl = decl;
         captures.push_back(ce);
     }
+
+    // BUG-L2 / §27.5: boxing non-ForVar locals with the guarded path introduces
+    // new basic blocks (a conditional branch in boxLocalSlot).  Update savedBB
+    // so the restore below positions the builder at the post-boxing block, not
+    // the now-terminated pre-boxing block.
+    savedBB = builder_.GetInsertBlock();
 
     // Capture `this` if we're inside an instance method — the lambda body
     // may access instance fields via implicit this. `this` is captured by

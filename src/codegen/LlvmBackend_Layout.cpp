@@ -1038,8 +1038,16 @@ llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) 
 // Idempotent: a slot already boxed is reused (multiple lambdas capturing the
 // same variable share one cell). Returns the cell pointer and, through
 // `newSlot`, the `ptr`-typed alloca that now holds it.
+//
+// BUG-L2 / §27.5: `forLoopVar` selects the boxing strategy. When false
+// (regular local/param), a single shared cell is allocated and reused across
+// all loop iterations via a null-guard — the cell is not re-allocated on each
+// iteration so accumulated writes are never discarded. When true (for-var loop
+// variable), a fresh cell is created on every pass (the for-loop incBB keeps
+// the original slot current, so each pass reads the correct iteration value).
 llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
-                                   llvm::AllocaInst*& newSlot) {
+                                   llvm::AllocaInst*& newSlot,
+                                   bool forLoopVar) {
     auto it = cellVars_.find(slot);
     if (it != cellVars_.end()) {
         // Already boxed: the slot is already a ptr-alloca holding the cell.
@@ -1047,23 +1055,90 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
         return builder_.CreateLoad(ptrTy(), slot, "cell");
     }
     llvm::Type* valTy = slot->getAllocatedType();
-    // Allocate a one-value heap cell sized to the value type.
+
+    // Determine whether to use a fresh cell each iteration or a single reused
+    // cell (null-guard).  A fresh cell is required when:
+    //   (a) the slot is a for-var loop variable (forLoopVar=true), OR
+    //   (b) the slot's value is re-initialised each iteration by code outside
+    //       the boxing mechanism — detected by checking if any StoreInst that
+    //       writes to `slot` is in the current basic block (the loop body).
+    //       E.g. `using var r := new R()` inside a while loop re-stores into
+    //       r_slot each iteration; using the null-guard would preserve the
+    //       first iteration's (disposed) pointer in the cell.
+    bool freshEachIteration = forLoopVar;
+    if (!freshEachIteration) {
+        llvm::BasicBlock* cur = builder_.GetInsertBlock();
+        for (llvm::Use& u : slot->uses()) {
+            if (auto* si = llvm::dyn_cast<llvm::StoreInst>(u.getUser())) {
+                if (si->getPointerOperand() == slot && si->getParent() == cur) {
+                    freshEachIteration = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (freshEachIteration) {
+        // Fresh cell each iteration: allocate and initialise from slot on every
+        // pass (for-var loop variable fresh binding, or per-iteration re-init).
+        llvm::Value* cellSize = builder_.CreatePtrToInt(
+            builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
+                               {builder_.getInt32(1)}),
+            i64());
+        llvm::Value* cell = builder_.CreateCall(callocFn(),
+                                                {builder_.getInt64(1), cellSize});
+        llvm::Value* cur2 = builder_.CreateLoad(valTy, slot, "preboxed");
+        builder_.CreateStore(cur2, cell);
+        newSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(cell, newSlot);
+        cellVars_[newSlot] = valTy;
+        return cell;
+    }
+
+    // Regular local declared outside the loop: guarded boxing — allocate and
+    // initialise the cell exactly once (first pass); reuse it on subsequent
+    // passes (loop re-entry) so accumulated writes are never reset from the
+    // stale original slot.
+    // The cell-holder alloca lives in the entry block and is null-initialised
+    // there so the runtime guard can distinguish first vs. subsequent passes.
+    newSlot = entryAlloca(ptrTy());
+    {
+        llvm::BasicBlock& entry = currentFn_->getEntryBlock();
+        auto insertPt = std::next(newSlot->getIterator());
+        llvm::IRBuilder<> eb(&entry, insertPt);
+        eb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), newSlot);
+    }
+
+    // Runtime guard.
+    llvm::Function* fn = currentFn_;
+    auto* allocBB = llvm::BasicBlock::Create(llvm_, "cell.alloc", fn);
+    auto* doneBB  = llvm::BasicBlock::Create(llvm_, "cell.done",  fn);
+
+    llvm::Value* existingCell =
+        builder_.CreateLoad(ptrTy(), newSlot, "cell.existing");
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        existingCell, llvm::ConstantPointerNull::get(ptrTy()), "cell.isnull");
+    builder_.CreateCondBr(isNull, allocBB, doneBB);
+
+    // Allocation branch: first pass only.
+    builder_.SetInsertPoint(allocBB);
     llvm::Value* cellSize = builder_.CreatePtrToInt(
         builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
                            {builder_.getInt32(1)}),
         i64());
     llvm::Value* cell = builder_.CreateCall(callocFn(),
                                             {builder_.getInt64(1), cellSize});
-    // Copy the current value out of the original slot into the cell.
     llvm::Value* cur = builder_.CreateLoad(valTy, slot, "preboxed");
     builder_.CreateStore(cur, cell);
-    // A value slot (e.g. `alloca i32`) cannot hold a pointer, so use a fresh
-    // `ptr`-typed alloca as the cell holder. The caller rebinds the variable
-    // to this slot; cellVars_ marks it boxed.
-    newSlot = entryAlloca(ptrTy());
     builder_.CreateStore(cell, newSlot);
+    builder_.CreateBr(doneBB);
+
+    // Done: cell ptr is in *newSlot.
+    builder_.SetInsertPoint(doneBB);
+    llvm::Value* cellPtr = builder_.CreateLoad(ptrTy(), newSlot, "cell");
+
     cellVars_[newSlot] = valTy;
-    return cell;
+    return cellPtr;
 }
 
 
