@@ -924,12 +924,28 @@ void Resolver::checkHidingAndOverride() {
             bool isOverride = hasMod(ms, "override");
             if (isOverride) {
                 if (!baseMemberOverridable(base)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ms->declLoc,
-                        std::string("`") + std::string(ms->name) +
-                        "` is declared `override` but the base "
-                        "member it would override is not `virtual`, "
-                        "`abstract`, or `override` (§12.1)");
+                    // Per §12.4: if the base member is a `sealed override`,
+                    // the override IS in the virtual category but is locked
+                    // against further overriding. Emit a sealed-specific
+                    // diagnostic instead of the generic §12.1 message so the
+                    // programmer knows WHY the override is rejected.
+                    if (hasMod(base, "override") && hasMod(base, "sealed")) {
+                        std::string baseCls = (base->parent && !base->parent->name.empty())
+                            ? std::string(base->parent->name) : "base class";
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string("cannot override `") +
+                            std::string(ms->name) +
+                            "`: it is declared `sealed` in `" +
+                            baseCls + "` (§12.4)");
+                    } else {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string("`") + std::string(ms->name) +
+                            "` is declared `override` but the base "
+                            "member it would override is not `virtual`, "
+                            "`abstract`, or `override` (§12.1)");
+                    }
                 } else {
                     // Slice S20: a legal override must match the
                     // base member's signature exactly.
