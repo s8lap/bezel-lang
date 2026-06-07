@@ -49,7 +49,8 @@ BEZEL_TEST(codegen_cg27c, int_tostring_equality) {
         "end Main; end C;"), 1);
 }
 
-// §5: bool true.ToString() → "true", Length = 4.
+// §5 / stdlib bool.ToString() → "True"/"False": true.ToString() → "True", Length = 4.
+// (Was incorrectly "true" — fixed per #452: stdlib specifies capital "True"/"False".)
 BEZEL_TEST(codegen_cg27c, bool_true_tostring_length) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -57,12 +58,51 @@ BEZEL_TEST(codegen_cg27c, bool_true_tostring_length) {
         "end Main; end C;"), 4);
 }
 
-// §5: bool false.ToString() → "false", Length = 5.
+// §5 / stdlib bool.ToString() → "True"/"False": false.ToString() → "False", Length = 5.
+// (Was incorrectly "false" — fixed per #452: stdlib specifies capital "True"/"False".)
 BEZEL_TEST(codegen_cg27c, bool_false_tostring_length) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var b := false; var s := b.ToString(); return s.Length; "
         "end Main; end C;"), 5);
+}
+
+// §5 / stdlib bool.ToString() → "True": equality assertion.
+// Per stdlib: `public method ToString(): string;  // "True" or "False"` (#452).
+BEZEL_TEST(codegen_cg27c, bool_true_tostring_equality) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b := true; var s := b.ToString(); "
+        "  return (1 if s = \"True\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §5 / stdlib bool.ToString() → "False": equality assertion (#452).
+BEZEL_TEST(codegen_cg27c, bool_false_tostring_equality) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b := false; var s := b.ToString(); "
+        "  return (1 if s = \"False\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §18.5 / stdlib bool.ToString(): string interpolation $"{true}" → "True" (#452).
+// Interpolation routes through emitPrimitiveToString, same bool→string path.
+BEZEL_TEST(codegen_cg27c, bool_true_interpolation_capitalized) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b := true; var s := $\"{b}\"; "
+        "  return (1 if s = \"True\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §18.5 / stdlib bool.ToString(): string interpolation $"{false}" → "False" (#452).
+BEZEL_TEST(codegen_cg27c, bool_false_interpolation_capitalized) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var b := false; var s := $\"{b}\"; "
+        "  return (1 if s = \"False\" else 0); "
+        "end Main; end C;"), 1);
 }
 
 // §5: long.ToString() — large number.
