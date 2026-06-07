@@ -379,6 +379,40 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // LLVM struct value.
             if (rt->declaration &&
                 rt->declaration->kind == ast::TypeDeclKind::Record) {
+                // issue #460: a CONCRETE generic-record instantiation appearing
+                // as a type annotation (a method return / parameter / field of
+                // `Box<string>`) must lower to the SAME specialized struct the
+                // construction + field-access sides produce, or the function
+                // signature ({i32} placeholder) disagrees with the body
+                // (specialized) and the return/store IR is malformed. Set up a
+                // temporary substitution from the record's concrete type args
+                // (resolved under any OUTER subst, so `Box<T>` inside a
+                // `Pair<string>` body maps T → its concrete type), and lower
+                // the record struct under it. A non-generic record (no
+                // genericArgs) keeps the unspecialized struct.
+                auto* rtd = dynamic_cast<const ast::TypeDecl*>(
+                    rt->declaration->decl);
+                if (!rt->genericArgs.empty() && rtd &&
+                    rtd->genericParams.size() == rt->genericArgs.size()) {
+                    auto savedSubst = genericSubst_;
+                    auto savedSemaTy = genericSubstSemaTy_;
+                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                    std::unordered_map<std::string_view, const sema::TypeRef*>
+                        newSema;
+                    for (std::size_t gi = 0;
+                         gi < rtd->genericParams.size(); ++gi) {
+                        newSubst[rtd->genericParams[gi].name] =
+                            lowerTypeRef(rt->genericArgs[gi]);
+                        newSema[rtd->genericParams[gi].name] =
+                            rt->genericArgs[gi];
+                    }
+                    genericSubst_ = std::move(newSubst);
+                    genericSubstSemaTy_ = std::move(newSema);
+                    llvm::StructType* spec = recordStruct(rt->declaration);
+                    genericSubst_ = std::move(savedSubst);
+                    genericSubstSemaTy_ = std::move(savedSemaTy);
+                    return spec;
+                }
                 return recordStruct(rt->declaration);
             }
             return i32();  // other value-kind named (enum) — int
@@ -514,6 +548,47 @@ unsigned Emitter::disposedFlagIndex(const sema::TypeSymbol* /*t*/) {
 
 
 llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
+    // §9.1 / §9.2: storage = non-static FieldSymbols (positional + body
+    // fields) and body auto-properties (PropertySymbol), in declaration order.
+    std::vector<const sema::Symbol*> storage;
+    collectRecordStorage(t, storage);
+
+    // CG-generic (issue #460): a generic RECORD must specialize its T-typed
+    // field layout per instantiation, exactly as classStruct does — otherwise a
+    // `record Box<T>(value: T)` instantiated as `Box<string>` lays `value` out
+    // as the unspecialized i32 generic placeholder while field access GEPs a
+    // `%bz.string` against an i32 base (malformed IR). When a substitution is
+    // active, compute the concrete field types under it and cache a SEPARATE
+    // specialized struct per distinct field-type vector (specializedStructs_),
+    // so Box<int> (i32 field) and Box<string> (ptr field) get distinct LLVM
+    // struct types and each access GEPs against the matching layout. Records
+    // carry no vtable/disposed-flag header (§9 — a record is a value type;
+    // §9.7 — no disposer unless borrow-bearing), so fields start at index 0,
+    // unlike classStruct which reserves indices 0/1 for the vtable + flag.
+    if (!genericSubst_.empty()) {
+        std::vector<llvm::Type*> specFieldTys;
+        specFieldTys.reserve(storage.size());
+        for (const sema::Symbol* m : storage)
+            specFieldTys.push_back(storageType(m));
+        auto& specMap = specializedStructs_[t];
+        auto sit = specMap.find(specFieldTys);
+        if (sit != specMap.end()) {
+            // Re-register field indices for this specialization so a subsequent
+            // field access under the same subst GEPs the correct slot.
+            unsigned sidx = 0;
+            for (const sema::Symbol* m : storage) fieldIndex_[m] = sidx++;
+            return sit->second;
+        }
+        std::string specName = std::string("record.") + std::string(t->name)
+            + "$spec" + std::to_string(specMap.size());
+        auto* specSt = llvm::StructType::create(llvm_, specName);
+        specSt->setBody(specFieldTys);
+        specMap[specFieldTys] = specSt;
+        unsigned sidx = 0;
+        for (const sema::Symbol* m : storage) fieldIndex_[m] = sidx++;
+        return specSt;
+    }
+
     auto it = structs_.find(t);
     if (it != structs_.end()) return it->second;
     auto* st = llvm::StructType::create(
@@ -521,10 +596,6 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
     structs_[t] = st;  // before filling, to support self-reference
     std::vector<llvm::Type*> fieldTys;
     unsigned idx = 0;
-    // §9.1 / §9.2: storage = non-static FieldSymbols (positional + body
-    // fields) and body auto-properties (PropertySymbol), in declaration order.
-    std::vector<const sema::Symbol*> storage;
-    collectRecordStorage(t, storage);
     for (const sema::Symbol* m : storage) {
         fieldTys.push_back(storageType(m));
         fieldIndex_[m] = idx++;
