@@ -363,36 +363,52 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             if (llvm::Value* r = lowerObjectToString(recv))
                                 return r;
                         }
-                        // §6.3: FP predicates as instance methods (x.IsNaN(), x.IsFinite()).
+                        // §6.3 / stdlib §9.2: FP predicates as instance methods
+                        // (x.IsNaN(), x.IsInfinity(), x.IsPositiveInfinity(),
+                        //  x.IsNegativeInfinity(), x.IsFinite()).
+                        // All produce i1 directly via inline fcmp sequences.
                         if (call->args.empty()) {
                             using P = sema::PrimitiveType;
                             bool isFP = tt->primitive == P::Double || tt->primitive == P::Float;
                             if (ma->member == "IsNaN" && isFP) {
                                 llvm::Value* recv = lowerExpr(*ma->target);
                                 if (!recv) return nullptr;
+                                // fcmp uno %x, %x — true iff x is NaN (per §9.2).
                                 return builder_.CreateFCmpUNO(recv, recv, "isnan");
                             }
                             if (ma->member == "IsInfinity" && isFP) {
                                 llvm::Value* recv = lowerExpr(*ma->target);
                                 if (!recv) return nullptr;
-                                auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                                if (!recv->getType()->isDoubleTy())
-                                    recv = builder_.CreateFPExt(recv, dbl);
+                                auto* fty = recv->getType();
+                                auto* posInf = llvm::ConstantFP::getInfinity(fty, false);
+                                auto* negInf = llvm::ConstantFP::getInfinity(fty, true);
                                 return builder_.CreateOr(
-                                    builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(dbl, false)),
-                                    builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(dbl, true)));
+                                    builder_.CreateFCmpOEQ(recv, posInf),
+                                    builder_.CreateFCmpOEQ(recv, negInf));
+                            }
+                            // stdlib §9.2: IsPositiveInfinity — fcmp oeq %x, +inf.
+                            if (ma->member == "IsPositiveInfinity" && isFP) {
+                                llvm::Value* recv = lowerExpr(*ma->target);
+                                if (!recv) return nullptr;
+                                auto* posInf = llvm::ConstantFP::getInfinity(recv->getType(), false);
+                                return builder_.CreateFCmpOEQ(recv, posInf, "isposinf");
+                            }
+                            // stdlib §9.2: IsNegativeInfinity — fcmp oeq %x, -inf.
+                            if (ma->member == "IsNegativeInfinity" && isFP) {
+                                llvm::Value* recv = lowerExpr(*ma->target);
+                                if (!recv) return nullptr;
+                                auto* negInf = llvm::ConstantFP::getInfinity(recv->getType(), true);
+                                return builder_.CreateFCmpOEQ(recv, negInf, "isneginf");
                             }
                             if (ma->member == "IsFinite" && isFP) {
                                 llvm::Value* recv = lowerExpr(*ma->target);
                                 if (!recv) return nullptr;
-                                // IsFinite = !IsNaN && !IsInfinity
+                                // IsFinite = !IsNaN && !IsInfinity (per §9.2).
+                                auto* fty = recv->getType();
                                 llvm::Value* isNaN = builder_.CreateFCmpUNO(recv, recv);
-                                auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                                if (!recv->getType()->isDoubleTy())
-                                    recv = builder_.CreateFPExt(recv, dbl);
                                 llvm::Value* isInf = builder_.CreateOr(
-                                    builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(dbl, false)),
-                                    builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(dbl, true)));
+                                    builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(fty, false)),
+                                    builder_.CreateFCmpOEQ(recv, llvm::ConstantFP::getInfinity(fty, true)));
                                 return builder_.CreateNot(builder_.CreateOr(isNaN, isInf), "isfinite");
                             }
                             if (ma->member == "Abs") {

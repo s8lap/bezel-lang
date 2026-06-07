@@ -4247,6 +4247,62 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return strObj;
     }
 
+    // stdlib §9.2: double / float static FP predicates — all return bool (i1).
+    // These lower to inline fcmp sequences; no runtime helper needed.
+    // IsNaN            → fcmp uno %x, %x
+    // IsInfinity       → (fcmp oeq %x, +inf) | (fcmp oeq %x, -inf)
+    // IsPositiveInfinity → fcmp oeq %x, +inf
+    // IsNegativeInfinity → fcmp oeq %x, -inf
+    // IsFinite         → !(IsNaN | IsInfinity)
+    if (call.args.size() == 1 && call.args[0].value &&
+        (pt == P::Double || pt == P::Float) &&
+        (m == "IsNaN" || m == "IsInfinity" || m == "IsPositiveInfinity" ||
+         m == "IsNegativeInfinity" || m == "IsFinite")) {
+        llvm::Value* arg = lowerExpr(*call.args[0].value);
+        if (!arg) return nullptr;
+        // Widen float to double only when the argument arrives as a narrower
+        // float type; if the value is already the correct FP width, use it
+        // directly.  IsNaN/IsFinite work on any FP width; the infinity checks
+        // need a same-width constant, so we use arg->getType() consistently.
+        auto* fty = arg->getType();
+        // If the arg is an integer (e.g. widened from an int literal 0) or
+        // some unexpected type, promote to double before comparing.
+        if (!fty->isFloatingPointTy()) {
+            fty = llvm::Type::getDoubleTy(llvm_);
+            arg = builder_.CreateSIToFP(arg, fty);
+        }
+        if (m == "IsNaN") {
+            // stdlib §9.2: IsNaN — unordered self-compare yields i1.
+            return builder_.CreateFCmpUNO(arg, arg, "isnan");
+        }
+        if (m == "IsInfinity") {
+            // stdlib §9.2: true for both +∞ and -∞.
+            auto* posInf = llvm::ConstantFP::getInfinity(fty, false);
+            auto* negInf = llvm::ConstantFP::getInfinity(fty, true);
+            return builder_.CreateOr(
+                builder_.CreateFCmpOEQ(arg, posInf),
+                builder_.CreateFCmpOEQ(arg, negInf), "isinf");
+        }
+        if (m == "IsPositiveInfinity") {
+            // stdlib §9.2: true only for +∞.
+            auto* posInf = llvm::ConstantFP::getInfinity(fty, false);
+            return builder_.CreateFCmpOEQ(arg, posInf, "isposinf");
+        }
+        if (m == "IsNegativeInfinity") {
+            // stdlib §9.2: true only for -∞.
+            auto* negInf = llvm::ConstantFP::getInfinity(fty, true);
+            return builder_.CreateFCmpOEQ(arg, negInf, "isneginf");
+        }
+        // IsFinite: not NaN and not infinity (per §9.2).
+        llvm::Value* isNaN = builder_.CreateFCmpUNO(arg, arg);
+        auto* posInf = llvm::ConstantFP::getInfinity(fty, false);
+        auto* negInf = llvm::ConstantFP::getInfinity(fty, true);
+        llvm::Value* isInf = builder_.CreateOr(
+            builder_.CreateFCmpOEQ(arg, posInf),
+            builder_.CreateFCmpOEQ(arg, negInf));
+        return builder_.CreateNot(builder_.CreateOr(isNaN, isInf), "isfinite");
+    }
+
     // double.TryParse / float.TryParse(s, out result): bool — stdlib §5.2
     if (m == "TryParse" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value &&
