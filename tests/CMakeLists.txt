@@ -112,6 +112,7 @@ set(BEZEL_TEST_SOURCES
     sema/primitive_assignability_test.cpp
     sema/assignment_assignability_test.cpp
     sema/mixed_numeric_test.cpp
+    sema/missing_operator_diagnostic_test.cpp
     sema/return_assignability_test.cpp
     sema/named_assignability_test.cpp
     sema/accessor_visibility_test.cpp
