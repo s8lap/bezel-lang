@@ -133,6 +133,7 @@ set(BEZEL_TEST_SOURCES
     sema/static_virtual_test.cpp
     sema/async_abstract_test.cpp
     sema/await_typing_test.cpp
+    sema/async_lambda_diagnostic_test.cpp
     sema/ctor_chain_test.cpp
     sema/static_ctor_params_test.cpp
     sema/base_visibility_test.cpp
