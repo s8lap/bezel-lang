@@ -557,16 +557,48 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!obj) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
     if (!rt) return nullptr;
-    // DEFERRED (§8.6 / §12.7): `is string` / `is Object`. A string stored in an
+    // §8.6 / §12.7 (#417): `is string` / `as string`. A string stored in an
     // Object is a bare `bz_string*` with NO leading vtable/descriptor word, so
-    // emitIsA's descriptor walk (`*obj` → vtable, `*vtable` → descArray) cannot
-    // safely run on it; making `o is string` correct needs a string runtime
-    // type tag that does not exist yet. Returning nullptr preserves the prior
-    // non-crashing fallback rather than dereferencing a non-vtable pointer.
+    // emitIsA's descriptor walk cannot run on it. Recognize it via
+    // bz_obj_is_string, which tells a string (word 0 is `char* data`, not a
+    // listed vtable) from a class/box (word 0 is a vtable) using the
+    // module-global vtable table. Only an OBJECT operand reaches here as a
+    // pointer; a string-typed operand `s is string` is constant-true and never
+    // produces a TypeTest the front-end keeps. `as string` selects the operand
+    // (already the bz_string*) or null.
     if (rt->kind == sema::TypeRef::Kind::Primitive &&
-        (rt->primitive == sema::PrimitiveType::String ||
-         rt->primitive == sema::PrimitiveType::Object))
+        rt->primitive == sema::PrimitiveType::String) {
+        if (!obj->getType()->isPointerTy()) return nullptr;
+        auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* isStr = builder_.CreateCall(
+            isStrFn, {obj, vtableTablePtr()}, "is.string");
+        llvm::Value* isStrBit =
+            builder_.CreateICmpNE(isStr, builder_.getInt32(0));
+        if (te.op == "is") return isStrBit;
+        if (te.op == "is not")
+            return builder_.CreateXor(isStrBit, builder_.getInt1(true));
+        if (te.op == "as")
+            // §17.4: `o as string` → the bz_string* on success, null otherwise.
+            return builder_.CreateSelect(
+                isStrBit, obj, llvm::ConstantPointerNull::get(ptrTy()));
         return nullptr;
+    }
+    // §8.6 / §12.7 (#417): `is Object` / `as Object`. Every non-null reference
+    // is an Object (the universal root, §8.1). `o is Object` is true for any
+    // non-null operand; `o as Object` is the operand itself (no downcast).
+    if (rt->kind == sema::TypeRef::Kind::Primitive &&
+        rt->primitive == sema::PrimitiveType::Object) {
+        if (!obj->getType()->isPointerTy()) return nullptr;
+        llvm::Value* nonNull = builder_.CreateICmpNE(
+            obj, llvm::ConstantPointerNull::get(ptrTy()), "is.object");
+        if (te.op == "is") return nonNull;
+        if (te.op == "is not")
+            return builder_.CreateXor(nonNull, builder_.getInt1(true));
+        if (te.op == "as")
+            return builder_.CreateSelect(
+                nonNull, obj, llvm::ConstantPointerNull::get(ptrTy()));
+        return nullptr;
+    }
     // §8.6 / §12.7: resolve the target's runtime descriptor. For a reference
     // type (class/interface) this is its descArray_; for a boxable VALUE type
     // (record/enum) or a value primitive it is the box descriptor built in

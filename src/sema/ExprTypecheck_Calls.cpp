@@ -494,6 +494,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }();
                 using P = PrimitiveType;
                 const auto& m = ma->member;
+                // §8.5 / §8.6 (#417): `o.ToString()` where o: Object or an
+                // interface — the universal Object.ToString (no MethodSymbol,
+                // dispatched through the vtable ToString slot in codegen). The
+                // result is `string` (§8.5). An Object-typed receiver is a
+                // Primitive(Object) TypeRef; an interface-typed receiver is a
+                // Named TypeRef whose declaration is an interface.
+                if (m == "ToString" && ce.args.empty() && recvTy) {
+                    bool isObjectRecv = recvTy->kind == TypeRef::Kind::Primitive &&
+                                        recvTy->primitive == P::Object;
+                    bool isIfaceRecv =
+                        recvTy->kind == TypeRef::Kind::Named &&
+                        recvTy->declaration &&
+                        recvTy->declaration->kind == ast::TypeDeclKind::Interface;
+                    if (isObjectRecv || isIfaceRecv) {
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        return;
+                    }
+                }
                 // stdlib §5: build a lazy IEnumerable<T> result type for a
                 // deferred LINQ operator. Represented as a Named TypeRef with
                 // no declaration and no astNode (a structural sentinel the

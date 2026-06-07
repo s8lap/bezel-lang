@@ -3358,6 +3358,24 @@ extern "C" void bz_string_release(void* s) {
     free(s);
 }
 
+// §8.6 / §12.7 (#417): is the Object-typed value `obj` a string? A string in an
+// Object slot is a bare bz_string* (word 0 = char* data); a class / boxed value
+// / built-in exception has a vtable pointer at word 0. `vtable_table` is the
+// null-terminated array codegen emits listing every vtable/box-vtable global.
+// `obj` is a string iff it is non-null and its first word is NOT one of those
+// vtables. (Runtime-internal vtables — IEnumerator state machines — are never
+// stored in a plain Object slot, so omitting them from the table is sound.)
+extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
+    if (!obj) return 0;
+    void* word0;
+    memcpy(&word0, obj, sizeof(void*));  // obj's first word (vtable or data ptr)
+    if (vtable_table) {
+        for (void** p = vtable_table; *p != nullptr; ++p)
+            if (*p == word0) return 0;   // a known vtable → not a string
+    }
+    return 1;                            // not a vtable → a string
+}
+
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
 // increment).

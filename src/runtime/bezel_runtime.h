@@ -577,6 +577,18 @@ void bz_event_source_free(void* src);
 void bz_string_retain(void* s);
 void bz_string_release(void* s);
 
+// §8.6 / §12.7 (#417): runtime discriminator for `o is string` / `o as string`
+// / `o.ToString()` where o: Object holds a string. A string stored in an Object
+// slot is a bare bz_string* whose first word is `char* data` (NOT a vtable). A
+// class / boxed value / built-in exception in an Object slot has a vtable
+// pointer at word 0. `vtable_table` is a null-terminated array of all the
+// vtable/box-vtable/exception-vtable globals codegen emitted for this program;
+// `obj` is a string iff it is non-null and `obj`'s first word is NOT one of
+// those vtables. Returns 1 (string) / 0 (not a string / null). The scan is
+// O(#vtables); the table is tiny (one entry per emitted type) and the call is
+// only on the rare `is/as/ToString string-through-Object` path.
+int32_t bz_obj_is_string(void* obj, void** vtable_table);
+
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
 // increment). Function-typed values (lambda closures, capturing or not, and
