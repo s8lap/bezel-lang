@@ -20,11 +20,15 @@
 // embedded in larger expressions, locals live across an await, `Task` (no value)
 // awaits, basic fault propagation, AND — added by #438 — `await` inside loop
 // bodies (while / range-for / nested), including loop-carried accumulation and
-// pre-/post-loop locals live across the loop's suspends. DEFERRED (not
-// exercised; rejected with a diagnostic or out of scope): `await` inside
-// try/catch/finally (§30.9, the new boundary — rejected with a clean
-// diagnostic), a real cross-thread suspend, atomic refcounts, and async
-// iterators.
+// pre-/post-loop locals live across the loop's suspends. The #438 remainder adds
+// `await` inside a try BODY, a CATCH ARM body, and a FINALLY (the handler-context
+// allocas — caught-exception binding/disposal, finally exit-mode/return-value,
+// and the in-flight exception on the finally-unwind path — are frame-backed
+// across a cross-thread suspend). DEFERRED (not exercised; rejected with a
+// diagnostic or out of scope): `await` inside a catch GUARD (`catch … when
+// await …`, the guard runs during dispatch before the handler scope exists —
+// rejected with a clean diagnostic), atomic refcounts, and async iterators
+// (which reject suspend-in-try wholesale, a separate boundary).
 
 #include <cstdio>
 #include <cstdlib>
@@ -615,12 +619,27 @@ BEZEL_TEST(async_30_9, await_in_nested_try) {
         24);
 }
 
-// §30.9 deferred tail (#438): `await` inside a CATCH ARM body is still NOT
-// supported — resuming into a catch handler (re-establishing the caught-exception
-// disposal scope across a suspend) is a further increment. Rejected with a clear
-// diagnostic and no malformed IR.
-BEZEL_TEST(async_30_9, await_in_catch_arm_is_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// ===========================================================================
+// §30.9 / §31.2 (#438 remainder): `await` inside a CATCH ARM and a FINALLY.
+//
+// The resume block of an in-handler await is lowered IN PLACE inside the
+// handler scope, so it inherits the correct compile-time unwind context
+// (currentCaughtExc_, the caught-exception disposal scope, the finally
+// exit-mode dispatch). The runtime values that must survive the suspend — the
+// caught-exception object pointer (binding + disposal slot), the finally
+// exit-mode / return-value slots, and the in-flight exception on the
+// finally-unwind path (which is captured out of the process-global bz$exc into
+// a frame slot) — are FRAME-BACKED across a cross-thread resume (lowerTry
+// registers them; fixupSuspendDominance heap-spills them, like a named local).
+// Only an `await` in a catch GUARD remains deferred (it runs during dispatch,
+// before the handler scope exists).
+// ===========================================================================
+
+// §30.9 / §31.2 (#438): `await` inside a CATCH ARM. A faulted body is caught,
+// then the catch arm awaits a recovery producer and uses its result. The arm
+// recovers x := 5. Synchronous (already-done) producer path.
+BEZEL_TEST(async_30_9, await_in_catch_arm_recovers) {
+    expectValueLeakFree(
         "module M; class C "
         "  public static async method Producer(n: int): Task<int> "
         "    return n; "
@@ -633,19 +652,348 @@ BEZEL_TEST(async_30_9, await_in_catch_arm_is_rejected) {
         "    try x := await Boom(); "
         "    catch Exception => do x := await Producer(5); end; end; "
         "    return x; "
-        "  end Main; end C;"));
+        "  end Main; end C;",
+        5);
 }
 
-// §30.9 deferred tail (#438): `await` inside a `finally` is likewise rejected.
-BEZEL_TEST(async_30_9, await_in_finally_is_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// §30.9 / §31.1 / §31.2 (#438): the CAUGHT EXCEPTION is used AFTER an await in
+// the catch arm. The binding `e` (a borrow whose lifetime is the arm body,
+// which spans the suspend) must survive the suspend — its object pointer is
+// frame-backed. Boom faults with message "boom"; after `await Producer(3)` the
+// arm reads e.Message and adds 10 to the recovered value: 3 + 10 = 13.
+BEZEL_TEST(async_30_9, await_in_catch_arm_uses_caught_exception_after_await) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(\"boom\"); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); "
+        "    catch var e: Exception => do "
+        "      var r := await Producer(3); "
+        "      if e.Message = \"boom\" then x := r + 10; else x := r; end; "
+        "    end; end; "
+        "    return x; "
+        "  end Main; end C;",
+        13);
+}
+
+// §30.9 / §31.2 (#438): `await` inside a FINALLY that runs after a NORMAL-
+// completing body. The body awaits (x := 5); the finally awaits a producer and
+// adds 100: 5 + 100 = 105.
+BEZEL_TEST(async_30_9, await_in_finally_runs_after_normal_body) {
+    expectValueLeakFree(
         "module M; class C "
         "  public static async method Producer(n: int): Task<int> "
         "    return n; "
         "  end Producer; "
         "  public static async method Main(): Task<int> "
-        "    var x := 1; "
-        "    try x := 1; finally x := await Producer(5); end; "
+        "    var x := 0; var ran := 0; "
+        "    try x := await Producer(5); "
+        "    finally ran := await Producer(100); end; "
+        "    return x + ran; "
+        "  end Main; end C;",
+        105);
+}
+
+// §30.9 / §31.2 (#438): `await` inside a FINALLY that runs after a FAULTED body,
+// then the original exception RE-PROPAGATES past the finally and is caught by an
+// enclosing try. The finally awaits Producer(7) on the exception path; the
+// in-flight exception (captured out of the process-global into a frame slot
+// across the suspend) is restored and re-raised, caught by the outer arm which
+// adds 1: 7 + 1 = 8. Confirms the finally runs on the faulted path AND the
+// exception survives the in-finally suspend.
+BEZEL_TEST(async_30_9, await_in_finally_runs_after_faulted_body_reraises) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var ran := 0; "
+        "    try "
+        "      try ran := await Boom(); "
+        "      finally ran := ran + await Producer(7); end; "
+        "    catch Exception => ran := ran + 1; end; "
+        "    return ran; "
+        "  end Main; end C;"),
+        8);
+}
+
+// §30.9 / §31.2 (#438): a faulted await CAUGHT by a catch arm that itself awaits,
+// with a finally that also awaits. Both handlers suspend. Boom faults; the catch
+// arm awaits Producer(8) → x := 8; the finally awaits Producer(30) → ran := 30:
+// 8 + 30 = 38. (A single-statement catch arm body — not a `do … end` block —
+// because the parser requires a `;`-terminated arm body before `finally`.)
+BEZEL_TEST(async_30_9, await_in_catch_and_finally_together) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Producer(n: int): Task<int> "
+        "    return n; "
+        "  end Producer; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; var ran := 0; "
+        "    try x := await Boom(); "
+        "    catch Exception => x := await Producer(8); "
+        "    finally ran := await Producer(30); end; "
+        "    return x + ran; "
+        "  end Main; end C;"),
+        38);
+}
+
+// §30.9 / §31.2 (#438): MULTIPLE awaits and named locals inside one catch arm.
+// The recovery arm awaits twice and binds the results to named locals `a`/`b`,
+// which (declared inside the catch arm) must be frame-backed across the suspends
+// — collectSuspendLocals recurses into the handler region. a := 3, b := 4,
+// x := 7.
+BEZEL_TEST(async_30_9, multiple_awaits_and_locals_in_catch_arm) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method P(n: int): Task<int> "
+        "    return n; "
+        "  end P; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); "
+        "    catch Exception => do "
+        "      var a := await P(3); "
+        "      var b := await P(4); "
+        "      x := a + b; "
+        "    end; end; "
+        "    return x; "
+        "  end Main; end C;",
+        7);
+}
+
+// §30.9 / §31.1 / §31.2 (#438): a bare re-raise (`throw;`) AFTER an await in a
+// catch arm. The caught-exception object (currentCaughtExc_) is re-stored into
+// the in-flight slot after the suspend — it must survive the suspend (a register
+// spilled to the heap frame by fixupSuspendDominance). The inner arm logs (await
+// Log(1)) then re-raises; the outer arm catches and adds 40: 1 + 40 = 41.
+BEZEL_TEST(async_30_9, reraise_after_await_in_catch_arm) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Log(n: int): Task<int> "
+        "    return n; "
+        "  end Log; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var logged := 0; "
+        "    try "
+        "      try logged := await Boom(); "
+        "      catch var e: Exception => do "
+        "        logged := await Log(1); "
+        "        throw; "
+        "      end; end; "
+        "    catch Exception => logged := logged + 40; end; "
+        "    return logged; "
+        "  end Main; end C;"),
+        41);
+}
+
+// §30.9 / §31.2 (#438): `return` from a catch arm that awaits, with a finally
+// that also awaits. The return value (await P(9) = 9) is routed through the
+// finally (frame-backed exit-mode + return-value slots) which awaits before the
+// actual return. 9.
+BEZEL_TEST(async_30_9, return_from_await_in_catch_through_await_in_finally) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method P(n: int): Task<int> "
+        "    return n; "
+        "  end P; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Helper(): Task<int> "
+        "    var ran := 0; "
+        "    try "
+        "      var x := await Boom(); "
+        "      return x; "
+        "    catch Exception => return await P(9); "
+        "    finally ran := await P(0); end; "
+        "  end Helper; "
+        "  public static async method Main(): Task<int> "
+        "    return await Helper(); "
+        "  end Main; end C;"),
+        9);
+}
+
+// §30.9 / §31.2 (#438): a FINALLY-only await (the try body does NOT await). The
+// finally body's await still needs its own resume state. x := 5 (sync body),
+// finally awaits P(100): 5 + 100 = 105.
+BEZEL_TEST(async_30_9, await_only_in_finally_body_not_in_try_body) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method P(n: int): Task<int> "
+        "    return n; "
+        "  end P; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; var ran := 0; "
+        "    try x := 5; finally ran := await P(100); end; "
+        "    return x + ran; "
+        "  end Main; end C;",
+        105);
+}
+
+// §30.9 / §31.2 (#438) cross-thread: MULTIPLE awaits + named locals in a catch
+// arm on the REAL cross-thread suspend path. Both `a` and `b` round-trip the
+// heap frame across two worker resumes. 3 + 4 = 7. Run 3x, ASan/TSan-clean.
+BEZEL_TEST(async_30_13, multiple_awaits_in_catch_arm_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method P(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end P; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); "
+        "    catch Exception => do "
+        "      var a := await P(3); "
+        "      var b := await P(4); "
+        "      x := a + b; "
+        "    end; end; "
+        "    return x; "
+        "  end Main; end C;",
+        7);
+}
+
+// §30.9 / §31.2 (#438) cross-thread: a bare re-raise after an await in a catch
+// arm, on the REAL cross-thread suspend path. The caught-exception object must
+// survive the worker resume to be re-raised. Caught by the outer arm: 1 + 40 = 41.
+BEZEL_TEST(async_30_13, reraise_after_await_in_catch_arm_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Log(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Log; "
+        "  public static async method Boom(): Task<int> "
+        "    await Task.Delay(5); "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var logged := 0; "
+        "    try "
+        "      try logged := await Boom(); "
+        "      catch var e: Exception => do "
+        "        logged := await Log(1); "
+        "        throw; "
+        "      end; end; "
+        "    catch Exception => logged := logged + 40; end; "
+        "    return logged; "
+        "  end Main; end C;",
+        41);
+}
+
+// §30.9 / §31.2 (#438) cross-thread: `await` in a FINALLY that runs after a
+// FAULTED body, then re-propagates the original exception, on the REAL cross-
+// thread suspend path. The in-flight exception is captured into a frame slot
+// across the in-finally suspend and re-raised; the outer arm catches it: the
+// finally added 7, the outer arm adds 1 → 8. Run 3x, ASan/TSan-clean.
+BEZEL_TEST(async_30_13, await_in_finally_faulted_reraise_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method P(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end P; "
+        "  public static async method Boom(): Task<int> "
+        "    await Task.Delay(5); "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var ran := 0; "
+        "    try "
+        "      try ran := await Boom(); "
+        "      finally ran := ran + await P(7); end; "
+        "    catch Exception => ran := ran + 1; end; "
+        "    return ran; "
+        "  end Main; end C;",
+        8);
+}
+
+// §30.9 / §31.2 (#438) cross-thread: an `await` inside a CATCH ARM on the REAL
+// cross-thread suspend path (Task.Delay). The caught exception is used after the
+// await; both the exception pointer and the catch result round-trip the heap
+// frame across the worker resume. 5 + 30 = 35. Run 3x, ASan/TSan-clean.
+BEZEL_TEST(async_30_13, await_in_catch_arm_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Boom(): Task<int> "
+        "    await Task.Delay(5); "
+        "    throw new InvalidOperationException(\"ct\"); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); "
+        "    catch var e: Exception => do "
+        "      var r := await Compute(5); "
+        "      if e.Message = \"ct\" then x := r + 30; else x := r; end; "
+        "    end; end; "
+        "    return x; "
+        "  end Main; end C;",
+        35);
+}
+
+// §30.9 / §31.2 (#438) cross-thread: an `await` inside a FINALLY on the REAL
+// cross-thread suspend path. The body awaits (x := 5); the finally awaits across
+// a worker resume and adds 100: 5 + 100 = 105. Run 3x, ASan/TSan-clean.
+BEZEL_TEST(async_30_13, await_in_finally_cross_thread) {
+    expectValueCrossThread(
+        "module M; class C "
+        "  public static async method Compute(n: int): Task<int> "
+        "    await Task.Delay(5); "
+        "    return n; "
+        "  end Compute; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; var ran := 0; "
+        "    try x := await Compute(5); "
+        "    finally ran := await Compute(100); end; "
+        "    return x + ran; "
+        "  end Main; end C;",
+        105);
+}
+
+// §30.9 deferred tail (#438): `await` inside a catch GUARD is STILL deferred —
+// the guard runs during catch dispatch, before the handler scope (and the
+// caught-exception state) exist, so resuming there would need the dispatch
+// sequence re-established. Rejected with a clean diagnostic, no malformed IR.
+BEZEL_TEST(async_30_9, await_in_catch_guard_is_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static async method Check(): Task<bool> "
+        "    return true; "
+        "  end Check; "
+        "  public static async method Boom(): Task<int> "
+        "    throw new InvalidOperationException(); "
+        "  end Boom; "
+        "  public static async method Main(): Task<int> "
+        "    var x := 0; "
+        "    try x := await Boom(); "
+        "    catch var e: Exception when await Check() => x := 1; end; "
         "    return x; "
         "  end Main; end C;"));
 }

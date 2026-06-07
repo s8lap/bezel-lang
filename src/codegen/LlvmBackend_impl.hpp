@@ -2092,6 +2092,12 @@ private:
     // suspend point (yield / await)? Helper for suspendInTryPosition.
     static bool stmtContainsSuspend(const ast::Stmt* s);
 
+    // §30.9 / §31.2 (#438): does a single statement (a catch-arm body) contain an
+    // `await`? Distinct from stmtContainsSuspend (which also reports `yield`):
+    // lowerTry uses this to decide whether to frame-back the handler-context
+    // allocas of an async catch arm (the binding / caught-exc disposal slots).
+    static bool stmtContainsAwait(const ast::Stmt* s);
+
     // §30.1 / §30.2: emit an `async` method (one returning Task / Task<T> /
     // OwnedTask<T>; the async-iterator forms — async + yield — are deferred).
     // Mirrors emitIteratorMethod with smKind_ == Await. Layers the task-driver
@@ -2250,6 +2256,20 @@ private:
     // operands of awaits embedded in larger expressions). Lazily calloc'd on the
     // first resume entry by fixupSuspendDominance; null when the body has none.
     unsigned asyncSpillPtrField_ = 0;
+    // §30.9 / §31.2 (#438): handler-context allocas that must survive a
+    // cross-thread suspend when an `await` lives inside a catch arm or a
+    // finally. lowerTry registers, in an async state machine, the catch-arm
+    // exception binding slot, the synthetic caught-exception disposal slot, and
+    // the finally exit-mode / return-value slots here. These are stored BEFORE
+    // the in-handler await and read AFTER the resume; unlike named locals they
+    // are not in smAllocaToField_ (the await spill/restore loop), so they would
+    // hold a fresh-stack garbage value on a worker resume. fixupSuspendDominance
+    // FORCE-promotes them into the heap spill area (alongside the dominance-
+    // demoted register temporaries), repointing the alloca to a heap GEP so the
+    // single store-before-suspend / read-after-resume round-trips the frame.
+    // Only the slots whose try region actually contains an in-handler await are
+    // added (a try whose catch/finally has no await never registers any).
+    std::vector<llvm::AllocaInst*> asyncHandlerSpillSlots_;
     // The async resume function (the bz_task_then continuation). The await
     // suspend point registers this on the awaited task.
     llvm::Function* asyncResumeFn_ = nullptr;
