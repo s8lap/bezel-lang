@@ -616,4 +616,247 @@ BEZEL_TEST(codegen_excdisp_04, ctor_throw_after_nullable_assign_leak_free) {
     BEZEL_EXPECT_EQ(lsan, 0);
 }
 
+// --------------------------------------------------------------------------
+// [467] §28.3 — an outer `using var` is disposed on the exception path even
+// when an inner `try`/`finally` sits in the same scope.
+//
+// §28.3 (line 4910): owned locals live when an exception propagates out of
+// their block are auto-disposed during unwinding. (line 4914): when the
+// exception passes through nested scopes, the inner scope's locals are disposed
+// before the outer scope's. (line 4922): the implicit auto-dispose composes
+// with an explicit `finally` — the explicit `finally` runs first, then the
+// implicit auto-dispose runs as the scope unwinds further.
+//
+// BUG: an outer `using var r` declared in an outer `try` scope was NOT disposed
+// on the exception path when an inner `try`/`finally` was present in the same
+// scope. The inner `finally`'s unwind block re-propagated straight to the outer
+// catch dispatch WITHOUT first disposing the scopes between the inner try and
+// the outer handler (where `r` lives), so `r` leaked. Without the inner
+// `finally`, disposal worked (the throw site disposed down to the outer try's
+// depth). The fix disposes the intervening scopes [savedDepth, thisTryDepth) at
+// the inner `finally`'s re-propagation, AFTER the finally body (§28.3 ordering).
+// --------------------------------------------------------------------------
+
+// [467-1] The exact repro: outer `using var r` + inner `try`/`finally` + throw +
+// outer `catch`. `r` is disposed exactly once on the exception path (count == 1).
+// Pre-fix: r leaked, count == 0.
+const char* kOuterUsingInnerFinallyThrow =
+    "module M; "
+    "class R "
+    "  public static _count: int := 0; "
+    "  destructor _count := _count + 1; end destructor; "
+    "end R; "
+    "class E end E; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      try "
+    "        throw new E(); "
+    "      finally "
+    "        var dummy := 0; "
+    "      end; "
+    "    catch E => var dummy2 := 0; "
+    "    end; "
+    "    return R._count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_467, outer_using_inner_finally_throw_disposes_once) {
+    BEZEL_EXPECT_EQ(run(kOuterUsingInnerFinallyThrow), 1);
+}
+
+BEZEL_TEST(codegen_excdisp_467, outer_using_inner_finally_throw_leak_free) {
+    // ASan/LSan-clean: the exception is caught (its object is reclaimed by the
+    // catch arm), and `r` is disposed/reclaimed exactly once — no leak, no
+    // double-free, no use-after-free on the exception path.
+    int lsan = runUnderLeakSanitizer(kOuterUsingInnerFinallyThrow);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// [467-2] §28.3 (line 4922) ORDER: the inner explicit `finally` runs FIRST, then
+// the outer `using var`'s implicit auto-dispose. A shared decimal log records
+// each step (finally appends 1, the destructor appends 2); the result is 12 iff
+// the finally ran before the dispose. (21 would mean the dispose ran first.)
+const char* kInnerFinallyBeforeOuterDispose =
+    "module M; "
+    "class Log "
+    "  public static _seq: int := 0; "
+    "end Log; "
+    "class R "
+    "  destructor Log._seq := Log._seq * 10 + 2; end destructor; "
+    "end R; "
+    "class E end E; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      try "
+    "        throw new E(); "
+    "      finally "
+    "        Log._seq := Log._seq * 10 + 1; "
+    "      end; "
+    "    catch E => var d := 0; "
+    "    end; "
+    "    return Log._seq; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_467, inner_finally_runs_before_outer_dispose) {
+    BEZEL_EXPECT_EQ(run(kInnerFinallyBeforeOuterDispose), 12);
+}
+
+// [467-3] NO DOUBLE-DISPOSE on the NORMAL (no-throw) path with the same shape.
+// The body falls through; `r` is disposed exactly once at the outer scope end
+// (count == 1, not 2). Guards against the fix introducing a second disposal on
+// the normal path.
+const char* kOuterUsingInnerFinallyNoThrow =
+    "module M; "
+    "class R "
+    "  public static _count: int := 0; "
+    "  destructor _count := _count + 1; end destructor; "
+    "end R; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      try "
+    "        var x := 0; "
+    "      finally "
+    "        var dummy := 0; "
+    "      end; "
+    "    catch Exception => var dummy2 := 0; "
+    "    end; "
+    "    return R._count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_467, normal_path_inner_finally_disposes_once) {
+    BEZEL_EXPECT_EQ(run(kOuterUsingInnerFinallyNoThrow), 1);
+}
+
+BEZEL_TEST(codegen_excdisp_467, normal_path_inner_finally_no_double_free) {
+    // ASan/LSan-clean: no exception is thrown, so nothing leaks and the single
+    // scope-end disposal of `r` reclaims it exactly once (no double-free).
+    int lsan = runUnderLeakSanitizer(kOuterUsingInnerFinallyNoThrow);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// [467-4] NESTED: two `using var`s in the outer scope + inner `try`/`finally` +
+// throw. Both are disposed exactly once, in REVERSE declaration order (§28.3
+// line 4914). A is declared first, B second; reverse order disposes B (appends
+// 2) before A (appends 1), so the log reads 21.
+const char* kTwoOuterUsingInnerFinallyThrow =
+    "module M; "
+    "class Log "
+    "  public static _seq: int := 0; "
+    "end Log; "
+    "class A "
+    "  destructor Log._seq := Log._seq * 10 + 1; end destructor; "
+    "end A; "
+    "class B "
+    "  destructor Log._seq := Log._seq * 10 + 2; end destructor; "
+    "end B; "
+    "class E end E; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var a := new A(); "
+    "      using var b := new B(); "
+    "      try "
+    "        throw new E(); "
+    "      finally "
+    "        var d := 0; "
+    "      end; "
+    "    catch E => var d2 := 0; "
+    "    end; "
+    "    return Log._seq; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_467, two_outer_using_inner_finally_reverse_order) {
+    BEZEL_EXPECT_EQ(run(kTwoOuterUsingInnerFinallyThrow), 21);
+}
+
+BEZEL_TEST(codegen_excdisp_467, two_outer_using_inner_finally_leak_free) {
+    // ASan/LSan-clean: both `using var`s reclaimed exactly once on the exception
+    // path; the caught exception object reclaimed by the catch arm. No leak, no
+    // double-free.
+    int lsan = runUnderLeakSanitizer(kTwoOuterUsingInnerFinallyThrow);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// [467-5] REGRESSION: the WITHOUT-inner-`finally` case still disposes `r` exactly
+// once on the throw (count == 1). This path was correct pre-fix (the throw site
+// disposed down to the outer try's depth) and must stay correct.
+const char* kOuterUsingNoInnerFinallyThrow =
+    "module M; "
+    "class R "
+    "  public static _count: int := 0; "
+    "  destructor _count := _count + 1; end destructor; "
+    "end R; "
+    "class E end E; "
+    "class C "
+    "  public static method Main(): int "
+    "    try "
+    "      using var r := new R(); "
+    "      throw new E(); "
+    "    catch E => var dummy2 := 0; "
+    "    end; "
+    "    return R._count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_467, no_inner_finally_throw_still_disposes_once) {
+    BEZEL_EXPECT_EQ(run(kOuterUsingNoInnerFinallyThrow), 1);
+}
+
+// [467-6] CROSS-METHOD propagation: the inner `try`/`finally` and outer
+// `using var` live in a method (Work) that has NO enclosing handler — the
+// exception propagates OUT of Work to Main's catch. Here the inner finally's
+// re-propagation targets the function's propagate path (savedDepth == 0), and
+// the intervening-scope discharge must still dispose `r` before Work returns
+// with the exception in flight (count == 1). Same bug shape as [467-1] but the
+// enclosing handler is a different stack frame.
+const char* kCrossMethodUsingInnerFinallyThrow =
+    "module M; "
+    "class R "
+    "  public static _count: int := 0; "
+    "  destructor _count := _count + 1; end destructor; "
+    "end R; "
+    "class E end E; "
+    "class C "
+    "  public static method Work(): int "
+    "    using var r := new R(); "
+    "    try "
+    "      throw new E(); "
+    "    finally "
+    "      var a := 0; "
+    "    end; "
+    "    return 0; "
+    "  end Work; "
+    "  public static method Main(): int "
+    "    try "
+    "      var z := Work(); "
+    "    catch E => var d := 0; "
+    "    end; "
+    "    return R._count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_467, cross_method_inner_finally_throw_disposes_once) {
+    BEZEL_EXPECT_EQ(run(kCrossMethodUsingInnerFinallyThrow), 1);
+}
+
+BEZEL_TEST(codegen_excdisp_467, cross_method_inner_finally_throw_leak_free) {
+    // ASan/LSan-clean: `r` reclaimed exactly once as the exception leaves Work;
+    // the exception object reclaimed by Main's catch arm. No leak, no double-free.
+    int lsan = runUnderLeakSanitizer(kCrossMethodUsingInnerFinallyThrow);
+    if (lsan == -1) return;  // toolchain unavailable: skip
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
 }  // namespace

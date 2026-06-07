@@ -1711,6 +1711,14 @@ private:
     // first (§28.3 reverse order; nested scopes inner-before-outer).
     void emitUnwindDisposals();
 
+    // #467 / §28.3: dispose disposeStack_ scopes in the half-open index range
+    // [lo, hi), innermost (higher index) first. Used by a try-with-finally
+    // re-propagating an exception to its enclosing handler to dispose the scopes
+    // between the inner try and that handler (e.g. an outer `using var`) AFTER
+    // the explicit finally body has run. See the definition for the full
+    // rationale.
+    void emitUnwindDisposalsInRange(std::size_t lo, std::size_t hi);
+
     // CG20/CG21: after a call that may throw, branch to the unwind target
     // when the exception global is non-null (disposing unwound using-vars
     // first), else continue.

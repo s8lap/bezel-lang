@@ -512,6 +512,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     std::size_t savedDepth = unwindScopeDepth_;
     unwindTarget_ = dispatchBB;
     unwindScopeDepth_ = disposeStack_.size();
+    // #467 / §28.3: the dispose-stack depth at THIS try's entry. The scopes in
+    // [savedDepth, thisTryDepth) lie between this try and its enclosing handler
+    // (`outerUnwind`). A throw out of this try's body only disposes scopes down
+    // to thisTryDepth; on the exception path through this try's finally those
+    // intervening scopes (e.g. an outer `using var`) are still live and must be
+    // disposed when re-propagating to outerUnwind — see finUnwindBB below.
+    std::size_t thisTryDepth = unwindScopeDepth_;
     bool bodyTerm = lowerScopedBlock(trys.body);
     unwindTarget_ = savedUnwind;
     unwindScopeDepth_ = savedDepth;
@@ -727,9 +734,22 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 builder_.CreateStore(orig, excGlobal());
                 builder_.CreateBr(propBB);
                 builder_.SetInsertPoint(propBB);
+                // #467 / §28.3: same intervening-scope discharge as the
+                // synchronous path below. Emitted after the in-flight exception
+                // is restored to bz$exc so the enclosing handler sees the right
+                // object; the disposals themselves do not touch bz$exc.
+                emitUnwindDisposalsInRange(savedDepth, thisTryDepth);
                 builder_.CreateBr(outerUnwind);
             }
         } else if (!lowerScopedBlock(trys.finallyBody)) {
+            // #467 / §28.3 (lines 4914, 4922): the explicit finally has now run;
+            // as the exception unwinds further out to the enclosing handler
+            // (outerUnwind), dispose any owned locals / using-vars that live in
+            // the scopes BETWEEN this try and that handler — the throw site only
+            // disposed scopes down to thisTryDepth, so [savedDepth, thisTryDepth)
+            // is still live. (No-op when this try sits directly in its handler's
+            // scope, i.e. savedDepth == thisTryDepth.)
+            emitUnwindDisposalsInRange(savedDepth, thisTryDepth);
             builder_.CreateBr(outerUnwind);
         }
     }
