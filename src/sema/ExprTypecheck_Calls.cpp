@@ -525,6 +525,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (elem) t->genericArgs.push_back(elem);
                     return t;
                 };
+                // per §5 / fix #459: build a Dictionary<K,V> result TypeRef for
+                // ToDictionary so that the inferred-local case (`var d :=
+                // seq.ToDictionary(keyFn)`) produces a type that both sema's
+                // `colName` check (reads astNode->name->parts[0]) and codegen's
+                // `isDictTypeName` recognize as a Dictionary receiver. A static
+                // synthetic ast::Type with the "Dictionary" name is used as the
+                // astNode; the actual key/value types live in genericArgs.
+                // The static nodes are intentionally leaked (program-lifetime),
+                // which is the correct treatment for a compiler's synthetic nodes.
+                auto makeDictResult = [&](TypeRef* keyElem,
+                                          TypeRef* valElem) -> TypeRef* {
+                    static const ast::Type* kDictAstNode = []() -> ast::Type* {
+                        auto* qn = new ast::QualifiedName;
+                        qn->parts.push_back("Dictionary");
+                        auto* t = new ast::Type;
+                        t->kind = ast::TypeKind::Named;
+                        t->name.reset(qn);
+                        return t;
+                    }();
+                    auto* tr = ctx_.makeTypeRef();
+                    tr->kind = TypeRef::Kind::Named;
+                    tr->declaration = nullptr;
+                    tr->astNode = kDictAstNode;
+                    if (keyElem) tr->genericArgs.push_back(keyElem);
+                    if (valElem) tr->genericArgs.push_back(valElem);
+                    return tr;
+                };
                 // stdlib §5: type a deferred LINQ operator `m` whose source
                 // element type is `srcElem`. ToArray materializes to Array<T>
                 // (modeled here as the lazy element type carried on the call;
@@ -650,10 +677,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // explicitly-typed local in practice, which supplies the
                         // collection type for downstream member access.
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
-                    // stdlib §5 ToDictionary — typed as lazy sentinel (same
-                    // convention as ToArray/ToSet: codegen builds the concrete dict).
-                    else if (m == "ToDictionary" && !ce.args.empty())
-                        ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
+                    // stdlib §5 ToDictionary — typed as Dictionary<K,V> sentinel
+                    // (fix #459 / §5 / §22): use makeDictResult so that inferred
+                    // locals (`var d := seq.ToDictionary(keyFn)`) produce a type
+                    // that isDictTypeName and colName recognize as a Dictionary
+                    // receiver. K is the key lambda's return type; V is srcElem.
+                    else if (m == "ToDictionary" && !ce.args.empty()) {
+                        TypeRef* keyTy = nullptr;
+                        if (ce.args[0].value) {
+                            if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
+                                if (lamTy->kind == TypeRef::Kind::Function &&
+                                    lamTy->funcReturn)
+                                    keyTy = lamTy->funcReturn;
+                        }
+                        ctx_.setExprType(&ce, makeDictResult(keyTy, srcElem));
+                    }
                     // stdlib §5 Ordering: Reverse() on a lazy receiver — preserves T.
                     // NOT added to typeLinqOperator (would clash with Array.Reverse
                     // in-place). Only typed here, where the receiver is already lazy.
@@ -737,10 +775,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         else if ((m == "ToArray" || m == "ToSet") &&
                                  !recvTy->genericArgs.empty())
                             ctx_.setExprType(&ce, makeLazyEnumerable(recvTy->genericArgs[0]));
-                        // stdlib §5 ToDictionary — typed as lazy sentinel.
+                        // stdlib §5 ToDictionary — typed as Dictionary<K,V> sentinel
+                        // (fix #459 / §5 / §22): same as the lazy-source path above.
                         else if (m == "ToDictionary" && !ce.args.empty() &&
-                                 !recvTy->genericArgs.empty())
-                            ctx_.setExprType(&ce, makeLazyEnumerable(recvTy->genericArgs[0]));
+                                 !recvTy->genericArgs.empty()) {
+                            TypeRef* keyTy = nullptr;
+                            if (ce.args[0].value) {
+                                if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
+                                    if (lamTy->kind == TypeRef::Kind::Function &&
+                                        lamTy->funcReturn)
+                                        keyTy = lamTy->funcReturn;
+                            }
+                            ctx_.setExprType(&ce,
+                                makeDictResult(keyTy, recvTy->genericArgs[0]));
+                        }
                         // stdlib §5 *OrNull (Array receiver): return nullable T.
                         else if ((m == "FirstOrNull" || m == "LastOrNull" ||
                                   m == "SingleOrNull") && ce.args.empty() &&

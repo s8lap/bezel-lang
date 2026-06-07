@@ -393,6 +393,48 @@ BEZEL_TEST(linq_gaps, todict_from_lazy_spec_5) {
 }
 
 // ===========================================================================
+// BUG #459 / §5 / §22 — ToDictionary with a TYPE-INFERRED local (`var d :=`).
+// When the local's type is inferred from the initializer, the ToDictionary
+// result must carry a Dictionary<K,V>-compatible TypeRef so that both sema
+// (Count return-type) and codegen (isDictTypeName) recognize the receiver.
+// Without the fix, the inferred local gets a "lazy sentinel" type and
+// d.Count dispatches through the lazy-enumerator path → Count=0.
+// ===========================================================================
+
+// §5 / §22 / #459: inferred var from ToDictionary; Count must be correct.
+BEZEL_TEST(linq_gaps, todict_inferred_var_count_459) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  using var d := a.ToDictionary((x: int) => x); "
+        "  return d.Count; "  // 3 — explicit-annotation form already works
+        "end Main; end C;"), 3);
+}
+
+// §5 / §22 / #459: inferred var from ToDictionary on a lazy pipeline.
+BEZEL_TEST(linq_gaps, todict_inferred_var_lazy_source_459) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  for var i in 1..5 do a.Add(i); end; "
+        "  using var d := a.Where((x) => x mod 2 = 0).ToDictionary((x: int) => x); "
+        "  return d.Count; "  // {2,4} → 2
+        "end Main; end C;"), 2);
+}
+
+// §5 / §22 / #459: key lookup on an inferred-var dictionary.
+BEZEL_TEST(linq_gaps, todict_inferred_var_containskey_459) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  using var d := a.ToDictionary((x: int) => x); "
+        "  return int(d.ContainsKey(20)); "  // 1
+        "end Main; end C;"), 1);
+}
+
+// ===========================================================================
 // FirstOrNull (§5 Element access): T? — null if empty
 // ===========================================================================
 
