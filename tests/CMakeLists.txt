@@ -332,6 +332,7 @@ set(BEZEL_TEST_SOURCES
     codegen/array_record_element_test.cpp
     codegen/owned_collection_remove_test.cpp
     codegen/lambda_codegen_fixes_test.cpp
+    codegen/iife_507_test.cpp
     codegen/indexer_compound_assign_test.cpp
     codegen/nameof_charrepeat_test.cpp
     codegen/blockform_property_itable_test.cpp
