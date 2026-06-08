@@ -819,6 +819,16 @@ _Noreturn
 #endif
 void bz_unhandled_exception(void);
 
+// fix #492 / §31.1 / §2.6: the in-flight exception pointer shared across ALL
+// separately-compiled modules. Codegen emits an ExternalLinkage reference to
+// the symbol "bz_exc" in every module (library or main); the linker resolves
+// them all to this single runtime definition. Before the fix each module had
+// its own InternalLinkage (BSS) copy under the name "bz$exc", so a cross-module
+// `throw` wrote one copy while the caller's pending-check read a different,
+// still-null copy. The symbol is now renamed "bz_exc" (a valid C identifier).
+// Null means "no exception in flight"; non-null is the heap-allocated object.
+extern void* bz_exc;
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
