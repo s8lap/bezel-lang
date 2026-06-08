@@ -5141,11 +5141,66 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     v = phi;
                 }
             }
+            // per §32 / issue #496: when the user's extern declaration was
+            // remapped to an existing internal function (e.g. malloc(i32)
+            // collides with the internal malloc(i64)), coerce each argument
+            // to the canonical parameter type so the call is well-typed.
+            // Only integer width adjustments and int/ptr conversions are
+            // needed: the ABI-relevant case is int (i32) vs. size_t (i64).
+            if (idx < it->second->getFunctionType()->getNumParams()) {
+                llvm::Type* want = it->second->getFunctionType()
+                                       ->getParamType(idx);
+                llvm::Type* have = v->getType();
+                if (have != want) {
+                    bool haveInt = have->isIntegerTy();
+                    bool wantInt = want->isIntegerTy();
+                    bool havePtr = have->isPointerTy();
+                    bool wantPtr = want->isPointerTy();
+                    if (haveInt && wantInt) {
+                        unsigned hw = have->getIntegerBitWidth();
+                        unsigned ww = want->getIntegerBitWidth();
+                        v = (hw < ww)
+                                ? builder_.CreateZExt(v, want, "ffi.zext")
+                                : builder_.CreateTrunc(v, want, "ffi.trunc");
+                    } else if (haveInt && wantPtr) {
+                        v = builder_.CreateIntToPtr(v, want, "ffi.i2p");
+                    } else if (havePtr && wantInt) {
+                        v = builder_.CreatePtrToInt(v, want, "ffi.p2i");
+                    }
+                    // ptr→ptr is identity in opaque-pointer LLVM (no bitcast).
+                }
+            }
             args.push_back(v);
             ++idx;
         }
         if (args.size() != it->second->arg_size()) return nullptr;
-        return builder_.CreateCall(it->second, args);
+        // per §32 / issue #496: coerce the return value if the canonical
+        // function returns a different type than the user's extern declared.
+        // E.g. malloc returns ptr but user declared IntPtr (i64): ptrtoint.
+        llvm::Value* result = builder_.CreateCall(it->second, args);
+        llvm::Type* canonRet = it->second->getReturnType();
+        llvm::Type* userRet = ed && ed->returnType
+                                  ? lowerType(ed->returnType.get())
+                                  : llvm::Type::getVoidTy(llvm_);
+        if (canonRet != userRet && !canonRet->isVoidTy() &&
+            !userRet->isVoidTy()) {
+            bool canonInt = canonRet->isIntegerTy();
+            bool userInt  = userRet->isIntegerTy();
+            bool canonPtr = canonRet->isPointerTy();
+            bool userPtr  = userRet->isPointerTy();
+            if (canonPtr && userInt) {
+                result = builder_.CreatePtrToInt(result, userRet, "ffi.rp2i");
+            } else if (canonInt && userPtr) {
+                result = builder_.CreateIntToPtr(result, userRet, "ffi.ri2p");
+            } else if (canonInt && userInt) {
+                unsigned cw = canonRet->getIntegerBitWidth();
+                unsigned uw = userRet->getIntegerBitWidth();
+                result = (cw < uw)
+                             ? builder_.CreateZExt(result, userRet, "ffi.rzext")
+                             : builder_.CreateTrunc(result, userRet, "ffi.rtrunc");
+            }
+        }
+        return result;
     }
     // CG60: call through a function-typed parameter or local (lambda
     // value). Lambda values are heap-allocated closure structs

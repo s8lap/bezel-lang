@@ -339,6 +339,7 @@ set(BEZEL_TEST_SOURCES
     codegen/itable_bool_return_494_test.cpp
     codegen/stringbuilder_capacity_497_test.cpp
     codegen/split_result_type_500_test.cpp
+    codegen/ffi_name_collision_496_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
