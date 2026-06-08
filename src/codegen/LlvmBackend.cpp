@@ -2,6 +2,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/FileSystem.h"
@@ -29,6 +30,18 @@ std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
 
 bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
                     std::string& error) {
+    // #506: verify the module before any file I/O or codegen pass runs. A
+    // malformed module must not produce a (broken) object file; the driver
+    // interprets a false return as a codegen error and stops the pipeline
+    // (no link, non-zero exit). This is the AOT-path gate — the JIT path
+    // (codegen_support.hpp::runJit) calls emitModule directly and does not
+    // go through here, so it is not affected.
+    if (llvm::verifyModule(module, &llvm::errs())) {
+        error = "IR verification failed (malformed IR emitted; "
+                "see report above)";
+        return false;
+    }
+
     static const bool inited = [] {
         llvm::InitializeNativeTarget();
         llvm::InitializeNativeTargetAsmPrinter();
