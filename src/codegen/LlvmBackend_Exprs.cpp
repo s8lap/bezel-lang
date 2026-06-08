@@ -3140,10 +3140,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return builder_.CreateCall(allocFn, {});
             }
             if (colName == "StringBuilder") {
-                // StringBuilder is a bz_array_t of chars (elem_size=1 or 2).
+                // StringBuilder is a bz_array_t of string *pointers* (parts list).
+                // Each element is a pointer-sized slot (8 bytes), matching SB_ESZ=8
+                // used by every Append/Insert/Remove/Replace/Length/ToString operation
+                // in LlvmBackend_Calls.cpp. Fix for #497: the old elem_size=2 produced
+                // a 128-byte backing buffer (64*2), but each Append advanced 8 bytes,
+                // overflowing after ~16 appends and corrupting allocator metadata.
+                // per §6 / §3.1.
+                constexpr int64_t SB_ESZ = 8;
                 auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
                 return builder_.CreateCall(allocFn,
-                    {builder_.getInt64(2), builder_.getInt64(64)});
+                    {builder_.getInt64(SB_ESZ), builder_.getInt64(64)});
             }
             if (colName == "Random") {
                 int64_t seed = 0;
