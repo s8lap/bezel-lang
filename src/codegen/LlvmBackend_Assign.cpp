@@ -747,6 +747,117 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
 }
 
 
+// fix #508 / stdlib §4.4 / §4.5 / §17.15: compound assignment `arr[i] OP= v`
+// on a HEAP-collection Array<T> / OwnedArray<T> indexer. The plain-assignment
+// path (`arr[i] := v`) was already correct via lowerCollectionIndexerSet, and
+// the explicit read-modify-write (`arr[i] := arr[i] OP v`) worked because the
+// get and the set each drove their own receiver+index evaluation. The COMPOUND
+// path (`arr[i] OP= v`) was broken because lowerStmt's else branch tried:
+//   (1) lowerPropertyCompound  → returns false (no user-property on Array<T>)
+//   (2) lowerIndexerCompound   → returns false (no user-indexer on Array<T>)
+//   (3) lvalueAddr             → returns null (no LLVM ArrayType for bz_array_t*)
+// After null from lvalueAddr, the branch returned without storing, silently
+// losing the new value.
+//
+// Fix: evaluate receiver and index ONCE, call bz_array_get, apply OP, then call
+// bz_array_set / bz_array_set_disposing — mirrors lowerCollectionIndexerGet for
+// the read and lowerCollectionIndexerSet for the write, sharing a single recv+idx
+// evaluation so the single-evaluation contract (§17.15) is satisfied.
+//
+// Dictionary compound-assign is NOT handled here: scalar-encoded dictionary
+// values require round-tripping through the inttoptr encode/decode, which adds
+// complexity with little payoff (dict compound-assign is unusual and can be
+// written explicitly as `d[k] := d[k] OP v`). That gap is noted and left to a
+// follow-up if needed.
+bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
+    if (!as.target || !as.value) return false;
+    auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
+    if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
+        return false;
+    auto* recvTy = ctx_.exprType(*ix->target);
+    // Only handle Array<T> / OwnedArray<T> and list-interface receivers
+    // (IReadOnlyList<T> / IList<T> / IOwnedList<T> are array-backed, §4.1-§4.3).
+    // Dictionary compound-assign is left to the explicit form (see note above).
+    bool isArr  = isCollectionTypeName(recvTy) || isListInterfaceName(recvTy);
+    if (!isArr) return false;
+
+    // --- Evaluate receiver and index ONCE (§17.15 single-evaluation). ---
+    llvm::Value* recv = lowerExpr(*ix->target);
+    if (!recv) return false;
+    llvm::Value* idx = lowerExpr(*ix->indices[0].value);
+    if (!idx) return false;
+    idx = idx->getType()->isIntegerTy(64) ? idx
+        : builder_.CreateSExt(idx, i64());
+
+    // --- Bounds-check (§31.2: out-of-range raises IndexOutOfRangeException). ---
+    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+    llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+    llvm::Value* oor = builder_.CreateICmpUGE(idx, len, "cic.oor");
+    emitGuardThrow(oor, "IndexOutOfRangeException");
+
+    // --- Determine element LLVM type and element-size (mirroring the get). ---
+    int64_t esz = collectionElemSize(recvTy);
+    llvm::Type* elemTy = i32();
+    if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+        if (auto* et = lowerTypeRef(recvTy->genericArgs[0])) elemTy = et;
+
+    // --- Read current value (bz_array_get). ---
+    llvm::AllocaInst* getSlot = entryAlloca(elemTy);
+    auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                           {ptrTy(), i64(), ptrTy(), i64()});
+    builder_.CreateCall(getFn, {recv, idx, getSlot, builder_.getInt64(esz)});
+    llvm::Value* cur = builder_.CreateLoad(elemTy, getSlot, "cic.cur");
+
+    // --- Evaluate RHS and apply the compound operator. ---
+    llvm::Value* rhs = lowerExpr(*as.value);
+    if (!rhs) return false;
+    std::string op(as.op);
+    if (!op.empty() && op.back() == '=') op.pop_back();
+    llvm::Value* newVal = emitCompoundOp(
+        op, cur, rhs, elemTy->isFloatingPointTy(),
+        isUnsignedTargetExpr(*as.target));
+    if (!newVal) return false;
+
+    // --- Lift nullable-value-typed result (mirrors lowerCollectionIndexerSet
+    //     fix #455 / §4.5). ---
+    {
+        const sema::TypeRef* elemTyRef =
+            (recvTy && !recvTy->genericArgs.empty())
+            ? recvTy->genericArgs[0] : nullptr;
+        if (elemTyRef && isNullableValueTy(elemTyRef)) {
+            llvm::StructType* expected = nullableValueStructTy(elemTyRef);
+            if (expected && newVal->getType() != expected) {
+                if (newVal->getType()->isPointerTy())
+                    newVal = nullableValueNull(elemTyRef);
+                else
+                    newVal = wrapNullableValue(elemTyRef, newVal);
+            }
+        }
+    }
+
+    // --- Write back (bz_array_set / bz_array_set_disposing for OwnedArray). ---
+    llvm::AllocaInst* setSlot = entryAlloca(newVal->getType());
+    builder_.CreateStore(newVal, setSlot);
+
+    bool listIfaceOwning = false;
+    if (isListInterfaceName(recvTy, &listIfaceOwning)) { /* already set */ }
+    llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy);
+    if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
+    if (elemDisp) {
+        auto* setFn = declareC("bz_array_set_disposing",
+                               llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+        builder_.CreateCall(setFn,
+                            {recv, idx, setSlot, builder_.getInt64(esz), elemDisp});
+    } else {
+        auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(setFn, {recv, idx, setSlot, builder_.getInt64(esz)});
+    }
+    return true;
+}
+
+
 const ast::Expr* Emitter::computedGetterOf(sema::Symbol* sym) {
     auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
     if (!ps || ps->isIndexer) return nullptr;

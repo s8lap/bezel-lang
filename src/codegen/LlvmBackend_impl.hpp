@@ -1271,6 +1271,14 @@ private:
     // target); false to let the caller fall through to other paths.
     bool lowerIndexerCompound(const ast::AssignmentStmt& as);
 
+    // fix #508 / stdlib §4.4 / §4.5 / §17.15: compound assignment `arr[i] OP= v`
+    // on a HEAP-collection Array<T> / OwnedArray<T> indexer. Evaluates receiver and
+    // index ONCE, reads via bz_array_get, applies OP, writes back via bz_array_set
+    // (or bz_array_set_disposing for OwnedArray). Returns true if handled; false if
+    // the target is not an array-backed heap collection (user-defined indexer,
+    // inline array, dict — those have other paths or are handled elsewhere).
+    bool lowerCollectionIndexerCompound(const ast::AssignmentStmt& as);
+
     // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer read
     // `a[i]` / `dict[key]` against the runtime backing (bz_array_* / bz_dict_*).
     // Returns the loaded element/value, or null if `ix`'s target is not a
