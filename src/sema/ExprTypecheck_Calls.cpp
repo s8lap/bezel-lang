@@ -686,11 +686,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // return-type checks, assignability) consults.  Typing is
                 // unconditional on receiver kind: GetType is valid on classes,
                 // records, enums, primitives (boxed per §8.2), and Object.
+                //
+                // #511: emit the "not yet implemented" diagnostic HERE in sema
+                // (not only in codegen) so that chained uses such as
+                // `obj.GetType().Name` fire the error unconditionally regardless
+                // of context.  The expression is still TYPED as `Type` so that
+                // no secondary "untyped expression" cascades are emitted and the
+                // future-implementation path (System.Reflection §11) is preserved.
                 if (m == "GetType" && ce.args.empty()) {
                     auto* typeTy = ctx_.makeTypeRef();
                     typeTy->kind = TypeRef::Kind::Named;
                     typeTy->declaration = builtinClassSym("Type");
                     ctx_.setExprType(&ce, typeTy);
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "reflection is not yet implemented: 'GetType()' "
+                        "(§8.2, #487); deferred pending System.Reflection §11");
                     return;
                 }
                 // stdlib §5: build a lazy IEnumerable<T> result type for a

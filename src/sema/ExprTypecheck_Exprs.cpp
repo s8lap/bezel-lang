@@ -591,12 +591,22 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // no user TypeDecl). The sema type of a TypeOfExpr is a Named TypeRef
     // backed by a builtinClassSym("Type") declaration. This prevents codegen
     // from seeing an untyped expression and emitting silent garbage (#487).
+    //
+    // #511: emit the "not yet implemented" diagnostic HERE in sema so that
+    // chained uses such as `typeof(T).Name` fire the error unconditionally
+    // regardless of context.  The expression is still TYPED as `Type` so that
+    // no secondary "untyped expression" cascades are emitted and the
+    // future-implementation path (System.Reflection §11) is preserved.
     if (auto* to = dynamic_cast<const ast::TypeOfExpr*>(&e)) {
         (void)to; // the queriedType is already resolved by TypeResolution
         auto* typeTy = ctx_.makeTypeRef();
         typeTy->kind = TypeRef::Kind::Named;
         typeTy->declaration = builtinClassSym("Type");
         ctx_.setExprType(&e, typeTy);
+        ctx_.diagnostics().report(
+            Severity::Error, e.span.begin,
+            "reflection is not yet implemented: 'typeof' "
+            "(§17.10, #487); deferred pending System.Reflection §11");
     }
     // §17.9: nameof(QualifiedName) → string. The result is the rightmost
     // identifier of the operand, as a compile-time string constant. No
