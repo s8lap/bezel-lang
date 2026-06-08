@@ -964,6 +964,75 @@ bool Emitter::lowerWhile(const ast::WhileStmt& ws) {
 
 bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     auto* range = dynamic_cast<const ast::RangeExpr*>(fs.iterable.get());
+
+    // fix #499 / §9.8 / §16.5: `for var i in r` where r is a Range-typed
+    // variable (not an inline RangeExpr literal). Load the stored struct and
+    // synthesise the same counted-loop that lowerRangeFor produces for a
+    // literal range — using the struct's start/end/step/flags fields.
+    if (!range && fs.iterable) {
+        auto* iterTy = ctx_.exprType(*fs.iterable);
+        if (!isRangeType(iterTy)) return false;  // not a Range — try other for-handlers
+
+        llvm::Value* rv = lowerExpr(*fs.iterable);
+        if (!rv) return false;
+
+        llvm::Value* lo64 = builder_.CreateExtractValue(rv, {0u}, "rfv.lo");
+        llvm::Value* hi64 = builder_.CreateExtractValue(rv, {1u}, "rfv.hi");
+        llvm::Value* step64 = builder_.CreateExtractValue(rv, {2u}, "rfv.step");
+        llvm::Value* flags8 = builder_.CreateExtractValue(rv, {3u}, "rfv.flg");
+        llvm::Value* incl   = builder_.CreateTrunc(flags8, i1(), "rfv.incl");
+
+        // Truncate to i32 for the loop variable (int Range). This matches the
+        // behavior of the inline-literal path which uses lo->getType() = i32.
+        llvm::Value* lo   = builder_.CreateTrunc(lo64, i32(), "rfv.lo32");
+        llvm::Value* hi   = builder_.CreateTrunc(hi64, i32(), "rfv.hi32");
+        llvm::Value* step = builder_.CreateTrunc(step64, i32(), "rfv.step32");
+
+        // Determine direction from step sign (use the i32 form).
+        bool descending = false;
+        if (auto* cs = llvm::dyn_cast<llvm::ConstantInt>(step))
+            descending = cs->getValue().isNegative();
+
+        llvm::AllocaInst* slot = entryAlloca(i32());
+        locals_[&fs] = slot;
+        builder_.CreateStore(lo, slot);
+
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "rfv.cond", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rfv.body", currentFn_);
+        auto* incBB  = llvm::BasicBlock::Create(llvm_, "rfv.inc",  currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "rfv.end",  currentFn_);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* cur = builder_.CreateLoad(i32(), slot);
+        // Direction-aware bound check using the incl flag from the struct.
+        llvm::Value* cond;
+        if (descending) {
+            llvm::Value* geLE = builder_.CreateICmpSGE(cur, hi);
+            llvm::Value* geLT = builder_.CreateICmpSGT(cur, hi);
+            cond = builder_.CreateSelect(incl, geLE, geLT, "rfv.cond");
+        } else {
+            llvm::Value* leLE = builder_.CreateICmpSLE(cur, hi);
+            llvm::Value* leLT = builder_.CreateICmpSLT(cur, hi);
+            cond = builder_.CreateSelect(incl, leLE, leLT, "rfv.cond");
+        }
+        builder_.CreateCondBr(cond, bodyBB, endBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+        bool term = lowerScopedBlock(fs.body);
+        loopStack_.pop_back();
+        if (!term) builder_.CreateBr(incBB);
+
+        builder_.SetInsertPoint(incBB);
+        llvm::Value* v = builder_.CreateLoad(i32(), slot);
+        builder_.CreateStore(builder_.CreateAdd(v, step), slot);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(endBB);
+        return true;
+    }
+
     if (!range || !range->lo || !range->hi) return false;
     llvm::Value* lo = lowerExpr(*range->lo);
     llvm::Value* hi = lowerExpr(*range->hi);

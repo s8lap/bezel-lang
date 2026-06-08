@@ -290,6 +290,15 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                  rt->declaration->name == "TimeSpan")) {
                 return i64();
             }
+            // fix #499 / §9.8: Range<T> is a compiler-intrinsic value-type
+            // record. Lower it to { i64 start, i64 end, i64 step, i8 flags }
+            // where flags bit 0 = IsEndInclusive (1 = `..`, 0 = `..<`).
+            // Using i64 for start/end (independent of T's width) keeps the
+            // struct layout uniform across Range<int>/Range<long>/etc.
+            if (rt->declaration && !rt->declaration->decl &&
+                rt->declaration->name == "Range") {
+                return rangeStructType();
+            }
             // §3 stdlib: collection and IO built-in classes (no user TypeDecl).
             // All are heap-allocated opaque pointers to runtime structs.
             // per stdlib §2.6: Guid is a 128-bit value type — { i64 lo, i64 hi }.
