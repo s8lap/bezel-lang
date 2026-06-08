@@ -445,6 +445,44 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         rt = substituteMemberType(rt, ma->target.get(),
                                                   ms->parent);
                 }
+                // per §14.1/§14.2 (issue #509): EXPLICIT method-level type
+                // arguments supplied at the call site (e.g. `Identity<int>(v)`
+                // or `Pass<Box>(b)` with `where T: class`) override the
+                // inferred-from-argument path below.  When the callee
+                // MemberAccessExpr carries non-empty typeArgs (populated by the
+                // parser's generic-arg disambiguation), build the
+                // generic-param → concrete-TypeRef map from those explicit args
+                // in declaration order, then substitute the return type.
+                if (!md->genericParams.empty() &&
+                    rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    rt->astNode->name->parts.size() == 1) {
+                    if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce.callee.get())) {
+                        if (!callMa->typeArgs.empty()) {
+                            // Build the explicit substitution map:
+                            // md->genericParams[i].name → resolved TypeRef for
+                            // callMa->typeArgs[i].
+                            std::unordered_map<std::string_view, TypeRef*>
+                                explicitSubst;
+                            for (std::size_t gi = 0;
+                                 gi < md->genericParams.size() &&
+                                 gi < callMa->typeArgs.size(); ++gi) {
+                                if (!callMa->typeArgs[gi]) continue;
+                                TypeRef* concreteArg =
+                                    ctx_.resolvedType(*callMa->typeArgs[gi]);
+                                if (concreteArg)
+                                    explicitSubst[md->genericParams[gi].name] =
+                                        concreteArg;
+                            }
+                            // Substitute the return-type param name.
+                            std::string_view retParamName =
+                                rt->astNode->name->parts[0];
+                            auto it = explicitSubst.find(retParamName);
+                            if (it != explicitSubst.end()) rt = it->second;
+                        }
+                    }
+                }
                 // per §14.1/§14.2 (issue #504): a GENERIC METHOD (its own
                 // `<T>` params on a non-generic parent, e.g. `static method
                 // Identity<T>(v:T):T` on plain `Wrapper`) whose declared
@@ -460,6 +498,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // one of those params, substitute it. This lets chained
                 // access `Identity(r).x` resolve `.x` against the concrete
                 // record type rather than the unresolvable bare `T`.
+                // (The #509 explicit-typeArgs path above takes priority; this
+                // path only runs when typeArgs is empty — i.e., type inference
+                // from arguments is needed.)
                 if (!md->genericParams.empty() &&
                     rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&

@@ -144,6 +144,14 @@ private:
     // returns true iff a `=>` follows. Used to distinguish
     // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.
     bool tokensLookLikeLambda(std::size_t startK);
+    // per §14.1: disambiguates `Method<T>(…)` (method-level type args) from
+    // `expr < T > (expr)` (relational comparison chain). peekAt(0) is the `<`
+    // token. Returns true iff the `<` starts a generic-arg list that closes
+    // with `>` followed immediately by `(` — the only context in which the
+    // programmer writes explicit method type args. Uses bounded lookahead;
+    // bails out (returns false) on EOF or on tokens that cannot appear inside
+    // a type-argument list.
+    bool tokensLookLikeMethodTypeArgs();
     // Slice 11: a single statement. Dispatches on the first token: `var` /
     // `using` for LocalDecl, `return` for ReturnStmt, otherwise an
     // expression that may be the start of an AssignmentStmt or an

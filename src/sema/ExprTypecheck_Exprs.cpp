@@ -973,19 +973,18 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         // Awaiting any other task shape (async-iterator MoveNextAsync, etc.)
         // is typed elsewhere — see the deferral note below.
         TypeRef* ot = ue.operand ? ctx_.exprType(*ue.operand) : nullptr;
-        // §30.2 / Appendix C.7 (#444): `await` requires a Task / Task<T> /
-        // OwnedTask<T> operand. When the operand's type is known and is NOT
-        // one of those three forms, reject it with a clean diagnostic rather
-        // than silently miscompiling. The most common trigger is a call-site
-        // generic type argument such as `Task.FromResult<int>(42)`, which the
-        // parser (per §A.7 — no call-site generic syntax) misparsed as a
-        // chained comparison `(Task.FromResult < int) > (42)` producing a bool,
-        // making the `await` operand bool-typed (i1) — a type the codegen
-        // cannot lower, causing a SIGSEGV crash (#444). A clean error here
-        // converts the crash into a diagnostic. Note: `await for` desugaring
-        // passes Task<bool> through this path, which IS a Named Task type and
-        // so is NOT flagged; similarly, any unresolved / unknown type (ot ==
-        // nullptr) is left undiagnosed to avoid false positives.
+        // §30.2 / Appendix C.7 (#444 / #509): `await` requires a Task /
+        // Task<T> / OwnedTask<T> operand. When the operand's type is known and
+        // is NOT one of those three forms, reject it with a clean diagnostic
+        // rather than silently miscompiling.
+        // NOTE: as of #509, the parser correctly handles `Method<T>(…)` as an
+        // explicit-type-arg call (§14.1) so `Task.FromResult<int>(42)` now
+        // resolves to `Task<int>` and passes through this guard normally.
+        // The guard remains for other non-Task operands (plain integer literals,
+        // arbitrary bool expressions, etc.).  `await for` desugaring passes
+        // Task<bool> through this path, which IS a Named Task type and is NOT
+        // flagged; any unresolved / unknown type (ot == nullptr) is left
+        // undiagnosed to avoid false positives.
         if (ot) {
             bool isTaskType = false;
             if (ot->kind == TypeRef::Kind::Named && !ot->nullable &&
@@ -998,10 +997,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 ctx_.diagnostics().report(
                     Severity::Error, ue.span.begin,
                     "`await` requires a `Task`, `Task<T>`, or `OwnedTask<T>` "
-                    "operand (§30.2 / §30.3). If you wrote `Method<T>(args)`, "
-                    "call-site generic type arguments are not supported — the "
-                    "compiler infers type arguments (§A.7); write "
-                    "`Method(args)` instead.");
+                    "operand (§30.2 / §30.3).");
                 return;
             }
         }
