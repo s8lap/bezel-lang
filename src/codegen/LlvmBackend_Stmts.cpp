@@ -121,6 +121,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // the write). The getter and setter are called with the receiver
                 // and index evaluated exactly once.
                 if (lowerIndexerCompound(*as)) return false;
+                // fix #508 / §4.4 / §4.5 / §17.15: heap-collection Array<T>
+                // compound assignment `arr[i] OP= v`. Must come after
+                // lowerIndexerCompound (user-defined indexer) and before the
+                // lvalueAddr fallback (which returns null for a bz_array_t*
+                // receiver, causing the write to be silently dropped). Evaluates
+                // receiver and index once; reads via bz_array_get, applies OP,
+                // writes back via bz_array_set / bz_array_set_disposing.
+                if (lowerCollectionIndexerCompound(*as)) return false;
             }
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = lvalueAddr(*as->target, elemTy);
