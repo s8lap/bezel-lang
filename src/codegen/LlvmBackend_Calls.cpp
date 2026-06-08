@@ -5516,6 +5516,54 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
                 using K = sema::TypeRef::Kind;
                 using P = sema::PrimitiveType;
+                // per §14.1 / §8.5 (issue #515): inside a generic method body
+                // that has been monomorphized to a value type (e.g. U=int),
+                // the receiver `v` has sema type `U` (Named, no declaration).
+                // sema sets no MethodSymbol for `v.ToString()` (the notnull
+                // constraint provides no type-surface member lookup). Without
+                // this guard the call falls through and returns nullptr →
+                // emitReturn emits `ret ptr null` for the string return →
+                // SIGSEGV at runtime on first dereference. Fix: resolve the
+                // receiver's type-param name through genericSubstSemaTy_; if
+                // the concrete bound type is a primitive, lower the receiver
+                // as that primitive and call emitPrimitiveToString directly —
+                // the same path `(42).ToString()` takes in lowerExpr.
+                if (!genericSubstSemaTy_.empty() &&
+                    recvTy && recvTy->kind == K::Named &&
+                    !recvTy->declaration &&
+                    recvTy->astNode && recvTy->astNode->name &&
+                    recvTy->astNode->name->parts.size() == 1) {
+                    std::string_view paramName =
+                        recvTy->astNode->name->parts[0];
+                    auto sit = genericSubstSemaTy_.find(paramName);
+                    if (sit != genericSubstSemaTy_.end() && sit->second) {
+                        const sema::TypeRef* concreteTy = sit->second;
+                        if (concreteTy->kind == K::Primitive &&
+                            concreteTy->primitive != P::Object &&
+                            concreteTy->primitive != P::None) {
+                            // Value type (int/bool/double/…): use the
+                            // primitive ToString path.
+                            llvm::Value* recv = lowerExpr(*ma->target);
+                            if (recv)
+                                return emitPrimitiveToString(
+                                    recv, concreteTy->primitive);
+                        } else if (concreteTy->kind == K::Named &&
+                                   concreteTy->declaration &&
+                                   (concreteTy->declaration->kind ==
+                                        ast::TypeDeclKind::Class ||
+                                    concreteTy->declaration->kind ==
+                                        ast::TypeDeclKind::Interface)) {
+                            // Reference type (class / interface): dispatch
+                            // through the uniform vtable ToString slot —
+                            // same path as `o: Object` / `o: IFoo`.
+                            llvm::Value* recv = lowerExpr(*ma->target);
+                            if (recv) {
+                                if (llvm::Value* r = lowerObjectToString(recv))
+                                    return r;
+                            }
+                        }
+                    }
+                }
                 bool isObjectRecv =
                     recvTy && recvTy->kind == K::Primitive &&
                     recvTy->primitive == P::Object;
@@ -5922,6 +5970,33 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             break;
                         }
                     }
+                    // per §14.1 (issue #516): a generic method with U appearing
+                    // ONLY in the lambda's return type (e.g. `Apply<U>(x:int,
+                    // fn:(int)->U):U`) may leave U unbound after the non-lambda
+                    // arg loop above — no concrete arg has declared type exactly
+                    // `U`. If the call site supplies explicit type arguments
+                    // (`Apply<string>(...)`), those explicit args settle the
+                    // substitution. Seed from the MemberAccessExpr's typeArgs
+                    // before buildOrderedArgs runs so lowerLambda resolves
+                    // lowerTypeRef(U) correctly when lowering the lambda return.
+                    if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                            call.callee.get())) {
+                        for (std::size_t gi = 0;
+                             gi < md->genericParams.size() &&
+                             gi < callMa->typeArgs.size(); ++gi) {
+                            std::string_view pname = md->genericParams[gi].name;
+                            if (preSubst.count(pname)) continue;
+                            if (!callMa->typeArgs[gi]) continue;
+                            sema::TypeRef* concreteArg =
+                                ctx_.resolvedType(*callMa->typeArgs[gi]);
+                            if (!concreteArg) continue;
+                            llvm::Type* lt = lowerTypeRef(concreteArg);
+                            if (lt != i32()) {
+                                preSubst[pname] = lt;
+                                preSema[pname] = concreteArg;
+                            }
+                        }
+                    }
                     if (preSubst != genericSubst_) {
                         preSavedSubst = genericSubst_;
                         preSavedSema  = genericSubstSemaTy_;
@@ -6057,6 +6132,32 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     newSubst[gp.name] = lowerTypeRef(at);
                     newSema[gp.name] = at;
                     break;
+                }
+            }
+            // per §14.1 (issues #515/#516): a generic method whose type param
+            // appears ONLY in lambda param/return positions (not in any
+            // non-lambda param's declared type) leaves the param unbound by
+            // the arg-inference loop above. When the call site supplies
+            // explicit type arguments (`Transform<int>`), use them to bind
+            // any still-unbound method generic params before the body is
+            // emitted. This complements the pre-pass (which seeds the binding
+            // for lowerLambda) and ensures the MAIN substitution (which drives
+            // emitInlineGenericMethod / emitGenericSpecialization) also has
+            // the correct binding, so that body-level dispatch (v.ToString()
+            // on a U-typed receiver) resolves via genericSubstSemaTy_.
+            if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get())) {
+                for (std::size_t gi = 0;
+                     gi < md->genericParams.size() &&
+                     gi < callMa->typeArgs.size(); ++gi) {
+                    std::string_view pname = md->genericParams[gi].name;
+                    if (newSubst.count(pname)) continue;
+                    if (!callMa->typeArgs[gi]) continue;
+                    sema::TypeRef* concreteArg =
+                        ctx_.resolvedType(*callMa->typeArgs[gi]);
+                    if (!concreteArg) continue;
+                    newSubst[pname] = lowerTypeRef(concreteArg);
+                    newSema[pname] = concreteArg;
                 }
             }
             genericSubst_ = std::move(newSubst);
@@ -6322,6 +6423,28 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 llvm::Type* concrRetTy = retTy
                     ? lowerTypeRef(retTy) : declRetTy;
                 if (concrRetTy != declRetTy) typesMismatch = true;
+            }
+            // per §14.1 (issue #515): a generic METHOD (with method-level
+            // `<U>` params — distinct from class-level generic params handled
+            // by the parentIsGeneric block above) has a compiled template body
+            // that used the i32 placeholder for every type param. Method calls
+            // on a type-param receiver in the template body (e.g.
+            // `v.ToString()` where v:U) return null — the template body is a
+            // correct TYPE-SAFE stub but semantically wrong: it returns null
+            // when the body needs a real method dispatch. Even when the
+            // template's function signature matches the concrete call's arg
+            // types (e.g. both U=int and the template both use i32), the body
+            // logic is wrong. Force specialization so the monomorphized body
+            // is emitted with the active genericSubst_ and can correctly
+            // dispatch any Object methods on the concrete type.
+            if (!typesMismatch && !md->genericParams.empty()) {
+                // At least one of the method's type params is bound in the
+                // current substitution — force specialization.
+                for (const auto& gp : md->genericParams) {
+                    if (genericSubst_.count(gp.name)) {
+                        typesMismatch = true; break;
+                    }
+                }
             }
         }
         if (typesMismatch) {
