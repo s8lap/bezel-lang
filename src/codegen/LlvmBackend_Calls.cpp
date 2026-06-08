@@ -5393,6 +5393,44 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
+        // issue #494 / §29.2 / §29.3: explicit `e.MoveNext()` call where `e` is
+        // typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
+        // TypeDecl, hence no MethodSymbol for MoveNext). The iterator state
+        // struct's vtable layout is [0]=td, [1]=Dispose, [2]=MoveNext(→i1),
+        // [3]=Current(→T) — the same layout emitted by emitIteratorMethod.
+        // Dispatch directly through vtable slot 2, returning i1 (bool), so that
+        // an inferred-var slot `var moved := e.MoveNext()` is typed i1 and a
+        // subsequent `if moved then` produces valid IR (not `br i32`).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "MoveNext" && ma->target && call.args.empty()) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                bool isBuiltinEnumerator =
+                    recvTy &&
+                    recvTy->kind == sema::TypeRef::Kind::Named &&
+                    !recvTy->declaration &&
+                    recvTy->astNode && recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    (recvTy->astNode->name->parts[0] == "IEnumerator" ||
+                     recvTy->astNode->name->parts[0] == "OwnedEnumerator");
+                if (isBuiltinEnumerator) {
+                    llvm::Value* recv = lowerExpr(*ma->target);
+                    if (recv && recv->getType()->isPointerTy()) {
+                        llvm::Value* vtable = builder_.CreateLoad(ptrTy(), recv);
+                        auto* moveNextTy =
+                            llvm::FunctionType::get(i1(), {ptrTy()}, false);
+                        llvm::Value* mnSlotPtr = builder_.CreateGEP(
+                            ptrTy(), vtable, {builder_.getInt32(2)});
+                        llvm::Value* mnFnPtr =
+                            builder_.CreateLoad(ptrTy(), mnSlotPtr);
+                        llvm::Value* r = builder_.CreateCall(
+                            moveNextTy, mnFnPtr, {recv}, "mn");
+                        emitPendingCheck();  // CG20: callee may have thrown
+                        return r;
+                    }
+                }
+            }
+        }
         // CG13/CG18: explicit `obj.Dispose()` call where Dispose is a
         // compiler-generated method (no MethodSymbol in sema). Emit a
         // dynamic vtable dispatch to the object's Dispose function (slot 1).
