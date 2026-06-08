@@ -176,9 +176,10 @@ public:
         // verifier-clean. The verifier therefore runs unconditionally in
         // ASSERT builds (!NDEBUG) — early detection of any future malformed-IR
         // regression — and remains opt-in via BEZEL_VERIFY_IR in release builds.
-        // It stays NON-FATAL (report-and-continue): a not-yet-exercised program
-        // shape that trips it should print a diagnostic, not hard-fail the
-        // build/JIT, until that case too is fixed.
+        // It stays NON-FATAL here (report-and-continue): the JIT test path uses
+        // emitModule directly and is more lenient than the AOT file-emission
+        // path. The AOT boundary (emitObjectFile) runs the verifier independently
+        // and returns false on failure, so the driver exits non-zero (#506).
 #ifndef NDEBUG
         bool wantVerify = true;
 #else
