@@ -87,17 +87,21 @@ BEZEL_TEST(codegen_cg24, float_double_mixed_arithmetic) {
                         "return (1 if f + d = 3.5 else 0);"), 1);
 }
 
-// §6.3 (IEEE 754): `<>` is the negation of `=`, so `NaN <> NaN` is true
-// (an unordered not-equal), while `NaN = NaN` is false. Non-NaN operands
-// are unaffected.
-BEZEL_TEST(codegen_cg24, nan_inequality_is_true) {
+// §4.3.1 (L308/L314): "NaN = NaN is true" — reflexive equality, deliberate
+// (needed for Set<double>/Dictionary key semantics, and `case` expressions).
+// `<>` is the negation of `=`, so `NaN <> NaN` is false.
+// IEEE <,<=,>,>= comparisons on NaN remain false (unchanged).
+// These tests were updated from the pre-fix expected values when #514 was fixed.
+BEZEL_TEST(codegen_cg24, nan_equality_is_true_spec_4_3_1) {
+    // §4.3.1: NaN = NaN must be true (reflexive equality).
     BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; "
-                        "return (1 if nan <> nan else 0);"), 1);
+                        "return (1 if nan = nan else 0);"), 1);
 }
 
-BEZEL_TEST(codegen_cg24, nan_equality_is_false) {
+BEZEL_TEST(codegen_cg24, nan_inequality_is_false_spec_4_3_1) {
+    // §4.3.1: NaN <> NaN is false (negation of `=` which is true).
     BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; "
-                        "return (1 if nan = nan else 0);"), 0);
+                        "return (1 if nan <> nan else 0);"), 0);
 }
 
 BEZEL_TEST(codegen_cg24, non_nan_inequality_unchanged) {
@@ -138,9 +142,10 @@ BEZEL_TEST(codegen_cg24, float_record_inequality) {
 }
 
 // §3.4: static properties on primitive type names.
-BEZEL_TEST(codegen_cg24, double_nan_is_not_equal_to_itself) {
-    // IEEE 754: NaN != NaN.
-    BEZEL_EXPECT_EQ(run("var x := double.NaN; return (1 if x = x else 0);"), 0);
+// §4.3.1: NaN = NaN is true (reflexive equality) — test updated from
+// the pre-#514-fix value (was 0 per IEEE) to 1 per spec §4.3.1 (L308).
+BEZEL_TEST(codegen_cg24, double_nan_equals_itself_reflexive_spec_4_3_1) {
+    BEZEL_EXPECT_EQ(run("var x := double.NaN; return (1 if x = x else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg24, double_positive_infinity_greater_than_zero) {
