@@ -113,6 +113,8 @@ void hashParam(std::uint64_t& h, const MetaParam& p) {
     hashStr(h, p.defaultText);
 }
 
+void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty);  // fwd
+
 void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashByte(h, static_cast<std::uint8_t>(m.kind));
     hashStr(h, m.name);
@@ -129,6 +131,25 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashBool(h, m.hasEnumValue);
     hashU64(h, static_cast<std::uint64_t>(m.enumValue));
     hashStr(h, m.valueText);  // §22.12 const value (issue #328 FINDING [3] BUG A)
+    // §11.3 (issue #502): hash nested type when present.
+    hashBool(h, m.nestedType != nullptr);
+    if (m.nestedType) hashTypeDecl(h, *m.nestedType);
+}
+
+void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
+    hashStr(h, ty.name);
+    hashByte(h, static_cast<std::uint8_t>(ty.kind));
+    hashByte(h, static_cast<std::uint8_t>(ty.visibility));
+    hashU64(h, ty.modifiers.size());
+    for (const std::string& s : ty.modifiers) hashStr(h, s);
+    hashU64(h, ty.genericParams.size());
+    for (const MetaGenericParam& g : ty.genericParams) hashGeneric(h, g);
+    hashU64(h, ty.baseTypes.size());
+    for (const MetaType& b : ty.baseTypes) hashType(h, b);
+    hashU64(h, ty.members.size());
+    for (const MetaMember& m : ty.members) hashMember(h, m);
+    // §9.2 (issue #501): include the positional-record flag.
+    hashBool(h, ty.hasPositionalFields);
 }
 
 } // namespace
@@ -144,17 +165,7 @@ std::uint64_t semanticHash(const ModuleMetadata& md) {
     for (const std::string& e : md.exports) hashStr(h, e);
     hashU64(h, md.types.size());
     for (const MetaTypeDecl& ty : md.types) {
-        hashStr(h, ty.name);
-        hashByte(h, static_cast<std::uint8_t>(ty.kind));
-        hashByte(h, static_cast<std::uint8_t>(ty.visibility));
-        hashU64(h, ty.modifiers.size());
-        for (const std::string& s : ty.modifiers) hashStr(h, s);
-        hashU64(h, ty.genericParams.size());
-        for (const MetaGenericParam& g : ty.genericParams) hashGeneric(h, g);
-        hashU64(h, ty.baseTypes.size());
-        for (const MetaType& b : ty.baseTypes) hashType(h, b);
-        hashU64(h, ty.members.size());
-        for (const MetaMember& m : ty.members) hashMember(h, m);
+        hashTypeDecl(h, ty);
     }
     hashU64(h, md.functions.size());
     for (const MetaFunction& fn : md.functions) {
@@ -202,19 +213,51 @@ bool MetaParam::operator==(const MetaParam& o) const {
            hasDefault == o.hasDefault && defaultText == o.defaultText;
 }
 
+// §11.3 / §9.2 (issue #501 / #502): MetaMember copy — needed because
+// MetaMember is move-only by default (unique_ptr member) but equality tests
+// and the deserializer need value copies (readMemberBody pushes into a
+// pre-sized vector via assignment, not emplacement).
+MetaMember::MetaMember(const MetaMember& o)
+    : kind(o.kind), name(o.name), visibility(o.visibility),
+      modifiers(o.modifiers), type(o.type), valueText(o.valueText),
+      genericParams(o.genericParams), params(o.params),
+      isOperator(o.isOperator), returnOwned(o.returnOwned),
+      hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
+    if (o.nestedType)
+        nestedType = std::make_unique<MetaTypeDecl>(*o.nestedType);
+}
+
+MetaMember& MetaMember::operator=(const MetaMember& o) {
+    if (this != &o) {
+        kind = o.kind; name = o.name; visibility = o.visibility;
+        modifiers = o.modifiers; type = o.type; valueText = o.valueText;
+        genericParams = o.genericParams; params = o.params;
+        isOperator = o.isOperator; returnOwned = o.returnOwned;
+        hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
+        nestedType = o.nestedType
+            ? std::make_unique<MetaTypeDecl>(*o.nestedType)
+            : nullptr;
+    }
+    return *this;
+}
+
 bool MetaMember::operator==(const MetaMember& o) const {
+    // Compare nestedType (both null, or both non-null with equal content).
+    bool nestedEq = (!nestedType && !o.nestedType) ||
+        (nestedType && o.nestedType && *nestedType == *o.nestedType);
     return kind == o.kind && name == o.name && visibility == o.visibility &&
            modifiers == o.modifiers && type == o.type &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
-           valueText == o.valueText;
+           valueText == o.valueText && nestedEq;
 }
 
 bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
     return name == o.name && kind == o.kind && visibility == o.visibility &&
            modifiers == o.modifiers && genericParams == o.genericParams &&
-           baseTypes == o.baseTypes && members == o.members;
+           baseTypes == o.baseTypes && members == o.members &&
+           hasPositionalFields == o.hasPositionalFields;
 }
 
 bool MetaFunction::operator==(const MetaFunction& o) const {
@@ -300,6 +343,10 @@ void emitParam(llvm::BitstreamWriter& w, const MetaParam& p) {
     w.ExitBlock();
 }
 
+// Forward declarations for mutual recursion (MetaMember ↔ MetaTypeDecl).
+void emitMember(llvm::BitstreamWriter& w, const MetaMember& m);  // fwd
+void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty);  // fwd
+
 void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     w.EnterSubblock(MEMBER_BLOCK, 4);
     llvm::SmallVector<std::uint64_t, 8> sc{
@@ -322,17 +369,28 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // REC_STRING after the params. A v1 reader skips it (skip-unknown); a v2
     // reader reads it tolerantly and an absent record yields "" (a v1 blob).
     emitString(w, m.valueText);
+    // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
+    // type's full declaration as an embedded TYPE_BLOCK. The trailing
+    // finishBlockImpl in readMemberBody skips it for v3 readers (they never
+    // see v4 blobs due to the version check). For v4 readers with kind !=
+    // NestedType the block is absent; readMemberBody ignores it.
+    if (m.kind == MetaMemberKind::NestedType && m.nestedType)
+        emitTypeDecl(w, *m.nestedType);
     w.ExitBlock();
 }
 
 void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     w.EnterSubblock(TYPE_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 5> sc{
+    // §9.2 (schema v4, issue #501): add hasPositionalFields as the 6th scalar.
+    // v3 readers reject v4 blobs so they never see this; v4 readers tolerate
+    // a v3 blob where sc.size() == 5 (hasPositionalFields treated as false).
+    llvm::SmallVector<std::uint64_t, 6> sc{
         static_cast<std::uint64_t>(ty.kind),
         static_cast<std::uint64_t>(ty.visibility),
         ty.genericParams.size(),
         ty.baseTypes.size(),
         ty.members.size(),
+        ty.hasPositionalFields ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, ty.name);
@@ -671,6 +729,11 @@ bool readParam(Reader& r, MetaParam& p) {
     return readParamBody(r, p);
 }
 
+// Forward declarations for mutual recursion (readMemberBody ↔ readTypeDeclBody).
+bool readMember(Reader& r, MetaMember& m);
+bool readTypeDecl(Reader& r, MetaTypeDecl& ty);
+bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty);
+
 bool readMemberBody(Reader& r, MetaMember& m) {
     llvm::SmallVector<std::uint64_t, 8> sc;
     if (!expectScalars(r, sc) || sc.size() < 8) return false;
@@ -695,6 +758,51 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     }
     // §22.12 const value (schema v2): the optional trailing REC_STRING. Read it
     // tolerantly — a v1 blob has none, so `m.valueText` stays empty.
+    // §11.3 (schema v4, issue #502): for NestedType members, a TYPE_BLOCK
+    // follows the valueText REC_STRING. We scan the trailing content manually
+    // to capture both without leaving the block.
+    if (m.kind == MetaMemberKind::NestedType) {
+        // Scan trailing content: capture the first REC_STRING as valueText,
+        // then enter any TYPE_BLOCK for the nested declaration.
+        bool gotValue = false;
+        bool gotNested = false;
+        while (true) {
+            unsigned id = 0;
+            Next n = nextEntry(r, id);
+            if (n == Next::EndBlock) {
+                r.cursor.ReadBlockEnd();
+                return true;
+            }
+            if (n == Next::Record) {
+                llvm::SmallVector<std::uint64_t, 32> vals;
+                auto got = r.cursor.readRecord(id, vals);
+                if (!got) { llvm::consumeError(got.takeError()); return false; }
+                if (got.get() == REC_STRING && !gotValue) {
+                    m.valueText.clear();
+                    m.valueText.reserve(vals.size());
+                    for (std::uint64_t v : vals)
+                        m.valueText.push_back(static_cast<char>(v & 0xFF));
+                    gotValue = true;
+                }
+                continue;
+            }
+            if (n == Next::SubBlock) {
+                if (id == TYPE_BLOCK && !gotNested) {
+                    // Enter and read the nested type.
+                    m.nestedType = std::make_unique<MetaTypeDecl>();
+                    if (r.cursor.EnterSubBlock(TYPE_BLOCK)) return false;
+                    // readTypeDeclBody reads the content + finishBlock.
+                    if (!readTypeDeclBody(r, *m.nestedType)) return false;
+                    gotNested = true;
+                } else {
+                    if (r.cursor.SkipBlock()) return false;
+                }
+                continue;
+            }
+            return false;  // Error
+        }
+    }
+    // Non-NestedType: use the original tolerant REC_STRING capture path.
     return finishBlockImpl(r, &m.valueText);
 }
 
@@ -704,13 +812,16 @@ bool readMember(Reader& r, MetaMember& m) {
 }
 
 bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
-    llvm::SmallVector<std::uint64_t, 5> sc;
+    llvm::SmallVector<std::uint64_t, 6> sc;
     if (!expectScalars(r, sc) || sc.size() < 5) return false;
     ty.kind = static_cast<MetaTypeDeclKind>(sc[0]);
     ty.visibility = static_cast<MetaVisibility>(sc[1]);
     std::uint64_t nGeneric = sc[2];
     std::uint64_t nBase = sc[3];
     std::uint64_t nMembers = sc[4];
+    // §9.2 (schema v4, issue #501): 6th scalar = hasPositionalFields.
+    // A v3 blob (read by v4 reader) has only 5 scalars → treat as false.
+    if (sc.size() >= 6) ty.hasPositionalFields = sc[5] != 0;
     if (!expectString(r, ty.name)) return false;
     if (!readStringList(r, ty.modifiers)) return false;
     ty.genericParams.resize(nGeneric);

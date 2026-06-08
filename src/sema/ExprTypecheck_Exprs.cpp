@@ -677,9 +677,16 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 !recordHasUserDeclaredEquality(ts)) {
                 // §9.3: skip positional / combined-form records (they get §9.1
                 // positional value equality, not the body-record rule).
-                bool positional = false;
-                if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
-                    positional = td->hasPositionalFields;
+                // For LOCAL records the flag lives on the ast::TypeDecl; for
+                // IMPORTED records (no ast node) it lives on TypeSymbol itself
+                // (set by SymbolCollection and carried in module metadata per
+                // issue #501 fix). Check TypeSymbol::hasPositionalFields first;
+                // if false and a TypeDecl is available, also check there.
+                bool positional = ts->hasPositionalFields;
+                if (!positional) {
+                    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+                        positional = td->hasPositionalFields;
+                }
                 if (!positional) {
                     ctx_.diagnostics().report(
                         Severity::Error, be.span.begin,

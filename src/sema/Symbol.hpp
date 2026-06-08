@@ -87,6 +87,15 @@ struct TypeSymbol : Symbol {
     // local obligation that would otherwise be inferred from kind==Class. Owned
     // builtins (CancellationTokenSource, Array, Dictionary, …) leave this false.
     bool isValueBuiltin = false;
+    // §9.1 / §9.2 (issue #501): true when this TypeSymbol represents a
+    // positional record (a record declared with a `(field...)` positional
+    // parameter list). Carried as a flag on the TypeSymbol so that imported
+    // positional records — which have no ast::TypeDecl (ts->decl is null) —
+    // still pass the §9.2 auto-equality-bearing check in
+    // ExprTypecheck_Exprs.cpp. For LOCAL records the check reads this flag
+    // or falls back to the ast::TypeDecl; for IMPORTED records only this
+    // flag is available.
+    bool hasPositionalFields = false;
 };
 
 // A.2 TypeAliasDecl — its target type is resolved by Type Resolution.
