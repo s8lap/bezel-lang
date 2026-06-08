@@ -156,6 +156,7 @@ set(BEZEL_TEST_SOURCES
     sema/class_destructuring_pattern_test.cpp
     sema/field_iface_property_489_test.cpp
     sema/typeof_gettype_487_test.cpp
+    sema/gettype_chain_511_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     flow/cfg_suspend_test.cpp

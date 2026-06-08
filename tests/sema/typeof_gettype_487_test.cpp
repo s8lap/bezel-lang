@@ -6,22 +6,34 @@
 //   §8.2    v.GetType() → Type        (runtime type of any value)
 //   §8.1    GetType is a universal Object member; every type has it
 //
-// Before this fix, typeof(T) had NO sema handler so its TypeRef was never
+// Before fix #487, typeof(T) had NO sema handler so its TypeRef was never
 // set — the expression was silently untyped.  GetType() was whitelisted as a
 // universal Object member (to suppress a false "no member" diagnostic) but
 // its call return type was also never set.  In both cases codegen received
 // an untyped expression and produced silent garbage / nullptr dereference.
 //
-// After this fix:
+// After fix #487 (typing) + fix #511 (sema diagnostic):
 //   1. typeof(T)     → Named TypeRef for the `Type` builtin class (§17.10)
 //   2. obj.GetType() → Named TypeRef for the `Type` builtin class (§8.2)
-//   3. Codegen emits a clean "not yet implemented" error for both (the
-//      runtime Type-object table is not yet built; deferred to a later
-//      milestone alongside the rest of System.Reflection (stdlib §11)).
-//      The error message contains "typeof" or "GetType" and "not yet
-//      implemented" so tests can match it.
+//   3. Both produce a clean sema-level error diagnostic containing "reflection"
+//      and "not yet implemented".  This is a deliberate promoted-from-codegen
+//      guard: the runtime Type-object table is not yet built (deferred to a
+//      later milestone alongside the rest of System.Reflection §11), and the
+//      diagnostic must fire at the CallExpr/TypeOfExpr itself so that chained
+//      uses (`obj.GetType().Name`, lambdas, generic bodies) all report cleanly
+//      rather than silently compiling, crashing at runtime, or failing with an
+//      LLVM IR verification error.  The expression REMAINS typed as `Type` so
+//      that no secondary "expression has no type" cascades appear and the
+//      future-implementation path is preserved.
 //   4. A normal member call on a class (control case) still compiles and
 //      runs correctly, ruling out over-rejection.
+//
+// Test reconciliation for #511: the SEMA TYPING group and the NO SILENT GARBAGE
+// group previously asserted BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors())
+// because #487 only emitted the error in codegen.  Fix #511 moves the
+// diagnostic to sema, so these tests now correctly assert hasErrors() == true
+// while additionally verifying that the TypeRef is still set to `Type`
+// (proving the typing is preserved despite the error).
 
 #include "sema/ExprTypecheck.hpp"
 #include "sema/Symbol.hpp"
@@ -82,12 +94,24 @@ bool isTypeTypeRef(const bezel::sema::TypeRef* tr) {
     return false;
 }
 
+// True iff any diagnostic message contains the given substring.
+bool anyDiagContains(const bezel::test::SemaResult& r,
+                     std::string_view substr) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find(std::string(substr)) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ===========================================================================
 // SEMA TYPING — these tests verify that sema assigns a Named `Type` TypeRef
 // to the initializer of `var t := typeof(...)`  and  `var t := x.GetType()`.
-// Before the fix, the TypeRef was null (untyped).
+// Before fix #487, the TypeRef was null (untyped).
+// After fix #511, these uses ALSO produce a sema error diagnostic (reflection
+// not yet implemented), so hasErrors() == true; the TypeRef is still `Type`.
 // ===========================================================================
 
 // §17.10: typeof(int) → Type.  Primitive type argument.
@@ -99,9 +123,12 @@ BEZEL_TEST(sema_typeof_gettype_487, typeof_primitive_typed_as_Type_spec_17_10) {
         "    var t := typeof(int); "
         "  end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #511: sema now emits the reflection diagnostic — hasErrors() is true.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "reflection"));
     auto* tr = firstLocalInitType(r);
-    // The initializer's TypeRef must be the `Type` builtin.
+    // The initializer's TypeRef must still be the `Type` builtin (typing
+    // is preserved despite the error so no secondary cascades appear).
     BEZEL_EXPECT_TRUE(isTypeTypeRef(tr));
 }
 
@@ -114,7 +141,8 @@ BEZEL_TEST(sema_typeof_gettype_487, typeof_string_typed_as_Type_spec_17_10) {
         "    var t := typeof(string); "
         "  end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "reflection"));
     auto* tr = firstLocalInitType(r);
     BEZEL_EXPECT_TRUE(isTypeTypeRef(tr));
 }
@@ -129,7 +157,8 @@ BEZEL_TEST(sema_typeof_gettype_487, typeof_user_class_typed_as_Type_spec_17_10) 
         "    var t := typeof(BankAccount); "
         "  end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "reflection"));
     auto* tr = firstLocalInitType(r);
     BEZEL_EXPECT_TRUE(isTypeTypeRef(tr));
 }
@@ -144,7 +173,8 @@ BEZEL_TEST(sema_typeof_gettype_487, gettype_on_class_typed_as_Type_spec_8_2) {
         "    var t := w.GetType(); "
         "  end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "reflection"));
     auto* tr = firstLocalInitType(r);
     BEZEL_EXPECT_TRUE(isTypeTypeRef(tr));
 }
@@ -158,7 +188,8 @@ BEZEL_TEST(sema_typeof_gettype_487, gettype_on_this_typed_as_Type_spec_8_2) {
         "    var t := this.GetType(); "
         "  end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "reflection"));
     auto* tr = firstLocalInitType(r);
     BEZEL_EXPECT_TRUE(isTypeTypeRef(tr));
 }
@@ -173,16 +204,17 @@ BEZEL_TEST(sema_typeof_gettype_487, gettype_on_record_typed_as_Type_spec_8_2) {
         "    var t := p.GetType(); "
         "  end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "reflection"));
     auto* tr = firstLocalInitType(r);
     BEZEL_EXPECT_TRUE(isTypeTypeRef(tr));
 }
 
 // ===========================================================================
 // NO SILENT GARBAGE — typeof(T) and GetType() must never be silently untyped.
-// Before the fix, `r.ctx->exprType(*init)` returned null, meaning codegen
+// Before fix #487, `r.ctx->exprType(*init)` returned null, meaning codegen
 // would see an untyped expr and emit garbage (or nullptr-deref / crash).
-// These tests confirm the TypeRef is non-null after the fix.
+// After fix #511 the diagnostic is in sema; the TypeRef is still non-null.
 // ===========================================================================
 
 // typeof(bool) TypeRef must be non-null (no silent garbage/crash path).
@@ -194,10 +226,13 @@ BEZEL_TEST(sema_typeof_gettype_487, typeof_not_silently_untyped_spec_17_10) {
         "    var t := typeof(bool); "
         "  end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #511: sema diagnostic fires — hasErrors() is now true.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "not yet implemented"));
     auto* tr = firstLocalInitType(r);
-    // Key invariant: the TypeRef is NOT null — before the fix it was null,
-    // causing codegen to emit a garbage value or crash.
+    // Key invariant: the TypeRef is NOT null — before fix #487 it was null,
+    // causing codegen to emit a garbage value or crash.  After #511 it is
+    // still set so no secondary "untyped expression" cascades appear.
     BEZEL_EXPECT_TRUE(tr != nullptr);
 }
 
@@ -211,7 +246,9 @@ BEZEL_TEST(sema_typeof_gettype_487, gettype_not_silently_untyped_spec_8_2) {
         "    var t := a.GetType(); "
         "  end M; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #511: sema diagnostic fires — hasErrors() is now true.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "not yet implemented"));
     auto* tr = firstLocalInitType(r);
     BEZEL_EXPECT_TRUE(tr != nullptr);
 }
