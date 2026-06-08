@@ -1561,12 +1561,24 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
 bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
     auto* iterTy = ctx_.exprType(*fs.iterable);
-    if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named ||
-        iterTy->declaration || !iterTy->astNode || !iterTy->astNode->name ||
-        iterTy->astNode->name->parts.empty())
+    if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
+    // §2.5 / §29.3 (issue #495): for a LOCALLY-declared iterable the name
+    // comes from astNode; for an IMPORTED-type iterable (cross-module call
+    // returning IEnumerable<T>) astNode is null and the name is in importedName
+    // (set by ModuleLoader from the metadata namedName field).  Declaration must
+    // be null in both cases — a non-null declaration means a user class whose
+    // GetEnumerator is handled by lowerIEnumerableFor.
+    if (iterTy->declaration) return false;
+    std::string_view n;
+    if (iterTy->astNode && iterTy->astNode->name &&
+        !iterTy->astNode->name->parts.empty()) {
+        n = iterTy->astNode->name->parts[0];
+    } else if (!iterTy->importedName.empty()) {
+        n = iterTy->importedName;
+    } else {
         return false;
+    }
     // Only handle the iteration-interface family.
-    auto n = iterTy->astNode->name->parts[0];
     if (n != "IEnumerable" && n != "IReadOnlyCollection" && n != "IReadOnlyList" &&
         n != "ICollection" && n != "IList" &&
         n != "OwnedEnumerable")

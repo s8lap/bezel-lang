@@ -365,6 +365,46 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 rt->declaration->name == "Guid") {
                 return guidStructType();
             }
+            // §2.5 / §29.3 (issue #495): imported TypeRefs for builtin stdlib
+            // types (IEnumerable<T>, Array<T>, Task, etc.) carry the type name
+            // in importedName (set by ModuleLoader — no astNode exists for
+            // imported types). Recognise all the heap-allocated builtin names here
+            // so they lower to ptrTy() rather than the i32 default.  The same
+            // name set as the !rt->declaration && rt->astNode path above — both
+            // are pointer-sized heap objects.  Value-type builtins (DateTime,
+            // TimeSpan, Guid, Range) must be listed first (they fall through here
+            // only if importedName is set AND the guards above did not match).
+            if (!rt->declaration && !rt->astNode && !rt->importedName.empty()) {
+                auto n = rt->importedName;
+                // Value types — mirror the astNode guards above.
+                if (n == "DateTime" || n == "TimeSpan") return i64();
+                if (n == "Guid")  return guidStructType();
+                if (n == "Range") return rangeStructType();
+                // Heap-pointer types — all stdlib collection/interface/task names.
+                if (n == "Array"       || n == "OwnedArray"     ||
+                    n == "Dictionary"  || n == "OwnedDictionary" ||
+                    n == "Stack"       || n == "OwnedStack"      ||
+                    n == "Queue"       || n == "OwnedQueue"      ||
+                    n == "Set"         || n == "OwnedSet"        ||
+                    n == "LinkedList"  || n == "OwnedLinkedList" ||
+                    n == "LinkedListNode"                        ||
+                    n == "StringBuilder" || n == "Random"       ||
+                    n == "IEnumerable"   || n == "IEnumerator"  ||
+                    n == "OwnedEnumerable" || n == "OwnedEnumerator" ||
+                    n == "IAsyncEnumerable" || n == "IAsyncEnumerator" ||
+                    n == "OwnedAsyncEnumerable" || n == "OwnedAsyncEnumerator" ||
+                    n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
+                    n == "ICollection" || n == "IList"           ||
+                    n == "IOwnedCollection" || n == "IOwnedList" ||
+                    n == "Task"        || n == "OwnedTask"       ||
+                    n == "Subscription"|| n == "IntPtr"          ||
+                    n == "UIntPtr"     || n == "CString"         ||
+                    n == "WString"     || n == "RawBytes"        ||
+                    n == "CancellationToken" ||
+                    n == "CancellationTokenSource") {
+                    return ptrTy();
+                }
+            }
             // #405 / §31.1 / §31.4: a built-in exception type (Exception or a
             // §31.4 subtype) has no user TypeDecl but IS a reference type — a
             // heap-allocated object (vtable + message). It must lower to a
