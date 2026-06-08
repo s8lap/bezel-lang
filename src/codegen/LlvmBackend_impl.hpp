@@ -86,27 +86,95 @@ inline std::int64_t parseIntLiteral(std::string_view text) {
     return static_cast<std::int64_t>(std::strtoll(digits.c_str(), nullptr, base));
 }
 
-// CG32: decode a char literal lexeme (`'A'`, `'\n'`, …) to its code point.
-// The lexer already validated the form; quotes are stripped and a leading
-// backslash selects a simple escape. Multi-byte UTF-8 yields its first
-// byte (full code-point decoding is deferred with string support).
+// CG32 / #527: decode a char literal lexeme (`'A'`, `'\n'`, `'A'`, …)
+// to its Unicode code point value (i32).
+//
+// The lexer already validated the form and consumed the correct number of
+// source bytes; we re-parse the raw text here.  Three distinct input shapes:
+//
+//  1. Escape sequence (\n \t \r \0 \\ \' \" \a \b \f \v)  — simple table.
+//  2. Unicode/hex escape (\uXXXX, \UXXXXXXXX, \xH..H) — accumulate hex digits.
+//  3. Raw UTF-8 scalar (one or more bytes, non-backslash) — decode the full
+//     code point from the UTF-8 byte sequence (per §18.3).
+//
+// The pre-fix code returned only the first byte for cases 2 and 3, which
+// produced wrong values for every non-ASCII or hex-escape char literal (#527).
 inline std::int64_t parseCharLiteral(std::string_view text) {
+    // Strip the surrounding single quotes.
     if (text.size() >= 2 && text.front() == '\'') text.remove_prefix(1);
     if (!text.empty() && text.back() == '\'') text.remove_suffix(1);
     if (text.empty()) return 0;
-    if (text[0] != '\\') return static_cast<unsigned char>(text[0]);
+
+    if (text[0] != '\\') {
+        // §18.3: raw Unicode scalar — may be a multi-byte UTF-8 sequence.
+        unsigned char b0 = static_cast<unsigned char>(text[0]);
+        if (b0 < 0x80) {
+            // Plain ASCII.
+            return static_cast<std::int64_t>(b0);
+        }
+        // Multi-byte UTF-8 — decode the full code point.
+        // (The lexer validated the sequence; we just extract the value.)
+        std::uint32_t cp = 0;
+        std::size_t extra = 0;
+        if      ((b0 & 0xE0) == 0xC0) { cp = b0 & 0x1F; extra = 1; }
+        else if ((b0 & 0xF0) == 0xE0) { cp = b0 & 0x0F; extra = 2; }
+        else if ((b0 & 0xF8) == 0xF0) { cp = b0 & 0x07; extra = 3; }
+        else { return static_cast<std::int64_t>(b0); } // malformed — return lead byte
+        for (std::size_t i = 1; i <= extra && i < text.size(); ++i) {
+            cp = (cp << 6) | (static_cast<unsigned char>(text[i]) & 0x3F);
+        }
+        return static_cast<std::int64_t>(cp);
+    }
+
+    // Escape sequence.
     if (text.size() < 2) return 0;
     switch (text[1]) {
-        case 'n': return '\n';
-        case 't': return '\t';
-        case 'r': return '\r';
-        case '0': return '\0';
+        // §18.8 named single-character escapes.
+        case 'n':  return '\n';
+        case 't':  return '\t';
+        case 'r':  return '\r';
+        case '0':  return '\0';
         case '\\': return '\\';
         case '\'': return '\'';
-        case '"': return '"';
-        case 'b': return '\b';
-        case 'f': return '\f';
-        case 'v': return '\v';
+        case '"':  return '"';
+        case 'a':  return '\a';  // per §18.8 — alert/bell = U+0007
+        case 'b':  return '\b';
+        case 'f':  return '\f';
+        case 'v':  return '\v';
+
+        // §18.8 \uXXXX — exactly 4 hex digits, BMP.
+        // §18.8 \UXXXXXXXX — exactly 8 hex digits, full range.
+        case 'u':
+        case 'U': {
+            const int required = (text[1] == 'u') ? 4 : 8;
+            std::uint32_t value = 0;
+            for (int i = 0; i < required && (2 + i) < static_cast<int>(text.size()); ++i) {
+                char c = text[static_cast<std::size_t>(2 + i)];
+                std::uint32_t nibble = 0;
+                if (c >= '0' && c <= '9') nibble = static_cast<std::uint32_t>(c - '0');
+                else if (c >= 'a' && c <= 'f') nibble = static_cast<std::uint32_t>(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') nibble = static_cast<std::uint32_t>(c - 'A' + 10);
+                else break;
+                value = (value << 4) | nibble;
+            }
+            return static_cast<std::int64_t>(value);
+        }
+
+        // §18.8 \xH..H — 1–4 hex digits, greedy, BMP.
+        case 'x': {
+            std::uint32_t value = 0;
+            for (std::size_t i = 2; i < text.size() && i < 6; ++i) {
+                char c = text[i];
+                std::uint32_t nibble = 0;
+                if (c >= '0' && c <= '9') nibble = static_cast<std::uint32_t>(c - '0');
+                else if (c >= 'a' && c <= 'f') nibble = static_cast<std::uint32_t>(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') nibble = static_cast<std::uint32_t>(c - 'A' + 10);
+                else break;
+                value = (value << 4) | nibble;
+            }
+            return static_cast<std::int64_t>(value);
+        }
+
         default: return static_cast<unsigned char>(text[1]);
     }
 }
