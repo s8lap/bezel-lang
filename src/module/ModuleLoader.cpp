@@ -336,8 +336,31 @@ struct Loader {
                 c->params = convertParams(mm.params, scope);
                 return c;
             }
-            // Property / Indexer / Event are part of the schema but not
-            // reconstructed in this increment; see the deferred note.
+            case MetaMemberKind::Property: {
+                // §2.5 / §22.9 (issue #503): reconstruct a PropertySymbol so
+                // that cross-module `obj.Prop` resolves to a real symbol instead
+                // of falling through member lookup and returning 0. The getter
+                // BODY is not reconstructed here (there is no ast::PropertyDecl
+                // in the importer); codegen handles the getter call separately:
+                //   - virtual/override: vtable-slot dispatch (propGetSlot_),
+                //     populated by buildVtable via isVirtualProperty() which
+                //     reads the modifiers reconstructed here.
+                //   - non-virtual: a call to bz$<Class>$<Prop>$propget, emitted
+                //     as ExternalLinkage by the exporter and declared as an
+                //     external by declareImportedPropertyGetters in the importer.
+                // The resolved property TYPE rides fieldTypes_ (same side table
+                // used for fields/consts) so ctx.importedMemberType() can read it.
+                auto* p = ctx.makeImportedSymbol<sema::PropertySymbol>();
+                p->name = ctx.internString(mm.name);
+                p->visibility = fromMetaVisibility(mm.visibility);
+                p->modifiers = intern(mm.modifiers);
+                p->parent = &parent;
+                p->scope = parent.memberScope;
+                p->isIndexer = false;
+                fieldTypes_[p] = convert(mm.type);
+                return p;
+            }
+            // Indexer / Event are part of the schema but deferred.
             default:
                 return nullptr;
         }

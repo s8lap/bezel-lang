@@ -1718,6 +1718,24 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             emitPendingCheck();
             return res;
         }
+        // §2.5 / §22.9 (issue #503): imported non-virtual property getter.
+        // computedGetterOf and blockGetterOf both returned null because the
+        // imported PropertySymbol has no ast::PropertyDecl. Call the external
+        // getter function `bz$<Class>$<Prop>$propget` declared by
+        // declareImportedPropertyGetters.
+        if (auto* ps =
+                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma))) {
+            auto git = importedPropGetterFns_.find(ps);
+            if (git != importedPropGetterFns_.end() && ma->target) {
+                llvm::Value* obj = lowerExpr(*ma->target);
+                if (obj && obj->getType()->isPointerTy()) {
+                    llvm::Value* res = builder_.CreateCall(
+                        git->second->getFunctionType(), git->second, {obj});
+                    emitPendingCheck();
+                    return res;
+                }
+            }
+        }
     }
     // CG8: field read `obj.f`.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
@@ -1838,8 +1856,19 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
     if (isIfaceProp && ifGetIt == ifacePropertyGetIndex_.end()) return nullptr;
 
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return nullptr;
-    llvm::Type* valTy = lowerType(pd->type.get());
+    // §2.5 / §22.9 / §12.1 (issue #503): for an IMPORTED virtual/override
+    // property, ps->decl is null (no ast::PropertyDecl in the importer). The
+    // vtable slot was still populated by buildVtable (which ran for imported
+    // classes too); we only need to derive the return type, which rides the
+    // importedMemberType side table (set by the loader from MetaMember::type).
+    llvm::Type* valTy = nullptr;
+    if (pd) {
+        valTy = lowerType(pd->type.get());
+    } else {
+        // Imported property: get the resolved type from the side table.
+        if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
+            valTy = lowerTypeRef(tr);
+    }
     if (!valTy) valTy = i32();
     auto* fnTy = llvm::FunctionType::get(valTy, {ptrTy()}, false);
 

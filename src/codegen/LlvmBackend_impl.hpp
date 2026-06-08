@@ -135,6 +135,14 @@ public:
         declareStatics();
         declareFunctions();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
+        // §2.5 / §22.9 (issue #503): emit ExternalLinkage getter stubs for
+        // non-virtual public properties (exporter side). After declareVtables so
+        // propGetSlot_ is populated; virtual properties are skipped.
+        emitExportedPropertyGetters();
+        // §2.5 / §22.9 (issue #503): declare external getter stubs for imported
+        // non-virtual property getters (importer side). After declareVtables
+        // so propGetSlot_ correctly reflects which imported properties are virtual.
+        if (ctx_.hasImports()) declareImportedPropertyGetters();
         setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
         computeEnumValues();  // CG30
         declareExterns();  // CG26
@@ -641,6 +649,12 @@ private:
     // polymorphic access site. Keyed by (prop, isSet).
     std::map<std::pair<const sema::PropertySymbol*, bool>, llvm::Function*>
         propAccessorFns_;
+    // §2.5 / §22.9 (issue #503): IMPORTED non-virtual property getter stubs.
+    // Keyed by the imported PropertySymbol; the value is an ExternalLinkage
+    // `T(ptr this)` declaration linking against the exporter's getter function
+    // (`bz$<Class>$<Prop>$propget`). Populated by declareImportedPropertyGetters.
+    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+        importedPropGetterFns_;
     // CG35-itable (§13 / §12): per-interface itable dispatch. For each
     // interface method `ms`, ifaceMethodIndex_[ms] is its 0-based position in
     // the interface's non-static method declaration order. This index is used
@@ -1624,6 +1638,21 @@ private:
     // define) for every imported method, so a cross-module call links against
     // the dependency's object. Only called when ctx_.hasImports().
     void declareImportedFunctions();
+
+    // §2.5 / §22.9 (issue #503): emit a named ExternalLinkage getter function
+    // `bz$<Class>$<Prop>$propget(ptr %this) -> T` for every PUBLIC, non-virtual,
+    // non-indexer property on every PUBLIC, non-generic LOCAL class. This gives
+    // the importer a stable cross-module symbol to call for a non-virtual property
+    // getter. Only called in the exporter (local symbols). Virtual properties
+    // already dispatch through the vtable; they do not need this function.
+    void emitExportedPropertyGetters();
+
+    // §2.5 / §22.9 (issue #503): declare EXTERNAL getter stubs for every
+    // imported PropertySymbol that is not virtual (not in propGetSlot_). Called
+    // after buildVtable (which populates propGetSlot_), so that we correctly
+    // distinguish virtual from non-virtual imported properties. The stubs are
+    // stored in importedPropGetterFns_ for use by the property-access lowering.
+    void declareImportedPropertyGetters();
 
     // CG17: assign vtable slots for a class, base-first. Slot 0 is Dispose
     // (handled at emit time); virtual methods take slots 1+. An override

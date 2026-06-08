@@ -3417,6 +3417,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                          dynamic_cast<MemberSymbol*>(member)
                                              ? dynamic_cast<MemberSymbol*>(member)->parent
                                              : nullptr));
+        } else if (dynamic_cast<PropertySymbol*>(member)) {
+            // §2.5 / §22.9 (issue #503): an IMPORTED property has no
+            // ast::PropertyDecl, so its type rides the importedMemberType side
+            // table (set by the loader). Attach it so that `h.N` is typed for
+            // downstream ownership/definite-assignment and codegen.
+            if (TypeRef* rt = ctx_.importedMemberType(member))
+                ctx_.setExprType(&ma,
+                    substituteMemberType(rt, ma.target.get(),
+                                         dynamic_cast<MemberSymbol*>(member)
+                                             ? dynamic_cast<MemberSymbol*>(member)->parent
+                                             : nullptr));
         } else if (auto* ec = dynamic_cast<EnumConstantSymbol*>(member)) {
             // §10 (issue #328 FINDING [1]): an IMPORTED enum-constant access
             // `Color.Green` has the enum type, exactly like the local-enum case
