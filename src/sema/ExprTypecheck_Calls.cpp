@@ -3126,9 +3126,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
                     }
-                    // §9.6: Split returns Array<string> — no simple TypeRef,
-                    // but suppress the diagnostic; codegen handles it.
-                    if (ma.member == "Split") return;
+                    // fix #500 / §9.6: Split(char|string|Array<char>) returns
+                    // owned Array<string>.  Set the result type explicitly so
+                    // that an unannotated local (`var parts := s.Split(',')`)
+                    // infers Array<string> and downstream `.Count`/`.Get(i)`/
+                    // for-in resolve correctly.  Mirror the makeConcreteCollection
+                    // Result pattern used by ToArray() in typeCall().
+                    if (ma.member == "Split") {
+                        static const ast::Type* kArrayAstNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("Array");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = kArrayAstNode;
+                        tr->genericArgs.push_back(
+                            ctx_.primitiveTypeRef(PrimitiveType::String));
+                        ctx_.setExprType(&ma, tr);
+                        return;
+                    }
                     // Emit a diagnostic for unrecognized string members.
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,

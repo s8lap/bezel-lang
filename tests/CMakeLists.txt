@@ -336,6 +336,7 @@ set(BEZEL_TEST_SOURCES
     codegen/ref_return_generic_490_test.cpp
     codegen/async_nullable_return_493_test.cpp
     codegen/itable_bool_return_494_test.cpp
+    codegen/split_result_type_500_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
