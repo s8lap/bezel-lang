@@ -316,6 +316,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         sv = builder_.CreateInsertValue(sv, flagsV, {3u}, "range.3");
         return sv;
     }
+    // §17.10 (#487): typeof(T) → Type.  The `Type` runtime class (stdlib §2.13)
+    // provides type identity and lattice metadata.  Its runtime representation
+    // (a global pointer to a type-descriptor object) is not yet emitted by the
+    // compiler backend (deferred alongside the broader System.Reflection surface,
+    // stdlib §11).  Until that milestone, typeof(T) in a codegen-bound context
+    // emits a clean compile-time error rather than reaching LLVM with an untyped
+    // expression and producing silent garbage or a crash (#487).
+    if (auto* to = dynamic_cast<const ast::TypeOfExpr*>(&e)) {
+        (void)to;
+        ctx_.diagnostics().report(
+            Severity::Error, e.span.begin,
+            "`typeof` is not yet implemented in codegen: the runtime `Type` "
+            "class (stdlib \xC2\xA7""2.13) requires a type-descriptor table that is "
+            "not yet emitted (\xC2\xA7""17.10, #487). This expression will be "
+            "supported in a future milestone.");
+        return llvm::PoisonValue::get(ptrTy());
+    }
     // §17.9: nameof(QualifiedName) → compile-time string constant equal to
     // the rightmost identifier of the operand (the only segment for a simple
     // name, the last segment for a dotted name such as BankAccount.Deposit →
