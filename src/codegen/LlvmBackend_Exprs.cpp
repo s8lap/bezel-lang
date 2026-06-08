@@ -2433,6 +2433,75 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 }
             }
         }
+        // fix #524 / §17.5: `elem in set` ≡ set.Contains(elem) for a
+        // dict-backed Set<T>.  The right operand must be a Set<T> whose
+        // element type has a dict backing (genericBackingType returns non-null);
+        // the left operand is the element to look up.
+        if (bin.right) {
+            auto* rTy = ctx_.exprType(*bin.right);
+            bool isSetRHS = rTy && rTy->kind == sema::TypeRef::Kind::Named &&
+                            !rTy->declaration && rTy->astNode &&
+                            rTy->astNode->name &&
+                            !rTy->astNode->name->parts.empty() &&
+                            (rTy->astNode->name->parts[0] == "Set" ||
+                             rTy->astNode->name->parts[0] == "OwnedSet");
+            if (isSetRHS) {
+                const sema::TypeRef* elemTy =
+                    genericBackingType(rTy, 0, /*isSet=*/true, nullptr);
+                if (elemTy) {
+                    bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
+                    llvm::Value* elem = lowerExpr(*bin.left);
+                    llvm::Value* set  = lowerExpr(*bin.right);
+                    if (!elem || !set) return nullptr;
+                    // Spill elem to a stack slot; a record already spilled to ptr.
+                    llvm::Value* ep;
+                    if (elemIsRecord && elem->getType()->isPointerTy()) {
+                        ep = elem;
+                    } else {
+                        llvm::AllocaInst* slot = entryAlloca(elem->getType());
+                        builder_.CreateStore(elem, slot);
+                        ep = slot;
+                    }
+                    auto* fn = declareC("bz_dict_contains_gen", i1(),
+                                        {ptrTy(), ptrTy()});
+                    return builder_.CreateCall(fn, {set, ep}, "set.in");
+                }
+            }
+        }
+        // fix #524 / §4.8: `key in dict` ≡ dict.ContainsKey(key) for a
+        // Dictionary<K,V>.  String keys use the dedicated fast path
+        // (bz_dict_contains_str); generic keys use bz_dict_contains_gen.
+        if (bin.right) {
+            auto* rTy = ctx_.exprType(*bin.right);
+            if (isDictTypeName(rTy)) {
+                const sema::TypeRef* keyTy =
+                    genericBackingType(rTy, 0, /*isSet=*/false, nullptr);
+                bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+                llvm::Value* key  = lowerExpr(*bin.left);
+                llvm::Value* dict = lowerExpr(*bin.right);
+                if (!key || !dict) return nullptr;
+                if (keyTy) {
+                    // Generic (non-string) key: spill to a slot, pass pointer.
+                    llvm::Value* kp;
+                    if (keyIsRecord && key->getType()->isPointerTy()) {
+                        kp = key;
+                    } else {
+                        llvm::AllocaInst* slot = entryAlloca(key->getType());
+                        builder_.CreateStore(key, slot);
+                        kp = slot;
+                    }
+                    auto* fn = declareC("bz_dict_contains_gen", i1(),
+                                        {ptrTy(), ptrTy()});
+                    return builder_.CreateCall(fn, {dict, kp}, "dict.in");
+                }
+                // String key fast path.
+                llvm::Value* kdata = loadStringData(key);
+                llvm::Value* klen  = loadStringLen(key);
+                auto* fn = declareC("bz_dict_contains_str", i1(),
+                                    {ptrTy(), ptrTy(), i64()});
+                return builder_.CreateCall(fn, {dict, kdata, klen}, "dict.in");
+            }
+        }
         return nullptr;  // other `in` forms (collection) not yet implemented
     }
     llvm::Value* l = lowerExpr(*bin.left);

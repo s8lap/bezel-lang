@@ -988,7 +988,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         }
                         // per §3: Contains → bool, IndexOf → int
-                        else if (m == "Contains")
+                        // per §4.10 stdlib: TryAdd(item: T): bool
+                        else if (m == "Contains" || m == "TryAdd")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "IndexOf")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
