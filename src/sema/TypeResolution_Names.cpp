@@ -795,6 +795,11 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target) resolveTypesInExpr(*ma->target, scope);
+        // per §14.1 (issue #509): resolve any explicit method type args
+        // (e.g. `.Identity<int>` → typeArgs[0] resolved to int TypeRef).
+        for (const auto& ta : ma->typeArgs) {
+            if (ta) resolveType(*ta, scope);
+        }
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {

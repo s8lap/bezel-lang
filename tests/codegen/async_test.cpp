@@ -1926,24 +1926,25 @@ BEZEL_TEST(async_30_5_445, two_plain_var_tasks_awaited_cross_thread_clean) {
 }
 
 // ===========================================================================
-// §30.2 / §A.7 (#444): `await` requires a Task / Task<T> / OwnedTask<T>
-// operand. Without the guard, `Task.FromResult<int>(42)` — misparsed by §A.7
-// (no call-site generic type argument syntax) as a chained comparison yielding
-// bool — was silently compiled to `await bool` (i1), which caused a SIGSEGV
-// in lowerAwait (the bool value was stored into a pointer-typed task field).
-// The guard converts the crash to a clean compile error.
+// §30.2 / §14.1 (#444 / #509): `await` requires a Task / Task<T> / OwnedTask<T>
+// operand.  Before #509, `Task.FromResult<int>(42)` was misparsed (§A.7 had no
+// call-site generic type argument syntax) as a chained comparison yielding bool,
+// causing `await bool` (i1) to SIGSEGV in lowerAwait.  After #509, the parser
+// correctly handles `Method<T>(…)` as an explicit-type-arg call:
+// `Task.FromResult<int>(42)` now returns `Task<int>` and the `await` is valid.
 // ===========================================================================
 
-// §30.2 / §A.7 (#444) repro: `Task.FromResult<int>(42)` misparsed as
-// `(Task.FromResult < int) > (42)` → bool. `await bool` must be a clean
-// compile error (no crash, exit non-zero = compile failed).
+// §14.1 / §30.2 (#509 fix for #444 repro): `Task.FromResult<int>(42)` is now
+// parsed correctly as an explicit-type-arg call (not a comparison).  The
+// `await` of its `Task<int>` result must compile and return 42.
 BEZEL_TEST(async_444, await_call_site_type_arg_misparsed_as_comparison_is_error) {
-    BEZEL_EXPECT_TRUE(compileFails(
+    expectValueLeakFree(
         "module M; class C "
         "  public static async method Main(): Task<int> "
         "    var x := await Task.FromResult<int>(42); "
         "    return x; "
-        "  end Main; end C;"));
+        "  end Main; end C;",
+        42);
 }
 
 // §30.2 / §A.7 (#444): `await` on a plain integer literal is also rejected

@@ -608,11 +608,19 @@ struct IdentifierExpr : Expr { std::string_view name; };
 // the grouping. exprToString always parenthesizes BinaryExpr, so reading any
 // expression's source-vs-AST shape is unambiguous in tests.
 
-// A.5: `expr "." Identifier`. Postfix; the `target` is whatever expression
-// preceded the dot.
+// A.5: `expr "." Identifier GenericArgs?`. Postfix; the `target` is whatever
+// expression preceded the dot.  The optional `typeArgs` hold the explicit
+// method-level type arguments when the programmer writes `obj.Method<T>(...)`.
+// The parser populates this only when a disambiguating scan confirms that the
+// `<` is a generic-type-arg list (not a relational operator); see §14.1 and
+// the parser note in Parser_Exprs.cpp.
 struct MemberAccessExpr : Expr {
     std::unique_ptr<Expr> target;
     std::string_view member;
+    // Explicit method-level type arguments, e.g. `.Identity<int>`.
+    // Empty when the programmer omits type args (most calls — type is inferred
+    // from arguments per §14.1 or from the return-target per #391).
+    std::vector<std::unique_ptr<Type>> typeArgs;
 };
 
 // A.4 / §A.5 Argument:

@@ -607,6 +607,78 @@ bool Parser::tokensLookLikeLambda(std::size_t startK) {
     }
 }
 
+// per §14.1 (issue #509): disambiguate `Method<T>(…)` (explicit method type
+// args) from `expr < T > (expr)` (relational chain).  peekAt(0) is the `<`
+// token after the member identifier has been consumed.
+//
+// Strategy: scan forward counting angle-bracket depth.  A token sequence that
+// matches `< (TypeArgToken | ",")* > (` is a type-arg list; anything else
+// (EOF, statement-terminator keyword, relational-expression operand like a
+// number or operator) is a relational `<`.
+//
+// "TypeArgToken" is conservative: identifier, primitive-type keyword, `?`
+// (nullable suffix), `[` / `]` (inline-array prefix), `<` / `>` (nested
+// generic args).  Operators other than `<`, `>`, `?`, `[`, `]`, `,` are
+// not valid inside a type-arg list and cause us to bail out.
+bool Parser::tokensLookLikeMethodTypeArgs() {
+    // peekAt(0) must be `<`.
+    std::size_t k = 1;                // start scanning after the opening `<`
+    std::size_t depth = 1;            // nesting level of `<` / `>`
+    static const std::size_t kLimit = 64; // prevent scanning unbounded input
+    for (std::size_t guard = 0; guard < kLimit; ++guard, ++k) {
+        const Token& t = peekAt(k);
+        if (t.kind == TokenKind::EndOfFile) return false;
+        if (t.kind == TokenKind::Punctuator) {
+            if (t.text == "<") { ++depth; continue; }
+            if (t.text == ">>" ) {
+                // Lexer emits ">>" as one token; consuming two `>`s.
+                if (depth <= 2) {
+                    // The outer `>` closes this generic-arg list and the
+                    // inner `>` would be left to the caller.  Treat this
+                    // as closing: after the `>>`, we need `(`.
+                    const Token& after = peekAt(k + 1);
+                    if (depth == 2) {
+                        // both `>` consumed here; we need `(` next.
+                        return after.kind == TokenKind::Punctuator &&
+                               after.text == "(";
+                    }
+                    // depth == 1: `>>` closes this list twice (malformed),
+                    // bail out.
+                    return false;
+                }
+                depth -= 2; continue;
+            }
+            if (t.text == ">") {
+                --depth;
+                if (depth == 0) {
+                    // The closing `>` of the arg list.  Confirm `(` follows.
+                    const Token& after = peekAt(k + 1);
+                    return after.kind == TokenKind::Punctuator &&
+                           after.text == "(";
+                }
+                continue;
+            }
+            // Punctuators valid inside a type arg: `,`, `?`, `[`, `]`.
+            if (t.text == "," || t.text == "?" ||
+                t.text == "[" || t.text == "]") continue;
+            // Any other punctuator (e.g. `+`, `-`, `*`, `(`, `)`, `=`,
+            // `..`) cannot appear inside a type arg; bail out.
+            return false;
+        }
+        if (t.kind == TokenKind::Keyword) {
+            // Primitive-type keywords (int, string, bool, …) are valid type
+            // names.  Other keywords (if, while, return, …) cannot appear
+            // inside a type arg.
+            if (isPrimitiveTypeKeyword(t.text)) continue;
+            return false;
+        }
+        if (t.kind == TokenKind::Identifier) continue; // type name component
+        // Numeric/char/string literals cannot be type args.
+        return false;
+    }
+    return false; // exceeded scan limit
+}
+
 ast::Param Parser::parseLambdaParam() {
     // A.7 `LambdaParam ::= FuncParamMods? Identifier (":" Type)?`. Type is
     // optional (unlike A.4 method ParamList).
@@ -886,6 +958,23 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             access->target = std::move(head);
             access->member = current_.text;
             advance();
+            // per §14.1 (issue #509): optional explicit method-level type
+            // arguments `<T1, T2, ...>` following the member name.  Only
+            // parsed when the disambiguating scan confirms the `<` is a
+            // generic-arg list (closes with `>` followed by `(`), not a
+            // relational `<` operator.
+            if (isPunctuator("<") && tokensLookLikeMethodTypeArgs()) {
+                advance(); // past `<`
+                access->typeArgs.push_back(parseType());
+                while (isPunctuator(",")) {
+                    advance(); // past `,`
+                    access->typeArgs.push_back(parseType());
+                }
+                if (!consumeClosingAngle()) {
+                    diagnostics_.report(Severity::Error, current_.location,
+                        "expected '>' to close method type-argument list");
+                }
+            }
             head = std::unique_ptr<ast::Expr>(access.release());
         } else if (consumePunctuator("?.")) {
             if (current_.kind != TokenKind::Identifier) {
