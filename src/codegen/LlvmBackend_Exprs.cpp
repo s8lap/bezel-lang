@@ -2223,11 +2223,27 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         if (op == "-") return builder_.CreateFSub(l, r);
         if (op == "*") return builder_.CreateFMul(l, r);
         if (op == "/") return builder_.CreateFDiv(l, r);
-        if (op == "=") return builder_.CreateFCmpOEQ(l, r);
-        // §6.3 (IEEE 754): `<>` is the negation of `=`, so it is true
-        // when either operand is NaN — an *unordered* not-equal (UNE).
-        // (`=` stays ordered-equal: `NaN = NaN` is false.)
-        if (op == "<>") return builder_.CreateFCmpUNE(l, r);
+        // §4.3.1 (L308/L314): "NaN = NaN is true" — reflexive equality.
+        // Emit: oeq(a,b) OR (isNaN(a) AND isNaN(b)).
+        // isNaN(x) is fcmp uno x, x (unordered compare: true iff x is NaN).
+        // IEEE <,<=,>,>= are NOT changed (NaN comparisons stay false, §4.3.1).
+        if (op == "=") {
+            llvm::Value* ieee_eq  = builder_.CreateFCmpOEQ(l, r, "feq");
+            llvm::Value* l_is_nan = builder_.CreateFCmpUNO(l, l, "lnan");
+            llvm::Value* r_is_nan = builder_.CreateFCmpUNO(r, r, "rnan");
+            llvm::Value* both_nan = builder_.CreateAnd(l_is_nan, r_is_nan, "bnan");
+            return builder_.CreateOr(ieee_eq, both_nan, "feq_ref");
+        }
+        // §4.3.1: `<>` is the negation of `=` (which is true for NaN=NaN),
+        // so `NaN <> NaN` is false.  Emit NOT(oeq OR both-NaN).
+        if (op == "<>") {
+            llvm::Value* ieee_eq  = builder_.CreateFCmpOEQ(l, r, "feq");
+            llvm::Value* l_is_nan = builder_.CreateFCmpUNO(l, l, "lnan");
+            llvm::Value* r_is_nan = builder_.CreateFCmpUNO(r, r, "rnan");
+            llvm::Value* both_nan = builder_.CreateAnd(l_is_nan, r_is_nan, "bnan");
+            llvm::Value* eq_ref   = builder_.CreateOr(ieee_eq, both_nan, "feq_ref");
+            return builder_.CreateNot(eq_ref, "fne_ref");
+        }
         if (op == "<") return builder_.CreateFCmpOLT(l, r);
         if (op == ">") return builder_.CreateFCmpOGT(l, r);
         if (op == "<=") return builder_.CreateFCmpOLE(l, r);
@@ -2500,9 +2516,17 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         if (op == "&") return builder_.CreateAnd(l, r);
         if (op == "|") return builder_.CreateOr(l, r);
         if (op == "^") return builder_.CreateXor(l, r);
-        if (op == "<<") return builder_.CreateShl(l, r);
-        if (op == ">>") return uns ? builder_.CreateLShr(l, r)
-                                   : builder_.CreateAShr(l, r);
+        // §6.5: shift count is reduced modulo the operand's bit width.
+        // LLVM shl/lshr/ashr with count >= bitwidth produces poison; mask
+        // the count to [0, bitwidth-1] before emitting the shift.
+        if (op == "<<" || op == ">>") {
+            unsigned bits = l->getType()->getIntegerBitWidth();
+            llvm::Value* mask = llvm::ConstantInt::get(r->getType(), bits - 1);
+            llvm::Value* cnt = builder_.CreateAnd(r, mask, "shcnt");
+            if (op == "<<")  return builder_.CreateShl(l, cnt);
+            return uns ? builder_.CreateLShr(l, cnt)
+                       : builder_.CreateAShr(l, cnt);
+        }
     }
     // §8.3 (equality table) / §15.1.2: inline arrays `[N]T` compare
     // element-by-element value equality — dispatch before the scalar integer
@@ -3826,6 +3850,37 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
     }
     llvm::Value* src = lowerExpr(argE);
     if (!src) return nullptr;
+    // §5.2 (L421): casting an integer to char requires the value to be in
+    // U+0000–U+10FFFF excluding the surrogate range U+D800–U+DFFF; otherwise
+    // raise OverflowException.  This check must precede the same-width-identity
+    // path below (int → char: both are i32, so srcTy==dstTy would skip it).
+    if (target == P::Char && src->getType()->isIntegerTy()) {
+        // Widen to i64 for the unsigned range check so negative int values
+        // (sign-extended) compare correctly against the unsigned bounds.
+        llvm::Type* i64ty = llvm::Type::getInt64Ty(llvm_);
+        llvm::Value* v64  = builder_.CreateSExt(src, i64ty, "ctoi64");
+        // below zero?
+        llvm::Value* neg  = builder_.CreateICmpSLT(
+            v64, llvm::ConstantInt::get(i64ty, 0), "cneg");
+        // above U+10FFFF?
+        llvm::Value* hi   = builder_.CreateICmpSGT(
+            v64, llvm::ConstantInt::get(i64ty, 0x10FFFF), "chi");
+        // in surrogate range [0xD800, 0xDFFF]?
+        llvm::Value* sg_lo = builder_.CreateICmpSGE(
+            v64, llvm::ConstantInt::get(i64ty, 0xD800), "csglo");
+        llvm::Value* sg_hi = builder_.CreateICmpSLE(
+            v64, llvm::ConstantInt::get(i64ty, 0xDFFF), "csghi");
+        llvm::Value* surr  = builder_.CreateAnd(sg_lo, sg_hi, "csurr");
+        // any of the three conditions triggers OverflowException
+        llvm::Value* bad   = builder_.CreateOr(
+            builder_.CreateOr(neg, hi, "coor"), surr, "cbad");
+        emitGuardThrow(bad, "OverflowException");
+        // Value is now known valid; truncate or keep as i32 char.
+        llvm::Type* dstCharTy = lowerPrimitive(P::Char);  // i32
+        if (src->getType() != dstCharTy)
+            return builder_.CreateTrunc(src, dstCharTy);
+        return src;
+    }
     llvm::Type* dstTy = lowerPrimitive(target);
     llvm::Type* srcTy = src->getType();
     if (srcTy == dstTy) return src;
