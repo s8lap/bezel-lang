@@ -1429,6 +1429,43 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // issue #494 / §29.2 / §29.3: explicit `e.Current` property access where
+    // `e` is typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
+    // TypeDecl, hence no PropertySymbol — lowerVirtualPropertyGet returns null).
+    // The iterator state struct's vtable layout is [0]=td, [1]=Dispose,
+    // [2]=MoveNext(→i1), [3]=Current(→T). Dispatch through slot 3 returning T.
+    // This complements the MoveNext fix in lowerCall (issue #494).
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->member == "Current" && ma->target) {
+            const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+            bool isBuiltinEnumerator =
+                recvTy &&
+                recvTy->kind == sema::TypeRef::Kind::Named &&
+                !recvTy->declaration &&
+                recvTy->astNode && recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                (recvTy->astNode->name->parts[0] == "IEnumerator" ||
+                 recvTy->astNode->name->parts[0] == "OwnedEnumerator");
+            if (isBuiltinEnumerator) {
+                llvm::Value* recv = lowerExpr(*ma->target);
+                if (recv && recv->getType()->isPointerTy()) {
+                    llvm::Type* elemTy =
+                        (!recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                        ? lowerTypeRef(recvTy->genericArgs[0])
+                        : i32();
+                    llvm::Value* vtable = builder_.CreateLoad(ptrTy(), recv);
+                    auto* currentTy =
+                        llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+                    llvm::Value* curSlotPtr = builder_.CreateGEP(
+                        ptrTy(), vtable, {builder_.getInt32(3)});
+                    llvm::Value* curFnPtr =
+                        builder_.CreateLoad(ptrTy(), curSlotPtr);
+                    return builder_.CreateCall(
+                        currentTy, curFnPtr, {recv}, "cur");
+                }
+            }
+        }
+    }
     // #481 / §12.1 / §12.5 / §13 / §23: a VIRTUAL or INTERFACE property read
     // through a (potentially) polymorphic receiver dispatches dynamically — load
     // the accessor function from the receiver's vtable/itable and call it. This

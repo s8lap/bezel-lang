@@ -334,6 +334,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nameof_charrepeat_test.cpp
     codegen/blockform_property_itable_test.cpp
     codegen/ref_return_generic_490_test.cpp
+    codegen/itable_bool_return_494_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

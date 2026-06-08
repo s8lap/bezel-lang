@@ -996,6 +996,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // .Next / .Previous: LinkedListNode<T>? — same.
                         // No call-expression methods on the node type per §4.6.
                     }
+                    // issue #494 / §29.2 / §29.3: builtin IEnumerator<T> /
+                    // OwnedEnumerator<T> call-expression methods.
+                    //   MoveNext(): bool — advances the iterator (vtable slot 2)
+                    // (Current is a readonly property, typed in resolveMemberAccess.)
+                    if (colName == "IEnumerator" || colName == "OwnedEnumerator") {
+                        if (m == "MoveNext" && ce.args.empty())
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // Dispose() → unit; no type needed.
+                    }
                     // Dictionary methods
                     if (colName == "Dictionary" || colName == "OwnedDictionary") {
                         if (m == "Count")
@@ -2714,6 +2723,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     }
     if (!targetType) {
+        // issue #494 / §29.2 / §29.3: `e.Current` property access where `e` is
+        // typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
+        // TypeDecl). Current returns T (the first generic arg). Typing this lets
+        // `var x := e.Current` and `s := s + e.Current` infer the element type.
+        if (ma.target && ma.member == "Current") {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isBuiltinEnumerator =
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty() &&
+                    (tt->astNode->name->parts[0] == "IEnumerator" ||
+                     tt->astNode->name->parts[0] == "OwnedEnumerator");
+                if (isBuiltinEnumerator && !tt->genericArgs.empty() &&
+                        tt->genericArgs[0]) {
+                    ctx_.setExprType(&ma, tt->genericArgs[0]);
+                    return;
+                }
+            }
+        }
         // #370 / §4.8: `Dictionary<K,V>.Keys` is `ICollection<K>` and
         // `.Values` is `ICollection<V>`. The Dictionary has no user
         // TypeSymbol (its TypeRef carries no declaration), so the ordinary
