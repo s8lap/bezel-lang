@@ -545,6 +545,9 @@ private:
     llvm::StructType* stringStructTy_ = nullptr;
     // per stdlib §2.6: Guid value-type struct { i64 lo, i64 hi }.
     llvm::StructType* guidStructTy_ = nullptr;
+    // fix #499 / §9.8: Range<T> value struct { i64 start, i64 end, i64 step, i8 flags }.
+    // flags bit 0 = IsEndInclusive (1 = inclusive `..`, 0 = half-open `..<`).
+    llvm::StructType* rangeStructTy_ = nullptr;
     // #422 / §27.5 / §28.9: the closure-cell type { ptr fn, ptr env, i64 rc }.
     llvm::StructType* closureCellTy_ = nullptr;
     unsigned stringLiteralIdx_ = 0;
@@ -843,6 +846,41 @@ private:
             guidStructTy_ = llvm::StructType::create(
                 llvm_, {i64(), i64()}, "bz.guid");
         return guidStructTy_;
+    }
+
+    // fix #499 / §9.8: Range<T> value struct { i64 start, i64 end, i64 step, i8 flags }.
+    // Field layout:
+    //   0: i64  start  (lo bound; 0 if open-ended on the low side)
+    //   1: i64  end    (hi bound; 0 if open-ended on the high side)
+    //   2: i64  step   (default 1; signed; negative means descending — §16.4)
+    //   3: i8   flags  (bit 0 = IsEndInclusive; bit 1 = startOpen; bit 2 = endOpen)
+    llvm::StructType* rangeStructType() {
+        if (!rangeStructTy_)
+            rangeStructTy_ = llvm::StructType::create(
+                llvm_,
+                {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_)},
+                "bz.range");
+        return rangeStructTy_;
+    }
+
+    // fix #499 / §9.8: test whether a TypeRef is a Range type (set by sema
+    // when visiting a RangeExpr or declared as `Range<T>`).
+    static bool isRangeType(const sema::TypeRef* rt) {
+        return rt &&
+               rt->kind == sema::TypeRef::Kind::Named &&
+               rt->declaration &&
+               !rt->declaration->decl &&
+               rt->declaration->name == "Range";
+    }
+
+    // fix #499 / §9.8: load the Range struct from the slot of a range-typed
+    // expression (an IdentifierExpr whose lsym->declType is Range). Returns
+    // the struct value `{ i64 start, i64 end, i64 step, i8 flags }`.
+    llvm::Value* loadRangeStruct(const ast::Expr& target) {
+        llvm::Value* v = lowerExpr(target);
+        if (!v) return nullptr;
+        // lowerExpr for a local of range type returns the struct value directly.
+        return v;
     }
 
     // #422: the sentinel rc value for static/literal strings (matches the

@@ -266,6 +266,56 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
         return llvm::Constant::getNullValue(lowerType(de->type.get()));
     }
+    // fix #499 / §9.8: RangeExpr in value position (e.g. `var r := a..b`).
+    // Builds a Range struct { i64 start, i64 end, i64 step, i8 flags } so the
+    // range can be stored in a local variable and used via member access / `in`.
+    // The inline-literal fast paths (`x in lo..hi`, `for var i in lo..hi`) are
+    // handled elsewhere and bypass this; this path only fires when the RangeExpr
+    // is lowered as a general expression (initializer of a local, etc.).
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        auto* sty = rangeStructType();
+        // start: lo value widened to i64; 0 if lo is absent (open-ended low).
+        llvm::Value* startV = builder_.getInt64(0);
+        if (re->lo) {
+            llvm::Value* lo = lowerExpr(*re->lo);
+            if (!lo) return nullptr;
+            startV = lo->getType() == i64()
+                         ? lo
+                         : builder_.CreateSExt(lo, i64(), "range.start");
+        }
+        // end: hi value widened to i64; 0 if hi is absent (open-ended high).
+        llvm::Value* endV = builder_.getInt64(0);
+        if (re->hi) {
+            llvm::Value* hi = lowerExpr(*re->hi);
+            if (!hi) return nullptr;
+            endV = hi->getType() == i64()
+                       ? hi
+                       : builder_.CreateSExt(hi, i64(), "range.end");
+        }
+        // step: explicit step if present, else 1 (§16.4 default).
+        llvm::Value* stepV = builder_.getInt64(1);
+        if (re->step) {
+            llvm::Value* s = lowerExpr(*re->step);
+            if (!s) return nullptr;
+            stepV = s->getType() == i64()
+                        ? s
+                        : builder_.CreateSExt(s, i64(), "range.step");
+        }
+        // flags: bit 0 = IsEndInclusive; bit 1 = startOpen; bit 2 = endOpen.
+        uint8_t flags = 0;
+        if (re->inclusive) flags |= 1u;
+        if (!re->lo)       flags |= 2u;
+        if (!re->hi)       flags |= 4u;
+        llvm::Value* flagsV =
+            llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), flags);
+        // Assemble the struct via insertvalue.
+        llvm::Value* sv = llvm::UndefValue::get(sty);
+        sv = builder_.CreateInsertValue(sv, startV, {0u}, "range.0");
+        sv = builder_.CreateInsertValue(sv, endV,   {1u}, "range.1");
+        sv = builder_.CreateInsertValue(sv, stepV,  {2u}, "range.2");
+        sv = builder_.CreateInsertValue(sv, flagsV, {3u}, "range.3");
+        return sv;
+    }
     // §17.9: nameof(QualifiedName) → compile-time string constant equal to
     // the rightmost identifier of the operand (the only segment for a simple
     // name, the last segment for a dotted name such as BankAccount.Deposit →
@@ -356,6 +406,27 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         }
                     }
                     auto* tt = ctx_.exprType(*ma->target);
+                    // fix #499 / §9.8: Range<T>.Contains(x) inside the
+                    // CallExpr dispatch path (ma->target has Range type).
+                    if (isRangeType(tt) && ma->member == "Contains" &&
+                        call->args.size() == 1 && call->args[0].value) {
+                        llvm::Value* rv = lowerExpr(*ma->target);
+                        llvm::Value* x  = lowerExpr(*call->args[0].value);
+                        if (rv && x) {
+                            llvm::Value* lo  = builder_.CreateExtractValue(rv, {0u}, "rc.lo");
+                            llvm::Value* hi  = builder_.CreateExtractValue(rv, {1u}, "rc.hi");
+                            llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "rc.flg");
+                            llvm::Value* xW  = x->getType() == i64()
+                                                   ? x
+                                                   : builder_.CreateSExt(x, i64(), "rc.xw");
+                            llvm::Value* geL  = builder_.CreateICmpSGE(xW, lo, "rc.geL");
+                            llvm::Value* incl = builder_.CreateTrunc(flg, i1(), "rc.incl");
+                            llvm::Value* leLE = builder_.CreateICmpSLE(xW, hi, "rc.leLE");
+                            llvm::Value* leLT = builder_.CreateICmpSLT(xW, hi, "rc.leLT");
+                            llvm::Value* leH  = builder_.CreateSelect(incl, leLE, leLT, "rc.leH");
+                            return builder_.CreateAnd(geL, leH, "rc.res");
+                        }
+                    }
                     if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
                         if (tt->primitive == sema::PrimitiveType::String) {
                             // CG27f: stdlib §9.6 string methods.
@@ -1094,6 +1165,71 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // stdlib §2.6: Guid.Empty — the all-zero Guid (static readonly property).
                 if (id2->name == "Guid" && ma->member == "Empty") {
                     return llvm::ConstantAggregateZero::get(guidStructType());
+                }
+            }
+        }
+    }
+    // fix #499 / §9.8: Range<T> instance member access.
+    // The Range struct is { i64 start, i64 end, i64 step, i8 flags }.
+    // flags bit 0 = IsEndInclusive; bit 1 = startOpen; bit 2 = endOpen.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) {
+            auto* tt = ctx_.exprType(*ma->target);
+            if (isRangeType(tt)) {
+                llvm::Value* rv = lowerExpr(*ma->target);
+                if (!rv) return nullptr;
+                const auto& mbr = ma->member;
+                if (mbr == "Start") {
+                    // §9.8: Start is T? (nullable). For the value-in-var case we
+                    // return the i64 lo field directly, cast to i32 (int range).
+                    // TODO: open-ended ranges (bit 1 of flags) should return null.
+                    llvm::Value* lo = builder_.CreateExtractValue(rv, {0u}, "r.start");
+                    // Narrow to i32 for int-range Start (T = int → i32).
+                    return builder_.CreateTrunc(lo, i32(), "r.start.i32");
+                }
+                if (mbr == "End") {
+                    llvm::Value* hi = builder_.CreateExtractValue(rv, {1u}, "r.end");
+                    return builder_.CreateTrunc(hi, i32(), "r.end.i32");
+                }
+                if (mbr == "Step") {
+                    // §9.8: Step is long (i64).
+                    return builder_.CreateExtractValue(rv, {2u}, "r.step");
+                }
+                if (mbr == "IsEndInclusive") {
+                    // flags bit 0.
+                    llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "r.flg");
+                    return builder_.CreateTrunc(flg, i1(), "r.incl");
+                }
+                if (mbr == "IsOpenEnded") {
+                    // §9.8: true if Start or End is null (bits 1 or 2 of flags).
+                    llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "r.flg");
+                    // (flags >> 1) & 3 != 0  →  startOpen or endOpen set.
+                    llvm::Value* shifted = builder_.CreateLShr(
+                        flg, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1));
+                    llvm::Value* masked  = builder_.CreateAnd(
+                        shifted,
+                        llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 3));
+                    return builder_.CreateICmpNE(
+                        masked,
+                        llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0),
+                        "r.open");
+                }
+                if (mbr == "IsEmpty") {
+                    // §9.8: a range is empty when it contains no values.
+                    // For an ascending range with Step=1 (default):
+                    //   inclusive (..)  : empty if hi < lo
+                    //   half-open (..<) : empty if hi <= lo
+                    // For Step != 1 (not yet fully general), we approximate with
+                    // the same endpoint test (correct for default-step ranges).
+                    llvm::Value* lo  = builder_.CreateExtractValue(rv, {0u}, "r.lo");
+                    llvm::Value* hi  = builder_.CreateExtractValue(rv, {1u}, "r.hi");
+                    llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "r.flg");
+                    llvm::Value* incl = builder_.CreateTrunc(flg, i1(), "r.incl");
+                    // inclusive: empty when hi < lo (i.e. NOT hi >= lo).
+                    llvm::Value* emptyIncl = builder_.CreateICmpSLT(hi, lo, "r.ei");
+                    // half-open: empty when hi <= lo (i.e. NOT hi > lo).
+                    llvm::Value* emptyHalf = builder_.CreateICmpSLE(hi, lo, "r.eh");
+                    return builder_.CreateSelect(incl, emptyIncl, emptyHalf, "r.empty");
                 }
             }
         }
@@ -1931,6 +2067,35 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                    ? builder_.CreateICmpSLE(x, hi)
                                    : builder_.CreateICmpSLT(x, hi);
             return builder_.CreateAnd(geL, leH);
+        }
+        // fix #499 / §9.8: `x in r` where r is a Range-typed variable.
+        // Load the stored { i64 start, i64 end, i64 step, i8 flags } struct
+        // and compute Contains(x) by endpoint + inclusivity check (§9.8:
+        // Step does not affect Contains). Equivalent to the inline-literal
+        // fast path above but extracts lo/hi/flags from the struct.
+        if (bin.right && !range) {
+            auto* rTy = ctx_.exprType(*bin.right);
+            if (isRangeType(rTy)) {
+                llvm::Value* x = lowerExpr(*bin.left);
+                llvm::Value* rv = lowerExpr(*bin.right);
+                if (!x || !rv) return nullptr;
+                llvm::Value* lo  = builder_.CreateExtractValue(rv, {0u}, "r.lo");
+                llvm::Value* hi  = builder_.CreateExtractValue(rv, {1u}, "r.hi");
+                llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "r.flg");
+                // Widen x to i64 for comparison against i64 start/end.
+                llvm::Value* xW = x->getType() == i64()
+                                      ? x
+                                      : builder_.CreateSExt(x, i64(), "r.xw");
+                llvm::Value* geL = builder_.CreateICmpSGE(xW, lo, "r.geL");
+                // flags bit 0: IsEndInclusive.
+                llvm::Value* incl =
+                    builder_.CreateTrunc(flg, i1(), "r.incl");
+                // Build both branches and select.
+                llvm::Value* leLE = builder_.CreateICmpSLE(xW, hi, "r.leLE");
+                llvm::Value* leLT = builder_.CreateICmpSLT(xW, hi, "r.leLT");
+                llvm::Value* leH  = builder_.CreateSelect(incl, leLE, leLT, "r.leH");
+                return builder_.CreateAnd(geL, leH, "r.in");
+            }
         }
         // §17.5: `c in s` — char membership test in a string.
         // True when the char c appears at any position in s.

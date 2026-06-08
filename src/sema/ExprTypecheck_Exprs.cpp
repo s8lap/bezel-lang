@@ -1378,6 +1378,25 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         if (re->lo) visitExpr(*re->lo);
         if (re->hi) visitExpr(*re->hi);
         if (re->step) visitExpr(*re->step);
+        // fix #499 / §9.8: give the RangeExpr itself a Range-named type so
+        // that `var r := a..b` infers lsym->declType = Range (not null).
+        // The element type is inferred from lo (or hi if lo is absent); it is
+        // recorded as the first generic arg so codegen can read it back when
+        // choosing the integer width for the Range struct's lo/hi fields.
+        // A Named TypeRef with declaration = builtinClassSym("Range") and
+        // declaration->decl = nullptr is the same shape used for DateTime /
+        // TimeSpan (scalar/struct value builtins), and lowerTypeRef will
+        // recognise it by declaration->name == "Range".
+        {
+            TypeRef* elemTy = nullptr;
+            if (re->lo)  elemTy = ctx_.exprType(*re->lo);
+            if (!elemTy && re->hi) elemTy = ctx_.exprType(*re->hi);
+            auto* rt = ctx_.makeTypeRef();
+            rt->kind = TypeRef::Kind::Named;
+            rt->declaration = builtinClassSym("Range");
+            if (elemTy) rt->genericArgs.push_back(elemTy);
+            ctx_.setExprType(&e, rt);
+        }
     }
     // Identifier / This / Base / TypeOf / NameOf / Default —
     // no expression children to recurse into.

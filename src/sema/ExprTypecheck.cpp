@@ -82,8 +82,11 @@ TypeSymbol* ExprTC::builtinClassSym(std::string_view name) {
     ts->decl = nullptr;
     // per §2.5 / §2.6 / §6.1 / §28 (issue #434): scalar/struct value types
     // have no heap allocation and no disposal obligation.
+    // §9.8: Range<T> is a compiler-intrinsic record (value type); include it
+    // so that ownership checks do not require a disposal path for Range locals.
     if (name == "DateTime" || name == "TimeSpan" ||
-        name == "Guid"     || name == "CancellationToken") {
+        name == "Guid"     || name == "CancellationToken" ||
+        name == "Range") {
         ts->isValueBuiltin = true;
     }
     builtinClassCache_[key] = ts;
