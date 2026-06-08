@@ -300,6 +300,7 @@ set(BEZEL_TEST_SOURCES
     codegen/event_leak_480_test.cpp
     codegen/cancellation_token_test.cpp
     codegen/datetime_timespan_test.cpp
+    codegen/timespan_encoding_525_526_test.cpp
     codegen/guid_test.cpp
     codegen/owned_collection_ops_test.cpp
     codegen/linked_list_test.cpp

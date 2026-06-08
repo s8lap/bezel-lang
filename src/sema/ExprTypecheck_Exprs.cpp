@@ -738,6 +738,26 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         op == "mod" || op == "&" || op == "|" || op == "^" ||
         op == "<<" || op == ">>") {
         TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+        // §2.5 (stdlib L264–265): TimeSpan + TimeSpan → TimeSpan and
+        // TimeSpan - TimeSpan → TimeSpan are compiler-intrinsic operators
+        // (TimeSpan is a builtin value type backed by a scalar i64 tick count;
+        // these operations are plain i64 add/sub). They are declared as
+        // `public static method operator +/-(a,b: TimeSpan): TimeSpan` in the
+        // stdlib but are NOT user-defined operators in any Bezel source body, so
+        // findBinaryOperator cannot find them. Intercept here before the
+        // user-Named-type guard below. The operator * (TimeSpan * double) is
+        // deliberately excluded — it requires cross-type widening that is
+        // deferred per the existing datetime_timespan_test.cpp note.
+        if (lt && lt->kind == TypeRef::Kind::Named &&
+            lt->declaration && !lt->declaration->decl &&
+            lt->declaration->name == "TimeSpan" &&
+            (op == "+" || op == "-")) {
+            auto* tsTy = ctx_.makeTypeRef();
+            tsTy->kind = TypeRef::Kind::Named;
+            tsTy->declaration = builtinClassSym("TimeSpan");
+            ctx_.setExprType(&be, tsTy);
+            return;
+        }
         // §25: arithmetic operators (+, -, *, /, mod) are NOT defined on
         // user class/record types unless the type declares a matching
         // `static method operator <op>` in its own body. `findBinaryOperator`
