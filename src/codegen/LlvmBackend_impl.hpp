@@ -134,6 +134,18 @@ public:
         declareStructs();
         declareStatics();
         declareFunctions();
+        // #510 / §10 / CG30: computeEnumValues must run BEFORE declareVtables
+        // so that enumValue_ is populated when declareVtables calls
+        // ensurePropertyAccessorFn to emit virtual/interface property accessor
+        // bodies. An arrow getter `=> Enum.Member` calls lowerExpr →
+        // enumConstant() which consults enumValue_; if enumValue_ is empty
+        // (because computeEnumValues had not run yet) enumConstant() returns
+        // nullptr and the body emits `ret i32 0` regardless of the accessor's
+        // declared value — Bug2 of #510. computeEnumValues depends only on
+        // ctx_.symbols() (populated by sema before codegen), so moving it here
+        // is safe; it has no dependency on methodFns_, vtables_, or any other
+        // codegen state that declareVtables or declareFunctions populates.
+        computeEnumValues();  // CG30 — moved before declareVtables (fix #510)
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
         // §2.5 / §22.9 (issue #503): emit ExternalLinkage getter stubs for
         // non-virtual public properties (exporter side). After declareVtables so
@@ -144,7 +156,6 @@ public:
         // so propGetSlot_ correctly reflects which imported properties are virtual.
         if (ctx_.hasImports()) declareImportedPropertyGetters();
         setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
-        computeEnumValues();  // CG30
         declareExterns();  // CG26
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);

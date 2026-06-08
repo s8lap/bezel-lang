@@ -989,6 +989,12 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
 
     llvm::Type* valTy = lowerType(pd->type.get());
     if (!valTy) valTy = i32();
+    // #510 / §7 / §12.1 / §13: resolve the property's sema TypeRef so we can
+    // detect nullable value types (int?, bool?, enum?) and wrap the accessor
+    // body's return value into the tagged { i8, T } struct when lowerExpr
+    // returns the raw inner value (Bug3 of #510). Null when pd->type is absent.
+    const sema::TypeRef* retTyRef = pd->type ? ctx_.resolvedType(*pd->type)
+                                              : nullptr;
 
     // Determine the concrete accessor body. Returns null fn (no slot fill) for
     // an abstract accessor; the override supplies the real one.
@@ -1093,9 +1099,33 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             }
         } else if (getterExpr) {
             llvm::Value* v = lowerExpr(*getterExpr);
-            if (!builder_.GetInsertBlock()->getTerminator())
+            if (!builder_.GetInsertBlock()->getTerminator()) {
+                // #510 / §7 / §12.1 / §13 (Bug3): when the property return
+                // type is a nullable value type ({ i8, T } struct) but
+                // lowerExpr returned the raw inner value (e.g. i1 for `true`,
+                // i32 for an integer literal, or ptr null for the `null`
+                // literal), wrap it into the struct before returning. Without
+                // this the ret instruction type-mismatches the function's
+                // declared return type and the IR verifier rejects the module.
+                //
+                // The mismatch arises because lowerExpr evaluates the body
+                // expression in its "natural" representation (not nullable),
+                // while the function's return type is the nullable struct
+                // derived from the property's declared type annotation. The
+                // wrap mirrors the same coercion that field initializers and
+                // argument-passing do for nullable value fields (§7).
+                if (v && v->getType() != valTy &&
+                    retTyRef && isNullableValueTy(retTyRef)) {
+                    if (llvm::isa<llvm::ConstantPointerNull>(v))
+                        // `null` literal from lowerExpr → tagged-null struct.
+                        v = nullableValueNull(retTyRef);
+                    else
+                        // Plain T value → { i8 1, T v } (has-value = true).
+                        v = wrapNullableValue(retTyRef, v);
+                }
                 builder_.CreateRet(v ? v
                                      : llvm::Constant::getNullValue(valTy));
+            }
         } else if (blockGet) {
             lowerScopedBlock(blockGet->stmts);
             if (!builder_.GetInsertBlock()->getTerminator())
