@@ -75,6 +75,17 @@ void Emitter::declareExterns() {
             std::vector<llvm::Type*> paramTys;
             for (const auto& p : ed->params)
                 paramTys.push_back(lowerType(p.type.get()));
+            // per §32 / issue #496: if the module already contains a function
+            // with this name (e.g. malloc/calloc/free declared internally by
+            // the codegen runtime), REUSE it instead of creating a second
+            // declaration. LLVM renames a conflicting second declaration
+            // (malloc → malloc.1), producing a dangling symbol at link time.
+            // The call site in lowerExternCall coerces argument widths so the
+            // canonical internal signature is always used at the LLVM level.
+            if (auto* existing = module_->getFunction(std::string(xd->name))) {
+                externFns_[xd] = existing;
+                continue;
+            }
             auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
             externFns_[xd] = llvm::Function::Create(
                 fnTy, llvm::Function::ExternalLinkage,
