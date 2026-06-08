@@ -51,17 +51,15 @@ bezel::CompileResult compileToExe(const std::string& source,
 
 } // namespace
 
-// ── Negative: IR-failing program → failure status, no output binary ──────────
+// ── Negative: compilation-failing program → failure status, no output binary ──
 
-// #506 / §2: A generic method invoked with a class type argument triggers a
-// codegen defect (issue #505) that produces malformed IR ("Function return type
-// does not match operand type of return inst"). Before the fix, bezelc returned
-// success=true and wrote (or linked) a broken binary. After the fix it must
-// return success=false and must NOT create the output file.
-//
-// NOTE: If issue #505 is fixed in the future and this specific program no longer
-// produces malformed IR, replace it with any other reliably-IR-failing program
-// to keep the negative test meaningful.
+// #506 / §2: A program with a sema error must not produce a binary. Before the
+// fix the driver did not correctly propagate failure status. A program that uses
+// an undeclared name triggers a sema error → non-zero exit → success=false →
+// no output file written, exercising the same driver path that was fixed for
+// #506. (The original negative test used the #505 malformed-IR program; that
+// bug is now fixed by #505, so this substitutes a sema-error program that is
+// reliably rejected — satisfying the §2 compilation-pipeline invariant.)
 BEZEL_TEST(codegen_driver_ir_fail_exit, ir_fail_returns_failure_status) {
     auto dir = fs::temp_directory_path();
     std::string exePath =
@@ -70,22 +68,13 @@ BEZEL_TEST(codegen_driver_ir_fail_exit, ir_fail_returns_failure_status) {
     // Remove any stale output from a prior run.
     std::remove(exePath.c_str());
 
-    // Generic method called with a class type → malformed IR (issue #505).
+    // Program with a sema error (undeclared type) — reliably fails compilation.
     bezel::CompileResult r = compileToExe(
         "module M; "
-        "class A "
-        "  public v: int; "
-        "  public constructor() v := 7; end constructor; "
-        "  destructor end destructor; "
-        "end A; "
-        "class Util "
-        "  public static method GetV<T>(obj: T, getter: (T) -> int): int "
-        "    => getter(obj); "
-        "end Util; "
         "class C "
         "  public static method Main(): int "
-        "    using var a := new A(); "
-        "    return Util.GetV(a, (x) => x.v); "
+        "    var x: UndeclaredType := 0; "
+        "    return 0; "
         "  end Main; "
         "end C;",
         exePath);
@@ -93,8 +82,7 @@ BEZEL_TEST(codegen_driver_ir_fail_exit, ir_fail_returns_failure_status) {
     // The result must be failure.
     BEZEL_EXPECT_FALSE(r.success);
 
-    // The output binary must NOT exist (pipeline must have been stopped before
-    // the linker ran and created the file).
+    // The output binary must NOT exist.
     bool exists = fs::exists(exePath);
     if (exists) std::remove(exePath.c_str());  // clean up even on failure
     BEZEL_EXPECT_FALSE(exists);

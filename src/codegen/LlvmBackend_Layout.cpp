@@ -1670,6 +1670,30 @@ llvm::Value* Emitter::emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
 llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                        llvm::Type*& elemTy) {
     auto* ms = storageMemberOf(ctx_.exprSymbol(ma));
+    // per §14.1/§14.2 (issue #505): when `ms` is null, sema did not resolve
+    // the member access (e.g. `x.v` where `x` is an unannotated lambda param
+    // of a generic method call — sema typed `x` as the bare T TypeRef so it
+    // could not look up field `v`). If the TARGET identifier has a
+    // lambdaParamTypeHint_ for a concrete class TypeRef (injected by the
+    // pre-pass in lowerCall), resolve the member by name from that class.
+    if (!ms && ma.target) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            sema::Symbol* tSym = ctx_.exprSymbol(*id);
+            auto hit = lambdaParamTypeHint_.find(tSym);
+            if (hit != lambdaParamTypeHint_.end() && hit->second) {
+                sema::TypeRef* hintTy = hit->second;
+                if (hintTy->kind == sema::TypeRef::Kind::Named &&
+                    hintTy->declaration) {
+                    // Look up member by name on the hinted class/record.
+                    for (sema::Symbol* m : hintTy->declaration->members) {
+                        if (!m || m->name != ma.member) continue;
+                        ms = storageMemberOf(m);
+                        if (ms) break;
+                    }
+                }
+            }
+        }
+    }
     if (!ms || !ms->parent || !ma.target) return nullptr;
     auto idxIt = fieldIndex_.find(ms);
     // CG-generic: for generic class field access (e.g. bd.value where

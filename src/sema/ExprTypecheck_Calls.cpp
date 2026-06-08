@@ -445,6 +445,46 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         rt = substituteMemberType(rt, ma->target.get(),
                                                   ms->parent);
                 }
+                // per §14.1/§14.2 (issue #504): a GENERIC METHOD (its own
+                // `<T>` params on a non-generic parent, e.g. `static method
+                // Identity<T>(v:T):T` on plain `Wrapper`) whose declared
+                // return type is a bare method-level type parameter is also
+                // typed by the substituted concrete type at the call site.
+                // `substituteMemberType` only handles class-level params
+                // (via `ms->parent->genericParams`); it is a no-op here
+                // because `Wrapper` has no generic params. Infer T from the
+                // call's arguments: for each method generic param, find the
+                // first value parameter whose declared type is exactly that
+                // param name, and read the corresponding call argument's
+                // sema exprType. If the return type is a bare reference to
+                // one of those params, substitute it. This lets chained
+                // access `Identity(r).x` resolve `.x` against the concrete
+                // record type rather than the unresolvable bare `T`.
+                if (!md->genericParams.empty() &&
+                    rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    rt->astNode->name->parts.size() == 1) {
+                    std::string_view retParamName = rt->astNode->name->parts[0];
+                    for (const auto& gp : md->genericParams) {
+                        if (gp.name != retParamName) continue;
+                        // Found the return type names this generic param.
+                        // Find a value param whose type IS this param name.
+                        for (std::size_t pi = 0;
+                             pi < md->params.size() &&
+                             pi < ce.args.size(); ++pi) {
+                            const ast::Type* pt = md->params[pi].type.get();
+                            if (!pt || pt->kind != ast::TypeKind::Named ||
+                                !pt->name ||
+                                pt->name->parts.size() != 1 ||
+                                pt->name->parts[0] != retParamName)
+                                continue;
+                            if (!ce.args[pi].value) continue;
+                            TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+                            if (argTy) { rt = argTy; break; }
+                        }
+                        break;
+                    }
+                }
                 ctx_.setExprType(&ce, rt);
             }
         } else if (md && !md->returnType) {

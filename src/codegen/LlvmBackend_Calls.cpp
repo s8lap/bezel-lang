@@ -5834,20 +5834,124 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         args.push_back(recv);
         argExprs.push_back(nullptr);  // receiver has no widening signedness
     }
-    // §22.4/§22.7: place arguments into parameter order (named by name,
-    // positional by position, omitted parameters defaulted).
-    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        if (!buildOrderedArgs(md->params, call.args, args, &argExprs))
-            return nullptr;
-    } else {
-        for (const auto& a : call.args) {
-            if (!a.value) return nullptr;
-            llvm::Value* v = lowerExpr(*a.value);
-            if (!v) return nullptr;
-            args.push_back(v);
-            argExprs.push_back(a.value.get());
+    // per §14.1/§14.2 (issue #505): a generic *method* with a closure-typed
+    // parameter (e.g. `GetV<T>(obj:T, getter:(T)->int):int`) may have lambda
+    // arguments that need the concrete LLVM type for T to be compiled
+    // correctly. `buildOrderedArgs` runs `lowerLambda` for each lambda arg,
+    // which consults `expectedFunctionType_` (set from the formal param's
+    // function type) to resolve param types. When the formal function type
+    // contains an unresolved generic param T, `lowerTypeRef(T)` returns i32
+    // and the lambda param keeps the placeholder type. As a result `x.v` on
+    // an i32 receiver returns null → the closure emits `ret void` in an i32
+    // function → IR verification failure.
+    //
+    // Fix: before calling `buildOrderedArgs`, infer the method-level generic
+    // substitution from non-lambda arguments (using their sema exprType, not
+    // lowering them) and install it in genericSubst_ so `lowerTypeRef(T)` in
+    // `lowerLambda` returns the concrete LLVM type. IMPORTANT: restore
+    // genericSubst_ to its ORIGINAL value after buildOrderedArgs completes,
+    // before the main substitution setup at lines 5906-5974 runs. This prevents
+    // the pre-inferred substitution from leaking into subsequent compilations
+    // (emitFunctionBody for the unspecialized generic would then use T=ptr for
+    // its closure call type, producing a i32(ptr,ptr) fnTy with an i32 arg →
+    // IR verification failure).
+    {
+        bool didPrePass = false;
+        std::unordered_map<std::string_view, llvm::Type*> preSavedSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> preSavedSema;
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            if (!md->genericParams.empty()) {
+                // Check whether any argument is a lambda (function-type formal).
+                bool hasLambdaArg = false;
+                for (const auto& a : call.args) {
+                    if (a.value &&
+                        dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
+                        hasLambdaArg = true; break;
+                    }
+                }
+                if (hasLambdaArg) {
+                    // Pre-infer method generic params from non-lambda args.
+                    std::unordered_map<std::string_view, llvm::Type*> preSubst =
+                        genericSubst_;
+                    std::unordered_map<std::string_view,
+                                       const sema::TypeRef*> preSema =
+                        genericSubstSemaTy_;
+                    for (const auto& gp : md->genericParams) {
+                        if (preSubst.count(gp.name)) continue;
+                        for (std::size_t pi = 0;
+                             pi < md->params.size() && pi < call.args.size();
+                             ++pi) {
+                            const ast::Type* pt = md->params[pi].type.get();
+                            if (!pt || pt->kind != ast::TypeKind::Named ||
+                                !pt->name ||
+                                pt->name->parts.size() != 1 ||
+                                pt->name->parts[0] != gp.name)
+                                continue;
+                            if (!call.args[pi].value) continue;
+                            // Skip lambda args — only infer from concrete vals.
+                            if (dynamic_cast<const ast::LambdaExpr*>(
+                                    call.args[pi].value.get()))
+                                continue;
+                            sema::TypeRef* at =
+                                ctx_.exprType(*call.args[pi].value);
+                            if (!at) continue;
+                            llvm::Type* lt = lowerTypeRef(at);
+                            if (lt != i32()) {
+                                preSubst[gp.name] = lt;
+                                preSema[gp.name] = at;
+                            }
+                            break;
+                        }
+                    }
+                    if (preSubst != genericSubst_) {
+                        preSavedSubst = genericSubst_;
+                        preSavedSema  = genericSubstSemaTy_;
+                        genericSubst_ = std::move(preSubst);
+                        genericSubstSemaTy_ = std::move(preSema);
+                        didPrePass = true;
+                    }
+                }
+            }
         }
-    }
+        // §22.4/§22.7: place arguments into parameter order.
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            if (!buildOrderedArgs(md->params, call.args, args, &argExprs)) {
+                // Restore before early-return.
+                if (didPrePass) {
+                    genericSubst_ = std::move(preSavedSubst);
+                    genericSubstSemaTy_ = std::move(preSavedSema);
+                }
+                return nullptr;
+            }
+        } else {
+            for (const auto& a : call.args) {
+                if (!a.value) {
+                    if (didPrePass) {
+                        genericSubst_ = std::move(preSavedSubst);
+                        genericSubstSemaTy_ = std::move(preSavedSema);
+                    }
+                    return nullptr;
+                }
+                llvm::Value* v = lowerExpr(*a.value);
+                if (!v) {
+                    if (didPrePass) {
+                        genericSubst_ = std::move(preSavedSubst);
+                        genericSubstSemaTy_ = std::move(preSavedSema);
+                    }
+                    return nullptr;
+                }
+                args.push_back(v);
+                argExprs.push_back(a.value.get());
+            }
+        }
+        // Restore genericSubst_ to original state after the lambda compilation
+        // that benefited from the pre-inferred substitution. The definitive
+        // substitution is set up below (lines ~5930+).
+        if (didPrePass) {
+            genericSubst_ = std::move(preSavedSubst);
+            genericSubstSemaTy_ = std::move(preSavedSema);
+        }
+    }  // end pre-pass + buildOrderedArgs block
 
     // CG-generic: before calling the method, if the receiver's exprType
     // has generic args and the parent TypeSymbol has genericParams,

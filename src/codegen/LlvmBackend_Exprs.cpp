@@ -2775,12 +2775,57 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 expectedFunctionType_->funcParams[pi].type) {
                 sema::TypeRef* expRT = expectedFunctionType_->funcParams[pi].type;
                 llvm::Type* expected = lowerTypeRef(expRT);
+                // per §14.1/§14.2 (issue #505): if lowerTypeRef still returns
+                // i32 (unresolved T from a method-level generic param) but the
+                // genericSubst_ has an explicit mapping for this param name
+                // (populated by the pre-pass in lowerCall), use that mapping
+                // directly. This handles the case where the pre-pass set T=ptr
+                // but lowerTypeRef returned i32 because the generic param
+                // TypeRef used a different AST node than what genericSubst_ was
+                // keyed on — a safety net for the nominal path.
+                if (expected == i32() && !genericSubst_.empty() &&
+                    expRT->kind == sema::TypeRef::Kind::Named &&
+                    !expRT->declaration && expRT->astNode &&
+                    expRT->astNode->name &&
+                    expRT->astNode->name->parts.size() == 1) {
+                    auto gsit = genericSubst_.find(expRT->astNode->name->parts[0]);
+                    if (gsit != genericSubst_.end() && gsit->second != i32())
+                        expected = gsit->second;
+                }
                 if (expected != i32()) {
                     ty = expected;
                     // Backfill: give the ParameterSymbol a resolved sema type so
-                    // that body identifier references pick up the right TypeRef.
-                    if (par && !par->declType)
-                        lambdaParamTypeHint_[par] = expRT;
+                    // that body identifier references (e.g. `x.v` — a field on
+                    // the lambda param) pick up the right TypeRef. Prefer the
+                    // CONCRETE TypeRef from genericSubstSemaTy_ over the bare
+                    // unresolved generic param TypeRef (expRT): with an unresolved
+                    // T TypeRef as the hint, lowerExpr(x) would set
+                    // ctx_.exprType(x) = T (no declaration) — and then
+                    // ctx_.exprSymbol(x.v) stays null (sema couldn't resolve .v
+                    // on an unresolved T) → fieldAddr returns null → ret void in
+                    // an i32 function → IR verification failure (#505).
+                    // With the concrete A TypeRef, lowerExpr(x) injects A's type
+                    // so the MemberAccess resolution chain can proceed.
+                    if (par && !par->declType) {
+                        sema::TypeRef* hintTy = expRT;
+                        // Resolve an unresolved generic param name through the
+                        // active sema substitution to get the concrete TypeRef.
+                        // genericSubstSemaTy_ stores const TypeRef*; the
+                        // TypeRef lives in the SemaContext arena, which is not
+                        // logically modified by the lookup — const_cast is safe.
+                        if (expRT->kind == sema::TypeRef::Kind::Named &&
+                            !expRT->declaration &&
+                            expRT->astNode && expRT->astNode->name &&
+                            expRT->astNode->name->parts.size() == 1 &&
+                            !genericSubstSemaTy_.empty()) {
+                            auto sit = genericSubstSemaTy_.find(
+                                expRT->astNode->name->parts[0]);
+                            if (sit != genericSubstSemaTy_.end() &&
+                                sit->second)
+                                hintTy = const_cast<sema::TypeRef*>(sit->second);
+                        }
+                        lambdaParamTypeHint_[par] = hintTy;
+                    }
                 }
             }
             userParamTys.push_back(ty);
