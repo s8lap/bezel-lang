@@ -445,12 +445,18 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     //   Task<T>        → T
     //   OwnedTask<T>   → T (Pattern B; ownership transfer is the awaiter's job)
     llvm::Type* resultTy = nullptr;
+    const sema::TypeRef* resultSemaTy = nullptr;
     if (ci.returnType) {
         auto* retRef = ctx_.resolvedType(*ci.returnType);
-        if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0])
-            resultTy = lowerTypeRef(retRef->genericArgs[0]);
+        if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
+            resultSemaTy = retRef->genericArgs[0];
+            resultTy = lowerTypeRef(resultSemaTy);
+        }
     }
     asyncResultTy_ = resultTy;
+    // §30.1 / §7.2 (#493): keep the sema TypeRef for T so emitAsyncComplete
+    // can detect a nullable value type and wrap the returned plain value.
+    asyncResultSemaType_ = resultSemaTy;
 
     // Build the kind-agnostic frame with three trailing async fields:
     //   [.. ] outerTask (ptr), [.. ] pendingTask (ptr), [.. ] spillArea (ptr).
@@ -740,6 +746,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smAllocaToField_.clear();
         asyncResumeFn_ = nullptr;
         asyncResultTy_ = nullptr;
+        asyncResultSemaType_ = nullptr;
     }
 }
 
@@ -1496,6 +1503,25 @@ void Emitter::emitAsyncComplete(llvm::Value* value) {
         {ptrTy(), ptrTy(), i64()});
 
     if (value && asyncResultTy_) {
+        // §30.1 / §7.2 (#493): when T is a nullable value type (int?, double?,
+        // enum?) the task result buffer must hold the full {hasValue=1, value}
+        // struct (sized by asyncResultTy_). A plain returned literal/primitive
+        // (e.g. `return 42`) comes out of lowerExpr as the non-nullable inner
+        // type (e.g. i32). Without wrapping, CreateStore would write i32 into a
+        // {i8, i32}-typed alloca at offset 0, leaving the hasValue field (byte 0)
+        // equal to the low byte of the integer and the value field (offset 4)
+        // zero — producing hasValue=non-zero but value=0 for int?, or hasValue=0
+        // (first byte of the double) → treated-null for double?. Fix: detect the
+        // mismatch and wrap the value into the nullable struct first.
+        if (asyncResultSemaType_ && isNullableValueTy(asyncResultSemaType_) &&
+            value->getType() != asyncResultTy_) {
+            auto* nst = llvm::dyn_cast<llvm::StructType>(asyncResultTy_);
+            if (nst && nst->getNumElements() == 2 &&
+                value->getType() == nst->getElementType(1)) {
+                // Plain value → {hasValue=1, value} (per §7.2).
+                value = wrapNullableValue(asyncResultSemaType_, value);
+            }
+        }
         // Spill the value into a stack slot and hand its address + size to the
         // runtime (§30.1: `return expression;` completes the task with value).
         uint64_t sz = module_->getDataLayout().getTypeAllocSize(asyncResultTy_);
