@@ -689,6 +689,121 @@ void Emitter::declareImportedFunctions() {
     }
 }
 
+// §2.5 / §22.9 (issue #503): emit a named, ExternalLinkage getter function for
+// every public non-virtual non-indexer PropertySymbol on every public non-generic
+// local class. The function `bz$<Class>$<Prop>$propget(ptr %this) -> T` has the
+// same signature as the virtual-property accessor (ensurePropertyAccessorFn),
+// which is InternalLinkage. A separate ExternalLinkage wrapper is used so the
+// importer can call it without touching the (potentially inlined) local accessor.
+//
+// The body calls `ensurePropertyAccessorFn(ts, ps, /*isSet=*/false)` (which does
+// the real work and caches the getter) — then the wrapper just tail-calls it.
+// If ensurePropertyAccessorFn returns nullptr (abstract with no body) the
+// wrapper is not emitted; abstract non-virtual properties don't exist in practice
+// but guard for safety.
+//
+// Virtual / override / abstract properties already dispatch via the vtable (the
+// slot carries the concrete accessor). Only plain, non-virtual getters need a
+// stable cross-module symbol. Static properties have no `this` parameter and are
+// handled separately by the static-field path; they're excluded here.
+void Emitter::emitExportedPropertyGetters() {
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (ts->visibility != ast::Visibility::Public) continue;
+        if (!ts->genericParams.empty()) continue;
+        for (sema::Symbol* m : ts->members) {
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+            if (!ps || ps->isIndexer) continue;
+            // Skip virtual/override/abstract/static — they have other dispatch paths.
+            if (isVirtualProperty(ps)) continue;
+            bool isStatic = false;
+            for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
+            if (isStatic) continue;
+            // Only public properties are part of the cross-module surface.
+            if (ps->visibility != ast::Visibility::Public) continue;
+            // Only getters — properties with no getter (setter-only, §22.9) skip.
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            // Derive the return type.
+            llvm::Type* valTy = lowerType(pd->type.get());
+            if (!valTy) valTy = i32();
+            std::string clsName = std::string(ts->name);
+            std::string propName = std::string(ps->name);
+            std::string mangled = "bz$" + clsName + "$" + propName + "$propget";
+            // Avoid double-declaration if the function was already created
+            // (shouldn't happen, but guard).
+            if (module_->getNamedValue(mangled)) continue;
+            auto* fnTy = llvm::FunctionType::get(valTy, {ptrTy()}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::GlobalValue::ExternalLinkage, mangled, *module_);
+            // Emit the body: call ensurePropertyAccessorFn to get the concrete
+            // getter (arrow or block), then forward the result.
+            // ensurePropertyAccessorFn requires the current emitter state; save/
+            // restore it exactly as other synthesized functions do.
+            llvm::Function* innerFn =
+                ensurePropertyAccessorFn(ts, ps, /*isSet=*/false);
+            if (!innerFn) {
+                // No concrete getter body (abstract or interface with no body).
+                // Erase the incomplete declaration so the module stays valid.
+                fn->eraseFromParent();
+                continue;
+            }
+            auto* savedFn = currentFn_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            currentFn_ = fn;
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            builder_.SetInsertPoint(entry);
+            llvm::Value* thisArg = &*fn->args().begin();
+            // Forward: call the (InternalLinkage) inner getter with `this`.
+            llvm::Value* result = builder_.CreateCall(
+                innerFn->getFunctionType(), innerFn, {thisArg});
+            builder_.CreateRet(result);
+            currentFn_ = savedFn;
+            if (savedInsert) builder_.SetInsertPoint(savedInsert);
+        }
+    }
+}
+
+
+// §2.5 / §22.9 (issue #503): declare an external getter function for every
+// imported non-virtual PropertySymbol, so the property-access lowering can call
+// it cross-module. The signature matches what the exporter emits in
+// emitExportedPropertyGetters: `bz$<Class>$<Prop>$propget(ptr %this) -> T`.
+// Only engages for non-virtual properties (virtual ones dispatch via the vtable
+// slot already populated by buildVtable). Must run after declareVtables
+// (which calls buildVtable for imported types), so propGetSlot_ is accurate.
+void Emitter::declareImportedPropertyGetters() {
+    for (sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+        if (!ps || ps->isIndexer) continue;
+        // Skip virtual: they dispatch through the vtable slot.
+        if (propGetSlot_.count(ps)) continue;
+        // Also skip interface properties: those dispatch through the itable.
+        if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
+            continue;
+        // Skip if already declared.
+        if (importedPropGetterFns_.count(ps)) continue;
+        // Derive the return type from the side table.
+        sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+        llvm::Type* retTy = retRef ? lowerTypeRef(retRef) : i32();
+        std::string clsName = ps->parent ? std::string(ps->parent->name) : "";
+        std::string mangled =
+            "bz$" + clsName + "$" + std::string(ps->name) + "$propget";
+        // Re-use an existing module declaration if present (e.g. a double-
+        // import from two transitive dependencies with the same symbol).
+        if (auto* existing = module_->getFunction(mangled)) {
+            importedPropGetterFns_[ps] = existing;
+            continue;
+        }
+        auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        importedPropGetterFns_[ps] = fn;
+    }
+}
+
+
 // §2.5 / §2.6 step 4 / §22.7 (issue #328 FINDING [7]): declare an IMPORTED
 // constructor as an EXTERNAL `void(ptr this, params...)` function so a
 // cross-module `new ImportedT(args)` binds to the dependency's emitted

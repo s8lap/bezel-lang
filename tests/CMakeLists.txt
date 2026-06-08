@@ -350,6 +350,7 @@ set(BEZEL_TEST_SOURCES
     module/cross_module_import_test.cpp
     module/cross_module_exception_test.cpp
     module/cross_module_iterator_test.cpp
+    module/xmod_property_503_test.cpp
 
     runtime/event_subscription_test.cpp
 
