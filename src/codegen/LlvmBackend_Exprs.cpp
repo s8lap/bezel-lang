@@ -3141,6 +3141,28 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                         }
                         lambdaParamTypeHint_[par] = hintTy;
                     }
+                } else if (par && !par->declType) {
+                    // per §14.1 (issue #516): even when the formal param type
+                    // resolves to i32 (e.g. `int` in `fn:(int)->U`), backfill
+                    // the lambda-param TypeRef hint so that body references like
+                    // `x.ToString()` see `int` as the receiver type and take
+                    // the primitive dispatch path. Without this, the lambda param
+                    // `x` has no sema type at all (sema left it null for an
+                    // unannotated param with no event-handler context), and
+                    // `x.ToString()` in the body falls to the `!calleeSym` catch
+                    // (no MethodSymbol for int.ToString on an untyped receiver)
+                    // which returns nullptr → the lambda closure emits `ret void`
+                    // in a `ptr`-returning function → IR verification failure.
+                    // The LLVM type `ty` stays i32 (correct for int), but sema's
+                    // type-oracle (`ctx_.exprType(x)`) now returns `int TypeRef`
+                    // so the primitive-intrinsic branch at lowerExpr line ~447
+                    // correctly dispatches `x.ToString()`.
+                    // Only apply this to CONCRETE (non-generic, non-null) TypeRefs
+                    // to avoid injecting an unresolved generic placeholder.
+                    if (expRT->kind == sema::TypeRef::Kind::Primitive &&
+                        expRT->primitive != sema::PrimitiveType::None) {
+                        lambdaParamTypeHint_[par] = expRT;
+                    }
                 }
             }
             userParamTys.push_back(ty);

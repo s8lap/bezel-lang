@@ -351,6 +351,7 @@ set(BEZEL_TEST_SOURCES
     codegen/property_accessor_types_510_test.cpp
     codegen/explicit_typeargs_509_test.cpp
     codegen/primitive_tostring_ieee_518_519_test.cpp
+    codegen/generic_value_method_515_516_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
