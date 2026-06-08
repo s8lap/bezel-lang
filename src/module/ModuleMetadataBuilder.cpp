@@ -318,6 +318,10 @@ std::vector<MetaGenericParam> convertGenericParams(
 
 // --- members ----------------------------------------------------------------
 
+// Forward declaration — defined after appendEnumConstants (§11.3, issue #502):
+// convertMember needs to call convertTypeDecl for nested types.
+MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx);
+
 // Convert a single exported member. Returns false to skip (kind not part of the
 // exported surface — e.g. a destructor, which §13.3 notes is not user-callable;
 // its public face is Dispose()).
@@ -414,8 +418,21 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         }
         return true;
     }
-    // Destructor (§13.3: not part of the public surface — Dispose() is) and
-    // nested types are not emitted as members in this increment.
+    // Destructor (§13.3: not part of the public surface — Dispose() is): skip.
+    if (dynamic_cast<const sema::DestructorSymbol*>(&m)) return false;
+    // §11.3 (schema v4, issue #502): emit public nested types so that a
+    // downstream importer can reconstruct a NestedTypeSymbol and resolve
+    // `new Outer.Inner()` / `Outer.Inner.Method()` across module boundaries.
+    if (auto* nts = dynamic_cast<const sema::NestedTypeSymbol*>(&m)) {
+        if (!nts->type) return false;  // degenerate nested type (parse error)
+        out.kind = MetaMemberKind::NestedType;
+        // The NestedTypeSymbol wrapper's name/visibility/modifiers are already
+        // set above (out.name = mm.name, out.visibility = ..., out.modifiers = ...).
+        // Emit the inner TypeSymbol's full declaration as `nestedType`.
+        out.nestedType = std::make_unique<MetaTypeDecl>(
+            convertTypeDecl(*nts->type, ctx));
+        return true;
+    }
     return false;
 }
 
@@ -462,6 +479,10 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx) 
     out.kind = toMetaTypeDeclKind(t.kind);
     out.visibility = toMetaVisibility(t.visibility, /*inInterface=*/false);
     out.modifiers = toStrings(t.modifiers);
+    // §9.2 (schema v4, issue #501): carry the positional-record flag so an
+    // importer can reconstruct TypeSymbol::hasPositionalFields and pass the
+    // §9.2 auto-equality check without an ast::TypeDecl.
+    out.hasPositionalFields = t.hasPositionalFields;
 
     const bool inInterface = (t.kind == ast::TypeDeclKind::Interface);
 

@@ -238,6 +238,34 @@ struct Loader {
         return out;
     }
 
+    // Reconstruct a full TypeSymbol from a MetaTypeDecl (used for nested types,
+    // §11.3 / issue #502). The reconstructed TypeSymbol lives in `parent`'s
+    // member scope and has its own fresh member scope for its own members.
+    sema::TypeSymbol* reconstructTypeSymbol(const MetaTypeDecl& td,
+                                            sema::TypeSymbol& parent) {
+        auto* t = ctx.makeImportedSymbol<sema::TypeSymbol>();
+        t->name = ctx.internString(td.name);
+        t->kind = fromMetaTypeDeclKind(td.kind);
+        t->visibility = fromMetaVisibility(td.visibility);
+        t->modifiers = intern(td.modifiers);
+        t->scope = parent.memberScope;
+        t->memberScope = ctx.newScope();
+        // §9.2 (issue #501): propagate positional-record flag.
+        t->hasPositionalFields = td.hasPositionalFields;
+        t->genericParams = convertGenericParams(td.genericParams, t->memberScope);
+        for (const MetaType& base : td.baseTypes) {
+            sema::TypeRef* ref = convert(base);
+            t->baseTypeRefs.push_back(ref);
+            if (ref->kind == sema::TypeRef::Kind::Named && ref->declaration)
+                t->baseTypes.push_back(ref->declaration);
+        }
+        for (const MetaMember& mm : td.members) {
+            if (sema::Symbol* m = convertMember(mm, *t))
+                t->members.push_back(m);
+        }
+        return t;
+    }
+
     // Reconstruct one member onto `parent`. Returns the symbol (already added by
     // caller) or null for member kinds not reconstructed in this increment.
     sema::Symbol* convertMember(const MetaMember& mm, sema::TypeSymbol& parent) {
@@ -360,6 +388,23 @@ struct Loader {
                 fieldTypes_[p] = convert(mm.type);
                 return p;
             }
+            case MetaMemberKind::NestedType: {
+                // §11.3 (schema v4, issue #502): reconstruct a NestedTypeSymbol
+                // with a fully populated inner TypeSymbol so that `new Outer.Inner()`
+                // and `Outer.Inner.Method()` resolve in the importer.
+                // The inner TypeSymbol's members (including their return types in
+                // returnTypes_ / fieldTypes_) are populated by the recursive
+                // convertMember calls inside reconstructTypeSymbol.
+                if (!mm.nestedType) return nullptr;  // malformed (no inner decl)
+                auto* nts = ctx.makeImportedSymbol<sema::NestedTypeSymbol>();
+                nts->name = ctx.internString(mm.name);
+                nts->visibility = fromMetaVisibility(mm.visibility);
+                nts->modifiers = intern(mm.modifiers);
+                nts->parent = &parent;
+                nts->scope = parent.memberScope;
+                nts->type = reconstructTypeSymbol(*mm.nestedType, parent);
+                return nts;
+            }
             // Indexer / Event are part of the schema but deferred.
             default:
                 return nullptr;
@@ -394,6 +439,10 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
         t->modifiers = loader.intern(td.modifiers);
         t->scope = sema::kModuleScope;
         t->memberScope = ctx.newScope();
+        // §9.2 (schema v4, issue #501): carry the positional-record flag so the
+        // §9.2 auto-equality check in ExprTypecheck_Exprs.cpp reads it from
+        // TypeSymbol::hasPositionalFields (no ast::TypeDecl exists for imported types).
+        t->hasPositionalFields = td.hasPositionalFields;
         localTypes[td.name] = t;
         created.push_back(t);
     }

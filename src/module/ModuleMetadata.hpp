@@ -27,6 +27,7 @@
 // pointers — so it survives across compilations and process boundaries.
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -71,7 +72,16 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // simply carries no instance-field `valueText` (absent → empty) and its ctor
 // members reconstruct exactly as a v3-produced blob's would — and a v2 reader
 // rejects a v3 blob (version > its kSchemaVersion), per the documented rule.
-inline constexpr std::uint32_t kSchemaVersion = 3;
+//
+// v4 (issue #501 / #502): two metadata extensions:
+//   - MetaTypeDecl::hasPositionalFields (§9.2 / issue #501): a new 6th scalar
+//     in TYPE_BLOCK's header. v3 readers reject v4 blobs (version check) and
+//     v4 readers read v3 blobs with only 5 scalars (missing 6th → false).
+//   - MetaMemberKind::NestedType = 8 (§11.3 / issue #502): a new member kind
+//     that carries an embedded TYPE_BLOCK for the nested type's full declaration.
+//     v3 readers reject v4 blobs. v4 readers reconstruct NestedTypeSymbol so
+//     that `new Outer.Inner()` resolves cross-module.
+inline constexpr std::uint32_t kSchemaVersion = 4;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
@@ -197,7 +207,11 @@ enum class MetaMemberKind : std::uint8_t {
     Event = 5,        // §24 event
     Const = 6,        // §11 const member
     EnumConstant = 7, // §10 enum constant
+    NestedType = 8,   // §11.3 nested class/record/enum (issue #502)
 };
+
+// Forward-declare MetaTypeDecl for use in MetaMember::nestedType.
+struct MetaTypeDecl;
 
 // A public member of a type. One struct covers all member kinds (distinguished
 // by `kind`); fields irrelevant to a kind stay default. This mirrors the
@@ -229,6 +243,23 @@ struct MetaMember {
     bool hasEnumValue = false;
     std::int64_t enumValue = 0;
 
+    // NestedType (§11.3, issue #502): when kind == NestedType, this holds
+    // the complete MetaTypeDecl for the nested type. Heap-allocated via
+    // unique_ptr to break the cyclic MetaMember → MetaTypeDecl → MetaMember
+    // dependency (MetaTypeDecl::members is std::vector<MetaMember>). Null
+    // for all other member kinds.
+    std::unique_ptr<MetaTypeDecl> nestedType;
+
+    // MetaMember must be movable (for vector resize) but not copyable in
+    // the presence of unique_ptr. We provide explicit copy semantics via
+    // operator==; the serializer/deserializer and loader only move or
+    // construct in place, so move-only is fine for production paths.
+    MetaMember() = default;
+    MetaMember(MetaMember&&) = default;
+    MetaMember& operator=(MetaMember&&) = default;
+    MetaMember(const MetaMember& o);
+    MetaMember& operator=(const MetaMember& o);
+
     bool operator==(const MetaMember&) const;
 };
 
@@ -244,6 +275,11 @@ struct MetaTypeDecl {
     // are interfaces — same convention as sema::TypeSymbol::baseTypeRefs.
     std::vector<MetaType> baseTypes;
     std::vector<MetaMember> members;
+    // §9.1 / §9.2 (issue #501): true when this type is a positional record
+    // (declared with a `(field...)` list). Carried in the metadata so an
+    // importer can reconstruct TypeSymbol::hasPositionalFields, which the
+    // §9.2 auto-equality check reads when there is no ast::TypeDecl.
+    bool hasPositionalFields = false;
 
     bool operator==(const MetaTypeDecl&) const;
 };

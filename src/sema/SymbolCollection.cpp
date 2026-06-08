@@ -196,6 +196,10 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
             sym->members.push_back(member);
         }
     }
+    // §9.1 / §9.2 (issue #501): mirror the AST flag onto the TypeSymbol so that
+    // imported positional records (which have no ast::TypeDecl in the importer)
+    // still pass the §9.2 auto-equality-bearing check via TypeSymbol::hasPositionalFields.
+    sym->hasPositionalFields = td.hasPositionalFields;
     // §9.1: a record's positional fields become public read-only members,
     // alongside any body-declared members. They carry no body `FieldDecl`, so
     // the FieldSymbol's `decl` is the owning TypeDecl and its type is read
