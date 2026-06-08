@@ -636,6 +636,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         return;
                     }
                 }
+                // §8.2 (#487): `v.GetType()` → Type.  GetType is a universal
+                // Object member (§8.1) present on every type, so it reaches here
+                // with no resolved MethodSymbol on any receiver.  Its return type
+                // is the `Type` builtin class (stdlib §2.13).  We type it here
+                // in typeCall (not in resolveMemberAccess) so the CallExpr itself
+                // is typed, which is what downstream type-inference (var locals,
+                // return-type checks, assignability) consults.  Typing is
+                // unconditional on receiver kind: GetType is valid on classes,
+                // records, enums, primitives (boxed per §8.2), and Object.
+                if (m == "GetType" && ce.args.empty()) {
+                    auto* typeTy = ctx_.makeTypeRef();
+                    typeTy->kind = TypeRef::Kind::Named;
+                    typeTy->declaration = builtinClassSym("Type");
+                    ctx_.setExprType(&ce, typeTy);
+                    return;
+                }
                 // stdlib §5: build a lazy IEnumerable<T> result type for a
                 // deferred LINQ operator. Represented as a Named TypeRef with
                 // no declaration and no astNode (a structural sentinel the
@@ -3387,6 +3403,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
             else if (m == "Equals")
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            else if (m == "GetType") {
+                // §8.2 (#487): GetType() is a universal Object member (§8.1)
+                // and returns the `Type` builtin class (stdlib §2.13).
+                auto* typeTy = ctx_.makeTypeRef();
+                typeTy->kind = TypeRef::Kind::Named;
+                typeTy->declaration = builtinClassSym("Type");
+                ctx_.setExprType(&ma, typeTy);
+            }
         }
         // issue #414 (§8.1, §11.3, §12.1): diagnose a genuinely-unknown member.
         // Left undiagnosed, an unresolved member produces no resolved symbol and
@@ -3434,6 +3458,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 std::string("no member `") + std::string(ma.member) +
                     "` on type `" + std::string(targetType->name) +
                     "` (§11.3, §12.1)");
+        }
+        // §8.2 (#487): `GetType` is universal and returns `Type` (stdlib §2.13).
+        // Set the MemberAccessExpr's type here so that: (a) a bare `obj.GetType`
+        // in value position is typed, and (b) `typeCall` can propagate it to the
+        // CallExpr via the callee-type path (line 526+ above). This covers the
+        // class-with-user-decl case; the builtin-class, record, and enum cases are
+        // handled in their respective branches above.
+        if (mm == "GetType") {
+            auto* typeTy = ctx_.makeTypeRef();
+            typeTy->kind = TypeRef::Kind::Named;
+            typeTy->declaration = builtinClassSym("Type");
+            ctx_.setExprType(&ma, typeTy);
         }
         return;
     }

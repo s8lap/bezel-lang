@@ -586,6 +586,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             }
         }
     }
+    // §17.10: typeof(T) → Type.  The `Type` sealed class is defined in the
+    // standard library (stdlib §2.13) and is a builtin Named type (arity 0,
+    // no user TypeDecl). The sema type of a TypeOfExpr is a Named TypeRef
+    // backed by a builtinClassSym("Type") declaration. This prevents codegen
+    // from seeing an untyped expression and emitting silent garbage (#487).
+    if (auto* to = dynamic_cast<const ast::TypeOfExpr*>(&e)) {
+        (void)to; // the queriedType is already resolved by TypeResolution
+        auto* typeTy = ctx_.makeTypeRef();
+        typeTy->kind = TypeRef::Kind::Named;
+        typeTy->declaration = builtinClassSym("Type");
+        ctx_.setExprType(&e, typeTy);
+    }
     // §17.9: nameof(QualifiedName) → string. The result is the rightmost
     // identifier of the operand, as a compile-time string constant. No
     // runtime resolution is performed; sema just types the expression as

@@ -5008,6 +5008,25 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // ordinary dispatch so a record with no user ToString gets the §9.1 form
     // rather than falling through to the no-method path.
     if (auto* v = tryLowerValueSemanticsCall(call)) return v;
+    // §8.2 (#487): `v.GetType()` — universal Object member returning the `Type`
+    // runtime class (stdlib §2.13). Sema types the CallExpr as Named Type, so
+    // the expression is well-typed. Codegen defers the implementation (the
+    // runtime type-descriptor table is not yet emitted); intercepted here to
+    // emit a clean error instead of silently returning garbage or crashing.
+    if (call.args.empty() && call.callee) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "GetType") {
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "`GetType()` is not yet implemented in codegen: the runtime "
+                    "`Type` class (stdlib \xC2\xA7""2.13) requires a type-descriptor "
+                    "table that is not yet emitted (\xC2\xA7""8.2, #487). This call "
+                    "will be supported in a future milestone.");
+                return llvm::PoisonValue::get(ptrTy());
+            }
+        }
+    }
     // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
     if (tryLowerConsoleCall(call)) return nullptr;  // unit result
     // Console.ReadLine() → string? / Console.ReadKey() → char
