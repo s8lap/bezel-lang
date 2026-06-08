@@ -680,6 +680,34 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.CreateCall(fn, {recv, elemPtr(item), sentinel});
                     return llvm::ConstantInt::get(i32(), 0);
                 }
+                // fix #522 / §4.10: .TryAdd(item): bool — inserts iff not
+                // already present; returns true when newly added. Equivalent to
+                // check-then-set; the result type is bool (i1) so it is safe
+                // as a branch condition (unlike Add which returns unit/i32 0).
+                if (m == "TryAdd" && call.args.size() == 1 && call.args[0].value) {
+                    llvm::Value* item = lowerExpr(*call.args[0].value);
+                    if (!item) return nullptr;
+                    llvm::Value* ep = elemPtr(item);
+                    auto* containsFn = declareC("bz_dict_contains_gen", i1(),
+                                                {ptrTy(), ptrTy()});
+                    llvm::Value* already = builder_.CreateCall(
+                        containsFn, {recv, ep}, "set.has");
+                    // If NOT already present, insert with sentinel value.
+                    auto* insertBB = llvm::BasicBlock::Create(
+                        llvm_, "ta.ins", currentFn_);
+                    auto* afterBB  = llvm::BasicBlock::Create(
+                        llvm_, "ta.after", currentFn_);
+                    llvm::Value* notPresent = builder_.CreateNot(already, "ta.new");
+                    builder_.CreateCondBr(notPresent, insertBB, afterBB);
+                    builder_.SetInsertPoint(insertBB);
+                    auto* setFn = declareC("bz_dict_set_gen",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(setFn, {recv, ep, sentinel});
+                    builder_.CreateBr(afterBB);
+                    builder_.SetInsertPoint(afterBB);
+                    // Return true iff newly inserted (i.e. was not present).
+                    return notPresent;
+                }
                 // .Contains(item): bool
                 if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
@@ -1577,9 +1605,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ? nullptr : lowerExpr(*call.args[0].value);
             if (!call.args.empty() && !idx) return nullptr;
             if (call.args.empty()) {
-                // Peek: last element (Stack) or first (Queue)
+                // fix #523 / stdlib §4.11: Peek() raises InvalidOperationException
+                // when the stack/queue is empty (same spec rule as Pop/Dequeue).
                 auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
                 llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                llvm::Value* isEmpty = builder_.CreateICmpEQ(
+                    len, builder_.getInt64(0), "peek.empty");
+                emitGuardThrow(isEmpty, "InvalidOperationException");
+                // Peek: last element (Stack) or first (Queue)
                 idx = builder_.CreateSub(len, builder_.getInt64(1));
             } else {
                 idx = builder_.CreateSExt(idx, i64());
@@ -1694,9 +1727,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return phi;
         }
         if ((m == "Pop" || m == "Dequeue") && call.args.empty()) {
-            // Get last (Pop) or first (Dequeue) element, then remove it
+            // fix #523 / stdlib §4.11/§4.12: Pop()/Dequeue() raise
+            // InvalidOperationException on an empty stack/queue.
+            // Get last (Pop) or first (Dequeue) element, then remove it.
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            llvm::Value* isEmpty = builder_.CreateICmpEQ(
+                len, builder_.getInt64(0), "pop.empty");
+            emitGuardThrow(isEmpty, "InvalidOperationException");
             llvm::Value* idx = m == "Pop"
                 ? builder_.CreateSub(len, builder_.getInt64(1))
                 : builder_.getInt64(0);
