@@ -5410,6 +5410,67 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
+    // fix #507 / §27.3: IIFE — the callee is a LambdaExpr invoked directly at
+    // its construction site: `((x) => x * 2)(5)`.  The sema TypeRef for the
+    // lambda has null funcReturn when the lambda's params are unannotated (the
+    // param `x` has no sema type, so the binary body `x * 2` also has no sema
+    // type, so funcReturn stays null).  The generic `!calleeSym` path below
+    // would call emitClosureCall with a null funcReturn → void return type →
+    // miscompile/SIGILL when the result is used.
+    //
+    // Fix: detect LambdaExpr callee early, lower the lambda's arguments
+    // directly to LLVM values, compute the actual function type from the
+    // lowered argument types + the best-effort return type (consulting the
+    // lambda's own sema exprBody type, with i32 fallback matching lowerLambda),
+    // then emit the closure call using that concrete function type.  This
+    // mirrors the closure-call path for variable-stored lambdas but derives the
+    // function type from the call-site argument values rather than the TypeRef,
+    // which is always sound for the argument types.
+    if (auto* iifeLam =
+            dynamic_cast<const ast::LambdaExpr*>(call.callee.get())) {
+        // Lower the lambda to a closure struct { fn_ptr, env_ptr, rc }.
+        llvm::Value* closureObj = lowerLambda(*iifeLam);
+        if (!closureObj) return nullptr;
+        // Load fn_ptr from closure[0] and env_ptr from closure[1].
+        llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closureObj,
+                                                 "iife.fn");
+        llvm::Value* envSlot = builder_.CreateGEP(
+            ptrTy(), closureObj, {builder_.getInt32(1)});
+        llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot,
+                                                  "iife.env");
+        // Lower call arguments.
+        std::vector<llvm::Value*> args;
+        args.push_back(envPtr);  // env_ptr is always the first arg
+        for (const auto& a : call.args) {
+            if (!a.value) return nullptr;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return nullptr;
+            args.push_back(v);
+        }
+        // Build the function type from the actual argument LLVM types.
+        // Return type: consult the sema exprType of the expression body
+        // (same logic as lowerLambda), falling back to i32 when null.
+        // This matches what lowerLambda emits for the actual LLVM function.
+        llvm::Type* retTy = i32();
+        if (iifeLam->exprBody) {
+            if (auto* rt = ctx_.exprType(*iifeLam->exprBody))
+                retTy = lowerTypeRef(rt);
+        } else if (auto* lamTy = ctx_.exprType(*iifeLam)) {
+            // Block-body lambda: pull return type from the lambda's own
+            // sema exprType (set by ExprTypecheck_Exprs.cpp).
+            if (lamTy->kind == sema::TypeRef::Kind::Function &&
+                lamTy->funcReturn)
+                retTy = lowerTypeRef(lamTy->funcReturn);
+        }
+        std::vector<llvm::Type*> argTys;
+        for (auto* v : args) argTys.push_back(v->getType());
+        auto* fnTy = llvm::FunctionType::get(retTy, argTys, false);
+        llvm::Value* result = builder_.CreateCall(fnTy, fnPtr, args,
+                                                  "iife.ret");
+        // #422 / §28.9: release the transient closure after the call.
+        emitClosureRelease(closureObj);
+        return retTy->isVoidTy() ? nullptr : result;
+    }
     // CG60: call through an indexed array element of function type —
     // `handlers[i]()` where handlers: [N](T) -> R. The IndexExpr has
     // no resolved symbol (calleeSym = null), so we lower the IndexExpr

@@ -1,0 +1,251 @@
+// Codegen regression tests for issue #507: immediately-invoked lambda
+// expressions (IIFEs) with arguments crash the compiler (SIGILL / exit 132).
+//
+// Root (§27.3): `lowerCall` handles `callee is LambdaExpr` only via the
+// generic `!calleeSym` branch that checks `ctx_.exprType(*call.callee)`.
+// When the lambda has UNANNOTATED params the sema TypeRef's funcReturn is
+// inferred from the body, but the funcParams[i].type entries are null for
+// untyped params.  The `emitClosureCall` helper then builds a function type
+// `i32(ptr, i32, …)` for the indirect call — but the actual LLVM function
+// emitted by `lowerLambda` has params typed by the callee argument values,
+// which may differ.  For annotated params the type is explicit and both sides
+// agree; for unannotated params with int args both sides happen to agree on
+// i32, so the simple cases pass.  The SIGILL arises when the callee is a bare
+// LambdaExpr and there is a mismatch between the expected function type and
+// the actual type in the IR verifier / JIT — in particular when `calleeType`
+// from `ctx_.exprType` is null (no sema coverage for IIFE-callee call return
+// type) and the generic `!calleeSym` branch returns null (no closure call
+// issued at all), causing the fallthrough path to generate an illegal
+// instruction attempting to call a non-function.
+//
+// Fix: in `lowerCall`, add an explicit early check for `call.callee` being a
+// `LambdaExpr`; lower the lambda to a closure via `lowerLambda` and dispatch
+// through the closure-call path with a function type built from the lambda's
+// actual LLVM param/ret types (bypassing the TypeRef-based reconstruction that
+// is unreliable for untyped params).
+//
+// Spec reference: §27.3 (lambda invocation), §27.5 (closure capture)
+//
+// Coverage:
+//   - IIFE with one argument, unannotated param (the original crash case)
+//   - IIFE with no arguments
+//   - IIFE capturing an outer local
+//   - IIFE with two parameters
+//   - IIFE returning a string (tests non-int return path)
+//   - Nested IIFE  `(((x)=>x)(...))`
+//   - CONTROL: `var f := (x)=>x*2; f(5)` (lambda-in-local) must still work
+//   - CONTROL: passing a lambda to a function as arg must still work
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+int run(const std::string& prog) {
+    auto r = runJit(prog);
+    return r.ran ? r.exitCode : -999;
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// §27.3 — IIFE with one unannotated argument (the original #507 crash case)
+// ---------------------------------------------------------------------------
+
+// §27.3 / #507: `((x) => x * 2)(5)` — lambda has one UNANNOTATED param,
+// called immediately with integer argument 5. Result must be 10.
+// If broken: SIGILL / exit 132 (compiler asserts or emits illegal instruction).
+// This is the exact crash case from the bug report.
+BEZEL_TEST(codegen_iife_507, iife_single_unannotated_param_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var r := ((x) => x * 2)(5); "
+        "    return r; "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// §27.3 / #507: annotated-param variant for comparison (must also pass).
+BEZEL_TEST(codegen_iife_507, iife_single_annotated_param_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var r := ((x: int) => x * 2)(5); "
+        "    return r; "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// §27.3 / #507: unannotated-param IIFE, result used directly in return.
+// `((x) => x + 3)(7)` == 10.
+BEZEL_TEST(codegen_iife_507, iife_single_unannotated_param_return_direct_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return ((x) => x + 3)(7); "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// ---------------------------------------------------------------------------
+// §27.3 — IIFE with no arguments
+// ---------------------------------------------------------------------------
+
+// §27.3 / #507: `(() => 42)()` — no-arg IIFE returning a constant.
+// Exercises the zero-param closure path through lowerCall.
+BEZEL_TEST(codegen_iife_507, iife_no_arg_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return (() => 42)(); "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §27.3 / #507: no-arg IIFE stored in a var first, then called — sanity that
+// the no-arg path also works via the local-variable closure route.
+BEZEL_TEST(codegen_iife_507, iife_no_arg_via_local_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var f := (() => 42); "
+        "    return f(); "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// ---------------------------------------------------------------------------
+// §27.3 / §27.5 — IIFE capturing an outer local
+// ---------------------------------------------------------------------------
+
+// §27.3 / §27.5 / #507: IIFE reads an outer local `n`. The closure env must
+// be populated with the cell for `n`. Result: 5 * 3 = 15.
+BEZEL_TEST(codegen_iife_507, iife_captures_outer_local_27_3_27_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var n := 5; "
+        "    return ((x: int) => x * n)(3); "
+        "  end Main; "
+        "end C;"), 15);
+}
+
+// §27.3 / §27.5 / #507: no-arg IIFE reads outer local. `(() => n)()` == 7.
+BEZEL_TEST(codegen_iife_507, iife_no_arg_captures_outer_local_27_3_27_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var n := 7; "
+        "    return (() => n)(); "
+        "  end Main; "
+        "end C;"), 7);
+}
+
+// ---------------------------------------------------------------------------
+// §27.3 — IIFE with two parameters
+// ---------------------------------------------------------------------------
+
+// §27.3 / #507: IIFE with two annotated params. `((a: int, b: int) => a + b)(3, 4)` == 7.
+BEZEL_TEST(codegen_iife_507, iife_two_annotated_params_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return ((a: int, b: int) => a + b)(3, 4); "
+        "  end Main; "
+        "end C;"), 7);
+}
+
+// §27.3 / #507: IIFE with two UNANNOTATED params. `((a, b) => a + b)(3, 4)` == 7.
+BEZEL_TEST(codegen_iife_507, iife_two_unannotated_params_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return ((a, b) => a + b)(3, 4); "
+        "  end Main; "
+        "end C;"), 7);
+}
+
+// §27.3 / #507: two-param IIFE with capture. `((a: int, b: int) => a * b + n)(2, 3)` where n=1 → 7.
+BEZEL_TEST(codegen_iife_507, iife_two_params_with_capture_27_3_27_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var n := 1; "
+        "    return ((a: int, b: int) => a * b + n)(2, 3); "
+        "  end Main; "
+        "end C;"), 7);
+}
+
+// ---------------------------------------------------------------------------
+// §27.3 — IIFE returning a string (non-int return)
+// ---------------------------------------------------------------------------
+
+// §27.3 / #507: IIFE returns a string. Verify the result via `.Length`.
+// `(() => \"hello\")().Length` == 5.
+BEZEL_TEST(codegen_iife_507, iife_returns_string_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return (() => \"hello\")().Length; "
+        "  end Main; "
+        "end C;"), 5);
+}
+
+// ---------------------------------------------------------------------------
+// §27.3 — Nested IIFE `(((x: int)=>x)(...))`
+// ---------------------------------------------------------------------------
+
+// §27.3 / #507: nested IIFE — the outer call's arg is itself an IIFE.
+// `((x: int) => x * 2)(((y: int) => y + 1)(4))` = (4+1)*2 = 10.
+BEZEL_TEST(codegen_iife_507, iife_nested_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    return ((x: int) => x * 2)(((y: int) => y + 1)(4)); "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// ---------------------------------------------------------------------------
+// §27.3 — CONTROL: lambda stored in var (must still pass — regression guard)
+// ---------------------------------------------------------------------------
+
+// §27.3 / control: `var f := (x: int) => x * 2; f(5)` — lambda stored in a
+// local, called through the local. Must still return 10. This path goes through
+// the LocalSymbol branch of lowerCall, not the LambdaExpr branch.
+BEZEL_TEST(codegen_iife_507, control_lambda_in_local_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var f := (x: int) => x * 2; "
+        "    return f(5); "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// §27.3 / control: passing a lambda as an argument to a method — the Apply
+// path through ParameterSymbol in lowerCall. Must still return 10.
+BEZEL_TEST(codegen_iife_507, control_lambda_passed_to_function_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Apply(f: (int) -> int, n: int): int "
+        "    return f(n); "
+        "  end Apply; "
+        "  public static method Main(): int "
+        "    return Apply((x: int) => x * 2, 5); "
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// §27.3 / control: no-arg lambda stored in local, called — regression guard
+// for the zero-param local-symbol closure path.
+BEZEL_TEST(codegen_iife_507, control_no_arg_lambda_in_local_27_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var f := () => 99; "
+        "    return f(); "
+        "  end Main; "
+        "end C;"), 99);
+}
