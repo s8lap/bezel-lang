@@ -251,6 +251,7 @@ set(BEZEL_TEST_SOURCES
     codegen/ctor_args_test.cpp
     codegen/static_ctor_test.cpp
     codegen/operator_test.cpp
+    codegen/operator_increment_498_test.cpp
     codegen/block_setter_test.cpp
     codegen/ref_out_params_test.cpp
     codegen/record_basics_test.cpp

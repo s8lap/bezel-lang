@@ -249,22 +249,56 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return false;
     }
     // CG31: `x++` / `x--` — overflow-checked increment/decrement.
+    // §17.6 / §25: when the target's type is a user-defined record or class
+    // that declares `static method operator ++` (resp. `--`), dispatch to that
+    // operator method and write the result back:
+    //   x++ ≡ x := T.operator++(x)   (per §17.6).
+    // For built-in numeric operands keep the existing x := x + 1 path.
     if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (inc->target) {
+            // §25: look for a user-defined operator on the target's Named type.
+            const std::string_view opTok = inc->op; // "++" or "--"
+            sema::MethodSymbol* opMethod = nullptr;
+            if (const sema::TypeRef* targetTy = ctx_.exprType(*inc->target)) {
+                if (targetTy->kind == sema::TypeRef::Kind::Named &&
+                    targetTy->declaration) {
+                    for (sema::Symbol* m : targetTy->declaration->members) {
+                        auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                        if (ms && ms->isOperator &&
+                            ms->operatorToken == opTok &&
+                            ms->params.size() == 1) {
+                            opMethod = ms;
+                            break;
+                        }
+                    }
+                }
+            }
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = lvalueAddr(*inc->target, elemTy);
             if (addr) {
-                bool fp = elemTy->isFloatingPointTy();
-                llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
-                llvm::Value* one =
-                    fp ? llvm::cast<llvm::Value>(
-                             llvm::ConstantFP::get(elemTy, 1.0))
-                       : llvm::cast<llvm::Value>(
-                             llvm::ConstantInt::get(elemTy, 1));
-                llvm::Value* res = emitCompoundOp(
-                    inc->op == "++" ? "+" : "-", cur, one, fp,
-                    isUnsignedTargetExpr(*inc->target));
-                if (res) builder_.CreateStore(res, addr);
+                if (opMethod) {
+                    // §17.6 / §25: dispatch to user-defined operator ++/--.
+                    // Load the current value (struct by value, class as pointer),
+                    // call the operator method, store the result back.
+                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    std::vector<llvm::Value*> args{cur};
+                    llvm::Value* res =
+                        emitMethodCall(opMethod, args, /*baseQualified=*/false);
+                    if (res) builder_.CreateStore(res, addr);
+                } else {
+                    // Built-in numeric increment/decrement.
+                    bool fp = elemTy->isFloatingPointTy();
+                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    llvm::Value* one =
+                        fp ? llvm::cast<llvm::Value>(
+                                 llvm::ConstantFP::get(elemTy, 1.0))
+                           : llvm::cast<llvm::Value>(
+                                 llvm::ConstantInt::get(elemTy, 1));
+                    llvm::Value* res = emitCompoundOp(
+                        inc->op == "++" ? "+" : "-", cur, one, fp,
+                        isUnsignedTargetExpr(*inc->target));
+                    if (res) builder_.CreateStore(res, addr);
+                }
             }
         }
         return false;
