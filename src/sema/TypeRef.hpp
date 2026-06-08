@@ -49,6 +49,15 @@ struct TypeRef {
     // Named:
     TypeSymbol* declaration = nullptr;
     std::vector<TypeRef*> genericArgs;
+    // §2.5 / §29.3 (issue #495): for a Named TypeRef reconstructed from module
+    // metadata, astNode is null (no AST exists) and declaration may be null when
+    // the type is a builtin not exported by the dependency (IEnumerable<T>,
+    // Array<T>, Task, etc.).  importedName carries the raw type name in that case
+    // so codegen (lowerTypeRef) can recognise it and return the correct LLVM type
+    // (ptrTy() for heap-allocated builtins) rather than falling through to i32.
+    // Always empty for locally-resolved TypeRefs (astNode / declaration carry the
+    // name information there).
+    std::string_view importedName;
 
     // InlineArray:
     const ast::Expr* arraySize = nullptr;   // ConstIntExpr; sema later evaluates

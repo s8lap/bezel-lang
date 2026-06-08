@@ -129,8 +129,22 @@ MetaType convertType(const sema::TypeRef* ref) {
             t.kind = TypeKind::Named;
             // §14: carry the referent's name (a generic-parameter use resolves
             // to a TypeSymbol named after the parameter, e.g. `T`).
-            if (ref->declaration != nullptr)
+            if (ref->declaration != nullptr) {
                 t.namedName = std::string(ref->declaration->name);
+            } else if (ref->astNode && ref->astNode->name &&
+                       !ref->astNode->name->parts.empty()) {
+                // §2.5 / §29.3 (issue #495): builtin types (IEnumerable<T>,
+                // Array<T>, Task, etc.) have no user TypeSymbol declaration —
+                // their TypeRef has declaration=nullptr and astNode set. Without
+                // this branch, namedName stays empty and the loader reconstructs
+                // an anonymous Named TypeRef that codegen lowers to i32 (the
+                // default for an unrecognised Named type), corrupting any
+                // pointer-sized builtin in an imported signature.  Carry the
+                // first part of the syntactic name so the loader can identify
+                // the type and lowerTypeRef can route it to ptrTy() (or the
+                // appropriate value-type for DateTime/Guid/etc.).
+                t.namedName = std::string(ref->astNode->name->parts[0]);
+            }
             for (const sema::TypeRef* arg : ref->genericArgs)
                 t.genericArgs.push_back(convertType(arg));
             return t;

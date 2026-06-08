@@ -140,6 +140,22 @@ struct Loader {
             case TypeKind::Named: {
                 ref->kind = sema::TypeRef::Kind::Named;
                 ref->declaration = lookupNamed(mt.namedName);
+                // §2.5 / §29.3 (issue #495): when the named type is a builtin
+                // interface or stdlib class (IEnumerable<T>, Array<T>, Task,
+                // etc.) it is NOT an exported user type in the dependency, so
+                // lookupNamed returns null.  The resulting TypeRef then has
+                // declaration=nullptr AND astNode=nullptr (no AST exists for an
+                // imported type), so lowerTypeRef cannot read the type's name
+                // from either field and falls through to the i32 default — which
+                // truncates pointer-sized types, causing SIGSEGV when the
+                // vtable-backed iterator pointer is stored in a 32-bit slot
+                // (bug A) or SIGABRT from the bad load type (bug B).
+                //
+                // Fix: record the name in importedName so lowerTypeRef can
+                // read it via the `importedName` path (the dedicated imported-
+                // type name branch, independent of astNode/declaration).
+                if (ref->declaration == nullptr && !mt.namedName.empty())
+                    ref->importedName = ctx.internString(mt.namedName);
                 for (const MetaType& ga : mt.genericArgs)
                     ref->genericArgs.push_back(convert(ga));
                 break;

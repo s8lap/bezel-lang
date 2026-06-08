@@ -6556,8 +6556,16 @@ bool Emitter::isLazyEnumerableType(const sema::TypeRef* rt) {
     // The lazy LINQ sentinel: a Named TypeRef with no declaration and no
     // astNode, carrying the element type as genericArgs[0]. Produced only by
     // the LINQ-operator typing in ExprTypecheck_Calls.cpp.
+    //
+    // §2.5 / §29.3 (issue #495): a TypeRef reconstructed from module metadata
+    // for a builtin interface (IEnumerable<T>, IAsyncEnumerable<T>, etc.) has
+    // the SAME shape — Named, no declaration, no astNode — but carries the
+    // type name in importedName (set by ModuleLoader).  Exclude those from the
+    // lazy-LINQ path so they fall through to lowerIEnumerableBuiltinFor /
+    // lowerIAsyncEnumerableFor, which use the correct vtable protocol (Current
+    // returns the element value directly, not a pointer to it).
     return rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
-           !rt->astNode && !rt->genericArgs.empty();
+           !rt->astNode && !rt->genericArgs.empty() && rt->importedName.empty();
 }
 
 // issue #343 / §8.3: trampoline matching the runtime's generic-dict hash fn
