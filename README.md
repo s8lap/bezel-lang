@@ -2,7 +2,9 @@
 
 Bezel is a systems language designed to feel high-level. It has no garbage
 collector; instead, the compiler tracks ownership of every heap object and
-ensures that each one is disposed exactly once.
+ensures that each one is disposed exactly once. Borrowing lets you pass
+references without transferring ownership, with lifetimes checked at compile
+time rather than enforced by a runtime.
 
 The language is paper-designed: the normative spec lives in `docs/`, and this
 repository hosts the compiler that implements it. Start with `CLAUDE.md` for the
@@ -11,9 +13,11 @@ language itself.
 
 ## Status
 
-The compiler implements a large subset of the language and AOT-compiles `.bzl`
-source files to native executables. The test suite covers 3,330 cases (all
-passing) spanning the full compiler pipeline from lexer through codegen.
+The project is a compiler-under-construction for a language with no users yet.
+The compiler AOT-compiles `.bzl` source files to native executables and
+implements a large and growing subset of the spec. The test suite runs
+4,262 spec-derived test cases (all passing on Fedora), spanning the full
+compiler pipeline from lexer through codegen.
 
 **What works:**
 
@@ -30,18 +34,27 @@ passing) spanning the full compiler pipeline from lexer through codegen.
   `Task` combinators, `await using`
 - Multi-module separate compilation (`bezelc -c` / `--import`)
 
-**In progress / not yet supported:**
+**Not yet implemented (compiler emits a diagnostic):**
 
-- A few async tail cases
-- Some stdlib areas (Streams, serialization, Spans)
-- Windows support (the runtime uses POSIX threads, clock, and getrandom) — see
-  issue #446
+- `typeof(T)` and `.GetType()` — runtime reflection (§17.10, §8.2); deferred
+  pending `System.Reflection`
+- Async lambdas (§30.6) — the state-machine lowering for lambda-specific async
+  frames is not yet implemented; sync and async methods work
+- Cross-module instantiation of generic types (§14, §2.5) — importing a generic
+  class or record and constructing it cross-module; generic methods work
+- `await` inside a catch guard (`catch ... when`) or inside a try/catch/finally
+  body with an async-iterator (§30 / §29)
+- Open-ended range patterns in `case` (§19)
+
+**Platform:** developed and tested on Fedora Linux. The runtime uses POSIX
+threads, `clock_gettime`, `pthread`, and `/dev/urandom`, so Windows is not yet
+supported. See [Cross-platform notes](#cross-platform-notes) below.
 
 ## Building
 
-**Prerequisites:** CMake ≥ 3.20, clang/clang++, LLVM 21 (headers + libraries).
-The compiler uses the LLVM 21 C++ API; older LLVM versions will need source
-changes.
+**Prerequisites:** CMake ≥ 3.20, clang/clang++, LLVM 21 dev headers and
+libraries. The compiler calls the LLVM 21 C++ API extensively; older LLVM
+versions are untested and will likely need source-level changes.
 
 ---
 
@@ -53,25 +66,31 @@ sudo dnf install cmake clang llvm llvm-devel
 
 `llvm-devel` provides `llvm-config` and `LLVMConfig.cmake`, which CMake uses to
 locate the LLVM installation. Optionally install `ccache` and `lld` for faster
-incremental builds — the build system detects them automatically:
+incremental builds — the build system detects and uses them automatically:
 
 ```sh
 sudo dnf install ccache lld   # optional; auto-detected
 ```
 
-Then build:
+Then configure and build:
 
 ```sh
 cmake -B build -DCMAKE_CXX_COMPILER=clang++
 cmake --build build -j$(nproc)
 ```
 
-You will see `Bezel: using LLVM 21.x.x` and (if installed) `Bezel: using ccache`
-and `Bezel: using lld linker` in the CMake output.
+CMake prints `Bezel: using LLVM 21.x.x` and, if installed, `Bezel: using
+ccache` and `Bezel: using lld linker`.
 
 ---
 
-### Debian / Ubuntu — UNVERIFIED, best-effort
+### Cross-platform notes
+
+The build has only been verified on Fedora Linux. The notes below are
+best-effort guidance for other platforms; they are **untested**. Verification
+and any needed fixes are tracked in issue #446.
+
+#### Debian / Ubuntu — UNTESTED
 
 ```sh
 sudo apt install cmake clang llvm-dev
@@ -81,11 +100,9 @@ cmake --build build -j$(nproc)
 
 Ubuntu 24.04 LTS ships LLVM 18; you may need to install LLVM 21 from
 [apt.llvm.org](https://apt.llvm.org/) and point CMake at it with
-`-DLLVM_DIR=...`. Verification and any needed fixes are tracked in issue #446.
+`-DLLVM_DIR=/path/to/llvm21/lib/cmake/llvm`.
 
----
-
-### Arch Linux — UNVERIFIED, best-effort
+#### Arch Linux — UNTESTED
 
 ```sh
 sudo pacman -S cmake clang llvm
@@ -93,39 +110,33 @@ cmake -B build -DCMAKE_CXX_COMPILER=clang++
 cmake --build build -j$(nproc)
 ```
 
-Arch typically ships a recent LLVM. Verification is tracked in issue #446.
+Arch typically ships a recent LLVM.
 
----
+#### macOS — UNTESTED
 
-### macOS — UNVERIFIED, best-effort
+Apple's system clang does not include LLVM development headers; install
+the Homebrew `llvm` formula which provides them:
 
 ```sh
 brew install llvm cmake
-cmake -B build -DCMAKE_CXX_COMPILER=$(brew --prefix llvm)/bin/clang++ \
-               -DLLVM_DIR=$(brew --prefix llvm)/lib/cmake/llvm
+cmake -B build \
+    -DCMAKE_CXX_COMPILER=$(brew --prefix llvm)/bin/clang++ \
+    -DLLVM_DIR=$(brew --prefix llvm)/lib/cmake/llvm
 cmake --build build -j$(nproc)
 ```
 
-Apple's system clang does not include LLVM development headers; the Homebrew
-`llvm` formula provides them. Verification is tracked in issue #446.
+#### Windows — NOT SUPPORTED
 
----
-
-### Windows — NOT YET SUPPORTED
-
-The runtime uses POSIX threads, `clock_gettime`, and `getrandom`. Cross-platform
-build and runtime portability work is tracked in issue #446.
+The runtime uses POSIX threads (`<pthread.h>`), `clock_gettime`, and
+`/dev/urandom`. Cross-platform runtime portability work is tracked in issue
+#446.
 
 ## Usage
 
 ### AOT compilation
 
-```sh
-./build/bezelc path/to/program.bzl -o out
-./out
-```
-
-A minimal program — `Main` returns an integer that becomes the process exit code:
+Source files use the `.bzl` extension. A minimal program — `Main` returns an
+integer that becomes the process exit code:
 
 ```
 module M;
@@ -160,10 +171,17 @@ Multiple `--import` flags are accepted for multiple dependencies.
 
 ## Testing
 
-Run the full test suite (3,330 tests):
+Run the full test suite:
 
 ```sh
 ./build/tests/bezel_tests
+```
+
+Or use the helper script, which removes any stale binary before rebuilding (the
+stale-binary problem is documented in `scripts/run-tests.sh`):
+
+```sh
+scripts/run-tests.sh
 ```
 
 Run a subset by name substring:
@@ -172,7 +190,8 @@ Run a subset by name substring:
 BEZEL_TEST_FILTER=<substring> ./build/tests/bezel_tests
 ```
 
-For example, `BEZEL_TEST_FILTER=lexer` runs only lexer tests.
+For example, `BEZEL_TEST_FILTER=codegen` runs only codegen tests,
+`BEZEL_TEST_FILTER=ownership` runs only ownership tests.
 
 ## Repository layout
 
@@ -190,6 +209,7 @@ src/
   driver/     Pipeline orchestration (§2, §33)
   main.cpp    bezelc CLI entry point
 tests/        Spec-derived tests, mirroring src/ phase layout
+scripts/      Build and test helpers (run-tests.sh)
 docs/         Normative spec, standard library, design rationale, guides
 ```
 
@@ -204,3 +224,7 @@ docs/         Normative spec, standard library, design rationale, guides
   `docs/Bezel_Guide_02_Errors_and_Nullability.md` — example-first guides to
   idiomatic Bezel
 - `CLAUDE.md` — working discipline for contributors and AI sessions
+
+## License
+
+Apache 2.0. See `LICENSE`.
