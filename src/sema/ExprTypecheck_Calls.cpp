@@ -953,8 +953,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     recvTy->declaration &&
                     recvTy->declaration->name == "Encoding") {
                     if (m == "GetBytes") {
+                        // fix #526 / stdlib §3.2: GetBytes returns owned
+                        // Array<byte>. Use makeConcreteCollectionResult (which
+                        // carries a synthetic "Array" astNode) rather than
+                        // makeLazyEnumerable (which has no astNode). Without the
+                        // astNode, isCollectionTypeName returns false and the
+                        // .Count / .Length codegen path does not recognise the
+                        // result as an array-backed collection, so .Count reads
+                        // garbage. The concrete Array<byte> TypeRef is the same
+                        // representation ToArray() uses (makeConcreteCollectionResult)
+                        // and is recognized correctly by all downstream sema and
+                        // codegen paths (isCollectionTypeName, bz_array_len, etc.).
                         ctx_.setExprType(
-                            &ce, makeLazyEnumerable(ctx_.primitiveTypeRef(P::Byte)));
+                            &ce, makeConcreteCollectionResult(
+                                "Array", ctx_.primitiveTypeRef(P::Byte)));
                     } else if (m == "GetString" || m == "Name") {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                     }
