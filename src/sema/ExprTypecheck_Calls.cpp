@@ -2538,6 +2538,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }
+                    // stdlib §9.2 (#519): IeeeEquals / BitwiseEquals — two-arg
+                    // static equality variants; both return bool.
+                    if (mbr == "IeeeEquals" || mbr == "BitwiseEquals") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    }
                 }
                 // int.Parse(s) → int.
                 if (mbr == "Parse") {

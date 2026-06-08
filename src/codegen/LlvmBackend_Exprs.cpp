@@ -605,6 +605,251 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 initStringRc(so);  // #422: producer's reference, rc := 1
                                 return so;
                             }
+                            // stdlib §9.1 (#518): ToString(radix: int) — the arg is an
+                            // integer (not a string format literal). Route to the same
+                            // inline radix-conversion logic as Convert.ToString(n, radix).
+                            // Supported radices: 2, 8, 10, 16 (per stdlib §9.1).
+                            {
+                                using P = sema::PrimitiveType;
+                                bool isIntRecv = (tt->primitive == P::Int ||
+                                                  tt->primitive == P::Long ||
+                                                  tt->primitive == P::UInt ||
+                                                  tt->primitive == P::ULong ||
+                                                  tt->primitive == P::Byte ||
+                                                  tt->primitive == P::SByte ||
+                                                  tt->primitive == P::Short ||
+                                                  tt->primitive == P::UShort);
+                                auto* argTy = ctx_.exprType(*call->args[0].value);
+                                bool argIsInt = argTy &&
+                                    argTy->kind == sema::TypeRef::Kind::Primitive &&
+                                    (argTy->primitive == P::Int ||
+                                     argTy->primitive == P::Long);
+                                if (isIntRecv && argIsInt) {
+                                    llvm::Value* radix = lowerExpr(*call->args[0].value);
+                                    if (!radix) return nullptr;
+                                    // Normalize receiver to i32 (or i64 for long).
+                                    bool isLong = (tt->primitive == P::Long ||
+                                                   tt->primitive == P::ULong);
+                                    if (isLong) {
+                                        if (!recv->getType()->isIntegerTy(64))
+                                            recv = builder_.CreateSExt(recv, i64());
+                                    } else {
+                                        if (!recv->getType()->isIntegerTy(32))
+                                            recv = builder_.CreateSExt(recv, i32());
+                                    }
+                                    // Resolve radix from a constant int.
+                                    const char* fmt = "%d";  // fallback: decimal
+                                    bool isBinary = false;
+                                    if (auto* cr = llvm::dyn_cast<llvm::ConstantInt>(radix)) {
+                                        uint64_t r = cr->getZExtValue();
+                                        if (r == 16) fmt = isLong ? "%llx" : "%x";
+                                        else if (r == 8) fmt = isLong ? "%llo" : "%o";
+                                        else if (r == 2) isBinary = true;
+                                        else fmt = isLong ? "%lld" : "%d";
+                                    } else {
+                                        // Non-constant radix: fall back to decimal.
+                                        fmt = isLong ? "%lld" : "%d";
+                                    }
+                                    // Binary path: emit a bit-scan loop.
+                                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                                    const unsigned BUF = 66;  // 64 bits + sign + NUL
+                                    if (isBinary) {
+                                        // Reuse the Convert.ToString(n,2) inline logic.
+                                        // Widen to i64 so the same loop handles both int and long.
+                                        llvm::Value* n64 = isLong
+                                            ? recv
+                                            : builder_.CreateSExt(recv, i64());
+                                        auto* buf2 = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
+                                        llvm::Value* b2Ptr = builder_.CreateGEP(
+                                            llvm::ArrayType::get(i8Ty, BUF), buf2,
+                                            {builder_.getInt64(0), builder_.getInt64(0)});
+                                        llvm::Value* isZero = builder_.CreateICmpEQ(
+                                            n64, builder_.getInt64(0));
+                                        auto* zeroBB = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.z", currentFn_);
+                                        auto* nonBB  = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.nz", currentFn_);
+                                        auto* binBB  = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.e", currentFn_);
+                                        builder_.CreateCondBr(isZero, zeroBB, nonBB);
+                                        // zero → "0"
+                                        builder_.SetInsertPoint(zeroBB);
+                                        builder_.CreateStore(
+                                            llvm::ConstantInt::get(i8Ty, '0'), b2Ptr);
+                                        llvm::Value* z1 = builder_.CreateGEP(
+                                            i8Ty, b2Ptr, builder_.getInt64(1));
+                                        builder_.CreateStore(
+                                            llvm::ConstantInt::get(i8Ty, 0), z1);
+                                        llvm::Value* zlen = builder_.getInt64(1);
+                                        auto* zeroBBEnd = builder_.GetInsertBlock();
+                                        builder_.CreateBr(binBB);
+                                        // non-zero: scan MSB then emit each bit.
+                                        builder_.SetInsertPoint(nonBB);
+                                        auto* bitPos = entryAlloca(i32());
+                                        builder_.CreateStore(builder_.getInt32(63), bitPos);
+                                        auto* fhBB = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.fh", currentFn_);
+                                        auto* fhBodyBB = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.fhb", currentFn_);
+                                        auto* fhEndBB = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.fhe", currentFn_);
+                                        builder_.CreateBr(fhBB);
+                                        builder_.SetInsertPoint(fhBB);
+                                        llvm::Value* bp = builder_.CreateLoad(i32(), bitPos);
+                                        llvm::Value* bpGe0 = builder_.CreateICmpSGT(
+                                            bp, builder_.getInt32(0));
+                                        llvm::Value* bpW = builder_.CreateZExt(bp, i64());
+                                        llvm::Value* bit = builder_.CreateAnd(
+                                            builder_.CreateLShr(n64, bpW),
+                                            builder_.getInt64(1));
+                                        llvm::Value* isOne = builder_.CreateICmpEQ(
+                                            bit, builder_.getInt64(1));
+                                        builder_.CreateCondBr(
+                                            builder_.CreateAnd(bpGe0,
+                                                builder_.CreateNot(isOne)),
+                                            fhBodyBB, fhEndBB);
+                                        builder_.SetInsertPoint(fhBodyBB);
+                                        builder_.CreateStore(
+                                            builder_.CreateSub(bp, builder_.getInt32(1)),
+                                            bitPos);
+                                        builder_.CreateBr(fhBB);
+                                        builder_.SetInsertPoint(fhEndBB);
+                                        auto* emBP  = entryAlloca(i32());
+                                        auto* emLen = entryAlloca(i64());
+                                        llvm::Value* startBP = builder_.CreateLoad(
+                                            i32(), bitPos);
+                                        builder_.CreateStore(startBP, emBP);
+                                        builder_.CreateStore(builder_.getInt64(0), emLen);
+                                        auto* emCBB = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.ec", currentFn_);
+                                        auto* emBBB = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.eb", currentFn_);
+                                        auto* emEBB = llvm::BasicBlock::Create(
+                                            llvm_, "bn2.ee", currentFn_);
+                                        builder_.CreateBr(emCBB);
+                                        builder_.SetInsertPoint(emCBB);
+                                        llvm::Value* ep = builder_.CreateLoad(i32(), emBP);
+                                        builder_.CreateCondBr(
+                                            builder_.CreateICmpSGE(ep, builder_.getInt32(0)),
+                                            emBBB, emEBB);
+                                        builder_.SetInsertPoint(emBBB);
+                                        llvm::Value* epB = builder_.CreateLoad(i32(), emBP);
+                                        llvm::Value* lenV = builder_.CreateLoad(i64(), emLen);
+                                        llvm::Value* epW = builder_.CreateZExt(epB, i64());
+                                        llvm::Value* d = builder_.CreateAnd(
+                                            builder_.CreateLShr(n64, epW),
+                                            builder_.getInt64(1));
+                                        llvm::Value* ch = builder_.CreateAdd(
+                                            builder_.CreateTrunc(d, i8Ty),
+                                            llvm::ConstantInt::get(i8Ty, '0'));
+                                        llvm::Value* dp = builder_.CreateGEP(
+                                            i8Ty, b2Ptr, lenV);
+                                        builder_.CreateStore(ch, dp);
+                                        builder_.CreateStore(
+                                            builder_.CreateAdd(lenV, builder_.getInt64(1)),
+                                            emLen);
+                                        builder_.CreateStore(
+                                            builder_.CreateSub(epB, builder_.getInt32(1)),
+                                            emBP);
+                                        builder_.CreateBr(emCBB);
+                                        builder_.SetInsertPoint(emEBB);
+                                        llvm::Value* nlen = builder_.CreateLoad(i64(), emLen);
+                                        llvm::Value* np2 = builder_.CreateGEP(
+                                            i8Ty, b2Ptr, nlen);
+                                        builder_.CreateStore(
+                                            llvm::ConstantInt::get(i8Ty, 0), np2);
+                                        auto* nonBBEnd = builder_.GetInsertBlock();
+                                        builder_.CreateBr(binBB);
+                                        // merge
+                                        builder_.SetInsertPoint(binBB);
+                                        auto* phiLen = builder_.CreatePHI(i64(), 2, "bn2.len");
+                                        phiLen->addIncoming(zlen, zeroBBEnd);
+                                        phiLen->addIncoming(nlen, nonBBEnd);
+                                        auto* mallocFn2 = declareC("malloc", ptrTy(), {i64()});
+                                        auto* memcpyFn2 = declareC("memcpy", ptrTy(),
+                                                                    {ptrTy(), ptrTy(), i64()});
+                                        llvm::Value* dSz2 = builder_.CreateAdd(
+                                            phiLen, builder_.getInt64(1));
+                                        llvm::Value* dc2 = builder_.CreateCall(
+                                            mallocFn2, {dSz2}, "bn2.d");
+                                        builder_.CreateCall(memcpyFn2, {dc2, b2Ptr, phiLen});
+                                        llvm::Value* np3 = builder_.CreateGEP(
+                                            i8Ty, dc2, phiLen);
+                                        builder_.CreateStore(
+                                            llvm::ConstantInt::get(i8Ty, 0), np3);
+                                        uint64_t sBytes2 = module_->getDataLayout()
+                                            .getTypeAllocSize(stringType());
+                                        llvm::Value* so2 = builder_.CreateCall(
+                                            mallocFn2,
+                                            {builder_.getInt64(sBytes2)}, "bn2.o");
+                                        builder_.CreateStore(
+                                            dc2,
+                                            builder_.CreateStructGEP(stringType(), so2, 0));
+                                        builder_.CreateStore(
+                                            phiLen,
+                                            builder_.CreateStructGEP(stringType(), so2, 1));
+                                        builder_.CreateStore(
+                                            llvm::ConstantInt::get(i8Ty, 1),
+                                            builder_.CreateStructGEP(stringType(), so2, 2));
+                                        initStringRc(so2);
+                                        return so2;
+                                    }
+                                    // Non-binary: snprintf with the chosen format.
+                                    llvm::Constant* fmtData2 = llvm::ConstantDataArray::getString(
+                                        llvm_, fmt, true);
+                                    unsigned fid2 = stringLiteralIdx_++;
+                                    auto* fmtGV2 = new llvm::GlobalVariable(
+                                        *module_, fmtData2->getType(), true,
+                                        llvm::GlobalValue::PrivateLinkage, fmtData2,
+                                        ".bz.rts.fmt." + std::to_string(fid2));
+                                    fmtGV2->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                                    auto* snpFn2 = module_->getFunction("snprintf");
+                                    if (!snpFn2) {
+                                        auto* ft2 = llvm::FunctionType::get(
+                                            i32(), {ptrTy(), i64(), ptrTy()}, true);
+                                        snpFn2 = llvm::Function::Create(
+                                            ft2, llvm::Function::ExternalLinkage,
+                                            "snprintf", module_.get());
+                                    }
+                                    auto* buf3 = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
+                                    llvm::Value* bPtr3 = builder_.CreateGEP(
+                                        llvm::ArrayType::get(i8Ty, BUF), buf3,
+                                        {builder_.getInt64(0), builder_.getInt64(0)});
+                                    llvm::Value* wr2 = builder_.CreateCall(
+                                        snpFn2,
+                                        {bPtr3, builder_.getInt64(BUF), fmtGV2, recv},
+                                        "rts.wr");
+                                    auto* mallocFn3 = declareC("malloc", ptrTy(), {i64()});
+                                    auto* memcpyFn3 = declareC("memcpy", ptrTy(),
+                                                               {ptrTy(), ptrTy(), i64()});
+                                    llvm::Value* l642 = builder_.CreateSExt(wr2, i64());
+                                    llvm::Value* dSz3 = builder_.CreateAdd(
+                                        l642, builder_.getInt64(1));
+                                    llvm::Value* dc3 = builder_.CreateCall(
+                                        mallocFn3, {dSz3}, "rts.d");
+                                    builder_.CreateCall(memcpyFn3, {dc3, bPtr3, l642});
+                                    llvm::Value* np4 = builder_.CreateGEP(
+                                        i8Ty, dc3, l642);
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty, 0), np4);
+                                    uint64_t sBytes3 = module_->getDataLayout()
+                                        .getTypeAllocSize(stringType());
+                                    llvm::Value* so3 = builder_.CreateCall(
+                                        mallocFn3,
+                                        {builder_.getInt64(sBytes3)}, "rts.o");
+                                    builder_.CreateStore(
+                                        dc3,
+                                        builder_.CreateStructGEP(stringType(), so3, 0));
+                                    builder_.CreateStore(
+                                        l642,
+                                        builder_.CreateStructGEP(stringType(), so3, 1));
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty, 1),
+                                        builder_.CreateStructGEP(stringType(), so3, 2));
+                                    initStringRc(so3);
+                                    return so3;
+                                }
+                            }
                             return emitPrimitiveToString(recv, tt->primitive);
                         }
                     }

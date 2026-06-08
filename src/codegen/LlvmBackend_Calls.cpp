@@ -4355,6 +4355,38 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return builder_.CreateNot(builder_.CreateOr(isNaN, isInf), "isfinite");
     }
 
+    // stdlib §9.2 (#519): double / float IeeeEquals / BitwiseEquals —
+    // two-arg static equality variants; both return bool (i1).
+    //
+    //   IeeeEquals(a, b)    → fcmp oeq a, b
+    //     (ordered equal: NaN op anything → false, including NaN-vs-NaN)
+    //   BitwiseEquals(a, b) → bitcast a/b to i64/i32, then icmp eq
+    //     (distinguishes +0.0 from -0.0 and distinct NaN payloads)
+    if (call.args.size() == 2 && call.args[0].value && call.args[1].value &&
+        (pt == P::Double || pt == P::Float) &&
+        (m == "IeeeEquals" || m == "BitwiseEquals")) {
+        llvm::Value* a = lowerExpr(*call.args[0].value);
+        llvm::Value* b = lowerExpr(*call.args[1].value);
+        if (!a || !b) return nullptr;
+        // Ensure both are the correct FP type (promote ints from literal 0).
+        auto* fty = (pt == P::Float)
+            ? llvm::Type::getFloatTy(llvm_)
+            : llvm::Type::getDoubleTy(llvm_);
+        if (!a->getType()->isFloatingPointTy())
+            a = builder_.CreateSIToFP(a, fty, "ieee.a.fp");
+        if (!b->getType()->isFloatingPointTy())
+            b = builder_.CreateSIToFP(b, fty, "ieee.b.fp");
+        if (m == "IeeeEquals") {
+            // stdlib §9.2: fcmp oeq — ordered equal → false for any NaN.
+            return builder_.CreateFCmpOEQ(a, b, "ieee.eq");
+        }
+        // BitwiseEquals: bitcast both to matching-width integer, icmp eq.
+        llvm::Type* intTy = (pt == P::Float) ? i32() : i64();
+        llvm::Value* ai = builder_.CreateBitCast(a, intTy, "bw.ai");
+        llvm::Value* bi = builder_.CreateBitCast(b, intTy, "bw.bi");
+        return builder_.CreateICmpEQ(ai, bi, "bw.eq");
+    }
+
     // double.TryParse / float.TryParse(s, out result): bool — stdlib §5.2
     if (m == "TryParse" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value &&
