@@ -3720,6 +3720,16 @@ extern "C" void bz_unhandled_exception(void) {
     exit(70);
 }
 
+// fix #492 / §31.1 / §2.6: the single process-wide in-flight exception pointer.
+// Codegen emits ExternalLinkage references to "bz_exc" in every compiled module
+// (library and main); the linker merges them all to this one definition.
+// Null = no exception in flight; non-null = heap-allocated exception object.
+// The symbol name is "bz_exc" (valid C identifier, extern "C" suppresses
+// C++ name mangling). The previous per-module name "bz$exc" was InternalLinkage
+// (BSS) — the $ was invisible externally and is dropped now that the symbol is
+// external.
+extern "C" void* bz_exc = nullptr;
+
 // ---------------------------------------------------------------------------
 // CancellationToken / CancellationTokenSource — stdlib §6.1 / spec §30.8.
 //

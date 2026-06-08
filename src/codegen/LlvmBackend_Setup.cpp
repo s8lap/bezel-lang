@@ -1821,10 +1821,25 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
 
 llvm::GlobalVariable* Emitter::excGlobal() {
     if (!excGlobal_) {
+        // fix #492 / §31.1 / §2.6: emit an ExternalLinkage DECLARATION (no
+        // initializer) so all separately-compiled modules reference the SAME
+        // "bz_exc" symbol defined once in bezel_runtime.cpp. Before this fix
+        // each module defined its own InternalLinkage (BSS) copy under the name
+        // "bz$exc"; a cross-module `throw` wrote the library's copy while the
+        // importer's pending-check read a still-null copy — the exception
+        // silently disappeared.
+        //
+        // An external declaration (nullptr initializer) in LLVM means "defined
+        // elsewhere"; the linker resolves all references to the runtime's single
+        // definition. The name "bz_exc" must match the name in bezel_runtime.cpp.
+        // (Renamed from "bz$exc" — a `$` in an external symbol name is a
+        // clang-only extension that triggers -Wdollar-in-identifier-extension in
+        // code that declares it in a header. "bz_exc" is a valid C identifier.)
         excGlobal_ = new llvm::GlobalVariable(
             *module_, ptrTy(), /*isConstant=*/false,
-            llvm::GlobalValue::InternalLinkage,
-            llvm::ConstantPointerNull::get(ptrTy()), "bz$exc");
+            llvm::GlobalValue::ExternalLinkage,
+            /*Initializer=*/nullptr,  // external declaration — defined in runtime
+            "bz_exc");
     }
     return excGlobal_;
 }
