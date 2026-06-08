@@ -2629,6 +2629,11 @@ private:
     // for a `Task` (no value). Used to size bz_task_complete's result buffer and
     // to type the value read back at the await site.
     llvm::Type* asyncResultTy_ = nullptr;
+    // The sema TypeRef for T in Task<T>, mirroring asyncResultTy_. Kept
+    // alongside it so emitAsyncComplete can detect a nullable value type (int?,
+    // double?, enum?) and wrap a plain returned value into the {hasValue=1,
+    // value} struct before storing — per §30.1 / §7.2 (#493).
+    const sema::TypeRef* asyncResultSemaType_ = nullptr;
 
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);
