@@ -1260,7 +1260,18 @@ void ExprTC::visitMember(const ast::Member& m) {
             // instance state.
             bool save = inFieldInitializer_;
             inFieldInitializer_ = true;
+            // fix #582 / §22.13: a static field initializer may reference
+            // other classes by name (e.g. `B := OtherClass.Constant + 1`).
+            // moduleScope_ holds all module-level type names; make it reachable
+            // via currentScope_ so lookupName("OtherClass") finds the
+            // TypeSymbol.  Without this, currentScope_ is null (field
+            // initializers have no enclosing method scope), and the
+            // cross-class qualifier resolves to null → lowerExpr returns null
+            // → the runtime store is skipped → field stays zero.
+            Scope* saveScope = currentScope_;
+            if (!currentScope_) currentScope_ = moduleScope_.get();
             visitExpr(*fd->initializer);
+            currentScope_ = saveScope;
             inFieldInitializer_ = save;
         }
     } else if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {

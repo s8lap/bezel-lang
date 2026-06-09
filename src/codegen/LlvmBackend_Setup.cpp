@@ -472,7 +472,8 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
     // global. Match on the field symbol; only static fields are in
     // staticGlobals_, so an instance field's FieldSymbol misses here
     // (and is handled by fieldAddr instead).
-    auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e));
+    auto* sym_raw = ctx_.exprSymbol(e);
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym_raw);
     if (!fs) return nullptr;
 
     // §22.12 / #536: when genericSubst_ is active and the field's parent class
@@ -634,18 +635,76 @@ void Emitter::declareFunctions() {
         ctorFns_[cs] = fn;
     }
 
-    // CG47: declare static constructors (§22.7) as `void()` functions.
+    // CG47 / fix #582 / §22.13: declare static initialisers.
+    //
+    // Two kinds exist per type (in order):
+    //  (a) A synthesized "sfinit" void() function — emitted when the type has
+    //      ≥1 non-constant static field initializer.  Evaluates those
+    //      initializers in textual declaration order and stores each result
+    //      into its backing global.  §22.13: "Within a single type, static
+    //      fields are initialized in textual declaration order."
+    //  (b) The user-written "cctor" void() function (§22.7) — emitted when
+    //      the source declares `static constructor()`.  §22.13: "The static
+    //      constructor, if any, runs after all static field initializers
+    //      complete."
+    //
+    // We iterate ctx_.symbols() in declaration order so that, across types,
+    // an earlier-declared type's sfinit+cctor always precede a later type's.
+    // Within a single type, sfinit (if any) is inserted BEFORE cctor (if
+    // any), satisfying the §22.13 ordering guarantee.  This works because
+    // SymbolCollection adds a class's TypeSymbol BEFORE its member symbols
+    // (constructors, fields), so the TypeSymbol and the synthesized sfinit
+    // entry for it always precede the user-written ConstructorSymbol entry.
+    //
+    // Helper: does `t` have any static field whose initializer is NOT a
+    // compile-time constant (i.e. not handled by constInitFor)?  Those need
+    // a runtime store emitted by the synthesized sfinit function.
+    auto needsRuntimeFieldInit = [&](const sema::TypeSymbol* t) -> bool {
+        for (const sema::Symbol* m : t->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (!fs || !isStaticField(fs)) continue;
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->initializer) continue;
+            const ast::Expr* e = fd->initializer.get();
+            // Mirrors constInitFor: only these expressions yield a
+            // compile-time LLVM Constant; everything else needs runtime eval.
+            if (dynamic_cast<const ast::IntLiteralExpr*>(e))     continue;
+            if (dynamic_cast<const ast::BoolLiteralExpr*>(e))    continue;
+            if (dynamic_cast<const ast::FloatLiteralExpr*>(e))   continue;
+            if (dynamic_cast<const ast::StringLiteralExpr*>(e))  continue;
+            if (dynamic_cast<const ast::VerbatimStringExpr*>(e)) continue;
+            return true;  // non-constant initializer found
+        }
+        return false;
+    };
+    // Track which types already have a synthesized sfinit so we do not
+    // double-emit one when the same TypeSymbol appears multiple times.
+    std::unordered_set<const sema::TypeSymbol*> sfInitEmitted;
+    auto* voidFnType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
     for (const auto& sym : ctx_.symbols()) {
-        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym.get());
-        if (!cs || !cs->isStatic) continue;
-        if (!dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) continue;
-        std::string cls = cs->parent ? std::string(cs->parent->name) : "";
-        auto* fnType = llvm::FunctionType::get(
-            llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
-        auto* fn = llvm::Function::Create(
-            fnType, llvm::Function::ExternalLinkage, "bz$" + cls + "$cctor",
-            module_.get());
-        staticCtors_.push_back({cs, fn});
+        // (a) Synthesized sfinit: emitted just before the user cctor entry for
+        //     the same type, so field inits run first.
+        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get())) {
+            if (!sfInitEmitted.count(ts) && needsRuntimeFieldInit(ts)) {
+                sfInitEmitted.insert(ts);
+                std::string cls(ts->name);
+                auto* fn = llvm::Function::Create(
+                    voidFnType, llvm::Function::InternalLinkage,
+                    "bz$" + cls + "$sfinit", module_.get());
+                staticCtors_.push_back({nullptr, ts, fn});
+            }
+        }
+        // (b) User-written cctor.
+        if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym.get())) {
+            if (!cs->isStatic) continue;
+            if (!dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) continue;
+            std::string cls = cs->parent ? std::string(cs->parent->name) : "";
+            auto* fn = llvm::Function::Create(
+                voidFnType, llvm::Function::ExternalLinkage,
+                "bz$" + cls + "$cctor", module_.get());
+            staticCtors_.push_back({cs, cs->parent, fn});
+        }
     }
 
     // CG13 / §28.2: declare, for every class, the public idempotent Dispose
@@ -2645,8 +2704,8 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // reaches the catch arm; otherwise it propagates to Main's propagateBB
     // (bz_unhandled_exception).
     if (isMain(ms)) {
-        for (auto& [cs, sfn] : staticCtors_) {
-            builder_.CreateCall(sfn, {});
+        for (auto& e : staticCtors_) {
+            builder_.CreateCall(e.fn, {});
             emitPendingCheck();
         }
         // §24.1 / §22.13 (#477 B6): allocate each static event's backing
@@ -2705,9 +2764,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
 
 
 void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
+                               const sema::TypeSymbol* type,
                                llvm::Function* fn) {
-    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-    if (!cd) return;
+    // cs may be null (synthesized field-init-only function); in that case
+    // there is no user-written ConstructorDecl body to lower.
+    const ast::ConstructorDecl* cd = nullptr;
+    if (cs) {
+        cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) return;  // malformed AST — nothing to emit
+    }
+
     currentFn_ = fn;
     currentReturnTypeNode_ = nullptr;  // ctors return void
     currentThis_ = nullptr;
@@ -2783,7 +2849,49 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
         builder_.SetInsertPoint(savedInsert);
     }
 
-    if (!lowerScopedBlock(cd->body)) builder_.CreateRetVoid();
+    // fix #582 / §22.13: emit runtime stores for every non-constant static
+    // field initializer of `type`, in textual declaration order.  This runs
+    // BEFORE the user-written constructor body (if any), satisfying §22.13:
+    // "Within a single type, static fields are initialized in textual
+    // declaration order" and "the static constructor … runs after all static
+    // field initializers complete."
+    //
+    // For a synthesized sfinit function (cs == null) this is the entire
+    // body.  For a user-written cctor (cs != null) this is the preamble
+    // before lowerScopedBlock(cd->body).
+    //
+    // Only non-constant initializers are emitted here; constant initializers
+    // (int/bool/float/string literals) are already encoded as the global's
+    // LLVM initializer by constInitFor, so they need no runtime store.
+    if (type) {
+        for (const sema::Symbol* m : type->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (!fs || !isStaticField(fs)) continue;
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->initializer) continue;
+            const ast::Expr* initExpr = fd->initializer.get();
+            // Skip initializers that constInitFor already handles as a
+            // compile-time constant — no runtime store needed for those.
+            if (dynamic_cast<const ast::IntLiteralExpr*>(initExpr))     continue;
+            if (dynamic_cast<const ast::BoolLiteralExpr*>(initExpr))    continue;
+            if (dynamic_cast<const ast::FloatLiteralExpr*>(initExpr))   continue;
+            if (dynamic_cast<const ast::StringLiteralExpr*>(initExpr))  continue;
+            if (dynamic_cast<const ast::VerbatimStringExpr*>(initExpr)) continue;
+            // Non-constant initializer: evaluate it and store into the global.
+            auto gvIt = staticGlobals_.find(fs);
+            if (gvIt == staticGlobals_.end()) continue;  // no backing global
+            llvm::Value* val = lowerExpr(*initExpr);
+            if (!val) continue;
+            builder_.CreateStore(val, gvIt->second);
+        }
+    }
+
+    // Lower the user-written static constructor body (cs != null).
+    if (cd) {
+        if (!lowerScopedBlock(cd->body)) builder_.CreateRetVoid();
+    } else {
+        builder_.CreateRetVoid();
+    }
 }
 
 
