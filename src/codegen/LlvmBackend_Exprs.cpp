@@ -3713,6 +3713,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
     auto savedRefParams = refParams_;
     auto savedLoopStack = loopStack_;
+    auto savedFinallyStack = finallyStack_;  // #546 / §31.2: a lambda compiled
+        // inside a try-with-finally must not clear the enclosing finally stack
+        // permanently — save it here and restore after the lambda body so the
+        // enclosing lowerTry's pop_back() finds the frame it pushed.
     llvm::BasicBlock* savedUnwind = unwindTarget_;
     llvm::BasicBlock* savedProp = propagateBB_;
     llvm::Value* savedCaught = currentCaughtExc_;
@@ -3945,6 +3949,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     cellVars_ = std::move(savedCellVars);
     disposeStack_ = std::move(savedDisposeStack);
     loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);  // #546 / §31.2: restore
     unwindTarget_ = savedUnwind;
     propagateBB_ = savedProp;
     currentCaughtExc_ = savedCaught;

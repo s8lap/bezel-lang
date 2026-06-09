@@ -96,3 +96,43 @@ BEZEL_TEST(codegen_cg21b, try_finally_without_catch) {
         "  end Main; "
         "end C;"), 10);
 }
+
+// §31.2 / §27.5 / issue #546: returning a function-typed (closure) value
+// through a try-with-finally must not crash the compiler.  The bug was that
+// lowerLambda cleared finallyStack_ without saving/restoring it, so the
+// enclosing lowerTry's pop_back() fired on an empty stack (assertion failure).
+// The lambda () => 42 is compiled INSIDE the try body while the FinallyFrame
+// is live on finallyStack_; after the fix, the frame is preserved across the
+// nested lambda compilation and the finally exit-mode dispatch works correctly.
+BEZEL_TEST(codegen_cg21b_546, finally_function_return_compiles_and_runs) {
+    // A method that returns a function type via `return <lambda>` inside a
+    // try-with-finally.  The returned value (exit mode = 1) must be stashed in
+    // the retValSlot, survive the finally body, and be returned to the caller.
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method GetFn(): () -> int "
+        "    try return () => 42; finally var _x: int := 0; end; "
+        "  end GetFn; "
+        "  public static method Main(): int "
+        "    var f: () -> int := C.GetFn(); "
+        "    return f(); "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §31.2 / §27.5 / issue #546: finally body runs before the closure is
+// returned — the side-effect counter shows finally executed, and the closure
+// value (exit mode = 1 through the retValSlot) still reaches the caller intact.
+BEZEL_TEST(codegen_cg21b_546, finally_runs_then_function_value_returned) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static _n: int := 0; "
+        "  public static method GetFn(): () -> int "
+        "    try return () => _n; finally _n := 7; end; "
+        "  end GetFn; "
+        "  public static method Main(): int "
+        "    var f: () -> int := C.GetFn(); "
+        "    return f(); "          // _n was set to 7 by finally before return
+        "  end Main; "
+        "end C;"), 7);
+}
