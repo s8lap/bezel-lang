@@ -686,6 +686,29 @@ int32_t bz_string_compare(const char* a, int64_t a_len,
 void* bz_string_split_anychar(const char* s, int64_t s_len,
                               const int32_t* seps, int64_t nsep);
 
+// ---------------------------------------------------------------------------
+// §4.6 / #535: Width-aware (code-point-level) string search/slice helpers.
+//
+// Every function below accepts full bz_string* pointers (layout
+// {ptr data, i64 len, i8 width, i64 rc}) and compares code points by value,
+// handling width 1/2/4 uniformly. All index/length arguments and return values
+// are code-point counts/indices, not byte offsets (§9.6 semantics).
+//
+// Callers own any newly allocated string results (rc := 1 on return).
+int32_t bz_str_startswith(const void* self, const void* prefix);
+int32_t bz_str_endswith(const void* self, const void* suffix);
+int32_t bz_str_contains(const void* self, const void* sub);
+int32_t bz_str_indexof(const void* self, const void* sub);
+int32_t bz_str_lastindexof(const void* self, const void* sub);
+// Substring(start, count): fresh string of `count` code points from `start`.
+void*   bz_str_substring(const void* self, int64_t start, int64_t count);
+// Replace(old, new): fresh string with all occurrences of `old` replaced.
+void*   bz_str_replace(const void* self, const void* old_str, const void* new_str);
+// Split(sep: char): fresh Array<string> split at every code point equal to sep.
+void*   bz_str_split_cp(const void* self, int32_t sep);
+// Split(sep: string): fresh Array<string> split at every occurrence of sep.
+void*   bz_str_split_str(const void* self, const void* sep);
+
 // StringBuilder helper — concatenates an array of bz.string pointers.
 // Caller must free *out_data with free() after use.
 // ---------------------------------------------------------------------------
