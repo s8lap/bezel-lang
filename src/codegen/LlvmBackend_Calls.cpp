@@ -6171,6 +6171,51 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
+    // per §14.1 / §22.12 (issue #520): a STATIC method on a generic class
+    // accessed via explicit receiver type args (`Registry<int>.Make(7)`) has no
+    // instance receiver to derive the substitution from — the `!isStaticMethod`
+    // guard above skips it.  Instead, recover the concrete type args from the
+    // callee's MemberAccessExpr target, which is an IdentifierExpr with a
+    // non-empty `typeArgs` vector and an exprType of kind Named whose
+    // genericArgs were populated by sema's IdentifierExpr visitor.
+    if (isStaticMethod(ms) && ms->parent) {
+        if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (auto* recvId = dynamic_cast<const ast::IdentifierExpr*>(
+                    callMa->target.get())) {
+                if (!recvId->typeArgs.empty()) {
+                    // The sema IdentifierExpr visitor built an instantiated
+                    // TypeRef on the receiver; read its genericArgs directly.
+                    sema::TypeRef* recvTy = ctx_.exprType(*recvId);
+                    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        recvTy->declaration == ms->parent &&
+                        !recvTy->genericArgs.empty()) {
+                        auto* td = dynamic_cast<const ast::TypeDecl*>(
+                            ms->parent->decl);
+                        if (td && td->genericParams.size() ==
+                                  recvTy->genericArgs.size()) {
+                            std::unordered_map<std::string_view, llvm::Type*>
+                                newSubst;
+                            std::unordered_map<std::string_view,
+                                               const sema::TypeRef*>
+                                newSema;
+                            for (std::size_t gi = 0;
+                                 gi < td->genericParams.size(); ++gi) {
+                                llvm::Type* concrTy =
+                                    lowerTypeRef(recvTy->genericArgs[gi]);
+                                std::string_view pname =
+                                    td->genericParams[gi].name;
+                                newSubst[pname] = concrTy;
+                                newSema[pname] = recvTy->genericArgs[gi];
+                            }
+                            genericSubst_ = std::move(newSubst);
+                            genericSubstSemaTy_ = std::move(newSema);
+                        }
+                    }
+                }
+            }
+        }
+    }
     // per §14.1/§14.2: a generic *method* (its own `<T>` params, e.g.
     // `static method Clone<T>(proto: T): T where T: class, new()`) is
     // monomorphized by inferring each method type parameter from the actual
