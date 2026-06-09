@@ -3134,6 +3134,22 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 }
             }
         }
+        // #534 / stdlib §4.8: dictionary literal `["k1":v1, "k2":v2, …]` — allocate
+        // and populate a Dictionary<K,V> (or OwnedDictionary<K,V>) via the SAME
+        // bz_dict_alloc / bz_dict_set_* calls that `new Dictionary()` + `.Add(k,v)`
+        // use. The slot is a bare `ptr` (same as for the new-expr path). The resolved
+        // dict TypeRef is read from the declared type annotation; without it we fall
+        // through and let lowerExpr return null (unrecoverable, same as before).
+        if (cl->isDict && !cl->keys.empty() && declType) {
+            if (const sema::TypeRef* dictTy = ctx_.resolvedType(*declType)) {
+                if (llvm::Value* tbl = materializeHeapDictLiteral(cl, dictTy)) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    locals_[declNode] = slot;
+                    builder_.CreateStore(tbl, slot);
+                    return;
+                }
+            }
+        }
         if (!cl->isDict && !cl->elements.empty()) {
             llvm::Type* arrTy = declType ? lowerType(declType) : nullptr;
             if (!arrTy) {
@@ -5300,6 +5316,126 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});
     }
     return arr;
+}
+
+
+// #534 / stdlib §4.8: materialize a dictionary literal `["k1":v1, "k2":v2, …]`
+// into a freshly-allocated Dictionary<K,V> (or OwnedDictionary<K,V>).
+//
+// Strategy: reuse EXACTLY the same allocation and per-entry insertion codegen
+// as the working `new Dictionary<K,V>()` + `.Add(k, v)` paths (lowerNew +
+// tryLowerCollectionInstanceCall), so the resulting object is bit-for-bit
+// identical to one built with explicit Add calls.
+//
+//   1. Allocate via bz_dict_alloc (string keys) or bz_dict_alloc_generic
+//      (generic keys) — mirroring lowerNew's Dictionary branch.
+//   2. For each (key, value) pair: lower both sub-expressions, encode the value
+//      via the same inttoptr/box logic, then call bz_dict_set_str or
+//      bz_dict_set_gen — mirroring the .Add(k, v) branch.
+//
+// Returns a `ptr` to the bz_dict_t.  Returns null when `dictTy` is not a
+// recognized Dictionary/OwnedDictionary TypeRef.
+llvm::Value* Emitter::materializeHeapDictLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* dictTy) {
+    if (!cl || !cl->isDict || !dictTy) return nullptr;
+    if (!isDictTypeName(dictTy)) return nullptr;
+    if (cl->keys.size() != cl->elements.size()) return nullptr;  // malformed AST
+
+    // Key type analysis (mirrors lowerNew Dictionary branch and .Add branch).
+    // genericBackingType returns non-null for every non-string key (int/long/
+    // bool/char/enum/record/float): use the generic-key runtime.  Null → string.
+    const sema::TypeRef* keyTy =
+        genericBackingType(dictTy, 0, /*isSet=*/false, nullptr);
+    bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+
+    // Value type analysis (mirrors .Add branch for record-value boxing — D4).
+    const sema::TypeRef* valTy =
+        (dictTy->genericArgs.size() > 1) ? dictTy->genericArgs[1] : nullptr;
+    const sema::TypeSymbol* valRec =
+        (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
+         valTy->declaration &&
+         valTy->declaration->kind == ast::TypeDeclKind::Record)
+            ? valTy->declaration : nullptr;
+
+    // --- 1. Allocate the backing hash table (same as lowerNew Dictionary). ---
+    llvm::Value* dict = nullptr;
+    if (keyTy) {
+        // Generic-key table: parameterised by key byte-size + hash/eq trampolines.
+        uint64_t ksz = 0;
+        genericBackingType(dictTy, 0, /*isSet=*/false, &ksz);
+        llvm::Function* hashT = buildValueHashTrampoline(keyTy);
+        llvm::Function* eqT   = buildValueEqTrampoline(keyTy);
+        auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
+                                 {i64(), ptrTy(), ptrTy()});
+        dict = builder_.CreateCall(allocFn,
+            {builder_.getInt64((int64_t)ksz), hashT, eqT}, "dlit.tbl");
+    } else {
+        // String-key fast-path table.
+        auto* allocFn = declareC("bz_dict_alloc", ptrTy(), {});
+        dict = builder_.CreateCall(allocFn, {}, "dlit.tbl");
+    }
+    if (!dict) return nullptr;
+
+    // --- 2. Insert each (key, value) pair (same as .Add(k, v)). -----------
+
+    // Encode a scalar/float/ptr/record value into the void* slot the runtime
+    // stores (mirrors the encodeValue lambda in tryLowerCollectionInstanceCall).
+    auto encodeVal = [&](llvm::Value* v) -> llvm::Value* {
+        if (valRec && v->getType()->isStructTy()) {
+            // Record value: heap-box it (malloc + store) — issue D4.
+            llvm::StructType* vst = recordStruct(valRec);
+            uint64_t vsz = module_->getDataLayout().getTypeAllocSize(vst);
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            llvm::Value* box =
+                builder_.CreateCall(mallocFn, {builder_.getInt64((int64_t)vsz)});
+            builder_.CreateStore(v, box);
+            return box;
+        }
+        if (v->getType()->isPointerTy()) return v;
+        // Scalar / float: widen to i64 then inttoptr so the value is
+        // self-contained (no shared-alloca aliasing across loop iterations).
+        llvm::Value* asI64 = v;
+        if (v->getType()->isFloatingPointTy()) {
+            if (v->getType()->isDoubleTy())
+                asI64 = builder_.CreateBitCast(v, i64());
+            else
+                asI64 = builder_.CreateZExt(builder_.CreateBitCast(v, i32()), i64());
+        } else if (!v->getType()->isIntegerTy(64)) {
+            asI64 = builder_.CreateZExt(v, i64());
+        }
+        return builder_.CreateIntToPtr(asI64, ptrTy());
+    };
+
+    // Spill a generic key to a stack slot and return its byte pointer
+    // (mirrors the genKeyPtr lambda in tryLowerCollectionInstanceCall).
+    auto spillKey = [&](llvm::Value* k) -> llvm::Value* {
+        if (keyIsRecord && k->getType()->isPointerTy())
+            return k;  // record is already spilled to an address
+        llvm::AllocaInst* slot = entryAlloca(k->getType());
+        builder_.CreateStore(k, slot);
+        return slot;
+    };
+
+    for (std::size_t i = 0; i < cl->keys.size(); ++i) {
+        if (!cl->keys[i] || !cl->elements[i]) continue;
+        llvm::Value* k = lowerExpr(*cl->keys[i]);
+        llvm::Value* v = lowerExpr(*cl->elements[i]);
+        if (!k || !v) continue;
+        llvm::Value* vPtr = encodeVal(v);
+        if (keyTy) {
+            auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {dict, spillKey(k), vPtr});
+        } else {
+            // String key: extract data/len from the bz_string struct.
+            llvm::Value* kd = loadStringData(k);
+            llvm::Value* kl = loadStringLen(k);
+            auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(fn, {dict, kd, kl, vPtr});
+        }
+    }
+    return dict;
 }
 
 
