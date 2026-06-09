@@ -4717,15 +4717,58 @@ llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
     // matches the storage members maps each argument to its field by
     // position. This is the original positional-record construction path,
     // taken only when the record has no explicit constructor.
+    //
+    // §22.5 / #540: named arguments on a positional record are also handled
+    // here by reordering the supplied args to field-declaration order before
+    // the field stores, mirroring buildOrderedArgs for class constructors.
     if (!hasAnyConstructor(t) && !args.empty() &&
         args.size() == fields.size()) {
         bool allPositional = true;
         for (const auto& a : args)
             if (!a.name.empty()) { allPositional = false; break; }
+
+        // Build a field-index-ordered pointer to each call argument.
+        // For positional args: fieldArg[i] = &args[i].
+        // For named args: fieldArg[i] = the arg whose .name == fields[i]->name.
+        // Fall through to the body-record path if any name is unrecognised.
+        std::vector<const ast::CallArgument*> fieldArg(fields.size(), nullptr);
+        bool mappingOk = true;
         if (allPositional) {
+            for (std::size_t i = 0; i < fields.size(); ++i)
+                fieldArg[i] = &args[i];
+        } else {
+            // §22.5 / #540: map each named argument to the field with that name.
+            // per §22.5, named arguments may appear in any order after positional
+            // arguments, but a positional record has no explicit constructor so
+            // all arguments must be named (or all positional — the mixed case
+            // is rejected by sema).
+            for (std::size_t ai = 0; ai < args.size(); ++ai) {
+                const ast::CallArgument& a = args[ai];
+                if (a.name.empty()) {
+                    // positional arg in a mixed call — fall through to body path.
+                    mappingOk = false; break;
+                }
+                bool found = false;
+                for (std::size_t fi = 0; fi < fields.size(); ++fi) {
+                    if (fields[fi]->name == a.name) {
+                        fieldArg[fi] = &a;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) { mappingOk = false; break; }
+            }
+            // Verify every field got an argument.
+            if (mappingOk) {
+                for (std::size_t fi = 0; fi < fields.size(); ++fi)
+                    if (!fieldArg[fi]) { mappingOk = false; break; }
+            }
+        }
+
+        if (mappingOk) {
             for (std::size_t i = 0; i < fields.size(); ++i) {
-                if (!args[i].value) return nullptr;
-                llvm::Value* v = lowerExpr(*args[i].value);
+                if (!fieldArg[i] || !fieldArg[i]->value) return nullptr;
+                llvm::Value* v = lowerExpr(*fieldArg[i]->value);
                 if (!v) return nullptr;
                 // CG-nullable: a NULLABLE VALUE field (int?, bool?, …, and a
                 // nullable enum — issue #364) stores the tagged struct {i8
