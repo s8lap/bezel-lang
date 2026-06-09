@@ -131,6 +131,11 @@ inline std::string typeToString(const ast::Type& t) {
                                   : std::string("<null>");
             break;
         case ast::TypeKind::Function:
+            // §27.2: a nullable function type is rendered with outer parens —
+            // `((int) -> bool)?` — to distinguish it from `(int) -> bool?`
+            // (non-null function returning nullable bool). The extra parens
+            // only appear when the whole function type is nullable.
+            if (t.nullable) out += '(';
             out += '(';
             for (std::size_t i = 0; i < t.funcParams.size(); ++i) {
                 if (i > 0) out += ", ";
@@ -150,6 +155,7 @@ inline std::string typeToString(const ast::Type& t) {
             if (t.funcReturnOwned) out += "owned ";
             out += t.funcReturn ? typeToString(*t.funcReturn)
                                 : std::string("<null>");
+            if (t.nullable) out += ')';
             break;
     }
     if (t.nullable) out += '?';

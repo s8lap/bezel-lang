@@ -638,6 +638,26 @@ std::unique_ptr<ast::Type> Parser::parseType() {
                     "expected ')' to close function-type parameter list");
             }
             if (!consumePunctuator("->")) {
+                // §27.2: `((FunctionType))?` — the outer parens are a
+                // grouping operator required before `?` (without them
+                // the `?` would attach to the return type instead of the
+                // whole function type). Detect: exactly one param, no
+                // modifier, no name, whose type is itself a Function;
+                // and `?` follows (the nullable suffix on the grouped
+                // type). Per spec: `((int) -> bool)?` is a nullable
+                // function type, distinct from `(int) -> bool?`.
+                if (type->funcParams.size() == 1 &&
+                    type->funcParams[0].modifier.empty() &&
+                    type->funcParams[0].name.empty() &&
+                    type->funcParams[0].type &&
+                    type->funcParams[0].type->kind ==
+                        ast::TypeKind::Function &&
+                    isPunctuator("?")) {
+                    auto inner = std::move(type->funcParams[0].type);
+                    inner->nullable = true;
+                    advance(); // consume `?`
+                    return inner;
+                }
                 diagnostics_.report(
                     Severity::Error, current_.location,
                     "expected '->' after function-type parameter list");
