@@ -8478,17 +8478,66 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         return llvm::ConstantInt::get(i32(), 0);
     }
     // --- Find(item): LinkedListNode<T>? ---
-    // Find by memcmp (value equality for primitives/records; pointer identity
-    // for class types — per §8.3 / §4.6 the class node value IS the pointer).
+    // fix #566 / §4.6/§8.3/§9.1: the previous bz_llist_find path used memcmp on
+    // raw element bytes, comparing bz_string* pointer values (not content) for
+    // string elements and raw pointer bytes for records with string fields.
+    // Mirror the #562 fix for LinkedList<T>.Contains: walk node-by-node applying
+    // emitRemoveElementEquality for per-element comparison, then return the
+    // matching node pointer (LinkedListNode<T>?) — null if no match found.
+    // No disposal: Find only borrows elements (§4.6, LinkedList<T> is non-owning).
     if (m == "Find" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
-        auto* fn = declareC("bz_llist_find", ptrTy(),
-                            {ptrTy(), ptrTy(), i64()});
-        return builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)},
-                                   "ll.find");
+        const sema::TypeRef* elemRef =
+            (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                      : nullptr;
+        bool elemIsClass = collectionElemIsClass(recvTy, 0);
+        // Spill the search target to a stable alloca slot.
+        llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
+        builder_.CreateStore(v, tgtSlot);
+        // nodeSlot: current node pointer during the walk.
+        llvm::AllocaInst* nodeSlot = entryAlloca(ptrTy());
+        // foundNodeSlot: the matching node pointer, null if not found.
+        llvm::AllocaInst* foundNodeSlot = entryAlloca(ptrTy());
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        builder_.CreateStore(nullP, foundNodeSlot);
+        auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+        auto* nextFn  = declareC("bz_llist_node_next",  ptrTy(), {ptrTy()});
+        auto* valFn   = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+        llvm::Value* firstNode = builder_.CreateCall(firstFn, {recv}, "llf.first");
+        builder_.CreateStore(firstNode, nodeSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "llf.c",  currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "llf.b",  currentFn_);
+        auto* matchBB = llvm::BasicBlock::Create(llvm_, "llf.m",  currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "llf.n",  currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "llf.e",  currentFn_);
+        builder_.CreateBr(condBB);
+        // Loop header: exit when node == null.
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* curNode = builder_.CreateLoad(ptrTy(), nodeSlot, "llf.cur");
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(curNode, nullP, "llf.nnull"),
+            bodyBB, endBB);
+        // Loop body: load element, test structural equality.
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llf.vp");
+        llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llf.el");
+        llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llf.tgt");
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, elemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, matchBB, nextBB);
+        // Match: save the node pointer and exit the loop.
+        builder_.SetInsertPoint(matchBB);
+        builder_.CreateStore(curNode, foundNodeSlot);
+        builder_.CreateBr(endBB);
+        // No match: advance to next node.
+        builder_.SetInsertPoint(nextBB);
+        llvm::Value* nxt = builder_.CreateCall(nextFn, {curNode}, "llf.next");
+        builder_.CreateStore(nxt, nodeSlot);
+        builder_.CreateBr(condBB);
+        // Return the matching node pointer (null if not found) — LinkedListNode<T>?.
+        builder_.SetInsertPoint(endBB);
+        return builder_.CreateLoad(ptrTy(), foundNodeSlot, "llf.result");
     }
     // --- Count (no-arg call form, e.g. l.Count()) → int ---
     if (m == "Count" && call.args.empty()) {
