@@ -3283,7 +3283,23 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             return;
         }
     }
+    // fix #541 / §7.1 / §17.14: when a lambda is assigned to an explicitly-typed
+    // local whose declared type is a function type with a NULLABLE VALUE return
+    // (e.g. `var f: (string)->int? := (k)=>42`), set expectedFunctionType_ so
+    // that lowerLambda derives the correct `{i8,T}` LLVM return type for the
+    // closure function — exactly as buildOrderedArgs does for function arguments.
+    // Without this, lowerLambda has no context, derives `i32` from the body
+    // literal, and emits `ret i32 42` into a function whose call site expects
+    // `{i8,i32}` → IR verification failure.
+    const sema::TypeRef* savedExpectedForLambdaDecl = expectedFunctionType_;
+    if (init && declType && dynamic_cast<const ast::LambdaExpr*>(init)) {
+        if (const sema::TypeRef* declTR = ctx_.resolvedType(*declType)) {
+            if (declTR->kind == sema::TypeRef::Kind::Function)
+                expectedFunctionType_ = declTR;
+        }
+    }
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
+    expectedFunctionType_ = savedExpectedForLambdaDecl;
     // CG40: a diverging initializer (`var x := throw E;`) terminated the
     // block; allocate the slot but emit no store.
     if (diverged_) return;
