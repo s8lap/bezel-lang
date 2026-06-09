@@ -5828,11 +5828,21 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             llvm::Value* fieldVal =
                 builder_.CreateExtractValue(scrut, {idxIt->second});
             if (!sp.nakedBinding.empty()) {
-                // Binding: store field value into a slot for `sp.nakedBinding`.
+                // Bare `Pt(x, y)` binding: store field value into a slot
+                // keyed on the PositionalPattern address — mirrors the sema
+                // anchor (`lsym->decl = reinterpret_cast<...>(&sp)`).
                 llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
                 builder_.CreateStore(fieldVal, slot);
                 const auto* key = reinterpret_cast<const ast::Node*>(&sp);
                 locals_[key] = slot;
+            } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
+                           sp.pattern.get())) {
+                // §19.3: `Pt(var x, var y)` — equivalent to bare form.
+                // Sema sets lsym->decl = vbp (the BindingPattern node), so
+                // key the slot on vbp to match localSlot()'s lookup.
+                llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
+                builder_.CreateStore(fieldVal, slot);
+                locals_[vbp] = slot;
             } else if (sp.pattern) {
                 // Non-binding sub-pattern: check it against the field value.
                 // For constant patterns (e.g. `0`), emit an equality check.

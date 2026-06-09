@@ -1,0 +1,176 @@
+// Regression tests for issue #577: `var`-prefixed bindings in a record
+// destructuring pattern arm were not visible in the arm body.
+//
+// §19.3: `Pt(var x, var y)` is equivalent to `Pt(x, y)` — both introduce
+// bindings of the destructured field values into the arm scope.
+//
+// Before the fix, sema skipped `BindingPattern` sub-patterns in a
+// DestructuringPattern's sub-pattern list (it only handled nakedBinding),
+// so the bound names were never inserted into the arm scope. Codegen
+// similarly lacked a slot for them. Now both are handled identically to
+// the bare naked-binding form.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::JitResult;
+using bezel::test::runJit;
+
+namespace {
+
+int runFull(const std::string& program) {
+    auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+
+} // namespace
+
+// ── §19.3 example 1: `Pt(var a, var b)` — both var-bindings visible ──────────
+
+// §19.3: `Pt(var a, var b)` extracts both fields; arm body computes a + b.
+// Expected: 10 + 20 = 30.
+BEZEL_TEST(codegen_577_var_destructure, var_bindings_both_visible_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(10, 20); "
+        "  return case p "
+        "    Pt(var a, var b) => a + b, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 30);
+}
+
+// §19.3: `Pt(var a, var b)` — use only first bound name (a).
+// Expected: 10.
+BEZEL_TEST(codegen_577_var_destructure, var_binding_first_field_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(10, 20); "
+        "  return case p "
+        "    Pt(var a, var b) => a, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 10);
+}
+
+// §19.3: `Pt(var a, var b)` — use only second bound name (b).
+// Expected: 20.
+BEZEL_TEST(codegen_577_var_destructure, var_binding_second_field_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(10, 20); "
+        "  return case p "
+        "    Pt(var a, var b) => b, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 20);
+}
+
+// ── §19.3 example 2: mixed `Pt(var a, b)` — one var-binding, one naked ───────
+
+// §19.3: Mixed `Pt(var a, b)` — first sub-pattern uses var-prefix, second
+// uses the bare naked-binding form. Both must be visible in the arm body.
+// Expected: 3 + 4 = 7.
+BEZEL_TEST(codegen_577_var_destructure, mixed_var_and_naked_binding_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Pair(A: int, B: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(3, 4); "
+        "  return case p "
+        "    Pair(var a, b) => a + b, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+// §19.3: Mixed `Pair(a, var b)` — second sub-pattern uses var-prefix.
+// Expected: 5 (value of b).
+BEZEL_TEST(codegen_577_var_destructure, naked_then_var_binding_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Pair(A: int, B: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(3, 5); "
+        "  return case p "
+        "    Pair(a, var b) => b, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 5);
+}
+
+// ── §19.3 regression: bare `Pt(a, b)` form still works after the fix ─────────
+
+// §19.3: Verify that the original bare `Pt(a, b)` form was not broken by
+// the fix that added var-binding support.
+// Expected: 3 + 4 = 7.
+BEZEL_TEST(codegen_577_var_destructure, bare_form_regression_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Point(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(3, 4); "
+        "  return case p "
+        "    Point(x, y) => x + y, "
+        "    _ => 0 "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+// ── §19.3: var-bindings in statement-position case ────────────────────────────
+
+// §19.3 applies to both expression-position and statement-position case.
+// In statement-position `case`, the arm body is a `do … end` block.
+// Expected: a + b = 10 + 20 = 30 (returned via a local variable).
+BEZEL_TEST(codegen_577_var_destructure, var_binding_case_stmt_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(10, 20); "
+        "  var r := 0; "
+        "  case p "
+        "    Pt(var a, var b) => do r := a + b; end "
+        "  end; "
+        "  return r; "
+        "end Main; end C;"), 30);
+}
+
+// ── §19.3: mixed constant + var-binding sub-patterns ─────────────────────────
+
+// §19.3 / §19.4: `Pair(0, var b)` — first sub-pattern is a constant (must
+// match 0), second is a var-binding. Arm fires only when first field == 0.
+// Expected: b = 7 when Pair(0, 7).
+BEZEL_TEST(codegen_577_var_destructure, const_then_var_binding_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Pair(A: int, B: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(0, 7); "
+        "  return case p "
+        "    Pair(0, var b) => b, "
+        "    _ => -1 "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+// Constant + var-binding: arm must NOT fire when the constant sub-pattern
+// does not match. Expected: -1 (fallthrough to _ arm).
+BEZEL_TEST(codegen_577_var_destructure, const_then_var_binding_no_match_spec_19_3) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Pair(A: int, B: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pair(5, 7); "
+        "  return case p "
+        "    Pair(0, var b) => b, "
+        "    _ => -1 "
+        "  end; "
+        "end Main; end C;"), -1);
+}
