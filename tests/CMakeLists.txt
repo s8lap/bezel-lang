@@ -378,6 +378,7 @@ set(BEZEL_TEST_SOURCES
     codegen/lambda_nullable_return_541_test.cpp
     codegen/lambda_nullable_cases_543_test.cpp
     codegen/record_named_args_540_test.cpp
+    codegen/in_operator_collection_551_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

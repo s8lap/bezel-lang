@@ -2568,7 +2568,91 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 return builder_.CreateCall(fn, {dict, kdata, klen}, "dict.in");
             }
         }
-        return nullptr;  // other `in` forms (collection) not yet implemented
+        // §17.5: `x in coll` where `coll` is an Array<T>-, Stack<T>-, or
+        // Queue<T>-typed expression (all bz_array_t-backed collections except
+        // Set/OwnedSet, which are dict-backed and handled above).
+        // Lowers to the same linear scan as Array<T>.Contains(x): iterate via
+        // bz_array_len / bz_array_ptr_at and compare each element using
+        // emitRemoveElementEquality (record/string/value-type equality per §8.3).
+        if (bin.right) {
+            auto* rTy = ctx_.exprType(*bin.right);
+            // isCollectionTypeName covers Array, OwnedArray, Stack, OwnedStack,
+            // Queue, OwnedQueue, Set, OwnedSet — but Set/OwnedSet are already
+            // handled above by the dict-backed path; they only reach here when
+            // genericBackingType returned null (no generic arg), which is a
+            // degenerate case not reached in practice.  isLinkedListTypeName
+            // covers LinkedList and OwnedLinkedList (bz_llist_t-backed).
+            bool isArr = isCollectionTypeName(rTy);
+            bool isLL  = isLinkedListTypeName(rTy);
+            if (isArr || isLL) {
+                const sema::TypeRef* elemRef =
+                    (rTy && !rTy->genericArgs.empty()) ? rTy->genericArgs[0]
+                                                       : nullptr;
+                bool elemIsClass = collectionElemIsClass(rTy, 0);
+                llvm::Value* elem = lowerExpr(*bin.left);
+                llvm::Value* coll = lowerExpr(*bin.right);
+                if (!elem || !coll) return nullptr;
+
+                if (isLL) {
+                    // per §4.6/§4.7: bz_llist_find does a memcmp scan over the
+                    // linked list's inline element bytes — value equality for
+                    // primitives/records, pointer identity for class types (per
+                    // §8.3 / §4.6).  Returns the first matching node pointer or
+                    // null if not found; we convert to i1.
+                    int64_t esz = collectionElemSize(rTy);
+                    llvm::AllocaInst* slot = entryAlloca(elem->getType());
+                    builder_.CreateStore(elem, slot);
+                    auto* findFn = declareC("bz_llist_find", ptrTy(),
+                                           {ptrTy(), ptrTy(), i64()});
+                    llvm::Value* node = builder_.CreateCall(
+                        findFn, {coll, slot, builder_.getInt64(esz)}, "coll.in.node");
+                    return builder_.CreateICmpNE(
+                        node, llvm::ConstantPointerNull::get(ptrTy()), "coll.in");
+                }
+
+                // Array-backed path: emit the same scan loop as
+                // tryLowerCollectionInstanceCall's Contains branch.
+                llvm::Type* elemTy = elemRef ? lowerTypeRef(elemRef) : i64();
+                if (!elemTy) elemTy = i64();
+                int64_t esz = collectionElemSize(rTy);
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {coll}, "coll.len");
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* condBB  = llvm::BasicBlock::Create(llvm_, "cin2.c", currentFn_);
+                auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "cin2.b", currentFn_);
+                auto* foundBB = llvm::BasicBlock::Create(llvm_, "cin2.f", currentFn_);
+                auto* nextBB  = llvm::BasicBlock::Create(llvm_, "cin2.n", currentFn_);
+                auto* endBB   = llvm::BasicBlock::Create(llvm_, "cin2.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len),
+                                      bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                       {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(
+                    ptrFn, {coll, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                llvm::Value* eq =
+                    emitRemoveElementEquality(el, elem, elemRef, elemIsClass);
+                if (!eq) return nullptr;
+                builder_.CreateCondBr(eq, foundBB, nextBB);
+                builder_.SetInsertPoint(foundBB);
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(
+                    builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                auto* phi = builder_.CreatePHI(i1(), 2, "coll.in");
+                phi->addIncoming(builder_.getTrue(),  foundBB);
+                phi->addIncoming(builder_.getFalse(), condBB);
+                return phi;
+            }
+        }
+        return nullptr;  // other `in` forms — not yet implemented
     }
     llvm::Value* l = lowerExpr(*bin.left);
     llvm::Value* r = lowerExpr(*bin.right);
