@@ -2210,7 +2210,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             // slot's address as `this` — mirroring the record field-access
             // path in fieldAddr (CG29/#254) and the §9.2 record-storage
             // access used by the synthesized ToString.
-            if (!obj->getType()->isPointerTy()) {
+            // #574 / §10.4: enums are value types (i32), but their getter
+            // bodies use `this` as a plain integer (e.g. `case this ...`),
+            // NOT as a struct pointer. Skip the spill for enum receivers so
+            // that `scrut = lowerExpr("this")` inside `lowerCaseExpr` yields
+            // the raw i32 value that can be compared against enum constants
+            // via icmp. Spilling an i32 to a ptr and then comparing the ptr
+            // against an i32 constant would produce malformed IR (icmp with
+            // mismatched types → IR verifier failure).
+            bool isEnumReceiver = propSym && propSym->parent &&
+                                  propSym->parent->kind == ast::TypeDeclKind::Enum;
+            if (!obj->getType()->isPointerTy() && !isEnumReceiver) {
                 llvm::AllocaInst* tmp = entryAlloca(obj->getType());
                 builder_.CreateStore(obj, tmp);
                 obj = tmp;
@@ -2255,7 +2265,21 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
             llvm::Value* saved = currentThis_;
             currentThis_ = obj;
+            // #574 / §10.4 / §19.2 (CG30): an enum computed property whose
+            // getter body is `case this Red => …` relies on enumTypeOf() to
+            // resolve `this` as the declaring enum type so patternMatches can
+            // compare the enum constant patterns. enumTypeOf() uses
+            // currentEnumMethod_ for a `this` identifier because sema does not
+            // attach an exprType to `this` — the same reason CG30 sets it for
+            // enum instance methods. Set it here for the duration of the
+            // inline getter body so `case this` inside an enum property works
+            // exactly as it does inside an enum method.
+            const sema::TypeSymbol* savedEnumMethod = currentEnumMethod_;
+            if (propSym && propSym->parent &&
+                propSym->parent->kind == ast::TypeDeclKind::Enum)
+                currentEnumMethod_ = propSym->parent;
             llvm::Value* v = lowerExpr(*getter);
+            currentEnumMethod_ = savedEnumMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
             return v;
