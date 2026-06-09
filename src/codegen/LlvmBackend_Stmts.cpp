@@ -421,6 +421,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // (`<dict>.Keys` has no sema element type, so this must run before the
         // generic for-handlers; it recognizes the AST shape directly.)
         if (lowerDictKeysFor(*fors)) return false;
+        // issue #537 / §4.8: `for var v in <dict>.Values` — iterate dict values.
+        // Mirrors lowerDictKeysFor but snapshots values (genericArgs[1]) instead
+        // of keys; must also run before the generic for-handlers.
+        if (lowerDictValuesFor(*fors)) return false;
         // issue #370 / §4.10: `for var x in <set>` over a dict-backed Set<T>.
         // Must precede lowerArrayFor (Set is a collection-type name but is NOT
         // array-backed when its element routes through the generic hash table).
@@ -1513,6 +1517,127 @@ bool Emitter::lowerDictKeysFor(const ast::ForStmt& fs) {
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
     builder_.CreateCall(freeFn, {lensArr});
+    return true;
+}
+
+
+// issue #537 / §4.8: `for var v in <dict>.Values` — iterate a Dictionary's
+// values.  The runtime snapshot helpers bz_dict_values_str (string-key table)
+// and bz_dict_values_gen (generic-key table) return a malloc'd void** array of
+// the live slot values — the same void* encoding used by Add/Set (inttoptr for
+// scalars, direct pointer for strings/classes, heap-box pointer for records).
+// The loop decodes each slot value into the V LLVM type using the same logic as
+// TryGetValue and GetOrAdd.
+bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
+    if (!fs.iterable) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(fs.iterable.get());
+    if (!ma || !ma->target || ma->member != "Values") return false;
+    auto* dictTy = ctx_.exprType(*ma->target);
+    if (!isDictTypeName(dictTy)) return false;
+    // genericArgs: [0] = K, [1] = V
+    if (dictTy->genericArgs.size() < 2 || !dictTy->genericArgs[1]) return false;
+    const sema::TypeRef* valTy = dictTy->genericArgs[1];
+
+    // Determine if V is a record (heap-boxed in the dict), a scalar, or a ptr.
+    // Any Named-kind TypeRef with a Record declaration is boxed (issue D4).
+    const sema::TypeSymbol* valRec =
+        (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
+         valTy->declaration &&
+         valTy->declaration->kind == ast::TypeDeclKind::Record)
+            ? valTy->declaration : nullptr;
+
+    llvm::Type* valLlvm = lowerTypeRef(valTy);
+    if (!valLlvm) return false;
+
+    llvm::Value* dictObj = lowerExpr(*ma->target);
+    if (!dictObj) return false;
+
+    // Snapshot the values array.  Choose the string-key or generic-key helper
+    // based on whether the key (genericArgs[0]) routes through the generic table.
+    auto* valsOutSlot = entryAlloca(ptrTy());
+    auto* cntSlot     = entryAlloca(i64());
+
+    bool useGen = genericBackingType(dictTy, 0, /*isSet=*/false, nullptr) != nullptr;
+    if (useGen) {
+        // Generic-key dict: bz_dict_values_gen(dict, void*** vals_out, int64_t* n)
+        auto* fn = declareC("bz_dict_values_gen", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {dictObj, valsOutSlot, cntSlot});
+    } else {
+        // String-key dict: bz_dict_values_str(dict, void*** vals_out, int64_t* n)
+        auto* fn = declareC("bz_dict_values_str", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {dictObj, valsOutSlot, cntSlot});
+    }
+    llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot); // void**
+    llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+
+    // Loop variable slot — stores the decoded V value.
+    auto* varSlot = entryAlloca(valRec ? ptrTy() : valLlvm);
+    locals_[&fs] = varSlot;
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "dv.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dv.body", currentFn_);
+    auto* incBB  = llvm::BasicBlock::Create(llvm_, "dv.inc",  currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "dv.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* idxB   = builder_.CreateLoad(i64(), idxSlot);
+    llvm::Value* vpPtr  = builder_.CreateGEP(ptrTy(), valsArr, idxB);
+    llvm::Value* slotV  = builder_.CreateLoad(ptrTy(), vpPtr);  // raw void*
+
+    // Decode void* → V following the same encoding as TryGetValue / GetOrAdd.
+    //   record value: slotV is the heap-box pointer → load the struct.
+    //   scalar (int/long/bool/char/enum/float/double): slotV was inttoptr'd →
+    //     ptrtoint back to i64, then trunc/bitcast to the target type.
+    //   pointer (string / class object): slotV IS the value.
+    llvm::Value* decoded;
+    if (valRec) {
+        // Record: bind the loop variable as a pointer to the box (body reads
+        // fields through it).  We do NOT copy the record here; the body reads
+        // via a load of the struct type, matching how lowerDictKeysFor's
+        // emitGenericKeyTableFor binds key values.  The box is owned by the dict
+        // and must not be freed.
+        decoded = slotV;  // ptr to boxed record
+    } else if (!valLlvm->isPointerTy()) {
+        // Scalar: undo the inttoptr encoding.
+        llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
+        if (valLlvm->isDoubleTy())
+            decoded = builder_.CreateBitCast(asI64, valLlvm);
+        else if (valLlvm->isFloatTy())
+            decoded = builder_.CreateBitCast(
+                builder_.CreateTrunc(asI64, i32()), valLlvm);
+        else if (valLlvm->isIntegerTy(64))
+            decoded = asI64;
+        else
+            decoded = builder_.CreateTrunc(asI64, valLlvm);
+    } else {
+        // Pointer (string / class object): the void* IS the value.
+        decoded = slotV;
+    }
+    builder_.CreateStore(decoded, varSlot);
+
+    loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+    bool term = lowerScopedBlock(fs.body);
+    loopStack_.pop_back();
+    if (!term) builder_.CreateBr(incBB);
+
+    builder_.SetInsertPoint(incBB);
+    llvm::Value* idxI = builder_.CreateLoad(i64(), idxSlot);
+    builder_.CreateStore(builder_.CreateAdd(idxI, builder_.getInt64(1)), idxSlot);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    builder_.CreateCall(freeFn, {valsArr});  // free the snapshot array itself
     return true;
 }
 
