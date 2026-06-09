@@ -45,6 +45,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "ICollection" || n == "IList" ||
         n == "IOwnedCollection" || n == "IOwnedList" ||
         n == "IEvent" || n == "IAsyncEvent" ||
+        // §2.8 / §2.9: auto-imported generic interfaces (stdlib §2.8–§2.9).
+        // Registered here so they resolve as base types and field/param types
+        // (fix #576: "unresolved type name 'IComparable'").
+        n == "IComparable" || n == "IEquatable" ||
         // §3 stdlib collection types (arity 1):
         n == "Stack" || n == "OwnedStack" ||
         n == "Queue" || n == "OwnedQueue" ||
