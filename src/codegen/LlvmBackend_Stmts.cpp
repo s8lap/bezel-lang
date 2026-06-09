@@ -475,6 +475,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 !returnedClosureLocalOwnsPlusOne(rs->value.get()))
                 emitClosureRetain(v);
         }
+        // fix #568 / §14.1 / §7.1: when the declared return type is a nullable
+        // VALUE type whose concrete form is reached only through the active
+        // monomorphization (`T?` with T = a value type — prim/enum/record), the
+        // function return type is the tagged {i8 hasValue; T} struct (lowerTypeRef
+        // above), but `return null` / `return <bare T value>` produce a null ptr /
+        // a bare value. Wrap them into the nullable struct here, where the sema
+        // return type is in scope — emitReturn's coercion only matched exact LLVM
+        // value types and missed the record/enum payload (specialized struct ≠
+        // the param's bare struct → IR-verify failure). A non-generic nullable
+        // value return already lowers correctly through the same struct, so this
+        // is a no-op there (v already IS the struct).
+        if (v && currentReturnTypeNode_) {
+            if (const sema::TypeRef* declRet =
+                    ctx_.resolvedType(*currentReturnTypeNode_))
+                v = coerceReturnToNullableValue(v, declRet);
+        }
         // §28.3 ownership transfer: if the return expression is a bare
         // `using var` local, exclude it from disposal — ownership moves
         // to the caller.  Without this, the local would be freed before

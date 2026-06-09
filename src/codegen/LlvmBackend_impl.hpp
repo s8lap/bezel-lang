@@ -1455,10 +1455,32 @@ private:
     // Wrap a plain value (primitive or enum integer) into a nullable: {i8 1, v}.
     llvm::Value* wrapNullableValue(const sema::TypeRef* rt, llvm::Value* val) {
         auto* st = nullableValueStructTy(rt);
+        // fix #569 / §14.1 / #460: inside a monomorphized body the value slot may
+        // be a SPECIALIZED record struct (`record.Pt$spec0`) while `val` is the
+        // unspecialized `record.Pt` (or vice versa) — layout-identical but a
+        // distinct named LLVM type, which insertvalue rejects. Reinterpret `val`
+        // to the slot type via an alloca round-trip when the layouts match.
+        val = reinterpretToType(val, st->getElementType(1));
         llvm::Value* res = builder_.CreateInsertValue(
             llvm::UndefValue::get(st),
             llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
         return builder_.CreateInsertValue(res, val, {1u});
+    }
+    // fix #569 / #460: if `v`'s type differs from `want` but both are
+    // layout-identical aggregates (the specialized-vs-unspecialized record-struct
+    // mismatch a monomorphized generic body induces), reinterpret `v` to `want`
+    // through an alloca round-trip (store as v's type, reload as `want`). Returns
+    // `v` unchanged when the types already match or are not safely reinterpretable.
+    llvm::Value* reinterpretToType(llvm::Value* v, llvm::Type* want) {
+        if (!v || !want || v->getType() == want) return v;
+        auto* vSt = llvm::dyn_cast<llvm::StructType>(v->getType());
+        auto* wSt = llvm::dyn_cast<llvm::StructType>(want);
+        if (vSt && wSt && vSt->isLayoutIdentical(wSt)) {
+            llvm::AllocaInst* tmp = entryAlloca(vSt);
+            builder_.CreateStore(v, tmp);
+            return builder_.CreateLoad(wSt, tmp, "nv.reinterp");
+        }
+        return v;
     }
     // Extract the hasValue field (nonzero = has value, 0 = null) as i1.
     llvm::Value* nullablePrimHasValue(llvm::Value* nv) {
@@ -1472,6 +1494,24 @@ private:
     }
 
     llvm::Type* lowerTypeRef(const sema::TypeRef* rt);
+
+    // fix #568 / §14.1 / §7.1: coerce a ReturnStmt value `v` to the function's
+    // declared nullable-VALUE return type when that type is reached through the
+    // active monomorphization (`T?` with T = a value type). `declRet` is the
+    // resolved declared return TypeRef. When the effective return type is a
+    // nullable value type and `v` is not already that struct:
+    //   * a null pointer  → the {i8 0, T 0} null constant;
+    //   * a bare T value matching the value slot → wrapped {i8 1, v};
+    //   * a bare T value that is a LAYOUT-EQUAL but differently-named struct
+    //     (the specialized-vs-unspecialized record-struct mismatch #460 induces
+    //     inside a monomorphized body) → reinterpreted via an alloca round-trip,
+    //     then wrapped.
+    // Returns `v` unchanged when no nullable-value coercion applies (a non-
+    // generic nullable value return already lowers to the struct directly, and
+    // a reference `?` / non-nullable return is untouched). Defined in
+    // LlvmBackend_Layout.cpp (needs nullableValueStructTy / recordStruct).
+    llvm::Value* coerceReturnToNullableValue(llvm::Value* v,
+                                             const sema::TypeRef* declRet);
 
     // §22.10: find the indexer PropertySymbol on a TypeSymbol, if any.
     const sema::PropertySymbol* findIndexer(
@@ -3982,6 +4022,36 @@ private:
     // Returns an empty string_view if the TypeRef is not a builtin named type.
     static std::string_view builtinTypeName(const sema::TypeRef* rt);
 
+    // fix #568: is `name` a BUILTIN type name that lowerTypeRef recognizes (a
+    // collection / interface / task / FFI / value builtin / exception), as
+    // opposed to a user-chosen generic type PARAMETER? A bare single-part Named
+    // TypeRef with no declaration is either a type parameter (`T`) or one of
+    // these reserved builtins; the #568 nullable-type-param lowering must only
+    // intercept the former (a builtin nullable like `Subscription?` keeps its own
+    // ptr/value lowering through the switch below). Mirrors the name sets the
+    // lowerTypeRef Named-case branches enumerate. Exception types are recognized
+    // via builtinVtable_, so this is a member (not static).
+    bool isBuiltinTypeRefName(std::string_view name) const {
+        static const std::unordered_set<std::string_view> kBuiltins = {
+            "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
+            "DateTime", "TimeSpan", "Range", "Guid",
+            "ArraySpan", "ReadOnlyArraySpan",
+            "Array", "OwnedArray", "Dictionary", "OwnedDictionary",
+            "Stack", "OwnedStack", "Queue", "OwnedQueue",
+            "Set", "OwnedSet", "LinkedList", "OwnedLinkedList",
+            "LinkedListNode", "StringBuilder", "Random",
+            "IEnumerable", "IEnumerator", "OwnedEnumerable", "OwnedEnumerator",
+            "IAsyncEnumerable", "IAsyncEnumerator",
+            "OwnedAsyncEnumerable", "OwnedAsyncEnumerator",
+            "IReadOnlyCollection", "IReadOnlyList", "ICollection", "IList",
+            "IOwnedCollection", "IOwnedList", "Task", "OwnedTask",
+            "Subscription", "CancellationToken", "CancellationTokenSource",
+        };
+        if (kBuiltins.count(name)) return true;
+        // §31.4: a built-in exception type (Exception / a subtype).
+        return builtinVtable_.find(std::string(name)) != builtinVtable_.end();
+    }
+
     static bool isDictTypeName(const sema::TypeRef* rt);
 
     // stdlib §6.7 / §30.5: true when `rt` is a Task / Task<T> or OwnedTask<T>
@@ -4056,6 +4126,23 @@ private:
         auto it = genericSubstSemaTy_.find(ty->astNode->name->parts[0]);
         if (it != genericSubstSemaTy_.end() && it->second) return it->second;
         return ty;
+    }
+
+    // fix #568 / §14.1 / §7.1: given a NULLABLE bare type-parameter ref `ty`
+    // (`T?`), resolve `T` to its concrete substituted sema type and write a
+    // NULLABLE COPY of it into `out` (so isNullableValueTy / nullableValueStructTy
+    // see the concrete value type with the `?` still applied). Returns true when
+    // the parameter resolves; false otherwise (`out` left unset). Reuses the #567
+    // resolveTypeParamRef param-name lookup. `out` is a value the caller owns so
+    // the synthesized nullable variant lives only as long as the lowering call —
+    // we never mutate the cached concrete TypeRef (its non-nullable form must be
+    // preserved for the non-nullable `T`-typed sites).
+    bool nullableTypeParamConcrete(const sema::TypeRef* ty, sema::TypeRef& out) {
+        const sema::TypeRef* c = resolveTypeParamRef(ty);
+        if (!c || c == ty) return false;  // unresolved param: nothing to do
+        out = *c;
+        out.nullable = true;
+        return true;
     }
 
     // issues D3 / D8 / §8.3: build C-ABI trampolines over an ARBITRARY
