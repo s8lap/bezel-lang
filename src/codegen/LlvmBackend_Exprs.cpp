@@ -3639,6 +3639,37 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             retSemaTy = expectedFunctionType_->funcReturn;
         }
     }
+    // fix #543 / §7 / §17.14: when expectedFunctionType_ declares a NULLABLE
+    // VALUE return type (T?), but the body-inferred retTy is NOT the matching
+    // tagged struct (e.g. it is the bare underlying record struct or a reference
+    // ptr), override retTy with the correct nullable struct.
+    //
+    // Root cause: sema infers the lambda's funcReturn from the first visible
+    // `return <expr>` in the body — for `return new Point(x,x)` this is `Point`
+    // (non-nullable), so `lowerTypeRef` returns `%record.Point`. Since
+    // `%record.Point != i32()`, the i32-only override above doesn't fire, and
+    // the lambda fn is declared to return `%record.Point` instead of
+    // `{i8,%record.Point}`. A subsequent `return null;` then emits `ret ptr null`
+    // into a `%record.Point`-returning function → IR verification failure.
+    //
+    // The same pattern applies to BUG-1 (conditional expr body typed Object? →
+    // ptr by sema when a null branch exists but the result is T?): the body-
+    // inferred type is `ptr` ≠ `i32`, so the existing override skips it too.
+    //
+    // Fix: when expectedFunctionType_->funcReturn IS a nullable value type, it
+    // is authoritative — use it even when a body-derived retTy was already found.
+    // The body-derived value is still lowered correctly (the nullable struct is
+    // produced by lowerConditional for expr-body, or by emitReturn's coercion for
+    // block-body); only the function's declared return type needs correction here.
+    // per §7.1 / §7.2 / §17.14.
+    if (expectedFunctionType_ && expectedFunctionType_->funcReturn &&
+        isNullableValueTy(expectedFunctionType_->funcReturn)) {
+        llvm::Type* expected = lowerTypeRef(expectedFunctionType_->funcReturn);
+        if (expected != retTy) {
+            retTy = expected;
+            retSemaTy = expectedFunctionType_->funcReturn;
+        }
+    }
     // Also try to resolve via genericSubst_ when the sema return type is
     // an unresolved named generic param (e.g. C in Curried<A,B,C>).
     if (retTy == i32() && lam.exprBody) {
