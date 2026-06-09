@@ -4124,8 +4124,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // per §6 / §3.1.
                 constexpr int64_t SB_ESZ = 8;
                 auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
-                return builder_.CreateCall(allocFn,
+                llvm::Value* sb = builder_.CreateCall(allocFn,
                     {builder_.getInt64(SB_ESZ), builder_.getInt64(64)});
+                // Fix #531 (§3.1): new StringBuilder(initial: string) — if a string
+                // arg is present, append it as the first part via bz_array_add,
+                // reusing the same IR sequence as Append(string) in Calls.cpp.
+                // The no-arg ctor and capacity-int ctor are not affected: the
+                // capacity arg has an int type (not String), so isStrArg is false.
+                if (!ne.args.empty() && ne.args[0].value) {
+                    auto* argTy = ctx_.exprType(*ne.args[0].value);
+                    bool isStrArg = argTy &&
+                        argTy->kind == sema::TypeRef::Kind::Primitive &&
+                        argTy->primitive == sema::PrimitiveType::String;
+                    if (isStrArg) {
+                        llvm::Value* s = lowerExpr(*ne.args[0].value);
+                        if (s) {
+                            llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                            builder_.CreateStore(s, slot);
+                            auto* addFn = declareC("bz_array_add",
+                                                   llvm::Type::getVoidTy(llvm_),
+                                                   {ptrTy(), ptrTy(), i64()});
+                            builder_.CreateCall(addFn,
+                                {sb, slot, builder_.getInt64(SB_ESZ)});
+                        }
+                    }
+                }
+                return sb;
             }
             if (colName == "Random") {
                 int64_t seed = 0;
