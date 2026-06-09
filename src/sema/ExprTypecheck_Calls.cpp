@@ -447,16 +447,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
                 // per §14.1/§14.2 (issue #509): EXPLICIT method-level type
                 // arguments supplied at the call site (e.g. `Identity<int>(v)`
-                // or `Pass<Box>(b)` with `where T: class`) override the
-                // inferred-from-argument path below.  When the callee
-                // MemberAccessExpr carries non-empty typeArgs (populated by the
-                // parser's generic-arg disambiguation), build the
-                // generic-param → concrete-TypeRef map from those explicit args
-                // in declaration order, then substitute the return type.
-                if (!md->genericParams.empty() &&
-                    rt->kind == TypeRef::Kind::Named && !rt->declaration &&
-                    rt->astNode && rt->astNode->name &&
-                    rt->astNode->name->parts.size() == 1) {
+                // or `MakeTwo<int>(a, b)` with compound return `Array<T>`)
+                // override the inferred-from-argument path below.  When the
+                // callee MemberAccessExpr or IdentifierExpr carries non-empty
+                // typeArgs (populated by the parser when it confirms
+                // `< TypeArgList > (`), build the generic-param → concrete-TypeRef
+                // map from those explicit args in declaration order, then
+                // substitute the return type via substituteReturnType so that
+                // BOTH bare-param returns (`T`) AND compound returns (`Array<T>`)
+                // are substituted.  issue #564 (§14.1 / §22.1): the previous
+                // code only handled bare-param return types; compound returns
+                // like `owned Array<T>` were left unsubstituted because the
+                // guard required `rt` to be the bare param itself.
+                if (!md->genericParams.empty()) {
                     // per §14.1 (issue #509/#561): explicit type args may
                     // appear on a MemberAccessExpr callee (`obj.Method<T>(...)`)
                     // OR on a bare IdentifierExpr callee (`Id<T>(...)` — a
@@ -489,17 +492,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 explicitSubst[md->genericParams[gi].name] =
                                     concreteArg;
                         }
-                        // Substitute the return-type param name.
-                        std::string_view retParamName =
-                            rt->astNode->name->parts[0];
-                        auto it = explicitSubst.find(retParamName);
-                        if (it != explicitSubst.end()) rt = it->second;
+                        // Apply substitution: substituteReturnType handles
+                        // both bare-param returns (e.g. `T` → concrete T)
+                        // and compound returns (e.g. `Array<T>` → `Array<int>`).
+                        if (!explicitSubst.empty())
+                            rt = substituteReturnType(rt, explicitSubst);
                     }
                 }
                 // per §14.1/§14.2 (issue #504): a GENERIC METHOD (its own
                 // `<T>` params on a non-generic parent, e.g. `static method
                 // Identity<T>(v:T):T` on plain `Wrapper`) whose declared
-                // return type is a bare method-level type parameter is also
+                // return type references a method-level type parameter is
                 // typed by the substituted concrete type at the call site.
                 // `substituteMemberType` only handles class-level params
                 // (via `ms->parent->genericParams`); it is a no-op here
@@ -507,22 +510,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // call's arguments: for each method generic param, find the
                 // first value parameter whose declared type is exactly that
                 // param name, and read the corresponding call argument's
-                // sema exprType. If the return type is a bare reference to
-                // one of those params, substitute it. This lets chained
-                // access `Identity(r).x` resolve `.x` against the concrete
-                // record type rather than the unresolvable bare `T`.
+                // sema exprType. Build a subst map and call substituteReturnType
+                // so that BOTH bare-param returns (`T`) AND compound returns
+                // (e.g. `Array<T>` — issue #564) are substituted correctly.
+                // This lets chained access `Identity(r).x` resolve `.x`
+                // against the concrete record type rather than the
+                // unresolvable bare `T`.
                 // (The #509 explicit-typeArgs path above takes priority; this
                 // path only runs when typeArgs is empty — i.e., type inference
                 // from arguments is needed.)
-                if (!md->genericParams.empty() &&
-                    rt->kind == TypeRef::Kind::Named && !rt->declaration &&
-                    rt->astNode && rt->astNode->name &&
-                    rt->astNode->name->parts.size() == 1) {
-                    std::string_view retParamName = rt->astNode->name->parts[0];
+                if (!md->genericParams.empty()) {
+                    // Build the argument-inferred substitution map: for each
+                    // method generic param, find the first value parameter whose
+                    // declared type is exactly that bare param name, and map
+                    // the param to the corresponding call argument's sema type.
+                    std::unordered_map<std::string_view, TypeRef*> argSubst;
                     for (const auto& gp : md->genericParams) {
-                        if (gp.name != retParamName) continue;
-                        // Found the return type names this generic param.
-                        // Find a value param whose type IS this param name.
                         for (std::size_t pi = 0;
                              pi < md->params.size() &&
                              pi < ce.args.size(); ++pi) {
@@ -530,14 +533,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (!pt || pt->kind != ast::TypeKind::Named ||
                                 !pt->name ||
                                 pt->name->parts.size() != 1 ||
-                                pt->name->parts[0] != retParamName)
+                                pt->name->parts[0] != gp.name)
                                 continue;
                             if (!ce.args[pi].value) continue;
                             TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
-                            if (argTy) { rt = argTy; break; }
+                            if (argTy) { argSubst[gp.name] = argTy; break; }
                         }
-                        break;
                     }
+                    // Apply substitution to the (possibly compound) return type.
+                    if (!argSubst.empty())
+                        rt = substituteReturnType(rt, argSubst);
                 }
                 ctx_.setExprType(&ce, rt);
             }
@@ -2414,10 +2419,16 @@ TypeRef* ExprTC::substituteReturnType(
     const std::unordered_map<std::string_view, TypeRef*>& solved) {
     if (!declared) return declared;
     // Bare parameter → its solved concrete type (carrying a `T?` annotation
-    // through to the substituted type's nullable form).
+    // through to the substituted type's nullable form). A bare parameter is a
+    // declaration-less Named TypeRef with a single name part that IS a method
+    // type parameter; distinguish it from a null-declaration stdlib built-in
+    // (e.g. `Array`) by checking whether the name is in `solved`.
     if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
         declared->astNode && declared->astNode->name &&
-        declared->astNode->name->parts.size() == 1) {
+        declared->astNode->name->parts.size() == 1 &&
+        declared->genericArgs.empty()) {
+        // Only a bare param reference has no genericArgs and no declaration.
+        // Check if this name is a solved type parameter.
         auto it = solved.find(declared->astNode->name->parts[0]);
         if (it != solved.end() && it->second) {
             TypeRef* sub = it->second;
@@ -2431,7 +2442,14 @@ TypeRef* ExprTC::substituteReturnType(
         return declared;
     }
     // Constructed generic → substitute each generic argument in place.
-    if (declared->kind == TypeRef::Kind::Named && declared->declaration &&
+    // This covers both user-defined generic types (declaration != nullptr, e.g.
+    // `Box<T>`) and null-declaration stdlib built-ins (e.g. `Array<T>`,
+    // `OwnedArray<T>`) — both carry the element type parameter in genericArgs.
+    // issue #564 (§14.1 / §22.1): the `declaration &&` guard was too strict;
+    // null-declaration stdlib collections were left unsubstituted, so
+    // `MakeTwo<int>(): owned Array<T>` typed the call as `Array<T>` instead of
+    // `Array<int>` and `arr[0]` resolved to unresolvable `?`.
+    if (declared->kind == TypeRef::Kind::Named &&
         !declared->genericArgs.empty()) {
         bool changed = false;
         std::vector<TypeRef*> newArgs;

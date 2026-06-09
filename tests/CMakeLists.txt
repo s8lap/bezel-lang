@@ -386,6 +386,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_record_values_snapshot_563_test.cpp
     codegen/set_literal_559_test.cpp
     codegen/generic_method_bare_typeargs_561_test.cpp
+    codegen/generic_array_index_type_564_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
