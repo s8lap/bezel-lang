@@ -3344,6 +3344,12 @@ private:
     // if the iterable is not a `<dict>.Keys` access.
     bool lowerDictKeysFor(const ast::ForStmt& fs);
 
+    // issue #537 / §4.8: `for var v in <dict>.Values` — iterate a Dictionary's
+    // values. The string-key dict uses bz_dict_values_str; the generic-key dict
+    // uses bz_dict_values_gen. The loop variable binds to V (genericArgs[1]).
+    // Returns false if the iterable is not a `<dict>.Values` access.
+    bool lowerDictValuesFor(const ast::ForStmt& fs);
+
     // issue #370: emit a counted loop over a snapshot of generic-table keys
     // (from bz_dict_keys_gen). `tableObj` is the bz_dict_t*; `elemTyRef` is the
     // key/element TypeRef (its LLVM type is how each key is loaded and bound to

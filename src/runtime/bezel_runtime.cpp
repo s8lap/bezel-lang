@@ -608,6 +608,46 @@ void bz_dict_keys_gen(void* dp, void*** keys_out, int64_t* n_out) {
     if (n_out)    *n_out    = j;
 }
 
+// issue #537 / stdlib §4.8: snapshot value arrays for `for var v in d.Values`.
+// Both functions return a malloc'd void** array of `n` slot values (one per live
+// entry).  The caller owns and must free() the array; the values themselves are
+// owned by the dictionary and must NOT be freed by the caller.
+//
+// bz_dict_values_str — string-keyed table (key_size == 0).
+void bz_dict_values_str(void* dp, void*** vals_out, int64_t* n_out) {
+    auto* d = (bz_dict_t*)dp;
+    int64_t n = d ? d->count : 0;
+    auto** vals = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
+    int64_t j = 0;
+    if (d) {
+        for (int64_t i = 0; i < d->capacity && j < n; i++) {
+            bz_entry_t& e = d->buckets[i];
+            if (e.key && !e.deleted)
+                vals[j++] = e.val;
+        }
+    }
+    if (vals_out) *vals_out = vals; else free(vals);
+    if (n_out)    *n_out    = j;
+}
+
+// bz_dict_values_gen — generic-key table (key_size > 0). Mirrors
+// bz_dict_values_str; the key_size check guards against null/uninitialized dicts.
+void bz_dict_values_gen(void* dp, void*** vals_out, int64_t* n_out) {
+    auto* d = (bz_dict_t*)dp;
+    int64_t n = d ? d->count : 0;
+    auto** vals = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
+    int64_t j = 0;
+    if (d && d->key_size > 0) {
+        for (int64_t i = 0; i < d->capacity && j < n; i++) {
+            bz_entry_t& e = d->buckets[i];
+            if (e.key && !e.deleted)
+                vals[j++] = e.val;
+        }
+    }
+    if (vals_out) *vals_out = vals; else free(vals);
+    if (n_out)    *n_out    = j;
+}
+
 // issue #389 / stdlib §4.10: fold a snapshot of `other`'s elements into/against
 // a dict-backed Set `self`. See the header for the `op` codes and the snapshot
 // contract. Frees the snapshot before returning. UnionWith/ExceptWith iterate

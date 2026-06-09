@@ -367,6 +367,7 @@ set(BEZEL_TEST_SOURCES
     codegen/lifted_operators_486_test.cpp
     codegen/dict_literal_534_test.cpp
     codegen/stringbuilder_ctor_531_test.cpp
+    codegen/dict_values_iter_537_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

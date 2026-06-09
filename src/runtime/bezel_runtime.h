@@ -226,6 +226,20 @@ void  bz_dict_clear(void* d, void (*dispose_val)(void*));
 // are the record's value bytes.
 void bz_dict_keys_gen(void* d, void*** keys_out, int64_t* n_out);
 
+// issue #537 / stdlib §4.8: enumerate Dictionary<K,V> values for
+// `for var v in d.Values`.  Mirrors bz_dict_keys_str / bz_dict_keys_gen but
+// snapshots values rather than keys.
+//
+// bz_dict_values_str — for string-keyed dictionaries (key_size == 0). Returns
+// a malloc'd array of `n` void* slot values (one per live entry). The caller
+// frees the array with free(); the values themselves are NOT freed here (they
+// are owned by the dictionary; the loop body borrows them).
+void bz_dict_values_str(void* d, void*** vals_out, int64_t* n_out);
+//
+// bz_dict_values_gen — for generic-key dictionaries (key_size > 0). Returns
+// the same shape: a malloc'd void** array of `n` slot values.
+void bz_dict_values_gen(void* d, void*** vals_out, int64_t* n_out);
+
 // issue #389 / stdlib §4.10: fold a key snapshot of `other` into/against a
 // dict-backed Set `self` (generic-key table). `keys` is a malloc'd array of `n`
 // pointers, each a malloc'd copy of one element's `self->key_size` bytes — the
