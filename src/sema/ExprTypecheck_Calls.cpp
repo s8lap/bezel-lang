@@ -3588,6 +3588,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // §5: Abs on numeric primitive — same type.
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(tt->primitive));
                     return;
+                } else if (ma.member == "CompareTo") {
+                    // fix #586 / stdlib §2.8 / §9.1–§9.5: CompareTo(other: T):
+                    // int — IComparable<T> contract. Covers every numeric and
+                    // char primitive (not string, which is handled above; not
+                    // bool, which does not implement IComparable per §9.4).
+                    using P = PrimitiveType;
+                    bool isComparable =
+                        tt->primitive == P::Int    || tt->primitive == P::Long  ||
+                        tt->primitive == P::Short  || tt->primitive == P::Byte  ||
+                        tt->primitive == P::SByte  || tt->primitive == P::UInt  ||
+                        tt->primitive == P::ULong  || tt->primitive == P::UShort||
+                        tt->primitive == P::Double || tt->primitive == P::Float ||
+                        tt->primitive == P::Decimal|| tt->primitive == P::Char;
+                    if (isComparable) {
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                        return;
+                    }
                 }
             }
         }

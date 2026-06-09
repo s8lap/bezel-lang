@@ -530,6 +530,70 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                 }
                             }
                         }
+                        // fix #586 / §2.8 / stdlib §9.1–§9.5: CompareTo(other: T): int
+                        // — IComparable<T> contract for numeric and char primitives.
+                        // Not string (handled by tryLowerStringMethod above) and not
+                        // bool (which does not implement IComparable, per §9.4).
+                        // Returns: negative if self < other, 0 if equal, positive if
+                        // self > other.  Formula: (a > b) - (a < b) → -1, 0, or 1.
+                        // Unsigned types use unsigned comparison (no negation needed;
+                        // the result int is still a signed i32).
+                        // Floating-point uses ordered (quiet-NaN-aware) comparisons
+                        // per §9.2; NaN < everything in the ordered sense (fcmp olt).
+                        if (call->args.size() == 1 && call->args[0].value &&
+                            ma->member == "CompareTo") {
+                            using P = sema::PrimitiveType;
+                            P pt = tt->primitive;
+                            bool isSignedInt   = pt == P::Int   || pt == P::Long  ||
+                                                 pt == P::Short || pt == P::SByte ||
+                                                 pt == P::Char;
+                            bool isUnsignedInt = pt == P::UInt  || pt == P::ULong ||
+                                                 pt == P::UShort|| pt == P::Byte;
+                            bool isFP          = pt == P::Double|| pt == P::Float;
+                            if (isSignedInt || isUnsignedInt || isFP) {
+                                llvm::Value* lhs = lowerExpr(*ma->target);
+                                llvm::Value* rhs = lowerExpr(*call->args[0].value);
+                                if (!lhs || !rhs) return nullptr;
+                                // Widen both sides to a uniform LLVM type if needed
+                                // (e.g. char is i32 code-point in codegen).
+                                if (lhs->getType() != rhs->getType()) {
+                                    if (isFP) {
+                                        // Widen float to double.
+                                        auto* dty = llvm::Type::getDoubleTy(llvm_);
+                                        lhs = builder_.CreateFPExt(lhs, dty, "cmp.ldw");
+                                        rhs = builder_.CreateFPExt(rhs, dty, "cmp.rdw");
+                                    } else {
+                                        // Integer mismatch: widen narrower side.
+                                        unsigned lb = lhs->getType()->getIntegerBitWidth();
+                                        unsigned rb = rhs->getType()->getIntegerBitWidth();
+                                        if (lb < rb) {
+                                            lhs = isUnsignedInt
+                                                ? builder_.CreateZExt(lhs, rhs->getType(), "cmp.lzx")
+                                                : builder_.CreateSExt(lhs, rhs->getType(), "cmp.lsx");
+                                        } else {
+                                            rhs = isUnsignedInt
+                                                ? builder_.CreateZExt(rhs, lhs->getType(), "cmp.rzx")
+                                                : builder_.CreateSExt(rhs, lhs->getType(), "cmp.rsx");
+                                        }
+                                    }
+                                }
+                                // Emit: (a > b) as i32 - (a < b) as i32
+                                llvm::Value* gt, *lt;
+                                if (isFP) {
+                                    gt = builder_.CreateFCmpOGT(lhs, rhs, "cmp.gt");
+                                    lt = builder_.CreateFCmpOLT(lhs, rhs, "cmp.lt");
+                                } else if (isUnsignedInt) {
+                                    gt = builder_.CreateICmpUGT(lhs, rhs, "cmp.gt");
+                                    lt = builder_.CreateICmpULT(lhs, rhs, "cmp.lt");
+                                } else {
+                                    gt = builder_.CreateICmpSGT(lhs, rhs, "cmp.gt");
+                                    lt = builder_.CreateICmpSLT(lhs, rhs, "cmp.lt");
+                                }
+                                llvm::Value* gtI = builder_.CreateZExt(gt, i32(), "cmp.gti");
+                                llvm::Value* ltI = builder_.CreateZExt(lt, i32(), "cmp.lti");
+                                return builder_.CreateSub(gtI, ltI, "cmp.res");
+                            }
+                        }
                         // §9.x: ToString(format) — formatted numeric string.
                         if (call->args.size() == 1 && call->args[0].value &&
                             ma->member == "ToString") {
