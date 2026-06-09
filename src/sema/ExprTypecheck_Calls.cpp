@@ -1075,8 +1075,49 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
                                    m == "Sorted" && ce.args.size() == 1) {
+                            // #542 / §3 / #472: validate that the comparer argument
+                            // is a function — (T, T) -> int.  A non-function arg
+                            // (e.g. an int literal) would be treated as a closure
+                            // pointer by codegen, producing malformed IR / a crash.
+                            if (ce.args[0].value) {
+                                const TypeRef* compTy =
+                                    ctx_.exprType(*ce.args[0].value);
+                                if (compTy &&
+                                    compTy->kind != TypeRef::Kind::Function &&
+                                    compTy->kind != TypeRef::Kind::Error) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "Sorted expects a comparer function "
+                                        "`(T, T) -> int` as its argument "
+                                        "(stdlib §3 / #472 / #542); "
+                                        "got a non-function value instead.");
+                                    return;
+                                }
+                            }
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 "Array", recvTy->genericArgs[0]));
+                        }
+                        // #542 / §3 / #472: Sort(comparer: (T,T)->int) in-place
+                        // sort with user-supplied comparer.  The codegen path for
+                        // Sort(comparer) calls lowerExpr on the arg and then treats
+                        // the result as a closure pointer; a non-function arg (e.g.
+                        // an int literal) would produce malformed IR / a crash.
+                        // Validate here so the user gets a clear sema error.
+                        if ((colName == "Array" || colName == "OwnedArray") &&
+                            m == "Sort" && ce.args.size() == 1 && ce.args[0].value) {
+                            const TypeRef* cmpTy =
+                                ctx_.exprType(*ce.args[0].value);
+                            if (cmpTy &&
+                                cmpTy->kind != TypeRef::Kind::Function &&
+                                cmpTy->kind != TypeRef::Kind::Error) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "Sort expects a comparer function "
+                                    "`(T, T) -> int` as its argument "
+                                    "(stdlib §3 / #542); "
+                                    "got a non-function value instead.");
+                                return;
+                            }
                         }
                         // stdlib §3 / #472: Reversed() and Sorted() are NOT defined
                         // on OwnedArray<T> — unique ownership makes a shallow copy
@@ -1205,10 +1246,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // the stored value (§4.8). Either way the static type is V,
                         // which the ownership checker treats as Borrowed (no disposal
                         // obligation) since GetOrAdd has no resolved `owned` return.
+                        //
+                        // #542: validate that the factory argument (args[1]) is a
+                        // function/lambda type — (K) -> V.  A non-function second arg
+                        // (e.g. an int literal) must be rejected here; without this
+                        // check sema silently emits no diagnostic and codegen
+                        // treats the integer value as a closure pointer, producing
+                        // malformed IR / a crash (stdlib §4.8 / §4.9).
                         else if (m == "GetOrAdd" && recvTy &&
                                  recvTy->genericArgs.size() > 1 &&
-                                 recvTy->genericArgs[1])
+                                 recvTy->genericArgs[1]) {
+                            // per §4.8 / §4.9: the second argument must be a factory
+                            // function `(K) -> V`.  Check it when the arg is present
+                            // and its type has been resolved.
+                            if (ce.args.size() >= 2 && ce.args[1].value) {
+                                const TypeRef* factTy =
+                                    ctx_.exprType(*ce.args[1].value);
+                                if (factTy &&
+                                    factTy->kind != TypeRef::Kind::Function &&
+                                    factTy->kind != TypeRef::Kind::Error) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "GetOrAdd expects a factory function "
+                                        "`(K) -> V` as its second argument "
+                                        "(stdlib §4.8 / §4.9 / #542); "
+                                        "got a non-function value instead.");
+                                    return;
+                                }
+                            }
                             ctx_.setExprType(&ce, recvTy->genericArgs[1]);
+                        }
                     }
                     // StringBuilder methods
                     if (colName == "StringBuilder") {
