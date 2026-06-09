@@ -230,6 +230,23 @@ void* bz_array_copy(void* arrp, int64_t elem_size) {
     return dst;
 }
 
+// #429 / §4.6 / §28.9: retain every non-null pointer-sized string element so a
+// freshly copied / materialized Array<string> independently co-owns a +1 per
+// element. Each slot is a bz_string*; bz_string_retain is a no-op on a
+// sentinel/literal or null, so a partial/empty array is safe. This pairs with
+// the per-element bz_string_release the array's later free/dispose issues — an
+// insert-built array retains at Add (codegen), a copy/materialize-built array
+// retains here, so both are symmetric and release exactly their +1 at free.
+void bz_array_retain_strings(void* arrp) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr->data) return;
+    for (int64_t i = 0; i < arr->count; ++i) {
+        void* elem = ((void**)arr->data)[i];
+        if (elem) bz_string_retain(elem);
+    }
+}
+
 void* bz_array_ptr_at(void* arrp, int64_t idx, int64_t elem_size) {
     auto* arr = (bz_array_t*)arrp;
     return (char*)arr->data + idx * elem_size;

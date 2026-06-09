@@ -1570,6 +1570,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
             llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
                                                     "rev.copy");
+            // #429 / §4.6 / §28.9: a copied Array<string> independently co-owns a
+            // +1 per element (it shares the source's element pointers). Retain each
+            // so the copy can be released symmetrically at its own free — else
+            // releasing un-retained elements would prematurely free strings the
+            // source still owns (a double-free). retain is null/sentinel-safe.
+            emitArrayRetainStringsIfStringArray(recvTy, copy);
             // In-place reverse on the copy (same logic as Reverse()).
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {copy});
@@ -1610,6 +1616,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
             llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
                                                     "srtd.copy");
+            // #429: a copied Array<string> co-owns a +1 per element (see Reversed).
+            emitArrayRetainStringsIfStringArray(recvTy, copy);
             // Re-use the same built-in comparator logic as Sort() no-arg.
             bool isStringElem2 = (elemTy2 == ptrTy());
             llvm::Function* cmpFn2 = nullptr;
@@ -1671,6 +1679,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
             llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
                                                     "srtdc.copy");
+            // #429: a copied Array<string> co-owns a +1 per element (see Reversed).
+            emitArrayRetainStringsIfStringArray(recvTy, copy);
             // fix #533 / §4.4: same two-param funcRef fix as Sort(comparer) above.
             // The comparer is (T,T)->int; build a two-param type hint so that
             // unannotated lambda params (e.g. `(p,q)=>p.X-q.X` on Array<Point>)
@@ -1814,6 +1824,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
             v = ensureNullableElem(v);
+            // #429 / §4.6 / §28.9: a borrowing Array<string> co-owns a +1 per
+            // element. Take an INDEPENDENT +1 at insert, released per element on
+            // free (stringElementReleaseDisposer). Mirror the field-store rule: a
+            // fresh +1 producer (`+`/interp/range-slice/string-return call) is
+            // TRANSFERRED (its single reference becomes the array's — no retain),
+            // anything else (literal/param/field/identifier alias) is RETAINED.
+            // retain is null-safe and a no-op on a sentinel/literal.
+            if (isStringElementArray(recvTy) &&
+                !isPlusOneStringProducer(call.args[0].value.get()))
+                emitStringRetain(v);
             // Store elem to stack alloca, pass pointer to runtime
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
@@ -1834,6 +1854,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!idx || !v) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
             v = ensureNullableElem(v);
+            // #429 / §4.6 / §28.9: Insert co-owns a +1 per string element,
+            // exactly like Add — transfer a +1 producer, retain anything else.
+            if (isStringElementArray(recvTy) &&
+                !isPlusOneStringProducer(call.args[1].value.get()))
+                emitStringRetain(v);
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
             auto* fn = declareC("bz_array_insert_at", llvm::Type::getVoidTy(llvm_),
@@ -1878,6 +1903,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!idx || !v) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
             v = ensureNullableElem(v);  // fix #455: lift inner type to tagged struct
+            // #429 / §4.6 / §28.9: .Set(i, v) OVERWRITES slot i on a borrowing
+            // Array<string> — release the displaced old element and take a +1 on
+            // the new one (transfer a +1 producer, retain otherwise). Use the
+            // disposing setter so the runtime releases the old value AFTER reading
+            // it (retain-new-before-release-old via the disposing path keeps a
+            // self-set `a[i] := a[i]` safe — the new retain runs before the old
+            // release). The disposer is the string-release thunk.
+            if (llvm::Function* strDisp = stringElementReleaseDisposer(recvTy)) {
+                if (!isPlusOneStringProducer(call.args[1].value.get()))
+                    emitStringRetain(v);
+                llvm::Value* oor2 = builder_.CreateICmpUGE(
+                    idx, builder_.CreateCall(
+                        declareC("bz_array_len", i64(), {ptrTy()}), {recv}),
+                    "set.oor");
+                emitGuardThrow(oor2, "IndexOutOfRangeException");
+                llvm::AllocaInst* slot = entryAlloca(v->getType());
+                builder_.CreateStore(v, slot);
+                auto* fn = declareC("bz_array_set_disposing",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, idx, slot,
+                                         builder_.getInt64(esz), strDisp});
+                return llvm::ConstantInt::get(i32(), 0);
+            }
             llvm::AllocaInst* slot = entryAlloca(v->getType());
             builder_.CreateStore(v, slot);
             auto* fn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
@@ -1893,7 +1942,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // #362 / stdlib §4.5: OwnedArray<T>.RemoveAt disposes the removed
             // element. Use the disposing variant for an owning class-element
             // array; a borrowing array just removes the slot.
-            if (llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy)) {
+            // #429 / §4.6 / §28.9: a borrowing Array<string> co-owns the removed
+            // element's +1, so RemoveAt must release it (else it leaks). The
+            // string-release thunk is mutually exclusive with the owning-class
+            // disposer (string is not a class).
+            llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy);
+            if (!elemDisp) elemDisp = stringElementReleaseDisposer(recvTy);
+            if (elemDisp) {
                 auto* fn = declareC("bz_array_remove_at_disposing",
                     llvm::Type::getVoidTy(llvm_),
                     {ptrTy(), i64(), i64(), ptrTy()});
@@ -1948,12 +2003,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCondBr(eq, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
             // Remove (and, for an owning array, dispose) the matched slot.
-            if (llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy)) {
+            // #429: a borrowing Array<string> releases the removed element's
+            // co-owned +1 (string-release thunk; mutually exclusive with the
+            // owning-class disposer). The query `target` is a pure borrow and is
+            // never released here — only the slot's stored element is.
+            llvm::Function* rmDisp = owningCollectionElemDisposer(recvTy);
+            if (!rmDisp) rmDisp = stringElementReleaseDisposer(recvTy);
+            if (rmDisp) {
                 auto* fn = declareC("bz_array_remove_at_disposing",
                     llvm::Type::getVoidTy(llvm_),
                     {ptrTy(), i64(), i64(), ptrTy()});
                 builder_.CreateCall(fn, {recv, idx, builder_.getInt64(esz),
-                                         elemDisp});
+                                         rmDisp});
             } else {
                 auto* fn = declareC("bz_array_remove_at",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), i64()});
@@ -1998,7 +2059,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // #362 / stdlib §4.5: OwnedArray<T>.Clear disposes every element.
             // Use the disposing variant for an owning class-element array; a
             // borrowing array just resets the count.
-            if (llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy)) {
+            // #429 / §4.6 / §28.9 / §28.11: a borrowing Array<string> co-owns a +1
+            // per element. Clear "removes all elements WITHOUT disposing them"
+            // (§28.11) — strings have no Dispose, so nothing is disposed; but the
+            // array's runtime-managed refcount references (§28.9) are reclaimed by
+            // releasing each, else the cleared elements leak. The string-release
+            // thunk is mutually exclusive with the owning-class disposer.
+            llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy);
+            if (!elemDisp) elemDisp = stringElementReleaseDisposer(recvTy);
+            if (elemDisp) {
                 auto* fn = declareC("bz_array_clear_disposing",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {recv, elemDisp});
@@ -2051,6 +2120,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(bodyBB);
             auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(ptrFn, {other, idx, builder_.getInt64(esz)});
+            // #429 / §4.6 / §28.9: AddRange into a borrowing Array<string> takes an
+            // INDEPENDENT +1 per appended element (the source `other` keeps its own
+            // +1). Without this the destination would release at free a +1 it never
+            // took — a premature free of strings `other` still co-owns. The element
+            // is a borrowed copy from `other`, so it is always RETAINED (never a
+            // transferred producer). retain is null/sentinel-safe.
+            if (isStringElementArray(recvTy)) {
+                llvm::Value* elemVal = builder_.CreateLoad(ptrTy(), ep, "ar.elem");
+                emitStringRetain(elemVal);
+            }
             auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
                                    {ptrTy(), ptrTy(), i64()});
             builder_.CreateCall(addFn, {recv, ep, builder_.getInt64(esz)});
@@ -7771,7 +7850,22 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         if (!lazy) return nullptr;
         int64_t esz = lazyElemSize(elemLlvmOf(elemRef), module_->getDataLayout());
         auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
-        return builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)}, "linq.toarr");
+        llvm::Value* arr =
+            builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)}, "linq.toarr");
+        // #429 / §4.6 / §28.9: a materialized Array<string> co-owns a +1 per
+        // element so it can be released symmetrically if bound to a disposable
+        // local/field. Elements are either borrowed source pointers (a Where /
+        // identity pipeline — retain co-owns them) or fresh +1 strings produced by
+        // a Select lambda (retain → rc 2; the lambda's transient +1 leaks, a
+        // pre-existing safe leak, never a double-free). Keyed on the produced
+        // element type being a non-nullable string.
+        if (elemRef && elemRef->kind == sema::TypeRef::Kind::Primitive &&
+            elemRef->primitive == sema::PrimitiveType::String && !elemRef->nullable) {
+            auto* rf = declareC("bz_array_retain_strings",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(rf, {arr});
+        }
+        return arr;
     }
 
     // ----- ToSet: materialize the (lazy) pipeline into an owned Set<T> -------
