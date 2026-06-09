@@ -1703,15 +1703,81 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     auto* f = declareC(fn, ptrTy(), {ptrTy()});
                     return builder_.CreateCall(f, {list}, "ll.nodeptr");
                 }
-                // First / Last: return the value of the first/last node (T).
-                // If list is empty this is undefined — same as Array.First() on empty.
+                // per §4.6 (stdlib L1264–1265): `First`/`Last` are typed `T?`.
+                // The getter yields `null` when the list is empty (the node
+                // pointer is null) and the element value otherwise. This null
+                // representation is required for §7.11 lifting and `??` to
+                // interoperate with the result — every consumer reads `l.First`
+                // as the nullable form sema assigned it.
                 {
                     const char* fn = ma->member == "First"
                         ? "bz_llist_first_node" : "bz_llist_last_node";
                     auto* nodeF = declareC(fn, ptrTy(), {ptrTy()});
                     llvm::Value* nodePtr = builder_.CreateCall(nodeF, {list}, "ll.fnode");
-                    auto* valF = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
-                    llvm::Value* valPtr = builder_.CreateCall(valF, {nodePtr}, "ll.vptr");
+                    llvm::Value* nodeNull = builder_.CreateICmpEQ(
+                        nodePtr, llvm::ConstantPointerNull::get(ptrTy()),
+                        "ll.empty");
+                    const sema::TypeRef* resTy = ctx_.exprType(e);
+                    // For a NULLABLE VALUE element type (int?, double?, …) the
+                    // result is the tagged {i8 hasValue; T value} struct, built
+                    // only on the present branch so the value load never runs on
+                    // an empty list (a null `valPtr`).
+                    if (resTy && isNullableValueTy(resTy)) {
+                        auto* entryBB = builder_.GetInsertBlock();
+                        auto* presentBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.val", currentFn_);
+                        auto* mergeBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.end", currentFn_);
+                        auto* st = nullableValueStructTy(resTy);
+                        builder_.CreateCondBr(nodeNull, mergeBB, presentBB);
+                        builder_.SetInsertPoint(presentBB);
+                        auto* valF = declareC("bz_llist_node_value_ptr",
+                                              ptrTy(), {ptrTy()});
+                        llvm::Value* valPtr =
+                            builder_.CreateCall(valF, {nodePtr}, "ll.vptr");
+                        llvm::Value* loaded =
+                            builder_.CreateLoad(elemLLTy, valPtr, "ll.val");
+                        llvm::Value* wrapped = wrapNullableValue(resTy, loaded);
+                        auto* presentEndBB = builder_.GetInsertBlock();
+                        builder_.CreateBr(mergeBB);
+                        builder_.SetInsertPoint(mergeBB);
+                        auto* phi = builder_.CreatePHI(st, 2, "ll.first");
+                        phi->addIncoming(nullableValueNull(resTy), entryBB);
+                        phi->addIncoming(wrapped, presentEndBB);
+                        return phi;
+                    }
+                    // For a reference (class/string/interface) element type, T?
+                    // is a nullable pointer: the node-value slot holds the
+                    // pointer; an empty list yields a null pointer directly.
+                    auto* valF = declareC("bz_llist_node_value_ptr",
+                                          ptrTy(), {ptrTy()});
+                    llvm::Value* valPtr =
+                        builder_.CreateCall(valF, {nodePtr}, "ll.vptr");
+                    if (elemLLTy->isPointerTy()) {
+                        // Read the slot only when the node is present; an empty
+                        // list returns a null reference.
+                        auto* entryBB = builder_.GetInsertBlock();
+                        auto* presentBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.ref", currentFn_);
+                        auto* mergeBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.refend", currentFn_);
+                        builder_.CreateCondBr(nodeNull, mergeBB, presentBB);
+                        builder_.SetInsertPoint(presentBB);
+                        llvm::Value* loaded =
+                            builder_.CreateLoad(elemLLTy, valPtr, "ll.refval");
+                        auto* presentEndBB = builder_.GetInsertBlock();
+                        builder_.CreateBr(mergeBB);
+                        builder_.SetInsertPoint(mergeBB);
+                        auto* phi = builder_.CreatePHI(elemLLTy, 2, "ll.first.ref");
+                        phi->addIncoming(
+                            llvm::ConstantPointerNull::get(
+                                llvm::cast<llvm::PointerType>(elemLLTy)),
+                            entryBB);
+                        phi->addIncoming(loaded, presentEndBB);
+                        return phi;
+                    }
+                    // Fallback (no resolved nullable result type): load the raw
+                    // element value as before.
                     return builder_.CreateLoad(elemLLTy, valPtr, "ll.val");
                 }
             }
@@ -2508,6 +2574,247 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     llvm::Value* r = lowerExpr(*bin.right);
     if (!l || !r) return nullptr;
     const auto& op = bin.op;
+    // §7.11 Lifted operators — nullable value types (int?, long?, double?,
+    // bool?, …). When either operand is a nullable value type:
+    //   - Arithmetic / bitwise / shift: result is T? (null when EITHER operand
+    //     is null). The underlying op and its overflow/div-zero checks run ONLY
+    //     when both operands are present (conditional branch, NOT a select).
+    //   - Relational (<, <=, >, >=): result is bool (false when EITHER null).
+    //     fcmp/icmp never trap, so a select suffices.
+    // Equality (= / <>) is handled separately (§8.4, already null-safe above).
+    // User-defined operator overloads are handled by the early call path above.
+    {
+        const sema::TypeRef* lTy = bin.left  ? ctx_.exprType(*bin.left)  : nullptr;
+        const sema::TypeRef* rTy = bin.right ? ctx_.exprType(*bin.right) : nullptr;
+        // §7.11 lifting: detect nullable value type operands.
+        // For mixed T + T? where left is non-nullable: lNullable = false but
+        // rNullable = true. The left payload is the raw scalar (l itself),
+        // not a struct — check isStructTy() guards this case.
+        bool lNullable = lTy && isNullableValueTy(lTy) && l->getType()->isStructTy();
+        bool rNullable = rTy && isNullableValueTy(rTy) && r->getType()->isStructTy();
+        bool isArithOp = (op == "+" || op == "-" || op == "*" || op == "/" ||
+                          op == "mod" || op == "&" || op == "|" || op == "^" ||
+                          op == "<<" || op == ">>");
+        bool isRelOp   = (op == "<" || op == "<=" || op == ">" || op == ">=");
+        if ((lNullable || rNullable) && (isArithOp || isRelOp)) {
+            // Extract (tag, payload) for each operand.
+            // A non-nullable operand has implicit tag=true and its value as payload.
+            llvm::Value* lTag     = lNullable ? nullablePrimHasValue(l) : builder_.getTrue();
+            llvm::Value* lPayload = lNullable ? nullablePrimValue(l)    : l;
+            llvm::Value* rTag     = rNullable ? nullablePrimHasValue(r) : builder_.getTrue();
+            llvm::Value* rPayload = rNullable ? nullablePrimValue(r)    : r;
+            // bothPresent = lTag AND rTag (i1).
+            llvm::Value* bothPresent = builder_.CreateAnd(lTag, rTag, "lift.both");
+
+            // ---- RELATIONAL: result is bool, no trap possible. ----
+            if (isRelOp) {
+                // Compute the comparison on payloads (safe to do always — icmp/fcmp
+                // never trap, and we AND with bothPresent anyway).
+                bool lFP = lPayload->getType()->isFloatingPointTy();
+                bool rFP = rPayload->getType()->isFloatingPointTy();
+                llvm::Value* cmp = nullptr;
+                if (lFP || rFP) {
+                    // Promote narrower FP type if widths differ.
+                    auto* fty =
+                        (lFP && rFP)
+                            ? (lPayload->getType()->getPrimitiveSizeInBits() >=
+                                       rPayload->getType()->getPrimitiveSizeInBits()
+                                   ? lPayload->getType()
+                                   : rPayload->getType())
+                            : (lFP ? lPayload->getType() : rPayload->getType());
+                    auto toFP = [&](llvm::Value* v) -> llvm::Value* {
+                        if (!v->getType()->isFloatingPointTy())
+                            return builder_.CreateSIToFP(v, fty);
+                        if (v->getType() != fty)
+                            return builder_.CreateFPExt(v, fty);
+                        return v;
+                    };
+                    llvm::Value* lp = toFP(lPayload);
+                    llvm::Value* rp = toFP(rPayload);
+                    if      (op == "<")  cmp = builder_.CreateFCmpOLT(lp, rp, "lift.cmp");
+                    else if (op == "<=") cmp = builder_.CreateFCmpOLE(lp, rp, "lift.cmp");
+                    else if (op == ">")  cmp = builder_.CreateFCmpOGT(lp, rp, "lift.cmp");
+                    else                 cmp = builder_.CreateFCmpOGE(lp, rp, "lift.cmp");
+                } else {
+                    // Integer comparison; widen to common width if needed.
+                    llvm::Value* lp = lPayload, *rp = rPayload;
+                    if (lp->getType()->isIntegerTy() && rp->getType()->isIntegerTy() &&
+                        lp->getType() != rp->getType()) {
+                        unsigned lb = lp->getType()->getIntegerBitWidth();
+                        unsigned rb = rp->getType()->getIntegerBitWidth();
+                        if (lb < rb) lp = builder_.CreateSExt(lp, rp->getType());
+                        else         rp = builder_.CreateSExt(rp, lp->getType());
+                    }
+                    bool uns = isUnsignedBinOperand(bin);
+                    if      (op == "<")  cmp = uns ? builder_.CreateICmpULT(lp, rp, "lift.cmp")
+                                                   : builder_.CreateICmpSLT(lp, rp, "lift.cmp");
+                    else if (op == "<=") cmp = uns ? builder_.CreateICmpULE(lp, rp, "lift.cmp")
+                                                   : builder_.CreateICmpSLE(lp, rp, "lift.cmp");
+                    else if (op == ">")  cmp = uns ? builder_.CreateICmpUGT(lp, rp, "lift.cmp")
+                                                   : builder_.CreateICmpSGT(lp, rp, "lift.cmp");
+                    else                 cmp = uns ? builder_.CreateICmpUGE(lp, rp, "lift.cmp")
+                                                   : builder_.CreateICmpSGE(lp, rp, "lift.cmp");
+                }
+                // §7.11: false when either operand is null; inner cmp when both present.
+                return builder_.CreateAnd(bothPresent, cmp, "lift.rel");
+            }
+
+            // ---- ARITHMETIC / BITWISE / SHIFT: result is T? ----
+            // The underlying op (including overflow/div-zero checks) must run
+            // ONLY in the bothPresent branch (§7.11). Use a conditional branch
+            // so the side-effecting checks don't fire on null-by-null-operand paths.
+            // Determine the result sema type (T?) from whichever operand is nullable.
+            const sema::TypeRef* nvTy = lNullable ? lTy : rTy;
+            // Build the conditional branch.
+            auto* entryBB  = builder_.GetInsertBlock();
+            auto* opBB     = llvm::BasicBlock::Create(llvm_, "lift.op",  currentFn_);
+            auto* mergeBB  = llvm::BasicBlock::Create(llvm_, "lift.end", currentFn_);
+            builder_.CreateCondBr(bothPresent, opBB, mergeBB);
+
+            // --- opBB: both operands are present, run the actual op. ---
+            builder_.SetInsertPoint(opBB);
+            // Widen integer payloads to a common width (mirrors the non-nullable path).
+            llvm::Value* lp = lPayload, *rp = rPayload;
+            bool lFP = lp->getType()->isFloatingPointTy();
+            bool rFP = rp->getType()->isFloatingPointTy();
+            if (!lFP && !rFP && lp->getType()->isIntegerTy() &&
+                rp->getType()->isIntegerTy() &&
+                lp->getType() != rp->getType()) {
+                bool uns = isUnsignedBinOperand(bin);
+                unsigned lb = lp->getType()->getIntegerBitWidth();
+                unsigned rb = rp->getType()->getIntegerBitWidth();
+                llvm::Type* wide = lb >= rb ? lp->getType() : rp->getType();
+                if (lb < rb) lp = uns ? builder_.CreateZExt(lp, wide)
+                                      : builder_.CreateSExt(lp, wide);
+                if (rb < lb) rp = uns ? builder_.CreateZExt(rp, wide)
+                                      : builder_.CreateSExt(rp, wide);
+            }
+            // Promote integer payload to FP when the other side is FP.
+            if (lFP || rFP) {
+                auto* fty =
+                    (lFP && rFP)
+                        ? (lp->getType()->getPrimitiveSizeInBits() >=
+                                   rp->getType()->getPrimitiveSizeInBits()
+                               ? lp->getType()
+                               : rp->getType())
+                        : (lFP ? lp->getType() : rp->getType());
+                auto toFP = [&](llvm::Value* v) -> llvm::Value* {
+                    if (!v->getType()->isFloatingPointTy())
+                        return builder_.CreateSIToFP(v, fty);
+                    if (v->getType() != fty)
+                        return builder_.CreateFPExt(v, fty);
+                    return v;
+                };
+                lp = toFP(lp); rp = toFP(rp);
+            }
+            // Compute the payload result using the same logic as the non-nullable
+            // path (including overflow and div-zero checks, per §7.11).
+            llvm::Value* payloadResult = nullptr;
+            if (lp->getType()->isFloatingPointTy()) {
+                // FP arithmetic — no overflow/div-zero checks (§6.3).
+                if      (op == "+")   payloadResult = builder_.CreateFAdd(lp, rp);
+                else if (op == "-")   payloadResult = builder_.CreateFSub(lp, rp);
+                else if (op == "*")   payloadResult = builder_.CreateFMul(lp, rp);
+                else if (op == "/")   payloadResult = builder_.CreateFDiv(lp, rp);
+            } else {
+                bool uns = isUnsignedBinOperand(bin);
+                // CG22 checked integer arithmetic (§6.1) — overflow/div-zero
+                // checks fire here, inside the bothPresent branch.
+                bool checkedInt = lp->getType()->isIntegerTy() &&
+                                  !lp->getType()->isIntegerTy(1);
+                if (checkedInt) {
+                    if (op == "+") {
+                        payloadResult = emitCheckedArith(
+                            uns ? llvm::Intrinsic::uadd_with_overflow
+                                : llvm::Intrinsic::sadd_with_overflow, lp, rp);
+                    } else if (op == "-") {
+                        payloadResult = emitCheckedArith(
+                            uns ? llvm::Intrinsic::usub_with_overflow
+                                : llvm::Intrinsic::ssub_with_overflow, lp, rp);
+                    } else if (op == "*") {
+                        payloadResult = emitCheckedArith(
+                            uns ? llvm::Intrinsic::umul_with_overflow
+                                : llvm::Intrinsic::smul_with_overflow, lp, rp);
+                    } else if (op == "/" || op == "mod") {
+                        emitGuardThrow(builder_.CreateICmpEQ(rp, zeroLike(rp)),
+                                       "DivideByZeroException");
+                        if (uns) {
+                            payloadResult = (op == "/") ? builder_.CreateUDiv(lp, rp)
+                                                        : builder_.CreateURem(lp, rp);
+                        } else {
+                            llvm::Value* minV   = minIntLike(rp);
+                            llvm::Value* negOne = llvm::ConstantInt::getSigned(
+                                rp->getType(), -1);
+                            emitGuardThrow(
+                                builder_.CreateAnd(builder_.CreateICmpEQ(lp, minV),
+                                                   builder_.CreateICmpEQ(rp, negOne)),
+                                "OverflowException");
+                            payloadResult = (op == "/") ? builder_.CreateSDiv(lp, rp)
+                                                        : builder_.CreateSRem(lp, rp);
+                        }
+                    }
+                }
+                if (!payloadResult) {
+                    // Unchecked ops (bool bitwise on i1, shifts, plain add/sub for
+                    // non-integer — fallback).
+                    if      (op == "+")   payloadResult = builder_.CreateAdd(lp, rp);
+                    else if (op == "-")   payloadResult = builder_.CreateSub(lp, rp);
+                    else if (op == "*")   payloadResult = builder_.CreateMul(lp, rp);
+                    else if (op == "/")   payloadResult = uns ? builder_.CreateUDiv(lp, rp)
+                                                              : builder_.CreateSDiv(lp, rp);
+                    else if (op == "mod") payloadResult = uns ? builder_.CreateURem(lp, rp)
+                                                              : builder_.CreateSRem(lp, rp);
+                    else if (op == "&")   payloadResult = builder_.CreateAnd(lp, rp);
+                    else if (op == "|")   payloadResult = builder_.CreateOr(lp, rp);
+                    else if (op == "^")   payloadResult = builder_.CreateXor(lp, rp);
+                    else if (op == "<<" || op == ">>") {
+                        unsigned bits = lp->getType()->getIntegerBitWidth();
+                        llvm::Value* mask = llvm::ConstantInt::get(rp->getType(), bits - 1);
+                        llvm::Value* cnt = builder_.CreateAnd(rp, mask, "shcnt");
+                        if (op == "<<")  payloadResult = builder_.CreateShl(lp, cnt);
+                        else             payloadResult = uns ? builder_.CreateLShr(lp, cnt)
+                                                             : builder_.CreateAShr(lp, cnt);
+                    }
+                }
+            }
+            auto* opEndBB = builder_.GetInsertBlock();
+            builder_.CreateBr(mergeBB);
+
+            // --- mergeBB: phi between present-value and zero-payload. ---
+            builder_.SetInsertPoint(mergeBB);
+            // PHI nodes must be first in the block. Create the payload PHI first,
+            // then the tag ZExt (which uses bothPresent from entryBB — a constant-
+            // or instruction-value already computed before the branch, so it is
+            // dominating and valid as a non-PHI operand after the PHIs).
+            // Build the result T? struct: {i8 tag, T payload}.
+            // - tag: 1 when both present (payloadResult is valid), 0 otherwise.
+            // - payload: payloadResult when present, else zero (the tag signals
+            //   null so the zero value is never read by correct code).
+            llvm::Value* payloadPhi = nullptr;
+            if (payloadResult) {
+                // PHI first (required to be at the top of the block).
+                auto* phi = builder_.CreatePHI(payloadResult->getType(), 2,
+                                               "lift.payload");
+                phi->addIncoming(payloadResult, opEndBB);
+                phi->addIncoming(
+                    llvm::Constant::getNullValue(payloadResult->getType()), entryBB);
+                payloadPhi = phi;
+            } else {
+                // Fallback: use zero of the struct's payload type.
+                auto* nvSt = nullableValueStructTy(nvTy);
+                payloadPhi = llvm::Constant::getNullValue(nvSt->getElementType(1));
+            }
+            // Non-PHI instructions follow the PHI group.
+            llvm::Value* resultTag = builder_.CreateZExt(
+                bothPresent, nullablePrimHasValTy(), "lift.tag");
+            // Construct the result nullable struct {tag, payload}.
+            auto* st = nullableValueStructTy(nvTy);
+            llvm::Value* res = builder_.CreateInsertValue(
+                llvm::UndefValue::get(st), resultTag, {0u}, "lift.res");
+            res = builder_.CreateInsertValue(res, payloadPhi, {1u});
+            return res;
+        }
+    }
     // CG24 (§6.3): floating-point arithmetic and comparisons (IEEE 754,
     // no overflow/div0 checks). If one operand is FP and the other an
     // integer, promote the integer (§6.2 mixed-type promotion).
@@ -3100,6 +3407,58 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     llvm::Value* v = lowerExpr(*un.operand);
     if (!v) return nullptr;
     const auto& op = un.op;
+
+    // §7.11 Lifted unary operators: `-` and `~` on nullable value types.
+    // When the operand is a nullable value type (int?, long?, …):
+    //   - Result is T? (null when operand is null).
+    //   - The underlying op (incl. OverflowException for `-`) runs ONLY when
+    //     the operand is present (conditional branch).
+    if ((op == "-" || op == "~") && un.operand) {
+        const sema::TypeRef* ot = ctx_.exprType(*un.operand);
+        if (ot && isNullableValueTy(ot) && v->getType()->isStructTy()) {
+            llvm::Value* tag     = nullablePrimHasValue(v);
+            llvm::Value* payload = nullablePrimValue(v);
+            auto* entryBB = builder_.GetInsertBlock();
+            auto* opBB    = llvm::BasicBlock::Create(llvm_, "uneg.op",  currentFn_);
+            auto* mergeBB = llvm::BasicBlock::Create(llvm_, "uneg.end", currentFn_);
+            builder_.CreateCondBr(tag, opBB, mergeBB);
+
+            builder_.SetInsertPoint(opBB);
+            llvm::Value* result = nullptr;
+            if (op == "-") {
+                if (payload->getType()->isFloatingPointTy()) {
+                    result = builder_.CreateFNeg(payload);
+                } else {
+                    if (payload->getType()->isIntegerTy() &&
+                        !payload->getType()->isIntegerTy(1)) {
+                        emitGuardThrow(
+                            builder_.CreateICmpEQ(payload, minIntLike(payload)),
+                            "OverflowException");
+                    }
+                    result = builder_.CreateNeg(payload);
+                }
+            } else { // op == "~"
+                result = builder_.CreateNot(payload);
+            }
+            auto* opEndBB = builder_.GetInsertBlock();
+            builder_.CreateBr(mergeBB);
+
+            builder_.SetInsertPoint(mergeBB);
+            // PHI first (required to be at top of block).
+            auto* phi = builder_.CreatePHI(payload->getType(), 2, "uneg.val");
+            phi->addIncoming(llvm::Constant::getNullValue(payload->getType()),
+                             entryBB);
+            phi->addIncoming(result, opEndBB);
+            llvm::Value* resTag = builder_.CreateZExt(
+                tag, nullablePrimHasValTy(), "uneg.tag");
+            auto* st = nullableValueStructTy(ot);
+            llvm::Value* res = builder_.CreateInsertValue(
+                llvm::UndefValue::get(st), resTag, {0u});
+            res = builder_.CreateInsertValue(res, phi, {1u});
+            return res;
+        }
+    }
+
     if (op == "-") {
         if (v->getType()->isFloatingPointTy())  // CG24: §6.3 IEEE negate
             return builder_.CreateFNeg(v);

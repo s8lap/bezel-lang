@@ -749,6 +749,27 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             }
         }
     }
+    // §7.11 "No three-valued logic": `and` / `or` require both operands to be
+    // non-nullable `bool`. A `bool?` operand is a compile error.
+    if (op == "and" || op == "or") {
+        auto isBoolNullable = [&](const ast::Expr* e) -> bool {
+            if (!e) return false;
+            const TypeRef* t = ctx_.exprType(*e);
+            return t && t->kind == TypeRef::Kind::Primitive &&
+                   t->primitive == PrimitiveType::Bool && t->nullable;
+        };
+        if (isBoolNullable(be.left.get()) || isBoolNullable(be.right.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) +
+                "` requires non-nullable `bool` operands (§7.11); a `bool?`"
+                " operand is not permitted — there is no three-valued logic."
+                " Use `??` to coalesce the `bool?` to a `bool` first, or"
+                " narrow with an explicit null check.");
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+    }
     if (op == "=" || op == "<>" || op == "<" || op == ">" ||
         op == "<=" || op == ">=" || op == "and" || op == "or") {
         ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
@@ -816,6 +837,63 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 ctx_.diagnostics().report(Severity::Error, be.span.begin,
                     std::string("operator `") + std::string(op) +
                     "` requires integer operands; use `+` for string concatenation");
+                return;
+            }
+        }
+        // §7.11 lifted operators: when EITHER operand is a nullable value
+        // primitive (`int?`, `double?`, `bool?`, …), the arithmetic / bitwise /
+        // shift result is lifted to `T?` — `null` when either operand is `null`,
+        // otherwise the underlying operator applied to the present payloads. A
+        // mixed `T?` + `T` expression also lifts (the non-nullable operand is
+        // treated as present), and the result is still `T?`. The result's
+        // underlying type is computed exactly as the non-nullable case would
+        // (so `int? + int?` is `int?`, and a future widening pair such as
+        // `int? + long?` widens identically), then marked nullable. (Equality
+        // `=`/`<>` does not reach this block — it returns `bool` above per §8.4
+        // — and relational ops also return `bool`, never lift to `bool?`.) The
+        // codegen lowering for these operators lives in
+        // LlvmBackend_Exprs.cpp::lowerBinary.
+        {
+            TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+            auto isNullablePrim = [](const TypeRef* t) {
+                return t && t->kind == TypeRef::Kind::Primitive && t->nullable;
+            };
+            bool lNull = isNullablePrim(lt);
+            bool rNull = isNullablePrim(rt);
+            if ((lNull || rNull) && lt && rt &&
+                lt->kind == TypeRef::Kind::Primitive &&
+                rt->kind == TypeRef::Kind::Primitive) {
+                // Determine the underlying (non-nullable) result primitive using
+                // the same §6.2 widening rule as the non-nullable path. For
+                // shift ops the result follows the left operand. For same-prim
+                // operands the result is that primitive.
+                PrimitiveType resultPrim = lt->primitive;
+                if (op != "<<" && op != ">>" &&
+                    lt->primitive != rt->primitive) {
+                    if (primitiveWidens(lt->primitive, rt->primitive))
+                        resultPrim = rt->primitive;       // left widens to right
+                    else if (primitiveWidens(rt->primitive, lt->primitive))
+                        resultPrim = lt->primitive;       // right widens to left
+                    else if (isPromotablePrimitive(lt->primitive) &&
+                             isPromotablePrimitive(rt->primitive)) {
+                        // §6.2: no implicit conversion in either direction — a
+                        // compile error, mirroring the non-nullable branch below.
+                        ctx_.diagnostics().report(
+                            Severity::Error, be.span.begin,
+                            std::string("operator `") + std::string(op) +
+                            "` has no implicit conversion between operand types `" +
+                            primitiveSpelling(lt->primitive) + "` and `" +
+                            primitiveSpelling(rt->primitive) +
+                            "` (§6.2); add an explicit cast (§5.2) to convert one"
+                            " operand to the other's type.");
+                        return;
+                    }
+                }
+                TypeRef* res = ctx_.makeTypeRef();
+                res->kind = TypeRef::Kind::Primitive;
+                res->primitive = resultPrim;
+                res->nullable = true;   // §7.11: lifted result is T?
+                ctx_.setExprType(&be, res);
                 return;
             }
         }
@@ -969,6 +1047,19 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         return;
     }
     if (op == "not") {
+        // §7.11: `not bool?` is a compile error.
+        if (ue.operand) {
+            const TypeRef* ot = ctx_.exprType(*ue.operand);
+            if (ot && ot->kind == TypeRef::Kind::Primitive &&
+                ot->primitive == PrimitiveType::Bool && ot->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ue.span.begin,
+                    "`not` requires a non-nullable `bool` operand (§7.11); a"
+                    " `bool?` operand is not permitted — there is no"
+                    " three-valued logic. Use `??` to coalesce the `bool?` to"
+                    " a `bool` first, or narrow with an explicit null check.");
+            }
+        }
         ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;
     }

@@ -158,6 +158,7 @@ set(BEZEL_TEST_SOURCES
     sema/typeof_gettype_487_test.cpp
     sema/gettype_chain_511_test.cpp
     sema/dict_iteration_diag_530_test.cpp
+    sema/lifted_operators_486_sema_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     flow/cfg_suspend_test.cpp
@@ -363,6 +364,7 @@ set(BEZEL_TEST_SOURCES
     codegen/sorted_comparer_record_533_test.cpp
     codegen/generic_static_520_test.cpp
     codegen/generic_static_state_536_test.cpp
+    codegen/lifted_operators_486_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
