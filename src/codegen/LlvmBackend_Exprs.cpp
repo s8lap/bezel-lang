@@ -1871,6 +1871,139 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // fix #556 / §4.8: `Dictionary<K,V>.Values` as an expression — returns a
+    // fresh bz_array_t* of decoded values.  Mirrors the Keys handler above but
+    // uses genericArgs[1] (the value type) and the bz_dict_values_* snapshots.
+    // The element decoding follows the same void*-encoding rules as
+    // lowerDictValuesFor (LlvmBackend_Stmts.cpp): record → heap-box pointer;
+    // nullable value type → unbox tagged struct; scalar → ptrtoint + trunc;
+    // pointer (string / class) → void* IS the value.
+    // The resulting bz_array_t* is typed as Array<V> by sema (fix #556), so
+    // collectionElemSize will compute the correct per-element stride and
+    // downstream .Count / .ToArray() / LINQ will work correctly.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && ma->member == "Values") {
+            auto* dictTy = ctx_.exprType(*ma->target);
+            if (isDictTypeName(dictTy) &&
+                dictTy->genericArgs.size() >= 2 &&
+                dictTy->genericArgs[1]) {
+                const sema::TypeRef* valTy = dictTy->genericArgs[1];
+                llvm::Type* valLlvm = lowerTypeRef(valTy);
+                if (valLlvm) {
+                    // Determine value category (matches lowerDictValuesFor).
+                    const sema::TypeSymbol* valRec =
+                        (valTy->kind == sema::TypeRef::Kind::Named &&
+                         valTy->declaration &&
+                         valTy->declaration->kind == ast::TypeDeclKind::Record)
+                            ? valTy->declaration : nullptr;
+                    bool valNullableVal = isNullableValueTy(valTy);
+
+                    llvm::Value* dictObj = lowerExpr(*ma->target);
+                    if (!dictObj) return nullptr;
+
+                    // Snapshot the values array via the string-key or generic-key
+                    // helper (same dispatch as lowerDictValuesFor).
+                    auto* valsOutSlot = entryAlloca(ptrTy());
+                    auto* cntSlot     = entryAlloca(i64());
+                    bool useGen =
+                        genericBackingType(dictTy, 0, /*isSet=*/false, nullptr)
+                        != nullptr;
+                    if (useGen) {
+                        auto* fn = declareC("bz_dict_values_gen",
+                                            llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy(), ptrTy(), ptrTy()});
+                        builder_.CreateCall(fn, {dictObj, valsOutSlot, cntSlot});
+                    } else {
+                        auto* fn = declareC("bz_dict_values_str",
+                                            llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy(), ptrTy(), ptrTy()});
+                        builder_.CreateCall(fn, {dictObj, valsOutSlot, cntSlot});
+                    }
+                    llvm::Value* valsArr =
+                        builder_.CreateLoad(ptrTy(), valsOutSlot);
+                    llvm::Value* cnt = builder_.CreateLoad(i64(), cntSlot);
+
+                    // Allocate the result array with the correct element stride.
+                    int64_t esz = collectionElemSize(
+                        ctx_.exprType(e));  // exprType(e) is the Array<V> TypeRef
+                    auto* allocFn = declareC("bz_array_alloc", ptrTy(),
+                                             {i64(), i64()});
+                    llvm::Value* result =
+                        builder_.CreateCall(allocFn,
+                                            {builder_.getInt64(esz), cnt},
+                                            "dv.arr");
+                    auto* addFn = declareC("bz_array_add",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy(), ptrTy(), i64()});
+                    auto* freeFn = declareC("free",
+                                            llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy()});
+
+                    // Loop over the snapshot, decode each void* → V, add to result.
+                    auto* idxSlot = entryAlloca(i64());
+                    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                    auto* condBB = llvm::BasicBlock::Create(llvm_, "dve.c",
+                                                            currentFn_);
+                    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dve.b",
+                                                            currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "dve.e",
+                                                            currentFn_);
+                    builder_.CreateBr(condBB);
+
+                    builder_.SetInsertPoint(condBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                    builder_.CreateCondBr(
+                        builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* idxB  = builder_.CreateLoad(i64(), idxSlot);
+                    llvm::Value* vpPtr = builder_.CreateGEP(ptrTy(), valsArr,
+                                                            idxB);
+                    llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
+
+                    // Decode void* → V (same encoding as lowerDictValuesFor).
+                    llvm::Value* decoded;
+                    if (valRec) {
+                        decoded = slotV;  // ptr to heap-boxed record
+                    } else if (valNullableVal && valLlvm->isStructTy()) {
+                        decoded = builder_.CreateLoad(valLlvm, slotV,
+                                                      "dve.nvval");
+                    } else if (!valLlvm->isPointerTy()) {
+                        llvm::Value* asI64 =
+                            builder_.CreatePtrToInt(slotV, i64());
+                        if (valLlvm->isDoubleTy())
+                            decoded = builder_.CreateBitCast(asI64, valLlvm);
+                        else if (valLlvm->isFloatTy())
+                            decoded = builder_.CreateBitCast(
+                                builder_.CreateTrunc(asI64, i32()), valLlvm);
+                        else if (valLlvm->isIntegerTy(64))
+                            decoded = asI64;
+                        else
+                            decoded = builder_.CreateTrunc(asI64, valLlvm);
+                    } else {
+                        decoded = slotV;  // pointer (string / class object)
+                    }
+
+                    // Store the decoded element into a stack slot and add to array.
+                    llvm::AllocaInst* elemSlot = entryAlloca(
+                        valRec ? ptrTy() : decoded->getType());
+                    builder_.CreateStore(decoded, elemSlot);
+                    builder_.CreateCall(addFn,
+                                        {result, elemSlot,
+                                         builder_.getInt64(esz)});
+
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idxB, builder_.getInt64(1)),
+                        idxSlot);
+                    builder_.CreateBr(condBB);
+
+                    builder_.SetInsertPoint(endBB);
+                    builder_.CreateCall(freeFn, {valsArr});
+                    return result;
+                }
+            }
+        }
+    }
     // CG22+: Exception.Message — built-in exceptions store a message
     // string pointer at byte offset 8 (slot 1) of the exception object.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {

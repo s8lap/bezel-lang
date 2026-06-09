@@ -3002,15 +3002,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
-        // #370 / §4.8: `Dictionary<K,V>.Keys` is `ICollection<K>` and
-        // `.Values` is `ICollection<V>`. The Dictionary has no user
-        // TypeSymbol (its TypeRef carries no declaration), so the ordinary
-        // member-lookup path never types these properties. Type the access as
-        // a collection-of-K (resp. V) carried structurally — a Named TypeRef
-        // with the element type as genericArgs[0]. That lets a `for var k in
-        // d.Keys` loop infer the loop variable's type as K (so `k.field`
-        // resolves over a record key). Codegen recognizes the `d.Keys` AST
-        // shape directly (issue #370), so it does not depend on this type.
+        // #370 / §4.8 / fix #556: `Dictionary<K,V>.Keys` is `ICollection<K>`
+        // and `.Values` is `ICollection<V>`.  The Dictionary has no user
+        // TypeSymbol, so the ordinary member-lookup path never types these
+        // properties.  Type the access as a concrete Array<K> (resp. Array<V>)
+        // carried structurally — a Named TypeRef whose astNode names "Array"
+        // and whose genericArgs[0] holds the element type.
+        //
+        // Using "Array" (not a null astNode) is load-bearing:
+        //   (a) isCollectionTypeName() in codegen requires a non-null astNode
+        //       with name "Array"/… so that .ToArray() and other LINQ ops on
+        //       d.Keys/d.Values route through the array-backed lazy path instead
+        //       of falling through to vtable dispatch on a raw bz_array_t*
+        //       (which was the root cause of the #556 SIGSEGV).
+        //   (b) isBuiltinColl in the .Count sema handler at L3046 requires the
+        //       same guard; with a null astNode, .Count was not typed `int` and
+        //       codegen read the array struct's first word as i32 (garbage).
+        //
+        // The runtime does produce a bz_array_t* for both Keys and Values
+        // (lowerExpr for Keys was already present; lowerExpr for Values is
+        // added in fix #556), so "Array" accurately describes the runtime object.
+        //
+        // The static astNode is program-lifetime (intentionally leaked),
+        // consistent with all other synthetic nodes (kArrayAstNode, kDictAstNode,
+        // etc.) in this file.
         if (ma.target && (ma.member == "Keys" || ma.member == "Values")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
                 bool isDict =
@@ -3021,10 +3036,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                      tt->astNode->name->parts[0] == "OwnedDictionary");
                 std::size_t gi = ma.member == "Keys" ? 0 : 1;
                 if (isDict && tt->genericArgs.size() > gi && tt->genericArgs[gi]) {
+                    // Static synthetic astNode for "Array" (program-lifetime).
+                    static const ast::Type* kKeysValuesArrayNode = []() -> ast::Type* {
+                        auto* qn = new ast::QualifiedName;
+                        qn->parts.push_back("Array");
+                        auto* t = new ast::Type;
+                        t->kind = ast::TypeKind::Named;
+                        t->name.reset(qn);
+                        return t;
+                    }();
                     auto* coll = ctx_.makeTypeRef();
                     coll->kind = TypeRef::Kind::Named;
                     coll->declaration = nullptr;
-                    coll->astNode = nullptr;
+                    coll->astNode = kKeysValuesArrayNode;
                     coll->genericArgs.push_back(tt->genericArgs[gi]);
                     ctx_.setExprType(&ma, coll);
                     return;
