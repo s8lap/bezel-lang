@@ -137,6 +137,44 @@ std::vector<uint32_t> Emitter::processStringCodePoints(
     if (text.size() < (verbatim ? 3u : 2u)) return {};
     text = text.substr(start, text.size() - start - 1);
 
+    // §4.6 / #528: decode a UTF-8 multi-byte sequence starting at text[i]
+    // into a single Unicode scalar value; i is advanced past any continuation
+    // bytes consumed beyond the lead byte.  Malformed lead bytes fall through
+    // as single-byte Latin-1 values so valid source (§1.1: UTF-8) always works.
+    auto decodeUtf8 = [](std::string_view t, size_t& i) -> uint32_t {
+        auto b0 = (unsigned char)t[i];
+        // 1-byte ASCII: 0xxxxxxx
+        if (b0 < 0x80) return b0;
+        // 2-byte sequence: 110xxxxx 10xxxxxx
+        if ((b0 & 0xE0) == 0xC0 && i + 1 < t.size() &&
+                ((unsigned char)t[i+1] & 0xC0) == 0x80) {
+            uint32_t cp = ((b0 & 0x1F) << 6) | ((unsigned char)t[i+1] & 0x3F);
+            ++i; return cp;
+        }
+        // 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx
+        if ((b0 & 0xF0) == 0xE0 && i + 2 < t.size() &&
+                ((unsigned char)t[i+1] & 0xC0) == 0x80 &&
+                ((unsigned char)t[i+2] & 0xC0) == 0x80) {
+            uint32_t cp = ((b0 & 0x0F) << 12) |
+                          (((unsigned char)t[i+1] & 0x3F) << 6) |
+                          ((unsigned char)t[i+2] & 0x3F);
+            i += 2; return cp;
+        }
+        // 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+        if ((b0 & 0xF8) == 0xF0 && i + 3 < t.size() &&
+                ((unsigned char)t[i+1] & 0xC0) == 0x80 &&
+                ((unsigned char)t[i+2] & 0xC0) == 0x80 &&
+                ((unsigned char)t[i+3] & 0xC0) == 0x80) {
+            uint32_t cp = ((b0 & 0x07) << 18) |
+                          (((unsigned char)t[i+1] & 0x3F) << 12) |
+                          (((unsigned char)t[i+2] & 0x3F) << 6) |
+                          ((unsigned char)t[i+3] & 0x3F);
+            i += 3; return cp;
+        }
+        // Malformed lead byte: fall back to single-byte Latin-1 value.
+        return b0;
+    };
+
     std::vector<uint32_t> cps;
     cps.reserve(text.size());
     for (size_t i = 0; i < text.size(); ++i) {
@@ -144,12 +182,16 @@ std::vector<uint32_t> Emitter::processStringCodePoints(
             if (text[i] == '"' && i+1 < text.size() && text[i+1] == '"') {
                 cps.push_back('"'); ++i;
             } else {
-                // Raw chars in verbatim — treat as Latin-1 code points.
-                cps.push_back((unsigned char)text[i]);
+                // Raw chars in verbatim — decode as UTF-8 code points (§4.6 / #528).
+                cps.push_back(decodeUtf8(text, i));
             }
             continue;
         }
-        if (text[i] != '\\') { cps.push_back((unsigned char)text[i]); continue; }
+        if (text[i] != '\\') {
+            // Non-backslash: decode as UTF-8 scalar (§4.6 / #528).
+            cps.push_back(decodeUtf8(text, i));
+            continue;
+        }
         if (++i >= text.size()) break;
         switch (text[i]) {
             case 'n': cps.push_back(0x0A); break;
