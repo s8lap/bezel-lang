@@ -353,6 +353,25 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         auto e = std::make_unique<ast::IdentifierExpr>();
         e->name = current_.text;
         advance();
+        // per §14.1 / §22.12 (issue #520): optional explicit type arguments
+        // on an identifier in receiver position, e.g. `Registry<int>.Make(7)`.
+        // Only parsed when the disambiguating scan confirms `< TypeArgList > .`
+        // (dot follows the closing `>`) — the static-member-access receiver
+        // form.  Relational chains (`a < b > c`) have a non-dot token after
+        // the `>`, so the scan returns false and leaves `<` for the binary
+        // expression parser to handle as a relational operator.
+        if (isPunctuator("<") && tokensLookLikeReceiverTypeArgs()) {
+            advance(); // past `<`
+            e->typeArgs.push_back(parseType());
+            while (isPunctuator(",")) {
+                advance(); // past `,`
+                e->typeArgs.push_back(parseType());
+            }
+            if (!consumeClosingAngle()) {
+                diagnostics_.report(Severity::Error, current_.location,
+                    "expected '>' to close receiver type-argument list");
+            }
+        }
         return std::unique_ptr<ast::Expr>(e.release());
     }
 
@@ -674,6 +693,63 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
         }
         if (t.kind == TokenKind::Identifier) continue; // type name component
         // Numeric/char/string literals cannot be type args.
+        return false;
+    }
+    return false; // exceeded scan limit
+}
+
+// per §14.1 / §22.12 (issue #520): disambiguate `GenericClass<T>.Member`
+// (explicit receiver type args, static access) from a relational `<` chain.
+// peekAt(0) is the `<` token after the identifier has been consumed.
+//
+// Identical strategy to tokensLookLikeMethodTypeArgs() except that the
+// closing `>` must be followed by `.` (dot) — the start of the `.Member`
+// access — rather than `(` (an argument list).  This allows:
+//   `Registry<int>.Make(7)`   → receiver type-arg list (> followed by .)
+// while still leaving:
+//   `a < b > 0`               → relational chain (> followed by numeric/ident)
+//   `Wrapper.Identity<int>(v)` → method type-arg list (handled by #509)
+// both parsed correctly.
+bool Parser::tokensLookLikeReceiverTypeArgs() {
+    std::size_t k = 1;                // start scanning after the opening `<`
+    std::size_t depth = 1;
+    static const std::size_t kLimit = 64;
+    for (std::size_t guard = 0; guard < kLimit; ++guard, ++k) {
+        const Token& t = peekAt(k);
+        if (t.kind == TokenKind::EndOfFile) return false;
+        if (t.kind == TokenKind::Punctuator) {
+            if (t.text == "<") { ++depth; continue; }
+            if (t.text == ">>") {
+                if (depth <= 2) {
+                    const Token& after = peekAt(k + 1);
+                    if (depth == 2) {
+                        return after.kind == TokenKind::Punctuator &&
+                               after.text == ".";
+                    }
+                    return false;
+                }
+                depth -= 2; continue;
+            }
+            if (t.text == ">") {
+                --depth;
+                if (depth == 0) {
+                    // The closing `>` of the arg list.  Confirm `.` follows —
+                    // a static-member access, not a call-argument list.
+                    const Token& after = peekAt(k + 1);
+                    return after.kind == TokenKind::Punctuator &&
+                           after.text == ".";
+                }
+                continue;
+            }
+            if (t.text == "," || t.text == "?" ||
+                t.text == "[" || t.text == "]") continue;
+            return false;
+        }
+        if (t.kind == TokenKind::Keyword) {
+            if (isPrimitiveTypeKeyword(t.text)) continue;
+            return false;
+        }
+        if (t.kind == TokenKind::Identifier) continue;
         return false;
     }
     return false; // exceeded scan limit

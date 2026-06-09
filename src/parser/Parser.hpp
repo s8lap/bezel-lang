@@ -152,6 +152,11 @@ private:
     // bails out (returns false) on EOF or on tokens that cannot appear inside
     // a type-argument list.
     bool tokensLookLikeMethodTypeArgs();
+    // per §14.1 / §22.12 (issue #520): disambiguates `GenericClass<T>.Member`
+    // (receiver-position explicit type args) from `expr < T > (expr)`.
+    // Like tokensLookLikeMethodTypeArgs() but requires `>` to be followed by
+    // `.` (dot) rather than `(` — the dot being the static-member access.
+    bool tokensLookLikeReceiverTypeArgs();
     // Slice 11: a single statement. Dispatches on the first token: `var` /
     // `using` for LocalDecl, `return` for ReturnStmt, otherwise an
     // expression that may be the start of an AssignmentStmt or an

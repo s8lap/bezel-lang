@@ -124,6 +124,33 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // Slice S29 (§22.8): a field initializer may not observe
             // an instance member (implicit-`this` reference).
             if (inFieldInitializer_) checkNotInstanceMember(*id, sym);
+            // per §14.1 / §22.12 (issue #520): when the identifier is a
+            // generic class name with explicit type args (`Registry<int>`),
+            // build an instantiated TypeRef (kind=Named, declaration=TypeSymbol,
+            // genericArgs populated with the resolved type args) and attach it
+            // as the exprType.  The subsequent `.member` MemberAccessExpr then
+            // finds a Named TypeRef with a declaration and resolves the static
+            // member against the concretely instantiated class.
+            // When typeArgs is empty (the common case) this block is skipped.
+            if (!id->typeArgs.empty()) {
+                if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+                    auto* instTy = ctx_.makeTypeRef();
+                    instTy->kind = TypeRef::Kind::Named;
+                    instTy->declaration = ts;
+                    for (const auto& ta : id->typeArgs) {
+                        if (ta) {
+                            TypeRef* resolved = ctx_.resolvedType(*ta);
+                            instTy->genericArgs.push_back(resolved);
+                        } else {
+                            instTy->genericArgs.push_back(nullptr);
+                        }
+                    }
+                    ctx_.setExprType(&e, instTy);
+                    // Return early — no further local/param/field type
+                    // attachment is needed; the exprType is now set.
+                    return;
+                }
+            }
             // Slice 3d: also attach the symbol's resolved type to
             // the identifier expr so MemberAccessExpr can pick it
             // up when this identifier is the target.

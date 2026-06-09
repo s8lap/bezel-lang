@@ -892,7 +892,18 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         }
         return;
     }
-    // Literals + Identifier + ThisBaseTypeOf — no nested Types/Exprs.
+    // per §14.1 / §22.12 (issue #520): an IdentifierExpr may carry explicit
+    // receiver type arguments (`Registry<int>` in `Registry<int>.Make(...)`).
+    // Resolve each type arg so that ctx_.resolvedType() can retrieve them
+    // later in ExprTypecheck (the same treatment MemberAccessExpr.typeArgs
+    // received for issue #509 at the branch above).
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        for (const auto& ta : id->typeArgs) {
+            if (ta) resolveType(*ta, scope);
+        }
+        return;
+    }
+    // Literals + ThisBaseTypeOf — no nested Types/Exprs.
 }
 
 }  // namespace bezel::sema

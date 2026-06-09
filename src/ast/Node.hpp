@@ -601,7 +601,16 @@ struct InterpolatedStringExpr : Expr {
 struct BoolLiteralExpr : Expr { bool value = false; };
 struct NullLiteralExpr : Expr {};
 
-struct IdentifierExpr : Expr { std::string_view name; };
+// per §14.1 / §22.12 (issue #520): an identifier that names a generic class
+// may carry explicit type arguments in expression/receiver position, as in
+// `Registry<int>.Make(...)`.  The parser populates `typeArgs` only when the
+// disambiguating scan confirms `< TypeArgList > .` (dot follows the closing
+// `>`), not a relational `<` operator.  Empty for all non-generic-receiver
+// uses (the common case).
+struct IdentifierExpr : Expr {
+    std::string_view name;
+    std::vector<std::unique_ptr<Type>> typeArgs;
+};
 
 // Source-level parentheses (`(expr)`) are NOT represented as their own AST
 // node — they only group the parse; the resulting tree shape already encodes
