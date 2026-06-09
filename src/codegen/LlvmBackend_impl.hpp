@@ -3218,6 +3218,13 @@ private:
     llvm::Value* materializeHeapCollectionLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy);
 
+    // #534 / stdlib §4.8: materialize a dictionary literal `["k1":v1, …]` into a
+    // freshly-allocated Dictionary<K,V>, reusing the SAME allocation and .Add
+    // codegen as the `new Dictionary<K,V>()` + `.Add(k, v)` paths. Returns a
+    // `ptr` to the bz_dict_t (or null if `dictTy` is not a Dictionary family).
+    llvm::Value* materializeHeapDictLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* dictTy);
+
     // per §4.6/§4.7: the resolved LinkedList<T>/OwnedLinkedList<T> TypeRef of
     // a local, or null if the local is not a linked list.
     const sema::TypeRef* linkedListTypeOfLocal(const ast::LocalDecl* ld);
