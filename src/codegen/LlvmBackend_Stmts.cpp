@@ -1586,6 +1586,11 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
          valTy->declaration &&
          valTy->declaration->kind == ast::TypeDeclKind::Record)
             ? valTy->declaration : nullptr;
+    // issue #539 / §4.8 / §7: nullable value types (int?, bool?, enum?,
+    // nullable record) lower to a tagged {i8 hasValue; T} struct and are
+    // heap-boxed by encodeValue.  Decode them the same way records are:
+    // load the struct back from the box pointer in the slot.
+    bool valNullableVal = valTy && isNullableValueTy(valTy);
 
     llvm::Type* valLlvm = lowerTypeRef(valTy);
     if (!valLlvm) return false;
@@ -1617,7 +1622,11 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     auto* idxSlot = entryAlloca(i64());
     builder_.CreateStore(builder_.getInt64(0), idxSlot);
 
-    // Loop variable slot — stores the decoded V value.
+    // Loop variable slot — stores the decoded V value.  For a non-nullable
+    // record, the loop variable is a pointer to the heap box (the body loads
+    // fields through it); for all other types it is the value itself.
+    // issue #539: nullable value types lower to a tagged struct and the loop
+    // variable holds the decoded struct (not a pointer), so allocate valLlvm.
     auto* varSlot = entryAlloca(valRec ? ptrTy() : valLlvm);
     locals_[&fs] = varSlot;
 
@@ -1637,7 +1646,9 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     llvm::Value* slotV  = builder_.CreateLoad(ptrTy(), vpPtr);  // raw void*
 
     // Decode void* → V following the same encoding as TryGetValue / GetOrAdd.
-    //   record value: slotV is the heap-box pointer → load the struct.
+    //   record value: slotV is the heap-box pointer → bind as pointer to box.
+    //   nullable value type (issue #539): slotV is the heap-box pointer of the
+    //     tagged {i8,T} struct → load the struct from the box.
     //   scalar (int/long/bool/char/enum/float/double): slotV was inttoptr'd →
     //     ptrtoint back to i64, then trunc/bitcast to the target type.
     //   pointer (string / class object): slotV IS the value.
@@ -1649,6 +1660,11 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
         // emitGenericKeyTableFor binds key values.  The box is owned by the dict
         // and must not be freed.
         decoded = slotV;  // ptr to boxed record
+    } else if (valNullableVal && valLlvm->isStructTy()) {
+        // Nullable value type: unbox the tagged struct from the heap box.
+        // The box is non-null even when hasValue=0 (the null tag is in the
+        // bytes, not the pointer).
+        decoded = builder_.CreateLoad(valLlvm, slotV, "dv.nvval");
     } else if (!valLlvm->isPointerTy()) {
         // Scalar: undo the inttoptr encoding.
         llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());

@@ -67,6 +67,11 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
          valTy->declaration &&
          valTy->declaration->kind == ast::TypeDeclKind::Record)
             ? valTy->declaration : nullptr;
+    // issue #539 / §4.8 / §7: nullable value types (int?, bool?, enum?,
+    // nullable record) lower to a tagged {i8 hasValue; T} struct and are
+    // heap-boxed by encodeValue (the same path as non-nullable records).
+    // Decode them the same way: load the struct bytes back from the box.
+    bool valNullableVal = valTy && isNullableValueTy(valTy);
     // issue #393 / §4.8: a record (aggregate) value is heap-boxed in the dict
     // (the runtime stores a malloc'd box of the record bytes — see the `.Set` /
     // `.TryGetValue` encode/decode in LlvmBackend_Calls.cpp). It is too wide for
@@ -103,11 +108,11 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     // §4.8: absent key → KeyNotFoundException.
     emitGuardThrow(builder_.CreateNot(found), "KeyNotFoundException");
     // Decode the stored void* into the value type (mirror TryGetValue). The
-    // cases are: a record (aggregate) value — load the boxed record struct out
-    // of the box (issue #393); scalars — decoded from the inttoptr'd slot;
-    // object/string pointers — the void* IS the pointer.
+    // cases are: a record or nullable-value-type tagged struct — load the boxed
+    // struct out of the box (issue #393 / #539); scalars — decoded from the
+    // inttoptr'd slot; object/string pointers — the void* IS the pointer.
     llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
-    if (valRec && valLlvm->isStructTy())
+    if ((valRec || valNullableVal) && valLlvm->isStructTy())
         return builder_.CreateLoad(valLlvm, valPtr, "ix.rec");
     if (!valLlvm->isPointerTy()) {
         llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
@@ -343,19 +348,24 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
          valTy->declaration &&
          valTy->declaration->kind == ast::TypeDeclKind::Record)
             ? valTy->declaration : nullptr;
+    // issue #539 / §4.8 / §7: nullable value types lower to a tagged {i8,T}
+    // struct and must be heap-boxed the same way non-nullable records are.
+    bool valNullableVal = valTy && isNullableValueTy(valTy);
     // Encode the value as the stored void* (mirror the dict Add path in
-    // LlvmBackend_Calls.cpp). The cases are: a record (aggregate) value —
-    // heap-boxed (malloc + store of its bytes), the box pointer stored, decoded
-    // back by the indexer get (issue #393 / §4.8); object/string pointers —
-    // stored directly; scalars — widened to i64 and inttoptr'd.
+    // LlvmBackend_Calls.cpp). The cases are: a record or nullable-value-type
+    // tagged struct — heap-boxed (malloc + store of its bytes), the box pointer
+    // stored, decoded back by the indexer get (issue #393 / #539 / §4.8);
+    // object/string pointers — stored directly; scalars — widened to i64 and
+    // inttoptr'd.
     auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
-        if (valRec && v->getType()->isStructTy()) {
-            llvm::StructType* vst = recordStruct(valRec);
-            uint64_t vsz = module_->getDataLayout().getTypeAllocSize(vst);
+        if ((valRec || valNullableVal) && v->getType()->isStructTy()) {
+            // Box the struct (record or nullable-value tagged struct).
+            uint64_t vsz =
+                module_->getDataLayout().getTypeAllocSize(v->getType());
             auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
             llvm::Value* box =
                 builder_.CreateCall(mallocFn, {builder_.getInt64((int64_t)vsz)});
-            builder_.CreateStore(v, box);   // copy the record bytes into the box
+            builder_.CreateStore(v, box);   // copy the struct bytes into the box
             return box;
         }
         if (v->getType()->isPointerTy()) return v;
