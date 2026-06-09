@@ -5558,6 +5558,9 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* v = tryLowerLazyLinqCall(call)) return v;
     // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T> node-based API.
     if (auto* v = tryLowerLinkedListInstanceCall(call)) return v;
+    // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> instance methods and
+    // Array<T>.AsSpan()/AsReadOnlySpan() construction.
+    if (auto* v = tryLowerArraySpanCall(call)) return v;
     // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
@@ -8665,6 +8668,516 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         phi->addIncoming(builder_.getFalse(), condBB);
         return phi;
     }
+    return nullptr;
+}
+
+
+// §4.15 (#549): lower Array<T>.AsSpan()/AsReadOnlySpan() constructor overloads
+// and ArraySpan<T>/ReadOnlyArraySpan<T> instance method calls.
+//
+// LLVM representation: { ptr source, i32 start, i32 length }
+//   source — the underlying bz_array_t* pointer (borrowed; never freed by the span)
+//   start  — the offset into the array (first element of the view)
+//   length — the number of elements in the view
+//
+// The span is a by-value record (no heap allocation).  Disposing the span does
+// NOT free the source array.  Per §4.15: "The `Source` field carries a borrow
+// of the array; per the borrow-bearing-record rule, the span's lifetime is
+// bounded by the source's lifetime."
+//
+// Overloads:
+//   AsSpan()                  → ArraySpan<T>(arr, 0, arr.Count)
+//   AsSpan(start)             → ArraySpan<T>(arr, start, arr.Count - start)
+//   AsSpan(start, length)     → ArraySpan<T>(arr, start, length)
+//   AsReadOnlySpan()          → ReadOnlyArraySpan<T>(arr, 0, arr.Count)
+//   … (same pattern for AsReadOnlySpan overloads)
+//
+// Instance methods implemented here:
+//   Length        → load field 2 (i32), sext to i32 (already i32)
+//   IsEmpty       → Length == 0
+//   Slice(s,l)    → build new span(Source, Start+s, l)
+//   AsReadOnly()  → build ReadOnlyArraySpan with same (Source, Start, Length)
+//   IndexOf(v)    → linear scan from Start to Start+Length; return first match
+//   Contains(v)   → IndexOf(v) >= 0
+//   Fill(v)       → write v into every slot (ArraySpan only)
+//   CopyFrom(src) → copy src slots into this span's slots (ArraySpan only)
+//   CopyTo(dst)   → copy this span's slots into dst (both span types)
+//   Reverse()     → reverse elements in place (ArraySpan only)
+//   SequenceEqual → compare pairwise
+//
+// Deferred (not implemented in this slice; guarded by a clean diagnostic):
+//   <none – all declared members are implemented or emit a clear error>
+//
+// The span indexer get (`span[i]`) and set (`span[i] := v`) are handled in
+// lowerCollectionIndexerGet / lowerCollectionIndexerSet in LlvmBackend_Assign.cpp.
+// The for-in loop (`for var x in span`) is handled in LlvmBackend_Stmts.cpp.
+llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const auto& m = ma->member;
+
+    auto* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+        recvTy->declaration)
+        return nullptr;
+    if (!recvTy->astNode || !recvTy->astNode->name ||
+        recvTy->astNode->name->parts.empty())
+        return nullptr;
+    std::string_view rcn = recvTy->astNode->name->parts[0];
+
+    // Helper: get the element size for a span over Array<T>.
+    // Uses recvTy->genericArgs[0] (the element type T of the span).
+    auto spanElemSize = [&]() -> int64_t {
+        if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return 8;
+        return collectionElemSize(recvTy);
+    };
+    auto spanElemTy = [&]() -> llvm::Type* {
+        if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return i32();
+        llvm::Type* t = lowerTypeRef(recvTy->genericArgs[0]);
+        return t ? t : i32();
+    };
+
+    // -----------------------------------------------------------------------
+    // Array<T>.AsSpan() / AsReadOnlySpan() — construct a span from an array.
+    // -----------------------------------------------------------------------
+    if (rcn == "Array" && (m == "AsSpan" || m == "AsReadOnlySpan")) {
+        // The span element type and size are those of the array (genericArgs[0]).
+        llvm::Value* arr = lowerExpr(*ma->target);
+        if (!arr) return nullptr;
+        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+        llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "arr.count");
+        llvm::Value* count = builder_.CreateTrunc(count64, i32(), "arr.count32");
+        // No-arg form: full array [0, Count)
+        if (call.args.empty()) {
+            return buildArraySpan(arr, builder_.getInt32(0), count);
+        }
+        // (start) form: [start, Count)
+        if (call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* start = lowerExpr(*call.args[0].value);
+            if (!start) return nullptr;
+            if (!start->getType()->isIntegerTy(32))
+                start = builder_.CreateTrunc(start, i32());
+            // bounds check: start must be in [0, Count]
+            llvm::Value* startNeg = builder_.CreateICmpSLT(
+                start, builder_.getInt32(0), "span.stneg");
+            llvm::Value* startOOB = builder_.CreateICmpSGT(
+                start, count, "span.stoob");
+            emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
+                           "IndexOutOfRangeException");
+            llvm::Value* len = builder_.CreateSub(count, start, "span.len");
+            return buildArraySpan(arr, start, len);
+        }
+        // (start, length) form — also handles Range<int> (deferred; treat as 2-arg)
+        if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            llvm::Value* start = lowerExpr(*call.args[0].value);
+            llvm::Value* len   = lowerExpr(*call.args[1].value);
+            if (!start || !len) return nullptr;
+            if (!start->getType()->isIntegerTy(32))
+                start = builder_.CreateTrunc(start, i32());
+            if (!len->getType()->isIntegerTy(32))
+                len = builder_.CreateTrunc(len, i32());
+            // bounds check: start ∈ [0, Count], len ∈ [0, Count-start]
+            llvm::Value* startNeg = builder_.CreateICmpSLT(
+                start, builder_.getInt32(0));
+            llvm::Value* startOOB = builder_.CreateICmpSGT(start, count);
+            emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
+                           "IndexOutOfRangeException");
+            llvm::Value* avail = builder_.CreateSub(count, start);
+            llvm::Value* lenNeg  = builder_.CreateICmpSLT(
+                len, builder_.getInt32(0));
+            llvm::Value* lenOOB  = builder_.CreateICmpSGT(len, avail);
+            emitGuardThrow(builder_.CreateOr(lenNeg, lenOOB),
+                           "IndexOutOfRangeException");
+            return buildArraySpan(arr, start, len);
+        }
+        return nullptr;
+    }
+
+    // -----------------------------------------------------------------------
+    // ArraySpan<T> / ReadOnlyArraySpan<T> instance method calls.
+    // -----------------------------------------------------------------------
+    if (rcn != "ArraySpan" && rcn != "ReadOnlyArraySpan") return nullptr;
+    bool isWritable = (rcn == "ArraySpan");
+
+    llvm::Value* spanVal = lowerExpr(*ma->target);
+    if (!spanVal) return nullptr;
+
+    // Spill the span value to an alloca once so repeated GEPs are stable.
+    auto* spanSt = arraySpanStructType();
+    auto* spanSlot = entryAlloca(spanSt);
+    builder_.CreateStore(spanVal, spanSlot);
+    auto loadSource = [&]() {
+        return builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 0), "sp.src");
+    };
+    auto loadStart = [&]() {
+        return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 1), "sp.st");
+    };
+    auto loadLen = [&]() {
+        return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, spanSlot, 2), "sp.len");
+    };
+
+    // -- Length / IsEmpty -------------------------------------------------------
+    if (m == "Length" && call.args.empty()) {
+        return loadLen();  // i32
+    }
+    if (m == "IsEmpty" && call.args.empty()) {
+        return builder_.CreateICmpEQ(loadLen(), builder_.getInt32(0), "sp.empty");
+    }
+
+    // -- Slice(start: int, length: int) ----------------------------------------
+    if (m == "Slice" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        llvm::Value* start = lowerExpr(*call.args[0].value);
+        llvm::Value* slen2 = lowerExpr(*call.args[1].value);
+        if (!start || !slen2) return nullptr;
+        if (!start->getType()->isIntegerTy(32))
+            start = builder_.CreateTrunc(start, i32());
+        if (!slen2->getType()->isIntegerTy(32))
+            slen2 = builder_.CreateTrunc(slen2, i32());
+        // bounds check against this span's length
+        llvm::Value* startNeg = builder_.CreateICmpSLT(start, builder_.getInt32(0));
+        llvm::Value* startOOB = builder_.CreateICmpSGT(start, slen);
+        emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
+                       "IndexOutOfRangeException");
+        llvm::Value* avail = builder_.CreateSub(slen, start);
+        llvm::Value* slen2Neg = builder_.CreateICmpSLT(slen2, builder_.getInt32(0));
+        llvm::Value* slen2OOB = builder_.CreateICmpSGT(slen2, avail);
+        emitGuardThrow(builder_.CreateOr(slen2Neg, slen2OOB),
+                       "IndexOutOfRangeException");
+        llvm::Value* newStart = builder_.CreateAdd(base, start, "sl.newst");
+        return buildArraySpan(src, newStart, slen2);
+    }
+
+    // -- AsReadOnly(): ArraySpan<T> → ReadOnlyArraySpan<T> -------------------
+    if (m == "AsReadOnly" && isWritable && call.args.empty()) {
+        // Same bit pattern; the type distinction is static only (§4.15).
+        return spanVal;  // struct value is identical for both span types
+    }
+
+    // -- IndexOf(value: T) → int -----------------------------------------------
+    if (m == "IndexOf" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        // idx32 = 0; loop while idx32 < slen
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "iof.c", currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iof.b", currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "iof.f", currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "iof.n", currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "iof.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "iof.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()), "iof.ai");
+        llvm::Value* ep = builder_.CreateCall(ptrAtFn,
+            {src, absIdx, builder_.getInt64(esz)}, "iof.ep");
+        llvm::Value* el = builder_.CreateLoad(ety, ep, "iof.el");
+        llvm::Value* eq = emitRemoveElementEquality(el, v,
+            recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0],
+            collectionElemIsClass(recvTy, 0));
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, foundBB, nextBB);
+        builder_.SetInsertPoint(nextBB);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(foundBB);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i32(), 2, "iof.r");
+        phi->addIncoming(idx32, foundBB);  // found: return current local index
+        phi->addIncoming(builder_.getInt32(-1), condBB);  // not found: -1
+        return phi;
+    }
+
+    // -- Contains(value: T) → bool ---------------------------------------------
+    if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
+        // Reuse IndexOf: Contains = IndexOf >= 0
+        // Build a synthetic IndexOf call result by inlining the same logic.
+        // (Sharing code with the IndexOf path above would require factoring; for
+        // clarity we simply check IndexOf's result here via an inline call.)
+        // Re-enter tryLowerArraySpanCall with a temporary CallExpr? — too complex.
+        // Instead, just inline: emit IndexOf and compare.
+        // (This means two code-size copies, but both are inlined; acceptable.)
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "cnt.c", currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "cnt.b", currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "cnt.f", currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "cnt.n", currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "cnt.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "cnt.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* ep = builder_.CreateCall(ptrAtFn,
+            {src, absIdx, builder_.getInt64(esz)});
+        llvm::Value* el = builder_.CreateLoad(ety, ep);
+        llvm::Value* eq = emitRemoveElementEquality(el, v,
+            recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0],
+            collectionElemIsClass(recvTy, 0));
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, foundBB, nextBB);
+        builder_.SetInsertPoint(nextBB);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(foundBB);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "cnt.r");
+        phi->addIncoming(builder_.getTrue(),  foundBB);
+        phi->addIncoming(builder_.getFalse(), condBB);
+        return phi;
+    }
+
+    // -- Fill(value: T) — ArraySpan<T> only ------------------------------------
+    if (m == "Fill" && isWritable &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* v = lowerExpr(*call.args[0].value);
+        if (!v) return nullptr;
+        int64_t esz = spanElemSize();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "fill.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "fill.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "fill.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "fill.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* ep = builder_.CreateCall(ptrAtFn,
+            {src, absIdx, builder_.getInt64(esz)});
+        builder_.CreateStore(v, ep);  // opaque ptr; store writes ety bytes
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // -- CopyTo(destination: ArraySpan<T>) — both span types ------------------
+    // -- CopyFrom(source: ReadOnlyArraySpan<T>) — ArraySpan<T> only ----------
+    if ((m == "CopyTo" || (m == "CopyFrom" && isWritable)) &&
+        call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* otherVal = lowerExpr(*call.args[0].value);
+        if (!otherVal) return nullptr;
+        // Spill the other span to an alloca.
+        auto* otherSlot = entryAlloca(spanSt);
+        builder_.CreateStore(otherVal, otherSlot);
+        llvm::Value* dstSrc  = nullptr, *dstBase = nullptr, *dstLen = nullptr;
+        llvm::Value* srcSrc  = nullptr, *srcBase = nullptr, *srcLen = nullptr;
+        if (m == "CopyTo") {
+            // copy THIS → dst (other)
+            srcSrc  = loadSource(); srcBase = loadStart(); srcLen = loadLen();
+            dstSrc  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 0));
+            dstBase = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 1));
+            dstLen  = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 2));
+        } else {
+            // CopyFrom: copy other (src) → THIS (dst)
+            dstSrc  = loadSource(); dstBase = loadStart(); dstLen = loadLen();
+            srcSrc  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 0));
+            srcBase = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 1));
+            srcLen  = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, otherSlot, 2));
+        }
+        // lengths must match (§4.15 "lengths must match, else ArgumentException")
+        emitGuardThrow(builder_.CreateICmpNE(srcLen, dstLen),
+                       "ArgumentException");
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "cpy.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cpy.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "cpy.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "cpy.i");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, srcLen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* si = builder_.CreateAdd(
+            builder_.CreateSExt(srcBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* di = builder_.CreateAdd(
+            builder_.CreateSExt(dstBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* sp = builder_.CreateCall(ptrAtFn,
+            {srcSrc, si, builder_.getInt64(esz)});
+        llvm::Value* dp = builder_.CreateCall(ptrAtFn,
+            {dstSrc, di, builder_.getInt64(esz)});
+        llvm::Value* val = builder_.CreateLoad(ety, sp);
+        builder_.CreateStore(val, dp);  // opaque ptr
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // -- Reverse() — ArraySpan<T> only ----------------------------------------
+    if (m == "Reverse" && isWritable && call.args.empty()) {
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* src  = loadSource();
+        llvm::Value* base = loadStart();
+        llvm::Value* slen = loadLen();
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "sprev.c", currentFn_);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sprev.b", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "sprev.e", currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "rv.i");
+        llvm::Value* half  = builder_.CreateSDiv(slen, builder_.getInt32(2));
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, half), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* j = builder_.CreateSub(
+            builder_.CreateSub(slen, idx32), builder_.getInt32(1));
+        llvm::Value* ai = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* aj = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(j, i64()));
+        llvm::Value* pa = builder_.CreateCall(ptrAtFn,
+            {src, ai, builder_.getInt64(esz)});
+        llvm::Value* pb = builder_.CreateCall(ptrAtFn,
+            {src, aj, builder_.getInt64(esz)});
+        llvm::Value* ta = builder_.CreateLoad(ety, pa);
+        llvm::Value* tb = builder_.CreateLoad(ety, pb);
+        builder_.CreateStore(tb, pa);  // opaque ptrs
+        builder_.CreateStore(ta, pb);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        return llvm::ConstantInt::get(i32(), 0);  // unit
+    }
+
+    // -- SequenceEqual(other: ArraySpan<T> | ReadOnlyArraySpan<T>) → bool -----
+    if (m == "SequenceEqual" && call.args.size() == 1 && call.args[0].value) {
+        llvm::Value* otherVal = lowerExpr(*call.args[0].value);
+        if (!otherVal) return nullptr;
+        auto* otherSlot = entryAlloca(spanSt);
+        builder_.CreateStore(otherVal, otherSlot);
+        llvm::Value* aLen = loadLen();
+        llvm::Value* bLen = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, otherSlot, 2), "se.blen");
+        // Fast-path: different lengths → false.
+        auto* fastFalse = llvm::BasicBlock::Create(llvm_, "se.ff", currentFn_);
+        auto* loopEntry = llvm::BasicBlock::Create(llvm_, "se.le", currentFn_);
+        auto* condBB    = llvm::BasicBlock::Create(llvm_, "se.c",  currentFn_);
+        auto* bodyBB    = llvm::BasicBlock::Create(llvm_, "se.b",  currentFn_);
+        auto* neqBB     = llvm::BasicBlock::Create(llvm_, "se.ne", currentFn_);
+        auto* incBB     = llvm::BasicBlock::Create(llvm_, "se.i",  currentFn_);
+        auto* endBB     = llvm::BasicBlock::Create(llvm_, "se.e",  currentFn_);
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(aLen, bLen), fastFalse, loopEntry);
+        builder_.SetInsertPoint(fastFalse);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(loopEntry);
+        auto* idxSlot = entryAlloca(i32());
+        builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        // Compute src/start pointers here (in loopEntry) BEFORE the branch to
+        // condBB so that no instructions are inserted after a terminator.
+        int64_t esz = spanElemSize();
+        llvm::Type* ety = spanElemTy();
+        llvm::Value* aSrc  = loadSource();
+        llvm::Value* aBase = loadStart();
+        llvm::Value* bSrc  = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, otherSlot, 0));
+        llvm::Value* bBase = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, otherSlot, 1));
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot, "se.idx");
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx32, aLen), bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* ai = builder_.CreateAdd(
+            builder_.CreateSExt(aBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* bi = builder_.CreateAdd(
+            builder_.CreateSExt(bBase, i64()),
+            builder_.CreateSExt(idx32, i64()));
+        llvm::Value* ap = builder_.CreateCall(ptrAtFn,
+            {aSrc, ai, builder_.getInt64(esz)});
+        llvm::Value* bp = builder_.CreateCall(ptrAtFn,
+            {bSrc, bi, builder_.getInt64(esz)});
+        llvm::Value* aEl = builder_.CreateLoad(ety, ap);
+        llvm::Value* bEl = builder_.CreateLoad(ety, bp);
+        llvm::Value* eq = emitRemoveElementEquality(aEl, bEl,
+            recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0],
+            collectionElemIsClass(recvTy, 0));
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, incBB, neqBB);
+        builder_.SetInsertPoint(neqBB);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(incBB);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "se.r");
+        phi->addIncoming(builder_.getFalse(), fastFalse);
+        phi->addIncoming(builder_.getFalse(), neqBB);
+        phi->addIncoming(builder_.getTrue(),  condBB);
+        return phi;
+    }
+
     return nullptr;
 }
 

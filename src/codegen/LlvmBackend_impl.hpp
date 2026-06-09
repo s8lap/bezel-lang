@@ -674,6 +674,9 @@ private:
     // fix #499 / §9.8: Range<T> value struct { i64 start, i64 end, i64 step, i8 flags }.
     // flags bit 0 = IsEndInclusive (1 = inclusive `..`, 0 = half-open `..<`).
     llvm::StructType* rangeStructTy_ = nullptr;
+    // §4.15: ArraySpan<T>/ReadOnlyArraySpan<T> value struct { ptr source, i32 start, i32 length }.
+    // Both writable and read-only spans share the same LLVM layout (per §4.15).
+    llvm::StructType* arraySpanStructTy_ = nullptr;
     // #422 / §27.5 / §28.9: the closure-cell type { ptr fn, ptr env, i64 rc }.
     llvm::StructType* closureCellTy_ = nullptr;
     unsigned stringLiteralIdx_ = 0;
@@ -1006,6 +1009,63 @@ private:
                 {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_)},
                 "bz.range");
         return rangeStructTy_;
+    }
+
+    // §4.15: ArraySpan<T>/ReadOnlyArraySpan<T> value struct { ptr source, i32 start, i32 length }.
+    // The element type T determines only the element-access stride, not the struct layout.
+    llvm::StructType* arraySpanStructType() {
+        if (!arraySpanStructTy_)
+            arraySpanStructTy_ = llvm::StructType::create(
+                llvm_, {ptrTy(), i32(), i32()}, "bz.arrayspan");
+        return arraySpanStructTy_;
+    }
+
+    // §4.15: test whether a TypeRef is ArraySpan<T> or ReadOnlyArraySpan<T>.
+    static bool isArraySpanTypeName(const sema::TypeRef* rt) {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+            return false;
+        auto n = rt->astNode->name->parts[0];
+        return n == "ArraySpan" || n == "ReadOnlyArraySpan";
+    }
+
+    // §4.15: extract the `Source` array pointer (field 0) from a lowered span struct value.
+    llvm::Value* spanSource(llvm::Value* spanVal) {
+        auto* st = arraySpanStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(spanVal, slot);
+        llvm::Value* ptr = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(st, slot, 0));
+        return ptr;
+    }
+
+    // §4.15: extract the `Start` offset (field 1) from a lowered span struct value, as i32.
+    llvm::Value* spanStart(llvm::Value* spanVal) {
+        auto* st = arraySpanStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(spanVal, slot);
+        return builder_.CreateLoad(i32(), builder_.CreateStructGEP(st, slot, 1));
+    }
+
+    // §4.15: extract the `Length` field (field 2) from a lowered span struct value, as i32.
+    llvm::Value* spanLength(llvm::Value* spanVal) {
+        auto* st = arraySpanStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(spanVal, slot);
+        return builder_.CreateLoad(i32(), builder_.CreateStructGEP(st, slot, 2));
+    }
+
+    // §4.15: build an ArraySpan struct value { source, start, length }.
+    llvm::Value* buildArraySpan(llvm::Value* source, llvm::Value* start,
+                                llvm::Value* length) {
+        auto* st = arraySpanStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(llvm::ConstantAggregateZero::get(st), slot);
+        builder_.CreateStore(source, builder_.CreateStructGEP(st, slot, 0));
+        builder_.CreateStore(start,  builder_.CreateStructGEP(st, slot, 1));
+        builder_.CreateStore(length, builder_.CreateStructGEP(st, slot, 2));
+        return builder_.CreateLoad(st, slot, "span.val");
     }
 
     // fix #499 / §9.8: test whether a TypeRef is a Range type (set by sema
@@ -3974,6 +4034,12 @@ private:
     // (Add*/Remove*/Find/Count/First/Last/etc.) and LinkedListNode<T> property
     // accesses (.Value/.Next/.Previous) via the bz_llist_* runtime.
     llvm::Value* tryLowerLinkedListInstanceCall(const ast::CallExpr& call);
+
+    // §4.15 (#549): lower Array<T>.AsSpan()/AsReadOnlySpan() and
+    // ArraySpan<T>/ReadOnlyArraySpan<T> instance method calls
+    // (Length, IsEmpty, Slice, AsReadOnly, IndexOf, Contains, Fill,
+    //  CopyFrom, CopyTo, Reverse, SequenceEqual).
+    llvm::Value* tryLowerArraySpanCall(const ast::CallExpr& call);
 
     // stdlib §4.10 (#351): lower a dict-backed Set's set-algebra op
     // (UnionWith/ExceptWith/IsSubsetOf/IsSupersetOf) when `otherExpr` is a

@@ -1602,6 +1602,26 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> readonly property reads.
+    // Both types are value structs { ptr source, i32 start, i32 length }.
+    // Length extracts field 2; IsEmpty compares field 2 to 0.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target &&
+            (ma->member == "Length" || ma->member == "IsEmpty")) {
+            auto* tt = ctx_.exprType(*ma->target);
+            if (isArraySpanTypeName(tt)) {
+                llvm::Value* sv = lowerExpr(*ma->target);
+                if (!sv) return nullptr;
+                llvm::Value* slen = builder_.CreateExtractValue(
+                    sv, {2u}, "sp.len");
+                if (ma->member == "Length")
+                    return slen;
+                // IsEmpty: length == 0
+                return builder_.CreateICmpEQ(
+                    slen, builder_.getInt32(0), "sp.empty");
+            }
+        }
+    }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
     // StringBuilder.Length — sum of part lengths (total chars).
     // Dictionary<K,V>.Count — runtime bz_dict_count.

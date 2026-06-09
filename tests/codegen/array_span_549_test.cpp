@@ -1,0 +1,704 @@
+// Codegen + sema — #549: ArraySpan<T> / ReadOnlyArraySpan<T>
+//
+// These are borrow-bearing record types defined in stdlib §4.15.  Each view
+// borrows a contiguous range of an Array<T>; the span must NOT free the array.
+//
+// Spec reference: Bezel_Standard_Library_0_130.md §4.15.
+//
+// Tests (all named for §4.15):
+//   §4.15 AsSpan() (0-arg) → Length matches array.Count
+//   §4.15 AsSpan(start, length) → partial view
+//   §4.15 indexer read  span[i] → correct element
+//   §4.15 indexer write span[i] := v → element is updated in source array
+//   §4.15 IsEmpty  on empty vs non-empty span
+//   §4.15 Slice(start, length) → sub-span
+//   §4.15 AsReadOnly() → ReadOnlyArraySpan<T> with same length
+//   §4.15 AsReadOnlySpan() construction directly
+//   §4.15 IndexOf(v) on span
+//   §4.15 Contains(v) on span
+//   §4.15 Fill(v) overwrites every slot
+//   §4.15 CopyFrom(src) copies slot-by-slot
+//   §4.15 CopyTo(dst) copies slot-by-slot
+//   §4.15 Reverse() reverses in place (and in source array)
+//   §4.15 SequenceEqual (same / different span)
+//   §4.15 for-in iteration over span
+//   §4.15 ASan: span over a 'using var' array does NOT free array at span end
+//   §4.15 ReadOnly: indexer setter rejected at compile time
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <sys/wait.h>
+
+#include "codegen/LlvmBackend.hpp"
+#include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+#include "native_test_harness.hpp"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+
+using bezel::test::runJit;
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Run the JIT pipeline; return exit code, or -999 on compile / JIT failure.
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// True iff sema rejected `src` with at least one error diagnostic.
+bool rejectedAtCompile(const std::string& src) {
+    auto r = runJit(src);
+    return !r.ran && r.diagnostics.hasErrors();
+}
+
+// ---- ASan leg (pattern from array_reversed_sorted_472_test.cpp) --------------
+int lowerToObject(const std::string& source, const std::string& objPath) {
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(source, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return -1;
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    bezel::sema::checkDefiniteAssignment(*unit, ctx);
+    bezel::ownership::checkOwnership(*unit, ctx);
+    if (diags.hasErrors()) return -1;
+    llvm::LLVMContext llvmCtx;
+    auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+    if (!module) return -1;
+    std::string err;
+    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    return 0;
+}
+
+int runUnderAsan(const std::string& source, int expectedExitCode) {
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_549_" + std::to_string(counter++);
+    std::string objPath = (dir / (stem + ".o")).string();
+    std::string exe     = (dir / stem).string();
+    if (lowerToObject(source, objPath) != 0) return -1;
+    auto cleanup = [&] {
+        std::remove(objPath.c_str());
+        std::remove(exe.c_str());
+    };
+    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    std::string runCmd = "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe +
+                         " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    cleanup();
+    if (status == -1) return -1;
+    if (!WIFEXITED(status)) return 1;
+    int code = WEXITSTATUS(status);
+    if (code == 99) return 1;
+    return (code == expectedExitCode) ? 0 : 1;
+}
+
+// Assert: JIT-correct AND ASan-clean.  Skips ASan leg when toolchain absent.
+void expectValueAndAsanClean(const std::string& source, int expectedExitCode) {
+    BEZEL_EXPECT_EQ(run(source), expectedExitCode);
+    int a = runUnderAsan(source, expectedExitCode);
+    if (a == -1) return;
+    BEZEL_EXPECT_EQ(a, 0);
+}
+
+}  // namespace
+
+// ===========================================================================
+// §4.15 AsSpan() 0-arg: full array view — Length equals array Count.
+// ===========================================================================
+
+// §4.15: arr.AsSpan().Length == arr.Count (3-element array → Length=3).
+BEZEL_TEST(array_span_549, asspan_0arg_length_equals_count_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  return sp.Length; "  // 3
+        "end Main; end C;", 3);
+}
+
+// §4.15: AsSpan() on empty array → Length=0.
+BEZEL_TEST(array_span_549, asspan_0arg_empty_length_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  var sp := a.AsSpan(); "
+        "  return sp.Length; "  // 0
+        "end Main; end C;", 0);
+}
+
+// ===========================================================================
+// §4.15 AsSpan(start, length): partial view.
+// ===========================================================================
+
+// §4.15: AsSpan(1, 2) on [10,20,30,40] → Length=2.
+BEZEL_TEST(array_span_549, asspan_start_length_length_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "  var sp := a.AsSpan(1, 2); "
+        "  return sp.Length; "  // 2
+        "end Main; end C;", 2);
+}
+
+// §4.15: AsSpan(1) on [10,20,30] → Length=2 (from offset to end).
+BEZEL_TEST(array_span_549, asspan_start_only_length_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(1); "
+        "  return sp.Length; "  // 2
+        "end Main; end C;", 2);
+}
+
+// ===========================================================================
+// §4.15 Indexer read: span[i] returns correct element.
+// ===========================================================================
+
+// §4.15: span[0] on full-array span returns first element.
+// [10,20,30]; span[2]=30.
+BEZEL_TEST(array_span_549, indexer_read_full_span_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  return sp[2]; "  // 30
+        "end Main; end C;", 30);
+}
+
+// §4.15: span[i] on a partial span indexes into the correct source offset.
+// [10,20,30,40]; sp=AsSpan(1,2) covers [20,30]; sp[0]=20, sp[1]=30 → 20*7+30=170.
+BEZEL_TEST(array_span_549, indexer_read_partial_span_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "  var sp := a.AsSpan(1, 2); "
+        "  return sp[0] * 7 + sp[1]; "  // 20*7+30=170
+        "end Main; end C;", 170 % 256);
+}
+
+// ===========================================================================
+// §4.15 Indexer write: span[i] := v stores into source array.
+// ===========================================================================
+
+// §4.15: span[1] := 77 on full array → a.Get(1)=77.
+BEZEL_TEST(array_span_549, indexer_write_mutates_source_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  sp[1] := 77; "
+        "  return a.Get(1); "  // 77
+        "end Main; end C;", 77);
+}
+
+// §4.15: write through partial span at sp[0] updates source array at offset Start.
+// [10,20,30,40]; sp=AsSpan(1,2); sp[0]:=55 → a.Get(1)=55 → 55.
+BEZEL_TEST(array_span_549, indexer_write_partial_span_offset_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "  var sp := a.AsSpan(1, 2); "
+        "  sp[0] := 55; "
+        "  return a.Get(1); "  // 55
+        "end Main; end C;", 55);
+}
+
+// ===========================================================================
+// §4.15 IsEmpty property.
+// ===========================================================================
+
+// §4.15: IsEmpty is true on a zero-length span; false on a non-empty span.
+// Return 1 if empty, 0 otherwise (for empty span); and 0 if empty, 1 otherwise.
+// Encode: empty → return 1; non-empty → return 0.
+BEZEL_TEST(array_span_549, isempty_empty_span_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  var sp := a.AsSpan(); "
+        "  if sp.IsEmpty then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 1);
+}
+
+BEZEL_TEST(array_span_549, isempty_nonempty_span_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(7); "
+        "  var sp := a.AsSpan(); "
+        "  if sp.IsEmpty then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 0);
+}
+
+// ===========================================================================
+// §4.15 Slice(start, length): sub-span construction.
+// ===========================================================================
+
+// §4.15: Slice(1,2) on a full span [10,20,30,40] → view [20,30]; Length=2.
+BEZEL_TEST(array_span_549, slice_length_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "  var sp := a.AsSpan(); "
+        "  var sl := sp.Slice(1, 2); "
+        "  return sl.Length; "  // 2
+        "end Main; end C;", 2);
+}
+
+// §4.15: Slice(1,2)[0] should return element at original index 1.
+// [10,20,30,40].AsSpan().Slice(1,2)[0]=20; Slice(1,2)[1]=30 → 20*7+30=170.
+BEZEL_TEST(array_span_549, slice_indexer_read_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "  var sp := a.AsSpan(); "
+        "  var sl := sp.Slice(1, 2); "
+        "  return sl[0] * 7 + sl[1]; "  // 20*7+30=170
+        "end Main; end C;", 170 % 256);
+}
+
+// ===========================================================================
+// §4.15 AsReadOnly(): converts ArraySpan<T> → ReadOnlyArraySpan<T>.
+// ===========================================================================
+
+// §4.15: AsReadOnly() on a 3-element span → ReadOnlyArraySpan<T> with Length=3.
+BEZEL_TEST(array_span_549, as_readonly_length_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var sp := a.AsSpan(); "
+        "  var ro := sp.AsReadOnly(); "
+        "  return ro.Length; "  // 3
+        "end Main; end C;", 3);
+}
+
+// §4.15: AsReadOnly()[i] reads correctly.
+// [10,20,30].AsSpan().AsReadOnly()[2]=30.
+BEZEL_TEST(array_span_549, as_readonly_indexer_read_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  var ro := sp.AsReadOnly(); "
+        "  return ro[2]; "  // 30
+        "end Main; end C;", 30);
+}
+
+// ===========================================================================
+// §4.15 AsReadOnlySpan() direct construction from Array<T>.
+// ===========================================================================
+
+// §4.15: a.AsReadOnlySpan() → ReadOnlyArraySpan<T> with Length=a.Count.
+BEZEL_TEST(array_span_549, as_readonly_span_direct_length_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(5); a.Add(6); "
+        "  var ro := a.AsReadOnlySpan(); "
+        "  return ro.Length; "  // 2
+        "end Main; end C;", 2);
+}
+
+// §4.15: a.AsReadOnlySpan()[i] reads element correctly.
+// [5,6]; ro[0]=5, ro[1]=6 → 5*10+6=56.
+BEZEL_TEST(array_span_549, as_readonly_span_direct_indexer_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(5); a.Add(6); "
+        "  var ro := a.AsReadOnlySpan(); "
+        "  return ro[0] * 10 + ro[1]; "  // 56
+        "end Main; end C;", 56);
+}
+
+// ===========================================================================
+// §4.15 IndexOf(value): linear scan in span range.
+// ===========================================================================
+
+// §4.15: IndexOf finds value at correct span-local index.
+// [10,20,30,20]; sp=AsSpan(); IndexOf(20)=1.
+BEZEL_TEST(array_span_549, indexof_found_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(20); "
+        "  var sp := a.AsSpan(); "
+        "  return sp.IndexOf(20); "  // 1
+        "end Main; end C;", 1);
+}
+
+// §4.15: IndexOf returns -1 when value not present.
+// [10,20,30]; IndexOf(99)=-1 → encode as exit code by returning 0 when ==-1.
+BEZEL_TEST(array_span_549, indexof_not_found_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  if sp.IndexOf(99) = -1 then return 7; end; "
+        "  return 0; "
+        "end Main; end C;", 7);
+}
+
+// §4.15: IndexOf on partial span uses span-local indexing (not array indexing).
+// [10,20,30,20]; sp=AsSpan(2,2) covers [30,20]; IndexOf(20)=1.
+BEZEL_TEST(array_span_549, indexof_partial_span_local_index_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(20); "
+        "  var sp := a.AsSpan(2, 2); "
+        "  return sp.IndexOf(20); "  // 1 (local index within [30,20])
+        "end Main; end C;", 1);
+}
+
+// ===========================================================================
+// §4.15 Contains(value).
+// ===========================================================================
+
+// §4.15: Contains returns true when value is present.
+BEZEL_TEST(array_span_549, contains_true_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  if sp.Contains(20) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 1);
+}
+
+// §4.15: Contains returns false when value is absent.
+BEZEL_TEST(array_span_549, contains_false_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  if sp.Contains(99) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 0);
+}
+
+// ===========================================================================
+// §4.15 Fill(value): overwrites every slot in the span's range.
+// ===========================================================================
+
+// §4.15: Fill(5) on a 3-element span writes 5 to all slots.
+// After Fill, a[0]=a[1]=a[2]=5.
+BEZEL_TEST(array_span_549, fill_overwrites_all_slots_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  sp.Fill(5); "
+        // Verify all three slots got 5: a[0]+a[1]+a[2] = 5+5+5 = 15
+        "  return a.Get(0) + a.Get(1) + a.Get(2); "  // 5+5+5=15
+        "end Main; end C;", 15);
+}
+
+// §4.15: Fill on partial span only mutates the span's range; elements outside remain.
+// [10,20,30,40]; sp=AsSpan(1,2); Fill(0) → a=[10,0,0,40].
+// Return a.Get(0)*1000 + a.Get(1)*100 + a.Get(2)*10 + a.Get(3) = 10040 % 256 = 56.
+BEZEL_TEST(array_span_549, fill_partial_span_range_only_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "  var sp := a.AsSpan(1, 2); "
+        "  sp.Fill(0); "
+        // a[0]=10, a[1]=0, a[2]=0, a[3]=40
+        // Use a small encoding: a[0]*3 + a[1]*2 + a[2]*1 + a[3]*1 = 30+0+0+40=70
+        "  return a.Get(0) * 3 + a.Get(1) * 2 + a.Get(2) + a.Get(3); "
+        "end Main; end C;", 70);
+}
+
+// ===========================================================================
+// §4.15 Reverse(): reverses slot ordering in place.
+// ===========================================================================
+
+// §4.15: Reverse() on a 3-element full span: [10,20,30] → [30,20,10].
+// After Reverse, a[0]=30.
+BEZEL_TEST(array_span_549, reverse_inplace_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); "
+        "  var sp := a.AsSpan(); "
+        "  sp.Reverse(); "
+        "  return a.Get(0); "  // 30
+        "end Main; end C;", 30);
+}
+
+// §4.15: Reverse() on a 4-element span: [10,20,30,40] → [40,30,20,10].
+// Return a.Get(0)=40.
+BEZEL_TEST(array_span_549, reverse_four_elements_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "  var sp := a.AsSpan(); "
+        "  sp.Reverse(); "
+        "  return a.Get(0); "  // 40
+        "end Main; end C;", 40);
+}
+
+// §4.15: Reverse() on a single-element span is a no-op.
+BEZEL_TEST(array_span_549, reverse_single_element_noop_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(42); "
+        "  var sp := a.AsSpan(); "
+        "  sp.Reverse(); "
+        "  return a.Get(0); "  // 42
+        "end Main; end C;", 42);
+}
+
+// ===========================================================================
+// §4.15 CopyFrom(source): copies slot-by-slot from ReadOnlyArraySpan<T>.
+// ===========================================================================
+
+// §4.15: CopyFrom copies all elements from source to destination span.
+// src=[1,2,3], dst=[0,0,0]; dst.CopyFrom(src) → dst now reads [1,2,3].
+// After copy, a=[1,2,3] → 1*49+2*7+3=66.
+BEZEL_TEST(array_span_549, copyfrom_copies_elements_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var src := new Array<int>(); "
+        "  src.Add(1); src.Add(2); src.Add(3); "
+        "  using var dst := new Array<int>(); "
+        "  dst.Add(0); dst.Add(0); dst.Add(0); "
+        "  var dstSp := dst.AsSpan(); "
+        "  var srcRo := src.AsReadOnlySpan(); "
+        "  dstSp.CopyFrom(srcRo); "
+        "  return dst.Get(0) * 49 + dst.Get(1) * 7 + dst.Get(2); "  // 1*49+2*7+3=66
+        "end Main; end C;", 66);
+}
+
+// ===========================================================================
+// §4.15 CopyTo(destination): copies slot-by-slot to destination ArraySpan<T>.
+// ===========================================================================
+
+// §4.15: CopyTo copies all elements into the destination span.
+// src=[1,2,3]; dstSp:=dst.AsSpan(); srcRo.CopyTo(dstSp) → dst=[1,2,3].
+// After copy, dst=[1,2,3] → 1*49+2*7+3=66.
+BEZEL_TEST(array_span_549, copyto_copies_elements_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var src := new Array<int>(); "
+        "  src.Add(1); src.Add(2); src.Add(3); "
+        "  using var dst := new Array<int>(); "
+        "  dst.Add(0); dst.Add(0); dst.Add(0); "
+        "  var srcRo := src.AsReadOnlySpan(); "
+        "  var dstSp := dst.AsSpan(); "
+        "  srcRo.CopyTo(dstSp); "
+        "  return dst.Get(0) * 49 + dst.Get(1) * 7 + dst.Get(2); "  // 1*49+2*7+3=66
+        "end Main; end C;", 66);
+}
+
+// ===========================================================================
+// §4.15 SequenceEqual: pairwise comparison.
+// ===========================================================================
+
+// §4.15: SequenceEqual returns true for two spans of identical elements.
+BEZEL_TEST(array_span_549, sequence_equal_equal_spans_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(1); b.Add(2); b.Add(3); "
+        "  var sa := a.AsSpan(); "
+        "  var sb := b.AsSpan(); "
+        "  if sa.SequenceEqual(sb) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 1);
+}
+
+// §4.15: SequenceEqual returns false for spans with different elements.
+BEZEL_TEST(array_span_549, sequence_equal_different_spans_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(1); b.Add(2); b.Add(9); "
+        "  var sa := a.AsSpan(); "
+        "  var sb := b.AsSpan(); "
+        "  if sa.SequenceEqual(sb) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 0);
+}
+
+// §4.15: SequenceEqual returns false when lengths differ.
+BEZEL_TEST(array_span_549, sequence_equal_length_mismatch_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(1); b.Add(2); b.Add(3); "
+        "  var sa := a.AsSpan(); "
+        "  var sb := b.AsSpan(); "
+        "  if sa.SequenceEqual(sb) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 0);
+}
+
+// §4.15: SequenceEqual with ReadOnlyArraySpan<T> overload.
+BEZEL_TEST(array_span_549, sequence_equal_with_readonly_span_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(5); a.Add(6); a.Add(7); "
+        "  using var b := new Array<int>(); "
+        "  b.Add(5); b.Add(6); b.Add(7); "
+        "  var sa := a.AsSpan(); "
+        "  var rob := b.AsReadOnlySpan(); "
+        "  if sa.SequenceEqual(rob) then return 1; end; "
+        "  return 0; "
+        "end Main; end C;", 1);
+}
+
+// ===========================================================================
+// §4.15 for-in loop over a span.
+// ===========================================================================
+
+// §4.15: for-in loop over span sums all elements.
+// [1,2,3,4]; sum=10.
+BEZEL_TEST(array_span_549, for_in_sum_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var sp := a.AsSpan(); "
+        "  var sum := 0; "
+        "  for var x in sp do "
+        "    sum := sum + x; "
+        "  end; "
+        "  return sum; "  // 10
+        "end Main; end C;", 10);
+}
+
+// §4.15: for-in over partial span iterates only span range.
+// [10,20,30,40]; sp=AsSpan(1,2) covers [20,30]; sum=50.
+BEZEL_TEST(array_span_549, for_in_partial_span_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); "
+        "  var sp := a.AsSpan(1, 2); "
+        "  var sum := 0; "
+        "  for var x in sp do "
+        "    sum := sum + x; "
+        "  end; "
+        "  return sum; "  // 20+30=50
+        "end Main; end C;", 50);
+}
+
+// §4.15: for-in over ReadOnlyArraySpan<T> (via AsReadOnlySpan).
+// [1,2,3]; sum=6.
+BEZEL_TEST(array_span_549, for_in_readonly_span_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var ro := a.AsReadOnlySpan(); "
+        "  var sum := 0; "
+        "  for var x in ro do "
+        "    sum := sum + x; "
+        "  end; "
+        "  return sum; "  // 6
+        "end Main; end C;", 6);
+}
+
+// ===========================================================================
+// §4.15 ASan: span borrows array — span end does NOT free the array.
+// ===========================================================================
+
+// §4.15 borrow lifetime: the span is a value-type record; its disposal must NOT
+// free the source array.  The source array remains accessible after the span
+// goes out of scope. After the span is done, the array still holds [1,2,3].
+// ASan detects any use-after-free or double-free.
+BEZEL_TEST(array_span_549, asan_span_does_not_free_array_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  do "
+        "    var sp := a.AsSpan(); "
+        "    var x := sp[0]; "
+        "  end; "
+        // span 'sp' is gone now; array 'a' must still be alive
+        "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 1*49+2*7+3=66
+        "end Main; end C;", 66);
+}
+
+// §4.15 ASan: ReadOnlyArraySpan also does not free source array.
+BEZEL_TEST(array_span_549, asan_readonly_span_does_not_free_array_spec_4_15) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(4); a.Add(5); "
+        "  do "
+        "    var ro := a.AsReadOnlySpan(); "
+        "    var x := ro[0]; "
+        "  end; "
+        "  return a.Get(0) * 10 + a.Get(1); "  // 4*10+5=45
+        "end Main; end C;", 45);
+}
+
+// ===========================================================================
+// §4.15 Diagnostic: ReadOnlyArraySpan indexer setter rejected at compile time.
+// ===========================================================================
+
+// §4.15: writing through ReadOnlyArraySpan[i] must be a compile-time error.
+BEZEL_TEST(array_span_549, readonly_span_setter_rejected_spec_4_15) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); "
+        "  var ro := a.AsReadOnlySpan(); "
+        "  ro[0] := 99; "  // must be rejected — read-only span has no setter
+        "  return 0; "
+        "end Main; end C;"));
+}

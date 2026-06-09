@@ -509,9 +509,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // indexer result type is the element T = genericArgs[0].
                         cn == "IReadOnlyList" || cn == "IList" ||
                         cn == "IOwnedList";
+                    // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> indexer
+                    // returns T = genericArgs[0].
+                    bool isSpan =
+                        cn == "ArraySpan" || cn == "ReadOnlyArraySpan";
                     bool isDict =
                         cn == "Dictionary" || cn == "OwnedDictionary";
-                    if (isArrLike && !tt->genericArgs.empty() &&
+                    if ((isArrLike || isSpan) && !tt->genericArgs.empty() &&
                         tt->genericArgs[0])
                         ctx_.setExprType(&e, tt->genericArgs[0]);
                     else if (isDict && tt->genericArgs.size() > 1 &&
