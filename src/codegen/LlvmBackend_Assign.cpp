@@ -19,6 +19,46 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
     auto* recvTy = ctx_.exprType(*ix.target);
+
+    // §4.15 (#549): ArraySpan<T>[i] / ReadOnlyArraySpan<T>[i]
+    // → Source[Start + i] with bounds-check against Length (not array Count).
+    if (isArraySpanTypeName(recvTy)) {
+        llvm::Value* spanVal = lowerExpr(*ix.target);
+        if (!spanVal) return nullptr;
+        llvm::Value* idx = lowerExpr(*ix.indices[0].value);
+        if (!idx) return nullptr;
+        // Unpack span fields.
+        auto* spanSt = arraySpanStructType();
+        auto* slot = entryAlloca(spanSt);
+        builder_.CreateStore(spanVal, slot);
+        llvm::Value* src  = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, slot, 0), "sp.src");
+        llvm::Value* base = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, slot, 1), "sp.st");
+        llvm::Value* slen = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, slot, 2), "sp.len");
+        // Bounds-check i against Length (§4.15: IndexOutOfRangeException).
+        if (!idx->getType()->isIntegerTy(32))
+            idx = builder_.CreateTrunc(idx, i32());
+        llvm::Value* idxNeg = builder_.CreateICmpSLT(idx, builder_.getInt32(0));
+        llvm::Value* idxOOB = builder_.CreateICmpSGE(idx, slen);
+        emitGuardThrow(builder_.CreateOr(idxNeg, idxOOB),
+                       "IndexOutOfRangeException");
+        // Absolute index = Start + i.
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx,  i64()), "sp.absi");
+        int64_t esz = collectionElemSize(recvTy);
+        llvm::Type* retTy = i32();
+        if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+            if (auto* et = lowerTypeRef(recvTy->genericArgs[0])) retTy = et;
+        llvm::AllocaInst* out = entryAlloca(retTy);
+        auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(getFn, {src, absIdx, out, builder_.getInt64(esz)});
+        return builder_.CreateLoad(retTy, out, "sp.elem");
+    }
+
     // issue #401 / §4.1-§4.3: a list-INTERFACE receiver (IReadOnlyList<T> /
     // IList<T> / IOwnedList<T>) is array-backed; its runtime pointer is the same
     // bz_array_t* as the concrete Array<T>/OwnedArray<T>, and its element type is
@@ -266,6 +306,47 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value || !val)
         return false;
     auto* recvTy = ctx_.exprType(*ix.target);
+
+    // §4.15 (#549): ArraySpan<T>[i] := value — borrowing-set; no disposal.
+    // ReadOnlyArraySpan<T> has no setter; codegen should never reach here for it,
+    // but guard defensively.
+    if (isArraySpanTypeName(recvTy)) {
+        std::string_view rcn = (recvTy->astNode && recvTy->astNode->name &&
+                                !recvTy->astNode->name->parts.empty())
+            ? std::string_view(recvTy->astNode->name->parts[0]) : "";
+        if (rcn == "ReadOnlyArraySpan") return false;  // read-only: no setter
+        llvm::Value* spanVal = lowerExpr(*ix.target);
+        if (!spanVal) return false;
+        llvm::Value* idx = lowerExpr(*ix.indices[0].value);
+        if (!idx) return false;
+        auto* spanSt = arraySpanStructType();
+        auto* slot = entryAlloca(spanSt);
+        builder_.CreateStore(spanVal, slot);
+        llvm::Value* src  = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(spanSt, slot, 0), "sp.src");
+        llvm::Value* base = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, slot, 1), "sp.st");
+        llvm::Value* slen = builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(spanSt, slot, 2), "sp.len");
+        if (!idx->getType()->isIntegerTy(32))
+            idx = builder_.CreateTrunc(idx, i32());
+        llvm::Value* idxNeg = builder_.CreateICmpSLT(idx, builder_.getInt32(0));
+        llvm::Value* idxOOB = builder_.CreateICmpSGE(idx, slen);
+        emitGuardThrow(builder_.CreateOr(idxNeg, idxOOB),
+                       "IndexOutOfRangeException");
+        llvm::Value* absIdx = builder_.CreateAdd(
+            builder_.CreateSExt(base, i64()),
+            builder_.CreateSExt(idx,  i64()), "sp.absi");
+        int64_t esz = collectionElemSize(recvTy);
+        // Borrowing set — no disposal of the displaced slot (§4.15 / §4.4).
+        llvm::AllocaInst* valSlot = entryAlloca(val->getType());
+        builder_.CreateStore(val, valSlot);
+        auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64(), ptrTy(), i64()});
+        builder_.CreateCall(setFn, {src, absIdx, valSlot, builder_.getInt64(esz)});
+        return true;
+    }
+
     // issue #401 / §4.1-§4.3: a list-INTERFACE receiver is array-backed (same
     // bz_array_t* as the concrete array), so it takes the `isArr` set path. The
     // OWNING interface IOwnedList<T> (§4.2) carries the disposing-setter

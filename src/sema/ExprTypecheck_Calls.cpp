@@ -1188,6 +1188,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Add/Push/Enqueue/Set/RemoveAt/Clear → unit (void)
                     }
+                    // §4.15 (#549): Array<T>.AsSpan() / AsSpan(start) /
+                    // AsSpan(start,length) / AsSpan(range) → ArraySpan<T>.
+                    // Array<T>.AsReadOnlySpan() and overloads → ReadOnlyArraySpan<T>.
+                    // Only on Array<T> (the borrowing collection); OwnedArray<T>
+                    // does not expose AsSpan (its elements are owned — see §4.5).
+                    if (colName == "Array" && !recvTy->genericArgs.empty() &&
+                        recvTy->genericArgs[0] &&
+                        (m == "AsSpan" || m == "AsReadOnlySpan") &&
+                        (ce.args.size() <= 2)) {
+                        std::string_view spanName =
+                            (m == "AsSpan") ? "ArraySpan" : "ReadOnlyArraySpan";
+                        // Build a synthetic ArraySpan<T> / ReadOnlyArraySpan<T> TypeRef.
+                        // Re-use the static-astNode pattern used by makeConcreteCollectionResult.
+                        static const ast::Type* kArraySpanNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("ArraySpan");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        static const ast::Type* kROArraySpanNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("ReadOnlyArraySpan");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = (m == "AsSpan") ? kArraySpanNode : kROArraySpanNode;
+                        tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                        ctx_.setExprType(&ce, tr);
+                    }
                     // per §4.6/§4.7: LinkedList<T> / OwnedLinkedList<T> node-based API.
                     // AddFirst/AddLast/AddBefore/AddAfter return LinkedListNode<T>.
                     // Find returns LinkedListNode<T>? (nullable).
@@ -1581,6 +1617,49 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         tsTy->declaration = builtinClassSym("TimeSpan");
                         if (m == "Add" || m == "Subtract" || m == "Negate")
                             ctx_.setExprType(&ce, tsTy);
+                    }
+                    // §4.15 (#549): ArraySpan<T> / ReadOnlyArraySpan<T> instance
+                    // method return types.  The receiver carries an astNode-backed
+                    // TypeRef (no declaration) so rcn == "ArraySpan" etc.
+                    if (rcn == "ArraySpan" || rcn == "ReadOnlyArraySpan") {
+                        // Length / IsEmpty are readonly properties; for-call form:
+                        if (m == "Length")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        else if (m == "IsEmpty")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        else if (m == "IndexOf")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        else if (m == "Contains" || m == "SequenceEqual")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        else if ((m == "Slice") &&
+                                 !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                            // Slice returns same span type (writable → writable,
+                            // read-only → read-only) with same element type.
+                            auto* tr = ctx_.makeTypeRef();
+                            tr->kind = TypeRef::Kind::Named;
+                            tr->declaration = nullptr;
+                            tr->astNode = recvTy->astNode;  // same synthetic node
+                            tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                            ctx_.setExprType(&ce, tr);
+                        } else if (m == "AsReadOnly" && rcn == "ArraySpan" &&
+                                   !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                            // ArraySpan<T>.AsReadOnly() → ReadOnlyArraySpan<T>
+                            static const ast::Type* kRONode = []() -> ast::Type* {
+                                auto* qn = new ast::QualifiedName;
+                                qn->parts.push_back("ReadOnlyArraySpan");
+                                auto* t = new ast::Type;
+                                t->kind = ast::TypeKind::Named;
+                                t->name.reset(qn);
+                                return t;
+                            }();
+                            auto* tr = ctx_.makeTypeRef();
+                            tr->kind = TypeRef::Kind::Named;
+                            tr->declaration = nullptr;
+                            tr->astNode = kRONode;
+                            tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                            ctx_.setExprType(&ce, tr);
+                        }
+                        // Fill/CopyFrom/CopyTo/Reverse → unit (void); no type set.
                     }
                 }
             }
@@ -3117,6 +3196,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (ok) {
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+            }
+        }
+        // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> readonly properties.
+        // Neither type has a user TypeSymbol, so the ordinary member-lookup path
+        // never types these.  Handle Length and IsEmpty here.
+        if (ma.target &&
+            (ma.member == "Length" || ma.member == "IsEmpty")) {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isSpan = tt->kind == TypeRef::Kind::Named &&
+                    !tt->declaration && tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty() &&
+                    (tt->astNode->name->parts[0] == "ArraySpan" ||
+                     tt->astNode->name->parts[0] == "ReadOnlyArraySpan");
+                if (isSpan) {
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(
+                            ma.member == "IsEmpty" ? PrimitiveType::Bool
+                                                   : PrimitiveType::Int));
                     return;
                 }
             }

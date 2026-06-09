@@ -1295,6 +1295,65 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             return true;
         }
     }
+    // §4.15 (#549): for var x in span — direct indexed loop over ArraySpan<T>
+    // or ReadOnlyArraySpan<T> (per spec §29.2, desugared as indexed loop over
+    // span.Start .. span.Start+span.Length with bz_array_ptr_at on Source).
+    {
+        auto* iterTy = ctx_.exprType(*fs.iterable);
+        if (isArraySpanTypeName(iterTy)) {
+            llvm::Value* spanVal = lowerExpr(*fs.iterable);
+            if (!spanVal) return false;
+            auto* spanSt = arraySpanStructType();
+            auto* spanSlot = entryAlloca(spanSt);
+            builder_.CreateStore(spanVal, spanSlot);
+            llvm::Value* src  = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(spanSt, spanSlot, 0), "sp.src");
+            llvm::Value* base = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, spanSlot, 1), "sp.st");
+            llvm::Value* slen = builder_.CreateLoad(i32(),
+                builder_.CreateStructGEP(spanSt, spanSlot, 2), "sp.len");
+            llvm::Type* elemTy = i32();
+            int64_t esz = 8;
+            if (iterTy && !iterTy->genericArgs.empty() && iterTy->genericArgs[0]) {
+                if (auto* et = lowerTypeRef(iterTy->genericArgs[0])) elemTy = et;
+                esz = collectionElemSize(iterTy);
+            }
+            auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            auto* idxSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(0), idxSlot);
+            auto* varSlot = entryAlloca(elemTy);
+            locals_[&fs] = varSlot;
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "sp.cond", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sp.body", currentFn_);
+            auto* incBB  = llvm::BasicBlock::Create(llvm_, "sp.inc",  currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sp.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx32 = builder_.CreateLoad(i32(), idxSlot);
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(idx32, slen), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* idx32b = builder_.CreateLoad(i32(), idxSlot);
+            llvm::Value* absIdx = builder_.CreateAdd(
+                builder_.CreateSExt(base, i64()),
+                builder_.CreateSExt(idx32b, i64()), "sp.ai");
+            llvm::Value* ep = builder_.CreateCall(ptrAtFn,
+                {src, absIdx, builder_.getInt64(esz)});
+            llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
+            builder_.CreateStore(elem, varSlot);
+            loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+            bool termSp = lowerScopedBlock(fs.body);
+            loopStack_.pop_back();
+            if (!termSp) builder_.CreateBr(incBB);
+            builder_.SetInsertPoint(incBB);
+            llvm::Value* idx32c = builder_.CreateLoad(i32(), idxSlot);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx32c, builder_.getInt32(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return true;
+        }
+    }
     // §3: for var x in array (runtime Array<T> object).
     {
         auto* iterTy = ctx_.exprType(*fs.iterable);

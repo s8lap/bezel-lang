@@ -308,6 +308,14 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 rt->astNode->name->parts[0] == "Guid") {
                 return guidStructType();
             }
+            // §4.15 (#549): ArraySpan<T> and ReadOnlyArraySpan<T> are value
+            // structs { ptr source, i32 start, i32 length } — no heap pointer.
+            if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty() &&
+                (rt->astNode->name->parts[0] == "ArraySpan" ||
+                 rt->astNode->name->parts[0] == "ReadOnlyArraySpan")) {
+                return arraySpanStructType();
+            }
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty()) {
                 auto n = rt->astNode->name->parts[0];
@@ -380,6 +388,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 if (n == "DateTime" || n == "TimeSpan") return i64();
                 if (n == "Guid")  return guidStructType();
                 if (n == "Range") return rangeStructType();
+                // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> are value structs.
+                if (n == "ArraySpan" || n == "ReadOnlyArraySpan")
+                    return arraySpanStructType();
                 // Heap-pointer types — all stdlib collection/interface/task names.
                 if (n == "Array"       || n == "OwnedArray"     ||
                     n == "Dictionary"  || n == "OwnedDictionary" ||
