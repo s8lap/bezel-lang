@@ -2253,7 +2253,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // issue #539: nullable value types (int?, bool?, etc.) lower to a tagged
         // {i8,T} struct and are also heap-boxed via the same path — they are
         // rejected by ZExt/Trunc (illegal on struct operands).
+        // issue #544: #539 only handled the case where the argument ALREADY lowers
+        // as a struct (e.g. `var v: int? := 42; d.Set("x", v)` — v is emitted as
+        // {i8,i32}).  When the argument is a scalar literal (`d.Add("a", 42)`, or
+        // a null-pointer literal), lowerExpr emits i32/null-ptr, not the tagged
+        // struct, so the isStructTy() guard was false and the value fell through to
+        // ZExt/inttoptr.  Decode then does CreateLoad({i8,i32}, inttoptr'd-ptr) →
+        // SIGSEGV.  Fix: when valNullableVal is true but the value is not yet a
+        // struct, promote it to the {i8,T} tagged struct (wrapNullableValue for a
+        // non-null scalar, nullableValueNull for a null pointer) before boxing.
         auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
+            // issue #544: promote a bare scalar/null to the {i8,T} nullable struct
+            // before the struct-boxing branch below, so the box always holds the
+            // full tagged struct regardless of whether the arg was already typed
+            // as T? or arrived as a plain T scalar / null literal.
+            if (valNullableVal && !v->getType()->isStructTy()) {
+                if (v->getType()->isPointerTy() &&
+                    llvm::isa<llvm::ConstantPointerNull>(v)) {
+                    v = nullableValueNull(valTy);   // null literal → {i8=0, T=0}
+                } else if (!v->getType()->isPointerTy()) {
+                    v = wrapNullableValue(valTy, v); // scalar T → {i8=1, T=v}
+                }
+                // pointer (non-null class pointer stored as T?) falls through to
+                // the pointer case below — class/string pointers are not boxed.
+            }
             if ((valRec || valNullableVal) && v->getType()->isStructTy()) {
                 // Box the struct (record or nullable-value-type tagged struct)
                 // into a malloc'd region.  The tag byte for nullable types is

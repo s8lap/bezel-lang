@@ -380,7 +380,22 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // stored, decoded back by the indexer get (issue #393 / #539 / §4.8);
     // object/string pointers — stored directly; scalars — widened to i64 and
     // inttoptr'd.
+    // issue #544 (mirrors LlvmBackend_Calls.cpp encodeValue fix): when the
+    // value type is nullable (int?, enum?, nullable record) but the lowered
+    // value is NOT yet a struct (scalar literal `d["k"] := 7` lowers as i32;
+    // null literal lowers as a null pointer), promote it to the tagged
+    // {i8,T} struct BEFORE the struct-boxing branch below, so the box always
+    // holds the full tagged struct and the decode path (lowerCollectionIndexerGet
+    // / TryGetValue) can safely load {i8,T} from the box.
     auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
+        if (valNullableVal && !v->getType()->isStructTy()) {
+            if (v->getType()->isPointerTy() &&
+                llvm::isa<llvm::ConstantPointerNull>(v)) {
+                v = nullableValueNull(valTy);    // null literal → {i8=0, T=0}
+            } else if (!v->getType()->isPointerTy()) {
+                v = wrapNullableValue(valTy, v); // scalar T → {i8=1, T=v}
+            }
+        }
         if ((valRec || valNullableVal) && v->getType()->isStructTy()) {
             // Box the struct (record or nullable-value tagged struct).
             uint64_t vsz =
