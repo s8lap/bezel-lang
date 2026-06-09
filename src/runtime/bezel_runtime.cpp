@@ -720,6 +720,76 @@ int32_t bz_set_algebra_gen(void* selfp, void** keys, int64_t n, int32_t op) {
     return result;
 }
 
+// issue #429 / §28.9 / §4.10: release every live string element's +1.
+// A Set<string> stores each element as a bz_string* in the generic-key
+// table's key slot (key_size == sizeof(void*)). This function reads the
+// string pointer from each key's raw bytes and calls bz_string_release on
+// it BEFORE bz_dict_free frees the key copy. Call this immediately before
+// bz_dict_free(d, null) — after this call the RC accounting is discharged;
+// the subsequent bz_dict_free reclaims the key copies and the table itself.
+// null/empty-table safe; a no-op on a non-generic table.
+void bz_set_string_keys_release(void* dp) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    if (d->key_size != (int64_t)sizeof(void*)) return;  // not a pointer-key set
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            void* strPtr;
+            memcpy(&strPtr, e.key, sizeof(void*));
+            if (strPtr) bz_string_release(strPtr);
+        }
+    }
+}
+
+// issue #429 / §28.9 / §4.10: like bz_dict_clear(d, null) but also releases
+// each live element's string +1 before freeing the key copy. Used by
+// Set<string>.Clear() so that cleared string elements are reclaimed (else
+// they would leak). The table itself stays allocated and usable afterward,
+// as with bz_dict_clear.
+void bz_dict_clear_set_strings(void* dp) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    if (d->key_size != (int64_t)sizeof(void*)) return;
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            // Release the string element (+1 discharge) before freeing key copy.
+            void* strPtr;
+            memcpy(&strPtr, e.key, sizeof(void*));
+            if (strPtr) bz_string_release(strPtr);
+            free(e.key);
+            // value is a sentinel (1) — nothing to dispose
+        }
+    }
+    memset(d->buckets, 0, (size_t)d->capacity * sizeof(bz_entry_t));
+    d->count = 0;
+}
+
+// issue #429 / §28.9 / §4.10: like bz_dict_remove_gen but releases the
+// removed string element's +1 before freeing the key copy. Used by
+// Set<string>.Remove() so that the removed element is reclaimed (else it
+// would leak). Returns true iff the element was present and removed.
+bool bz_dict_remove_set_string(void* dp, const void* key) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    // Release the string element's +1 before freeing the key copy.
+    if (d->buckets[idx].key) {
+        void* strPtr;
+        memcpy(&strPtr, d->buckets[idx].key, sizeof(void*));
+        if (strPtr) bz_string_release(strPtr);
+    }
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // bz_llist_t — doubly-linked list (stdlib §4.6 / §4.7)
 // ---------------------------------------------------------------------------

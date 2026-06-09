@@ -671,10 +671,21 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // sentinel non-null value stored for present elements
                 llvm::Value* sentinel = builder_.CreateIntToPtr(
                     builder_.getInt64(1), ptrTy());
+                // #429 / §28.9 / §4.10: is this a Set<string>? If so, the set
+                // co-owns a +1 per string element (retained at Add, released at
+                // Remove/Clear/free). Mirror the Array<string> rule: a fresh +1
+                // producer is TRANSFERRED (no retain); anything else is RETAINED.
+                bool isStrSet = isStringElementSet(recvTy);
                 // .Add(item) — insert (idempotent by content; §4.10 dedup).
                 if (m == "Add" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
                     if (!item) return nullptr;
+                    // #429 / §28.9: retain the string element before inserting —
+                    // the set takes an INDEPENDENT +1. A +1 producer is transferred
+                    // (its single reference becomes the set's — no retain); a borrow
+                    // / literal / identifier is retained. retain is null/sentinel-safe.
+                    if (isStrSet && !isPlusOneStringProducer(call.args[0].value.get()))
+                        emitStringRetain(item);
                     auto* fn = declareC("bz_dict_set_gen",
                         llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
                     builder_.CreateCall(fn, {recv, elemPtr(item), sentinel});
@@ -700,6 +711,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Value* notPresent = builder_.CreateNot(already, "ta.new");
                     builder_.CreateCondBr(notPresent, insertBB, afterBB);
                     builder_.SetInsertPoint(insertBB);
+                    // #429 / §28.9: retain on insert (same rule as Add — the set
+                    // co-owns the +1 only if TryAdd actually inserts, so emit the
+                    // retain inside the insertBB arm). A +1 producer is transferred.
+                    if (isStrSet && !isPlusOneStringProducer(call.args[0].value.get()))
+                        emitStringRetain(item);
                     auto* setFn = declareC("bz_dict_set_gen",
                         llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
                     builder_.CreateCall(setFn, {recv, ep, sentinel});
@@ -717,9 +733,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.has");
                 }
                 // .Remove(item): bool
+                // #429 / §28.9 / §4.10: for a Set<string>, use the releasing
+                // variant (bz_dict_remove_set_string) which releases the string
+                // element's +1 before freeing its key copy — else the removed
+                // string leaks. The query `item` is a pure borrow; the release
+                // target is the KEY copy stored in the table, not the query itself.
                 if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
                     if (!item) return nullptr;
+                    if (isStrSet) {
+                        auto* fn = declareC("bz_dict_remove_set_string", i1(),
+                                            {ptrTy(), ptrTy()});
+                        return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.rm");
+                    }
                     auto* fn = declareC("bz_dict_remove_gen", i1(),
                                         {ptrTy(), ptrTy()});
                     return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.rm");
@@ -738,14 +764,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         builder_.getInt64(0), "set.empty");
                 }
                 // per §4.10 (#351): .Clear() empties the backing table. The
-                // table stays allocated for reuse; Count is 0 afterward. A
-                // dict-backed Set's value slots are non-owned sentinels, so no
-                // value disposal is needed (null dispose_val).
+                // table stays allocated for reuse; Count is 0 afterward.
+                // #429 / §28.9: for a Set<string>, use bz_dict_clear_set_strings
+                // which releases each string element's +1 before freeing its key
+                // copy — else the cleared elements would leak. For any other
+                // element type the value slots are sentinels: pass null disposer.
                 if (m == "Clear" && call.args.empty()) {
-                    auto* fn = declareC("bz_dict_clear",
-                        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                    builder_.CreateCall(fn,
-                        {recv, llvm::ConstantPointerNull::get(ptrTy())});
+                    if (isStrSet) {
+                        auto* fn = declareC("bz_dict_clear_set_strings",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {recv});
+                    } else {
+                        auto* fn = declareC("bz_dict_clear",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                        builder_.CreateCall(fn,
+                            {recv, llvm::ConstantPointerNull::get(ptrTy())});
+                    }
                     return llvm::ConstantInt::get(i32(), 0);  // unit result
                 }
                 // per §4.10 (#351/#389): set-algebra ops over a dict-backed Set.
@@ -2320,15 +2354,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         //   * borrowing Dictionary<K, record> → free each value's heap box
         //     (dictValueBoxFreer; the box is value-storage, nothing to dispose
         //     inside — §4.8 Dictionary borrows, it does not own values).
-        //   * everything else (scalar/string value, borrowing class value) → no
-        //     value disposal (a borrowing Dictionary owns nothing; §4.8). The
-        //     runtime always frees each key's byte copy regardless.
+        //   * #429 / §28.9: borrowing Dictionary<K, string> → release each
+        //     surviving string value's +1 (stringElementReleaseThunk). The dict
+        //     co-owns a +1 per stored value; Clear reclaims them all, exactly
+        //     mirroring the scope-end free. A value displaced earlier by the
+        //     indexer setter (#429 overwrite path) was already released there —
+        //     not in the table here, no double-release.
+        //   * everything else (scalar, borrowing class value) → no disposal.
         // bz_dict_clear handles BOTH the string-key and generic-key tables (it
         // frees e.key — a strndup'd copy in string mode, a malloc'd byte copy in
         // generic mode — for every live entry).
         if (m == "Clear" && call.args.empty()) {
             llvm::Function* disp = owningDictValueDisposer(recvTy);
             if (!disp) disp = dictValueBoxFreer(recvTy);
+            // #429 / §28.9: release string values at Clear, same as at free.
+            if (!disp && isStringValueDict(recvTy))
+                disp = stringElementReleaseThunk();
             llvm::Value* dispV = disp
                 ? llvm::cast<llvm::Value>(disp)
                 : llvm::ConstantPointerNull::get(ptrTy());
@@ -2351,11 +2392,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
         }
         // .Add(k, v) / .Set(k, v)
+        // #429 / §28.9: for a borrowing Dictionary<K, string> co-owns a +1 per
+        // stored value. Take an INDEPENDENT +1 at insert/overwrite by retaining
+        // the string value before storing it. Mirror the field-store rule: a
+        // fresh +1 producer is TRANSFERRED (its single reference becomes the
+        // dict's — no retain); anything else (borrow/literal/identifier) is
+        // RETAINED. retain is null-safe and a no-op on a sentinel/literal.
+        // NOTE: .Add and .Set on a BORROWING Dictionary do NOT release a prior
+        // value (they are documented to throw DuplicateKey on .Add; .Set simply
+        // overwrites without disposal — the indexer setter `d[k] := v` is the
+        // overwriting path and IS handled in lowerCollectionIndexerSet).
         if ((m == "Add" || m == "Set") && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             llvm::Value* v = lowerExpr(*call.args[1].value);
             if (!k || !v) return nullptr;
+            // #429: retain the string value BEFORE encoding (v is still the raw
+            // bz_string* at this point; encodeValue returns it as-is for pointers).
+            if (isStringValueDict(recvTy) &&
+                !isPlusOneStringProducer(call.args[1].value.get()))
+                emitStringRetain(v);
             llvm::Value* vPtr = encodeValue(v);
             if (keyTy) {
                 auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
@@ -2372,17 +2428,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // .Remove(k): bool — per §4.9: OwnedDictionary.Remove disposes the
         // removed value (exactly once) before unlinking; a non-owning
         // Dictionary.Remove unlinks without disposal (§4.8, borrows).
+        // #429 / §28.9: a borrowing Dictionary<K, string> co-owns a +1 per
+        // stored value — Remove must release the removed value's +1 (else it
+        // leaks). Use the disposing-remove variant with stringElementReleaseThunk
+        // as the value-disposer, exactly mirroring the OwnedDictionary path.
         if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
             // For an OwnedDictionary<K, class> get the value disposer thunk
             // (same helper Clear uses, so the dispose logic is exactly-once
-            // and consistent). For borrowing Dict or non-class values, disp
-            // is null and we fall back to the plain non-disposing remove.
+            // and consistent). For borrowing Dictionary<K, string>, get the
+            // string-release thunk. For borrowing Dict or non-class/non-string
+            // values, valDisp is null → fall through to plain non-disposing remove.
             llvm::Function* valDisp = owningDictValueDisposer(recvTy);
+            // #429: borrowing Dictionary<K, string> releases the removed value.
+            if (!valDisp && isStringValueDict(recvTy))
+                valDisp = stringElementReleaseThunk();
             if (keyTy) {
                 if (valDisp) {
-                    // OwnedDictionary with generic key: dispose then unlink.
+                    // OwnedDictionary (or Dict<K,string>) with generic key.
                     auto* fn = declareC("bz_dict_remove_gen_disposing", i1(),
                                         {ptrTy(), ptrTy(), ptrTy()});
                     return builder_.CreateCall(
@@ -2394,7 +2458,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             auto [kd, kl] = strDataLen(k);
             if (valDisp) {
-                // OwnedDictionary with string key: dispose then unlink.
+                // OwnedDictionary (or Dict<string,string>) with string key.
                 auto* fn = declareC("bz_dict_remove_str_disposing", i1(),
                                     {ptrTy(), ptrTy(), i64(), ptrTy()});
                 return builder_.CreateCall(

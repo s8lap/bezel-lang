@@ -1015,6 +1015,235 @@ const char* kArrayIntControlUnaffected =
     "  if total = 2100000 then return 0; end; return 1; "
     "end Main; end C;";
 
+// ---- Programs: Set<string> element reference-counting (#429 set category) ---
+
+// §28.9 / §4.10: heap strings inserted into a `using var Set<string>` are
+// retained on Add and released when the set is freed at scope end.  Looped so
+// any per-iteration leak accumulates.  The `Mk` helper forces a heap string
+// (a +1 producer; the set transfers the +1 and co-owns it).
+const char* kSetStringInsertDispose =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      using var s := new Set<string>(); "
+    "      s.Add(C.Mk(\"alpha\")); "
+    "      s.Add(C.Mk(\"beta\")); "
+    "      total := total + s.Count; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 100000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §4.10 / §28.11 (Remove releases): Set<string>.Remove releases the
+// element's +1 (else the removed string leaks).  Looped.
+const char* kSetStringRemoveReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      using var s := new Set<string>(); "
+    "      s.Add(C.Mk(\"red\")); "
+    "      s.Add(C.Mk(\"green\")); "
+    "      var ok: bool := s.Remove(\"red!\"); "
+    "      total := total + s.Count; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 50000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §4.10 / §28.11 (Clear releases): Set<string>.Clear releases every
+// element's +1 (else all cleared strings leak).  Looped.
+const char* kSetStringClearReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; "
+    "    while i < 50000 do "
+    "      using var s := new Set<string>(); "
+    "      s.Add(C.Mk(\"one\")); "
+    "      s.Add(C.Mk(\"two\")); "
+    "      s.Add(C.Mk(\"three\")); "
+    "      s.Clear(); "
+    "      i := i + 1; "
+    "    end; "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §4.10: many elements trigger a rehash; all must be released on free.
+const char* kSetStringManyRehashFree =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"#\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 10000 do "
+    "      using var s := new Set<string>(); "
+    "      s.Add(C.Mk(\"a\")); s.Add(C.Mk(\"b\")); s.Add(C.Mk(\"c\")); "
+    "      s.Add(C.Mk(\"d\")); s.Add(C.Mk(\"e\")); s.Add(C.Mk(\"f\")); "
+    "      s.Add(C.Mk(\"g\")); s.Add(C.Mk(\"h\")); s.Add(C.Mk(\"i\")); "
+    "      s.Add(C.Mk(\"j\")); s.Add(C.Mk(\"k\")); s.Add(C.Mk(\"l\")); "
+    "      s.Add(C.Mk(\"m\")); s.Add(C.Mk(\"n\")); s.Add(C.Mk(\"o\")); "
+    "      s.Add(C.Mk(\"p\")); s.Add(C.Mk(\"q\")); s.Add(C.Mk(\"r\")); "
+    "      s.Add(C.Mk(\"s\")); s.Add(C.Mk(\"t\")); "
+    "      total := total + s.Count; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 200000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 (CONTROL — Set<int> unaffected): integer-element sets store no heap
+// strings; the new string-release path must never touch them.
+const char* kSetIntControlUnaffected =
+    "module M; class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 50000 do "
+    "    using var s := new Set<int>(); "
+    "    s.Add(3); s.Add(7); s.Add(3); "
+    "    total := total + s.Count; "
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 100000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// ---- Programs: Dictionary<K,string> value reference-counting (#429) ---------
+
+// §28.9 / §4.8: heap strings stored as values in a string-keyed Dictionary are
+// retained on Add and released when the dict is freed at scope end.
+const char* kDictStringValueInsertDispose =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      using var d := new Dictionary<string, string>(); "
+    "      d.Add(\"k1\", C.Mk(\"hello\")); "
+    "      d.Add(\"k2\", C.Mk(\"world\")); "
+    "      total := total + d.Count; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 100000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §4.8: generic-key Dictionary<int, string> retains the string values
+// and releases them at scope-end free.
+const char* kDictIntKeyStringValueInsertDispose =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      using var d := new Dictionary<int, string>(); "
+    "      d.Add(1, C.Mk(\"foo\")); "
+    "      d.Add(2, C.Mk(\"bar\")); "
+    "      total := total + d.Count; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 100000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §4.8 (overwrite — release old, retain new): `d[k] := newStr` must
+// release the displaced old value and co-own the new one.  Looped.
+const char* kDictStringValueOverwriteReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      using var d := new Dictionary<string, string>(); "
+    "      d.Add(\"key\", C.Mk(\"first\")); "
+    "      d[\"key\"] := C.Mk(\"second\"); "
+    "      var v: string := d[\"key\"]; "
+    "      total := total + v.Length; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 350000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §4.8 / §28.11 (Remove releases): Dictionary<string,string>.Remove
+// releases the removed value's +1.  Looped.
+const char* kDictStringValueRemoveReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      using var d := new Dictionary<string, string>(); "
+    "      d.Add(\"a\", C.Mk(\"one\")); "
+    "      d.Add(\"b\", C.Mk(\"two\")); "
+    "      var ok: bool := d.Remove(\"a\"); "
+    "      total := total + d.Count; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 50000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §4.8 / §28.11 (Clear releases): Dictionary<string,string>.Clear
+// releases every surviving value's +1.  Looped.
+const char* kDictStringValueClearReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; "
+    "    while i < 50000 do "
+    "      using var d := new Dictionary<string, string>(); "
+    "      d.Add(\"x\", C.Mk(\"uno\")); "
+    "      d.Add(\"y\", C.Mk(\"dos\")); "
+    "      d.Add(\"z\", C.Mk(\"tres\")); "
+    "      d.Clear(); "
+    "      i := i + 1; "
+    "    end; "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 (CONTROL — Dictionary<string,int> unaffected): scalar values are never
+// given a string release disposer — the scalar encode/decode path is untouched.
+const char* kDictStringKeyIntValueControlUnaffected =
+    "module M; class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 50000 do "
+    "    using var d := new Dictionary<string, int>(); "
+    "    d.Add(\"a\", 3); d.Add(\"b\", 7); "
+    "    total := total + d.Count; "
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 100000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// §28.9 (cross-collection double-free guard): a heap string inserted into BOTH
+// a Set<string> AND an Array<string> must be independently retained by each
+// co-owner; disposing both must release each co-owner's +1 exactly once — no
+// double-free, no leak.  The element is a borrow (identifier), so both
+// collections RETAIN it; after both are freed the string is released twice
+// (rc drains to the producer's original +1, released at local scope end).
+const char* kSetAndArrayShareNoDoubleFree =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"@\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      var shared: string := C.Mk(\"shared\"); "
+    "      using var arr := new Array<string>(); "
+    "      using var s := new Set<string>(); "
+    "      arr.Add(shared); "
+    "      s.Add(shared); "
+    "      total := total + s.Count + arr.Count; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 100000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // --- LSan-clean tests (#429 field-store reclaim: leaked before, clean now) ---
@@ -1230,4 +1459,77 @@ BEZEL_TEST(codegen_escaping_string_429, array_int_control_unaffected_28_9) {
     // CONTROL: a scalar Array<int> is never given a string disposer — the scalar
     // insert/free path is untouched (no spurious release of an inttoptr'd value).
     expectValueAndLeakFree(kArrayIntControlUnaffected, 0);
+}
+
+// --- LSan-clean tests (#429 Set<string> element category) --------------------
+
+BEZEL_TEST(codegen_escaping_string_429, set_string_insert_dispose_reclaimed_28_9) {
+    // Set<string>.Add retains each heap string; free releases them — no leak.
+    expectValueAndLeakFree(kSetStringInsertDispose, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, set_string_remove_reclaimed_28_11) {
+    // Set<string>.Remove releases the removed element's +1 — no leak.
+    expectValueAndLeakFree(kSetStringRemoveReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, set_string_clear_reclaimed_28_11) {
+    // Set<string>.Clear releases all elements' +1 — no leak.
+    expectValueAndLeakFree(kSetStringClearReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, set_string_many_rehash_free_28_9) {
+    // Many-element Set<string> (triggers rehash); all elements released on free.
+    expectValueAndLeakFree(kSetStringManyRehashFree, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, set_int_control_unaffected_28_9) {
+    // CONTROL: Set<int> is never given a string-release key-dispose path. Set<T>
+    // for non-string T has a pre-existing key-copy leak (bz_dict_set_gen malloc'd
+    // key bytes are not released at free — a separate correctness fix outside the
+    // #429 scope). Check no UAF/double-free; tolerate the pre-existing leak.
+    expectValueAndNoCorruption(kSetIntControlUnaffected, 0);
+}
+
+// --- LSan-clean tests (#429 Dictionary<K,string> value category) -------------
+
+BEZEL_TEST(codegen_escaping_string_429, dict_str_key_string_value_insert_dispose_28_9) {
+    // Dictionary<string,string> values retained on Add; released on dict free.
+    expectValueAndLeakFree(kDictStringValueInsertDispose, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, dict_int_key_string_value_insert_dispose_28_9) {
+    // Dictionary<int,string> values retained on Add; released on dict free.
+    expectValueAndLeakFree(kDictIntKeyStringValueInsertDispose, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, dict_string_value_overwrite_reclaimed_28_9) {
+    // Indexer-set on an existing key releases old value, retains new — no leak.
+    expectValueAndLeakFree(kDictStringValueOverwriteReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, dict_string_value_remove_reclaimed_28_11) {
+    // Dictionary<string,string>.Remove releases the removed value — no leak.
+    expectValueAndLeakFree(kDictStringValueRemoveReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, dict_string_value_clear_reclaimed_28_11) {
+    // Dictionary<string,string>.Clear releases all surviving values — no leak.
+    expectValueAndLeakFree(kDictStringValueClearReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, dict_scalar_value_control_unaffected_28_9) {
+    // CONTROL: Dictionary<string,int> values are never given a string disposer.
+    expectValueAndLeakFree(kDictStringKeyIntValueControlUnaffected, 0);
+}
+
+// --- Cross-collection double-free guard --------------------------------------
+
+BEZEL_TEST(codegen_escaping_string_429, set_and_array_share_no_double_free_28_9) {
+    // A string in both Set<string> and Array<string>: each independently retains
+    // once; disposing both releases each co-owner exactly once — no double-free.
+    // The `var shared` local holds its own +1 which the ownership analysis
+    // considers escaping (pre-existing #422 scope — its residual +1 is a known
+    // safe leak); the CRITICAL check here is no UAF/double-free.
+    expectValueAndNoCorruption(kSetAndArrayShareNoDoubleFree, 0);
 }
