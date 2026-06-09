@@ -239,7 +239,18 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
     // into the operand; a bare re-raise `throw` (null operand, §31.2.4) carries
     // nothing to check. // per §31.1, §28.8, §17.12
     if (auto* te = dynamic_cast<const ast::ThrowExpr*>(&e)) {
-        if (te->operand) handleDischarge(*te->operand);
+        // §31.1 / #430: `throw new Wrap(ex)` in expression position (arm body
+        // expression form or `??` chain) must check the same catch-borrow-escapes-
+        // via-new-expr rule as the ThrowStmt path in visitStmt.  The ThrowStmt path
+        // calls this check explicitly; mirror it here so that expression-form arm
+        // bodies (`=> throw new Wrap(ex)` without `;`) are also covered. per §31.1
+        if (te->operand) {
+            if (const auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(te->operand.get())) {
+                checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
+            }
+            handleDischarge(*te->operand);
+        }
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {

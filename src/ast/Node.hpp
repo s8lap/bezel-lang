@@ -227,15 +227,17 @@ struct YieldStmt : Stmt {
 //                  | "var" Identifier ":" Type ("," Type)*      /* binding */
 //   CatchArm     ::= CatchPattern ("when" Expression)? "=>" ArmBody
 //
-// ArmBody is parsed as a single Stmt (which can be a DoEndBlock —
-// `do Statement* end ;` — for multi-statement bodies). The Expression
-// form is admitted only inside CaseExpr, not catch arms.
+// ArmBody is stored as a Stmt. The three forms from §31.2.2 / §A.6 are all
+// supported: (1) Expression (no `;` — wrapped in ExpressionStmt by the
+// parser), (2) Statement (with terminating `;`), (3) `do Statement* end`
+// (inline DoEndBlock, no trailing `;` required — #588). Expression-form
+// bodies use consumePunctuator(";") optionally so both `;` and no-`;` work.
 struct CatchArm {
     bool hasBinding = false;     // `var IDENT : ...` vs plain `Type, ...`
     std::string_view varName;    // empty when !hasBinding
     std::vector<std::unique_ptr<Type>> types; // 1+ entries (the CatchPattern)
     std::unique_ptr<Expr> guard; // optional `when EXPR`
-    std::unique_ptr<Stmt> body;  // single Statement (may be DoEndBlock)
+    std::unique_ptr<Stmt> body;  // arm body (ExpressionStmt, Statement, or DoEndBlock)
 };
 
 // A.6 TryStmt: `"try" Statement* CatchBlock FinallyClause? "end" ";"` or
