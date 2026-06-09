@@ -923,7 +923,6 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* icBB = llvm::BasicBlock::Create(llvm_, "eq.ic", currentFn_);
         auto* planBB = llvm::BasicBlock::Create(llvm_, "eq.pl", currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "eq.end", currentFn_);
-        auto* entBB  = builder_.GetInsertBlock();
         builder_.CreateCondBr(ignoreCase, icBB, planBB);
         builder_.SetInsertPoint(planBB);
         llvm::Value* plainEq = emitStringEq(self, other);
@@ -939,7 +938,6 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 tolowerFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "tolower", module_.get());
             }
             llvm::Value* slen = loadStringLen(s);
-            llvm::Value* sdata = loadStringData(s);
             auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
             llvm::Value* dsz = builder_.CreateAdd(slen, builder_.getInt64(1));
             llvm::Value* nd = builder_.CreateCall(mallocFn, {dsz});
@@ -993,60 +991,24 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         return builder_.CreateTrunc(emitStringOrdCmp(self, other), i32(), "cmp.result");
     }
 
-    // §9.6: StartsWith(prefix: string): bool
-    // prefix.len <= self.len AND memcmp(self.data, prefix.data, prefix.len)==0
+    // §9.6 / #535: StartsWith(prefix: string): bool — code-point comparison.
+    // Delegates to bz_str_startswith which handles width 1/2/4 uniformly.
     if (method == "StartsWith") {
         llvm::Value* prefix = getStrArg(0);
         if (!prefix) return nullptr;
-        llvm::Value* selfLen = loadStringLen(self);
-        llvm::Value* prefLen = loadStringLen(prefix);
-        // if prefLen > selfLen → false
-        llvm::Value* tooLong = builder_.CreateICmpUGT(prefLen, selfLen, "sw.toolong");
-        auto* cmpBB = llvm::BasicBlock::Create(llvm_, "sw.cmp", currentFn_);
-        auto* endBB = llvm::BasicBlock::Create(llvm_, "sw.end", currentFn_);
-        auto* entryBB = builder_.GetInsertBlock();
-        builder_.CreateCondBr(tooLong, endBB, cmpBB);
-        builder_.SetInsertPoint(cmpBB);
-        auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* cmpRes = builder_.CreateCall(
-            memcmpFn, {loadStringData(self), loadStringData(prefix), prefLen});
-        llvm::Value* eqZ = builder_.CreateICmpEQ(cmpRes, llvm::ConstantInt::get(i32(),0));
-        auto* cmpEnd = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
-        builder_.SetInsertPoint(endBB);
-        auto* phi = builder_.CreatePHI(i1(), 2, "sw.result");
-        phi->addIncoming(builder_.getFalse(), entryBB);
-        phi->addIncoming(eqZ, cmpEnd);
-        return phi;
+        auto* fn = declareC("bz_str_startswith", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* res = builder_.CreateCall(fn, {self, prefix}, "sw.result");
+        return builder_.CreateTrunc(res, i1(), "sw.bool");
     }
 
-    // §9.6: EndsWith(suffix: string): bool
+    // §9.6 / #535: EndsWith(suffix: string): bool — code-point comparison.
+    // Delegates to bz_str_endswith which handles width 1/2/4 uniformly.
     if (method == "EndsWith") {
         llvm::Value* suffix = getStrArg(0);
         if (!suffix) return nullptr;
-        llvm::Value* selfLen = loadStringLen(self);
-        llvm::Value* sufLen = loadStringLen(suffix);
-        llvm::Value* tooLong = builder_.CreateICmpUGT(sufLen, selfLen, "ew.toolong");
-        auto* cmpBB = llvm::BasicBlock::Create(llvm_, "ew.cmp", currentFn_);
-        auto* endBB = llvm::BasicBlock::Create(llvm_, "ew.end", currentFn_);
-        auto* entryBB = builder_.GetInsertBlock();
-        builder_.CreateCondBr(tooLong, endBB, cmpBB);
-        builder_.SetInsertPoint(cmpBB);
-        // offset = selfLen - sufLen; compare self.data+offset with suffix.data
-        llvm::Value* offset = builder_.CreateSub(selfLen, sufLen, "ew.off");
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* selfOff = builder_.CreateGEP(i8Ty, loadStringData(self), offset);
-        auto* memcmpFn = declareC("memcmp", i32(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* cmpRes = builder_.CreateCall(
-            memcmpFn, {selfOff, loadStringData(suffix), sufLen});
-        llvm::Value* eqZ = builder_.CreateICmpEQ(cmpRes, llvm::ConstantInt::get(i32(),0));
-        auto* cmpEnd = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
-        builder_.SetInsertPoint(endBB);
-        auto* phi = builder_.CreatePHI(i1(), 2, "ew.result");
-        phi->addIncoming(builder_.getFalse(), entryBB);
-        phi->addIncoming(eqZ, cmpEnd);
-        return phi;
+        auto* fn = declareC("bz_str_endswith", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* res = builder_.CreateCall(fn, {self, suffix}, "ew.result");
+        return builder_.CreateTrunc(res, i1(), "ew.bool");
     }
 
     // §9.6: Contains(sub: string): bool — uses libc memmem (POSIX).
@@ -1065,7 +1027,6 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cic.body", currentFn_);
                 auto* foundBB = llvm::BasicBlock::Create(llvm_, "cic.found", currentFn_);
                 auto* endBB  = llvm::BasicBlock::Create(llvm_, "cic.end",  currentFn_);
-                auto* entBB  = builder_.GetInsertBlock();
                 builder_.CreateBr(loopBB);
                 builder_.SetInsertPoint(loopBB);
                 llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
@@ -1089,21 +1050,12 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 return phi;
             }
         }
+        // §9.6 / #535: Contains(sub: string) — code-point comparison via runtime.
         llvm::Value* sub = getStrArg(0);
         if (!sub) return nullptr;
-        // Declare memmem: void* memmem(void*, size_t, void*, size_t)
-        auto* memmemFn = module_->getFunction("memmem");
-        if (!memmemFn) {
-            auto* ft = llvm::FunctionType::get(
-                ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
-            memmemFn = llvm::Function::Create(
-                ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
-        }
-        llvm::Value* found = builder_.CreateCall(memmemFn, {
-            loadStringData(self), loadStringLen(self),
-            loadStringData(sub),  loadStringLen(sub)});
-        return builder_.CreateICmpNE(
-            found, llvm::ConstantPointerNull::get(ptrTy()), "contains");
+        auto* fn = declareC("bz_str_contains", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* res = builder_.CreateCall(fn, {self, sub}, "contains.r");
+        return builder_.CreateTrunc(res, i1(), "contains");
     }
 
     // §9.6: IndexOf(sub: string): int — first occurrence, -1 if not found.
@@ -1147,27 +1099,11 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 return result;
             }
         }
+        // §9.6 / #535: IndexOf(sub: string) — code-point index via runtime.
         llvm::Value* sub = getStrArg(0);
         if (!sub) return nullptr;
-        auto* memmemFn = module_->getFunction("memmem");
-        if (!memmemFn) {
-            auto* ft = llvm::FunctionType::get(
-                ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
-            memmemFn = llvm::Function::Create(
-                ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
-        }
-        llvm::Value* selfData = loadStringData(self);
-        llvm::Value* found = builder_.CreateCall(memmemFn, {
-            selfData, loadStringLen(self),
-            loadStringData(sub), loadStringLen(sub)});
-        llvm::Value* isNull = builder_.CreateICmpEQ(
-            found, llvm::ConstantPointerNull::get(ptrTy()), "iof.null");
-        // If found: index = (found ptr) - (selfData ptr), cast to i32.
-        llvm::Value* diff = builder_.CreatePtrDiff(
-            llvm::Type::getInt8Ty(llvm_), found, selfData, "iof.diff");
-        llvm::Value* idx = builder_.CreateTrunc(diff, i32(), "iof.idx");
-        return builder_.CreateSelect(isNull,
-            llvm::ConstantInt::getSigned(i32(), -1), idx, "iof.result");
+        auto* fn = declareC("bz_str_indexof", i32(), {ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {self, sub}, "iof.result");
     }
 
     // §9.6: LastIndexOf(sub: string): int — last occurrence, -1 if not found.
@@ -1209,89 +1145,28 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             return builder_.CreateLoad(i32(), lastS, "lioc.result");
         }
     }
-    // Implemented by scanning from the end using reverse memmem search loop.
+    // §9.6 / #535: LastIndexOf(sub: string) — code-point index via runtime.
     if (method == "LastIndexOf") {
         llvm::Value* sub = getStrArg(0);
         if (!sub) return nullptr;
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* selfLen  = loadStringLen(self);
-        llvm::Value* selfData = loadStringData(self);
-        llvm::Value* subLen   = loadStringLen(sub);
-        llvm::Value* subData  = loadStringData(sub);
-        auto* memmemFn = module_->getFunction("memmem");
-        if (!memmemFn) {
-            auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
-            memmemFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
-        }
-        // Scan from offset 0..selfLen-subLen, track last match.
-        auto* lastSlot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(-1), lastSlot);
-        auto* posSlot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), posSlot);
-        auto* condBB = llvm::BasicBlock::Create(llvm_, "liof.cond", currentFn_);
-        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "liof.body", currentFn_);
-        auto* endBB  = llvm::BasicBlock::Create(llvm_, "liof.end",  currentFn_);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(condBB);
-        llvm::Value* pos = builder_.CreateLoad(i64(), posSlot);
-        llvm::Value* rem = builder_.CreateSub(selfLen, pos, "liof.rem");
-        llvm::Value* hasSub = builder_.CreateICmpSGE(rem, subLen, "liof.hasub");
-        builder_.CreateCondBr(hasSub, bodyBB, endBB);
-        builder_.SetInsertPoint(bodyBB);
-        llvm::Value* posB = builder_.CreateLoad(i64(), posSlot);
-        llvm::Value* remB = builder_.CreateSub(selfLen, posB, "liof.remb");
-        llvm::Value* dataOff = builder_.CreateGEP(i8Ty, selfData, posB, "liof.off");
-        llvm::Value* found = builder_.CreateCall(memmemFn, {dataOff, remB, subData, subLen}, "liof.found");
-        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
-        llvm::Value* notFound = builder_.CreateICmpEQ(found, nullPtr);
-        auto* updateBB = llvm::BasicBlock::Create(llvm_, "liof.upd", currentFn_);
-        builder_.CreateCondBr(notFound, endBB, updateBB);
-        builder_.SetInsertPoint(updateBB);
-        llvm::Value* matchOff = builder_.CreatePtrDiff(i8Ty, found, selfData, "liof.moff");
-        builder_.CreateStore(matchOff, lastSlot);
-        // Advance past this match.
-        llvm::Value* newPos = builder_.CreateAdd(matchOff, subLen, "liof.npos");
-        builder_.CreateStore(newPos, posSlot);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(endBB);
-        llvm::Value* lastI64 = builder_.CreateLoad(i64(), lastSlot);
-        return builder_.CreateTrunc(lastI64, i32(), "liof.result");
+        auto* fn = declareC("bz_str_lastindexof", i32(), {ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {self, sub}, "liof.result");
     }
 
     // §9.6: Substring(start) → new string from start to end.
-    // §9.6: Substring(start, length) → new string of given length.
+    // §9.6 / #535: Substring(start[, length]): owned string — code-point slice.
+    // Delegates to bz_str_substring which uses the source string's width field
+    // to copy the correct bytes (width * count) and preserves the source width.
     if (method == "Substring") {
         llvm::Value* startV = getIntArg(0);
         if (!startV) return nullptr;
-        llvm::Value* selfLen = loadStringLen(self);
         llvm::Value* start64 = builder_.CreateSExt(startV, i64(), "sub.start");
-        llvm::Value* subLen = (call.args.size() >= 2 && call.args[1].value)
-            ? builder_.CreateSExt(lowerExpr(*call.args[1].value), i64(), "sub.len")
-            : builder_.CreateSub(selfLen, start64, "sub.len");
-        // Clamp to avoid over-reading.
-        llvm::Value* maxLen = builder_.CreateSub(selfLen, start64, "sub.maxlen");
-        llvm::Value* tooLong = builder_.CreateICmpSGT(subLen, maxLen, "sub.toolong");
-        subLen = builder_.CreateSelect(tooLong, maxLen, subLen, "sub.clamped");
-        // Allocate new string data + object.
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* dataSize = builder_.CreateAdd(subLen, builder_.getInt64(1));
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSize}, "sub.data");
-        llvm::Value* srcPtr = builder_.CreateGEP(
-            i8Ty, loadStringData(self), start64, "sub.src");
-        builder_.CreateCall(memcpyFn, {newData, srcPtr, subLen});
-        llvm::Value* endPtr = builder_.CreateGEP(i8Ty, newData, subLen);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), endPtr);
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* newStr = builder_.CreateCall(
-            mallocFn, {builder_.getInt64(strBytes)}, "sub.obj");
-        builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
-        builder_.CreateStore(subLen, builder_.CreateStructGEP(stringType(), newStr, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-            builder_.CreateStructGEP(stringType(), newStr, 2));
-            initStringRc(newStr);  // #422: producer's reference, rc := 1
-        return newStr;
+        // If length arg absent, pass -1 to signal "rest of string" to runtime.
+        llvm::Value* count64 = (call.args.size() >= 2 && call.args[1].value)
+            ? builder_.CreateSExt(lowerExpr(*call.args[1].value), i64(), "sub.count")
+            : builder_.getInt64(-1);
+        auto* fn = declareC("bz_str_substring", ptrTy(), {ptrTy(), i64(), i64()});
+        return builder_.CreateCall(fn, {self, start64, count64}, "sub.result");
     }
 
     // §9.6: Replace(oldChar, newChar): string — replaces all char occurrences.
@@ -1366,113 +1241,16 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         }
     }
 
-    // §9.6: Replace(oldStr, newStr): string — replaces all occurrences of
-    // `oldStr` with `newStr` in `self`. Uses memmem for finding occurrences;
-    // builds the result via repeated concatenation in a loop.
+    // §9.6 / #535: Replace(oldStr, newStr): string — code-point-aware via runtime.
+    // bz_str_replace handles width 1/2/4 correctly and chooses the narrowest
+    // output width for the result (§4.6 adaptive storage).
     if (method == "Replace" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
         llvm::Value* oldStr = lowerExpr(*call.args[0].value);
         llvm::Value* newStr = lowerExpr(*call.args[1].value);
         if (!oldStr || !newStr) return nullptr;
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        // Declare memmem.
-        auto* memmemFn = module_->getFunction("memmem");
-        if (!memmemFn) {
-            auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
-            memmemFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
-        }
-        // Walk the input, collecting prefix+new segments.
-        // For simplicity emit a result built from:
-        //   acc = "" ; pos = self.data ; end = self.data + self.len
-        //   while (found = memmem(pos, end-pos, old.data, old.len)):
-        //     acc = acc + str(pos..found) + newStr
-        //     pos = found + old.len
-        //   acc = acc + str(pos..end)
-        // All in LLVM IR using a loop.
-        llvm::Value* selfLen  = loadStringLen(self);
-        llvm::Value* selfData = loadStringData(self);
-        llvm::Value* oldData  = loadStringData(oldStr);
-        llvm::Value* oldLen   = loadStringLen(oldStr);
-        llvm::Value* newData2 = loadStringData(newStr);
-        llvm::Value* newLen   = loadStringLen(newStr);
-        // Allocate result buffer: worst case self.len * (newLen / oldLen + 1)
-        // For simplicity allocate 4x self.len + newLen as initial buffer.
-        // Actually: build result as linked list of segments, then concat.
-        // Simpler approach: use realloc-based appending.
-        // Simplest for now: pre-allocate 4x self.len + 4*newLen bytes.
-        llvm::Value* bound = builder_.CreateAdd(
-            builder_.CreateMul(selfLen, builder_.getInt64(4)),
-            builder_.CreateMul(newLen, builder_.getInt64(4)));
-        bound = builder_.CreateAdd(bound, builder_.getInt64(1));
-        llvm::Value* resBuf = builder_.CreateCall(mallocFn, {bound}, "repl.buf");
-        auto* resLenSlot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), resLenSlot);
-        auto* posSlot = entryAlloca(ptrTy());
-        builder_.CreateStore(selfData, posSlot);
-        llvm::Value* endPtr = builder_.CreateGEP(i8Ty, selfData, selfLen, "repl.end");
-        // Loop.
-        auto* condBB = llvm::BasicBlock::Create(llvm_, "repl.cond", currentFn_);
-        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "repl.body", currentFn_);
-        auto* dumpBB = llvm::BasicBlock::Create(llvm_, "repl.dump", currentFn_);
-        auto* endBB  = llvm::BasicBlock::Create(llvm_, "repl.end",  currentFn_);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(condBB);
-        llvm::Value* pos    = builder_.CreateLoad(ptrTy(), posSlot);
-        llvm::Value* remain = builder_.CreatePtrDiff(i8Ty, endPtr, pos, "repl.rem");
-        llvm::Value* hasOld = builder_.CreateICmpSGT(oldLen, builder_.getInt64(0));
-        llvm::Value* remGe  = builder_.CreateICmpSGE(remain, oldLen);
-        llvm::Value* canSearch = builder_.CreateAnd(hasOld, remGe);
-        builder_.CreateCondBr(canSearch, bodyBB, dumpBB);
-        builder_.SetInsertPoint(bodyBB);
-        llvm::Value* pos2    = builder_.CreateLoad(ptrTy(), posSlot);
-        llvm::Value* remain2 = builder_.CreatePtrDiff(i8Ty, endPtr, pos2, "repl.rem2");
-        llvm::Value* found   = builder_.CreateCall(memmemFn, {pos2, remain2, oldData, oldLen}, "repl.found");
-        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
-        llvm::Value* notFound = builder_.CreateICmpEQ(found, nullPtr);
-        auto* copyBB = llvm::BasicBlock::Create(llvm_, "repl.copy", currentFn_);
-        builder_.CreateCondBr(notFound, dumpBB, copyBB);
-        builder_.SetInsertPoint(copyBB);
-        // Copy prefix: found - pos2 bytes.
-        llvm::Value* prefLen = builder_.CreatePtrDiff(i8Ty, found, pos2, "repl.pref");
-        llvm::Value* resLen  = builder_.CreateLoad(i64(), resLenSlot);
-        llvm::Value* dst1    = builder_.CreateGEP(i8Ty, resBuf, resLen);
-        builder_.CreateCall(memcpyFn, {dst1, pos2, prefLen});
-        llvm::Value* resLen2 = builder_.CreateAdd(resLen, prefLen);
-        // Copy newStr.
-        llvm::Value* dst2    = builder_.CreateGEP(i8Ty, resBuf, resLen2);
-        builder_.CreateCall(memcpyFn, {dst2, newData2, newLen});
-        llvm::Value* resLen3 = builder_.CreateAdd(resLen2, newLen);
-        builder_.CreateStore(resLen3, resLenSlot);
-        // Advance pos past the old occurrence.
-        llvm::Value* afterOld = builder_.CreateGEP(i8Ty, found, oldLen, "repl.after");
-        builder_.CreateStore(afterOld, posSlot);
-        builder_.CreateBr(condBB);
-        // Dump remaining.
-        builder_.SetInsertPoint(dumpBB);
-        llvm::Value* pos3     = builder_.CreateLoad(ptrTy(), posSlot);
-        llvm::Value* tailLen  = builder_.CreatePtrDiff(i8Ty, endPtr, pos3, "repl.tail");
-        llvm::Value* resLen4  = builder_.CreateLoad(i64(), resLenSlot);
-        llvm::Value* dst3     = builder_.CreateGEP(i8Ty, resBuf, resLen4);
-        builder_.CreateCall(memcpyFn, {dst3, pos3, tailLen});
-        llvm::Value* finalLen = builder_.CreateAdd(resLen4, tailLen);
-        builder_.CreateStore(finalLen, resLenSlot);
-        builder_.CreateBr(endBB);
-        builder_.SetInsertPoint(endBB);
-        // Null-terminate.
-        llvm::Value* fLen     = builder_.CreateLoad(i64(), resLenSlot);
-        llvm::Value* nulPtr2  = builder_.CreateGEP(i8Ty, resBuf, fLen);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr2);
-        // Build result string object.
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* resStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "repl.obj");
-        builder_.CreateStore(resBuf, builder_.CreateStructGEP(stringType(), resStr, 0));
-        builder_.CreateStore(fLen, builder_.CreateStructGEP(stringType(), resStr, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-            builder_.CreateStructGEP(stringType(), resStr, 2));
-            initStringRc(resStr);  // #422: producer's reference, rc := 1
-        return resStr;
+        auto* fn = declareC("bz_str_replace", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {self, oldStr, newStr}, "repl.result");
     }
 
     // §9.6: ToUpper/ToLower — ASCII-only case conversion via toupper/tolower.
@@ -2006,56 +1784,35 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         return newStr;
     }
 
-    // §9.6: Split — two of the three overloads are lowered here:
-    //   Split(separator: char)   — split on a single code point
-    //   Split(separator: string) — split on a substring delimiter
-    // Both return owned Array<string>. Width=1 (ASCII/UTF-8 byte mode), matching
-    // bz_string_split/ToString. The Split(separators: Array<char>) overload is
-    // NOT yet lowered: it depends on Array<char>'s element storage being a
-    // contiguous i32 buffer, which interacts with pre-existing Array<char>
-    // read-path issues — deferred rather than risk a miscompile.
+    // §9.6 / #535: Split — two overloads lowered here, both now width-aware.
+    //   Split(separator: char)   — code-point comparison via bz_str_split_cp
+    //   Split(separator: string) — code-point comparison via bz_str_split_str
+    // The Split(separators: Array<char>) overload is NOT yet lowered (same
+    // reason as before: Array<char> element storage interacts with pre-existing
+    // Array<char> read-path issues — deferred rather than risk a miscompile).
     if (method == "Split" && call.args.size() == 1 && call.args[0].value) {
         auto* argTy = ctx_.exprType(*call.args[0].value);
-        llvm::Value* selfData = loadStringData(self);
-        llvm::Value* selfLen  = loadStringLen(self);
 
-        // Split(separator: char): one separator code point. Reuse the any-char
-        // splitter with a single-element separator buffer on the stack.
+        // Split(separator: char) — pass self + the separator code point.
         if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
             argTy->primitive == sema::PrimitiveType::Char) {
             llvm::Value* sepCh = lowerExpr(*call.args[0].value);
             if (!sepCh) return nullptr;
             if (!sepCh->getType()->isIntegerTy(32))
                 sepCh = builder_.CreateSExt(sepCh, i32());
-            llvm::AllocaInst* sepSlot = entryAlloca(i32());
-            builder_.CreateStore(sepCh, sepSlot);
-            auto* fn = declareC("bz_string_split_anychar", ptrTy(),
-                                {ptrTy(), i64(), ptrTy(), i64()});
-            return builder_.CreateCall(
-                fn, {selfData, selfLen, sepSlot, builder_.getInt64(1)},
-                "split.char.result");
+            auto* fn = declareC("bz_str_split_cp", ptrTy(), {ptrTy(), i32()});
+            return builder_.CreateCall(fn, {self, sepCh}, "split.char.result");
         }
 
-        // Split(separator: string): substring delimiter. Guard the receiver
-        // type: only lower a genuine string argument here. A non-string, non-
-        // char argument (e.g. an Array<char> for the not-yet-supported set
-        // overload) must NOT reach loadStringData, which would mis-GEP a non-
-        // string value — fall through to nullptr (normal unsupported path).
+        // Split(separator: string) — pass self + the delimiter bz_string*.
+        // Guard type to avoid mis-GEP on a non-string argument.
         if (!argTy || argTy->kind != sema::TypeRef::Kind::Primitive ||
             argTy->primitive != sema::PrimitiveType::String)
             return nullptr;
         llvm::Value* delim = lowerExpr(*call.args[0].value);
         if (!delim) return nullptr;
-        // Runtime signature (bezel_runtime.h): bz_string_split(s, s_len, delim,
-        // delim_len) — 4 params {ptr,i64,ptr,i64}. The previous declaration had a
-        // spurious leading ptr (5 params) while the call passes 4, producing
-        // malformed IR (arg-count mismatch) and an ABI-mismatched call.
-        auto* fn = declareC("bz_string_split", ptrTy(),
-                            {ptrTy(), i64(), ptrTy(), i64()});
-        llvm::Value* delimData = loadStringData(delim);
-        llvm::Value* delimLen  = loadStringLen(delim);
-        return builder_.CreateCall(fn, {selfData, selfLen, delimData, delimLen},
-                                   "split.result");
+        auto* fn = declareC("bz_str_split_str", ptrTy(), {ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {self, delim}, "split.result");
     }
 
     return nullptr;  // method not recognised

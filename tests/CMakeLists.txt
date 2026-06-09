@@ -271,6 +271,7 @@ set(BEZEL_TEST_SOURCES
     codegen/inline_array_equality_test.cpp
     codegen/string_test.cpp
     codegen/string_length_codepoints_528_test.cpp
+    codegen/string_methods_codepoints_535_test.cpp
     codegen/string_compare_test.cpp
     codegen/nullable_string_compare_test.cpp
     codegen/string_tostring_test.cpp

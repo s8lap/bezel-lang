@@ -3217,6 +3217,324 @@ void* bz_string_split_anychar(const char* s, int64_t s_len,
     return arr;
 }
 
+// ---------------------------------------------------------------------------
+// §4.6 / #535: Width-aware (code-point-level) string search/slice helpers.
+//
+// The internal bz.string representation stores code points at 1/2/4 bytes each
+// depending on the maximum code point value in the string (§4.6 adaptive-width
+// storage). Byte-level search primitives (memmem, memcmp) operating on the raw
+// buffer are WRONG for width>1: passing `len` (code-point count) as a byte
+// size reads only the first `len` out of `len*width` actual data bytes.
+//
+// These helpers accept full bz_string* pointers, read each operand's width
+// field, and compare code points by value regardless of storage width. All
+// index/length arguments and return values are CODE-POINT counts/indices, not
+// byte offsets, matching §9.6's documented semantics.
+//
+// Helper: read one code point from a string's data buffer at code-point index i.
+static inline uint32_t bz_str_cp(const bz_string_struct* s, int64_t i) {
+    if (s->width == 1) return ((const uint8_t*)s->data)[i];
+    if (s->width == 2) return ((const uint16_t*)s->data)[i];
+    return ((const uint32_t*)s->data)[i];
+}
+
+// Helper: build a fresh +1 bz_string from a sub-range [start, start+count) of
+// source string `s`. The result uses the NARROWEST width that fits all its code
+// points (§4.6 adaptive-width storage). This allows comparing a substring of
+// an ASCII segment extracted from a wide string against a width=1 literal using
+// emitStringEquals's memcmp path (which only works for equal-width operands).
+static void* bz_str_slice_cp(const bz_string_struct* s, int64_t start, int64_t count) {
+    if (count < 0) count = 0;
+    // Scan to find the maximum code point value in the range.
+    uint32_t maxCp = 0;
+    for (int64_t i = 0; i < count; ++i) {
+        uint32_t cp = bz_str_cp(s, start + i);
+        if (cp > maxCp) maxCp = cp;
+    }
+    // Select narrowest width (§4.6 adaptive storage).
+    int8_t w = (maxCp <= 0xFF) ? 1 : (maxCp <= 0xFFFF ? 2 : 4);
+    size_t byte_count = (size_t)count * (size_t)w;
+    // Allocate data buffer (with one width-sized terminator slot).
+    void* data = calloc(byte_count + (size_t)w, 1);
+    if (w == 1) {
+        uint8_t* d = (uint8_t*)data;
+        for (int64_t i = 0; i < count; ++i) d[i] = (uint8_t)bz_str_cp(s, start + i);
+    } else if (w == 2) {
+        uint16_t* d = (uint16_t*)data;
+        for (int64_t i = 0; i < count; ++i) d[i] = (uint16_t)bz_str_cp(s, start + i);
+    } else {
+        uint32_t* d = (uint32_t*)data;
+        for (int64_t i = 0; i < count; ++i) d[i] = bz_str_cp(s, start + i);
+    }
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &data, sizeof(void*));
+    memcpy(strObj + 8, &count, sizeof(int64_t));
+    strObj[16] = (uint8_t)w;
+    bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
+    return strObj;
+}
+
+// Helper: compare two code-point sequences for equality.
+// Returns 1 if they have the same length and the same code point at every
+// position, 0 otherwise. Width of each may differ.
+static int bz_str_cp_seq_eq(const bz_string_struct* a, int64_t a_start,
+                             const bz_string_struct* b, int64_t b_start,
+                             int64_t len) {
+    for (int64_t i = 0; i < len; ++i) {
+        if (bz_str_cp(a, a_start + i) != bz_str_cp(b, b_start + i)) return 0;
+    }
+    return 1;
+}
+
+// per §9.6 / #535: StartsWith(prefix: string): bool — code-point comparison.
+// Returns 1 if every code point of `prefix` matches the corresponding leading
+// code point of `self`, 0 otherwise. Width mismatch is handled via bz_str_cp.
+extern "C" int32_t bz_str_startswith(const void* self_p, const void* prefix_p) {
+    if (!self_p || !prefix_p) return 0;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* p = (const bz_string_struct*)prefix_p;
+    if (p->len > s->len) return 0;
+    return bz_str_cp_seq_eq(s, 0, p, 0, p->len);
+}
+
+// per §9.6 / #535: EndsWith(suffix: string): bool — code-point comparison.
+extern "C" int32_t bz_str_endswith(const void* self_p, const void* suffix_p) {
+    if (!self_p || !suffix_p) return 0;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* suf = (const bz_string_struct*)suffix_p;
+    if (suf->len > s->len) return 0;
+    int64_t offset = s->len - suf->len;
+    return bz_str_cp_seq_eq(s, offset, suf, 0, suf->len);
+}
+
+// per §9.6 / #535: Contains(sub: string): bool — code-point sliding window.
+// Returns 1 if `sub` appears as a consecutive code-point subsequence anywhere
+// in `self`; 0 otherwise.
+extern "C" int32_t bz_str_contains(const void* self_p, const void* sub_p) {
+    if (!self_p || !sub_p) return 0;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* n = (const bz_string_struct*)sub_p;
+    if (n->len == 0) return 1;   // empty needle is always contained (§9.6)
+    if (n->len > s->len) return 0;
+    int64_t limit = s->len - n->len;
+    for (int64_t i = 0; i <= limit; ++i) {
+        if (bz_str_cp_seq_eq(s, i, n, 0, n->len)) return 1;
+    }
+    return 0;
+}
+
+// per §9.6 / #535: IndexOf(sub: string): int — first code-point occurrence.
+// Returns the code-point index of the first occurrence of `sub` in `self`,
+// or -1 if not found. An empty needle returns 0 (per §9.6 "appears at 0").
+extern "C" int32_t bz_str_indexof(const void* self_p, const void* sub_p) {
+    if (!self_p || !sub_p) return -1;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* n = (const bz_string_struct*)sub_p;
+    if (n->len == 0) return 0;
+    if (n->len > s->len) return -1;
+    int64_t limit = s->len - n->len;
+    for (int64_t i = 0; i <= limit; ++i) {
+        if (bz_str_cp_seq_eq(s, i, n, 0, n->len)) return (int32_t)i;
+    }
+    return -1;
+}
+
+// per §9.6 / #535: LastIndexOf(sub: string): int — last code-point occurrence.
+// Returns the code-point index of the LAST occurrence of `sub` in `self`,
+// or -1 if not found.
+extern "C" int32_t bz_str_lastindexof(const void* self_p, const void* sub_p) {
+    if (!self_p || !sub_p) return -1;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* n = (const bz_string_struct*)sub_p;
+    if (n->len == 0) return (int32_t)s->len;  // convention: last+1 position
+    if (n->len > s->len) return -1;
+    int64_t limit = s->len - n->len;
+    for (int64_t i = limit; i >= 0; --i) {
+        if (bz_str_cp_seq_eq(s, i, n, 0, n->len)) return (int32_t)i;
+    }
+    return -1;
+}
+
+// per §9.6 / #535: Substring(start, count): owned string — code-point slice.
+// Returns a fresh +1 string of `count` code points starting at code-point
+// index `start`. Clamps `count` to the available tail if needed.
+// Preserves the source string's width (§4.6 per-string storage width).
+extern "C" void* bz_str_substring(const void* self_p, int64_t start, int64_t count) {
+    if (!self_p) {
+        // Return empty string.
+        uint8_t* e = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+        void* edata = calloc(1, 1);
+        memcpy(e, &edata, sizeof(void*));
+        int64_t z = 0;
+        memcpy(e + 8, &z, sizeof(int64_t));
+        e[16] = 1;
+        bz_string_init_rc(e);
+        return e;
+    }
+    const auto* s = (const bz_string_struct*)self_p;
+    if (start < 0) start = 0;
+    if (start > s->len) start = s->len;
+    int64_t avail = s->len - start;
+    if (count < 0 || count > avail) count = avail;
+    return bz_str_slice_cp(s, start, count);
+}
+
+// per §9.6 / #535: Replace(old, new): owned string — code-point-aware.
+// Replaces every non-overlapping occurrence of `old_p` in `self_p` with
+// `new_p`. The result may have a DIFFERENT width from the source (e.g.
+// replacing ASCII content with non-ASCII widens; the output uses the narrowest
+// width that fits all resulting code points). For simplicity, the result is
+// built into a code-point buffer at width 4, then repacked at narrowest width.
+extern "C" void* bz_str_replace(const void* self_p,
+                                 const void* old_p,
+                                 const void* new_p) {
+    if (!self_p) {
+        // Return empty string (same as bz_str_substring empty case).
+        uint8_t* e = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+        void* edata = calloc(1, 1);
+        memcpy(e, &edata, sizeof(void*));
+        int64_t z = 0;
+        memcpy(e + 8, &z, sizeof(int64_t));
+        e[16] = 1;
+        bz_string_init_rc(e);
+        return e;
+    }
+    const auto* s   = (const bz_string_struct*)self_p;
+    const auto* old = (const bz_string_struct*)old_p;
+    const auto* nw  = (const bz_string_struct*)new_p;
+
+    // Empty needle: return a copy of self (§9.6: no-op on empty old).
+    if (!old || old->len == 0) {
+        return bz_str_slice_cp(s, 0, s->len);
+    }
+
+    // Collect result code points into a width-4 scratch buffer.
+    // Worst-case: each source CP replaced by nw->len CPs.
+    int64_t cap = (s->len + 1) * (nw ? nw->len + 1 : 1) + 1;
+    uint32_t* out = (uint32_t*)malloc((size_t)cap * sizeof(uint32_t));
+    int64_t olen = 0;
+    uint32_t maxCp = 0;
+
+    int64_t i = 0;
+    while (i <= s->len - old->len) {
+        if (bz_str_cp_seq_eq(s, i, old, 0, old->len)) {
+            // Emit replacement.
+            if (nw) {
+                for (int64_t k = 0; k < nw->len; ++k) {
+                    uint32_t cp = bz_str_cp(nw, k);
+                    if (cp > maxCp) maxCp = cp;
+                    out[olen++] = cp;
+                }
+            }
+            i += old->len;
+        } else {
+            uint32_t cp = bz_str_cp(s, i);
+            if (cp > maxCp) maxCp = cp;
+            out[olen++] = cp;
+            ++i;
+        }
+    }
+    // Emit remaining tail.
+    while (i < s->len) {
+        uint32_t cp = bz_str_cp(s, i);
+        if (cp > maxCp) maxCp = cp;
+        out[olen++] = cp;
+        ++i;
+    }
+
+    // Pack into narrowest width (§4.6 adaptive storage).
+    int8_t w = (maxCp <= 0xFF) ? 1 : (maxCp <= 0xFFFF ? 2 : 4);
+    void* data = calloc((size_t)(olen > 0 ? olen : 1) * (size_t)w + (size_t)w, 1);
+    if (w == 1) {
+        uint8_t* d = (uint8_t*)data;
+        for (int64_t k = 0; k < olen; ++k) d[k] = (uint8_t)out[k];
+    } else if (w == 2) {
+        uint16_t* d = (uint16_t*)data;
+        for (int64_t k = 0; k < olen; ++k) d[k] = (uint16_t)out[k];
+    } else {
+        uint32_t* d = (uint32_t*)data;
+        for (int64_t k = 0; k < olen; ++k) d[k] = out[k];
+    }
+    free(out);
+
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &data, sizeof(void*));
+    memcpy(strObj + 8, &olen, sizeof(int64_t));
+    strObj[16] = (uint8_t)w;
+    bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
+    return strObj;
+}
+
+// per §9.6 / #535: Split(separator: char) — code-point-aware single separator.
+// Splits `self_p` at every code point that equals `sep` (a Unicode scalar).
+// Returns an owned bz_array_t* of bz.string*; each segment preserves the
+// source string's width. Supersedes bz_string_split_anychar for the char
+// overload (which passed raw byte data + code-point count, wrong for width>1).
+extern "C" void* bz_str_split_cp(const void* self_p, int32_t sep) {
+    void* arr = bz_array_alloc(8, 8);
+    if (!self_p) {
+        // Return array with one empty-string element.
+        void* e = bz_str_substring(nullptr, 0, 0);
+        bz_array_add(arr, &e, 8);
+        return arr;
+    }
+    const auto* s = (const bz_string_struct*)self_p;
+    int64_t start = 0;
+    for (int64_t i = 0; i < s->len; ++i) {
+        if ((int32_t)bz_str_cp(s, i) == sep) {
+            void* seg = bz_str_slice_cp(s, start, i - start);
+            bz_array_add(arr, &seg, 8);
+            start = i + 1;
+        }
+    }
+    // Trailing segment (possibly empty).
+    void* seg = bz_str_slice_cp(s, start, s->len - start);
+    bz_array_add(arr, &seg, 8);
+    return arr;
+}
+
+// per §9.6 / #535: Split(separator: string) — code-point-aware string delimiter.
+// Splits `self_p` at every non-overlapping occurrence of `delim_p`.
+// Returns an owned bz_array_t* of bz.string*; each segment preserves the
+// source string's width.
+extern "C" void* bz_str_split_str(const void* self_p, const void* delim_p) {
+    void* arr = bz_array_alloc(8, 8);
+    if (!self_p) {
+        void* e = bz_str_substring(nullptr, 0, 0);
+        bz_array_add(arr, &e, 8);
+        return arr;
+    }
+    const auto* s = (const bz_string_struct*)self_p;
+    if (!delim_p) {
+        void* seg = bz_str_slice_cp(s, 0, s->len);
+        bz_array_add(arr, &seg, 8);
+        return arr;
+    }
+    const auto* d = (const bz_string_struct*)delim_p;
+    if (d->len == 0) {
+        // Empty delimiter: return array with one element (the whole string).
+        void* seg = bz_str_slice_cp(s, 0, s->len);
+        bz_array_add(arr, &seg, 8);
+        return arr;
+    }
+    int64_t start = 0;
+    int64_t limit = s->len - d->len;
+    for (int64_t i = 0; i <= limit; ) {
+        if (bz_str_cp_seq_eq(s, i, d, 0, d->len)) {
+            void* seg = bz_str_slice_cp(s, start, i - start);
+            bz_array_add(arr, &seg, 8);
+            start = i + d->len;
+            i = start;
+        } else {
+            ++i;
+        }
+    }
+    // Trailing segment.
+    void* seg = bz_str_slice_cp(s, start, s->len - start);
+    bz_array_add(arr, &seg, 8);
+    return arr;
+}
+
 void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || arr->count == 0) {
