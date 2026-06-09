@@ -722,6 +722,27 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             }
         }
     }
+    // §7.11 "No three-valued logic": `and` / `or` require both operands to be
+    // non-nullable `bool`. A `bool?` operand is a compile error.
+    if (op == "and" || op == "or") {
+        auto isBoolNullable = [&](const ast::Expr* e) -> bool {
+            if (!e) return false;
+            const TypeRef* t = ctx_.exprType(*e);
+            return t && t->kind == TypeRef::Kind::Primitive &&
+                   t->primitive == PrimitiveType::Bool && t->nullable;
+        };
+        if (isBoolNullable(be.left.get()) || isBoolNullable(be.right.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) +
+                "` requires non-nullable `bool` operands (§7.11); a `bool?`"
+                " operand is not permitted — there is no three-valued logic."
+                " Use `??` to coalesce the `bool?` to a `bool` first, or"
+                " narrow with an explicit null check.");
+            ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+    }
     if (op == "=" || op == "<>" || op == "<" || op == ">" ||
         op == "<=" || op == ">=" || op == "and" || op == "or") {
         ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
@@ -942,6 +963,19 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         return;
     }
     if (op == "not") {
+        // §7.11: `not bool?` is a compile error.
+        if (ue.operand) {
+            const TypeRef* ot = ctx_.exprType(*ue.operand);
+            if (ot && ot->kind == TypeRef::Kind::Primitive &&
+                ot->primitive == PrimitiveType::Bool && ot->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ue.span.begin,
+                    "`not` requires a non-nullable `bool` operand (§7.11); a"
+                    " `bool?` operand is not permitted — there is no"
+                    " three-valued logic. Use `??` to coalesce the `bool?` to"
+                    " a `bool` first, or narrow with an explicit null check.");
+            }
+        }
         ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;
     }

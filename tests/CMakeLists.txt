@@ -157,6 +157,7 @@ set(BEZEL_TEST_SOURCES
     sema/field_iface_property_489_test.cpp
     sema/typeof_gettype_487_test.cpp
     sema/gettype_chain_511_test.cpp
+    sema/lifted_operators_486_sema_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     flow/cfg_suspend_test.cpp
@@ -355,6 +356,7 @@ set(BEZEL_TEST_SOURCES
     codegen/primitive_tostring_ieee_518_519_test.cpp
     codegen/generic_value_method_515_516_test.cpp
     codegen/collections_r9_522_523_524_test.cpp
+    codegen/lifted_operators_486_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

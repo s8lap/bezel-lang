@@ -187,28 +187,34 @@ BEZEL_TEST(linked_list_4_6, find_absent) {
 // ---------------------------------------------------------------------------
 
 // per §4.6: RemoveFirst removes the head and decrements Count.
+// Reconciled for §7.11 (#486): `l.First` is `int?` (LinkedList<int>.First: T?
+// per §4.6). After lifting, `l.Count * 10 + l.First` is `int?`, not `int`.
+// Narrow with `?? 0`; the list is non-empty so the coalesce never fires.
 BEZEL_TEST(linked_list_4_6, remove_first_decrements_count) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
         "  l.RemoveFirst(); "
-        "  return l.Count * 10 + l.First; "   // 2*10 + 20 = 40
+        "  return (l.Count * 10 + l.First) ?? 0; "   // 2*10 + 20 = 40
         "end Main; end C;"), 40);
 }
 
 // per §4.6: RemoveLast removes the tail and decrements Count.
+// Reconciled for §7.11 (#486): `l.Last` is `int?`; narrow with `?? 0`.
 BEZEL_TEST(linked_list_4_6, remove_last_decrements_count) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
         "  l.RemoveLast(); "
-        "  return l.Count * 10 + l.Last; "   // 2*10 + 20 = 40
+        "  return (l.Count * 10 + l.Last) ?? 0; "   // 2*10 + 20 = 40
         "end Main; end C;"), 40);
 }
 
 // per §4.6: RemoveNode removes a specific node by pointer.
+// Reconciled for §7.11 (#486): `l.First` and `l.Last` are `int?`; the lifted
+// arithmetic chain `int + int? + int?` is `int?`. Narrow with `?? 0`.
 BEZEL_TEST(linked_list_4_6, remove_node_by_pointer) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -216,7 +222,7 @@ BEZEL_TEST(linked_list_4_6, remove_node_by_pointer) {
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
         "  var n := l.Find(20); "
         "  l.RemoveNode(n); "
-        "  return l.Count * 10 + l.First + l.Last; "   // 2*10 + 10 + 30 = 60
+        "  return (l.Count * 10 + l.First + l.Last) ?? 0; "   // 2*10 + 10 + 30 = 60
         "end Main; end C;"), 60);
 }
 
