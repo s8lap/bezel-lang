@@ -6943,6 +6943,26 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         }
     }
     if (canDispatch) {
+        // fix #580 / §14.1 / §14.2 / §12 / §13: a VIRTUAL generic method (its own
+        // `<T>` params bound in the active substitution) cannot dispatch through
+        // the fixed-signature vtable/itable slot — the slot holds the i32-erased
+        // template, so a non-int type argument is passed at the wrong
+        // width/representation (a silent miscompile). Dispatch by the receiver's
+        // dynamic descriptor to a per-(class, type-arg) monomorphized body
+        // instead. Covers both class-virtual and interface-method parents.
+        if (!genericSubst_.empty()) {
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            bool genericMethodBound = false;
+            if (md && !md->genericParams.empty())
+                for (const auto& gp : md->genericParams)
+                    if (genericSubst_.count(gp.name)) { genericMethodBound = true; break; }
+            if (genericMethodBound) {
+                llvm::Value* r = emitVirtualGenericDispatch(ms, args);
+                if (r != nullptr || diverged_) {
+                    return r;  // emitVirtualGenericDispatch runs emitPendingCheck per call
+                }
+            }
+        }
         // CG-generic: if there is an active type-parameter substitution
         // and this method has generic params/return, use inline emission
         // rather than vtable dispatch — the vtable function was compiled
@@ -7159,6 +7179,22 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
 llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
                                        std::vector<llvm::Value*>& args,
                                        const CallableInfo& ci) {
+    // Build the function type with concrete arg/ret types.
+    std::vector<llvm::Type*> paramTys;
+    for (auto* a : args) paramTys.push_back(a->getType());
+    llvm::Function* specFn = buildSpecializedMethodFn(ms, ci, paramTys);
+    if (!specFn) return nullptr;
+    // Call the specialized function.
+    if (args.size() != specFn->arg_size()) return nullptr;
+    llvm::Value* r = builder_.CreateCall(specFn, args);
+    emitPendingCheck();
+    return r;
+}
+
+
+llvm::Function* Emitter::buildSpecializedMethodFn(
+        sema::MethodSymbol* ms, const CallableInfo& ci,
+        const std::vector<llvm::Type*>& paramTys) {
     // Build the substitution key for caching. per §14.2 (monomorphization): the
     // key must distinguish instantiations whose specialized bodies differ. The
     // erased LLVM type vector alone is not enough — every class/interface type
@@ -7182,23 +7218,15 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
     auto cacheKey = std::make_tuple(ms, substKey, idKey);
     auto cit = specializedMethods_.find(cacheKey);
     if (cit != specializedMethods_.end()) {
-        // Already compiled — just call it (identical instantiations share one
-        // specialization: same ms + same LLVM types + same type identities).
-        llvm::Function* fn = cit->second;
-        if (args.size() != fn->arg_size()) return nullptr;
-        llvm::Value* r = builder_.CreateCall(fn, args);
-        emitPendingCheck();
-        return r;
+        // Already compiled — share one specialization across identical
+        // instantiations (same ms + same LLVM types + same type identities).
+        return cit->second;
     }
 
-    // Build the function type with concrete arg/ret types.
-    std::vector<llvm::Type*> paramTys;
-    for (auto* a : args) paramTys.push_back(a->getType());
     // Return type: apply genericSubst_ to the declared return type.
     llvm::Type* retTy = llvm::Type::getVoidTy(llvm_);
-    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-    if (md && md->returnType) {
-        sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+    if (ci.returnType) {
+        sema::TypeRef* rt = ctx_.resolvedType(*ci.returnType);
         if (rt) retTy = lowerTypeRef(rt);
     }
     auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
@@ -7256,13 +7284,11 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
 
     // Bind `this` and params.
     auto argIt = specFn->arg_begin();
-    std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
     if (!isStaticMethod(ms)) {
         currentThis_ = &*argIt++;
     } else {
         currentThis_ = nullptr;
     }
-    auto* md2 = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     for (std::size_t pi = 0; pi < ms->params.size(); ++pi, ++argIt) {
         sema::Symbol* psym = ms->params[pi];
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
@@ -7278,9 +7304,26 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
         }
     }
 
-    // Emit block body.
-    bool terminated = ci.stmts && lowerScopedBlock(*ci.stmts);
-    if (!terminated) emitImplicitReturn(specFn);
+    // Emit the body. fix #580: handle both EXPRESSION and block bodies, so a
+    // virtual generic method whose override is `=> $"..."` (an expression body)
+    // produces a callable standalone function for dispatch-by-descriptor.
+    if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
+        llvm::Value* rv = lowerExpr(*ci.exprBody);
+        // Mirror emitMethodBody's `=> expr` handling: a diverging expr (e.g.
+        // `=> throw E`) already terminated the block; otherwise box a value-typed
+        // result returned through an Object/interface return type (§8.6).
+        if (diverged_) {
+            /* block already terminated */
+        } else {
+            if (rv && ci.returnType)
+                rv = boxForTarget(rv, ctx_.resolvedType(*ci.returnType),
+                                  ci.exprBody);
+            if (!emitReturn(specFn, rv)) emitImplicitReturn(specFn);
+        }
+    } else {
+        bool terminated = ci.stmts && lowerScopedBlock(*ci.stmts);
+        if (!terminated) emitImplicitReturn(specFn);
+    }
 
     // Restore outer state.
     builder_.SetInsertPoint(savedInsert);
@@ -7298,11 +7341,210 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
     disposeStack_ = std::move(savedDispose);
     currentReturnTypeNode_ = savedRetNode;
 
-    // Call the specialized function.
-    if (args.size() != specFn->arg_size()) return nullptr;
-    llvm::Value* r = builder_.CreateCall(specFn, args);
+    return specFn;
+}
+
+
+// fix #580 / §14.1 / §14.2 / §12 / §13: dispatch a VIRTUAL generic method by the
+// receiver's dynamic type, calling a per-(class, type-arg) monomorphized body.
+//
+// A virtual generic method cannot be dispatched through the ordinary vtable (or
+// interface itable) slot: every override/implementation is compiled ONCE as a
+// template with each type parameter erased to the i32 placeholder, so the slot's
+// function signature is fixed to that placeholder. Calling it with a concrete
+// non-int type argument (string=ptr, double=f64) passes the argument at the wrong
+// width/representation through the slot — a silent miscompile (issue #580). And
+// the template body itself formats `x:T` as an int (T→i32), so even a
+// width-correct call would be wrong.
+//
+// The dynamic type is statically known to be one of a finite set:
+//   * class parent     — the static class (= ms->parent) and its subclasses;
+//   * interface parent — every class that implements the interface.
+// We load the receiver's runtime descriptor (vtable[0] = td$C), compare it
+// against each candidate class's descriptor global, and call the monomorphized
+// specialization of the override/implementation that candidate runs.
+llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
+                                        std::vector<llvm::Value*>& args) {
+    if (args.empty() || !args[0]->getType()->isPointerTy()) return nullptr;
+    const sema::TypeSymbol* staticType = ms->parent;
+    if (!staticType) return nullptr;
+    auto* staticMd = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!staticMd) return nullptr;
+    bool ifaceParent = staticType->kind == ast::TypeDeclKind::Interface;
+
+    // The most-derived method named `ms->name` reachable from class `c`
+    // (the override or interface implementation `c`'s instances run).
+    auto mostDerived = [&](const sema::TypeSymbol* c) -> sema::MethodSymbol* {
+        return findMethodByName(c, ms->name);
+    };
+    auto isSubclassOf = [&](const sema::TypeSymbol* c,
+                            const sema::TypeSymbol* anc) -> bool {
+        for (const sema::TypeSymbol* t = c; t; t = baseClassOf(t))
+            if (t == anc) return true;
+        return false;
+    };
+    auto implementsIface = [&](const sema::TypeSymbol* c,
+                               const sema::TypeSymbol* iface) -> bool {
+        std::vector<const sema::TypeSymbol*> supers;
+        collectTypeAndBases(c, supers);
+        for (auto* s : supers) if (s == iface) return true;
+        return false;
+    };
+
+    // Candidate classes whose instances could reach this call: subclasses (class
+    // parent) or implementers (interface parent), each paired with the
+    // implementation it runs.
+    struct Branch { const sema::TypeSymbol* cls; sema::MethodSymbol* impl; };
+    std::vector<Branch> branches;
+    sema::MethodSymbol* defaultImpl = nullptr;
+
+    if (!ifaceParent) {
+        // CLASS parent: the static class's own override is the natural default
+        // (always reachable). A subclass that does NOT override differently
+        // inherits this default — no branch needed for it (dedup by impl).
+        defaultImpl = mostDerived(staticType);
+        if (!defaultImpl) defaultImpl = ms;
+        for (const auto& sym : ctx_.symbols()) {
+            auto* c = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!c || c->kind != ast::TypeDeclKind::Class) continue;
+            if (c == staticType) continue;
+            if (!isSubclassOf(c, staticType)) continue;
+            if (!descArray_.count(c)) continue;
+            sema::MethodSymbol* impl = mostDerived(c);
+            if (!impl || impl == defaultImpl) continue;  // inherits the default
+            branches.push_back({c, impl});
+        }
+    } else {
+        // INTERFACE parent: there is no instantiable static type, so every
+        // implementer class must be matched by its OWN descriptor (two classes
+        // may share an inherited implementation but still need distinct branches,
+        // since the default is only correct for the one class it belongs to). The
+        // last implementer becomes the default branch.
+        std::vector<Branch> all;
+        for (const auto& sym : ctx_.symbols()) {
+            auto* c = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!c || c->kind != ast::TypeDeclKind::Class) continue;
+            if (!implementsIface(c, staticType)) continue;
+            if (!descArray_.count(c)) continue;
+            sema::MethodSymbol* impl = mostDerived(c);
+            if (!impl) continue;
+            all.push_back({c, impl});
+        }
+        if (all.empty()) return nullptr;  // no implementer — bail safely
+        defaultImpl = all.back().impl;
+        all.pop_back();
+        branches = std::move(all);
+    }
+    if (!defaultImpl) return nullptr;  // no implementation found — bail safely
+
+    // Re-key the active substitution by the override's own generic-param names.
+    // Base::Show<T> and Derived::Show<U> may name the parameter differently; the
+    // substitution we built keys on the static method's names, so positionally
+    // remap to the override's names before building its specialization.
+    auto specForImpl = [&](sema::MethodSymbol* impl) -> llvm::Function* {
+        CallableInfo ci;
+        if (!callableInfo(impl, ci)) return nullptr;
+        auto* implMd = dynamic_cast<const ast::MethodDecl*>(impl->decl);
+        // Build paramTys from the actual args (already concrete).
+        std::vector<llvm::Type*> paramTys;
+        for (auto* a : args) paramTys.push_back(a->getType());
+        auto savedSubst = genericSubst_;
+        auto savedSema = genericSubstSemaTy_;
+        if (implMd && implMd->genericParams.size() ==
+                          staticMd->genericParams.size() &&
+            !implMd->genericParams.empty()) {
+            std::unordered_map<std::string_view, llvm::Type*> rk;
+            std::unordered_map<std::string_view, const sema::TypeRef*> rks;
+            for (std::size_t gi = 0; gi < staticMd->genericParams.size(); ++gi) {
+                std::string_view from = staticMd->genericParams[gi].name;
+                std::string_view to = implMd->genericParams[gi].name;
+                auto it = genericSubst_.find(from);
+                if (it != genericSubst_.end()) rk[to] = it->second;
+                auto is = genericSubstSemaTy_.find(from);
+                if (is != genericSubstSemaTy_.end()) rks[to] = is->second;
+            }
+            genericSubst_ = std::move(rk);
+            genericSubstSemaTy_ = std::move(rks);
+        }
+        llvm::Function* fn = buildSpecializedMethodFn(impl, ci, paramTys);
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSema);
+        return fn;
+    };
+
+    // Build all specializations up front (each into its own standalone function);
+    // none is emitted inline into the current block.
+    llvm::Function* defFn = specForImpl(defaultImpl);
+    if (!defFn) return nullptr;
+    std::vector<std::pair<const sema::TypeSymbol*, llvm::Function*>> brFns;
+    for (auto& b : branches) {
+        llvm::Function* f = specForImpl(b.impl);
+        if (!f) return nullptr;
+        brFns.push_back({b.cls, f});
+    }
+
+    // Common case: no subclass overrides differently — a direct call to the
+    // single specialization is correct (the dynamic type always most-derives it).
+    if (brFns.empty()) {
+        if (args.size() != defFn->arg_size()) return nullptr;
+        llvm::Value* r = builder_.CreateCall(defFn, args);
+        emitPendingCheck();
+        return r;
+    }
+
+    // Emit the dispatch: load td = vptr[0], compare against each branch class's
+    // descriptor, call its specialization; otherwise the default. The call result
+    // (if non-void) is collected into a phi over the per-branch end blocks.
+    llvm::FunctionType* defTy = defFn->getFunctionType();
+    llvm::Type* retTy = defTy->getReturnType();
+    bool hasResult = !retTy->isVoidTy();
+
+    llvm::Value* recv = args[0];
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv, "vt");
+    llvm::Value* td = builder_.CreateLoad(
+        ptrTy(),
+        builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(0)}), "td");
+
+    llvm::BasicBlock* endBB =
+        llvm::BasicBlock::Create(llvm_, "vgen.end", currentFn_);
+    std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incoming;
+
+    for (std::size_t i = 0; i < brFns.size(); ++i) {
+        llvm::Value* desc = descArray_[brFns[i].first];
+        llvm::Value* eq = builder_.CreateICmpEQ(td, desc, "vgen.is");
+        llvm::BasicBlock* thenBB =
+            llvm::BasicBlock::Create(llvm_, "vgen.case", currentFn_);
+        llvm::BasicBlock* nextBB =
+            llvm::BasicBlock::Create(llvm_, "vgen.next", currentFn_);
+        builder_.CreateCondBr(eq, thenBB, nextBB);
+        builder_.SetInsertPoint(thenBB);
+        if (args.size() != brFns[i].second->arg_size()) return nullptr;
+        llvm::Value* cr = builder_.CreateCall(brFns[i].second, args);
+        emitPendingCheck();
+        incoming.push_back({hasResult ? cr : nullptr,
+                            builder_.GetInsertBlock()});
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(nextBB);
+    }
+    // Default branch (current block = the last nextBB).
+    if (args.size() != defFn->arg_size()) return nullptr;
+    llvm::Value* dr = builder_.CreateCall(defFn, args);
     emitPendingCheck();
-    return r;
+    incoming.push_back({hasResult ? dr : nullptr, builder_.GetInsertBlock()});
+    builder_.CreateBr(endBB);
+
+    builder_.SetInsertPoint(endBB);
+    if (!hasResult) {
+        // Void method: there is no value to phi, but the caller distinguishes
+        // "handled" from "not handled" by a non-null return. Return the (void)
+        // default call instruction as a non-null sentinel — its value is never
+        // used (void), and returning nullptr would make the caller fall through
+        // to the regular vtable path and emit a second, broken call.
+        return dr;
+    }
+    llvm::PHINode* phi = builder_.CreatePHI(retTy, incoming.size(), "vgen.res");
+    for (auto& [v, bb] : incoming) phi->addIncoming(v, bb);
+    return phi;
 }
 
 

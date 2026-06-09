@@ -4342,6 +4342,28 @@ private:
                                            std::vector<llvm::Value*>& args,
                                            const CallableInfo& ci);
 
+    // fix #580 / §14.1 / §14.2: build (or fetch from cache) a STANDALONE
+    // monomorphized function for `ms` under the active genericSubst_, with the
+    // given concrete parameter types. Handles both block AND expression bodies.
+    // Returns the llvm::Function* (does NOT emit a call), so a virtual generic
+    // call can place several candidate specializations behind a runtime
+    // dispatch-by-descriptor (one per overriding class in the hierarchy).
+    llvm::Function* buildSpecializedMethodFn(sema::MethodSymbol* ms,
+                                             const CallableInfo& ci,
+                                             const std::vector<llvm::Type*>&
+                                                 paramTys);
+
+    // fix #580: a VIRTUAL generic method call cannot dispatch through the fixed
+    // vtable slot (the slot holds the i32-erased template, so a non-int type
+    // argument is passed at the wrong width/representation — a miscompile). The
+    // dynamic type is one of a statically-known finite set (the static class and
+    // its subclasses). Emit a dispatch-by-descriptor: load the receiver's td
+    // (vtable[0]), and for each candidate class call the monomorphized override
+    // it most-derives, defaulting to the static class's own specialization.
+    // Returns the call result, or nullptr if this path does not apply.
+    llvm::Value* emitVirtualGenericDispatch(sema::MethodSymbol* ms,
+                                            std::vector<llvm::Value*>& args);
+
     // CG-generic: emit a method body inline with the current genericSubst_
     // active, binding `this` and the parameters to the actual arguments.
     // Used when the method function was compiled for a generic template (T→i32)
