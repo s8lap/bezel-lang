@@ -272,3 +272,59 @@ BEZEL_TEST(iter_native_c_437, iterator_as_ienumerable_param) {
         "    return Sum(Range(1, 10)); "
         "  end Main; end C;"), 55);
 }
+
+// ---------------------------------------------------------------------------
+// §29.2 / §29.3 (#552): user-defined IEnumerable<T> iterated via interface type.
+//
+// Before #552, `for x in items` where `items` was STATICALLY typed as
+// IEnumerable<T> but held a user-class instance (not an iterator state machine
+// or wrapped Array<T>) silently miscompiled: the codegen treated the class
+// object as if it were already an enumerator (vtable slots [2]=MoveNext,
+// [3]=Current), but a class object has [2]=Dispose / [3]=ToString → wrong
+// result (0 instead of 15).  Fix: wrap the user-class argument in a thin
+// sm-compatible enumerator wrapper at the call site (buildOrderedArgs) and at
+// local-variable initialisation sites.
+// ---------------------------------------------------------------------------
+
+// §29.2 (#552-A): user class passed to IEnumerable<T> param; sum 1..5 = 15.
+BEZEL_TEST(iter_native_552, user_class_as_ienumerable_param) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        std::string("module M;") + kIntRangeBase +
+        "class C "
+        "  public static method Sum(items: IEnumerable<int>): int "
+        "    var s := 0; for var x in items do s:=s+x; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var r := new IntRange(1, 5); "
+        "    return Sum(r); "
+        "  end Main; end C;"), 15);
+}
+
+// §29.2 (#552-B): user class stored in IEnumerable<int> local then iterated.
+// Uses `using var` so the underlying object is properly disposed.
+BEZEL_TEST(iter_native_552, user_class_in_ienumerable_local) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        std::string("module M;") + kIntRangeBase +
+        "class C "
+        "  public static method Main(): int "
+        "    using var items: IEnumerable<int> := new IntRange(1, 5); "
+        "    var s := 0; for var x in items do s:=s+x; end; return s; "
+        "  end Main; end C;"), 15);
+}
+
+// §29.2 (#552-C): user class iterated twice through IEnumerable<T> param
+// (each call to Sum allocates a fresh enumerator via GetEnumerator).
+BEZEL_TEST(iter_native_552, user_class_ienumerable_double_sum) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        std::string("module M;") + kIntRangeBase +
+        "class C "
+        "  public static method Sum(items: IEnumerable<int>): int "
+        "    var s := 0; for var x in items do s:=s+x; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var r := new IntRange(1, 5); "
+        "    var a := Sum(r); "
+        "    var b := Sum(r); "
+        "    return a + b; "
+        "  end Main; end C;"), 30);
+}

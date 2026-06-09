@@ -3489,6 +3489,27 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // source (class/string/interface) is left as its bare pointer (#399).
     if (v && declType)
         v = boxForTarget(v, ctx_.resolvedType(*declType), init);
+    // §29.2 (#552): when a user class (implementing IEnumerable<T>) is assigned
+    // to a local declared as IEnumerable<T>, wrap it in a thin sm-compatible
+    // enumerator exactly as buildOrderedArgs does at call sites.  Without this,
+    // `using var items: IEnumerable<T> := new MyRange(...)` followed by
+    // `for var x in items do` silently miscompiles (vtable[2] = Dispose, not
+    // MoveNext) because lowerIEnumerableBuiltinFor's vtable-dispatch path
+    // assumes the IEnumerable<T>-typed value IS already an enumerator.
+    if (v && declType && init) {
+        const sema::TypeRef* declTR = ctx_.resolvedType(*declType);
+        if (declTR && declTR->kind == sema::TypeRef::Kind::Named &&
+            !declTR->declaration &&
+            declTR->astNode && declTR->astNode->name &&
+            !declTR->astNode->name->parts.empty() &&
+            declTR->astNode->name->parts[0] == "IEnumerable") {
+            const sema::TypeRef* initTR = ctx_.exprType(*init);
+            if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
+                initTR->declaration) {
+                v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR);
+            }
+        }
+    }
     llvm::Type* declaredTy = declType ? lowerType(declType) : nullptr;
     // §5.1: when the local is declared with an explicit wider numeric type
     // and the initializer lowered to a narrower numeric LLVM type (e.g.
