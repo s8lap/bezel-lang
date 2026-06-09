@@ -1235,6 +1235,15 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     unwindScopeDepth_   = 0;
     diverged_           = false;
 
+    // #574 / §10.4 / §19.2 (CG30): if this property belongs to an enum, set
+    // currentEnumMethod_ so that enumTypeOf("this") resolves correctly inside
+    // a `case this` body — sema does not attach an exprType to `this` inside
+    // enum members, so the same workaround used by enum instance methods is
+    // needed here too.
+    const sema::TypeSymbol* savedEnumMethod2 = currentEnumMethod_;
+    if (cls && cls->kind == ast::TypeDeclKind::Enum)
+        currentEnumMethod_ = cls;
+
     if (!isSet) {
         // --- Getter body. ---
         if (isAuto) {
@@ -1309,6 +1318,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     }
 
     // --- Restore state. ---
+    currentEnumMethod_   = savedEnumMethod2;
     currentFn_          = savedFn;
     currentThis_        = savedThis;
     locals_             = std::move(savedLocals);

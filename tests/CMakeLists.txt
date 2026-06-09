@@ -250,6 +250,7 @@ set(BEZEL_TEST_SOURCES
     codegen/null_cond_call_test.cpp
     codegen/conditional_member_test.cpp
     codegen/enum_case_test.cpp
+    codegen/enum_property_case_574_test.cpp
     codegen/expr_result_member_test.cpp
     codegen/conversion_test.cpp
     codegen/numeric_conversion_test.cpp
