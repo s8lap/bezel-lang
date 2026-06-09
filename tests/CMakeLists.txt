@@ -162,6 +162,7 @@ set(BEZEL_TEST_SOURCES
     sema/decimal_diagnostics_521_test.cpp
     sema/getoradd_argcheck_542_test.cpp
     sema/icomparable_iequatable_576_test.cpp
+    sema/alias_transparency_578_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     flow/cfg_suspend_test.cpp
