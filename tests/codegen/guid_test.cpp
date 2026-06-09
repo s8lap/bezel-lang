@@ -1,6 +1,6 @@
 // Codegen tests for the Guid builtin type (stdlib §2.6).
 //
-// Spec reference: Bezel_Standard_Library_0_129.md §2.6
+// Spec reference: Bezel_Standard_Library_0_130.md §2.6
 //
 // Implemented members (per the doc, all cited below):
 //   - Empty: static readonly property → the all-zero Guid

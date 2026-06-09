@@ -1,6 +1,6 @@
 // Codegen tests for LINQ operator gaps filled in this milestone (stdlib §5).
 //
-// Operators added (verified against §5 of Bezel_Standard_Library_0_129.md):
+// Operators added (verified against §5 of Bezel_Standard_Library_0_130.md):
 //
 //   Union(other: IEnumerable<T>): IEnumerable<T>        — LAZY  (§5 Set-like)
 //   Intersect(other: IEnumerable<T>): IEnumerable<T>    — LAZY  (§5 Set-like)

@@ -6,8 +6,8 @@
 // disposable owned class: Cancel() sets the cancellation flag; tokens derived
 // from it then observe IsCancellationRequested == true.
 //
-// Spec reference: Bezel_Standard_Library_0_129.md §6.1,
-//                 Bezel_Language_Spec_0_129.md §30.8.
+// Spec reference: Bezel_Standard_Library_0_130.md §6.1,
+//                 Bezel_Language_Spec_0_130.md §30.8.
 //
 // Deferred (not tested here, with reasons):
 //   - Register(callback): owned Subscription — needs closure-list infra (a

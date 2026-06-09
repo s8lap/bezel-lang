@@ -3,7 +3,7 @@
 // DateTime and TimeSpan are builtin value types stored as scalar int64 tick
 // counts (100-ns ticks since 0001-01-01 00:00:00 UTC, per .NET semantics).
 // The Bezel standard library definition is in:
-//   Bezel_Standard_Library_0_129.md §2.5
+//   Bezel_Standard_Library_0_130.md §2.5
 //
 // Deferred members (with reasons):
 //   - DateTime.Parse / TryParse: needs string parsing infra (would require a

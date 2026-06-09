@@ -1,5 +1,5 @@
 // Codegen tests for LinkedList<T> / OwnedLinkedList<T> node-based API.
-// Derives from stdlib §4.6 / §4.7 (Bezel_Standard_Library_0_129.md §4.6–§4.7).
+// Derives from stdlib §4.6 / §4.7 (Bezel_Standard_Library_0_130.md §4.6–§4.7).
 //
 // Covers:
 //   §4.6: AddFirst, AddLast, AddBefore, AddAfter, RemoveFirst, RemoveLast,

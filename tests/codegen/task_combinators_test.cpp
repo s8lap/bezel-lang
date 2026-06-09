@@ -1,7 +1,7 @@
 // Codegen — Task static combinator methods (stdlib §6.7 / §30.10).
 //
 // Tests for Task.FromResult<T>, Task.WhenAll, Task.WhenAny, Task.FireAndForget,
-// and `using var` Task disposal. These derive from Bezel_Standard_Library_0_129.md
+// and `using var` Task disposal. These derive from Bezel_Standard_Library_0_130.md
 // §6.7 (lines 2852-2886) and language spec §30.5 / §30.10.
 //
 // Like async_test.cpp, the async emitter accumulates LLVM module state across
