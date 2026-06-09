@@ -371,6 +371,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_values_iter_537_test.cpp
     codegen/dict_literal_contexts_538_test.cpp
     codegen/dict_nullable_value_539_test.cpp
+    codegen/record_named_args_540_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
