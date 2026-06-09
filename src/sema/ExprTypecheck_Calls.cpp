@@ -457,30 +457,43 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     rt->astNode->name->parts.size() == 1) {
-                    if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
-                            ce.callee.get())) {
-                        if (!callMa->typeArgs.empty()) {
-                            // Build the explicit substitution map:
-                            // md->genericParams[i].name → resolved TypeRef for
-                            // callMa->typeArgs[i].
-                            std::unordered_map<std::string_view, TypeRef*>
-                                explicitSubst;
-                            for (std::size_t gi = 0;
-                                 gi < md->genericParams.size() &&
-                                 gi < callMa->typeArgs.size(); ++gi) {
-                                if (!callMa->typeArgs[gi]) continue;
-                                TypeRef* concreteArg =
-                                    ctx_.resolvedType(*callMa->typeArgs[gi]);
-                                if (concreteArg)
-                                    explicitSubst[md->genericParams[gi].name] =
-                                        concreteArg;
-                            }
-                            // Substitute the return-type param name.
-                            std::string_view retParamName =
-                                rt->astNode->name->parts[0];
-                            auto it = explicitSubst.find(retParamName);
-                            if (it != explicitSubst.end()) rt = it->second;
+                    // per §14.1 (issue #509/#561): explicit type args may
+                    // appear on a MemberAccessExpr callee (`obj.Method<T>(...)`)
+                    // OR on a bare IdentifierExpr callee (`Id<T>(...)` — a
+                    // same-class or in-scope generic call without a dot).  Both
+                    // AST node types carry a `typeArgs` vector populated by the
+                    // parser when it confirms `< TypeArgList > (`.
+                    const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
+                        nullptr;
+                    if (auto* callMa =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                ce.callee.get()))
+                        callTypeArgs = &callMa->typeArgs;
+                    else if (auto* callId =
+                                 dynamic_cast<const ast::IdentifierExpr*>(
+                                     ce.callee.get()))
+                        callTypeArgs = &callId->typeArgs;
+                    if (callTypeArgs && !callTypeArgs->empty()) {
+                        // Build the explicit substitution map:
+                        // md->genericParams[i].name → resolved TypeRef for
+                        // (*callTypeArgs)[i].
+                        std::unordered_map<std::string_view, TypeRef*>
+                            explicitSubst;
+                        for (std::size_t gi = 0;
+                             gi < md->genericParams.size() &&
+                             gi < callTypeArgs->size(); ++gi) {
+                            if (!(*callTypeArgs)[gi]) continue;
+                            TypeRef* concreteArg =
+                                ctx_.resolvedType(*(*callTypeArgs)[gi]);
+                            if (concreteArg)
+                                explicitSubst[md->genericParams[gi].name] =
+                                    concreteArg;
                         }
+                        // Substitute the return-type param name.
+                        std::string_view retParamName =
+                            rt->astNode->name->parts[0];
+                        auto it = explicitSubst.find(retParamName);
+                        if (it != explicitSubst.end()) rt = it->second;
                     }
                 }
                 // per §14.1/§14.2 (issue #504): a GENERIC METHOD (its own

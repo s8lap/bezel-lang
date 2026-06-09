@@ -1024,6 +1024,31 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
     // `?(args)`, `[indices]`, `!` (postfix null-forgiving). All bind to the
     // expression on the left.
     for (;;) {
+        // per §14.1 (issue #561): explicit method-level type arguments on a bare
+        // identifier call — `Id<string>("hello")` — where the identifier is in
+        // callee position (no leading dot). The disambiguating scan confirms
+        // `< TypeArgList > (` so this is a generic call, not a relational chain.
+        // Store the type args on the IdentifierExpr so sema and codegen can
+        // substitute T→concrete when typing and emitting the call.
+        if (isPunctuator("<") && tokensLookLikeMethodTypeArgs()) {
+            if (auto* idHead =
+                    dynamic_cast<ast::IdentifierExpr*>(head.get())) {
+                if (idHead->typeArgs.empty()) {
+                    advance(); // past `<`
+                    idHead->typeArgs.push_back(parseType());
+                    while (isPunctuator(",")) {
+                        advance(); // past `,`
+                        idHead->typeArgs.push_back(parseType());
+                    }
+                    if (!consumeClosingAngle()) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected '>' to close method type-argument list");
+                    }
+                    continue; // loop back — the `(` call-suffix follows
+                }
+            }
+        }
         if (consumePunctuator(".")) {
             if (current_.kind != TokenKind::Identifier) {
                 diagnostics_.report(Severity::Error, current_.location,
