@@ -199,6 +199,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerClosureFieldStore(*as->target, addr, rhs,
                                                      as->value.get());
+                // #429 (box FIELD-STORE category) / §8.6 / §28.9: a store into
+                // a CLASS Object/interface field whose every store (per the
+                // collectBoxStorageFields pre-pass) uses a boxable value source
+                // takes an independent +1 (retain-new or transfer-producer /
+                // release-old), released on the owner's disposal. Parallel to
+                // lowerClosureFieldStore above. Gated on isBoxFieldLvalue which
+                // checks both the target type (Object/interface class field) and
+                // the source type (boxable value or box-return call), so a
+                // class-reference store to an Object field never reaches here.
+                if (!handled)
+                    handled = lowerBoxFieldStore(*as->target, addr, rhs,
+                                                 as->value.get());
                 if (!handled)
                     builder_.CreateStore(rhs, addr);
             } else if (as->op == "??=") {

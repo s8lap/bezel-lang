@@ -192,6 +192,7 @@ set(BEZEL_TEST_SOURCES
     codegen/closure_refcount_test.cpp
     codegen/linq_refcount_test.cpp
     codegen/box_refcount_test.cpp
+    codegen/escaping_box_refcount_test.cpp
     codegen/owned_field_disposal_test.cpp
     codegen/generic_owned_field_disposal_test.cpp
     codegen/owned_collection_disposal_test.cpp
