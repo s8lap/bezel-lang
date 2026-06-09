@@ -5031,17 +5031,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     //
                     // §22.9 / §28.3 (FINDING [4]): the body is inlined into THIS
                     // frame, so its exception edges route to this function's
-                    // unwind chain — not a dedicated ctor cleanup block. Build a
-                    // cleanup block that disposes the assigned owned fields + base
-                    // subobject (with the generic substitution still active, so an
-                    // owned type-parameter field is classified by its concrete
-                    // type), frees the instance block, then continues to the
-                    // ENCLOSING unwind. Route the inlined body's exceptions to it
-                    // by setting unwindTarget_ = cleanupBB for the body (and
-                    // unwindScopeDepth_ to the current dispose depth, so unwound
-                    // owned locals of the body are disposed first). Saved/restored
-                    // around the body. This mirrors emitConstructorBody's cleanup
-                    // for the called-ctor case.
+                    // unwind chain — not a dedicated ctor cleanup block.
+                    // inlineCtorBody builds that cleanup block (assigned owned
+                    // fields + base subobject + free, continuing to the
+                    // ENCLOSING unwind), runs the leading `base(...)`/`this(...)`
+                    // chain (§12 — recursively inlining a generic base ctor so
+                    // its field stores use the specialized layout, issue #585),
+                    // then lowers the remaining body. Without running the chain,
+                    // a generic base's inherited fields stayed calloc-zeroed
+                    // (the base ctor never ran), so a `protected` base field read
+                    // 0 in/through the derived class (#585).
                     llvm::Value* savedThis = currentThis_;
                     auto savedLocals = locals_;
                     auto savedParams = paramSlots_;
@@ -5056,21 +5055,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         builder_.CreateStore(args[pi + 1], slot);
                         paramSlots_[cs->params[pi]] = slot;
                     }
-                    // Capture the enclosing unwind destination (BEFORE we
-                    // override unwindTarget_) so the cleanup re-propagates there.
-                    auto* savedInsert = builder_.GetInsertBlock();
-                    llvm::BasicBlock* enclosingUnwind = unwindBB();
-                    auto* cleanupBB = llvm::BasicBlock::Create(
-                        llvm_, "ctor.inline.cleanup", currentFn_);
-                    builder_.SetInsertPoint(cleanupBB);
-                    emitOwnedFieldDisposals(t);
-                    emitBaseDisposeChain(t);
-                    builder_.CreateCall(freeFn(), {obj});
-                    builder_.CreateBr(enclosingUnwind);
-                    if (savedInsert) builder_.SetInsertPoint(savedInsert);
-                    unwindTarget_ = cleanupBB;
-                    unwindScopeDepth_ = disposeStack_.size();
-                    lowerScopedBlock(cd->body);
+                    inlineCtorBody(cs, obj);
                     unwindTarget_ = savedUnwindTarget;
                     unwindScopeDepth_ = savedUnwindDepth;
                     currentThis_ = savedThis;

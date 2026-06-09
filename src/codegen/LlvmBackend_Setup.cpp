@@ -3362,9 +3362,92 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         if (!v) return;
         args.push_back(v);
     }
+    // §12 / §14 (issue #585): when a generic substitution is active, the target
+    // ctor function in ctorFns_ is the T→i32 TEMPLATE — calling it would store
+    // the chained ctor's fields against the unspecialized layout and would
+    // mismatch a non-int `T` argument (a `ptr` string passed to an `i32`
+    // param). Inline the target ctor body instead, with the current
+    // substitution active, so its field stores use the concrete specialized
+    // layout. The param `T` of the base/sibling generic class shares the name
+    // bound in genericSubst_ (both `Container<T>` and `Wrapper<T>` name it `T`),
+    // so the active substitution applies directly. The target's own
+    // `base(...)`/implicit-base chain runs recursively inside inlineCtorBody.
+    if (!genericSubst_.empty() && targetCls && !targetCls->genericParams.empty()) {
+        auto* targetCd = dynamic_cast<const ast::ConstructorDecl*>(target->decl);
+        if (targetCd && args.size() == target->params.size() + 1) {
+            // Save/restore the inlining frame state, then bind the chained
+            // ctor's params to the lowered argument values and inline its body
+            // onto the SAME object subobject (currentThis_).
+            llvm::Value* subObj = currentThis_;
+            auto savedLocals = locals_;
+            auto savedParams = paramSlots_;
+            llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
+            std::size_t savedUnwindDepth = unwindScopeDepth_;
+            locals_.clear();
+            paramSlots_.clear();
+            for (std::size_t pi = 0; pi < target->params.size(); ++pi) {
+                auto* slot = entryAlloca(args[pi + 1]->getType());
+                builder_.CreateStore(args[pi + 1], slot);
+                paramSlots_[target->params[pi]] = slot;
+            }
+            inlineCtorBody(target, subObj);
+            unwindTarget_ = savedUnwindTarget;
+            unwindScopeDepth_ = savedUnwindDepth;
+            currentThis_ = subObj;
+            locals_ = std::move(savedLocals);
+            paramSlots_ = std::move(savedParams);
+            return;
+        }
+    }
     if (args.size() == it->second->arg_size()) {
         builder_.CreateCall(it->second, args);
     }
+}
+
+
+// §12 / §14 (issue #585): inline a constructor's body into the current function
+// with the active generic substitution. `obj` is `this` (already the correct
+// subobject), and the ctor's parameters must already be bound in paramSlots_.
+// Runs the leading constructor chain (an explicit `base(...)`/`this(...)`, else
+// the implicit base), then the remaining body statements. A constructor-cleanup
+// block (assigned owned fields + base subobject + free, routed to the enclosing
+// unwind) guards the inlined body's exception edges, mirroring lowerNew's
+// inline path and emitConstructorBody.
+void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
+    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+    if (!cd) return;
+    currentThis_ = obj;
+
+    // Build the cleanup block first, capturing the enclosing unwind target.
+    auto* savedInsert = builder_.GetInsertBlock();
+    llvm::BasicBlock* enclosingUnwind = unwindBB();
+    auto* cleanupBB =
+        llvm::BasicBlock::Create(llvm_, "ctor.inline.cleanup", currentFn_);
+    builder_.SetInsertPoint(cleanupBB);
+    emitOwnedFieldDisposals(cs->parent);
+    emitBaseDisposeChain(cs->parent);
+    builder_.CreateCall(freeFn(), {obj});
+    builder_.CreateBr(enclosingUnwind);
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    unwindTarget_ = cleanupBB;
+    unwindScopeDepth_ = disposeStack_.size();
+
+    // Run the leading chain (base/this) — recursively inlining a generic base
+    // ctor — then lower the rest of the body. With neither written, the
+    // implicit base ctor runs (chaining further up).
+    bool isThis = false;
+    std::size_t startIdx = 0;
+    if (!cd->body.empty()) {
+        if (const ast::CallExpr* chain = chainCallOf(*cd->body[0], isThis)) {
+            emitChainCall(chain, isThis, cs);
+            startIdx = 1;
+        } else {
+            emitImplicitBase(cs->parent, currentThis_);
+        }
+    } else {
+        emitImplicitBase(cs->parent, currentThis_);
+    }
+    lowerScopedBlock(cd->body, startIdx);
 }
 
 

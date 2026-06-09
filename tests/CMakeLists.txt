@@ -298,6 +298,7 @@ set(BEZEL_TEST_SOURCES
     codegen/closure_capture_test.cpp
     codegen/generic_test.cpp
     codegen/generic_mono_test.cpp
+    codegen/generic_base_field_585_test.cpp
     codegen/generic_return_inference_test.cpp
     codegen/generic_collection_return_test.cpp
     codegen/collection_test.cpp
