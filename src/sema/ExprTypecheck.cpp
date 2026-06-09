@@ -2128,20 +2128,33 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 armScope.parent = currentScope_;
                 for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
                     const auto& sp = dp->subPatterns[i];
-                    if (sp.nakedBinding.empty()) continue;
                     TypeRef* fieldTy = nullptr;
                     if (i < fields.size() && fields[i]->posParam &&
                         fields[i]->posParam->type) {
                         fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
                     }
-                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
-                    lsym->name = sp.nakedBinding;
-                    // Use the PositionalPattern's address (stable since
-                    // AST is immutable) as the unique decl anchor so
-                    // codegen can key locals_[] on the same pointer.
-                    lsym->decl = reinterpret_cast<const ast::Node*>(&sp);
-                    lsym->declType = fieldTy;
-                    armScope.names[sp.nakedBinding] = lsym;
+                    if (!sp.nakedBinding.empty()) {
+                        // Bare `Pt(x, y)` — nakedBinding carries the name.
+                        // Use the PositionalPattern's address (stable since
+                        // AST is immutable) as the unique decl anchor so
+                        // codegen can key locals_[] on the same pointer.
+                        auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                        lsym->name = sp.nakedBinding;
+                        lsym->decl = reinterpret_cast<const ast::Node*>(&sp);
+                        lsym->declType = fieldTy;
+                        armScope.names[sp.nakedBinding] = lsym;
+                    } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
+                                   sp.pattern.get())) {
+                        // §19.3: `Pt(var x, var y)` — equivalent to bare form;
+                        // register the bound name keyed on the BindingPattern
+                        // node (codegen keys its slot on the same pointer).
+                        auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                        lsym->name = vbp->name;
+                        lsym->decl = vbp;
+                        lsym->declType = vbp->type
+                            ? ctx_.resolvedType(*vbp->type) : fieldTy;
+                        armScope.names[vbp->name] = lsym;
+                    }
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
