@@ -463,6 +463,92 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
     // (and is handled by fieldAddr instead).
     auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e));
     if (!fs) return nullptr;
+
+    // §22.12 / #536: when genericSubst_ is active and the field's parent class
+    // has generic parameters, each distinct instantiation must use its own
+    // static-field global (per §22.12: "each distinct instantiation has its own
+    // static state"). The base declareStatics() global is named
+    // `bz$Counter$count` and is shared — redirect to a per-instantiation global
+    // named `bz$Counter$int$count` / `bz$Counter$string$count` etc.
+    if (!genericSubst_.empty() && fs->parent && !fs->parent->genericParams.empty()) {
+        // Build a substitution key limited to the parent class's type parameters
+        // (not method-level type params).  Use (llvm::Type*, identity_token) pairs
+        // in parameter-declaration order so that the key is stable across calls.
+        std::vector<llvm::Type*> substTypes;
+        std::vector<const void*> substIds;
+        std::string typeArgMangle;
+        for (const sema::Symbol* gp : fs->parent->genericParams) {
+            auto sit = genericSubst_.find(gp->name);
+            if (sit == genericSubst_.end()) continue;
+            substTypes.push_back(sit->second);
+            auto semaSit = genericSubstSemaTy_.find(gp->name);
+            const sema::TypeRef* semaTy =
+                (semaSit != genericSubstSemaTy_.end()) ? semaSit->second : nullptr;
+            substIds.push_back(typeRefIdentityToken(semaTy));
+            // Build the human-readable mangle suffix for the global's name.
+            if (!typeArgMangle.empty()) typeArgMangle += "_";
+            if (semaTy) {
+                if (semaTy->kind == sema::TypeRef::Kind::Named &&
+                    semaTy->declaration)
+                    typeArgMangle += std::string(semaTy->declaration->name);
+                else if (semaTy->kind == sema::TypeRef::Kind::Primitive) {
+                    switch (semaTy->primitive) {
+                        case sema::PrimitiveType::Bool:   typeArgMangle += "bool"; break;
+                        case sema::PrimitiveType::Char:   typeArgMangle += "char"; break;
+                        case sema::PrimitiveType::String: typeArgMangle += "string"; break;
+                        case sema::PrimitiveType::Byte:   typeArgMangle += "byte"; break;
+                        case sema::PrimitiveType::SByte:  typeArgMangle += "sbyte"; break;
+                        case sema::PrimitiveType::Short:  typeArgMangle += "short"; break;
+                        case sema::PrimitiveType::UShort: typeArgMangle += "ushort"; break;
+                        case sema::PrimitiveType::Int:    typeArgMangle += "int"; break;
+                        case sema::PrimitiveType::UInt:   typeArgMangle += "uint"; break;
+                        case sema::PrimitiveType::Long:   typeArgMangle += "long"; break;
+                        case sema::PrimitiveType::ULong:  typeArgMangle += "ulong"; break;
+                        case sema::PrimitiveType::Float:  typeArgMangle += "float"; break;
+                        case sema::PrimitiveType::Double: typeArgMangle += "double"; break;
+                        case sema::PrimitiveType::Decimal:typeArgMangle += "decimal"; break;
+                        default: typeArgMangle += "prim"; break;
+                    }
+                } else {
+                    typeArgMangle += "t";
+                }
+            } else {
+                typeArgMangle += "t";
+            }
+        }
+        // Only redirect if we found at least one bound parent type param.
+        if (!substTypes.empty()) {
+            auto key = std::make_pair(static_cast<const sema::Symbol*>(fs),
+                                      std::make_pair(substTypes, substIds));
+            auto git = genericInstStaticGlobals_.find(key);
+            if (git != genericInstStaticGlobals_.end()) return git->second;
+
+            // First access for this (field, instantiation) pair — check
+            // staticGlobals_ has the template-level global so we can copy its
+            // type and initializer.
+            auto baseIt = staticGlobals_.find(fs);
+            if (baseIt == staticGlobals_.end()) return nullptr;
+            llvm::GlobalVariable* base = baseIt->second;
+
+            // Name: bz$Counter$int$count — insert the type-arg mangle between
+            // the class name and the field name.
+            std::string cls = fs->parent ? std::string(fs->parent->name) : "";
+            std::string fname = std::string(fs->name);
+            std::string gname = "bz$" + cls + "$" + typeArgMangle + "$" + fname;
+
+            // Create the per-instantiation global with the same type and
+            // constant initializer as the template-level global (which was
+            // initialized by constInitFor in declareStatics).
+            auto* gv = new llvm::GlobalVariable(
+                *module_, base->getValueType(), /*isConstant=*/false,
+                llvm::GlobalValue::InternalLinkage,
+                base->getInitializer(),
+                gname);
+            genericInstStaticGlobals_[key] = gv;
+            return gv;
+        }
+    }
+
     auto it = staticGlobals_.find(fs);
     return it == staticGlobals_.end() ? nullptr : it->second;
 }

@@ -649,6 +649,19 @@ private:
     std::unordered_map<const sema::Symbol*, llvm::GlobalVariable*>
         staticGlobals_;
 
+    // §22.12 / #536: per-instantiation static-field globals for generic classes.
+    // When a static field's parent class has generic params and genericSubst_ is
+    // active (during monomorphization of a static method body), the field must
+    // resolve to an instantiation-specific global rather than the shared
+    // template-level one.  Keyed by (FieldSymbol*, (llvm_types, identity_tokens))
+    // — same disambiguation as specializedMethods_ (llvm types alone collapse
+    // class/interface to `ptr`; the identity token breaks that collision).
+    std::map<std::pair<const sema::Symbol*,
+                       std::pair<std::vector<llvm::Type*>,
+                                 std::vector<const void*>>>,
+             llvm::GlobalVariable*>
+        genericInstStaticGlobals_;
+
     // §24.1 (#477 B6): each STATIC event's compiler-generated backing
     // EventSource<T> field — a static owned field, modeled as a `ptr` global
     // initialized to null at module load and allocated (bz_event_source_new)
