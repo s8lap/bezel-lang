@@ -8527,39 +8527,84 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         return llvm::ConstantInt::get(i32(), 0);
     }
     // --- Remove(item): bool — per §4.6/§4.3 IOwnedCollection ---
-    // Find the first node whose element matches `item` (by memcmp / pointer
-    // identity for class elements, per §8.3), unlink it, dispose the owned
-    // element (OwnedLinkedList only), and return true. Returns false if no
-    // matching node is found and disposes nothing in that case.
-    // Pattern: Find → if found, RemoveNode (with disposer) → return bool.
-    // A NON-owning LinkedList.Remove unlinks without disposing (§4.6, borrows).
+    // fix #565 / §4.6/§8.3/§9.1: the previous bz_llist_find path used memcmp on
+    // raw element bytes, comparing bz_string* pointer values (not content) for
+    // string elements and raw pointer bytes for records with string fields.
+    // Mirror the #562 fix for LinkedList<T>.Contains: walk node-by-node applying
+    // emitRemoveElementEquality for per-element comparison, then call
+    // bz_llist_remove_node on the matching node (unlinks + optionally disposes).
+    // Ownership semantics are preserved: OwnedLinkedList passes its disposer;
+    // non-owning LinkedList passes null (§4.6, borrows — no element disposal).
     if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
-        // Find the first matching node (nullptr if absent).
-        auto* findFn = declareC("bz_llist_find", ptrTy(),
-                                {ptrTy(), ptrTy(), i64()});
-        llvm::Value* node = builder_.CreateCall(findFn,
-            {recv, slot, builder_.getInt64(esz)}, "ll.find");
-        // found = (node != null)
-        llvm::Value* found = builder_.CreateICmpNE(
-            node, llvm::ConstantPointerNull::get(ptrTy()), "ll.found");
+        const sema::TypeRef* elemRef =
+            (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                      : nullptr;
+        bool elemIsClass = collectionElemIsClass(recvTy, 0);
+        // Spill the search target to a stable alloca slot.
+        llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
+        builder_.CreateStore(v, tgtSlot);
+        // nodeSlot: current node pointer during the walk.
+        llvm::AllocaInst* nodeSlot = entryAlloca(ptrTy());
+        // foundNodeSlot: the node pointer saved when a match is found.
+        llvm::AllocaInst* foundNodeSlot = entryAlloca(ptrTy());
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        builder_.CreateStore(nullP, foundNodeSlot);
+        auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+        auto* nextFn  = declareC("bz_llist_node_next",  ptrTy(), {ptrTy()});
+        auto* valFn   = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+        llvm::Value* firstNode = builder_.CreateCall(firstFn, {recv}, "llr.first");
+        builder_.CreateStore(firstNode, nodeSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "llr.c",  currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "llr.b",  currentFn_);
+        auto* matchBB = llvm::BasicBlock::Create(llvm_, "llr.m",  currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "llr.n",  currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "llr.e",  currentFn_);
+        builder_.CreateBr(condBB);
+        // Loop header: exit when node == null OR a match was stored.
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* curNode = builder_.CreateLoad(ptrTy(), nodeSlot, "llr.cur");
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(curNode, nullP, "llr.nnull"),
+            bodyBB, endBB);
+        // Loop body: load element, test equality.
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llr.vp");
+        llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llr.el");
+        llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llr.tgt");
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, elemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, matchBB, nextBB);
+        // Match: save the node pointer and exit the loop.
+        builder_.SetInsertPoint(matchBB);
+        builder_.CreateStore(curNode, foundNodeSlot);
+        builder_.CreateBr(endBB);
+        // No match: advance to next node.
+        builder_.SetInsertPoint(nextBB);
+        llvm::Value* nxt = builder_.CreateCall(nextFn, {curNode}, "llr.next");
+        builder_.CreateStore(nxt, nodeSlot);
+        builder_.CreateBr(condBB);
+        // After loop: check if a match was found (foundNodeSlot != null).
+        builder_.SetInsertPoint(endBB);
+        llvm::Value* foundNode = builder_.CreateLoad(ptrTy(), foundNodeSlot,
+                                                     "llr.fnd");
+        llvm::Value* found = builder_.CreateICmpNE(foundNode, nullP, "llr.found");
         // If found, call RemoveNode (which unlinks + optionally disposes).
+        // OwnedLinkedList disposes the element; LinkedList borrows, no disposal.
         llvm::Function* elemDisp =
             isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
         llvm::Value* disp = elemDisp
             ? llvm::cast<llvm::Value>(elemDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
-        auto* remBB  = llvm::BasicBlock::Create(llvm_, "ll.rem.do", currentFn_);
-        auto* contBB = llvm::BasicBlock::Create(llvm_, "ll.rem.cont", currentFn_);
+        auto* remBB  = llvm::BasicBlock::Create(llvm_, "llr.rem", currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "llr.cont", currentFn_);
         builder_.CreateCondBr(found, remBB, contBB);
         builder_.SetInsertPoint(remBB);
         auto* remFn = declareC("bz_llist_remove_node",
                                llvm::Type::getVoidTy(llvm_),
                                {ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(remFn, {recv, node, disp});
+        builder_.CreateCall(remFn, {recv, foundNode, disp});
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
         // Return i1 bool — the branch condition MUST be i1 (M3 fix).
