@@ -2967,6 +2967,19 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
                         arr, builder_.CreateStructGEP(st, obj, idxIt->second));
                     continue;
                 }
+                // #559: if the field is a hash-backed Set/OwnedSet and
+                // materializeHeapSetLiteral returned null (unrecognised element
+                // type), do NOT fall through to the inline-array GEP path below —
+                // that path treats the Set `ptr` field as a struct → malformed IR.
+                if (isCollectionTypeName(fieldRt)) {
+                    std::string_view cn =
+                        fieldRt->astNode && fieldRt->astNode->name &&
+                        !fieldRt->astNode->name->parts.empty()
+                            ? fieldRt->astNode->name->parts[0]
+                            : std::string_view{};
+                    if (cn == "Set" || cn == "OwnedSet")
+                        continue;  // safe no-op; sema already diagnosed the type
+                }
             }
             if (cl->elements.empty()) continue;
             llvm::Value* fieldGep =
@@ -3393,6 +3406,25 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     locals_[declNode] = slot;
                     builder_.CreateStore(tbl, slot);
                     return;
+                }
+            }
+        }
+        // #559: if the declared type is a hash-backed Set/OwnedSet and
+        // materializeHeapSetLiteral returned null (unrecognised element type —
+        // a sema error), do NOT fall through to the inline-array GEP path: that
+        // path treats the Set's `ptr` slot as a struct → malformed IR → crash.
+        // A missing-materialization here means sema already diagnosed the type
+        // mismatch; just skip.
+        if (!cl->isDict && declType) {
+            if (const sema::TypeRef* collTy = ctx_.resolvedType(*declType)) {
+                if (isCollectionTypeName(collTy)) {
+                    std::string_view cn =
+                        collTy->astNode && collTy->astNode->name &&
+                        !collTy->astNode->name->parts.empty()
+                            ? collTy->astNode->name->parts[0]
+                            : std::string_view{};
+                    if (cn == "Set" || cn == "OwnedSet")
+                        return;  // materialization failed; safe no-op
                 }
             }
         }
@@ -6117,14 +6149,14 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy) {
     if (!cl || cl->isDict || !collTy) return nullptr;
     if (!isCollectionTypeName(collTy)) return nullptr;
-    // Restrict to the array-backed sequence family. Set/OwnedSet are array-typed
-    // by name but hash-backed at runtime (dedup) — not materializable via the
-    // plain bz_array_add path. Leave them to a future slice.
+    // Dispatch Set/OwnedSet to the dedicated hash-backed materializer (they use
+    // bz_dict_alloc_generic + bz_dict_set_gen, not the array path below).
     std::string_view name = collTy->astNode && collTy->astNode->name &&
                             !collTy->astNode->name->parts.empty()
                                 ? collTy->astNode->name->parts[0]
                                 : std::string_view{};
-    if (name == "Set" || name == "OwnedSet") return nullptr;
+    if (name == "Set" || name == "OwnedSet")
+        return materializeHeapSetLiteral(cl, collTy);
 
     // Element type + byte size, computed exactly as the `new` / `.Add` paths do
     // (collectionElemSize reads genericArgs[0]); both sides agree on the layout.
@@ -6190,6 +6222,88 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});
     }
     return arr;
+}
+
+
+// #559 / stdlib §4.10: materialize a Set<T>/OwnedSet<T> sequence literal
+// `[e1, e2, …]` into a freshly-allocated Set<T>.
+//
+// Strategy: reuse EXACTLY the same allocation and per-element insertion codegen
+// as the working `new Set<T>()` + `.Add(e)` paths (lowerNew + the Set branch
+// of tryLowerCollectionInstanceCall) so the resulting object is bit-for-bit
+// identical to one built with explicit Add calls.
+//
+//   1. Allocate via bz_dict_alloc_generic (same as lowerNew Set<T> branch) —
+//      parameterised by key byte-size + hash/eq trampolines for T.
+//   2. For each element in textual order: lower the sub-expression, spill it to
+//      a stack slot, and call bz_dict_set_gen with sentinel value 1 — mirroring
+//      the Set.Add branch of tryLowerCollectionInstanceCall.  Duplicate keys are
+//      silently collapsed (the dict stores the first occurrence; a subsequent
+//      bz_dict_set_gen on an equal key is a no-op), giving the dedup semantics
+//      §4.10 / stdlib §4.10 requires.
+//
+// #429 / §28.9 ownership: for Set<string>, each element is co-owned (retained
+// at insert); a +1 producer is transferred, a borrow/literal is retained —
+// exactly as Set.Add handles it in tryLowerCollectionInstanceCall.
+//
+// Returns a `ptr` to the bz_dict_t.  Returns null when `setTy` is not a
+// Set/OwnedSet TypeRef with a recognised element type (caller then falls
+// through to the inline-array path, which is incorrect for Sets — but the
+// lowerLocalDecl guard already prevents reaching this function for non-Set
+// targets, so null here means "unrecognized element", which is a sema error).
+llvm::Value* Emitter::materializeHeapSetLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy) {
+    if (!cl || cl->isDict || !setTy) return nullptr;
+    // Require a known element type; genericBackingType returns non-null for every
+    // element type the generic-dict runtime supports (all primitives, enums,
+    // records, strings — §4.10 / isSet=true path).
+    uint64_t ksz = 0;
+    const sema::TypeRef* elemTy =
+        genericBackingType(setTy, 0, /*isSet=*/true, &ksz);
+    if (!elemTy) return nullptr;
+
+    // --- 1. Allocate the backing hash table (same call as lowerNew Set<T>). ---
+    llvm::Function* hashT = buildValueHashTrampoline(elemTy);
+    llvm::Function* eqT   = buildValueEqTrampoline(elemTy);
+    auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
+                             {i64(), ptrTy(), ptrTy()});
+    llvm::Value* tbl = builder_.CreateCall(
+        allocFn, {builder_.getInt64((int64_t)ksz), hashT, eqT}, "slit.tbl");
+
+    // Sentinel non-null value stored for present elements (same as Set.Add).
+    llvm::Value* sentinel = builder_.CreateIntToPtr(builder_.getInt64(1), ptrTy());
+
+    bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
+    // #429 / §28.9: Set<string> co-owns a +1 per element.
+    bool isStrSet = isStringElementSet(setTy);
+
+    auto* setFn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
+                           {ptrTy(), ptrTy(), ptrTy()});
+
+    // --- 2. Insert each element in textual order (duplicates collapsed). -----
+    for (const auto& elemPtr : cl->elements) {
+        if (!elemPtr) continue;
+        llvm::Value* ev = lowerExpr(*elemPtr);
+        if (!ev) continue;
+        // #429 / §28.9: retain the string element before inserting — the set
+        // takes an INDEPENDENT +1.  A +1 producer is transferred (no retain);
+        // a borrow / literal / identifier is retained.
+        if (isStrSet && !isPlusOneStringProducer(elemPtr.get()))
+            emitStringRetain(ev);
+        // Spill to a stack slot and pass its byte address to the generic runtime
+        // (mirrors the elemPtr lambda in the Set.Add branch of
+        // tryLowerCollectionInstanceCall).
+        llvm::Value* keyPtr;
+        if (elemIsRecord && ev->getType()->isPointerTy()) {
+            keyPtr = ev;  // record already spilled to an address
+        } else {
+            llvm::AllocaInst* slot = entryAlloca(ev->getType());
+            builder_.CreateStore(ev, slot);
+            keyPtr = slot;
+        }
+        builder_.CreateCall(setFn, {tbl, keyPtr, sentinel});
+    }
+    return tbl;
 }
 
 

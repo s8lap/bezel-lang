@@ -3465,6 +3465,17 @@ private:
     llvm::Value* materializeHeapDictLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* dictTy);
 
+    // #559 / stdlib §4.10: materialize a Set<T>/OwnedSet<T> sequence literal
+    // `[e1, e2, …]` into a freshly-allocated Set backed by bz_dict_alloc_generic,
+    // reusing the SAME allocation and per-element insertion as the
+    // `new Set<T>()` + `.Add(e)` paths (bz_dict_set_gen + sentinel value 1).
+    // Duplicates are silently collapsed (dict stores the first; second call is
+    // a no-op on an already-present key). Returns a `ptr` to the bz_dict_t
+    // (or null if `setTy` is not a Set/OwnedSet TypeRef with a recognised
+    // element type).
+    llvm::Value* materializeHeapSetLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy);
+
     // per §4.6/§4.7: the resolved LinkedList<T>/OwnedLinkedList<T> TypeRef of
     // a local, or null if the local is not a linked list.
     const sema::TypeRef* linkedListTypeOfLocal(const ast::LocalDecl* ld);
