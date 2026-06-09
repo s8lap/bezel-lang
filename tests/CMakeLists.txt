@@ -381,6 +381,7 @@ set(BEZEL_TEST_SOURCES
     codegen/record_named_args_540_test.cpp
     codegen/in_operator_collection_551_test.cpp
     codegen/in_operator_string_llist_558_560_test.cpp
+    codegen/llist_contains_eq_562_test.cpp
     codegen/dict_keys_values_view_556_test.cpp
     codegen/set_literal_559_test.cpp
     codegen/generic_method_bare_typeargs_561_test.cpp

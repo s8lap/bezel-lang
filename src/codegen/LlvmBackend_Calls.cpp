@@ -8565,18 +8565,60 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // Return i1 bool — the branch condition MUST be i1 (M3 fix).
         return found;
     }
-    // --- Contains(item): bool — find by value equality, return true if found ---
+    // --- Contains(item): bool — node-walk with structural equality ---
+    // fix #562 / §4.6/§8.3/§9.1: the previous bz_llist_find path used memcmp on
+    // raw element bytes, comparing bz_string* pointer values (not content) for
+    // string elements and raw pointer bytes for records with string fields.
+    // Mirror the #560 fix for `x in LinkedList<T>`: walk node-by-node applying
+    // emitRemoveElementEquality so that string content equality (§4.6) and
+    // record structural equality (§8.3/§9.1) are correctly observed.
     if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
-        llvm::AllocaInst* slot = entryAlloca(v->getType());
-        builder_.CreateStore(v, slot);
-        auto* findFn = declareC("bz_llist_find", ptrTy(),
-                                {ptrTy(), ptrTy(), i64()});
-        llvm::Value* node = builder_.CreateCall(findFn,
-            {recv, slot, builder_.getInt64(esz)}, "ll.find");
-        return builder_.CreateICmpNE(
-            node, llvm::ConstantPointerNull::get(ptrTy()), "ll.has");
+        const sema::TypeRef* elemRef =
+            (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                      : nullptr;
+        bool elemIsClass = collectionElemIsClass(recvTy, 0);
+        // Spill the search target to a stable alloca slot (same pattern as the
+        // `in` operator LinkedList path in LlvmBackend_Exprs.cpp §2764).
+        llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
+        builder_.CreateStore(v, tgtSlot);
+        llvm::AllocaInst* nodeSlot = entryAlloca(ptrTy());
+        auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+        auto* nextFn  = declareC("bz_llist_node_next",  ptrTy(), {ptrTy()});
+        auto* valFn   = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* firstNode = builder_.CreateCall(firstFn, {recv}, "llc.first");
+        builder_.CreateStore(firstNode, nodeSlot);
+        auto* condBB  = llvm::BasicBlock::Create(llvm_, "llc.c",  currentFn_);
+        auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "llc.b",  currentFn_);
+        auto* foundBB = llvm::BasicBlock::Create(llvm_, "llc.f",  currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "llc.n",  currentFn_);
+        auto* endBB   = llvm::BasicBlock::Create(llvm_, "llc.e",  currentFn_);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        llvm::Value* curNode = builder_.CreateLoad(ptrTy(), nodeSlot, "llc.cur");
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(curNode, nullP, "llc.nnull"),
+            bodyBB, endBB);
+        builder_.SetInsertPoint(bodyBB);
+        llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llc.vp");
+        llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llc.el");
+        llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llc.tgt");
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, elemIsClass);
+        if (!eq) return nullptr;
+        builder_.CreateCondBr(eq, foundBB, nextBB);
+        builder_.SetInsertPoint(foundBB);
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(nextBB);
+        llvm::Value* nxt = builder_.CreateCall(nextFn, {curNode}, "llc.next");
+        builder_.CreateStore(nxt, nodeSlot);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "llc.result");
+        phi->addIncoming(builder_.getTrue(),  foundBB);
+        phi->addIncoming(builder_.getFalse(), condBB);
+        return phi;
     }
     return nullptr;
 }
