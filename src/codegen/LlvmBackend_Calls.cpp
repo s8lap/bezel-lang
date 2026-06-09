@@ -7684,11 +7684,36 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
     if (!collTy || collTy->genericArgs.size() <= idx) return nullptr;
     const sema::TypeRef* ty = collTy->genericArgs[idx];
     if (!ty) return nullptr;
+    // fix #567 / §14.1: inside a monomorphized generic body the key/element
+    // genericArg is still the bare type parameter (`K` / `T`). Resolve it to the
+    // concrete substituted type so eligibility + the hash/eq trampolines follow
+    // the CONCRETE key/element's contract (§8.3), not the placeholder's string
+    // fast path — which mismatches the caller's concrete dispatch (malformed IR /
+    // segfault). No-op outside a generic body or for a concrete genericArg.
+    ty = resolveTypeParamRef(ty);
     using K = sema::TypeRef::Kind;
     bool isString = ty->kind == K::Primitive &&
                     ty->primitive == sema::PrimitiveType::String && !ty->nullable;
     // Dictionary: string keys keep their dedicated fast path (bz_dict_*_str).
     if (!isSet && isString) return nullptr;
+    // fix #567 / §14.1: a still-UNRESOLVED type parameter (a single-part Named
+    // with no `declaration`, e.g. `K`/`T` with no active binding — the
+    // UNSPECIALIZED template body emitted by emitFunctionBody) routes through the
+    // generic-key hash path, NOT the string fast path. The template body is dead
+    // (only monomorphized specializations are called), but it must still pass IR
+    // verification; the placeholder lowers consistently to i32, so the i32-keyed
+    // generic trampolines (store i32 / hash i32 / compare i32) produce valid IR,
+    // whereas the string fast path would GEP the i32 key as a %bz.string pointer
+    // (malformed IR). Every real call site sees the concrete substituted key.
+    if (ty->kind == K::Named && !ty->declaration && ty->astNode &&
+        ty->astNode->name && ty->astNode->name->parts.size() == 1) {
+        if (byteSize) {
+            llvm::Type* lt = lowerTypeRef(ty);  // i32 placeholder
+            *byteSize = lt ? module_->getDataLayout().getTypeAllocSize(lt)
+                           : (uint64_t)8;
+        }
+        return ty;
+    }
     // Eligible generic-backed types: a record (existing path) or a non-nullable
     // primitive/enum scalar (D3) — plus string for sets (D8). Nullable keys and
     // other shapes are not wired here.

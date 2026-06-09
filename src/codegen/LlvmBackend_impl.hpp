@@ -4038,6 +4038,26 @@ private:
                                             unsigned idx, bool isSet,
                                             uint64_t* byteSize);
 
+    // fix #567 / §14.1: resolve a bare type-parameter TypeRef (a single-part
+    // Named with no `declaration`, e.g. `K` / `T`) to its CONCRETE substituted
+    // sema type via the active monomorphization binding (`genericSubstSemaTy_`).
+    // Inside a monomorphized generic body the genericArgs of a collection type
+    // (`Dictionary<K, int>` / `Set<T>`) still carry the placeholder parameter;
+    // returning it unresolved makes hash-backed-collection dispatch select the
+    // string-key fast path instead of the concrete key/element's hash/eq
+    // (malformed IR / segfault — issue #567). Any non-type-parameter ref, or a
+    // type param with no active binding, is returned unchanged. Mirrors the same
+    // param-name lookup recordMemberTypeResolved / lowerNew's `new T()` path use.
+    const sema::TypeRef* resolveTypeParamRef(const sema::TypeRef* ty) {
+        if (!ty || ty->kind != sema::TypeRef::Kind::Named || ty->declaration ||
+            genericSubstSemaTy_.empty() || !ty->astNode || !ty->astNode->name ||
+            ty->astNode->name->parts.size() != 1)
+            return ty;
+        auto it = genericSubstSemaTy_.find(ty->astNode->name->parts[0]);
+        if (it != genericSubstSemaTy_.end() && it->second) return it->second;
+        return ty;
+    }
+
     // issues D3 / D8 / §8.3: build C-ABI trampolines over an ARBITRARY
     // equality-bearing value type's hash / equality for the generic dict/set
     // runtime variant. Generalizes buildRecord*Trampoline from records to
