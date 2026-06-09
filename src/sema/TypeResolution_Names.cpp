@@ -558,9 +558,36 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         }
     }
     if (!tsym) {
-        // Could be a TypeAliasSymbol or other. For slice 2, treat as
-        // a Named pointing to no declaration (sema slice 3+ resolves
-        // aliases).
+        // §27.8: type aliases are pure synonyms. If the symbol is a
+        // TypeAliasSymbol, resolve the alias transparently by copying the
+        // underlying type's resolved TypeRef into `ref`. This makes alias-typed
+        // locals behave identically to the underlying type for operator dispatch,
+        // lambda-target inference, and all other typecheck paths (fix #578).
+        if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(sym)) {
+            const auto* aliasDecl =
+                dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
+            if (aliasDecl && aliasDecl->aliasedType) {
+                if (TypeRef* underlying =
+                        ctx_.resolvedType(*aliasDecl->aliasedType)) {
+                    // Copy the underlying kind and payload into ref. The nullable
+                    // flag on ref was already set from the syntactic `?` suffix in
+                    // resolveType; the underlying type's nullable flag is
+                    // independent (a bare alias mention `Meters` is not nullable
+                    // even if the aliased type happened to be `double?`).
+                    bool savedNullable = ref.nullable;
+                    const ast::Type* savedAstNode = ref.astNode;
+                    ref = *underlying;
+                    // Restore the original astNode and nullable so diagnostics and
+                    // null-safety checks still refer to the use site, not the
+                    // alias declaration. If the use site wrote `Pred?`, honour it.
+                    ref.astNode = savedAstNode;
+                    ref.nullable = savedNullable || underlying->nullable;
+                    return;
+                }
+            }
+        }
+        // Unknown symbol kind (or alias with unresolved underlying type) — treat
+        // as a Named pointing to no declaration, matching the prior behaviour.
         ref.kind = TypeRef::Kind::Named;
         ref.declaration = nullptr;
     } else {
