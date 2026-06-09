@@ -254,6 +254,7 @@ set(BEZEL_TEST_SOURCES
     codegen/overload_test.cpp
     codegen/ctor_args_test.cpp
     codegen/static_ctor_test.cpp
+    codegen/static_init_exception_529_test.cpp
     codegen/operator_test.cpp
     codegen/operator_increment_498_test.cpp
     codegen/block_setter_test.cpp
