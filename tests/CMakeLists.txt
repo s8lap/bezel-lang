@@ -159,6 +159,7 @@ set(BEZEL_TEST_SOURCES
     sema/gettype_chain_511_test.cpp
     sema/dict_iteration_diag_530_test.cpp
     sema/lifted_operators_486_sema_test.cpp
+    sema/decimal_diagnostics_521_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     flow/cfg_suspend_test.cpp
