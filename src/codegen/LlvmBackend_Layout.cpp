@@ -230,6 +230,43 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
     // For an enum the value slot is its underlying integer (i32 — CG44); per
     // issue #364 this gives `enum?` a null distinct from the value-0 member.
     if (isNullableValueTy(rt)) return nullableValueStructTy(rt);
+    // fix #568 / §14.1 / §7.1: a nullable BARE TYPE-PARAMETER (`T?` where `T` is
+    // a generic param with no declaration) inside a generic method body.
+    // isNullableValueTy is false for it (`T` resolves to no known value type), so
+    // without this it would fall through to the generic-subst branch below, which
+    // resolves `T` → its concrete LLVM type and DROPS the nullability — typing a
+    // `T?` (T=int) return as i32. The body's `return null` then emits
+    // `ret ptr null` against an i32 return type (IR-verify failure). Two shapes:
+    //   * MONOMORPHIZED body (genericSubstSemaTy_ active): when the concrete
+    //     substitution is a VALUE type, lower to the SAME nullable struct the
+    //     value-type `T?` would produce — resolve the parameter to its concrete
+    //     sema type (the #567 mechanism) and lower its nullable variant. A param
+    //     bound to a REFERENCE type (string/class) keeps the reference `?`
+    //     lowering (a plain ptr) — handled by the fall-through.
+    //   * UNSPECIALIZED TEMPLATE body (no active subst, emitFunctionBody — the
+    //     "dead" template #567 also has to keep IR-valid): the concrete T is
+    //     unknown, so lower `T?` to the placeholder nullable value struct
+    //     {i8, i32}. `return null` then emits a valid zeroinitializer struct and
+    //     `return v` (v:T lowered to the i32 placeholder) wraps as tag=1. The
+    //     template is never called; only the per-instantiation specialization is.
+    if (rt->nullable && rt->kind == sema::TypeRef::Kind::Named &&
+        !rt->declaration && rt->astNode && rt->astNode->name &&
+        rt->astNode->name->parts.size() == 1 &&
+        !isBuiltinTypeRefName(rt->astNode->name->parts[0])) {
+        if (!genericSubstSemaTy_.empty()) {
+            sema::TypeRef nv;
+            if (nullableTypeParamConcrete(rt, nv)) {
+                if (isNullableValueTy(&nv)) return nullableValueStructTy(&nv);
+                // resolved to a reference type → plain ptr `?` lowering.
+            } else {
+                // a type param with no active binding — fall to template rule.
+                return nullablePrimStructTy(sema::PrimitiveType::Int);
+            }
+        } else {
+            // unspecialized template body: placeholder nullable value struct.
+            return nullablePrimStructTy(sema::PrimitiveType::Int);
+        }
+    }
     switch (rt->kind) {
         case sema::TypeRef::Kind::Unit:
             return llvm::Type::getVoidTy(llvm_);
@@ -749,6 +786,44 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
             llvm_, {nullablePrimHasValTy(), recordStruct(rt->declaration)});
     }
     return nullablePrimStructTy(rt->primitive);
+}
+
+
+// fix #568 / §14.1 / §7.1: see the declaration comment in LlvmBackend_impl.hpp.
+llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
+                                                  const sema::TypeRef* declRet) {
+    if (!v || !declRet) return v;
+    // Resolve the EFFECTIVE nullable value type. A bare nullable type-parameter
+    // (`T?`) resolves through the active monomorphization to its concrete value
+    // type; a non-generic nullable value type (`int?` / `Pt?`) is used directly.
+    sema::TypeRef nvBuf;
+    const sema::TypeRef* nv = nullptr;
+    if (isNullableValueTy(declRet)) {
+        nv = declRet;
+    } else if (declRet->nullable &&
+               declRet->kind == sema::TypeRef::Kind::Named &&
+               !declRet->declaration && !genericSubstSemaTy_.empty()) {
+        if (nullableTypeParamConcrete(declRet, nvBuf) && isNullableValueTy(&nvBuf))
+            nv = &nvBuf;
+    }
+    if (!nv) return v;  // reference `?` / non-nullable / unresolved — untouched.
+
+    llvm::StructType* nst = nullableValueStructTy(nv);
+    if (v->getType() == nst) return v;  // already the tagged struct.
+    // `return null` lowered to a null pointer → the {i8 0, T 0} null constant.
+    if (v->getType()->isPointerTy() && llvm::isa<llvm::ConstantPointerNull>(v))
+        return nullableValueNull(nv);
+
+    llvm::Type* slotTy = nst->getElementType(1);
+    // A bare value matching the value slot — or a layout-equal but differently-
+    // named aggregate (the specialized-vs-unspecialized record struct mismatch a
+    // monomorphized body induces, #460) — is wrapped. wrapNullableValue
+    // reinterprets the latter to the slot type before insertvalue.
+    if (v->getType() == slotTy) return wrapNullableValue(nv, v);
+    if (auto* vSt = llvm::dyn_cast<llvm::StructType>(v->getType()))
+        if (auto* sSt = llvm::dyn_cast<llvm::StructType>(slotTy))
+            if (vSt->isLayoutIdentical(sSt)) return wrapNullableValue(nv, v);
+    return v;  // shapes incompatible — leave to emitReturn's own coercion.
 }
 
 

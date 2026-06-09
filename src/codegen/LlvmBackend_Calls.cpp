@@ -1885,18 +1885,38 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         //       type was not resolved to int?) — produce {hasValue=0, 0}.
         // If the sema type WAS resolved to int? correctly, lowerExpr already
         // returns the tagged struct and v->getType() == expected → no-op.
+        // fix #569 / §14.1: inside a monomorphized generic body the element
+        // genericArg is a BARE nullable type-parameter (`T?`), for which
+        // isNullableValueTy is false (T resolves to no known value type). Resolve
+        // it through the active monomorphization (genericSubstSemaTy_, the #567/
+        // #568 mechanism) to the concrete nullable value type so Add wraps the
+        // bare T value into the SAME tagged {i8, T} struct the (now 8-byte) esz
+        // and the caller-side `arr[i]` decode expect. Without this the bare value
+        // was stored at the nullable element's stride → garbage tag/value on read.
         auto ensureNullableElem = [&](llvm::Value* v) -> llvm::Value* {
             const sema::TypeRef* elemTyRef =
                 (recvTy && !recvTy->genericArgs.empty())
                 ? recvTy->genericArgs[0] : nullptr;
-            if (!elemTyRef || !isNullableValueTy(elemTyRef)) return v;
-            llvm::StructType* expected = nullableValueStructTy(elemTyRef);
+            if (!elemTyRef) return v;
+            sema::TypeRef nvBuf;
+            const sema::TypeRef* nvTy = nullptr;
+            if (isNullableValueTy(elemTyRef)) {
+                nvTy = elemTyRef;
+            } else if (elemTyRef->nullable &&
+                       elemTyRef->kind == sema::TypeRef::Kind::Named &&
+                       !elemTyRef->declaration && !genericSubstSemaTy_.empty()) {
+                if (nullableTypeParamConcrete(elemTyRef, nvBuf) &&
+                    isNullableValueTy(&nvBuf))
+                    nvTy = &nvBuf;
+            }
+            if (!nvTy) return v;
+            llvm::StructType* expected = nullableValueStructTy(nvTy);
             if (!expected || v->getType() == expected) return v;
             // (b) null pointer → null tagged struct.
             if (v->getType()->isPointerTy())
-                return nullableValueNull(elemTyRef);
+                return nullableValueNull(nvTy);
             // (a) inner scalar/struct value → {hasValue=1, v}.
-            return wrapNullableValue(elemTyRef, v);
+            return wrapNullableValue(nvTy, v);
         };
 
         // .Add(v) / .Push(v) / .Enqueue(v)
@@ -7213,6 +7233,12 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
     auto savedLoop = loopStack_;
     auto savedDispose = disposeStack_;
     llvm::Function* savedFn = currentFn_;
+    // fix #568 / §8.6: the specialized body's ReturnStmt lowering consults
+    // currentReturnTypeNode_ (return-value boxing, nullable-value coercion). It
+    // must name THIS method's declared return type while the body is emitted —
+    // not the outer caller's. Save and restore around the body.
+    const ast::Type* savedRetNode = currentReturnTypeNode_;
+    currentReturnTypeNode_ = ci.returnType;
 
     currentFn_ = specFn;
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", specFn);
@@ -7270,6 +7296,7 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
     diverged_ = savedDiverged;
     loopStack_ = std::move(savedLoop);
     disposeStack_ = std::move(savedDispose);
+    currentReturnTypeNode_ = savedRetNode;
 
     // Call the specialized function.
     if (args.size() != specFn->arg_size()) return nullptr;

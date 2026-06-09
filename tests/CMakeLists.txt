@@ -398,6 +398,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_method_bare_typeargs_561_test.cpp
     codegen/generic_array_index_type_564_test.cpp
     codegen/generic_coll_keyhash_567_test.cpp
+    codegen/generic_nullable_typeparam_568_569_test.cpp
     codegen/array_span_549_test.cpp
     codegen/record_with_test.cpp
     codegen/record_this_with_575_test.cpp
