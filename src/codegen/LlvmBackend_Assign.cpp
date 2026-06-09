@@ -1625,6 +1625,280 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
 }
 
 
+// §29.2 (#552): generate (or reuse) a standalone thunk function for an
+// expression-form property getter. The thunk signature is `retTy(ptr self)`,
+// matching the block-getter protocol of ensurePropertyBlockGetter.  We save
+// and restore the full emitter context exactly as ensurePropertyBlockGetter
+// does; lowerExpr then runs inside the thunk's basic block with the thunk
+// parameter as currentThis_.
+llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
+                                               const ast::Expr* getterExpr,
+                                               llvm::Type* retTy) {
+    auto it = exprGetterThunks_.find(ps);
+    if (it != exprGetterThunks_.end()) return it->second;
+
+    if (!retTy) retTy = i32();
+    auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage,
+        "bz$exprget$" + std::string(ps->name), *module_);
+    exprGetterThunks_[ps] = fn;
+
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+
+    // Save entire emitter state (mirrors ensurePropertyBlockGetter).
+    auto* savedFn       = currentFn_;
+    auto  savedBB       = builder_.GetInsertBlock();
+    auto  savedBBOffset = savedBB ? builder_.GetInsertPoint()
+                                  : decltype(savedBB->begin()){};
+    auto* savedThis     = currentThis_;
+    auto  savedLocals   = locals_;
+    auto  savedParams   = paramSlots_;
+    auto  savedRef      = refParams_;
+    auto  savedDispose  = disposeStack_;
+    auto  savedLoop     = loopStack_;
+    auto* savedUnwind   = unwindTarget_;
+    auto* savedProp     = propagateBB_;
+    auto* savedCaught   = currentCaughtExc_;
+    auto  savedUD       = unwindScopeDepth_;
+    auto  savedDiv      = diverged_;
+    auto  savedGSubst   = genericSubst_;
+
+    currentFn_         = fn;
+    builder_.SetInsertPoint(entryBB);
+    currentThis_       = &*fn->args().begin();
+    locals_.clear(); paramSlots_.clear(); refParams_.clear();
+    disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    unwindTarget_      = nullptr; propagateBB_ = nullptr;
+    currentCaughtExc_  = nullptr; unwindScopeDepth_ = 0;
+    diverged_          = false; genericSubst_.clear();
+
+    llvm::Value* val = lowerExpr(*getterExpr);
+    if (!val) val = llvm::Constant::getNullValue(retTy);
+    if (val->getType() != retTy && retTy->isIntegerTy() &&
+        val->getType()->isIntegerTy())
+        val = builder_.CreateTrunc(val, retTy);
+    builder_.CreateRet(val);
+
+    // Restore state.
+    currentFn_         = savedFn;
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
+    currentThis_       = savedThis;
+    locals_            = std::move(savedLocals);
+    paramSlots_        = std::move(savedParams);
+    refParams_         = std::move(savedRef);
+    disposeStack_      = std::move(savedDispose);
+    loopStack_         = std::move(savedLoop);
+    unwindTarget_      = savedUnwind;
+    propagateBB_       = savedProp;
+    currentCaughtExc_  = savedCaught;
+    unwindScopeDepth_  = savedUD;
+    diverged_          = savedDiv;
+    genericSubst_      = std::move(savedGSubst);
+
+    return fn;
+}
+
+
+// §29.2 (#552): wrap a user class instance (implementing IEnumerable<T>) in a
+// type-specific, vtable-backed enumerator whose MoveNext/Current/Dispose
+// delegate to the enumerator class returned by GetEnumerator().  Layout:
+//   struct { ptr vtable, ptr enumerator }
+//   vtable: [0]=td(self), [1]=Dispose, [2]=MoveNext→i1, [3]=Current→T
+// Eagerly calls GetEnumerator() on the source object at the wrapping site.
+// Returns src unchanged if GetEnumerator() or the enumerator class cannot be
+// resolved; the caller falls back to the raw pointer (which will misfire at
+// runtime, but that's no worse than before this fix).
+llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
+                                                  const sema::TypeSymbol* srcTs,
+                                                  const sema::TypeRef* iEnumTy) {
+    // 1. Find GetEnumerator on the source class.
+    sema::MethodSymbol* getEnumSym = findMethodByName(srcTs, "GetEnumerator");
+    if (!getEnumSym) return src;
+
+    // 2. Find the concrete enumerator TypeSymbol (same logic as lowerIEnumerableFor).
+    auto* getEnumDecl = dynamic_cast<const ast::MethodDecl*>(getEnumSym->decl);
+    if (!getEnumDecl || !getEnumDecl->returnType) return src;
+    auto* enumTyRef = ctx_.resolvedType(*getEnumDecl->returnType);
+    if (!enumTyRef) return src;
+    auto* enumTs = (enumTyRef->kind == sema::TypeRef::Kind::Named)
+                   ? enumTyRef->declaration : nullptr;
+    if (!enumTs) {
+        // GetEnumerator() declares return type as builtin IEnumerator<T>.
+        // Scan all compiled TypeSymbols for a class with MoveNext + Current.
+        for (const auto& sym : ctx_.symbols()) {
+            auto* cand = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!cand || cand->kind != ast::TypeDeclKind::Class) continue;
+            if (cand == srcTs) continue;
+            bool hasMN = false, hasCur = false;
+            for (auto* m : cand->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (!ms || !methodFns_.count(ms)) continue;
+                if (ms->name == "MoveNext")  hasMN  = true;
+                if (ms->name == "Current")   hasCur = true;
+            }
+            if (!hasCur) {
+                for (auto* m : cand->members) {
+                    auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                    if (ps && ps->name == "Current") { hasCur = true; break; }
+                }
+            }
+            if (hasMN && hasCur) { enumTs = const_cast<sema::TypeSymbol*>(cand); break; }
+        }
+    }
+    if (!enumTs) return src;
+
+    // 3. Find MoveNext, Current, and Dispose on the enumerator class.
+    sema::MethodSymbol* moveNextSym = findMethodByName(enumTs, "MoveNext");
+    if (!moveNextSym) return src;
+    auto mnIt = methodFns_.find(moveNextSym);
+    if (mnIt == methodFns_.end()) return src;
+    llvm::Function* moveNextFn = mnIt->second;
+
+    sema::MethodSymbol* currentMethodSym = findMethodByName(enumTs, "Current");
+    sema::PropertySymbol* currentPropSym = nullptr;
+    if (!currentMethodSym)
+        currentPropSym = classPropertyByName(enumTs, "Current");
+
+    // 4. Resolve element type.
+    llvm::Type* elemTy = ptrTy();
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+
+    // 5. Resolve the Current function pointer.
+    llvm::Function* currentFn = nullptr;
+    if (currentMethodSym) {
+        auto curIt = methodFns_.find(currentMethodSym);
+        if (curIt != methodFns_.end()) currentFn = curIt->second;
+    } else if (currentPropSym) {
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
+        if (pd) {
+            if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
+                currentFn = ensurePropertyBlockGetter(pd, acc);
+            } else if (const ast::Expr* ge = computedGetterOf(currentPropSym)) {
+                llvm::Type* propRetTy = pd->type ? lowerType(pd->type.get()) : elemTy;
+                if (!propRetTy) propRetTy = elemTy;
+                currentFn = ensureExprGetterThunk(currentPropSym, ge, propRetTy);
+            }
+        }
+    }
+    if (!currentFn) return src;
+
+    // 6. Resolve the Dispose function pointer (optional; use no-op if absent).
+    llvm::Function* enumDisposeFn = nullptr;
+    {
+        auto dIt = disposerFns_.find(enumTs);
+        if (dIt != disposerFns_.end()) enumDisposeFn = dIt->second;
+    }
+
+    // 7. Build type-specific wrapper functions keyed on the enumerator class name.
+    std::string key = std::string(enumTs->name);
+    std::string stName = "userenumenum." + key;
+    auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
+    if (!stTy)
+        stTy = llvm::StructType::create(llvm_, {ptrTy(), ptrTy()}, stName);
+
+    std::string prefix = "bz$userenumenum$" + key + "$";
+    auto getOrCreate = [&](const std::string& name, llvm::FunctionType* ft,
+                           std::function<void(llvm::Function*)> fill)
+        -> llvm::Function* {
+        if (auto* f = module_->getFunction(name)) return f;
+        auto* f = llvm::Function::Create(ft, llvm::Function::InternalLinkage,
+                                         name, module_.get());
+        fill(f);
+        return f;
+    };
+
+    // Dispose: call enum.Dispose() then free(self).
+    llvm::Function* wrapDisposeFn = getOrCreate(prefix + "Dispose",
+        llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* enumF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* enumPtr = b.CreateLoad(ptrTy(), enumF);
+            if (enumDisposeFn) {
+                b.CreateCall(enumDisposeFn->getFunctionType(), enumDisposeFn, {enumPtr});
+            }
+            auto* freeFnCallee = module_->getOrInsertFunction(
+                "free", llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+            b.CreateCall(llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+                freeFnCallee, {self});
+            b.CreateRetVoid();
+        });
+
+    // MoveNext: call enum.MoveNext() and return bool.
+    llvm::Function* wrapMoveNextFn = getOrCreate(prefix + "MoveNext",
+        llvm::FunctionType::get(i1(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* enumF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* enumPtr = b.CreateLoad(ptrTy(), enumF);
+            llvm::Value* r = b.CreateCall(moveNextFn->getFunctionType(),
+                                          moveNextFn, {enumPtr});
+            // Ensure i1 return regardless of MoveNext's declared LLVM type.
+            if (r->getType() != b.getInt1Ty())
+                r = b.CreateTrunc(r, b.getInt1Ty());
+            b.CreateRet(r);
+        });
+
+    // Current: call enum.Current getter and return T.
+    llvm::Function* wrapCurrentFn = getOrCreate(prefix + "Current",
+        llvm::FunctionType::get(elemTy, {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* enumF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* enumPtr = b.CreateLoad(ptrTy(), enumF);
+            llvm::Value* r = b.CreateCall(currentFn->getFunctionType(),
+                                          currentFn, {enumPtr});
+            // Coerce to elemTy if needed (e.g. i32 → i1 for bool).
+            if (r->getType() != elemTy && elemTy->isIntegerTy() &&
+                r->getType()->isIntegerTy())
+                r = b.CreateTrunc(r, elemTy);
+            b.CreateRet(r);
+        });
+
+    // 8. Build vtable global.
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 4);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: filled below
+            wrapDisposeFn,
+            wrapMoveNextFn,
+            wrapCurrentFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // 9. Eagerly call GetEnumerator() on the source to get the enumerator ptr.
+    std::vector<llvm::Value*> geArgs = {src};
+    llvm::Value* enumPtr = emitMethodCall(getEnumSym, geArgs, /*baseQualified=*/false);
+    if (!enumPtr) return src;
+
+    // 10. Allocate wrapper struct and fill fields.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* wrap = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64(stSz)}, "userenumenum");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, wrap, 0));
+    builder_.CreateStore(enumPtr, builder_.CreateStructGEP(stTy, wrap, 1));
+    return wrap;
+}
+
+
 bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       const std::vector<ast::CallArgument>& args,
                       std::vector<llvm::Value*>& out,
@@ -1715,6 +1989,17 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                     actualTy->astNode->name->parts[0] == "Array";
                 if (actualIsArray) {
                     v = wrapArrayAsIEnumerable(v, formalTy);
+                }
+                // §29.2 (#552): when a user class (implementing IEnumerable<T>)
+                // is passed to an IEnumerable<T> parameter, wrap it in a thin
+                // sm-compatible enumerator that eagerly calls GetEnumerator() and
+                // delegates MoveNext/Current/Dispose to the concrete enumerator
+                // class. Without this the callee's vtable-dispatch path would
+                // call vtable[2] (Dispose on the class) instead of MoveNext.
+                else if (actualTy &&
+                         actualTy->kind == sema::TypeRef::Kind::Named &&
+                         actualTy->declaration) {
+                    v = wrapUserClassAsIEnumerable(v, actualTy->declaration, formalTy);
                 }
             }
         }
