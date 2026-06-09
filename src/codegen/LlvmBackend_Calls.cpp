@@ -2140,6 +2140,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
              valTy->declaration &&
              valTy->declaration->kind == ast::TypeDeclKind::Record)
                 ? valTy->declaration : nullptr;
+        // issue #539 / §4.8 / §7: nullable value types (int?, bool?, enum?,
+        // nullable record) lower to a tagged {i8 hasValue; T} struct.  Like a
+        // non-nullable record they are too wide for the scalar inttoptr slot
+        // encoding and must be heap-boxed the same way (malloc the struct,
+        // store the tag + payload bytes, put the box pointer in the slot).
+        // valRec above covers non-nullable records; valNullableVal covers the
+        // nullable-value-type case (which slipped to ZExt/Trunc and crashed).
+        bool valNullableVal = valTy && isNullableValueTy(valTy);
 
         // Helper: extract string data/len from bz.string ptr
         auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
@@ -2163,14 +2171,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // self-contained (no shared-alloca aliasing across loop iterations);
         // issue D4: a record value is heap-boxed (malloc + memcpy of its bytes)
         // and the box pointer is stored.
+        // issue #539: nullable value types (int?, bool?, etc.) lower to a tagged
+        // {i8,T} struct and are also heap-boxed via the same path — they are
+        // rejected by ZExt/Trunc (illegal on struct operands).
         auto encodeValue = [&](llvm::Value* v) -> llvm::Value* {
-            if (valRec && v->getType()->isStructTy()) {
-                llvm::StructType* vst = recordStruct(valRec);
-                uint64_t vsz = module_->getDataLayout().getTypeAllocSize(vst);
+            if ((valRec || valNullableVal) && v->getType()->isStructTy()) {
+                // Box the struct (record or nullable-value-type tagged struct)
+                // into a malloc'd region.  The tag byte for nullable types is
+                // preserved in the stored bytes, so null vs non-null survives.
+                uint64_t vsz =
+                    module_->getDataLayout().getTypeAllocSize(v->getType());
                 auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
                 llvm::Value* box =
                     builder_.CreateCall(mallocFn, {builder_.getInt64((int64_t)vsz)});
-                builder_.CreateStore(v, box);   // copy the record bytes into the box
+                builder_.CreateStore(v, box);   // copy the struct bytes into the box
                 return box;
             }
             if (v->getType()->isPointerTy()) return v;
@@ -2317,10 +2331,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
             }
             llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
-            if (valRec && outTy && outTy->isStructTy()) {
-                // Load the boxed record and store it into the out slot. Guard the
-                // box pointer (it is null on a not-found lookup) so we never
-                // dereference null: only copy on the found path.
+            if ((valRec || valNullableVal) && outTy && outTy->isStructTy()) {
+                // Load the boxed struct (record or nullable-value-type tagged
+                // struct) and store it into the out slot.  Guard the box pointer
+                // (it is null on a not-found lookup) so we never dereference
+                // null: only copy on the found path.
+                // issue #539: nullable value types produce a non-null box even
+                // for the null? value (hasValue=0 is in the bytes, not the ptr).
                 auto* copyBB = llvm::BasicBlock::Create(llvm_, "tg.copy", currentFn_);
                 auto* endBB  = llvm::BasicBlock::Create(llvm_, "tg.end", currentFn_);
                 llvm::Value* nonNull = builder_.CreateICmpNE(
@@ -2390,11 +2407,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!valLlvm) valLlvm = ptrTy();
 
             // Decode a stored void* slot value into the V LLVM type — identical to
-            // the TryGetValue / indexer-get decode (record → load the boxed struct;
-            // scalar → ptrtoint then truncate/bitcast; pointer → the void* IS the
-            // string/object pointer). `slotV` is the raw stored void*.
+            // the TryGetValue / indexer-get decode (record or nullable-value-type
+            // tagged struct → load the boxed struct; scalar → ptrtoint then
+            // truncate/bitcast; pointer → the void* IS the string/object pointer).
+            // issue #539: nullable value types (int?, bool?, etc.) lower to a
+            // {i8,T} struct and must be unboxed the same way records are.
+            // `slotV` is the raw stored void*.
             auto decodeSlot = [&](llvm::Value* slotV) -> llvm::Value* {
-                if (valRec && valLlvm->isStructTy())
+                if ((valRec || valNullableVal) && valLlvm->isStructTy())
                     return builder_.CreateLoad(valLlvm, slotV, "goa.rec");
                 if (!valLlvm->isPointerTy()) {
                     llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());

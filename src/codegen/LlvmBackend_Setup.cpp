@@ -2335,15 +2335,18 @@ llvm::Function* Emitter::valueBoxFreeThunk() {
 
 llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // #401 / stdlib §4.8: only a BORROWING Dictionary<K,V> whose value type V is
-    // a RECORD stores a heap box per value (the encode in
-    // LlvmBackend_{Calls,Assign}.cpp boxes exactly `valRec && isStructTy()`); its
-    // disposal must reclaim each surviving box. An OwnedDictionary<K, class>
-    // routes through owningDictValueDisposer instead (#394: dispose+free a class
-    // object), and a borrowing Dictionary with a scalar/string value stores no
-    // box (the value is inttoptr'd or is the pointer itself) — both return null
-    // here, so the value box is never freed twice. The record check mirrors the
-    // encode's broad test (any record declaration, equality-bearing or not), NOT
-    // the narrower recordTypeOfRef, so it matches every boxed value exactly.
+    // a RECORD or a NULLABLE VALUE TYPE stores a heap box per value (the encode in
+    // LlvmBackend_{Calls,Assign}.cpp boxes exactly `(valRec || valNullableVal) &&
+    // isStructTy()`); its disposal must reclaim each surviving box. An
+    // OwnedDictionary<K, class> routes through owningDictValueDisposer instead
+    // (#394: dispose+free a class object), and a borrowing Dictionary with a
+    // scalar/string value stores no box (the value is inttoptr'd or is the pointer
+    // itself) — both return null here, so the value box is never freed twice.
+    // The record check mirrors the encode's broad test (any record declaration,
+    // equality-bearing or not), NOT the narrower recordTypeOfRef, so it matches
+    // every boxed value exactly.
+    // issue #539 / §7: nullable value types ({i8,T} tagged structs) are also
+    // heap-boxed by encodeValue; their boxes must be freed at Clear/scope-end too.
     if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
         dictTy->astNode->name->parts.empty())
         return nullptr;
@@ -2354,7 +2357,8 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
         valTy && valTy->kind == sema::TypeRef::Kind::Named &&
         valTy->declaration &&
         valTy->declaration->kind == ast::TypeDeclKind::Record;
-    if (!valIsRecord) return nullptr;
+    bool valIsNullableVal = valTy && isNullableValueTy(valTy);
+    if (!valIsRecord && !valIsNullableVal) return nullptr;
     return valueBoxFreeThunk();
 }
 
