@@ -3599,10 +3599,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     }
 
     // Pre-determine return type from sema's exprType of the body.
+    // retSemaTy tracks the sema TypeRef that SET retTy (used below for
+    // nullable-value promotion in the expr-body emit path — fix #541 / §7).
     llvm::Type* retTy = i32();
+    const sema::TypeRef* retSemaTy = nullptr;
     if (lam.exprBody) {
-        if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody))
+        if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody)) {
             retTy = lowerTypeRef(rt);
+            retSemaTy = rt;
+        }
     } else {
         // BUG-L3 / §27: for block-body lambdas the return type is NOT the
         // expression-body type (there is none) but the sema-inferred funcReturn
@@ -3617,7 +3622,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             if (lamTy->kind == sema::TypeRef::Kind::Function &&
                 lamTy->funcReturn) {
                 llvm::Type* inferred = lowerTypeRef(lamTy->funcReturn);
-                if (inferred != i32()) retTy = inferred;
+                if (inferred != i32()) {
+                    retTy = inferred;
+                    retSemaTy = lamTy->funcReturn;
+                }
             }
         }
     }
@@ -3626,7 +3634,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     if (retTy == i32() && expectedFunctionType_ &&
         expectedFunctionType_->funcReturn) {
         llvm::Type* expected = lowerTypeRef(expectedFunctionType_->funcReturn);
-        if (expected != i32()) retTy = expected;
+        if (expected != i32()) {
+            retTy = expected;
+            retSemaTy = expectedFunctionType_->funcReturn;
+        }
     }
     // Also try to resolve via genericSubst_ when the sema return type is
     // an unresolved named generic param (e.g. C in Curried<A,B,C>).
@@ -3636,8 +3647,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 rt->astNode && rt->astNode->name &&
                 rt->astNode->name->parts.size() == 1) {
                 auto sit = genericSubst_.find(rt->astNode->name->parts[0]);
-                if (sit != genericSubst_.end() && sit->second != i32())
+                if (sit != genericSubst_.end() && sit->second != i32()) {
                     retTy = sit->second;
+                    // retSemaTy stays the unresolved generic ref — no
+                    // nullable-value wrap needed for generic param types.
+                }
             }
         }
     }
@@ -3841,8 +3855,41 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     if (lam.exprBody) {
         llvm::Value* v = lowerExpr(*lam.exprBody);
         if (!builder_.GetInsertBlock()->getTerminator()) {
-            if (v && !retTy->isVoidTy()) builder_.CreateRet(v);
-            else builder_.CreateRetVoid();
+            if (v && !retTy->isVoidTy()) {
+                // fix #541 / §7.1: when the lambda's expected return type is a
+                // NULLABLE VALUE TYPE (`T?` → `{i8 hasValue; T value}`) but the
+                // body expression lowered to the bare underlying `T` (or a
+                // narrower numeric that sema widened — e.g. `int` literal in
+                // `double?` context), promote the value exactly as
+                // `var x: T? := <nonnull>` does — using wrapNullableValue
+                // (hasValue=1).  The `null` pointer literal lowers to a
+                // ConstantPointerNull (ptr-typed); map that to the all-zero
+                // tagged-null struct instead.  Without this promotion the `ret`
+                // instruction carries a bare (possibly mistyped) value into a
+                // `{i8,T}`-returning function, which the LLVM verifier rejects.
+                // per §7.1 / §7.2.
+                if (retSemaTy && isNullableValueTy(retSemaTy) &&
+                    v->getType() != retTy) {
+                    auto* expectedSt = nullableValueStructTy(retSemaTy);
+                    if (v->getType()->isPointerTy() &&
+                        llvm::isa<llvm::ConstantPointerNull>(v)) {
+                        v = nullableValueNull(retSemaTy);
+                    } else {
+                        llvm::Type* payloadTy = expectedSt->getElementType(1);
+                        // Apply numeric widening (§5.1: int→double etc.) before
+                        // wrapping, mirroring coerceNumericToType in
+                        // lowerLocalDecl.  This handles `() => 3` in double?
+                        // context where the literal is i32 but the payload is f64.
+                        if (v->getType() != payloadTy)
+                            v = coerceNumericToType(v, payloadTy);
+                        if (v->getType() == payloadTy)
+                            v = wrapNullableValue(retSemaTy, v);
+                    }
+                }
+                builder_.CreateRet(v);
+            } else {
+                builder_.CreateRetVoid();
+            }
         }
     } else {
         lowerScopedBlock(lam.stmts);
