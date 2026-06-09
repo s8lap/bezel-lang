@@ -377,6 +377,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_nullable_read_544_test.cpp
     codegen/lambda_nullable_return_541_test.cpp
     codegen/lambda_nullable_cases_543_test.cpp
+    codegen/closure_call_nullable_param_557_test.cpp
     codegen/record_named_args_540_test.cpp
     codegen/in_operator_collection_551_test.cpp
 

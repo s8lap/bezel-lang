@@ -5828,6 +5828,35 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         for (std::size_t ai = 1; ai < args.size(); ++ai) {
             llvm::Type* declTy = (ai < allArgTys.size()) ? allArgTys[ai] : nullptr;
             if (!declTy || args[ai]->getType() == declTy) continue;
+            // per §7.5 / §22.1: if the declared parameter is a nullable value
+            // type (T?) and the actual argument is the bare T (a plain scalar
+            // or record value), promote it to {i8=1, T} — the same promotion
+            // that regular (non-closure) call sites perform via the CG-nullable
+            // block in lowerCallArgs (LlvmBackend_Assign.cpp ~L1673).
+            // pi = ai - 1 maps from the args slot (which has +1 for env_ptr)
+            // back to the funcParams index.
+            {
+                std::size_t pi = ai - 1;
+                if (pi < rt->funcParams.size() && rt->funcParams[pi].type) {
+                    // funcParams[pi].type is already a resolved sema::TypeRef*.
+                    const sema::TypeRef* formalTy = rt->funcParams[pi].type;
+                    if (isNullableValueTy(formalTy)) {
+                        auto* expectedSt = nullableValueStructTy(formalTy);
+                        if (args[ai]->getType() != expectedSt) {
+                            if (args[ai]->getType()->isPointerTy() &&
+                                llvm::isa<llvm::ConstantPointerNull>(
+                                    args[ai])) {
+                                args[ai] = nullableValueNull(formalTy);
+                            } else if (args[ai]->getType() ==
+                                       expectedSt->getElementType(1)) {
+                                args[ai] = wrapNullableValue(formalTy,
+                                                             args[ai]);
+                            }
+                        }
+                        continue;  // type is now correct; skip numeric coercions
+                    }
+                }
+            }
             if (declTy->isIntegerTy() && args[ai]->getType()->isFloatingPointTy())
                 args[ai] = builder_.CreateFPToSI(args[ai], declTy);
             else if (declTy->isFloatingPointTy() && args[ai]->getType()->isIntegerTy())
