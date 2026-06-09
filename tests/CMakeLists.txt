@@ -372,6 +372,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_values_iter_537_test.cpp
     codegen/dict_literal_contexts_538_test.cpp
     codegen/dict_nullable_value_539_test.cpp
+    codegen/dict_nullable_read_544_test.cpp
     codegen/lambda_nullable_return_541_test.cpp
     codegen/record_named_args_540_test.cpp
 
