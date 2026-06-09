@@ -132,10 +132,47 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (lowerCollectionIndexerCompound(*as)) return false;
             }
             llvm::Type* elemTy = nullptr;
-            llvm::Value* addr = lvalueAddr(*as->target, elemTy);
-            if (!addr) return false;
-            llvm::Value* rhs = lowerExpr(*as->value);
-            if (!rhs) return false;
+            llvm::Value* addr = nullptr;
+            llvm::Value* rhs = nullptr;
+            // #579 / §27.5: a recursive lambda assigned to a local refers to
+            // that very local in its body — `counter := (n) => ... counter(n-1)`.
+            // Lowering the RHS lambda BOXES the captured `counter` slot: it
+            // promotes the slot to a shared heap cell and REBINDS locals_[decl]
+            // to the new cell-holder alloca (so the closure's env and all later
+            // reads route through the cell). If we compute the LHS address FIRST
+            // (the normal order below), lvalueAddr resolves `counter` to the
+            // ORIGINAL un-boxed slot; the subsequent store writes the finalized
+            // closure into that stale slot while the captured cell still holds
+            // the pre-box garbage. The lambda then calls through the cell and
+            // dereferences the garbage pointer → SIGSEGV.
+            //
+            // Fix: for a plain `:=` to a local/param identifier (an lvalue with
+            // NO side effects of its own — the only "effect" is selecting the
+            // storage slot, which does not depend on the RHS value), lower the
+            // RHS FIRST so any capture-induced boxing/rebinding completes, then
+            // resolve the LHS address through the (now-rebound) slot — which
+            // boxedStorage routes to the shared cell. The store then reaches the
+            // same cell the closure captured. Observationally identical to the
+            // spec eval order for a side-effect-free identifier target.
+            //
+            // Restricted to `:=` (a plain store); compound `OP=` / `??=` keep
+            // the address-then-RHS order so their read-modify-write reads the
+            // current value first. Field / static-field / index targets keep the
+            // natural left-to-right order (their LHS may have side effects, and
+            // they cannot be the lambda being initialized for the first time).
+            if (as->op == ":=" &&
+                dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
+                localSlot(*as->target) != nullptr) {
+                rhs = lowerExpr(*as->value);
+                if (!rhs) return false;
+                addr = lvalueAddr(*as->target, elemTy);
+                if (!addr) return false;
+            } else {
+                addr = lvalueAddr(*as->target, elemTy);
+                if (!addr) return false;
+                rhs = lowerExpr(*as->value);
+                if (!rhs) return false;
+            }
             // §8.6: a value-typed RHS assigned to an Object/interface lvalue is
             // boxed (so a later is/as/dispatch on the target sees a box). Keyed
             // off the target's static type; a no-op for reference RHS (#399).
