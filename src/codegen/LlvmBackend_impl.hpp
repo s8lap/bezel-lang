@@ -246,8 +246,8 @@ public:
         for (auto& [sym, fn] : ctorFns_) {
             emitConstructorBody(sym, fn);
         }
-        for (auto& [cs, fn] : staticCtors_) {
-            emitStaticConstructorBody(cs, fn);
+        for (auto& e : staticCtors_) {
+            emitStaticConstructorBody(e.cs, e.type, e.fn);
         }
         for (auto& [ts, fn] : disposerFns_) {
             // §2.5 (issue #328 item 1): an IMPORTED class's disposerFns_ entry is
@@ -335,11 +335,27 @@ private:
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
     std::unordered_map<sema::ConstructorSymbol*, llvm::Function*> ctorFns_;
-    // CG47: static constructors (§22.7) — `void()` functions run once before
-    // `main` (in declaration order). Kept ordered (not a map) for a stable
+    // CG47 / fix #582 / §22.13: one entry per static-initialisation unit that
+    // must run before `main`.  Kept ordered (declaration order) for a stable
     // run order.
-    std::vector<std::pair<sema::ConstructorSymbol*, llvm::Function*>>
-        staticCtors_;
+    //
+    // `cs` is non-null for a user-written static constructor; null for a
+    // synthesized field-init-only function (see fix #582 / §22.13 — a type
+    // that has non-constant static field initializers but no explicit static
+    // constructor gets a synthesized `bz$<T>$sfinit` here).  `type` is always
+    // set and drives field-initialiser emission in emitStaticConstructorBody.
+    //
+    // Within a single type, the synthesized sfinit entry (if any) is inserted
+    // BEFORE the user cctor entry (if any), so field initializers run first
+    // per §22.13 ("static fields are initialized in textual declaration order
+    // … the static constructor, if any, runs after all static field
+    // initializers complete").
+    struct StaticCtorEntry {
+        sema::ConstructorSymbol*    cs;    // null = synthesized field-init-only
+        const sema::TypeSymbol*     type;  // always set
+        llvm::Function*             fn;
+    };
+    std::vector<StaticCtorEntry> staticCtors_;
 
     // CG11: enclosing-loop branch targets for `break`/`continue` (§A.6).
     // `continue` jumps to `continueTarget` (the loop's condition block),
@@ -2994,10 +3010,17 @@ private:
     // `this`); its params bind to the ConstructorSymbol's ParameterSymbols.
     // Field initializers run in `lowerNew` before the call, so the body
     // only runs the explicit statements. Returns void.
-    // CG47: emit a static constructor body (§22.7). No `this`, no
-    // parameters, no base/this chain — it runs the body statements once to
-    // initialize the type's static state.
+    // CG47 / fix #582 / §22.13: emit a static initialisation unit.
+    //   cs   — user-written ConstructorSymbol, or null for a synthesized
+    //          field-init-only function.
+    //   type — the owning TypeSymbol; used to find static fields (always set).
+    //   fn   — the void() LLVM function to populate.
+    // Emits, in order:
+    //   1. Runtime stores for every non-constant static field initializer of
+    //      `type` (in textual declaration order, per §22.13).
+    //   2. The user-written static constructor body (only when cs != null).
     void emitStaticConstructorBody(sema::ConstructorSymbol* cs,
+                                   const sema::TypeSymbol* type,
                                    llvm::Function* fn);
 
     void emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* fn);
