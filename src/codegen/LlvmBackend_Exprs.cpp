@@ -4429,9 +4429,31 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     llvm::Value* src = lowerExpr(*we.source);
     if (!src) return nullptr;
     auto* rt = ctx_.exprType(*we.source);
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
-        return src;
-    const sema::TypeSymbol* t = rt->declaration;
+    const sema::TypeSymbol* t = nullptr;
+    if (rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
+        t = rt->declaration;
+    } else {
+        // #575 / §9.5 / §22.3: `this` inside a record instance method has no
+        // sema exprType (the member-access resolver uses currentType_ directly,
+        // so ExprTypecheck leaves `this` unannotated for named-type methods).
+        // When the source is the receiver pointer (src == currentThis_), recover
+        // the owner TypeSymbol by reverse-looking currentFn_ in methodFns_ so
+        // the record `with`-copy path can determine the struct layout and field
+        // indices. Without this, lowerWith returns the raw pointer and the
+        // method emits `ret ptr` where `ret %record.T` is expected →
+        // IR verification failure.
+        if (src == currentThis_ && currentFn_) {
+            for (const auto& [ms, fn] : methodFns_) {
+                if (fn == currentFn_ && ms->parent &&
+                    ms->parent->kind == ast::TypeDeclKind::Record) {
+                    t = ms->parent;
+                    rt = nullptr;  // no concrete TypeRef; use method's own subst
+                    break;
+                }
+            }
+        }
+        if (!t) return src;
+    }
     const bool isRecord = t->kind == ast::TypeDeclKind::Record;
     // issue #462 / §9.5 / §14.1: a GENERIC record `with`-copy must use the
     // SPECIALIZED struct layout for the source's instantiation, not the i32
@@ -4453,7 +4475,17 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     llvm::Value* base = src;
     if (isRecord) {
         base = entryAlloca(st);
-        builder_.CreateStore(src, base);
+        // #575 / §9.5 / §22.3: when `this with { … }` is used inside a record
+        // instance method, lowerExpr(this) returns currentThis_ which is a
+        // POINTER to the record (CG29 — record methods receive `this` as ptr,
+        // §9.4). A regular non-this record source is already a struct VALUE.
+        // Load the struct from the pointer before spilling to the copy alloca;
+        // storing a ptr into a struct-typed alloca would corrupt the copy and
+        // produce a "return type does not match" IR verification failure.
+        llvm::Value* srcVal = src->getType()->isPointerTy()
+                              ? builder_.CreateLoad(st, src, "this.val")
+                              : src;
+        builder_.CreateStore(srcVal, base);
     }
     std::vector<const sema::Symbol*> storage;
     collectInstanceStorage(t, storage);
