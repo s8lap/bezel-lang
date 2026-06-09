@@ -2824,6 +2824,27 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
             }
             continue;
         }
+        // #538 / stdlib §4.8: dictionary literal `["k1":v1, "k2":v2, …]` as a
+        // field initializer.  Same root cause as #534 (local-decl context): the
+        // old `!cl->isDict` guard caused dict literals to fall through to
+        // lowerExpr, which returns null for CollectionLiteralExpr → field left
+        // null → crash on first dict access.  Route through the same
+        // materializeHeapDictLiteral helper that #534 wired for local-decls.
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
+            cl && cl->isDict && !cl->keys.empty()) {
+            const sema::TypeRef* fieldRt = nullptr;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
+            if (fieldRt) {
+                if (llvm::Value* tbl = materializeHeapDictLiteral(cl, fieldRt)) {
+                    builder_.CreateStore(
+                        tbl, builder_.CreateStructGEP(st, obj, idxIt->second));
+                    continue;
+                }
+            }
+        }
         llvm::Value* v = lowerExpr(*init);
         if (!v) continue;
         // §5.1: an int initializer for a wider numeric field is implicitly
