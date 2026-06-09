@@ -6127,7 +6127,24 @@ bool Emitter::usingVarIsMovedClassObject(const ast::LocalDecl* ld) {
     // The moved value's type is the field/slot element type; require a
     // class/interface object (records and value types free their own storage
     // and never reach the dynamic-dispose path).
-    return isClassOrInterfaceRef(ctx_.exprType(*ld->initializer));
+    const sema::TypeRef* rt = ctx_.exprType(*ld->initializer);
+    if (isClassOrInterfaceRef(rt)) return true;
+    // #572 / §28.3 / §14.1: `using var x := move item` where `item` has a
+    // generic-type-parameter type (declaration == nullptr, single-part name).
+    // The raw TypeRef has no declaration so isClassOrInterfaceRef returns false.
+    // Resolve through genericSubstSemaTy_ to the concrete substituted TypeRef
+    // and test it instead.  Ownership has already transferred from `item` to
+    // `x` via move (§28.8.1); registering disposal on `x` only, not on `item`,
+    // avoids double-dispose.
+    if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+        rt->declaration == nullptr && !genericSubstSemaTy_.empty() &&
+        rt->astNode && rt->astNode->name &&
+        rt->astNode->name->parts.size() == 1) {
+        auto it = genericSubstSemaTy_.find(rt->astNode->name->parts[0]);
+        if (it != genericSubstSemaTy_.end())
+            return isClassOrInterfaceRef(it->second);
+    }
+    return false;
 }
 
 
