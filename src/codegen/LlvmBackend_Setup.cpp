@@ -4000,6 +4000,83 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                    tt->primitive == sema::PrimitiveType::String;
         }
     }
+    // #429 (RETURN-escape category) / §4.6 / §28.9: a CALL to a user-defined,
+    // locally-compiled method whose declared return type is `string` hands the
+    // caller EXACTLY +1 (the callee's ReturnStmt lowering mints it). So such a
+    // call is a +1 producer at the call site: a bound local TRANSFERS the single
+    // reference (no extra retain) and releases it at scope end if non-escaping,
+    // and a string-field store TRANSFERS it into the field. Builtin stdlib string
+    // methods and cross-module imported methods are EXCLUDED (see the helper).
+    if (isUserMethodStringReturnCall(init)) return true;
+    return false;
+}
+
+
+// #429 (RETURN-escape category) / §4.6 / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. Recognize a CallExpr whose resolved callee is a
+// USER-DEFINED, LOCALLY-COMPILED MethodSymbol (backed by an ast::MethodDecl, not
+// imported, not an operator) and whose declared return type is (non-nullable)
+// `string`. Such a call goes through THIS module's ReturnStmt lowering, which
+// mints exactly +1 for the returned string — so the caller owns that single
+// reference. Cross-module imported methods (their callee does NOT run our
+// ReturnStmt minting) and builtin stdlib string methods (no resolved
+// MethodSymbol — matched structurally in tryLowerStringMethod) are excluded,
+// keeping their prior borrow-with-leak handling untouched.
+bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
+    auto* call = dynamic_cast<const ast::CallExpr*>(init);
+    if (!call || !call->callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
+    if (!ms) return false;                         // builtin string method / not a method
+    if (ms->isOperator) return false;              // operator overloads excluded
+    if (ctx_.isImported(ms)) return false;         // cross-module: deferred (no local mint)
+    // Must be a locally-compiled body — backed by an ast::MethodDecl whose body
+    // codegen lowers (so its ReturnStmt runs the +1 mint). An abstract/interface
+    // method's runtime target is some override that IS compiled here and also
+    // mints +1 on return, so a declared-string virtual/abstract call is fine; we
+    // only require a MethodDecl with a `string` return type.
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || !md->returnType) return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+    return rt && !rt->nullable &&
+           rt->kind == sema::TypeRef::Kind::Primitive &&
+           rt->primitive == sema::PrimitiveType::String;
+}
+
+
+// #429 (RETURN-escape category) / §4.6 / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. A returned IDENTIFIER names a non-nullable string LOCAL
+// that owns a +1 in its slot when EITHER it was retained at bind (a borrow local
+// in stringBorrowAll_) OR its initializer is a +1 producer (the producer's +1
+// was transferred into the slot — armStringLocalRefcount left it un-retained but
+// the slot holds the producer's single reference). In both cases the return must
+// TRANSFER that +1 to the caller rather than mint a second one (which would leak,
+// since the escaped local is not released at scope end). Gated on the analyzed
+// function so the eligibility sets describe THIS body (a lambda/thunk body whose
+// locals were not walked returns false here → its returns fall back to the
+// retain path, which is safe — at worst a leak, never a UAF/double-free).
+bool Emitter::returnedStringLocalOwnsPlusOne(const ast::Expr* e) const {
+    if (currentFn_ != stringReleaseEligibleFn_) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (!id) return false;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc || !loc->decl) return false;
+    const void* declNode = static_cast<const void*>(loc->decl);
+    // A borrow local was retained at bind (owns a +1).
+    if (stringBorrowAll_.count(declNode)) return true;
+    // A producer-initialized non-nullable string local transferred the
+    // producer's +1 into its slot. (Borrow locals are exactly stringBorrowAll_;
+    // a non-using string LocalDecl whose initializer is a +1 producer is the
+    // producer case — its +1 lives in the slot whether or not it escapes.)
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (ld && !ld->isUsing && ld->initializer &&
+        isPlusOneStringProducer(ld->initializer.get())) {
+        const sema::TypeRef* lt = nullptr;
+        if (ld->type) lt = ctx_.resolvedType(*ld->type);
+        if (!lt) lt = ctx_.exprType(*ld->initializer);
+        return lt && !lt->nullable &&
+               lt->kind == sema::TypeRef::Kind::Primitive &&
+               lt->primitive == sema::PrimitiveType::String;
+    }
     return false;
 }
 

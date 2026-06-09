@@ -361,6 +361,38 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (v && rs->value && currentReturnTypeNode_)
             v = boxForTarget(v, ctx_.resolvedType(*currentReturnTypeNode_),
                              rs->value.get());
+        // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
+        // declared return type is (non-nullable) `string` mints EXACTLY +1 for
+        // the returned value, transferring ownership of one reference to the
+        // caller. The caller treats the result as a +1 producer
+        // (isPlusOneStringProducer) and balances it with a transfer-then-release,
+        // so the round trip neither leaks (the +1 is released) nor dangles (the
+        // +1 keeps a borrowed value alive past the callee). The value is either
+        // TRANSFERRED (it already carries a +1 the callee owns) or RETAINED (a
+        // pure borrow, so a fresh +1 is minted); bz_string_retain is a no-op on a
+        // sentinel/literal/null. We TRANSFER (no retain) when the returned
+        // expression already owns a +1:
+        //   * a +1 PRODUCER expression (`+`/interpolation/range-slice, or a
+        //     nested string-returning call), whose single reference flows out; or
+        //   * an IDENTIFIER naming a non-nullable string LOCAL that owns a +1 —
+        //     a producer-initialized local (transferred the producer's +1 into
+        //     its slot) or a borrow local (retained +1 at bind, stringBorrowAll_).
+        //     Such a returned local is escaped (escape walk) so it is NOT released
+        //     at scope end, and is excluded from disposal by the retSlot path
+        //     below — its single +1 flows out to the caller instead of leaking.
+        // Otherwise (a param read, a field read `this.f`, a literal, an alias not
+        // owning a +1) the value is a BORROW → RETAIN to mint the +1.
+        if (v && rs->value && currentReturnTypeNode_ &&
+            v->getType()->isPointerTy()) {
+            const sema::TypeRef* declRet =
+                ctx_.resolvedType(*currentReturnTypeNode_);
+            if (declRet && !declRet->nullable &&
+                declRet->kind == sema::TypeRef::Kind::Primitive &&
+                declRet->primitive == sema::PrimitiveType::String &&
+                !isPlusOneStringProducer(rs->value.get()) &&
+                !returnedStringLocalOwnsPlusOne(rs->value.get()))
+                emitStringRetain(v);
+        }
         // §28.3 ownership transfer: if the return expression is a bare
         // `using var` local, exclude it from disposal — ownership moves
         // to the caller.  Without this, the local would be freed before
