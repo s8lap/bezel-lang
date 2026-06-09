@@ -1832,6 +1832,24 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                 }
                 genericSubst_ = std::move(newSubst);
             }
+        } else if (targetTy->kind == sema::TypeRef::Kind::Named &&
+                   targetTy->declaration &&
+                   targetTy->declaration != ms->parent &&
+                   !targetTy->genericArgs.empty() &&
+                   !ms->parent->genericParams.empty()) {
+            // §12 / §14 (issue #585): direct access of an INHERITED field
+            // declared on a generic BASE (`ms->parent`) through a derived
+            // instance (`targetTy` == Wrapper<Pt>). The branch above requires
+            // targetTy->declaration == ms->parent, so it does not fire — without
+            // a substitution classStruct(ms->parent) uses the T→i32 template
+            // layout and the GEP/field type are wrong for a non-int base field
+            // (read 0 / garbage). Bind the base's generic params to the concrete
+            // arguments the derived class supplied (walking the base chain).
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(targetTy, ms->parent, ancSubst,
+                                            ancSema))
+                genericSubst_ = std::move(ancSubst);
         }
     }
     if (idxIt == fieldIndex_.end()) {

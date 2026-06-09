@@ -6719,6 +6719,27 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     genericSubst_ = std::move(newSubst);
                     genericSubstSemaTy_ = std::move(newSema);
                 }
+            } else if (recvTy &&
+                       recvTy->kind == sema::TypeRef::Kind::Named &&
+                       recvTy->declaration && recvTy->declaration != ms->parent &&
+                       !recvTy->genericArgs.empty() &&
+                       !ms->parent->genericParams.empty()) {
+                // §12 / §14 (issue #585): an INHERITED method declared on a
+                // generic BASE (`ms->parent`) called on a derived instance
+                // (`recvTy` == Wrapper<string>). The branch above requires
+                // recvTy->declaration == ms->parent, so it does not fire; without
+                // a substitution the inherited method runs as the T→i32 template
+                // and reads a non-int base field at the wrong width (#585). Walk
+                // the base chain to bind the base's generic params to the
+                // concrete arguments the derived class supplied.
+                std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*>
+                    ancSema;
+                if (computeAncestorGenericSubst(recvTy, ms->parent, ancSubst,
+                                                ancSema)) {
+                    genericSubst_ = std::move(ancSubst);
+                    genericSubstSemaTy_ = std::move(ancSema);
+                }
             }
         }
     }
@@ -6910,6 +6931,80 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSemaTy);
     return result;
+}
+
+
+// §12 / §14 (issue #585): see the header comment in LlvmBackend_impl.hpp. Walk
+// the base-class chain from `recvTy`'s declaration up to `ancestor`, resolving
+// each level's base type-arguments through the level below, then fill the
+// ancestor's generic-param substitution maps.
+bool Emitter::computeAncestorGenericSubst(
+        const sema::TypeRef* recvTy, const sema::TypeSymbol* ancestor,
+        std::unordered_map<std::string_view, llvm::Type*>& outSubst,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& outSema) {
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+        !recvTy->declaration || !ancestor || ancestor->genericParams.empty())
+        return false;
+    const sema::TypeSymbol* cur = recvTy->declaration;
+    if (cur == ancestor) return false;  // declared directly on receiver class
+
+    // curArgs: the concrete TypeRefs bound to `cur`'s generic params at this
+    // level. Seeded from the receiver's own generic args, then re-derived for
+    // each base level by resolving the base ref's args through this map.
+    std::unordered_map<std::string_view, const sema::TypeRef*> curArgs;
+    auto* curTd = dynamic_cast<const ast::TypeDecl*>(cur->decl);
+    if (!curTd || curTd->genericParams.size() != recvTy->genericArgs.size())
+        return false;
+    for (std::size_t gi = 0; gi < curTd->genericParams.size(); ++gi)
+        curArgs[curTd->genericParams[gi].name] = recvTy->genericArgs[gi];
+
+    // Walk up the class base chain until we reach `ancestor`.
+    while (cur && cur != ancestor) {
+        const sema::TypeSymbol* base = baseClassOf(cur);
+        if (!base) return false;  // ancestor not on the chain
+        // Find the base TypeRef (carries the base's generic args expressed in
+        // terms of `cur`'s generic params, e.g. Container<T_cur>).
+        const sema::TypeRef* baseRef = nullptr;
+        for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi) {
+            if (cur->baseTypes[bi] == base) {
+                baseRef = (bi < cur->baseTypeRefs.size())
+                              ? cur->baseTypeRefs[bi] : nullptr;
+                break;
+            }
+        }
+        // Resolve each of the base's generic args through curArgs (a bare
+        // generic-param ref `T` → its concrete binding; an already-concrete
+        // arg passes through). If the base has params but no usable baseRef,
+        // we cannot resolve — bail.
+        std::unordered_map<std::string_view, const sema::TypeRef*> nextArgs;
+        auto* baseTd = dynamic_cast<const ast::TypeDecl*>(base->decl);
+        if (!base->genericParams.empty()) {
+            if (!baseRef || !baseTd ||
+                baseTd->genericParams.size() != baseRef->genericArgs.size())
+                return false;
+            for (std::size_t gi = 0; gi < baseTd->genericParams.size(); ++gi) {
+                const sema::TypeRef* arg = baseRef->genericArgs[gi];
+                if (arg && arg->kind == sema::TypeRef::Kind::Named &&
+                    !arg->declaration && arg->astNode && arg->astNode->name &&
+                    arg->astNode->name->parts.size() == 1) {
+                    auto it = curArgs.find(arg->astNode->name->parts[0]);
+                    if (it != curArgs.end()) arg = it->second;
+                }
+                nextArgs[baseTd->genericParams[gi].name] = arg;
+            }
+        }
+        cur = base;
+        curArgs = std::move(nextArgs);
+    }
+    if (cur != ancestor) return false;
+    // curArgs now holds ancestor's param-name → concrete TypeRef.
+    for (const sema::Symbol* gp : ancestor->genericParams) {
+        auto it = curArgs.find(gp->name);
+        if (it == curArgs.end() || !it->second) return false;
+        outSubst[gp->name] = lowerTypeRef(it->second);
+        outSema[gp->name] = it->second;
+    }
+    return !outSubst.empty();
 }
 
 

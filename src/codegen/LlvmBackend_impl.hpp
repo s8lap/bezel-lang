@@ -3209,6 +3209,18 @@ private:
     // recurse to its base so a deeper ctor still runs.
     void emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj);
 
+    // §12 / §14 (issue #585): inline a constructor's body INTO the current
+    // function with the active generic substitution, having already bound
+    // `this` (= obj) and its parameters in paramSlots_. Runs the leading
+    // `base(...)`/`this(...)` chain (or the implicit base) first, then the
+    // remaining body. Used both for the most-derived ctor at a generic `new`
+    // site and, recursively, for a generic base ctor reached via `base(...)`
+    // — the base ctor must be inlined (not called as the T→i32 template
+    // function) so its field stores use the concrete substituted layout and
+    // a non-int `T` argument matches the field type. Caller saves/restores
+    // currentThis_, locals_, paramSlots_, and the unwind state.
+    void inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj);
+
     // Bind each parameter to an entry-block alloca. When `hasThis`, the
     // first arg is `this` (kept as a value in currentThis_, not a slot —
     // it isn't reassignable). Remaining args map to `paramSyms`.
@@ -4333,6 +4345,25 @@ private:
                                 bool baseQualified,
                                 const std::vector<const ast::Expr*>* argExprs
                                     = nullptr);
+
+    // §12 / §14 (issue #585): compute the concrete generic substitution for an
+    // ANCESTOR generic class reached through inheritance from `recvTy`. When a
+    // method is INHERITED — declared on a generic base (`ms->parent` ==
+    // `ancestor`) but called on a derived instance (`recvTy` == `Wrapper<string>`)
+    // — the receiver-class substitution block only binds the derived class's
+    // params, leaving the ancestor's `T` unbound so the inherited method runs as
+    // the T→i32 template (mislaying a non-int base field, the read half of #585).
+    // Walks the base-class chain from `recvTy`'s declaration up to `ancestor`,
+    // resolving each level's base type-arguments through the level below, and
+    // fills `outSubst` (param-name → LLVM type) and `outSema` (param-name →
+    // concrete TypeRef) for `ancestor`'s generic params. Returns true iff
+    // `ancestor` is a generic class reachable from `recvTy` and the chain
+    // resolved every parameter. A no-op (returns false) when the method is
+    // declared directly on the receiver's class (the existing block handles it).
+    bool computeAncestorGenericSubst(
+        const sema::TypeRef* recvTy, const sema::TypeSymbol* ancestor,
+        std::unordered_map<std::string_view, llvm::Type*>& outSubst,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& outSema);
 
     // CG-generic: compile a specialized version of a block-body method with
     // the current genericSubst_ applied to all types.  The specialized
