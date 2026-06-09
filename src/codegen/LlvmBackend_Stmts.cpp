@@ -320,6 +320,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     // operator method and write the result back:
     //   x++ ≡ x := T.operator++(x)   (per §17.6).
     // For built-in numeric operands keep the existing x := x + 1 path.
+    //
+    // fix #587 / §20.5: `++`/`--` on a computed property or user-defined indexer
+    // slot must call the setter to write the incremented value back.
+    // The lvalueAddr fallback returns null for these targets (no backing alloca),
+    // so the store was silently dropped. After a null from lvalueAddr two additional
+    // paths handle the write-back:
+    //   (a) Block-setter computed property (`obj.P++`): mirrors lowerPropertyCompound
+    //       — read via getter (lowerExpr), compute ±1, write via lowerPropertySetValue.
+    //   (b) User-defined indexer (`v[i]++`): mirrors lowerIndexerCompound — evaluate
+    //       receiver and index once, call getter, compute ±1, call setter.
     if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (inc->target) {
             // §25: look for a user-defined operator on the target's Named type.
@@ -364,6 +374,219 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         inc->op == "++" ? "+" : "-", cur, one, fp,
                         isUnsignedTargetExpr(*inc->target));
                     if (res) builder_.CreateStore(res, addr);
+                }
+            } else {
+                // fix #587 / §20.5: lvalueAddr returned null — the target is either
+                // a computed property with a block setter or a user-defined indexer.
+                // Both require a getter read + arithmetic + setter write-back.
+                const std::string binOp = (inc->op == "++") ? "+" : "-";
+                // --- (a) Block-setter computed property: `obj.P++` / `obj.P--` ---
+                // mirrors lowerPropertyCompound (§22.9): read via getter expression,
+                // compute new value, write via setter body.
+                if (computedSetterOf(*inc->target)) {
+                    llvm::Value* cur = lowerExpr(*inc->target);  // getter read
+                    if (cur) {
+                        bool fp = cur->getType()->isFloatingPointTy();
+                        llvm::Value* one =
+                            fp ? llvm::cast<llvm::Value>(
+                                     llvm::ConstantFP::get(cur->getType(), 1.0))
+                               : llvm::cast<llvm::Value>(
+                                     llvm::ConstantInt::get(cur->getType(), 1));
+                        llvm::Value* res = emitCompoundOp(
+                            binOp, cur, one, fp,
+                            isUnsignedTargetExpr(*inc->target));
+                        if (res) lowerPropertySetValue(*inc->target, res);
+                    }
+                // --- (b) User-defined indexer: `v[i]++` / `v[i]--` ---
+                // mirrors lowerIndexerCompound (§20 / §23.4): evaluate receiver and
+                // index once, call getter, compute new value, call setter.
+                } else if (auto* ix =
+                               dynamic_cast<const ast::IndexExpr*>(
+                                   inc->target.get())) {
+                    if (ix->target && !ix->indices.empty() &&
+                        ix->indices[0].value) {
+                        auto* targetTy2 = ctx_.exprType(*ix->target);
+                        if (targetTy2 &&
+                            targetTy2->kind == sema::TypeRef::Kind::Named &&
+                            targetTy2->declaration) {
+                            auto* ps = findIndexer(targetTy2->declaration);
+                            auto* pd = ps ? dynamic_cast<const ast::PropertyDecl*>(
+                                               ps->decl) : nullptr;
+                            if (ps && pd) {
+                                // Locate getter and setter bodies.
+                                const ast::Expr* getterExpr = nullptr;
+                                const ast::PropertyAccessor* getterBlock = nullptr;
+                                if (pd->bodyKind ==
+                                        ast::PropertyBodyKind::Expression &&
+                                    pd->exprBody)
+                                    getterExpr = pd->exprBody.get();
+                                for (const auto& a : pd->accessors) {
+                                    if (!a.isSet) {
+                                        if (a.bodyKind ==
+                                            ast::PropertyAccessorBodyKind::Block)
+                                            getterBlock = &a;
+                                        else if (a.exprBody)
+                                            getterExpr = a.exprBody.get();
+                                        break;
+                                    }
+                                }
+                                const ast::Expr* setterExpr = nullptr;
+                                const std::vector<std::unique_ptr<ast::Stmt>>*
+                                    setterStmts = nullptr;
+                                for (const auto& a : pd->accessors) {
+                                    if (a.isSet) {
+                                        if (a.exprBody)
+                                            setterExpr = a.exprBody.get();
+                                        else if (!a.stmts.empty())
+                                            setterStmts = &a.stmts;
+                                        break;
+                                    }
+                                }
+                                if ((getterExpr || getterBlock) &&
+                                    (setterExpr || setterStmts)) {
+                                    // Evaluate receiver once.
+                                    llvm::Value* obj = lowerExpr(*ix->target);
+                                    if (obj) {
+                                        // Spill each index param once; reused by
+                                        // both getter and setter to avoid double
+                                        // evaluation (§23.4 single-evaluation).
+                                        std::vector<llvm::AllocaInst*> idxSlots;
+                                        idxSlots.reserve(ps->indexerParams.size());
+                                        bool ok = true;
+                                        for (std::size_t k = 0;
+                                             k < ps->indexerParams.size() &&
+                                             k < ix->indices.size(); ++k) {
+                                            if (!ix->indices[k].value) {
+                                                idxSlots.push_back(nullptr);
+                                                ok = false; break;
+                                            }
+                                            llvm::Value* av =
+                                                lowerExpr(*ix->indices[k].value);
+                                            if (!av) {
+                                                idxSlots.push_back(nullptr);
+                                                ok = false; break;
+                                            }
+                                            auto* sl = entryAlloca(av->getType());
+                                            builder_.CreateStore(av, sl);
+                                            idxSlots.push_back(sl);
+                                        }
+                                        if (ok) {
+                                            // --- Call getter ---
+                                            llvm::Value* cur = nullptr;
+                                            if (getterBlock) {
+                                                llvm::Value* objPtr = obj;
+                                                if (!objPtr->getType()
+                                                         ->isPointerTy()) {
+                                                    auto* tmp = entryAlloca(
+                                                        obj->getType());
+                                                    builder_.CreateStore(obj, tmp);
+                                                    objPtr = tmp;
+                                                }
+                                                std::vector<llvm::Value*> cArgs;
+                                                cArgs.push_back(objPtr);
+                                                for (auto* sl : idxSlots) {
+                                                    if (!sl) { ok = false; break; }
+                                                    cArgs.push_back(
+                                                        builder_.CreateLoad(
+                                                            sl->getAllocatedType(),
+                                                            sl));
+                                                }
+                                                if (ok) {
+                                                    llvm::Function* fn =
+                                                        ensureIndexerBlockGetter(
+                                                            pd, getterBlock, ps);
+                                                    cur = builder_.CreateCall(
+                                                        fn->getFunctionType(), fn,
+                                                        cArgs);
+                                                    emitPendingCheck();
+                                                }
+                                            } else {
+                                                llvm::Value* savedThis =
+                                                    currentThis_;
+                                                auto savedLocals = locals_;
+                                                auto savedParams = paramSlots_;
+                                                auto savedSubst =
+                                                    setupReceiverGenericSubst(
+                                                        ix->target.get(),
+                                                        ps->parent);
+                                                currentThis_ = obj;
+                                                locals_.clear();
+                                                paramSlots_.clear();
+                                                for (std::size_t k = 0;
+                                                     k < ps->indexerParams.size() &&
+                                                     k < idxSlots.size(); ++k) {
+                                                    if (!idxSlots[k]) continue;
+                                                    paramSlots_[ps->indexerParams[k]] =
+                                                        idxSlots[k];
+                                                }
+                                                cur = lowerExpr(*getterExpr);
+                                                currentThis_ = savedThis;
+                                                locals_ = std::move(savedLocals);
+                                                paramSlots_ =
+                                                    std::move(savedParams);
+                                                genericSubst_ =
+                                                    std::move(savedSubst);
+                                            }
+                                            // --- Compute ±1 and call setter ---
+                                            if (cur) {
+                                                bool fp =
+                                                    cur->getType()
+                                                        ->isFloatingPointTy();
+                                                llvm::Value* one =
+                                                    fp ? llvm::cast<llvm::Value>(
+                                                             llvm::ConstantFP::get(
+                                                                 cur->getType(),
+                                                                 1.0))
+                                                       : llvm::cast<llvm::Value>(
+                                                             llvm::ConstantInt::get(
+                                                                 cur->getType(), 1));
+                                                llvm::Value* newVal =
+                                                    emitCompoundOp(
+                                                        binOp, cur, one, fp,
+                                                        isUnsignedTargetExpr(
+                                                            *inc->target));
+                                                if (newVal) {
+                                                    // --- Call setter ---
+                                                    llvm::Value* savedThis =
+                                                        currentThis_;
+                                                    auto savedLocals = locals_;
+                                                    auto savedParams = paramSlots_;
+                                                    currentThis_ = obj;
+                                                    locals_.clear();
+                                                    paramSlots_.clear();
+                                                    for (std::size_t k = 0;
+                                                         k < ps->indexerParams
+                                                                 .size() &&
+                                                         k < idxSlots.size();
+                                                         ++k) {
+                                                        if (!idxSlots[k]) continue;
+                                                        paramSlots_[ps->indexerParams[k]] =
+                                                            idxSlots[k];
+                                                    }
+                                                    auto* vslot =
+                                                        entryAlloca(
+                                                            newVal->getType());
+                                                    builder_.CreateStore(newVal,
+                                                                         vslot);
+                                                    locals_[pd] = vslot;
+                                                    if (setterExpr)
+                                                        lowerExpr(*setterExpr);
+                                                    else if (setterStmts)
+                                                        lowerScopedBlock(
+                                                            *setterStmts);
+                                                    currentThis_ = savedThis;
+                                                    locals_ =
+                                                        std::move(savedLocals);
+                                                    paramSlots_ =
+                                                        std::move(savedParams);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
