@@ -225,6 +225,21 @@ public:
         if (ctx_.hasImports()) declareImportedPropertyGetters();
         setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
         declareExterns();  // CG26
+        // #429 (box RETURN + FIELD-STORE category) / §8.6 / §28.9: before any
+        // method bodies are lowered, determine:
+        //   (a) which locally-compiled methods always return boxable value
+        //       sources (boxReturnMethods_) — callers of these treat the result
+        //       as a +1 box producer and may release it at scope end;
+        //   (b) which Object/interface-typed CLASS fields ONLY receive boxable
+        //       value stores across the entire class (boxStorageFields_) —
+        //       emitDisposerCore releases these fields via bz_box_release.
+        // Both analyses must run BEFORE the method body loop so that per-body
+        // collectBoxReleaseEligible (which calls isPlusOneBoxProducer, which
+        // calls isUserMethodBoxReturnCall) sees a populated boxReturnMethods_,
+        // and the disposer (emitted after all method bodies) sees a fully-
+        // populated boxStorageFields_.
+        collectBoxReturnMethods();
+        collectBoxStorageFields();
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }
@@ -3289,10 +3304,100 @@ private:
     // then allocates a fresh rc=1 box wrapper that codegen fully controls — so
     // binding the result to the local CONSUMES that single reference. A reference
     // initializer (a class instance coerced to Object — the #399 path) is NOT a
-    // box producer: boxForTarget is a no-op and no wrapper exists. Used to gate
-    // release eligibility. (Not const: it consults the boxable-value predicates,
-    // which are non-const Emitter members.)
+    // box producer: boxForTarget is a no-op and no wrapper exists.
+    // Also true when the initializer is a call to a method in boxReturnMethods_
+    // (a locally-compiled method whose body always returns boxable value sources —
+    // see isUserMethodBoxReturnCall): such a call's return value was produced by
+    // boxForTarget at the callee's return site and is a fresh rc=1 box. Used to
+    // gate release eligibility. (Not const: it consults the boxable-value
+    // predicates, which are non-const Emitter members.)
     bool isPlusOneBoxProducer(const ast::LocalDecl* ld);
+
+    // #429 (box RETURN category) / §8.6 / §28.9: true when `init` is a call
+    // to a USER-DEFINED, LOCALLY-COMPILED Bezel method whose declared return
+    // type is Object or an interface AND whose body provably always returns
+    // boxable value sources (i.e. all return statements return a boxable value
+    // type, so boxForTarget at the callee's return site always creates a fresh
+    // rc=1 box — see collectBoxReturnMethods). Such a call hands back EXACTLY
+    // +1: the fresh box the callee created. The caller treats the result as a
+    // +1 producer and may release it at scope end if non-escaping. Excludes
+    // cross-module imported methods (their callee does NOT run THIS module's
+    // boxForTarget) and methods that sometimes return class references.
+    // Parallel to isUserMethodClosureReturnCall for closures.
+    bool isUserMethodBoxReturnCall(const ast::Expr* init) const;
+
+    // #429 (box RETURN + FIELD-STORE) / §8.6 / §28.9: true when `target` is
+    // an Object- or interface-typed CLASS instance field / auto-property lvalue
+    // (NOT a local / param / ref-param / array element / static field / record
+    // field) AND the expression at `valueExpr` has a boxable value source type
+    // (so boxForTarget will/has allocated a fresh box). Only such a combination
+    // warrants an independent +1 on the field. Guards: a class reference
+    // assigned to an Object field (reference source) returns false → no
+    // bz_box_retain/release on a class instance.
+    bool isBoxFieldLvalue(const ast::Expr& target, const ast::Expr* valueExpr);
+    // #429 (box FIELD-STORE) / §8.6 / §28.9: store `newVal` (a box pointer
+    // after boxForTarget) into the class Object/interface field at `fieldAddr`
+    // with retain-new / release-old, giving the field an INDEPENDENT +1.
+    // Order: load-old → retain-or-transfer-new → store-new → release-old.
+    // A +1 producer (a freshly-boxed value or a box-return method call) is
+    // TRANSFERRED (no extra retain); anything else (borrow — a param/field/
+    // identifier) is RETAINED. retain-before-release keeps a self-overwrite
+    // safe. Adds the field's symbol to boxStorageFields_ so the disposer
+    // knows to release it. Returns true when handled; false if not a box field
+    // (caller stores normally). Parallel to lowerClosureFieldStore for closures.
+    bool lowerBoxFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
+                            llvm::Value* newVal, const ast::Expr* valueExpr);
+
+    // #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: the per-module set of
+    // class field symbols (FieldSymbol / auto-property PropertySymbol) for which
+    // EVERY store (across all methods + constructors + field initializers of the
+    // class) supplies a boxable value source type. These fields provably always
+    // hold a box (never a class reference), so emitDisposerCore can safely call
+    // bz_box_release on them at disposal. Populated incrementally by
+    // lowerBoxFieldStore and emitInstanceInit (via isBoxFieldLvalue); fields
+    // that receive a class-reference store are never added (they miss the
+    // isBoxFieldLvalue gate) so the class-instance-in-Object hazard is avoided.
+    // NOTE: this is further protected by collectBoxStorageFields, a pre-pass
+    // that explicitly REMOVES any field from this set that receives a non-box
+    // store, making the safety guarantee hold across compilation order.
+    std::unordered_set<const void*> boxStorageFields_;
+
+    // #429 (box RETURN + FIELD-STORE) / §8.6 / §28.9: is `m` in
+    // boxStorageFields_? True iff this field was determined (via the
+    // collectBoxStorageFields pre-pass + per-store bookkeeping) to hold ONLY
+    // boxes — every store was a boxable value source. Used by emitDisposerCore
+    // to gate bz_box_release at disposal. Parallel to isClosureStorageMember.
+    bool isBoxStorageMember(const sema::Symbol* m) {
+        return boxStorageFields_.count(static_cast<const void*>(m)) != 0;
+    }
+
+    // #429 (box RETURN category) / §8.6 / §28.9: the set of user-defined,
+    // locally-compiled MethodSymbols whose declared return type is Object or
+    // an interface AND whose body provably always returns boxable value source
+    // types (so boxForTarget at the return site always creates a fresh rc=1
+    // box). Populated by collectBoxReturnMethods() before any method bodies
+    // are lowered. A call to such a method is recognized as a +1 box producer
+    // by isUserMethodBoxReturnCall / isPlusOneBoxProducer.
+    std::unordered_set<const sema::MethodSymbol*> boxReturnMethods_;
+    // Scan all MethodDecl bodies to populate boxReturnMethods_. A method is a
+    // "box return method" if its declared return type is Object/interface,
+    // it is locally compiled (not imported), and every ReturnStmt in its body
+    // carries a value whose static type is boxable (isBoxableValueType or
+    // isNullableValueTy). An arrow-body method is a box return method iff its
+    // expression body is of boxable type. Called once from run() before the
+    // method-body emission loop.
+    void collectBoxReturnMethods();
+    // Scan all method / constructor bodies AND field initializers for stores
+    // to Object/interface-typed CLASS instance fields. A field is added to
+    // boxStorageFields_ ONLY if EVERY store to it (across all methods and
+    // constructors of the class) carries a boxable value source type — i.e.
+    // every store goes through boxForTarget. A field that receives a class-
+    // reference store is never added (class references have reference source
+    // types, failing the isBoxableValueType / isNullableValueTy check). This
+    // pre-pass ensures disposal is sound: bz_box_release fires only for fields
+    // we know can never hold a class instance. Called once from run() before
+    // the method-body emission loop.
+    void collectBoxStorageFields();
 
     // §28.3: populate unwindIneligible_ from a method/ctor body. A tracked owned
     // local/param becomes ineligible if it appears in a value-consuming position

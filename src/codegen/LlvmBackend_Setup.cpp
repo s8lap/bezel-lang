@@ -1873,6 +1873,42 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
     }
 
+    // #429 (box FIELD-STORE category) / §8.6 / §28.9: release every Object/
+    // interface field / auto-property of THIS class (own members only; an
+    // inherited slot is released by the base CORE disposer via
+    // emitBaseDisposeChain — visiting only ts->members avoids double-release).
+    // A box storage field holds an INDEPENDENT +1 (taken at store via
+    // lowerBoxFieldStore / emitInstanceInit); on disposal that +1 is released
+    // EXACTLY ONCE via bz_box_release, freeing the box wrapper at rc 0. Safety:
+    //   - isBoxStorageMember gates on boxStorageFields_, which is populated ONLY
+    //     for fields where collectBoxStorageFields + lowerBoxFieldStore confirmed
+    //     EVERY store uses a boxable value source. A field that ever received a
+    //     class-reference store is NOT in boxStorageFields_ → NOT released here.
+    //     This is the cardinal box-vs-class discriminator: bz_box_release is
+    //     NEVER called on a class instance. (Corrupting offset 8 of a class
+    //     instance — the disposed-flag word — would cause double-dispose / UAF.)
+    //   - bz_box_release is null-safe (a calloc-zeroed null field is a no-op).
+    //   - After releasing, NULL the slot so a re-entrant / double dispose finds
+    //     null and is a no-op (the #396 slot-null precedent, parallel to the
+    //     string-field and closure-field nulling above).
+    //   - The boxed value is a value-type leaf (no owned sub-objects): the
+    //     release frees ONLY the wrapper — no cascade.
+    {
+        llvm::StructType* bst = classStruct(ts);
+        for (const sema::Symbol* m : ts->members) {
+            bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
+            if (!isField && !isAutoProperty(m)) continue;
+            if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
+            if (!isBoxStorageMember(m)) continue;
+            unsigned idx = fieldIndex_[m];
+            llvm::Value* addr = builder_.CreateStructGEP(bst, currentThis_, idx,
+                                                         "boxf.addr");
+            llvm::Value* val = builder_.CreateLoad(ptrTy(), addr, "boxf.val");
+            emitBoxRelease(val);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        }
+    }
+
     // #480 / §24.1 / §28: free each instance event's backing EventSource.
     // emitInstanceInit allocated one bz_event_source_new per instance EventSymbol;
     // those allocations are NOT visited by the FieldSymbol loop above because
@@ -3012,6 +3048,35 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
                               isUserMethodClosureReturnCall(init);
             if (!isProducer)
                 emitClosureRetain(v);
+        }
+        // #429 (box FIELD-STORE category) / §8.6 / §28.9: a CLASS Object/
+        // interface field / auto-property initializer that stores a boxable
+        // value gives the field its own reference, like a later assignment.
+        // The field is calloc-zeroed (null) before this, so there is no old
+        // value to release (no bz_box_release needed here). A fresh +1 producer
+        // (a boxable value source: boxForTarget creates a fresh rc=1 box, or a
+        // box-return method call whose callee's boxForTarget produced the box)
+        // is TRANSFERRED (no extra retain — its single reference flows into the
+        // field). Anything else (a borrow — a local / param / field that holds
+        // a box but whose +1 belongs to its own slot) is RETAINED via
+        // bz_box_retain so the field's count is independent. The disposal
+        // release (emitDisposerCore box field loop) balances it. Gated on
+        // isBoxStorageMember (populated by collectBoxStorageFields) so ONLY
+        // fields confirmed to always hold boxes are touched — a class-reference
+        // initializer for a field that sometimes holds class refs is excluded.
+        // emitInstanceInit runs only for CLASS construction (records use the
+        // by-value path in lowerNew, whose Object fields are borrows, §9).
+        if (v->getType()->isPointerTy() && isBoxStorageMember(m)) {
+            const sema::TypeRef* srcTy = ctx_.exprType(*init);
+            bool isProducer =
+                (srcTy && (isBoxableValueType(srcTy) || isNullableValueTy(srcTy))) ||
+                isUserMethodBoxReturnCall(init);
+            if (!isProducer)
+                emitBoxRetain(v);
+            // Record in boxStorageFields_ so disposal is armed. The field is
+            // already in boxStorageFields_ from collectBoxStorageFields; this
+            // re-insert is a no-op but makes it explicit.
+            boxStorageFields_.insert(static_cast<const void*>(m));
         }
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
@@ -4855,6 +4920,124 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
 }
 
 
+// #429 (box RETURN category) / §8.6 / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. Recognize a CallExpr whose resolved callee is a
+// USER-DEFINED, LOCALLY-COMPILED MethodSymbol (backed by an ast::MethodDecl,
+// not imported, not an operator) that appears in boxReturnMethods_ — i.e. a
+// method whose declared return type is Object/interface AND whose body provably
+// always returns a boxable value source (every return stmt carries a value of
+// boxable type, so boxForTarget at the callee's return site always creates a
+// fresh rc=1 box). Such a call hands back EXACTLY +1: the fresh box the callee
+// created. The caller is the +1 owner. Cross-module imported methods are
+// excluded (their callee does NOT run THIS module's boxForTarget). Parallel to
+// isUserMethodClosureReturnCall for closures.
+bool Emitter::isUserMethodBoxReturnCall(const ast::Expr* init) const {
+    auto* call = dynamic_cast<const ast::CallExpr*>(init);
+    if (!call || !call->callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
+    if (!ms) return false;
+    if (ms->isOperator) return false;
+    if (ctx_.isImported(ms)) return false;
+    return boxReturnMethods_.count(ms) != 0;
+}
+
+
+// #429 (box RETURN + FIELD-STORE) / §8.6 / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. A target expression is a box-storage-eligible
+// Object/interface-typed class instance field / auto-property lvalue iff:
+//   - its resolved type is Object or an interface (isObjectOrInterfaceTarget),
+//   - the valueExpr's static type is a boxable VALUE type or nullable value
+//     (isBoxableValueType / isNullableValueTy) — i.e. boxForTarget will/has
+//     created a fresh box for it; a class-reference source type is excluded,
+//   - it is NOT a plain local / parameter slot (localSlot returns non-null),
+//   - it is NOT a ref/out alias (refParamAddr returns non-null),
+//   - it is NOT a program-lifetime static field (staticFieldGlobal non-null),
+//   - its symbol is a FieldSymbol or auto-property of a CLASS (not a record).
+// Parallel to isClosureFieldLvalue for closures.
+bool Emitter::isBoxFieldLvalue(const ast::Expr& target,
+                               const ast::Expr* valueExpr) {
+    // The target type must be Object or an interface.
+    const sema::TypeRef* rt = ctx_.exprType(target);
+    if (!rt || !isObjectOrInterfaceTarget(rt)) return false;
+    // The source expression must be a boxable value type (not a class ref).
+    // A class reference assigned to an Object field has a reference source type
+    // → isBoxableValueType / isNullableValueTy returns false → excluded here,
+    // preventing bz_box_retain/release on a class instance.
+    if (!valueExpr) return false;
+    const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+    if (!srcTy) return false;
+    if (!isBoxableValueType(srcTy) && !isNullableValueTy(srcTy)) {
+        // Also accept a call to a box-return method: its callee always produces
+        // a fresh box (see isUserMethodBoxReturnCall). The source type is
+        // Object/interface (the callee's return type), not itself boxable, but
+        // the value IS a box pointer from the callee's boxForTarget.
+        if (!isUserMethodBoxReturnCall(valueExpr)) return false;
+    }
+    // Exclude locals, ref params, and static fields.
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    // Must be a class instance field or auto-property (not record, not static).
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
+        return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
+    if (isAutoProperty(sym)) {
+        auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
+        return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
+    }
+    return false;
+}
+
+
+// #429 (box FIELD-STORE) / §8.6 / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. Store `newVal` (a box pointer after boxForTarget or
+// a box from a box-return method call) into the class Object/interface field
+// at `fieldAddr` with retain-new / release-old, giving the field an INDEPENDENT
+// +1. Order: load-old → retain-or-transfer-new → store-new → release-old.
+// Retaining the new value BEFORE releasing the old makes a self-assignment
+// safe (rc dips +1 then back, never transiently 0). A +1 producer (a freshly-
+// boxed value, i.e. the source had a boxable value type, or a call to a box-
+// return method) is TRANSFERRED (no retain — its single reference becomes the
+// field's); anything else is RETAINED via bz_box_retain. bz_box_retain/release
+// are null-safe (no-op on null). Also records the field in boxStorageFields_ so
+// emitDisposerCore knows to release it. Returns true when handled.
+// Parallel to lowerClosureFieldStore for closures.
+bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
+                                 llvm::Value* fieldAddr,
+                                 llvm::Value* newVal,
+                                 const ast::Expr* valueExpr) {
+    if (!isBoxFieldLvalue(target, valueExpr)) return false;
+    if (!fieldAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "boxf.old");
+    // A +1 producer is TRANSFERRED (no retain) — its single reference flows
+    // into the field. A borrow is RETAINED so the field's count is independent.
+    // Producer: a freshly-boxed value source (boxable value type → boxForTarget
+    // just created the box) OR a call to a box-return method (callee's box).
+    const sema::TypeRef* srcTy = valueExpr ? ctx_.exprType(*valueExpr) : nullptr;
+    bool isProducer =
+        (srcTy && (isBoxableValueType(srcTy) || isNullableValueTy(srcTy))) ||
+        isUserMethodBoxReturnCall(valueExpr);
+    if (!isProducer)
+        emitBoxRetain(newVal);
+    builder_.CreateStore(newVal, fieldAddr);
+    emitBoxRelease(oldVal);
+    // Record this field as a box storage field so the disposer releases it.
+    // Safety: isBoxFieldLvalue already verified the source is boxable; a class-
+    // reference source cannot reach here. If the field was previously added via
+    // another store (same field, same class, same box-only pattern), it stays
+    // in the set — the pre-pass collectBoxStorageFields ensures no class-ref
+    // stores reach this path.
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (sym) boxStorageFields_.insert(static_cast<const void*>(sym));
+    return true;
+}
+
+
 namespace {
 // #422 / §27.5 / §28.9: a strict, conservative walk that decides whether a
 // SPECIFIC closure (function-typed) `var` local ever escapes its scope. A
@@ -5250,13 +5433,19 @@ void Emitter::collectStringReleaseEligible(
 }
 
 
-// #422 / §8.6 / §28.9: is local `ld` a codegen-internal +1 box producer? It is
-// when the declared target type is Object or an interface AND the initializer's
-// static type is a boxable VALUE type (record/enum/primitive) or a nullable
-// value type — i.e. exactly the cases boxForTarget/boxValue allocate a fresh
-// rc=1 box wrapper for. A class instance coerced to Object (the #399 path) has a
-// REFERENCE initializer (class/interface/string/Object) for which boxForTarget
-// is a no-op — NOT a producer, never released, so the class model is untouched.
+// #422 / #429 (box RETURN) / §8.6 / §28.9: is local `ld` a codegen-internal
+// +1 box producer? It is when the declared target type is Object or an
+// interface AND either:
+//   (a) the initializer's static type is a boxable VALUE type
+//       (record/enum/primitive) or a nullable value type — i.e. exactly the
+//       cases boxForTarget/boxValue allocate a fresh rc=1 box wrapper for; OR
+//   (b) the initializer is a call to a locally-compiled method in
+//       boxReturnMethods_ (a method that ALWAYS returns a boxable value and
+//       therefore ALWAYS triggers boxForTarget at its callee return site),
+//       so the caller receives a fresh rc=1 box from the callee.
+// A class instance coerced to Object (the #399 path) has a REFERENCE
+// initializer (class/interface/string/Object) for which boxForTarget is a
+// no-op — NOT a producer, never released, so the class model is untouched.
 // An INFERRED local (no `: Type`) is not a producer either: without a declared
 // Object/interface target boxForTarget never boxes (the local takes the value
 // type directly). Mirrors the boxForTarget gate in lowerLocalDecl exactly.
@@ -5266,7 +5455,11 @@ bool Emitter::isPlusOneBoxProducer(const ast::LocalDecl* ld) {
     if (!isObjectOrInterfaceTarget(declTy)) return false;
     const sema::TypeRef* srcTy = ctx_.exprType(*ld->initializer);
     if (!srcTy) return false;
-    return isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
+    // Case (a): the initializer itself is a boxable value source.
+    if (isBoxableValueType(srcTy) || isNullableValueTy(srcTy)) return true;
+    // Case (b): a call to a box-return method (always returns a fresh box).
+    if (isUserMethodBoxReturnCall(ld->initializer.get())) return true;
+    return false;
 }
 
 namespace {
@@ -5570,6 +5763,233 @@ void Emitter::collectBoxReleaseEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             boxReleaseEligible_.insert(static_cast<const void*>(ld));
+    }
+}
+
+
+// #429 (box RETURN category) / §8.6 / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. Scan all locally-compiled method bodies in methodFns_.
+// A MethodSymbol is added to boxReturnMethods_ iff its declared return type is
+// Object or an interface, it is not imported, and every ReturnStmt in the body
+// carries a value whose STATIC TYPE (ctx_.exprType) is a boxable value type or
+// nullable value type. An arrow-body method counts iff its expression body has
+// a boxable type. A method with no ReturnStmt (empty body or fall-off) is not
+// added (it has no returns to count). This pre-pass runs BEFORE any method body
+// is lowered, so all isUserMethodBoxReturnCall queries during per-body
+// collectBoxReleaseEligible see a fully-populated set.
+void Emitter::collectBoxReturnMethods() {
+    // Recursive statement scanner: sets `allBox` to false if any ReturnStmt
+    // returns a non-boxable value, and sets `hasReturn` to true when any
+    // ReturnStmt with a value is found.
+    struct Scanner {
+        const sema::SemaContext& ctx;
+        Emitter& em;
+        bool allBox = true;
+        bool hasReturn = false;
+
+        void scanStmts(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+            for (auto& s : stmts) scanStmt(s.get());
+        }
+        void scanStmt(const ast::Stmt* s) {
+            if (!s || !allBox) return;
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                if (rs->value) {
+                    hasReturn = true;
+                    const sema::TypeRef* srcTy = ctx.exprType(*rs->value);
+                    if (!srcTy ||
+                        (!em.isBoxableValueType(srcTy) &&
+                         !em.isNullableValueTy(srcTy))) {
+                        allBox = false;
+                    }
+                }
+                return;
+            }
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                scanStmts(is->ifBranch.body);
+                for (auto& br : is->elifBranches) scanStmts(br.body);
+                scanStmts(is->elseBody);
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                scanStmts(ws->body);
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                scanStmts(fs->body);
+            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                scanStmts(d->body);
+            } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                scanStmts(ts->body);
+                for (auto& c : ts->catches)
+                    if (c.body) scanStmt(c.body.get());
+                scanStmts(ts->finallyBody);
+            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms)
+                    scanStmts(arm.stmts);
+            }
+        }
+    };
+
+    for (auto& [sym, fn] : methodFns_) {
+        if (ctx_.isImported(sym)) continue;
+        auto* md = dynamic_cast<const ast::MethodDecl*>(sym->decl);
+        if (!md || !md->returnType) continue;
+        const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+        if (!rt || !isObjectOrInterfaceTarget(rt)) continue;
+
+        if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody) {
+            // Arrow body: the body expression itself is the returned value.
+            const sema::TypeRef* srcTy = ctx_.exprType(*md->exprBody);
+            if (srcTy && (isBoxableValueType(srcTy) || isNullableValueTy(srcTy)))
+                boxReturnMethods_.insert(sym);
+        } else if (md->bodyKind == ast::MethodBodyKind::Block && !md->stmts.empty()) {
+            Scanner sc{ctx_, *this};
+            sc.scanStmts(md->stmts);
+            if (sc.allBox && sc.hasReturn)
+                boxReturnMethods_.insert(sym);
+        }
+        // Abstract or empty block body: not a box return method.
+    }
+}
+
+
+// #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. For every class TypeSymbol, find all Object/interface-
+// typed instance fields and auto-properties. Then scan EVERY method and
+// constructor body of that class for AssignmentStmt stores (:=) to those
+// fields. Additionally, check each field's own AST initializer (FieldDecl /
+// PropertyDecl autoInitializer). A field is added to boxStorageFields_ ONLY if:
+//   (a) every such store has a BOXABLE VALUE source type (isBoxableValueType or
+//       isNullableValueTy on ctx_.exprType(*valueExpr)); OR
+//   (b) the store is a call to a box-return method (isUserMethodBoxReturnCall) —
+//       this is treated as a boxable source (the callee produced a fresh box).
+// A field that receives ANY class-reference store (a reference source type) is
+// excluded. This guarantees that bz_box_release in emitDisposerCore never fires
+// for an Object field that might hold a class instance.
+// NOTE: this pre-pass only runs the STATIC analysis. lowerBoxFieldStore also
+// adds to boxStorageFields_ at emission time (for fields that pass isBoxFieldLvalue
+// during lowering), but the pre-pass is the authoritative gate: a field is only
+// a box storage field if the pre-pass confirmed all stores are box-valued.
+void Emitter::collectBoxStorageFields() {
+    // For each class, collect its Object/interface instance field symbols.
+    for (auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+
+        // Collect candidate fields: Object/interface typed instance fields.
+        std::vector<const sema::Symbol*> candidates;
+        for (const sema::Symbol* m : ts->members) {
+            bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
+            if (!isField && !isAutoProperty(m)) continue;
+            if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
+            const sema::TypeRef* ft = recordMemberType(m);
+            if (!ft || !isObjectOrInterfaceTarget(ft)) continue;
+            candidates.push_back(m);
+        }
+        if (candidates.empty()) continue;
+
+        // Track which candidates are still "box only" (start as true).
+        std::unordered_map<const void*, bool> ok;
+        for (const sema::Symbol* m : candidates)
+            ok[static_cast<const void*>(m)] = true;
+
+        // Helper: check a store to an Object/interface field — if the source
+        // type is NOT boxable (and not a box-return call), mark it non-box.
+        auto checkStore = [&](const ast::Expr* target, const ast::Expr* val) {
+            if (!target || !val) return;
+            sema::Symbol* fsym = ctx_.exprSymbol(*target);
+            if (!fsym) return;
+            auto it = ok.find(static_cast<const void*>(fsym));
+            if (it == ok.end()) return;  // not a candidate field
+            if (!it->second) return;     // already excluded
+            const sema::TypeRef* srcTy = ctx_.exprType(*val);
+            if (!srcTy) { it->second = false; return; }
+            bool isBoxableSource =
+                isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
+            bool isBoxReturnCall = isUserMethodBoxReturnCall(val);
+            if (!isBoxableSource && !isBoxReturnCall)
+                it->second = false;
+        };
+
+        // Recursive statement scanner for stores.
+        std::function<void(const ast::Stmt*)> scanStmt;
+        scanStmt = [&](const ast::Stmt* s) {
+            if (!s) return;
+            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                if (as->op == ":=" && as->target && as->value)
+                    checkStore(as->target.get(), as->value.get());
+            }
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                for (auto& b : is->ifBranch.body) scanStmt(b.get());
+                for (auto& br : is->elifBranches)
+                    for (auto& b : br.body) scanStmt(b.get());
+                for (auto& b : is->elseBody) scanStmt(b.get());
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (auto& b : ws->body) scanStmt(b.get());
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (auto& b : fs->body) scanStmt(b.get());
+            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) scanStmt(b.get());
+            } else if (auto* ts2 = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts2->body) scanStmt(b.get());
+                for (auto& c : ts2->catches)
+                    if (c.body) scanStmt(c.body.get());
+                for (auto& b : ts2->finallyBody) scanStmt(b.get());
+            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms)
+                    for (auto& a : arm.stmts) scanStmt(a.get());
+            }
+        };
+
+        // Check field initializers (AST FieldDecl / PropertyDecl initializer).
+        for (const sema::Symbol* m : candidates) {
+            const ast::Expr* init = nullptr;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                init = fd->initializer.get();
+            else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                init = pd->autoInitializer.get();
+            if (!init) continue;  // no initializer → calloc-zeroed null → OK
+            // Synthesize a check: the "target" symbol is m, the "source" is
+            // init. We check the init directly.
+            auto it = ok.find(static_cast<const void*>(m));
+            if (!it->second) continue;
+            const sema::TypeRef* srcTy = ctx_.exprType(*init);
+            if (!srcTy) { it->second = false; continue; }
+            bool isBoxableSource =
+                isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
+            bool isBoxReturnCall = isUserMethodBoxReturnCall(init);
+            if (!isBoxableSource && !isBoxReturnCall)
+                it->second = false;
+        }
+
+        // Check all method bodies for stores to these fields.
+        for (auto& [msym, fn] : methodFns_) {
+            if (ctx_.isImported(msym)) continue;
+            auto* md = dynamic_cast<const ast::MethodDecl*>(msym->decl);
+            if (!md) continue;
+            // Only scan methods that belong to THIS class (ts).
+            if (msym->parent != ts) continue;
+            for (auto& s : md->stmts) scanStmt(s.get());
+        }
+
+        // Check all constructor bodies for stores to these fields.
+        for (auto& [csym, fn] : ctorFns_) {
+            if (ctx_.isImported(csym)) continue;
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(csym->decl);
+            if (!cd) continue;
+            if (csym->parent != ts) continue;
+            for (auto& s : cd->body) scanStmt(s.get());
+        }
+
+        // Also scan the class's destructor if any.
+        for (const sema::Symbol* m : ts->members) {
+            auto* ds = dynamic_cast<const sema::MethodSymbol*>(m);
+            if (!ds) continue;
+            auto* dd = dynamic_cast<const ast::DestructorDecl*>(ds->decl);
+            if (!dd) continue;
+            for (auto& s : dd->body) scanStmt(s.get());
+        }
+
+        // Add fields that survived as box-only to boxStorageFields_.
+        for (auto& [voidPtr, isOk] : ok) {
+            if (isOk) boxStorageFields_.insert(voidPtr);
+        }
     }
 }
 
