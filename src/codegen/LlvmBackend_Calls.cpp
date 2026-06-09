@@ -1494,10 +1494,32 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // so qsort can reach the user lambda without a global pointer.
         if (m == "Sort" && call.args.size() == 1 && call.args[0].value) {
             llvm::Type* elemTy2 = getElemTy();
-            // Lower the comparer lambda with the right expected function type:
-            // (T, T) -> int.  lowerLinqLambda sets the closure ABI { fn, env }.
+            // fix #533 / §4.4: the comparer is (T,T)->int — TWO params of
+            // element type.  lowerLinqLambda only adds ONE param to the synthetic
+            // funcRef used to infer unannotated lambda param types; for the second
+            // param `b` in `(a,b)=>a.X-b.X` with a record T, no type hint was
+            // injected, fieldAddr on `b.X` returned null, and the lambda body
+            // emitted `ret void` into an i32-returning function → IR failure.
+            // Fix: build a two-param funcRef so both lambda params get the
+            // correct element TypeRef as their type hint.
             sema::TypeRef* intRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
-            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), intRef);
+            sema::TypeRef* elemTypeRef = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            auto* cmpFuncRef = ctx_.makeTypeRef();
+            cmpFuncRef->kind = sema::TypeRef::Kind::Function;
+            cmpFuncRef->funcReturn = intRef;
+            if (elemTypeRef) {
+                sema::TypeRef::FuncParam fp1;
+                fp1.type = elemTypeRef;
+                cmpFuncRef->funcParams.push_back(std::move(fp1));
+                sema::TypeRef::FuncParam fp2;
+                fp2.type = elemTypeRef;
+                cmpFuncRef->funcParams.push_back(std::move(fp2));
+            }
+            const sema::TypeRef* savedExpected = expectedFunctionType_;
+            expectedFunctionType_ = cmpFuncRef;
+            llvm::Value* closure = lowerExpr(*call.args[0].value.get());
+            expectedFunctionType_ = savedExpected;
             if (!closure) return nullptr;
 
             // Build a fresh trampoline: int(void* closure, const void* a, const void* b)
@@ -1649,8 +1671,28 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
             llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
                                                     "srtdc.copy");
+            // fix #533 / §4.4: same two-param funcRef fix as Sort(comparer) above.
+            // The comparer is (T,T)->int; build a two-param type hint so that
+            // unannotated lambda params (e.g. `(p,q)=>p.X-q.X` on Array<Point>)
+            // both receive the element TypeRef and field access resolves correctly.
             sema::TypeRef* intRef2 = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
-            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), intRef2);
+            sema::TypeRef* elemTypeRef2 = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            auto* cmpFuncRef2 = ctx_.makeTypeRef();
+            cmpFuncRef2->kind = sema::TypeRef::Kind::Function;
+            cmpFuncRef2->funcReturn = intRef2;
+            if (elemTypeRef2) {
+                sema::TypeRef::FuncParam fp1;
+                fp1.type = elemTypeRef2;
+                cmpFuncRef2->funcParams.push_back(std::move(fp1));
+                sema::TypeRef::FuncParam fp2;
+                fp2.type = elemTypeRef2;
+                cmpFuncRef2->funcParams.push_back(std::move(fp2));
+            }
+            const sema::TypeRef* savedExpected2 = expectedFunctionType_;
+            expectedFunctionType_ = cmpFuncRef2;
+            llvm::Value* closure = lowerExpr(*call.args[0].value.get());
+            expectedFunctionType_ = savedExpected2;
             if (!closure) return nullptr;
 
             // Build trampoline: int(void* closure, const void* a, const void* b)
