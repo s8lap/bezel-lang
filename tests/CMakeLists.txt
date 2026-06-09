@@ -73,6 +73,7 @@ set(BEZEL_TEST_SOURCES
     parser/bug_468_ne_operator_test.cpp
     parser/nullable_function_type_584_test.cpp
     parser/lambda_conditional_body_589_test.cpp
+    parser/catch_arm_expr_body_588_test.cpp
     sema/symbol_collection_test.cpp
     sema/type_resolution_test.cpp
     sema/expr_literal_types_test.cpp
@@ -409,6 +410,7 @@ set(BEZEL_TEST_SOURCES
     codegen/writeline_nullable_581_583_test.cpp
     codegen/primitive_compareto_586_test.cpp
     codegen/virtual_generic_override_580_test.cpp
+    codegen/catch_expr_body_588_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

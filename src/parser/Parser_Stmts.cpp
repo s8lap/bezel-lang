@@ -347,7 +347,118 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                         Severity::Error, current_.location,
                         "expected '=>' after catch pattern");
                 }
-                arm.body = parseStatement();
+                // §31.2.2 / §A.6 ArmBody: three forms are valid in a catch arm —
+                //   (1) Expression    — no `;`; `,` or `end`/`finally` follows
+                //   (2) Statement     — with its terminating `;`
+                //   (3) "do" … "end" — multi-statement block, no `;` after `end`
+                //
+                // (3) must NOT go through parseStatement() for DoEndBlock because
+                // parseStatement's DoEndBlock requires a trailing `;` that is absent
+                // in arm-body position. Parse it inline, as parseCaseStmtArm does.
+                // (2) delegates to parseStatement() for statement-leading keywords.
+                // (1) parses an expression, then checks whether `;` follows.
+                // per §31.2.2
+                if (isKeyword("do")) {
+                    // Inline `do … end` block — no trailing `;` required (arm body
+                    // form per §31.2.2), but accept optional `;` for compatibility
+                    // with the statement-form `do … end;` that parseStatement() would
+                    // normally produce. The `;` is consumed when present and silently
+                    // omitted when absent (e.g. when `,` or `end` follows `end`).
+                    advance(); // past `do`
+                    auto blk = std::make_unique<ast::DoEndBlock>();
+                    while (!isKeyword("end") && !isKeyword("catch") &&
+                           !isKeyword("finally") &&
+                           current_.kind != TokenKind::EndOfFile) {
+                        auto inner = parseStatement();
+                        if (inner) blk->body.push_back(std::move(inner));
+                        else if (current_.kind != TokenKind::EndOfFile) advance();
+                    }
+                    if (!consumeKeyword("end")) {
+                        diagnostics_.report(Severity::Error, current_.location,
+                                            "expected 'end' to close catch arm 'do' block");
+                    }
+                    consumePunctuator(";"); // optional: present in statement form, absent in expression form
+                    arm.body = std::move(blk);
+                } else if (isKeyword("return") ||
+                    isKeyword("var")      || isKeyword("const")  ||
+                    isKeyword("yield")    || isKeyword("break")  ||
+                    isKeyword("continue") || isKeyword("using")  ||
+                    isKeyword("await")) {
+                    // Statement-leading: delegate to parseStatement() as before.
+                    arm.body = parseStatement();
+                } else {
+                    // Expression-leading (includes bare `throw` re-raise and
+                    // `throw expr`). Parse the expression first, then detect
+                    // the increment/assignment/expression-stmt forms.
+                    auto lhs = parseExpression();
+                    if (current_.kind == TokenKind::Punctuator &&
+                        (current_.text == "++" || current_.text == "--")) {
+                        auto inc = std::make_unique<ast::IncrementStmt>();
+                        inc->target = std::move(lhs);
+                        inc->op = current_.text;
+                        advance();
+                        if (!consumePunctuator(";")) {
+                            diagnostics_.report(
+                                Severity::Error, current_.location,
+                                "expected ';' after increment/decrement");
+                        }
+                        arm.body = std::move(inc);
+                    } else if (
+                        current_.kind == TokenKind::Punctuator &&
+                        (current_.text == ":="  || current_.text == "+="  ||
+                         current_.text == "-="  || current_.text == "*="  ||
+                         current_.text == "/="  || current_.text == "&="  ||
+                         current_.text == "|="  || current_.text == "^="  ||
+                         current_.text == "<<=" || current_.text == ">>=" ||
+                         current_.text == "??=")) {
+                        // Discard form: `_ := expr;`
+                        bool isDiscard = false;
+                        if (current_.text == ":=") {
+                            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                    lhs.get())) {
+                                if (id->name == "_") {
+                                    isDiscard = true;
+                                    advance(); // past `:=`
+                                    auto d = std::make_unique<ast::DiscardStmt>();
+                                    d->value = parseExpression();
+                                    if (!consumePunctuator(";")) {
+                                        diagnostics_.report(
+                                            Severity::Error, current_.location,
+                                            "expected ';' after discard statement");
+                                    }
+                                    arm.body = std::move(d);
+                                }
+                            }
+                        }
+                        if (!isDiscard) {
+                            auto a = std::make_unique<ast::AssignmentStmt>();
+                            a->target = std::move(lhs);
+                            a->op = current_.text;
+                            advance();
+                            a->value = parseExpression();
+                            if (!consumePunctuator(";")) {
+                                diagnostics_.report(
+                                    Severity::Error, current_.location,
+                                    "expected ';' after assignment");
+                            }
+                            arm.body = std::move(a);
+                        }
+                    } else {
+                        // Pure expression form (§31.2.2 form 1) or expression
+                        // statement form (form 2, with optional `;`).
+                        // `;` is consumed when present (statement form) and
+                        // silently omitted when the next token is `,` or
+                        // `end`/`finally` (expression form per §31.2.2).
+                        if (lhs || isPunctuator(";")) {
+                            auto es = std::make_unique<ast::ExpressionStmt>();
+                            es->expr = std::move(lhs);
+                            consumePunctuator(";"); // optional — present in stmt form, absent in expr form
+                            arm.body = std::move(es);
+                        }
+                        // If lhs is null and no `;`, fall through with null body
+                        // (the arm will have no body, which downstream handles gracefully).
+                    }
+                }
                 stmt->catches.push_back(std::move(arm));
             };
             parseCatchArm();
