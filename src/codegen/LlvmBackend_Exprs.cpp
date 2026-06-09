@@ -1829,13 +1829,90 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
-    // §3: Dictionary<K,V>.Keys — property returning Array<string> of all keys.
+    // fix #571 / §4.8: Dictionary<K,V>.Keys — property returning Array<K> of
+    // all keys.  Previously this always called bz_dict_keys_str, which reads the
+    // string-key table and returns garbage/crash for non-string (generic-table)
+    // keys (int, enum, record).  Now dispatches like lowerDictKeysFor (Stmts.cpp):
+    // generic-table keys (K != string) → bz_dict_keys_gen path; string keys →
+    // existing bz_dict_keys_str path.  The for-in handler (lowerDictKeysFor) is
+    // the correctness reference for both paths.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Keys") {
             auto* tt = ctx_.exprType(*ma->target);
             if (isDictTypeName(tt)) {
                 llvm::Value* dictObj = lowerExpr(*ma->target);
                 if (!dictObj) return nullptr;
+
+                // Determine key type and whether it routes through the generic table.
+                const sema::TypeRef* genKeyTy =
+                    genericBackingType(tt, 0, /*isSet=*/false, nullptr);
+
+                if (genKeyTy) {
+                    // fix #571 / §4.8: non-string key — use bz_dict_keys_gen.
+                    // bz_dict_keys_gen returns a malloc'd void** array of `n`
+                    // pointers, each a malloc'd copy of one key's raw bytes.
+                    // Load each key with genKeyTy's LLVM type, store into the
+                    // result Array<K> — mirrors emitGenericKeyTableFor (Stmts.cpp)
+                    // and the Values expression handler above.
+                    llvm::Type* keyLlvm = lowerTypeRef(genKeyTy);
+                    if (!keyLlvm) return nullptr;
+                    int64_t esz = collectionElemSize(ctx_.exprType(e));
+
+                    auto* keysOutSlot = entryAlloca(ptrTy());
+                    auto* cntSlot     = entryAlloca(i64());
+                    auto* keysFn = declareC("bz_dict_keys_gen",
+                                            llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(keysFn, {dictObj, keysOutSlot, cntSlot});
+                    llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
+                    llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+                    auto* freeFn = declareC("free",
+                                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                    llvm::Value* result =
+                        builder_.CreateCall(allocFn,
+                                            {builder_.getInt64(esz), cnt}, "dk.arr");
+                    auto* addFn = declareC("bz_array_add",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy(), ptrTy(), i64()});
+
+                    auto* idxSlot = entryAlloca(i64());
+                    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                    auto* condBB = llvm::BasicBlock::Create(llvm_, "dk2.c", currentFn_);
+                    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dk2.b", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "dk2.e", currentFn_);
+                    builder_.CreateBr(condBB);
+
+                    builder_.SetInsertPoint(condBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                    builder_.CreateCondBr(
+                        builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* idxB    = builder_.CreateLoad(i64(), idxSlot);
+                    llvm::Value* kpPtr   = builder_.CreateGEP(ptrTy(), keysArr, idxB);
+                    llvm::Value* keyPtr  = builder_.CreateLoad(ptrTy(), kpPtr);
+                    // Load the key value from its raw-bytes copy (mirrors
+                    // emitGenericKeyTableFor: CreateLoad(elemTy, keyPtr)).
+                    llvm::Value* keyVal  = builder_.CreateLoad(keyLlvm, keyPtr,
+                                                               "dk2.kv");
+                    llvm::AllocaInst* keySlot = entryAlloca(keyLlvm);
+                    builder_.CreateStore(keyVal, keySlot);
+                    builder_.CreateCall(addFn,
+                                        {result, keySlot, builder_.getInt64(esz)});
+                    // Free this iteration's key-bytes copy (mirrors lowerDictKeysFor
+                    // and emitGenericKeyTableFor).
+                    builder_.CreateCall(freeFn, {keyPtr});
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idxB, builder_.getInt64(1)), idxSlot);
+                    builder_.CreateBr(condBB);
+
+                    builder_.SetInsertPoint(endBB);
+                    builder_.CreateCall(freeFn, {keysArr});
+                    return result;
+                }
+
+                // String keys: existing bz_dict_keys_str path (unchanged).
                 auto* keysOutSlot = entryAlloca(ptrTy());
                 auto* lensOutSlot = entryAlloca(ptrTy());
                 auto* cntSlot2 = entryAlloca(i64());

@@ -477,6 +477,15 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 v = wrapNullableValue(valTy, v); // scalar T → {i8=1, T=v}
             }
         }
+        // fix #570 / §4.8 / §7 / §9: nullable RECORD value (Item?) — when the
+        // caller passes the inner record struct directly (e.g. `d["k"] := new Item(42)`
+        // implicitly coerced to Item?), the value is an Item struct (not the
+        // tagged {i8,Item} struct).  The promotion above skips it (isStructTy() is
+        // true).  Wrap into {i8=1, Item} before boxing so decode always finds the
+        // full tagged struct.  Detect by comparing against the outer tagged struct.
+        if (valNullableVal && v->getType()->isStructTy() &&
+            v->getType() != nullableValueStructTy(valTy))
+            v = wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
         if ((valRec || valNullableVal) && v->getType()->isStructTy()) {
             // Box the struct (record or nullable-value tagged struct).
             uint64_t vsz =
