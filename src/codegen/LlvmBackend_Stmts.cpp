@@ -1667,12 +1667,15 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     auto* idxSlot = entryAlloca(i64());
     builder_.CreateStore(builder_.getInt64(0), idxSlot);
 
-    // Loop variable slot — stores the decoded V value.  For a non-nullable
-    // record, the loop variable is a pointer to the heap box (the body loads
-    // fields through it); for all other types it is the value itself.
-    // issue #539: nullable value types lower to a tagged struct and the loop
-    // variable holds the decoded struct (not a pointer), so allocate valLlvm.
-    auto* varSlot = entryAlloca(valRec ? ptrTy() : valLlvm);
+    // Loop variable slot — stores the decoded V value.  For all types
+    // (including records) the slot holds the value itself (a struct for records,
+    // not a pointer).  fix #563: the previous code used ptrTy() for records and
+    // stored the raw heap-box pointer; fieldAddr then GEP'd into the
+    // pointer-holding alloca rather than the record struct, yielding garbage
+    // field reads.  Mirror emitGenericKeyTableFor: load the struct out of the
+    // box and store the struct value into a slot typed as valLlvm.
+    // issue #539: nullable value types lower to a tagged struct — same: valLlvm.
+    auto* varSlot = entryAlloca(valLlvm);
     locals_[&fs] = varSlot;
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "dv.cond", currentFn_);
@@ -1691,7 +1694,10 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     llvm::Value* slotV  = builder_.CreateLoad(ptrTy(), vpPtr);  // raw void*
 
     // Decode void* → V following the same encoding as TryGetValue / GetOrAdd.
-    //   record value: slotV is the heap-box pointer → bind as pointer to box.
+    //   record value: slotV is the heap-box pointer → load the record struct
+    //     out of the box (fix #563; mirrors emitGenericKeyTableFor and the
+    //     direct-indexer get in lowerCollectionIndexerGet §4.8).  The box is
+    //     owned by the dict and must not be freed — we only read its bytes.
     //   nullable value type (issue #539): slotV is the heap-box pointer of the
     //     tagged {i8,T} struct → load the struct from the box.
     //   scalar (int/long/bool/char/enum/float/double): slotV was inttoptr'd →
@@ -1699,12 +1705,11 @@ bool Emitter::lowerDictValuesFor(const ast::ForStmt& fs) {
     //   pointer (string / class object): slotV IS the value.
     llvm::Value* decoded;
     if (valRec) {
-        // Record: bind the loop variable as a pointer to the box (body reads
-        // fields through it).  We do NOT copy the record here; the body reads
-        // via a load of the struct type, matching how lowerDictKeysFor's
-        // emitGenericKeyTableFor binds key values.  The box is owned by the dict
-        // and must not be freed.
-        decoded = slotV;  // ptr to boxed record
+        // fix #563 / §4.8: load the record struct from the heap box.  The
+        // runtime heap-boxes records (malloc + memcpy) so they fit in the void*
+        // value slot; decode by loading the struct type out of the box pointer,
+        // exactly as lowerCollectionIndexerGet does for dict[key] on a record V.
+        decoded = builder_.CreateLoad(valLlvm, slotV, "dv.rec");
     } else if (valNullableVal && valLlvm->isStructTy()) {
         // Nullable value type: unbox the tagged struct from the heap box.
         // The box is non-null even when hasValue=0 (the null tag is in the

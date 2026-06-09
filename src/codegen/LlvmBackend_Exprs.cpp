@@ -1871,13 +1871,19 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
-    // fix #556 / §4.8: `Dictionary<K,V>.Values` as an expression — returns a
-    // fresh bz_array_t* of decoded values.  Mirrors the Keys handler above but
-    // uses genericArgs[1] (the value type) and the bz_dict_values_* snapshots.
-    // The element decoding follows the same void*-encoding rules as
-    // lowerDictValuesFor (LlvmBackend_Stmts.cpp): record → heap-box pointer;
-    // nullable value type → unbox tagged struct; scalar → ptrtoint + trunc;
-    // pointer (string / class) → void* IS the value.
+    // fix #556 / fix #563 / §4.8: `Dictionary<K,V>.Values` as an expression —
+    // returns a fresh bz_array_t* of decoded values.  Mirrors the Keys handler
+    // above but uses genericArgs[1] (the value type) and the bz_dict_values_*
+    // snapshots.  The element decoding follows the same void*-encoding rules as
+    // lowerDictValuesFor (LlvmBackend_Stmts.cpp): record → load the struct from
+    // the heap box (fix #563); nullable value type → unbox tagged struct;
+    // scalar → ptrtoint + trunc; pointer (string / class) → void* IS the value.
+    // fix #563: the old code stored the raw box pointer (ptrTy()) into elemSlot
+    // and called bz_array_add with the struct's byte-count; bz_array_add then
+    // copied struct-size bytes out of an 8-byte pointer slot → garbage.  The
+    // correct decode mirrors lowerCollectionIndexerGet §4.8: load the struct
+    // bytes out of the box (CreateLoad(valLlvm, slotV)) and put the struct value
+    // into a properly-typed elemSlot so bz_array_add copies the real bytes.
     // The resulting bz_array_t* is typed as Array<V> by sema (fix #556), so
     // collectionElemSize will compute the correct per-element stride and
     // downstream .Count / .ToArray() / LINQ will work correctly.
@@ -1961,10 +1967,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                                             idxB);
                     llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
 
-                    // Decode void* → V (same encoding as lowerDictValuesFor).
+                    // Decode void* → V (same encoding as lowerDictValuesFor,
+                    // fixed by #563 to match lowerCollectionIndexerGet §4.8).
                     llvm::Value* decoded;
                     if (valRec) {
-                        decoded = slotV;  // ptr to heap-boxed record
+                        // fix #563 / §4.8: load the record struct from the
+                        // heap box.  The runtime boxes records (malloc+memcpy)
+                        // so they fit in the void* slot; decode by loading the
+                        // struct type back out of the box pointer — the same
+                        // path the direct dict indexer get uses.
+                        decoded = builder_.CreateLoad(valLlvm, slotV, "dve.rec");
                     } else if (valNullableVal && valLlvm->isStructTy()) {
                         decoded = builder_.CreateLoad(valLlvm, slotV,
                                                       "dve.nvval");
@@ -1984,9 +1996,13 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         decoded = slotV;  // pointer (string / class object)
                     }
 
-                    // Store the decoded element into a stack slot and add to array.
-                    llvm::AllocaInst* elemSlot = entryAlloca(
-                        valRec ? ptrTy() : decoded->getType());
+                    // Store the decoded element into a stack slot and add to
+                    // array.  fix #563: elemSlot must be typed as decoded's
+                    // type (always decoded->getType() now that records produce
+                    // a struct value from the load above, not a ptrTy()).
+                    // bz_array_add copies esz bytes from elemSlot; the slot
+                    // must hold the actual struct bytes, not a pointer to them.
+                    llvm::AllocaInst* elemSlot = entryAlloca(decoded->getType());
                     builder_.CreateStore(decoded, elemSlot);
                     builder_.CreateCall(addFn,
                                         {result, elemSlot,
