@@ -103,10 +103,11 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, base_case_only) {
 }
 
 // §27.5 / #579: a block-bodied recursive sum (1..n) via the captured `sum`.
-// The block body lets the base case use an `if`/`return` (an expression-bodied
-// ternary lambda directly in an assignment RHS does not parse in this version —
-// a separate parser limitation, tracked as a follow-up to #579, not the
-// runtime segfault this issue is about).
+// Note: an expression-bodied form `sum := (n: int) => 0 if n <= 0 else
+// n + sum(n - 1)` also parses and is tested separately in
+// lambda_conditional_body_589_test.cpp (fix #589). The block body is kept
+// here because this test's focus is the §27.5 recursive-capture semantics,
+// not the conditional-expression parsing.
 BEZEL_TEST(codegen_recursive_lambda_27_5, recursive_sum) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
