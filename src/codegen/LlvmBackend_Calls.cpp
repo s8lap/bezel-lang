@@ -2311,6 +2311,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // pointer (non-null class pointer stored as T?) falls through to
                 // the pointer case below — class/string pointers are not boxed.
             }
+            // fix #570 / §4.8 / §7 / §9: nullable RECORD value (Item?) — when
+            // the caller passes the inner record struct directly (e.g. `new Item(42)`
+            // implicitly coerced to Item?), the value is an Item struct (not yet
+            // the tagged {i8,Item} struct).  The #544 promotion above skips it
+            // (isStructTy() is true so `!isStructTy()` is false).  Wrap it into
+            // the {i8=1, Item} tagged struct before boxing so decode always sees
+            // the full tagged struct.  Detect by comparing against the outer tagged
+            // struct type: if they differ the inner record must be wrapped.
+            if (valNullableVal && v->getType()->isStructTy() &&
+                v->getType() != nullableValueStructTy(valTy))
+                v = wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
             if ((valRec || valNullableVal) && v->getType()->isStructTy()) {
                 // Box the struct (record or nullable-value-type tagged struct)
                 // into a malloc'd region.  The tag byte for nullable types is
