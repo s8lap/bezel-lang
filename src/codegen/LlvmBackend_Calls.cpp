@@ -1488,6 +1488,207 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // tryLowerLazyLinqCall (the sorted snapshot is built on first
         // enumeration, after which iteration is deferred per element).
 
+        // per §3 / #472: .Sort(comparer: (T,T)->int) — in-place sort with
+        // user-supplied comparison closure.  `bz_array_sort_closure` takes a
+        // closure-aware trampoline `int(void* cl, const void* a, const void* b)`
+        // so qsort can reach the user lambda without a global pointer.
+        if (m == "Sort" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Type* elemTy2 = getElemTy();
+            // Lower the comparer lambda with the right expected function type:
+            // (T, T) -> int.  lowerLinqLambda sets the closure ABI { fn, env }.
+            sema::TypeRef* intRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), intRef);
+            if (!closure) return nullptr;
+
+            // Build a fresh trampoline: int(void* closure, const void* a, const void* b)
+            // Loads T from a and b, calls the closure as fn(env, T_a, T_b) → int.
+            auto savedIP = builder_.saveIP();
+            llvm::Function* savedFn = currentFn_;
+            auto* tTy = llvm::FunctionType::get(
+                i32(), {ptrTy(), ptrTy(), ptrTy()}, false);
+            auto* tramp = llvm::Function::Create(
+                tTy, llvm::Function::InternalLinkage, "bz$sortcmp", module_.get());
+            currentFn_ = tramp;
+            auto* trampBB = llvm::BasicBlock::Create(llvm_, "entry", tramp);
+            builder_.SetInsertPoint(trampBB);
+            {
+                llvm::Value* cl = tramp->getArg(0);
+                llvm::Value* ap = tramp->getArg(1);
+                llvm::Value* bp = tramp->getArg(2);
+                llvm::Value* av = builder_.CreateLoad(elemTy2, ap, "cmp.a");
+                llvm::Value* bv = builder_.CreateLoad(elemTy2, bp, "cmp.b");
+                llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), cl, "cl.fn");
+                llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), cl,
+                                           {builder_.getInt32(1)});
+                llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+                auto* clTy = llvm::FunctionType::get(i32(), {ptrTy(), elemTy2, elemTy2}, false);
+                llvm::Value* r = builder_.CreateCall(clTy, fnPtr, {envPtr, av, bv}, "cmp.r");
+                builder_.CreateRet(r);
+            }
+            builder_.restoreIP(savedIP);
+            currentFn_ = savedFn;
+
+            auto* sortClFn = declareC("bz_array_sort_closure",
+                llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), i64(), ptrTy(), ptrTy()});
+            builder_.CreateCall(sortClFn, {recv, builder_.getInt64(esz), closure, tramp});
+            // Release inline-lambda closure after the sort completes (#422).
+            if (argIsInlineLambda(0)) emitClosureRelease(closure);
+            return llvm::ConstantInt::get(i32(), 0);
+        }
+
+        // per §3 / #472: Array<T>.Reversed() — returns a new Array<T> with
+        // elements in reverse order; the receiver `arr` is unchanged.
+        // Implementation: shallow-copy via bz_array_copy, then in-place reverse.
+        if (m == "Reversed" && call.args.empty() &&
+            recvTy && recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            recvTy->astNode->name->parts[0] == "Array") {
+            llvm::Type* elemTy = getElemTy();
+            auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
+                                                    "rev.copy");
+            // In-place reverse on the copy (same logic as Reverse()).
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {copy});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "revd.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "revd.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "revd.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* i = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* half = builder_.CreateSDiv(len, builder_.getInt64(2));
+            builder_.CreateCondBr(builder_.CreateICmpSLT(i, half), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* j = builder_.CreateSub(builder_.CreateSub(len, i),
+                                                builder_.getInt64(1));
+            llvm::Value* pa = builder_.CreateCall(ptrFn, {copy, i, builder_.getInt64(esz)});
+            llvm::Value* pb = builder_.CreateCall(ptrFn, {copy, j, builder_.getInt64(esz)});
+            llvm::Value* ta = builder_.CreateLoad(elemTy, pa);
+            llvm::Value* tb = builder_.CreateLoad(elemTy, pb);
+            builder_.CreateStore(tb, pa);
+            builder_.CreateStore(ta, pb);
+            builder_.CreateStore(builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return copy;
+        }
+
+        // per §3 / #472: Array<T>.Sorted() — returns a new sorted Array<T>
+        // (no-comparer form; T must be IComparable<T>: int or string here).
+        // Implementation: shallow-copy, then in-place Sort() on the copy.
+        if (m == "Sorted" && call.args.empty() &&
+            recvTy && recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            recvTy->astNode->name->parts[0] == "Array") {
+            llvm::Type* elemTy2 = getElemTy();
+            auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
+                                                    "srtd.copy");
+            // Re-use the same built-in comparator logic as Sort() no-arg.
+            bool isStringElem2 = (elemTy2 == ptrTy());
+            llvm::Function* cmpFn2 = nullptr;
+            if (isStringElem2) {
+                auto* cmpName = "bz$strcmp";
+                cmpFn2 = module_->getFunction(cmpName);
+                if (!cmpFn2) {
+                    auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    cmpFn2 = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
+                                                    cmpName, module_.get());
+                    auto* bb2 = llvm::BasicBlock::Create(llvm_, "entry", cmpFn2);
+                    llvm::IRBuilder<> cmpB2(bb2);
+                    llvm::Value* aSlot = &*cmpFn2->arg_begin();
+                    llvm::Value* bSlot = &*std::next(cmpFn2->arg_begin());
+                    llvm::Value* aStr = cmpB2.CreateLoad(ptrTy(), aSlot);
+                    llvm::Value* bStr = cmpB2.CreateLoad(ptrTy(), bSlot);
+                    llvm::Value* aData = cmpB2.CreateLoad(ptrTy(),
+                        cmpB2.CreateStructGEP(stringType(), aStr, 0));
+                    llvm::Value* bData = cmpB2.CreateLoad(ptrTy(),
+                        cmpB2.CreateStructGEP(stringType(), bStr, 0));
+                    auto* strcmpFn2 = module_->getFunction("strcmp");
+                    if (!strcmpFn2) {
+                        auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                        strcmpFn2 = llvm::Function::Create(ft, llvm::Function::ExternalLinkage,
+                                                           "strcmp", module_.get());
+                    }
+                    cmpB2.CreateRet(cmpB2.CreateCall(strcmpFn2, {aData, bData}));
+                }
+            } else {
+                auto* cmpName = "bz$intcmp";
+                cmpFn2 = module_->getFunction(cmpName);
+                if (!cmpFn2) {
+                    auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                    cmpFn2 = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
+                                                    cmpName, module_.get());
+                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn2);
+                    llvm::IRBuilder<> cmpB(bb);
+                    llvm::Value* a = &*cmpFn2->arg_begin();
+                    llvm::Value* b = &*std::next(cmpFn2->arg_begin());
+                    llvm::Value* av = cmpB.CreateLoad(i32(), a);
+                    llvm::Value* bv = cmpB.CreateLoad(i32(), b);
+                    cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                }
+            }
+            auto* sortFn2 = declareC("bz_array_sort", llvm::Type::getVoidTy(llvm_),
+                                     {ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(sortFn2, {copy, builder_.getInt64(esz), cmpFn2});
+            return copy;
+        }
+
+        // per §3 / #472: Array<T>.Sorted(comparer: (T,T)->int) — returns a new
+        // sorted Array<T> using the user-supplied comparer.
+        // Implementation: shallow-copy, then in-place Sort(comparer) on the copy.
+        if (m == "Sorted" && call.args.size() == 1 && call.args[0].value &&
+            recvTy && recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            recvTy->astNode->name->parts[0] == "Array") {
+            llvm::Type* elemTy2 = getElemTy();
+            auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* copy = builder_.CreateCall(copyFn, {recv, builder_.getInt64(esz)},
+                                                    "srtdc.copy");
+            sema::TypeRef* intRef2 = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), intRef2);
+            if (!closure) return nullptr;
+
+            // Build trampoline: int(void* closure, const void* a, const void* b)
+            auto savedIP2 = builder_.saveIP();
+            llvm::Function* savedFn2 = currentFn_;
+            auto* tTy2 = llvm::FunctionType::get(
+                i32(), {ptrTy(), ptrTy(), ptrTy()}, false);
+            auto* tramp2 = llvm::Function::Create(
+                tTy2, llvm::Function::InternalLinkage, "bz$sortcmpc", module_.get());
+            currentFn_ = tramp2;
+            auto* trampBB2 = llvm::BasicBlock::Create(llvm_, "entry", tramp2);
+            builder_.SetInsertPoint(trampBB2);
+            {
+                llvm::Value* cl = tramp2->getArg(0);
+                llvm::Value* ap = tramp2->getArg(1);
+                llvm::Value* bp = tramp2->getArg(2);
+                llvm::Value* av = builder_.CreateLoad(elemTy2, ap, "cmpc.a");
+                llvm::Value* bv = builder_.CreateLoad(elemTy2, bp, "cmpc.b");
+                llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), cl, "cl.fn");
+                llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), cl,
+                                           {builder_.getInt32(1)});
+                llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+                auto* clTy = llvm::FunctionType::get(i32(), {ptrTy(), elemTy2, elemTy2}, false);
+                llvm::Value* r = builder_.CreateCall(clTy, fnPtr, {envPtr, av, bv}, "cmpc.r");
+                builder_.CreateRet(r);
+            }
+            builder_.restoreIP(savedIP2);
+            currentFn_ = savedFn2;
+
+            auto* sortClFn2 = declareC("bz_array_sort_closure",
+                llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), i64(), ptrTy(), ptrTy()});
+            builder_.CreateCall(sortClFn2, {copy, builder_.getInt64(esz), closure, tramp2});
+            // Release inline-lambda closure after the sort completes (#422).
+            if (argIsInlineLambda(0)) emitClosureRelease(closure);
+            return copy;
+        }
+
         // per §3/§25.2: .IndexOf(item): int — index of first match, -1 if not
         // found. Match semantics (issue #424 / §25.2): dispatched per element
         // type by emitRemoveElementEquality — record structural equality (§8.3),

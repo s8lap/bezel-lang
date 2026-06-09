@@ -635,9 +635,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         msg += " Per §26.5 the in-place instance "
                                                "method shadows the LINQ `Reverse` "
                                                "extension (§5); to build a reversed "
-                                               "copy, drive the LINQ `Reverse()` from "
-                                               "a lazy IEnumerable<T> receiver (e.g. "
-                                               "`a.Where(...).Reverse().ToArray()`).";
+                                               "copy use `a.Reversed()` (§3 / #472) "
+                                               "or drive the LINQ `Reverse()` from a "
+                                               "lazy receiver (`a.Where(..).Reverse()"
+                                               ".ToArray()`).";
                                     ctx_.diagnostics().report(
                                         Severity::Error, ma->span.begin, msg);
                                     return;
@@ -1030,6 +1031,71 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 m == "ToSet" ? "Set" : "Array",
                                 recvTy->genericArgs[0]));
+                        // stdlib §3 / #472: Array<T>.Reversed() and
+                        // Array<T>.Sorted() / Array<T>.Sorted(comparer) —
+                        // value-returning copy-forms (past-participle convention).
+                        // Return type: owned Array<T> (same element type as receiver).
+                        // Only on Array<T> (not OwnedArray<T>); OwnedArray has unique
+                        // ownership semantics that make copying its elements unsound.
+                        // Sorted() without a comparer requires T: IComparable<T> —
+                        // we check here that T is int or string (the concrete types
+                        // implementing IComparable<T> in this milestone); all other
+                        // element types require the explicit-comparer form.
+                        else if (colName == "Array" && !recvTy->genericArgs.empty() &&
+                                 m == "Reversed" && ce.args.empty()) {
+                            ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                                "Array", recvTy->genericArgs[0]));
+                        } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
+                                   m == "Sorted" && ce.args.empty()) {
+                            // Constraint check: T must be IComparable<T>.  For
+                            // the concrete subset supported (int, string), this is
+                            // trivially satisfied.  For any other T, emit a
+                            // compile-time diagnostic directing the user to the
+                            // explicit-comparer form — per §3 / #472.
+                            const TypeRef* elemTy472 = recvTy->genericArgs[0];
+                            bool isComparableElem =
+                                (elemTy472 && elemTy472->kind == TypeRef::Kind::Primitive &&
+                                 (elemTy472->primitive == P::Int ||
+                                  elemTy472->primitive == P::String ||
+                                  elemTy472->primitive == P::Long ||
+                                  elemTy472->primitive == P::Byte ||
+                                  elemTy472->primitive == P::Double ||
+                                  elemTy472->primitive == P::Float ||
+                                  elemTy472->primitive == P::Char));
+                            if (!isComparableElem) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "Array<T>.Sorted() requires T to implement "
+                                    "IComparable<T> (§3 / #472); T is not a "
+                                    "built-in comparable type. "
+                                    "Use Sorted(comparer: (T, T) -> int) instead.");
+                            } else {
+                                ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                                    "Array", recvTy->genericArgs[0]));
+                            }
+                        } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
+                                   m == "Sorted" && ce.args.size() == 1) {
+                            ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                                "Array", recvTy->genericArgs[0]));
+                        }
+                        // stdlib §3 / #472: Reversed() and Sorted() are NOT defined
+                        // on OwnedArray<T> — unique ownership makes a shallow copy
+                        // unsound (elements are owned; a bitwise copy would double-
+                        // free). Emit a clear diagnostic so the user knows to convert
+                        // to Array<T> first (e.g. with ToArray()).
+                        if (colName == "OwnedArray" &&
+                            (m == "Reversed" || m == "Sorted")) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string(m) +
+                                "() is not defined on OwnedArray<T> (§3 / #472). "
+                                "OwnedArray<T> elements are uniquely owned; a shallow "
+                                "copy would produce two owners of the same object, "
+                                "violating §28.3 exactly-once disposal. "
+                                "Convert to Array<T> first (e.g. with ToArray()) "
+                                "then call " + std::string(m) + "().");
+                            return;
+                        }
                         // stdlib §5 ToDictionary — typed as Dictionary<K,V> sentinel
                         // (fix #459 / §5 / §22): same as the lazy-source path above.
                         else if (m == "ToDictionary" && !ce.args.empty() &&

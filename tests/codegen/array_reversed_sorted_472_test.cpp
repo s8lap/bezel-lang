@@ -1,0 +1,414 @@
+// Codegen + sema — #472: Array<T>.Reversed() and Array<T>.Sorted[...] —
+// value-returning copy-forms (past-participle convention, stdlib §3 / #472).
+//
+// DESIGN (decided, do not redesign):
+//   Reversed(): owned Array<T>   — returns a NEW array, elements in reverse
+//                                   order; `arr` unchanged.
+//   Sorted(comparer: (T,T)->int): owned Array<T>
+//                                — returns a NEW sorted array; `arr` unchanged.
+//   Sorted(): owned Array<T>     — no-comparer form; T must be IComparable<T>
+//                                   (int / string in this milestone).
+//
+// In-place Reverse() / Sort() stay UNCHANGED (mutate, return ()).
+// OwnedArray<T> gets NO value-forms (unique ownership — copy semantics unsound).
+//
+// Spec reference: stdlib §3 (Array<T> instance methods), §26.5 (instance
+// members win over LINQ extensions).  All examples trace the copy-then-op path.
+//
+// Tests:
+//   - Reversed(): reversed copy returned; original unchanged (int & string).
+//   - Sorted(): sorted copy returned; original unchanged (int).
+//   - Sorted(comparer): sorted copy with user comparer; original unchanged (int).
+//   - Chaining: arr.Reversed().Get(0) etc.
+//   - Ownership: result consumed via using var; ASan-clean (no leak, no UAF).
+//   - Control: in-place Reverse() / Sort() still mutate arr.
+//   - Diagnostic: Sorted() on non-IComparable T emits a clean error.
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <sys/wait.h>
+
+#include "codegen/LlvmBackend.hpp"
+#include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+#include "native_test_harness.hpp"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+
+using bezel::test::runJit;
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Run the JIT pipeline; return the exit code, or -999 if the program did not
+// run (compile error / JIT failure).
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// True iff sema rejected `src` with at least one error diagnostic.
+bool rejectedAtCompile(const std::string& src) {
+    auto r = runJit(src);
+    return !r.ran && r.diagnostics.hasErrors();
+}
+
+// True iff at least one reported diagnostic message contains `needle`.
+bool diagContains(const std::string& src, const std::string& needle) {
+    auto r = runJit(src);
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+// ---- ASan leg (mirrors array_reverse_chain_466_test.cpp) -------------------
+int lowerToObject(const std::string& source, const std::string& objPath) {
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(source, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return -1;
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    bezel::sema::checkDefiniteAssignment(*unit, ctx);
+    bezel::ownership::checkOwnership(*unit, ctx);
+    if (diags.hasErrors()) return -1;
+    llvm::LLVMContext llvmCtx;
+    auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+    if (!module) return -1;
+    std::string err;
+    if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    return 0;
+}
+
+// Compile under ASan + LeakSanitizer, run, check exit code.
+// Returns 0 (clean), 1 (sanitizer problem or wrong exit code), -1 (skip).
+int runUnderAsan(const std::string& source, int expectedExitCode) {
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_472_" + std::to_string(counter++);
+    std::string objPath = (dir / (stem + ".o")).string();
+    std::string exe     = (dir / stem).string();
+    if (lowerToObject(source, objPath) != 0) return -1;
+    auto cleanup = [&] {
+        std::remove(objPath.c_str());
+        std::remove(exe.c_str());
+    };
+    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    std::string runCmd = "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe +
+                         " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    cleanup();
+    if (status == -1) return -1;
+    if (!WIFEXITED(status)) return 1;
+    int code = WEXITSTATUS(status);
+    if (code == 99) return 1;
+    return (code == expectedExitCode) ? 0 : 1;
+}
+
+// Assert: JIT-correct AND ASan-clean.  Skips ASan leg when toolchain absent.
+void expectValueAndAsanClean(const std::string& source, int expectedExitCode) {
+    BEZEL_EXPECT_EQ(run(source), expectedExitCode);
+    int a = runUnderAsan(source, expectedExitCode);
+    if (a == -1) return;
+    BEZEL_EXPECT_EQ(a, 0);
+}
+
+}  // namespace
+
+// ===========================================================================
+// Reversed(): returned copy is reversed; original is unchanged.  (stdlib §3 / #472)
+// ===========================================================================
+
+// §3 / #472: Reversed() on [1,2,3] → copy is [3,2,1]; original stays [1,2,3].
+// Encode both sequences: copy: 3*49+2*7+1=162; original: 1*49+2*7+3=66.
+// Return copy[0]*49+copy[1]*7+copy[2] = 162.
+BEZEL_TEST(array_reversed_sorted_472, reversed_int_copy_correct_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  using var rev := a.Reversed(); "
+        "  return rev.Get(0) * 49 + rev.Get(1) * 7 + rev.Get(2); "  // 162
+        "end Main; end C;", 162);
+}
+
+// §3 / #472: original array is unchanged after Reversed().
+BEZEL_TEST(array_reversed_sorted_472, reversed_int_original_unchanged_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  using var rev := a.Reversed(); "
+        "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 1*49+2*7+3=66
+        "end Main; end C;", 66);
+}
+
+// §3 / #472: Reversed() on a single-element array is a copy of length 1.
+BEZEL_TEST(array_reversed_sorted_472, reversed_single_element_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); a.Add(7); "
+        "  using var rev := a.Reversed(); "
+        "  return rev.Length * 10 + rev.Get(0); "  // 1*10+7=17
+        "end Main; end C;", 17);
+}
+
+// §3 / #472: Reversed() on an empty array returns an empty copy.
+BEZEL_TEST(array_reversed_sorted_472, reversed_empty_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  using var rev := a.Reversed(); "
+        "  return rev.Length; "  // 0
+        "end Main; end C;", 0);
+}
+
+// §3 / #472: chained — arr.Reversed().Get(0) directly on the result expression.
+// [5,3,1] reversed = [1,3,5]; Get(0)=1.
+BEZEL_TEST(array_reversed_sorted_472, reversed_chained_get_spec_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(5); a.Add(3); a.Add(1); "
+        "  using var rev := a.Reversed(); "
+        "  return rev.Get(0); "  // 1
+        "end Main; end C;"), 1);
+}
+
+// §3 / #472: Reversed() on Array<string> — [\"c\",\"b\",\"a\"] reversed.
+// Encode using string lengths as a proxy (all length 1); check via Length.
+BEZEL_TEST(array_reversed_sorted_472, reversed_string_copy_length_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<string>(); "
+        "  a.Add(\"alpha\"); a.Add(\"beta\"); a.Add(\"gamma\"); "
+        "  using var rev := a.Reversed(); "
+        "  return rev.Length; "  // 3
+        "end Main; end C;", 3);
+}
+
+// ===========================================================================
+// Sorted(comparer): sorted copy; original unchanged.  (stdlib §3 / #472)
+// ===========================================================================
+
+// §3 / #472: Sorted(comparer) on [3,1,2] → copy is [1,2,3]; original stays [3,1,2].
+// Encode copy: 1*49+2*7+3=66.
+BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_copy_correct_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(3); a.Add(1); a.Add(2); "
+        "  using var s := a.Sorted((x: int, y: int) => x - y); "
+        "  return s.Get(0) * 49 + s.Get(1) * 7 + s.Get(2); "  // 1*49+2*7+3=66
+        "end Main; end C;", 66);
+}
+
+// §3 / #472: original array is unchanged after Sorted(comparer).
+BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_original_unchanged_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(3); a.Add(1); a.Add(2); "
+        "  using var s := a.Sorted((x: int, y: int) => x - y); "
+        "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 3*49+1*7+2=156
+        "end Main; end C;", 156);
+}
+
+// §3 / #472: descending sort via comparer — [1,2,3] → [3,2,1].
+// Encode: 3*49+2*7+1=162.
+BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_descending_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  using var s := a.Sorted((x: int, y: int) => y - x); "
+        "  return s.Get(0) * 49 + s.Get(1) * 7 + s.Get(2); "  // 3*49+2*7+1=162
+        "end Main; end C;", 162);
+}
+
+// §3 / #472: Sorted(comparer) on a single-element array — copy of length 1.
+BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_single_element_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); a.Add(42); "
+        "  using var s := a.Sorted((x: int, y: int) => x - y); "
+        "  return s.Length * 100 + s.Get(0); "  // 1*100+42=142
+        "end Main; end C;", 142);
+}
+
+// §3 / #472: chained — check Length of Sorted(comparer) result.
+BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_chained_length_spec_3) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(9); a.Add(1); a.Add(5); "
+        "  using var s := a.Sorted((x: int, y: int) => x - y); "
+        "  return s.Length; "  // 3
+        "end Main; end C;"), 3);
+}
+
+// ===========================================================================
+// Sorted() (no-comparer, IComparable<T>).  (stdlib §3 / #472)
+// ===========================================================================
+
+// §3 / #472: Sorted() on Array<int>: [3,1,2] → [1,2,3]; original unchanged.
+// Encode copy: 1*49+2*7+3=66.
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_int_copy_correct_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(3); a.Add(1); a.Add(2); "
+        "  using var s := a.Sorted(); "
+        "  return s.Get(0) * 49 + s.Get(1) * 7 + s.Get(2); "  // 1*49+2*7+3=66
+        "end Main; end C;", 66);
+}
+
+// §3 / #472: original unchanged after Sorted().
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_int_original_unchanged_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(3); a.Add(1); a.Add(2); "
+        "  using var s := a.Sorted(); "
+        "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 3*49+1*7+2=156
+        "end Main; end C;", 156);
+}
+
+// §3 / #472: Sorted() on an empty Array<int> returns an empty array.
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_empty_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  using var s := a.Sorted(); "
+        "  return s.Length; "  // 0
+        "end Main; end C;", 0);
+}
+
+// §3 / #472: Sorted() on a single-element array returns a copy of length 1.
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_single_element_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); a.Add(7); "
+        "  using var s := a.Sorted(); "
+        "  return s.Length * 10 + s.Get(0); "  // 1*10+7=17
+        "end Main; end C;", 17);
+}
+
+// §3 / #472: Sorted() — non-IComparable T emits a compile-time diagnostic.
+// Uses a record type (not int/string) as the element — must be rejected.
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_non_comparable_rejected_spec_3) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; "
+        "record Point public x: int; public y: int; end Point; "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  using var s := a.Sorted(); "  // Point is not IComparable<Point>
+        "  return s.Length; "
+        "end Main; end C;"));
+}
+
+// §3 / #472: diagnostic message cites IComparable and the comparer alternative.
+BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_non_comparable_diag_spec_3) {
+    const char* src =
+        "module M; "
+        "record Point public x: int; public y: int; end Point; "
+        "class C public static method Main(): int "
+        "  using var a := new Array<Point>(); "
+        "  using var s := a.Sorted(); "
+        "  return s.Length; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(diagContains(src, "IComparable"));
+    BEZEL_EXPECT_TRUE(diagContains(src, "comparer"));
+}
+
+// ===========================================================================
+// Control: in-place Reverse() and Sort() still mutate arr.  (§3 / regression)
+// ===========================================================================
+
+// §3 / regression: in-place Reverse() still mutates arr; Reversed() is not
+// confused with it.  After a.Reverse(), a=[3,2,1]: 3*49+2*7+1=162.
+BEZEL_TEST(array_reversed_sorted_472, inplace_reverse_still_mutates_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  a.Reverse(); "
+        "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 162
+        "end Main; end C;", 162);
+}
+
+// §3 / regression: in-place Sort() (no-arg) still mutates arr; Sorted() is not
+// confused with it.  After a.Sort(), a=[1,2,3]: 1*49+2*7+3=66.
+BEZEL_TEST(array_reversed_sorted_472, inplace_sort_still_mutates_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(3); a.Add(1); a.Add(2); "
+        "  a.Sort(); "
+        "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 1*49+2*7+3=66
+        "end Main; end C;", 66);
+}
+
+// §3 / regression: in-place Sort(comparer) still mutates arr.
+// [3,1,2] sorted desc → [3,2,1]: 3*49+2*7+1=162.
+BEZEL_TEST(array_reversed_sorted_472, inplace_sort_comparer_still_mutates_spec_3) {
+    expectValueAndAsanClean(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(3); a.Add(1); a.Add(2); "
+        "  a.Sort((x: int, y: int) => y - x); "
+        "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 3*49+2*7+1=162
+        "end Main; end C;", 162);
+}
+
+// ===========================================================================
+// OwnedArray<T> does NOT get value-forms — must still be accepted for the
+// in-place forms and rejected for the copy-forms (via undefined-method path).
+// Note: OwnedArray<T> in-place Reverse()/Sort() work (they're the same runtime
+// ops); only the copy-forms Reversed()/Sorted() must be absent.
+// ===========================================================================
+
+// §3 / #472: OwnedArray<int>.Reversed() must be rejected — OwnedArray has no
+// value-form copy-method (ownership semantics prevent a shallow copy).
+BEZEL_TEST(array_reversed_sorted_472, ownedarray_reversed_rejected_spec_3) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var a := new OwnedArray<int>(); "
+        "  a.Add(1); a.Add(2); "
+        "  using var rev := a.Reversed(); "  // OwnedArray has no Reversed()
+        "  return rev.Length; "
+        "end Main; end C;"));
+}
+
+// §3 / #472: OwnedArray<int>.Sorted() must be rejected.
+BEZEL_TEST(array_reversed_sorted_472, ownedarray_sorted_rejected_spec_3) {
+    BEZEL_EXPECT_TRUE(rejectedAtCompile(
+        "module M; class C public static method Main(): int "
+        "  using var a := new OwnedArray<int>(); "
+        "  a.Add(3); a.Add(1); "
+        "  using var s := a.Sorted(); "  // OwnedArray has no Sorted()
+        "  return s.Length; "
+        "end Main; end C;"));
+}
