@@ -5307,8 +5307,9 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     // can detect a nullable VALUE type ({i8 hasValue; T value} struct) and
     // apply hasValue-based matching instead of the pointer-based paths.
     const sema::TypeRef* scrutTy = ctx_.exprType(*ce.scrutinee);
+    const sema::TypeRef* resultSemaTy = ctx_.exprType(ce);
     llvm::Type* resultTy = i32();
-    if (auto* rt = ctx_.exprType(ce)) resultTy = lowerTypeRef(rt);
+    if (resultSemaTy) resultTy = lowerTypeRef(resultSemaTy);
 
     auto* endBB = llvm::BasicBlock::Create(llvm_, "case.end", currentFn_);
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incomings;
@@ -5377,8 +5378,13 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             if (resultTy)
                 v = coerceNumericToType(v, resultTy,
                                         isUnsignedTargetExpr(*arm.exprBody));
+            // fix #573 / §19.2 / §7.1 / §7.5: defer the branch-to-endBB so
+            // nullable widening can emit into this block after all arms are
+            // seen (same discipline as lowerConditional — see Path A/B there).
+            // The CreateBr(endBB) terminators are emitted in the post-loop
+            // widening pass below.
             incomings.push_back({v, builder_.GetInsertBlock()});
-            builder_.CreateBr(endBB);
+            // Do NOT create br here — deferred to post-loop.
         }
         // Reset for the next arm's pattern-test / body: a prior arm's
         // divergence must not bleed into the next arm.
@@ -5386,7 +5392,114 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         builder_.SetInsertPoint(nextBB);
     }
     // No arm matched → MatchFailureException (§19.6).
+    // (The current insert point is the last arm's nextBB, which is exactly
+    // where control falls when no arm matched — correct placement for the
+    // MatchFailure throw.)
     emitThrowBuiltin("MatchFailureException");
+
+    // fix #573 / §19.2 / §7.1 / §7.5: nullable VALUE-TYPE widening for the
+    // case result PHI.  A `case n: int  1 => 100, _ => null end` whose
+    // declared return type is `int?` produces arm values of different LLVM
+    // types: `100` is a bare i32 while `null` is a ConstantPointerNull (ptr)
+    // — sema resolves the common result type as the nullable struct but
+    // lowerExpr for an integer literal emits a bare scalar, and lowerExpr for
+    // the `null` literal uses ptr null when the sema type is a reference type.
+    // The same mismatch occurs even when sema resolves to a non-nullable
+    // reference type (ptr) but one arm emitted a value struct.
+    //
+    // Apply exactly the same two paths as lowerConditional (§17 / §7):
+    //
+    //   Path A — sema result IS a nullable VALUE type: widen each arm to the
+    //   tagged {i8 hasValue; T value} struct using the existing helpers.
+    //   • bare T               → wrapNullableValue (hasValue=1, T)
+    //   • ConstantPointerNull  → nullableValueNull  (hasValue=0, T=0)
+    //   • already the struct   → pass through
+    //
+    //   Path B — sema result is a REFERENCE type (ptr) but arm values are
+    //   mismatched (some ptr-null, some non-ptr): derive the nullable struct
+    //   from the non-null arm's LLVM type and widen all arms.  This handles
+    //   `1 => 100, _ => null` whose sema result is Object? (ptr) but one arm
+    //   lowered to i32.
+    //
+    // In both paths, widening instructions for non-null arms are emitted
+    // INSIDE THAT ARM'S BLOCK (the block recorded in incomings[i].second,
+    // set as insert point before each widen so the result dominates the PHI
+    // edge). Branch terminators (CreateBr(endBB)) are emitted per arm after
+    // widening, also inside the arm's block, before moving to endBB.
+    if (!incomings.empty()) {
+        bool needPathA = resultSemaTy && isNullableValueTy(resultSemaTy);
+        if (needPathA) {
+            // Path A: sema-guided widening to the nullable struct.
+            llvm::StructType* nst = nullableValueStructTy(resultSemaTy);
+            auto widenOne = [&](llvm::Value*& v) {
+                if (!v || v->getType() == nst) return;
+                if (v->getType()->isPointerTy() &&
+                    llvm::isa<llvm::ConstantPointerNull>(v)) {
+                    v = nullableValueNull(resultSemaTy);  // constant, no instrs
+                } else if (v->getType() == nst->getElementType(1)) {
+                    v = wrapNullableValue(resultSemaTy, v);  // emits into bb
+                }
+            };
+            for (auto& [v, bb] : incomings) {
+                builder_.SetInsertPoint(bb);
+                widenOne(v);
+            }
+        } else {
+            // Path B: no sema-supplied nullable struct; detect ptr-null vs
+            // non-ptr mismatch across all arms and reconcile using the
+            // non-null arm's LLVM type.
+            auto isNullPtr = [](llvm::Value* v) {
+                return v->getType()->isPointerTy() &&
+                       llvm::isa<llvm::ConstantPointerNull>(v);
+            };
+            // Check whether there is a mixed-type situation: at least one
+            // ptr-null arm AND at least one non-ptr arm.
+            bool hasNullPtr = false, hasNonPtr = false;
+            llvm::Value* nonPtrSample = nullptr;
+            for (auto& [v, bb] : incomings) {
+                if (isNullPtr(v)) { hasNullPtr = true; }
+                else              { hasNonPtr = true; nonPtrSample = v; }
+            }
+            if (hasNullPtr && hasNonPtr && nonPtrSample) {
+                // Derive the nullable struct type from the non-ptr arm.
+                llvm::Type* innerTy = nonPtrSample->getType();
+                llvm::StructType* nst;
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(innerTy);
+                    st && st->getNumElements() == 2 &&
+                    st->getElementType(0) == nullablePrimHasValTy()) {
+                    // Non-ptr arm already has the {i8, T} struct — use as-is.
+                    nst = st;
+                } else {
+                    // Non-ptr arm is a bare T; build the {i8, T} struct type.
+                    nst = llvm::StructType::get(
+                        llvm_, {nullablePrimHasValTy(), innerTy});
+                }
+                for (auto& [v, bb] : incomings) {
+                    if (isNullPtr(v)) {
+                        // null → all-zero constant, no instructions needed.
+                        v = llvm::ConstantAggregateZero::get(nst);
+                    } else if (v->getType() != nst) {
+                        // bare T → wrap into {i8 1, T} in the arm's block.
+                        builder_.SetInsertPoint(bb);
+                        llvm::Value* res = builder_.CreateInsertValue(
+                            llvm::UndefValue::get(nst),
+                            llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                            {0u});
+                        v = builder_.CreateInsertValue(res, v, {1u});
+                    }
+                    // else: already nst — pass through.
+                }
+            }
+        }
+    }
+
+    // Emit branch terminators to endBB for each non-diverged arm.  This is
+    // deferred until after widening so the widening instructions precede the
+    // branch in the arm's block (required for dominance / correct IR).
+    for (auto& [v, bb] : incomings) {
+        builder_.SetInsertPoint(bb);
+        builder_.CreateBr(endBB);
+    }
 
     builder_.SetInsertPoint(endBB);
     // CG40: if EVERY arm diverged, no arm reaches endBB — the whole case
