@@ -1776,6 +1776,11 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // bz_array_free / bz_llist_free are null-safe, so no field null-check needed.
         if (it->collTy) {
             llvm::Function* elemDisp = owningCollectionElemDisposer(it->collTy);
+            // #429 / §4.6 / §28.9: an `owned Array<string>` field co-owns a +1 per
+            // element (retained at insert / copy); release each on the owner's
+            // disposal via the string-release thunk. owningCollectionElemDisposer
+            // returned null for it (mutually exclusive — string is not a class).
+            if (!elemDisp) elemDisp = stringElementReleaseDisposer(it->collTy);
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
                 : llvm::ConstantPointerNull::get(ptrTy());
@@ -2279,6 +2284,64 @@ llvm::Function* Emitter::owningCollectionElemDisposer(
     if (n.rfind("Owned", 0) != 0) return nullptr;  // not an owning collection
     if (!collectionElemIsClass(collTy, 0)) return nullptr;
     return elementDisposerThunk();
+}
+
+
+llvm::Function* Emitter::stringElementReleaseThunk() {
+    // #429 / §4.6 / §28.9: a standalone `void(void*)` thunk that releases one
+    // co-owned string element (the slot holds a bz_string*). bz_string_release is
+    // null-safe and a no-op on a sentinel/literal, so a null/never-stored slot is
+    // safe to pass. Built once with its own IRBuilder so the active `builder_`
+    // insert point is untouched (mirrors elementDisposerThunk).
+    if (stringElementReleaseThunk_) return stringElementReleaseThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$strElemRelease", module_.get());
+    llvm::Argument* s = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    llvm::IRBuilder<> b(entry);
+    auto* relFn = declareC("bz_string_release",
+                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    b.CreateCall(relFn, {s});   // null-safe / sentinel-safe in the runtime
+    b.CreateRetVoid();
+    stringElementReleaseThunk_ = fn;
+    return fn;
+}
+
+
+bool Emitter::isStringElementArray(const sema::TypeRef* collTy) {
+    // #429 / §4.6 / §28.9: an array-backed BORROWING collection (Array / Stack /
+    // Queue) whose element type is a non-nullable `string`. Such a collection
+    // co-owns a +1 per element (retained at insert / copy) and must release each
+    // at free. EXCLUSIONS, each intentional:
+    //   - an "Owned…" form — class-element only (string is forbidden as an owned
+    //     collection element, §15.2 class-only restriction), so it never carries
+    //     string elements; owningCollectionElemDisposer already returns null here.
+    //   - Set/OwnedSet — hash-backed (the dict path), NOT array-backed; its
+    //     string elements live in the generic-key table, a separate sub-slice.
+    //   - a nullable `string?` element — its slot may also legitimately hold null;
+    //     retain/release are null-safe, but the nullable surface is left to a
+    //     follow-on for parity with the field/local string? handling (which also
+    //     stays leaky-but-safe), avoiding any new behaviour on null slots.
+    if (!collTy || !collTy->astNode || !collTy->astNode->name ||
+        collTy->astNode->name->parts.empty())
+        return false;
+    std::string_view n = collTy->astNode->name->parts[0];
+    if (n != "Array" && n != "Stack" && n != "Queue") return false;
+    if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return false;
+    const sema::TypeRef* el = collTy->genericArgs[0];
+    return el->kind == sema::TypeRef::Kind::Primitive &&
+           el->primitive == sema::PrimitiveType::String && !el->nullable;
+}
+
+
+llvm::Function* Emitter::stringElementReleaseDisposer(const sema::TypeRef* collTy) {
+    // #429 / §4.6 / §28.9: the per-element release callback for a borrowing
+    // Array<string> (etc.) — null for any other collection (caller falls back to
+    // the null disposer / owning-class disposer).
+    if (!isStringElementArray(collTy)) return nullptr;
+    return stringElementReleaseThunk();
 }
 
 
@@ -3550,6 +3613,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             Disposal d{it->second, nullptr};
             d.collection = true;
             d.collectionElemDisposer = owningCollectionElemDisposer(collTy);
+            // #429 / §4.6 / §28.9: a borrowing Array<string> co-owns a +1 per
+            // element (retained at insert / copy); at scope end release each via
+            // the string-release thunk. owningCollectionElemDisposer returned null
+            // for it (string is not a class, and Array is not "Owned…"), so the
+            // two disposers are mutually exclusive.
+            if (!d.collectionElemDisposer)
+                d.collectionElemDisposer = stringElementReleaseDisposer(collTy);
             disposeStack_.back().push_back(d);
             return;
         }
@@ -5424,6 +5494,15 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
             ev = coerceNumericToType(ev, elemLlvmTy,
                                      isUnsignedTargetExpr(*elemPtr));
         }
+        // #429 / §4.6 / §28.9: an Array<string> built from a literal co-owns a +1
+        // per element, exactly as the `.Add(...)` path does (transfer a +1
+        // producer, retain anything else) — so a literal-built array disposed at
+        // scope end releases each element symmetrically (no leak, no premature
+        // free of a borrowed element). Keyed on the produced array being a
+        // borrowing Array<string> (etc.).
+        if (isStringElementArray(collTy) &&
+            !isPlusOneStringProducer(elemPtr.get()))
+            emitStringRetain(ev);
         llvm::AllocaInst* slot = entryAlloca(ev->getType());
         builder_.CreateStore(ev, slot);
         builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});

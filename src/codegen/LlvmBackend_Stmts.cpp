@@ -80,7 +80,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // issue #388 / stdlib §4.4-§4.9: heap-collection indexer
                     // setter `a[i] := v` / `dict[key] := v` (the OWNING
                     // variants dispose the displaced owner, §4.5 / §4.9).
-                    if (lowerCollectionIndexerSet(*ix, rhsOnce)) return false;
+                    if (lowerCollectionIndexerSet(*ix, rhsOnce, as->value.get()))
+                        return false;
                     // Not an indexer property — fall through to plain array
                     // assignment using the already-computed RHS.
                     llvm::Type* elemTy2 = nullptr;

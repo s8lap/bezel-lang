@@ -741,6 +741,280 @@ const char* kNestedCallChainNoUaf =
     "  end Main; "
     "end C;";
 
+// --- Programs: COLLECTION-INSERT escape (#429 collection-insert sub-slice,
+//     strings in a BORROWING Array<string> only) -----------------------------
+//
+// Ownership convention (#429 collection-insert sub-slice), a STRING inserted
+// into a borrowing Array<string> (Stack/Queue<string> share the array backing):
+//   - The array becomes a refcount CO-OWNER: it takes an INDEPENDENT +1 per
+//     element at Add / Insert / indexer-set / array-literal (a +1 producer is
+//     TRANSFERRED, anything else RETAINED — mirrors the field-store rule), and a
+//     copy/materialize (Sorted/Reversed/ToArray/AddRange) retains the copied
+//     elements so the new array independently co-owns its +1s.
+//   - At the array's free/dispose, scope-end OR an owner's disposal, EACH element
+//     is bz_string_release'd exactly once (the string-release element disposer);
+//     Remove/RemoveAt/Clear release the affected element(s) too. The array's +1
+//     is INDEPENDENT of the producer's local +1, so no double-free; a sentinel/
+//     literal/null element is a no-op.
+// NOTE: each producer uses a helper `Mk(s) => s + "!"` so the inserted string is
+// a genuine HEAP allocation — a foldable literal-concat like `"a" + "b"` is a
+// constant sentinel (never heap), which would not exercise the reclaim path.
+
+// §28.9 / §28.11 (cardinal insert+free): produced strings inserted into a `using
+// var` Array<string> are released at scope end. Looped 50 with a resize → the
+// whole array (backing + every element) is reclaimed per iteration. Leaked
+// before this sub-slice (the array dropped its elements without releasing them).
+const char* kArrayInsertLoopReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      using var arr := new Array<string>(); "
+    "      arr.Add(C.Mk(\"alpha\")); "             // "alpha!" => 6
+    "      arr.Add(C.Mk(\"beta\")); "              // "beta!"  => 5
+    "      total := total + arr.Get(0).Length + arr.Get(1).Length; "  // 11
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 550000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.11 (resize stress): many produced strings forcing several array
+// growths; on free every element is released exactly once → LSan-clean. Without
+// the per-element release the 30 element strings would all leak each iteration.
+const char* kArrayManyElemsResizeReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"#\"; end Mk; "
+    "  public static method Main(): int "
+    "    var it: int := 0; var total: int := 0; "
+    "    while it < 20000 do "
+    "      using var arr := new Array<string>(); "
+    "      var k: int := 0; "
+    "      while k < 30 do "
+    "        arr.Add(C.Mk(\"node\")); "            // "node#" => 5
+    "        k := k + 1; "
+    "      end; "
+    "      total := total + arr.Get(29).Length; "  // 5
+    "      it := it + 1; "
+    "    end; "
+    "    if total = 100000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 (insert then read back, no UAF): a produced string is inserted, read
+// back through Get and used while the array is still alive → correct value, no
+// UAF. The element carries the array's +1; reading it does not consume that +1.
+const char* kArrayInsertReadBackNoUaf =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    using var arr := new Array<string>(); "
+    "    arr.Add(C.Mk(\"hello\")); "              // "hello!" => 6
+    "    var s: string := arr.Get(0); "          // borrow of the element
+    "    return s.Length; "                       // 6, read while array alive
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.11 (indexer overwrite): `arr[i] := other` releases the OLD element
+// and takes a +1 on the NEW one — only the final value survives to free. Looped
+// so a leaked OLD value (no release-old) OR a leaked array (no release-on-free)
+// would accumulate; both are guarded. Self-overwrite-safe via retain-before-
+// release. Returns the final element length.
+const char* kArrayIndexerOverwriteReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; "
+    "    using var arr := new Array<string>(); "
+    "    arr.Add(C.Mk(\"orig\")); "               // "orig!" initial
+    "    while i < 50000 do "
+    "      arr[0] := C.Mk(\"updated\"); "         // release-old, retain/transfer-new
+    "      i := i + 1; "
+    "    end; "
+    "    return arr.Get(0).Length; "              // "updated!" => 8
+    "  end Main; "
+    "end C;";
+
+// §28.9 (indexer overwrite, alias read — cardinal UAF guard): a local aliases
+// the element, the slot is overwritten, then the alias is read. The alias must
+// still see valid memory. With release-old only dropping the array's +1, and the
+// alias holding the value through Get (the element still had the array's +1 when
+// aliased and the array is alive), the overwrite must not free what the alias
+// reads. Value + no-corruption (a residual leak is tolerated; a UAF is not).
+const char* kArrayOverwriteAliasReadNoUaf =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"@\"; end Mk; "
+    "  public static method Main(): int "
+    "    using var arr := new Array<string>(); "
+    "    arr.Add(C.Mk(\"keepme\")); "             // "keepme@" => 7
+    "    var alias: string := arr.Get(0); "       // alias the element
+    "    arr[0] := C.Mk(\"replaced\"); "          // overwrite slot 0
+    "    return alias.Length; "                    // 7, must be intact
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.11 (Remove/Clear release): RemoveAt then Clear on a `using var`
+// Array<string> release the affected elements (else they leak). Looped → any
+// per-iteration leak would accumulate. After RemoveAt(0) and Clear() the array
+// is empty; the array itself is freed at scope end. Returns 0.
+const char* kArrayRemoveClearReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; "
+    "    while i < 50000 do "
+    "      using var arr := new Array<string>(); "
+    "      arr.Add(C.Mk(\"one\")); "
+    "      arr.Add(C.Mk(\"two\")); "
+    "      arr.Add(C.Mk(\"three\")); "
+    "      arr.RemoveAt(0); "                      // release removed element
+    "      arr.Clear(); "                          // release remaining elements
+    "      i := i + 1; "
+    "    end; "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.11 (Remove(item) release): Remove by value releases the matched
+// element. Looped; a per-iteration leak of the removed string would accumulate.
+// The QUERY is a string LITERAL (a sentinel — never heap, no argument-pass leak,
+// which is a separate sub-slice); §25.2 string Remove matches by CONTENT, so the
+// literal "red!" matches the heap-produced element "red!" (= seed + "!").
+const char* kArrayRemoveItemReclaimed =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      using var arr := new Array<string>(); "
+    "      arr.Add(C.Mk(\"red\")); "              // heap "red!" => 4
+    "      arr.Add(C.Mk(\"green\")); "            // heap "green!" => 6
+    "      var found: bool := arr.Remove(\"red!\"); "  // literal query, content-match
+    "      total := total + arr.Get(0).Length; " // "green!" remains => 6
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 300000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.11 (Insert + indexer-set composition): Insert at an index, then
+// overwrite an existing slot. Both paths co-own/release correctly. Single-shot.
+const char* kArrayInsertThenSet =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    using var arr := new Array<string>(); "
+    "    arr.Add(C.Mk(\"aa\")); "
+    "    arr.Insert(0, C.Mk(\"bbb\")); "           // "bbb!" at index 0
+    "    arr[1] := C.Mk(\"cccc\"); "              // overwrite index 1 (was "aa!")
+    "    return arr.Get(0).Length + arr.Get(1).Length; "  // 4 + 5 = 9
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.11 (copy producer — the double-free guard): Sorted() shallow-copies
+// the source array's element pointers. The copy independently co-owns a +1 per
+// element (retained at copy), so disposing BOTH the source and the sorted copy
+// releases each string exactly twice over its two co-owners — never freeing a
+// value the other still holds (no double-free) and leaving no leak. Without the
+// copy-retain the sorted copy would release un-retained pointers, prematurely
+// freeing the source's strings (a double-free). Both are `using var`.
+const char* kArraySortedCopyNoDoubleFree =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    using var src := new Array<string>(); "
+    "    src.Add(C.Mk(\"banana\")); "
+    "    src.Add(C.Mk(\"apple\")); "
+    "    src.Add(C.Mk(\"cherry\")); "
+    "    using var srt := src.Sorted(); "          // shallow copy, retained
+    "    return srt.Get(0).Length + src.Get(0).Length; "  // "apple!"(6)+"banana!"(7)=13
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.11 (AddRange — co-own, no double-free): AddRange copies the source
+// elements into a second array; the destination takes an INDEPENDENT +1 per
+// element. Disposing both arrays releases each string over its two co-owners —
+// no premature free of a value the other still holds. Both `using var`.
+const char* kArrayAddRangeNoDoubleFree =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Main(): int "
+    "    using var a := new Array<string>(); "
+    "    a.Add(C.Mk(\"xx\")); "                    // "xx!" => 3
+    "    a.Add(C.Mk(\"yy\")); "                    // "yy!" => 3
+    "    using var b := new Array<string>(); "
+    "    b.AddRange(a); "                           // co-own a's elements
+    "    return a.Get(0).Length + b.Get(1).Length; "  // 3 + 3 = 6
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.11 (RETURN-escape interplay — no double-free): an element read out
+// of the array AND returned/used after the array is gone. arr.Get(0) returns a
+// borrow; binding it to a `var` borrow-retains it (#429), so the returned value
+// carries its OWN +1 — when the array is freed (releasing its +1) the returned
+// value survives, and is reclaimed at the caller's scope. No double-free across
+// the array-free / return handoff. Value + leak-free.
+const char* kArrayElementReturnInterplay =
+    "module M; class C "
+    "  public static method Mk(s: string): string return s + \"!\"; end Mk; "
+    "  public static method Pick(): string "
+    "    using var arr := new Array<string>(); "
+    "    arr.Add(C.Mk(\"chosen\")); "             // "chosen!" => 7
+    "    var e: string := arr.Get(0); "           // borrow-retained at bind (+1)
+    "    return e; "                               // transfer its +1 to the caller
+    "  end Pick; "                                 // arr freed here: releases its +1
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 50000 do "
+    "      var s: string := C.Pick(); "            // caller transfers+releases +1
+    "      total := total + s.Length; "            // 7
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 350000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.4 / §28.9 / §28.11 (owned field of Array<string>): a class with an `owned
+// Array<string>` field populated in the constructor with a HEAP-produced string;
+// on the owner's disposal the array's backing is freed AND each element released
+// (emitOwnedFieldDisposals). Looped → steady-state LSan-clean (the object + its
+// array + every element reclaimed each iteration). The constructor receives a
+// param and stores `param + "!"` (a +1 producer transferred into the array).
+const char* kOwnedArrayStringFieldReclaimed =
+    "module M; class Holder "
+    "  public owned Tags: Array<string>; "
+    "  public constructor(seed: string) "
+    "    this.Tags := new Array<string>(); "
+    "    this.Tags.Add(seed + \"!\"); "           // +1 producer transferred in
+    "    this.Tags.Add(seed + \"?\"); "
+    "  end constructor; "
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 50000 do "
+    "    using var h := new Holder(\"tag\"); "     // "tag!"(4) + "tag?"(4)
+    "    total := total + h.Tags.Get(0).Length + h.Tags.Get(1).Length; "  // 8
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 400000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// §28.9 (CONTROL — Array<int> unaffected): a scalar-element array is never given
+// a string disposer; insert/free is byte-only, no release loop. Looped to prove
+// the scalar path is untouched (no spurious release of an inttoptr'd scalar).
+const char* kArrayIntControlUnaffected =
+    "module M; class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 50000 do "
+    "    using var arr := new Array<int>(); "
+    "    arr.Add(7); arr.Add(35); "
+    "    total := total + arr.Get(0) + arr.Get(1); "  // 42
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 2100000 then return 0; end; return 1; "
+    "end Main; end C;";
+
 }  // namespace
 
 // --- LSan-clean tests (#429 field-store reclaim: leaked before, clean now) ---
@@ -877,4 +1151,83 @@ BEZEL_TEST(codegen_escaping_string_429, nested_call_chain_no_uaf_28_3) {
     // f(g()): the inner +1 is passed as an ARGUMENT (out of the RETURN lane) and
     // is conservatively leaked; the cardinal point is no UAF / double-free.
     expectValueAndNoCorruption(kNestedCallChainNoUaf, 6);
+}
+
+// --- COLLECTION-INSERT escape category (#429 collection-insert sub-slice:
+//     borrowing Array<string> co-owns +1 per element; leaked before, clean now) -
+
+BEZEL_TEST(codegen_escaping_string_429, array_insert_loop_reclaimed_28_11) {
+    // Produced strings inserted into a using-var Array<string> are released at
+    // scope end (insert+free). Leaked before this sub-slice.
+    expectValueAndLeakFree(kArrayInsertLoopReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_many_elems_resize_reclaimed_28_11) {
+    // Resize stress: every element released on free → no leak across growth.
+    expectValueAndLeakFree(kArrayManyElemsResizeReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_insert_read_back_no_uaf_28_9) {
+    // Read an element back through Get and use it while the array is alive — the
+    // element carries the array's +1, reading does not consume it (no UAF).
+    expectValueAndLeakFree(kArrayInsertReadBackNoUaf, 6);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_indexer_overwrite_reclaimed_28_11) {
+    // arr[i] := other releases the OLD element and co-owns the NEW; only the
+    // final value survives to free. Looped → bounded, no leak (retain-before-
+    // release keeps it self-overwrite-safe).
+    expectValueAndLeakFree(kArrayIndexerOverwriteReclaimed, 8);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_overwrite_alias_read_no_uaf_28_9) {
+    // The alias holds the element through Get; overwriting the slot releases only
+    // the array's +1, never the value the alias still reads — no UAF.
+    expectValueAndNoCorruption(kArrayOverwriteAliasReadNoUaf, 7);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_remove_clear_reclaimed_28_11) {
+    // RemoveAt + Clear release the affected elements (else they leak); looped.
+    expectValueAndLeakFree(kArrayRemoveClearReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_remove_item_reclaimed_28_11) {
+    // Remove(item) releases the matched element; looped → no per-iter leak.
+    expectValueAndLeakFree(kArrayRemoveItemReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_insert_then_set_28_11) {
+    // Insert + indexer-set compose: both co-own/release correctly.
+    expectValueAndLeakFree(kArrayInsertThenSet, 9);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_sorted_copy_no_double_free_28_11) {
+    // The cardinal double-free guard: a Sorted() shallow copy co-owns a +1 per
+    // element (retained at copy), so disposing both src and the copy never frees
+    // a value the other still holds.
+    expectValueAndLeakFree(kArraySortedCopyNoDoubleFree, 13);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_addrange_no_double_free_28_11) {
+    // AddRange co-owns the source elements with an independent +1 — no premature
+    // free when both arrays are disposed.
+    expectValueAndLeakFree(kArrayAddRangeNoDoubleFree, 6);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_element_return_interplay_28_9) {
+    // An element read out AND returned/used after the array is freed: the
+    // borrow-retained return value survives the array's per-element release — no
+    // double-free across the array-free / return handoff.
+    expectValueAndLeakFree(kArrayElementReturnInterplay, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, owned_array_string_field_reclaimed_28_4) {
+    // An owned Array<string> field releases each element on the owner's disposal.
+    expectValueAndLeakFree(kOwnedArrayStringFieldReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, array_int_control_unaffected_28_9) {
+    // CONTROL: a scalar Array<int> is never given a string disposer — the scalar
+    // insert/free path is untouched (no spurious release of an inttoptr'd value).
+    expectValueAndLeakFree(kArrayIntControlUnaffected, 0);
 }

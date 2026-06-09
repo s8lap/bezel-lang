@@ -257,9 +257,12 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
 // `a[i] := v` / `dict[key] := v`. For an OWNING collection (OwnedArray /
 // OwnedDictionary) the displaced slot/value is disposed exactly once before the
 // new owner is stored (§4.5 / §4.9). Mirrors `.Set(i, v)` (§4.5) and the dict
-// `.Add(k, v)` lowering. `val` is the already-lowered RHS.
+// `.Add(k, v)` lowering. `val` is the already-lowered RHS; `valueExpr` is the
+// RHS AST (when available) used to decide transfer-vs-retain for a #429
+// borrowing Array<string> overwrite.
 bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
-                                        llvm::Value* val) {
+                                        llvm::Value* val,
+                                        const ast::Expr* valueExpr) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value || !val)
         return false;
     auto* recvTy = ctx_.exprType(*ix.target);
@@ -307,6 +310,26 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                         val = wrapNullableValue(elemTyRef, val);  // scalar → {1, val}
                 }
             }
+        }
+        // #429 / §4.6 / §28.9: a borrowing Array<string> overwrite via the
+        // indexer `arr[i] := v` releases the displaced old element and takes a +1
+        // on the new one (transfer a +1 producer, retain anything else). The
+        // disposing setter releases the OLD value AFTER reading it, so emitting
+        // the new-retain BEFORE the call keeps a self-set `a[i] := a[i]` safe (the
+        // rc dips +1 then back, never transiently 0 — no UAF / double-free). This
+        // is checked BEFORE the owning-class disposer below; a string element is
+        // never a class, so the two paths are mutually exclusive.
+        if (llvm::Function* strDisp = stringElementReleaseDisposer(recvTy)) {
+            if (!valueExpr || !isPlusOneStringProducer(valueExpr))
+                emitStringRetain(val);
+            llvm::AllocaInst* slot = entryAlloca(val->getType());
+            builder_.CreateStore(val, slot);
+            auto* fn = declareC("bz_array_set_disposing",
+                llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
+                                     strDisp});
+            return true;
         }
         llvm::AllocaInst* slot = entryAlloca(val->getType());
         builder_.CreateStore(val, slot);

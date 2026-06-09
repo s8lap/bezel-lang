@@ -98,6 +98,15 @@ void bz_array_sort_closure(void* arr, int64_t elem_size,
 // and Array<T>.Sorted[...] (stdlib §3 / #472).
 void* bz_array_copy(void* arr, int64_t elem_size);
 
+// #429 / §4.6 / §28.9: bz_string_retain every non-null pointer-sized element of
+// `arr` (each slot holds a bz_string*).  Codegen calls this on a freshly copied
+// or materialized Array<string> (bz_array_copy / bz_lazy_to_array result) so the
+// new array independently co-owns a +1 per element — matching the per-element
+// bz_string_release the array's free/dispose later issues.  Only valid for an
+// array whose elements are pointer-sized strings.  retain is a no-op on a
+// sentinel/literal or null, so partial/empty arrays are safe.
+void bz_array_retain_strings(void* arr);
+
 // Return a pointer directly into the array's internal buffer at element `idx`.
 // Only valid until the next mutation; used for zero-copy access in codegen.
 void* bz_array_ptr_at(void* arr, int64_t idx, int64_t elem_size);
