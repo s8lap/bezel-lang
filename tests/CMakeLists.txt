@@ -406,6 +406,7 @@ set(BEZEL_TEST_SOURCES
     codegen/record_this_with_575_test.cpp
     codegen/writeline_nullable_581_583_test.cpp
     codegen/primitive_compareto_586_test.cpp
+    codegen/virtual_generic_override_580_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
