@@ -394,6 +394,17 @@ llvm::Constant* Emitter::constInitFor(const ast::FieldDecl* fd, llvm::Type* ty) 
         }
         // CG24: float/double literal initializer for static float fields.
         if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(e)) {
+            // #521 / §4.4: a decimal literal (m/M suffix) must not reach
+            // here — sema diagnoses it before codegen runs. As a belt-and-
+            // suspenders guard, skip the ConstantFP emission for m-literals
+            // so that a double ConstantFP is never inserted into an i32
+            // global (which would crash the IR verifier). Fall through to
+            // the null-value zero-init below.
+            if (!fl->text.empty()) {
+                char last = fl->text.back();
+                if (last == 'm' || last == 'M')
+                    return llvm::Constant::getNullValue(ty);
+            }
             std::string digits;
             for (char c : fl->text) {
                 if (c == '_' || c == 'f' || c == 'F' || c == 'd' ||

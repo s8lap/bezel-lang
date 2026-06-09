@@ -316,17 +316,37 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         return;
     }
     if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(&e)) {
-        // §18.1: the `f`/`F` suffix gives type `float` (f32); `d`/`D`,
-        // `m`/`M`, or no suffix gives `double` (f64) / decimal. Currently
-        // only float and double are codegen-backed.
+        // §18.1: the `f`/`F` suffix gives type `float` (f32); `d`/`D` or
+        // no suffix gives `double` (f64); `m`/`M` gives `decimal` (§4.4).
         PrimitiveType pt = PrimitiveType::Double;
+        bool isDecimalLiteral = false;
         if (!fl->text.empty()) {
             char last = fl->text.back();
-            if (last == 'f' || last == 'F') pt = PrimitiveType::Float;
-            // `d`/`D` → double (already default); `m`/`M` → decimal
-            // (not yet implemented, leave as double for now).
+            if (last == 'f' || last == 'F') {
+                pt = PrimitiveType::Float;
+            } else if (last == 'm' || last == 'M') {
+                // §4.4: `m`/`M` suffix → decimal literal. Type it correctly
+                // as decimal (not double) so the suffix is not silently
+                // discarded (#521). Full 128-bit decimal arithmetic is not
+                // yet codegen-backed, so emit a diagnostic here rather than
+                // letting the program reach codegen and either miscompile
+                // (decimal lowered as i32) or crash the IR verifier (a
+                // double ConstantFP stored into an i32 global for static
+                // fields). The diagnostic is a deferred-feature error, not a
+                // permanent restriction; remove it when §4.4 is implemented.
+                pt = PrimitiveType::Decimal;
+                isDecimalLiteral = true;
+            }
+            // `d`/`D` → double (already default).
         }
         ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
+        // #521: diagnose decimal literals before they reach codegen.
+        if (isDecimalLiteral) {
+            ctx_.diagnostics().report(
+                Severity::Error, e.span.begin,
+                "decimal literals are not yet fully implemented (§4.4, #521);"
+                " full 128-bit decimal arithmetic is deferred");
+        }
         return;
     }
     if (dynamic_cast<const ast::CharLiteralExpr*>(&e)) {
@@ -904,6 +924,23 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         // one the other implicitly widens to per §5.1. (Shift ops `<<`/`>>`
         // keep the left operand's type: the right operand is a shift count,
         // not an arithmetic operand, so no promotion applies.)
+        // #521 / §4.4: a helper used below to guard any arithmetic operation
+        // whose resolved result type is `decimal`. Full 128-bit decimal
+        // arithmetic is not yet codegen-backed (lowerPrimitive(Decimal) falls
+        // through to i32, which would silently miscompile every operation and
+        // produce SIGFPE on division by zero). Diagnose here in sema so the
+        // program never reaches codegen in a broken state.
+        auto diagDecimalArith = [&](const TypeRef* resultTy) -> bool {
+            if (resultTy && resultTy->kind == TypeRef::Kind::Primitive &&
+                resultTy->primitive == PrimitiveType::Decimal) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "decimal arithmetic is not yet implemented (§4.4, #521);"
+                    " full 128-bit decimal arithmetic is deferred");
+                return true;
+            }
+            return false;
+        };
         if (op != "<<" && op != ">>") {
             TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
             if (lt && rt &&
@@ -913,11 +950,16 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 !lt->nullable && !rt->nullable) {
                 if (primitiveWidens(lt->primitive, rt->primitive)) {
                     // left widens to right → result is right (the wider).
+                    // #521: if the wider type is decimal, diagnose before
+                    // allowing the expression to reach codegen.
+                    if (diagDecimalArith(rt)) return;
                     ctx_.setExprType(&be, rt);
                     return;
                 }
                 if (primitiveWidens(rt->primitive, lt->primitive)) {
                     // right widens to left → result is left (the wider).
+                    // #521: same guard for decimal-result from right→left widen.
+                    if (diagDecimalArith(lt)) return;
                     ctx_.setExprType(&be, lt);
                     return;
                 }
@@ -947,6 +989,10 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 }
             }
         }
+        // #521 / §4.4: same-type decimal arithmetic (both operands are
+        // decimal, so no widening path was taken above). Diagnose before
+        // typing the result as decimal so codegen never sees it.
+        if (diagDecimalArith(lt)) return;
         if (lt) ctx_.setExprType(&be, lt);
         return;
     }

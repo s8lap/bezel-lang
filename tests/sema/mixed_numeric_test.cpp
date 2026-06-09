@@ -170,10 +170,15 @@ BEZEL_TEST(sema_mixed_numeric, uint_plus_ulong_ok_spec_6_2) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(sema_mixed_numeric, int_plus_decimal_ok_spec_6_2) {
-    // §5.1: int → decimal is permitted (integers widen to decimal).
+BEZEL_TEST(sema_mixed_numeric, int_plus_decimal_diagnosed_521) {
+    // §5.1: int → decimal is a valid implicit widening in principle (the
+    // conversion table admits it), but §4.4 decimal arithmetic is not yet
+    // implemented (#521). The compiler diagnoses any decimal operation
+    // (even promotable int+decimal) to prevent silent miscompilation as i32
+    // arithmetic. This test was updated from "ok" to "error" by fix #521;
+    // revert it when full §4.4 decimal arithmetic lands.
     auto r = parseSemaAll(wrap("int", "decimal", "+"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // Same-type operands are never a mixed-type case.
@@ -187,7 +192,13 @@ BEZEL_TEST(sema_mixed_numeric, uint_plus_uint_ok) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(sema_mixed_numeric, decimal_plus_decimal_ok) {
+BEZEL_TEST(sema_mixed_numeric, decimal_plus_decimal_diagnosed_521) {
+    // §4.4: decimal arithmetic is not yet implemented (#521). Same-type
+    // decimal+decimal would silently miscompile as i32 addition (since
+    // lowerPrimitive(Decimal) falls to i32). The compiler now diagnoses
+    // any decimal arithmetic operation to prevent the silent miscompile.
+    // This test was updated from "ok" to "error" by fix #521; revert it
+    // when full §4.4 decimal arithmetic lands.
     auto r = parseSemaAll(wrap("decimal", "decimal", "+"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
