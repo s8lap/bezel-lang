@@ -1703,15 +1703,81 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     auto* f = declareC(fn, ptrTy(), {ptrTy()});
                     return builder_.CreateCall(f, {list}, "ll.nodeptr");
                 }
-                // First / Last: return the value of the first/last node (T).
-                // If list is empty this is undefined — same as Array.First() on empty.
+                // per §4.6 (stdlib L1264–1265): `First`/`Last` are typed `T?`.
+                // The getter yields `null` when the list is empty (the node
+                // pointer is null) and the element value otherwise. This null
+                // representation is required for §7.11 lifting and `??` to
+                // interoperate with the result — every consumer reads `l.First`
+                // as the nullable form sema assigned it.
                 {
                     const char* fn = ma->member == "First"
                         ? "bz_llist_first_node" : "bz_llist_last_node";
                     auto* nodeF = declareC(fn, ptrTy(), {ptrTy()});
                     llvm::Value* nodePtr = builder_.CreateCall(nodeF, {list}, "ll.fnode");
-                    auto* valF = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
-                    llvm::Value* valPtr = builder_.CreateCall(valF, {nodePtr}, "ll.vptr");
+                    llvm::Value* nodeNull = builder_.CreateICmpEQ(
+                        nodePtr, llvm::ConstantPointerNull::get(ptrTy()),
+                        "ll.empty");
+                    const sema::TypeRef* resTy = ctx_.exprType(e);
+                    // For a NULLABLE VALUE element type (int?, double?, …) the
+                    // result is the tagged {i8 hasValue; T value} struct, built
+                    // only on the present branch so the value load never runs on
+                    // an empty list (a null `valPtr`).
+                    if (resTy && isNullableValueTy(resTy)) {
+                        auto* entryBB = builder_.GetInsertBlock();
+                        auto* presentBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.val", currentFn_);
+                        auto* mergeBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.end", currentFn_);
+                        auto* st = nullableValueStructTy(resTy);
+                        builder_.CreateCondBr(nodeNull, mergeBB, presentBB);
+                        builder_.SetInsertPoint(presentBB);
+                        auto* valF = declareC("bz_llist_node_value_ptr",
+                                              ptrTy(), {ptrTy()});
+                        llvm::Value* valPtr =
+                            builder_.CreateCall(valF, {nodePtr}, "ll.vptr");
+                        llvm::Value* loaded =
+                            builder_.CreateLoad(elemLLTy, valPtr, "ll.val");
+                        llvm::Value* wrapped = wrapNullableValue(resTy, loaded);
+                        auto* presentEndBB = builder_.GetInsertBlock();
+                        builder_.CreateBr(mergeBB);
+                        builder_.SetInsertPoint(mergeBB);
+                        auto* phi = builder_.CreatePHI(st, 2, "ll.first");
+                        phi->addIncoming(nullableValueNull(resTy), entryBB);
+                        phi->addIncoming(wrapped, presentEndBB);
+                        return phi;
+                    }
+                    // For a reference (class/string/interface) element type, T?
+                    // is a nullable pointer: the node-value slot holds the
+                    // pointer; an empty list yields a null pointer directly.
+                    auto* valF = declareC("bz_llist_node_value_ptr",
+                                          ptrTy(), {ptrTy()});
+                    llvm::Value* valPtr =
+                        builder_.CreateCall(valF, {nodePtr}, "ll.vptr");
+                    if (elemLLTy->isPointerTy()) {
+                        // Read the slot only when the node is present; an empty
+                        // list returns a null reference.
+                        auto* entryBB = builder_.GetInsertBlock();
+                        auto* presentBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.ref", currentFn_);
+                        auto* mergeBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.refend", currentFn_);
+                        builder_.CreateCondBr(nodeNull, mergeBB, presentBB);
+                        builder_.SetInsertPoint(presentBB);
+                        llvm::Value* loaded =
+                            builder_.CreateLoad(elemLLTy, valPtr, "ll.refval");
+                        auto* presentEndBB = builder_.GetInsertBlock();
+                        builder_.CreateBr(mergeBB);
+                        builder_.SetInsertPoint(mergeBB);
+                        auto* phi = builder_.CreatePHI(elemLLTy, 2, "ll.first.ref");
+                        phi->addIncoming(
+                            llvm::ConstantPointerNull::get(
+                                llvm::cast<llvm::PointerType>(elemLLTy)),
+                            entryBB);
+                        phi->addIncoming(loaded, presentEndBB);
+                        return phi;
+                    }
+                    // Fallback (no resolved nullable result type): load the raw
+                    // element value as before.
                     return builder_.CreateLoad(elemLLTy, valPtr, "ll.val");
                 }
             }

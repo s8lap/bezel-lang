@@ -365,6 +365,27 @@ BEZEL_TEST(codegen_lifted_ops_486, double_lt_left_null_yields_false_spec_7_11) {
         "return int(a < b);"), 0);
 }
 
+// §7.11 + IEEE 754: both operands present but one is NaN. NaN is unordered, so
+// the ordered relational comparison yields false for every ordering operator —
+// `<`, `<=`, `>`, `>=` all return false. (This matches the non-nullable double
+// comparison: lifting does not change the IEEE ordering semantics; it only adds
+// the "false if either operand is null" rule on top.) `double.NaN` per stdlib
+// §2.8. We pack all four results into the exit code; every operator → 0.
+BEZEL_TEST(codegen_lifted_ops_486, double_relational_nan_both_present_false_spec_7_11) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: double? := double.NaN; var b: double? := 1.0; "
+        "var lt: int := int(a < b); var gt: int := int(a > b); "
+        "var le: int := int(a <= b); var ge: int := int(a >= b); "
+        "return lt * 1000 + gt * 100 + le * 10 + ge;"), 0);
+}
+
+// §7.11 + IEEE 754: NaN on the right operand — same all-false outcome.
+BEZEL_TEST(codegen_lifted_ops_486, double_relational_nan_right_false_spec_7_11) {
+    BEZEL_EXPECT_EQ(run(
+        "var a: double? := 1.0; var b: double? := double.NaN; "
+        "return int(a < b) + int(a > b) + int(a <= b) + int(a >= b);"), 0);
+}
+
 
 // =========================================================================
 // §7.11 — long? arithmetic

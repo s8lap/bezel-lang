@@ -813,6 +813,63 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 return;
             }
         }
+        // §7.11 lifted operators: when EITHER operand is a nullable value
+        // primitive (`int?`, `double?`, `bool?`, …), the arithmetic / bitwise /
+        // shift result is lifted to `T?` — `null` when either operand is `null`,
+        // otherwise the underlying operator applied to the present payloads. A
+        // mixed `T?` + `T` expression also lifts (the non-nullable operand is
+        // treated as present), and the result is still `T?`. The result's
+        // underlying type is computed exactly as the non-nullable case would
+        // (so `int? + int?` is `int?`, and a future widening pair such as
+        // `int? + long?` widens identically), then marked nullable. (Equality
+        // `=`/`<>` does not reach this block — it returns `bool` above per §8.4
+        // — and relational ops also return `bool`, never lift to `bool?`.) The
+        // codegen lowering for these operators lives in
+        // LlvmBackend_Exprs.cpp::lowerBinary.
+        {
+            TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+            auto isNullablePrim = [](const TypeRef* t) {
+                return t && t->kind == TypeRef::Kind::Primitive && t->nullable;
+            };
+            bool lNull = isNullablePrim(lt);
+            bool rNull = isNullablePrim(rt);
+            if ((lNull || rNull) && lt && rt &&
+                lt->kind == TypeRef::Kind::Primitive &&
+                rt->kind == TypeRef::Kind::Primitive) {
+                // Determine the underlying (non-nullable) result primitive using
+                // the same §6.2 widening rule as the non-nullable path. For
+                // shift ops the result follows the left operand. For same-prim
+                // operands the result is that primitive.
+                PrimitiveType resultPrim = lt->primitive;
+                if (op != "<<" && op != ">>" &&
+                    lt->primitive != rt->primitive) {
+                    if (primitiveWidens(lt->primitive, rt->primitive))
+                        resultPrim = rt->primitive;       // left widens to right
+                    else if (primitiveWidens(rt->primitive, lt->primitive))
+                        resultPrim = lt->primitive;       // right widens to left
+                    else if (isPromotablePrimitive(lt->primitive) &&
+                             isPromotablePrimitive(rt->primitive)) {
+                        // §6.2: no implicit conversion in either direction — a
+                        // compile error, mirroring the non-nullable branch below.
+                        ctx_.diagnostics().report(
+                            Severity::Error, be.span.begin,
+                            std::string("operator `") + std::string(op) +
+                            "` has no implicit conversion between operand types `" +
+                            primitiveSpelling(lt->primitive) + "` and `" +
+                            primitiveSpelling(rt->primitive) +
+                            "` (§6.2); add an explicit cast (§5.2) to convert one"
+                            " operand to the other's type.");
+                        return;
+                    }
+                }
+                TypeRef* res = ctx_.makeTypeRef();
+                res->kind = TypeRef::Kind::Primitive;
+                res->primitive = resultPrim;
+                res->nullable = true;   // §7.11: lifted result is T?
+                ctx_.setExprType(&be, res);
+                return;
+            }
+        }
         // §6.2 mixed-type arithmetic: "the smaller-range operand is implicitly
         // promoted to the larger type using §5.1. The result has the larger
         // type." For the non-shift operators, when both operands are primitive
