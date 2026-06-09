@@ -2471,6 +2471,19 @@ private:
                rt->primitive == sema::PrimitiveType::String;
     }
 
+    // #429 (closure FIELD-STORE / disposal): true when member `m` is a class
+    // instance field / auto-property whose declared type is a function type
+    // (Kind::Function). Such a field holds an independent +1 on a closure cell,
+    // retained at store and released on the owner's disposal — parallel to
+    // isStringStorageMember for strings. Nullable function types (`(() -> T)?`)
+    // resolve as a function TypeRef with nullable=true; bz_closure_release is
+    // null-safe, so nullable closure fields are included (same as
+    // isStringStorageMember includes nullable string?).
+    bool isClosureStorageMember(const sema::Symbol* m) {
+        const sema::TypeRef* rt = recordMemberType(m);
+        return rt && rt->kind == sema::TypeRef::Kind::Function;
+    }
+
     // #429: is the resolved TypeRef `rt` a (non-nullable) `string`? Used to
     // zero-init a no-initializer `var s: string;` slot so reassignment's
     // release-old is null-safe. Nullable string? is excluded (left untouched).
@@ -3191,6 +3204,35 @@ private:
     // stays readable.
     void armStringLocalRefcount(const void* declNode, llvm::AllocaInst* slot,
                                 llvm::Value* v, const ast::Expr* init);
+
+    // #429 (closure RETURN category) / §28.9 / §28.3: true when `init` is a
+    // call to a user-defined, locally-compiled method whose declared return type
+    // is a function type (Kind::Function). Such a call goes through THIS
+    // module's ReturnStmt lowering, which mints exactly +1 for the returned
+    // closure cell — so the caller owns that single reference (a +1 producer
+    // at the call site). Cross-module imported methods are excluded (no local
+    // mint). Parallel to isUserMethodStringReturnCall for strings.
+    bool isUserMethodClosureReturnCall(const ast::Expr* init) const;
+    // #429 (closure RETURN category) / §28.9 / §28.3: true when the returned
+    // expression is an identifier naming a closure-typed local whose slot
+    // already owns a +1 — either initialized by a +1 closure producer (lambda /
+    // method-ref) or explicitly tracked as non-escaping and release-eligible
+    // (closureReleaseEligible_). Such a returned local TRANSFERS its single +1
+    // to the caller (no second retain). Parallel to returnedStringLocalOwnsPlusOne.
+    bool returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const;
+    // #429 (closure RETURN + FIELD-STORE) / §28.9: is `target` a closure-typed
+    // CLASS instance field / auto-property lvalue (NOT a local / param /
+    // ref-param / array element / static field / record field)? Only such a
+    // location owns an independent +1 released on the owner's disposal.
+    bool isClosureFieldLvalue(const ast::Expr& target);
+    // #429 (closure FIELD-STORE) / §28.9: store `newVal` into the class closure
+    // field at `fieldAddr` with retain-new / release-old, giving the field an
+    // INDEPENDENT +1. Order: load-old → retain-or-transfer-new → store-new →
+    // release-old. A +1 producer (lambda / method-ref / user-method closure-
+    // returning call) is TRANSFERRED; anything else is RETAINED. Parallel to
+    // lowerStringFieldStore. Returns true when handled.
+    bool lowerClosureFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
+                                llvm::Value* newVal, const ast::Expr* valueExpr);
 
     // #422 / §27.5 / §28.9: the set of `var` closure (function-typed) LocalDecl
     // nodes PROVABLY eligible for scope-end bz_closure_release — initialized
