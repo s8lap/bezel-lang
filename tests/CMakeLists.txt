@@ -380,6 +380,7 @@ set(BEZEL_TEST_SOURCES
     codegen/closure_call_nullable_param_557_test.cpp
     codegen/record_named_args_540_test.cpp
     codegen/in_operator_collection_551_test.cpp
+    codegen/in_operator_string_llist_558_560_test.cpp
     codegen/dict_keys_values_view_556_test.cpp
 
     module/module_metadata_test.cpp

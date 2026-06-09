@@ -2587,13 +2587,30 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 return builder_.CreateAnd(geL, leH, "r.in");
             }
         }
-        // §17.5: `c in s` — char membership test in a string.
+        // §17.5/§4.6: `c in s` — char membership test in a string.
         // True when the char c appears at any position in s.
+        // fix #558 / §17.5/§4.6: `sub in s` — substring containment when LHS is
+        // also a string. Lowers to `bz_str_contains(s, sub)` — the same runtime
+        // function that backs `s.Contains(sub: string): bool` (§9.6). Both forms
+        // require a `string` RHS; they differ only in LHS type (Char vs String).
         if (bin.right) {
             auto* rTy = ctx_.exprType(*bin.right);
             if (rTy && rTy->kind == sema::TypeRef::Kind::Primitive &&
                 rTy->primitive == sema::PrimitiveType::String) {
                 auto* lTy = ctx_.exprType(*bin.left);
+                // §17.5/§4.6 (fix #558): `string in string` — substring test.
+                // Reuses bz_str_contains(haystack, needle): i32 which is the same
+                // function backing string.Contains(sub: string) (§9.6, #535).
+                if (lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
+                    lTy->primitive == sema::PrimitiveType::String) {
+                    llvm::Value* needle   = lowerExpr(*bin.left);
+                    llvm::Value* haystack = lowerExpr(*bin.right);
+                    if (!needle || !haystack) return nullptr;
+                    auto* fn = declareC("bz_str_contains", i32(), {ptrTy(), ptrTy()});
+                    llvm::Value* res = builder_.CreateCall(fn, {haystack, needle},
+                                                           "sin.r");
+                    return builder_.CreateTrunc(res, i1(), "sin");
+                }
                 if (lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
                     lTy->primitive == sema::PrimitiveType::Char) {
                     // Implement as: scan through string code points for a match.
@@ -2601,7 +2618,6 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     llvm::Value* haystack = lowerExpr(*bin.right);
                     if (!needle || !haystack) return nullptr;
                     llvm::Value* len = loadStringLen(haystack);
-                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
                     auto* idxS = entryAlloca(i64());
                     builder_.CreateStore(builder_.getInt64(0), idxS);
                     auto* cBB = llvm::BasicBlock::Create(llvm_, "cin.c", currentFn_);
@@ -2727,20 +2743,67 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 if (!elem || !coll) return nullptr;
 
                 if (isLL) {
-                    // per §4.6/§4.7: bz_llist_find does a memcmp scan over the
-                    // linked list's inline element bytes — value equality for
-                    // primitives/records, pointer identity for class types (per
-                    // §8.3 / §4.6).  Returns the first matching node pointer or
-                    // null if not found; we convert to i1.
-                    int64_t esz = collectionElemSize(rTy);
-                    llvm::AllocaInst* slot = entryAlloca(elem->getType());
-                    builder_.CreateStore(elem, slot);
-                    auto* findFn = declareC("bz_llist_find", ptrTy(),
-                                           {ptrTy(), ptrTy(), i64()});
-                    llvm::Value* node = builder_.CreateCall(
-                        findFn, {coll, slot, builder_.getInt64(esz)}, "coll.in.node");
-                    return builder_.CreateICmpNE(
-                        node, llvm::ConstantPointerNull::get(ptrTy()), "coll.in");
+                    // fix #560 / §17.5/§4.6/§8.3: walk the linked list applying
+                    // emitRemoveElementEquality for per-element comparison so that
+                    // string content equality (§4.6), record structural equality
+                    // (§8.3/§9.1) and class Equals-dispatch (§8.4) are all correct.
+                    // The previous bz_llist_find path used memcmp on raw element
+                    // bytes — wrong for string elements (compared bz_string* pointer,
+                    // not content) and for records with string fields.
+                    llvm::Type* elemLLTy = elemRef ? lowerTypeRef(elemRef) : i64();
+                    if (!elemLLTy) elemLLTy = i64();
+                    auto* firstFn = declareC("bz_llist_first_node", ptrTy(),
+                                            {ptrTy()});
+                    auto* nextFn  = declareC("bz_llist_node_next", ptrTy(),
+                                            {ptrTy()});
+                    auto* valFn   = declareC("bz_llist_node_value_ptr", ptrTy(),
+                                            {ptrTy()});
+                    auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+                    // Spill `elem` (the search target) to a stable slot so that
+                    // emitRemoveElementEquality receives consistent operand types.
+                    llvm::AllocaInst* tgtSlot = entryAlloca(elem->getType());
+                    builder_.CreateStore(elem, tgtSlot);
+                    // nodeSlot holds the current node pointer across iterations.
+                    llvm::AllocaInst* nodeSlot = entryAlloca(ptrTy());
+                    llvm::Value* firstNode = builder_.CreateCall(
+                        firstFn, {coll}, "ll.in.first");
+                    builder_.CreateStore(firstNode, nodeSlot);
+                    auto* condBB  = llvm::BasicBlock::Create(llvm_, "llin.c",  currentFn_);
+                    auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "llin.b",  currentFn_);
+                    auto* foundBB = llvm::BasicBlock::Create(llvm_, "llin.f",  currentFn_);
+                    auto* nextBB  = llvm::BasicBlock::Create(llvm_, "llin.n",  currentFn_);
+                    auto* endBB   = llvm::BasicBlock::Create(llvm_, "llin.e",  currentFn_);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(condBB);
+                    llvm::Value* curNode = builder_.CreateLoad(ptrTy(), nodeSlot,
+                                                               "ll.in.cur");
+                    builder_.CreateCondBr(
+                        builder_.CreateICmpNE(curNode, nullP, "ll.in.nnull"),
+                        bodyBB, endBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* vp = builder_.CreateCall(valFn, {curNode},
+                                                          "ll.in.vp");
+                    llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "ll.in.el");
+                    // Load `elem` back from slot to match the type `el` has.
+                    llvm::Value* tgt = builder_.CreateLoad(elem->getType(),
+                                                           tgtSlot, "ll.in.tgt");
+                    llvm::Value* eq = emitRemoveElementEquality(el, tgt,
+                                                                elemRef,
+                                                                elemIsClass);
+                    if (!eq) return nullptr;
+                    builder_.CreateCondBr(eq, foundBB, nextBB);
+                    builder_.SetInsertPoint(foundBB);
+                    builder_.CreateBr(endBB);
+                    builder_.SetInsertPoint(nextBB);
+                    llvm::Value* nxt = builder_.CreateCall(nextFn, {curNode},
+                                                            "ll.in.next");
+                    builder_.CreateStore(nxt, nodeSlot);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(endBB);
+                    auto* phi = builder_.CreatePHI(i1(), 2, "llin.result");
+                    phi->addIncoming(builder_.getTrue(),  foundBB);
+                    phi->addIncoming(builder_.getFalse(), condBB);
+                    return phi;
                 }
 
                 // Array-backed path: emit the same scan loop as
