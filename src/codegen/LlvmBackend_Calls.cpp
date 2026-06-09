@@ -177,6 +177,53 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         return p != sema::PrimitiveType::String &&
                p != sema::PrimitiveType::Bool;  // bool → constant globals
     };
+    // fix #581 / fix #583 / §7 / §18.5: nullable VALUE types (int?, bool?,
+    // double?, enum?, nullable record) lower to a tagged {i8 hasValue; T}
+    // struct.  The existing Primitive dispatch below calls
+    // emitPrimitiveToString(arg, primitive) with the RAW struct value, which
+    // (a) passes a struct where an integer is expected → IR-crash for bool?
+    //     ("Trunc only operates on integer: trunc {i8,i1} to i1") because
+    //     emitPrimitiveToString's bool branch does CreateTrunc(val, i1()), and
+    // (b) passes the {i8,i32} struct to snprintf's %d for int?, printing the
+    //     first byte of the struct (the hasValue tag, value 1) instead of 42.
+    // Intercept BEFORE the Primitive check: branch on the hasValue tag and
+    // format the inner value via emitValueToString (which already handles all
+    // primitive/enum/record cases), or emit the literal "null".  This mirrors
+    // the interpolation path in LlvmBackend_Exprs.cpp (~line 127) and the
+    // emitValueToString path in LlvmBackend_String.cpp (~line 1904).
+    if (argTy && isNullableValueTy(argTy) && arg->getType()->isStructTy()) {
+        llvm::Value* hasVal = nullablePrimHasValue(arg);           // i1
+        llvm::Value* innerVal = nullablePrimValue(arg);             // T
+        auto* valBB  = llvm::BasicBlock::Create(llvm_, "wln.nv.val",  currentFn_);
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "wln.nv.null", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "wln.nv.end",  currentFn_);
+        builder_.CreateCondBr(hasVal, valBB, nullBB);
+        // hasValue: format the inner value using its non-nullable TypeRef.
+        builder_.SetInsertPoint(valBB);
+        sema::TypeRef innerTy = *argTy;
+        innerTy.nullable = false;
+        llvm::Value* valStr = emitValueToString(innerVal, &innerTy);
+        auto* valEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        // null: the literal "null" (matching §18.5 interpolation null rendering).
+        builder_.SetInsertPoint(nullBB);
+        llvm::Value* nullStr = lowerStringLiteral("\"null\"", false);
+        auto* nullEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(ptrTy(), 2, "wln.nv.str");
+        phi->addIncoming(valStr, valEnd);
+        phi->addIncoming(nullStr, nullEnd);
+        strPtr = phi;
+        // Note: freeTransient stays false here.  The valStr may be a
+        // transient heap string (for numeric inner types) or a constant
+        // global (for bool/string).  Freeing a PHI result conditionally after
+        // the write requires a second hasValue check; the minor leak matches
+        // what the interpolation path accepts.  Tracking this is a follow-up
+        // to issue #421 for nullable arguments.
+        emitConsoleWrite(strPtr, isWriteLine, stdfd);
+        return true;
+    }
     if (argTy) {
         if (argTy->kind == sema::TypeRef::Kind::Primitive &&
             argTy->primitive != sema::PrimitiveType::String) {

@@ -399,6 +399,7 @@ set(BEZEL_TEST_SOURCES
     codegen/array_span_549_test.cpp
     codegen/record_with_test.cpp
     codegen/record_this_with_575_test.cpp
+    codegen/writeline_nullable_581_583_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
