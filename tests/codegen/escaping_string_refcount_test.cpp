@@ -451,6 +451,296 @@ const char* kExplicitDisposeLoop =
     "  if total = 800000 then return 0; end; return 1; "
     "end Main; end C;";
 
+// --- Programs: STRING RETURN escape (#429 RETURN category) -----------------
+//
+// Ownership convention (#429 RETURN sub-slice), STRING returned from a
+// USER-DEFINED, LOCALLY-COMPILED method whose declared return type is `string`:
+//   - The callee mints EXACTLY +1 for the returned value (§28.3 ownership
+//     transfer): a +1 producer (`+`/interpolation/range-slice) is TRANSFERRED
+//     (no retain); anything else (literal / param / field / call = a borrow) is
+//     RETAINED, so the returned value carries exactly one reference to the
+//     caller. A non-escaping returned LOCAL is excluded from the scope-end
+//     string release so it is not freed before `ret`.
+//   - The caller treats such a call result like any other +1 producer: a
+//     `var s := Make()` local TRANSFERS the single reference (no extra retain)
+//     and releases it at scope end iff the local is proven non-escaping → the
+//     callee's +1 is balanced by the caller's release (no leak, no UAF). Stored
+//     into a class string field, the field TRANSFERS the +1 (released on
+//     disposal); passed onward as an argument it leaks the +1 (the ARGUMENT-pass
+//     category is out of this sub-slice — safe, never a UAF/double-free).
+
+// §28.9 / §28.3: a method returning a fresh `+` concat (a +1 producer). The
+// callee TRANSFERS the producer reference out; the caller's non-escaping `var s`
+// TRANSFERS it in and releases it at scope end → freed each iteration. Looped
+// 200k for steady-state. LEAKED before this sub-slice (the caller never released
+// the callee's +1).
+const char* kReturnConcatLoopReclaimed =
+    "module M; class C "
+    "  public static method Build(): string return \"re\" + \"turn\"; end Build; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 200000 do "
+    "      var s: string := C.Build(); "        // +1 from callee, released at scope end
+    "      total := total + s.Length; "          // "return" => 6
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 1200000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.3: a method returning a string LITERAL. A literal is a sentinel
+// (rc = 0x7FFF…): the callee's mint-retain is a no-op, and the caller's
+// transfer-then-release is a no-op too. No leak (a literal is a constant global,
+// not a heap allocation), no double-free of the literal. Looped for steady state.
+const char* kReturnLiteralLoopClean =
+    "module M; class C "
+    "  public static method Lit(): string return \"lit\"; end Lit; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 200000 do "
+    "      var s: string := C.Lit(); "
+    "      total := total + s.Length; "          // "lit" => 3
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 600000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.3: a method returning a borrowed FIELD `return this.Tag;`. The
+// field value is a borrow, so the callee RETAINS it → the returned value carries
+// an INDEPENDENT +1 (the field keeps its own +1, released on the owner's
+// disposal). The caller's non-escaping `var s` transfers+releases the returned
+// +1 → no UAF of the field's value, and no leak. The cardinal guard: the
+// callee's retain is what keeps the returned value alive past the owner; without
+// it the caller would read a value the owner could free. Looped → steady-state
+// LSan-clean (the Holder + its field reclaimed each iteration via using var).
+const char* kReturnBorrowedFieldLoopNoUaf =
+    "module M; class Holder "
+    "  public Tag: string; "
+    "  public constructor() this.Tag := \"fie\" + \"ld\"; end constructor; "
+    "  public method Get(): string return this.Tag; end Get; "
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 100000 do "
+    "    using var h := new Holder(); "
+    "    var s: string := h.Get(); "             // callee retains the borrow → +1
+    "    total := total + s.Length; "            // "field" => 5
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 500000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// §28.9 / §28.3: a method returning a PARAM `return s;`. The param is a borrow,
+// so the callee RETAINS it → the returned value carries +1. The caller's
+// non-escaping local transfers+releases it. The call-site argument is a literal
+// (sentinel), so the retain/release on it are no-ops and the literal is never
+// freed. Looped → steady-state clean.
+const char* kReturnParamLoopClean =
+    "module M; class C "
+    "  public static method Echo(s: string): string return s; end Echo; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 200000 do "
+    "      var r: string := C.Echo(\"echoed\"); "
+    "      total := total + r.Length; "          // "echoed" => 6
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 1200000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.3: return inside an IF / early-return. Both the early `return` and
+// the fall-through `return` are direct returns of a +1 producer; each path mints
+// +1 (transfers the producer). The caller's non-escaping local releases it.
+// Exercises the per-path return mint, not just the single tail return. Looped.
+const char* kReturnInIfEarlyReturnLoop =
+    "module M; class C "
+    "  public static method Pick(b: bool): string "
+    "    if b then return \"ye\" + \"s\"; end; "  // early return of a +1 producer
+    "    return \"n\" + \"o\"; "                  // tail return of a +1 producer
+    "  end Pick; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 200000 do "
+    "      var s: string := C.Pick(i = 0); "      // "no" for i>0 => length 2
+    "      total := total + s.Length; "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 400001 then return 0; end; return 1; " // "yes"(3) + 199999*"no"(2) = 400001
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.3 / §4.6: a returned call result stored DIRECTLY into a class
+// string field — the field-store ARC composes with the RETURN mint. The call is
+// a +1 producer (RETURN category), so lowerStringFieldStore TRANSFERS the +1
+// into the field (no extra retain); disposal releases it → reclaimed. The
+// strongest interplay check: RETURN mint hands off to field-store transfer with
+// a single balanced +1. Looped → steady-state LSan-clean.
+const char* kReturnIntoFieldStoreLoop =
+    "module M; class Maker "
+    "  public static method Make(): string return \"ma\" + \"de\"; end Make; "
+    "end Maker; "
+    "class Holder "
+    "  public Name: string; "
+    "  public constructor() this.Name := Maker.Make(); end constructor; " // transfer +1
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 200000 do "
+    "    using var h := new Holder(); "
+    "    total := total + h.Name.Length; "        // "made" => 4
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 800000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// §28.9 / §28.3: `var t := <producer>; return t;` — a returned LOCAL that ALREADY
+// owns a +1 (the `+` producer transferred its single reference into the slot).
+// The return TRANSFERS that +1 (no second retain) — minting a fresh one would
+// leak, since the escaped local is not released at scope end. The caller's
+// non-escaping local transfers+releases the single +1 → exactly one allocation
+// freed per iteration. Looped → steady-state LSan-clean. The decisive guard
+// against double-counting the producer-local's +1 on return.
+const char* kReturnProducerLocalLoopNoDouble =
+    "module M; class C "
+    "  public static method Build(): string "
+    "    var t: string := \"lo\" + \"cal\"; "    // producer local owns +1
+    "    return t; "                              // TRANSFER its +1 (no retain)
+    "  end Build; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 200000 do "
+    "      var s: string := C.Build(); "
+    "      total := total + s.Length; "           // "local" => 5
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 1000000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.9 / §28.3: `var t := p; return t;` where `p` is a PARAM — exercises the
+// borrow-local arm of returnedStringLocalOwnsPlusOne: a borrow local is RETAINED
+// at bind (stringBorrowAll_) and so owns a +1, which the return TRANSFERS (no
+// second retain). Returning it with a retain instead would mint an EXTRA +1 that
+// leaks; transferring keeps the round trip balanced. The call-site argument is a
+// literal (sentinel) so all retain/release on `p` are no-ops — the test is
+// LSan-clean and verifies correctness + no UAF/double-free of the borrow-local
+// return path. (A leak-free demonstration with a HEAP param argument is blocked
+// by the ARGUMENT-pass category being out of this sub-slice: passing a heap
+// string as an argument leaks the argument's +1 regardless of the return path.)
+const char* kReturnBorrowLocalOfParamLoop =
+    "module M; class C "
+    "  public static method Wrap(p: string): string "
+    "    var t: string := p; "                    // borrow local: retained +1 at bind
+    "    return t; "                              // TRANSFER the retained +1
+    "  end Wrap; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 200000 do "
+    "      var r: string := C.Wrap(\"wrapped\"); "
+    "      total := total + r.Length; "           // "wrapped" => 7
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 1400000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §31.2 / §28.9 / §28.3: `return <producer>;` inside a try-with-FINALLY. The +1
+// mint runs before the value is stashed into the finally frame's return slot and
+// routed through the finally block; the finally body runs, then the stashed value
+// is ret'd. The returned +1 producer is a fresh allocation not aliased by any
+// in-scope local, so the finally body's disposals never free it (no UAF), and the
+// caller's transfer+release balances the +1 (no leak). Confirms the mint composes
+// with the §31.2 return-through-finally path. Looped → steady-state LSan-clean.
+const char* kReturnConcatThroughFinallyLoop =
+    "module M; class C "
+    "  public static method Build(): string "
+    "    var guard: int := 0; "
+    "    try "
+    "      return \"fin\" + \"ally\"; "            // return through the finally
+    "    finally "
+    "      guard := guard + 1; "                  // finally body runs, no UAF
+    "    end; "
+    "  end Build; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      var s: string := C.Build(); "
+    "      total := total + s.Length; "            // "finally" => 7
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 700000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// §28.4 / §28.9 / §28.3: a VIRTUAL/OVERRIDE string-returning method called
+// through a base reference. Both the base virtual body and the derived override
+// body go through the SAME ReturnStmt +1 minting, so the dynamic target hands
+// back exactly +1 regardless of which override runs; the call site treats it as a
+// +1 producer (the static callee is a declared-string MethodDecl). The caller's
+// non-escaping local transfers+releases the single +1 → no leak, and critically
+// no double-free across the vtable dispatch. Looped → steady-state LSan-clean.
+const char* kReturnVirtualOverrideLoop =
+    "module M; class Base "
+    "  public virtual method Name(): string return \"ba\" + \"se\"; end Name; "
+    "end Base; "
+    "class Derived : Base "
+    "  public override method Name(): string return \"deri\" + \"ved\"; end Name; "
+    "end Derived; "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 100000 do "
+    "    using var d := new Derived(); "
+    "    var b: Base := d; "
+    "    var s: string := b.Name(); "             // dynamic dispatch → "derived"
+    "    total := total + s.Length; "             // 7
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 700000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// §11 / §28.9 / §28.3: a string-returning method called through an INTERFACE
+// reference (itable dispatch). The interface method's MethodDecl declares `:
+// string`, so the call site recognizes the +1-producer handoff; the implementing
+// class's body mints +1 on return. Caller transfers+releases → no leak, no
+// double-free across the itable dispatch. Looped → steady-state LSan-clean.
+const char* kReturnInterfaceDispatchLoop =
+    "module M; interface INamed "
+    "  method Name(): string; "
+    "end INamed; "
+    "class Thing : INamed "
+    "  public method Name(): string return \"th\" + \"ing\"; end Name; "
+    "end Thing; "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 100000 do "
+    "    using var t := new Thing(); "
+    "    var n: INamed := t; "
+    "    var s: string := n.Name(); "             // itable dispatch → "thing"
+    "    total := total + s.Length; "             // 5
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 500000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// §28.9 / §28.3: nested call chain `f(g())`. `g()` (Build) mints +1; it is passed
+// DIRECTLY as an ARGUMENT to `f` (Len) — the ARGUMENT-pass category, OUT of this
+// RETURN sub-slice, so the inner +1 is conservatively LEAKED (never released by
+// the caller — there is no bound local). The cardinal point here is memory
+// SAFETY: the callee `Len` reads its borrowed param intact (no UAF), the result
+// is correct, and there is no double-free. Value + no-corruption (a residual
+// leak from the un-bound inner +1 is tolerated; this sub-slice does not claim the
+// argument-pass category).
+const char* kNestedCallChainNoUaf =
+    "module M; class C "
+    "  public static method Build(): string return \"ne\" + \"sted\"; end Build; "
+    "  public static method Len(s: string): int return s.Length; end Len; "
+    "  public static method Main(): int "
+    "    return C.Len(C.Build()); "               // "nested" => 6
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // --- LSan-clean tests (#429 field-store reclaim: leaked before, clean now) ---
@@ -525,4 +815,66 @@ BEZEL_TEST(codegen_escaping_string_429, field_coalesce_assign_reclaimed_4_7) {
 
 BEZEL_TEST(codegen_escaping_string_429, record_string_field_no_double_free_9) {
     expectValueAndNoCorruption(kRecordStringFieldNoDoubleFree, 6);
+}
+
+// --- RETURN escape category (#429 RETURN sub-slice): callee mints +1, caller
+//     transfers + releases. Leaked before this sub-slice; clean now. ----------
+
+BEZEL_TEST(codegen_escaping_string_429, return_concat_loop_reclaimed_28_3) {
+    expectValueAndLeakFree(kReturnConcatLoopReclaimed, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_literal_loop_clean_28_9) {
+    expectValueAndLeakFree(kReturnLiteralLoopClean, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_borrowed_field_loop_no_uaf_28_3) {
+    // The callee retains the borrowed field → the returned value carries an
+    // independent +1, so the caller never reads a value the owner can free.
+    expectValueAndLeakFree(kReturnBorrowedFieldLoopNoUaf, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_param_loop_clean_28_3) {
+    expectValueAndLeakFree(kReturnParamLoopClean, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_in_if_early_return_loop_28_3) {
+    expectValueAndLeakFree(kReturnInIfEarlyReturnLoop, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_into_field_store_loop_28_3) {
+    // RETURN mint composes with field-store transfer: a single balanced +1.
+    expectValueAndLeakFree(kReturnIntoFieldStoreLoop, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_producer_local_loop_no_double_28_3) {
+    // Returning a producer LOCAL transfers its single +1 (no double-count).
+    expectValueAndLeakFree(kReturnProducerLocalLoopNoDouble, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_borrow_local_of_param_loop_28_3) {
+    // Returning a borrow LOCAL transfers its retained +1.
+    expectValueAndLeakFree(kReturnBorrowLocalOfParamLoop, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_concat_through_finally_loop_31_2) {
+    // The +1 mint composes with the §31.2 return-through-finally path: no UAF
+    // (the finally body cannot free the fresh returned +1), no leak.
+    expectValueAndLeakFree(kReturnConcatThroughFinallyLoop, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_virtual_override_loop_28_4) {
+    // Both override bodies mint +1 on return → no double-free across vtable.
+    expectValueAndLeakFree(kReturnVirtualOverrideLoop, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, return_interface_dispatch_loop_11) {
+    // Itable dispatch: the impl body mints +1; caller balances → clean.
+    expectValueAndLeakFree(kReturnInterfaceDispatchLoop, 0);
+}
+
+BEZEL_TEST(codegen_escaping_string_429, nested_call_chain_no_uaf_28_3) {
+    // f(g()): the inner +1 is passed as an ARGUMENT (out of the RETURN lane) and
+    // is conservatively leaked; the cardinal point is no UAF / double-free.
+    expectValueAndNoCorruption(kNestedCallChainNoUaf, 6);
 }

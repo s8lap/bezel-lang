@@ -3050,6 +3050,32 @@ private:
     // eligibility and to release intermediate concat operands.
     bool isPlusOneStringProducer(const ast::Expr* init) const;
 
+    // #429 (RETURN-escape category) / §4.6 / §28.9: is `init` a CALL to a
+    // USER-DEFINED, LOCALLY-COMPILED Bezel method whose declared return type is
+    // (non-nullable) `string`? Such a call hands back EXACTLY +1: the callee's
+    // ReturnStmt lowering mints a +1 for the returned string (transfer a +1
+    // producer, else retain a borrow), so the caller owns that single reference
+    // and may treat the result like any other +1 producer (transfer into a local
+    // slot, release at scope end if non-escaping). Excludes builtin stdlib string
+    // methods (no resolved MethodSymbol — matched structurally in
+    // tryLowerStringMethod) and CROSS-MODULE IMPORTED methods (their callee does
+    // NOT go through this module's ReturnStmt minting), which keep their prior
+    // borrow-with-leak handling. Operators / constructors are excluded too.
+    bool isUserMethodStringReturnCall(const ast::Expr* init) const;
+
+    // #429 (RETURN-escape category) / §4.6 / §28.9: is `e` an IDENTIFIER naming a
+    // non-nullable string LOCAL that already OWNS a +1 reference in its slot?
+    // True for a producer-initialized local (the producer's +1 was transferred
+    // into the slot) or a borrow local that was retained at bind
+    // (stringBorrowAll_). When such a local is RETURNED, its single +1 must be
+    // TRANSFERRED to the caller (no extra retain) — the local is escaped (so not
+    // released at scope end) and excluded from disposal, so its +1 flows out
+    // rather than leaking. A param read, a field read, a literal, or an alias
+    // that does not own a +1 is NOT covered (those are pure borrows → the return
+    // mint RETAINS them). Only meaningful while the current function is the one
+    // collectStringReleaseEligible analyzed (stringReleaseEligibleFn_).
+    bool returnedStringLocalOwnsPlusOne(const ast::Expr* e) const;
+
     // #429 / §4.6 / §28.9: store `newVal` (a string) into the CLASS string
     // field/auto-property at `fieldAddr` with retain-new / release-old, giving
     // the field an INDEPENDENT +1 (released on the owner's disposal). Returns
