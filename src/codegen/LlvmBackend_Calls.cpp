@@ -6745,7 +6745,12 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // call — even for methods with non-generic param/return types (like
     // `Size(): int`), because the struct layout changes when generic field
     // types (e.g. [5]T) are substituted with concrete types (e.g. [5]ptr).
-    if (!genericSubst_.empty() && !isStaticMethod(ms)) {
+    // §22.12 / #536: this now also covers STATIC methods on generic classes —
+    // a static method body may access static fields, which must resolve to the
+    // per-instantiation global (e.g. `bz$Counter$int$count`).  Monomorphizing
+    // the body ensures genericSubst_ is active inside it so staticFieldGlobal
+    // can redirect to the instantiation-specific global.
+    if (!genericSubst_.empty()) {
         // Check if the method's parent class has generic params (i.e., is a
         // generic class that has been instantiated with the current subst).
         bool parentIsGeneric = false;
