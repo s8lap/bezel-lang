@@ -6498,25 +6498,36 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             break;
                         }
                     }
-                    // per §14.1 (issue #516): a generic method with U appearing
-                    // ONLY in the lambda's return type (e.g. `Apply<U>(x:int,
-                    // fn:(int)->U):U`) may leave U unbound after the non-lambda
-                    // arg loop above — no concrete arg has declared type exactly
-                    // `U`. If the call site supplies explicit type arguments
-                    // (`Apply<string>(...)`), those explicit args settle the
-                    // substitution. Seed from the MemberAccessExpr's typeArgs
+                    // per §14.1 (issue #516/#561): a generic method with U
+                    // appearing ONLY in the lambda's return type (e.g.
+                    // `Apply<U>(x:int, fn:(int)->U):U`) may leave U unbound
+                    // after the non-lambda arg loop above — no concrete arg has
+                    // declared type exactly `U`. If the call site supplies
+                    // explicit type arguments (`Apply<string>(...)`), those
+                    // explicit args settle the substitution. Seed from the
+                    // callee's typeArgs (MemberAccessExpr or bare IdentifierExpr)
                     // before buildOrderedArgs runs so lowerLambda resolves
                     // lowerTypeRef(U) correctly when lowering the lambda return.
-                    if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
-                            call.callee.get())) {
+                    {
+                    const std::vector<std::unique_ptr<ast::Type>>* callTAs =
+                        nullptr;
+                    if (auto* callMa =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                call.callee.get()))
+                        callTAs = &callMa->typeArgs;
+                    else if (auto* callId =
+                                 dynamic_cast<const ast::IdentifierExpr*>(
+                                     call.callee.get()))
+                        callTAs = &callId->typeArgs;
+                    if (callTAs) {
                         for (std::size_t gi = 0;
                              gi < md->genericParams.size() &&
-                             gi < callMa->typeArgs.size(); ++gi) {
+                             gi < callTAs->size(); ++gi) {
                             std::string_view pname = md->genericParams[gi].name;
                             if (preSubst.count(pname)) continue;
-                            if (!callMa->typeArgs[gi]) continue;
+                            if (!(*callTAs)[gi]) continue;
                             sema::TypeRef* concreteArg =
-                                ctx_.resolvedType(*callMa->typeArgs[gi]);
+                                ctx_.resolvedType(*(*callTAs)[gi]);
                             if (!concreteArg) continue;
                             llvm::Type* lt = lowerTypeRef(concreteArg);
                             if (lt != i32()) {
@@ -6524,6 +6535,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                 preSema[pname] = concreteArg;
                             }
                         }
+                    }
                     }
                     if (preSubst != genericSubst_) {
                         preSavedSubst = genericSubst_;
@@ -6707,8 +6719,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     break;
                 }
             }
-            // per §14.1 (issues #515/#516): a generic method whose type param
-            // appears ONLY in lambda param/return positions (not in any
+            // per §14.1 (issues #515/#516/#561): a generic method whose type
+            // param appears ONLY in lambda param/return positions (not in any
             // non-lambda param's declared type) leaves the param unbound by
             // the arg-inference loop above. When the call site supplies
             // explicit type arguments (`Transform<int>`), use them to bind
@@ -6718,20 +6730,30 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             // emitInlineGenericMethod / emitGenericSpecialization) also has
             // the correct binding, so that body-level dispatch (v.ToString()
             // on a U-typed receiver) resolves via genericSubstSemaTy_.
+            // The callee may be a MemberAccessExpr (`obj.Method<T>(...)`) or
+            // a bare IdentifierExpr (`Id<T>(...)` — in-scope call without dot).
+            {
+            const std::vector<std::unique_ptr<ast::Type>>* callTAs = nullptr;
             if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
-                    call.callee.get())) {
+                    call.callee.get()))
+                callTAs = &callMa->typeArgs;
+            else if (auto* callId = dynamic_cast<const ast::IdentifierExpr*>(
+                         call.callee.get()))
+                callTAs = &callId->typeArgs;
+            if (callTAs) {
                 for (std::size_t gi = 0;
                      gi < md->genericParams.size() &&
-                     gi < callMa->typeArgs.size(); ++gi) {
+                     gi < callTAs->size(); ++gi) {
                     std::string_view pname = md->genericParams[gi].name;
                     if (newSubst.count(pname)) continue;
-                    if (!callMa->typeArgs[gi]) continue;
+                    if (!(*callTAs)[gi]) continue;
                     sema::TypeRef* concreteArg =
-                        ctx_.resolvedType(*callMa->typeArgs[gi]);
+                        ctx_.resolvedType(*(*callTAs)[gi]);
                     if (!concreteArg) continue;
                     newSubst[pname] = lowerTypeRef(concreteArg);
                     newSema[pname] = concreteArg;
                 }
+            }
             }
             genericSubst_ = std::move(newSubst);
             genericSubstSemaTy_ = std::move(newSema);
