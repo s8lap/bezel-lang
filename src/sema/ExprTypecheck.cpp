@@ -1882,12 +1882,41 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             ctx_.primitiveTypeRef(PrimitiveType::Char);
                     // §3 / §29.2: runtime Array<T> or other IEnumerable<T>
                     // with a Named TypeRef — element type from first generic arg.
+                    // Guard: Dictionary<K,V> and OwnedDictionary<K,V> are NOT
+                    // directly iterable (stdlib §4.8 / §4.9 — no default
+                    // `for var e in d` iteration is provided). Blindly taking
+                    // genericArgs[0] (K) mis-types the element and causes a
+                    // confusing late failure; emit a clear diagnostic instead.
                     } else if (tt->kind == TypeRef::Kind::Named &&
                                !tt->genericArgs.empty() &&
                                tt->genericArgs[0]) {
-                        // Covers Array<T>, Stack<T>, Queue<T>, user-defined
-                        // IEnumerable<T> types that expose their T directly.
-                        lsym->declType = tt->genericArgs[0];
+                        // Check whether the Named type is Dictionary or
+                        // OwnedDictionary and reject direct iteration (§4.8).
+                        std::string_view colTypeName;
+                        if (tt->astNode && tt->astNode->name &&
+                            !tt->astNode->name->parts.empty())
+                            colTypeName = tt->astNode->name->parts[0];
+                        else if (!tt->importedName.empty())
+                            colTypeName = tt->importedName;
+                        if (colTypeName == "Dictionary" ||
+                            colTypeName == "OwnedDictionary") {
+                            // per §4.8 / §4.9: direct iteration is not supported.
+                            // Do NOT set lsym->declType — leave the loop variable
+                            // untyped so the body is still walked (cascade
+                            // suppression), but report the early clear diagnostic.
+                            ctx_.diagnostics().report(
+                                Severity::Error, fs->span.begin,
+                                std::string(colTypeName) +
+                                "<K,V> is not directly iterable (stdlib \xC2\xA7""4.8); "
+                                "iterate `d.Keys` (key-iteration) or "
+                                "`d.Drain()` (OwnedDictionary, ownership-transfer) "
+                                "instead of `for var e in d`");
+                        } else {
+                            // Covers Array<T>, Stack<T>, Queue<T>, Set<T>,
+                            // LinkedList<T>, and other IEnumerable<T> types that
+                            // expose their element type T as genericArgs[0].
+                            lsym->declType = tt->genericArgs[0];
+                        }
                     } else if (tt->kind == TypeRef::Kind::Named &&
                                tt->declaration) {
                         // §29.2: user-defined IEnumerable<T> — find GetEnumerator
