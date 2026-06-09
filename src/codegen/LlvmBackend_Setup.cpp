@@ -2370,8 +2370,19 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // CG47: run every static constructor once, before the program's
     // body. The entry point Main is the single root, so calling them at
     // its start runs them before any user code (§22.7).
+    // fix #529 / §22.7 (part b): after each static-ctor call, check bz_exc.
+    // If the ctor threw, the ctor's own propagate block has already wrapped the
+    // original exception in TypeInitializationException (see
+    // emitStaticConstructorBody). emitPendingCheck then routes the wrapped
+    // exception through Main's normal unwind path — if Main's body has an
+    // enclosing try/catch (e.g. in a test), the TypeInitializationException
+    // reaches the catch arm; otherwise it propagates to Main's propagateBB
+    // (bz_unhandled_exception).
     if (isMain(ms)) {
-        for (auto& [cs, sfn] : staticCtors_) builder_.CreateCall(sfn, {});
+        for (auto& [cs, sfn] : staticCtors_) {
+            builder_.CreateCall(sfn, {});
+            emitPendingCheck();
+        }
         // §24.1 / §22.13 (#477 B6): allocate each static event's backing
         // EventSource<T> at program start (the single static root), so a
         // subscribe/raise on a static event reaches a real shared source.
@@ -2444,7 +2455,68 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     currentCaughtExc_ = nullptr;
     currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
-    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+
+    // fix #529 / §22.7 (part a): establish the entry block FIRST so that
+    // builder_ has a valid insert point, then pre-seed propagateBB_ with a
+    // custom block that wraps the escaping exception in TypeInitializationException
+    // before returning to the caller.
+    //
+    // Any uncaught exception inside the static-ctor body eventually branches to
+    // propagateBB().  The lazy propagateBB() would produce a plain `ret void`
+    // for a non-main void function, leaving bz_exc pointing at the ORIGINAL
+    // exception.  By pre-seeding propagateBB_ we intercept every uncaught-
+    // exception exit and:
+    //   1. Load bz_exc (the original exception that escaped the ctor).
+    //   2. Allocate a TypeInitializationException (24 bytes):
+    //        [offset  0] vtable ptr    — identifies the type at runtime
+    //        [offset  8] message ptr   — null (calloc zeroes it; §31.4)
+    //        [offset 16] InnerException — the original exception (§22.7)
+    //   3. Store the wrapped exception back into bz_exc.
+    //   4. Return void — the caller's emitPendingCheck (in Main's prologue,
+    //      fix #529 part b) observes the non-null bz_exc and routes the
+    //      TypeInitializationException through Main's normal unwind path,
+    //      reaching a catch arm if one is in scope.
+    //
+    // An exception that IS caught inside the static-ctor body (via try/catch)
+    // never reaches propagateBB_ — lowerTry handles it before the propagate
+    // branch; the ctor then returns normally (ret void with bz_exc == null).
+    //
+    // NOTE: The TypeInitializationException disposer is the shared no-op
+    // bz$exDispose, which does not recurse into InnerException; the inner object
+    // is therefore not freed at program exit when the exception is not caught.
+    // This is an acceptable simplification for the process-exit path.  A full fix
+    // would add a typed disposer for TypeInitializationException; tracked as a
+    // follow-on to issue #529.
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entryBB);
+
+    // Pre-seed propagateBB_ before lowering the body so that every throw inside
+    // the body (direct throw or emitPendingCheck on a nested call) reaches the
+    // wrapping block.
+    propagateBB_ = llvm::BasicBlock::Create(llvm_, "sinit.propagate", fn);
+    {
+        // Temporarily switch to the propagate block to emit its body.
+        auto* savedInsert = builder_.GetInsertBlock();
+        builder_.SetInsertPoint(propagateBB_);
+        llvm::Value* origExc = builder_.CreateLoad(ptrTy(), excGlobal());
+        auto vit = builtinVtable_.find("TypeInitializationException");
+        if (vit != builtinVtable_.end()) {
+            llvm::Value* tie = builder_.CreateCall(
+                callocFn(), {builder_.getInt64(1), builder_.getInt64(24)});
+            // vtable at offset 0
+            builder_.CreateStore(vit->second, tie);
+            // message at offset 8: null (calloc zeroed it)
+            // InnerException at offset 16
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* innerSlot =
+                builder_.CreateGEP(i8Ty, tie, builder_.getInt64(16));
+            builder_.CreateStore(origExc, innerSlot);
+            builder_.CreateStore(tie, excGlobal());
+        }
+        builder_.CreateRetVoid();
+        builder_.SetInsertPoint(savedInsert);
+    }
+
     if (!lowerScopedBlock(cd->body)) builder_.CreateRetVoid();
 }
 
