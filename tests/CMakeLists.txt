@@ -222,6 +222,7 @@ set(BEZEL_TEST_SOURCES
     codegen/nullable_record_test.cpp
     codegen/ffi_test.cpp
     codegen/case_expr_test.cpp
+    codegen/case_expr_nullable_result_573_test.cpp
     codegen/finally_test.cpp
     codegen/long_int_test.cpp
     codegen/short_circuit_test.cpp
