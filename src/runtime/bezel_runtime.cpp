@@ -189,6 +189,47 @@ void bz_array_sort(void* arrp, int64_t elem_size,
         qsort(arr->data, (size_t)arr->count, (size_t)elem_size, cmp);
 }
 
+// stdlib §3 / #472: Sort with a closure-bearing comparator.
+// `cmpfn(closure, a, b)` wraps the user lambda `(T, T) -> int`.
+// We use a thread-local shim so qsort (which takes a plain function pointer)
+// can reach the closure without a global lock.
+namespace {
+thread_local void*  bz_sort_cl_closure = nullptr;
+thread_local int  (*bz_sort_cl_fn)(void*, const void*, const void*) = nullptr;
+extern "C" int bz_sort_cl_shim(const void* a, const void* b) {
+    return bz_sort_cl_fn(bz_sort_cl_closure, a, b);
+}
+}  // namespace
+
+void bz_array_sort_closure(void* arrp, int64_t elem_size,
+                           void* closure,
+                           int (*cmpfn)(void*, const void*, const void*)) {
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr || arr->count < 2) return;
+    bz_sort_cl_closure = closure;
+    bz_sort_cl_fn      = cmpfn;
+    qsort(arr->data, (size_t)arr->count, (size_t)elem_size, bz_sort_cl_shim);
+    bz_sort_cl_closure = nullptr;
+    bz_sort_cl_fn      = nullptr;
+}
+
+// stdlib §3 / #472: Shallow-copy `arr` — allocate a new bz_array_t with the
+// same element bytes.  The copy does NOT deep-clone pointer-typed elements;
+// for the borrowing Array<T> this is correct (Array<T> does not own its class
+// elements — ownership stays with the original owner).  The returned array is
+// fresh-owned by the caller; dispose with bz_array_free(result, nullptr).
+void* bz_array_copy(void* arrp, int64_t elem_size) {
+    auto* src = (bz_array_t*)arrp;
+    if (!src) return bz_array_alloc(elem_size, 0);
+    auto* dst = (bz_array_t*)bz_array_alloc(elem_size, src->count);
+    if (src->count > 0 && src->data) {
+        memcpy(dst->data, src->data, (size_t)(src->count * elem_size));
+        dst->count = src->count;
+        if (dst->capacity < src->count) dst->capacity = src->count;
+    }
+    return dst;
+}
+
 void* bz_array_ptr_at(void* arrp, int64_t idx, int64_t elem_size) {
     auto* arr = (bz_array_t*)arrp;
     return (char*)arr->data + idx * elem_size;

@@ -84,6 +84,20 @@ void bz_array_free(void* arr, void (*dispose_elem)(void*));
 void bz_array_sort(void* arr, int64_t elem_size,
                    int (*cmp)(const void*, const void*));
 
+// Sort in place with a closure-aware comparator.  `cmpfn(closure, a, b)`
+// receives the opaque closure pointer and two element pointers; returns
+// negative/zero/positive.  Used for Array<T>.Sort(comparer: (T,T)->int)
+// and the derived Sorted(comparer) copy-form (stdlib §3 / #472).
+void bz_array_sort_closure(void* arr, int64_t elem_size,
+                           void* closure,
+                           int (*cmpfn)(void*, const void*, const void*));
+
+// Return a shallow copy of `arr` (same element bytes, no deep clone).
+// The caller owns the returned array and must free it with
+// bz_array_free(result, /*disposer=*/null).  Used by Array<T>.Reversed()
+// and Array<T>.Sorted[...] (stdlib §3 / #472).
+void* bz_array_copy(void* arr, int64_t elem_size);
+
 // Return a pointer directly into the array's internal buffer at element `idx`.
 // Only valid until the next mutation; used for zero-copy access in codegen.
 void* bz_array_ptr_at(void* arr, int64_t idx, int64_t elem_size);

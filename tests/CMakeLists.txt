@@ -355,6 +355,7 @@ set(BEZEL_TEST_SOURCES
     codegen/primitive_tostring_ieee_518_519_test.cpp
     codegen/generic_value_method_515_516_test.cpp
     codegen/collections_r9_522_523_524_test.cpp
+    codegen/array_reversed_sorted_472_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
