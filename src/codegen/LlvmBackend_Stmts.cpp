@@ -321,14 +321,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // array (caller crashes). Materialize a real heap collection here (same
         // bz_array_alloc + bz_array_add as `new`/`.Add`); ownership transfers to
         // the caller as the §28.3 owned result.
+        // #538 / stdlib §4.8: same problem for `return ["k1":v1, …]` — a dict
+        // literal also falls through lowerExpr → null.  The `!cl->isDict` guard
+        // below is widened to also handle dict literals via the same
+        // materializeHeapDictLiteral helper that #534 introduced for local-decls.
         llvm::Value* v = nullptr;
         if (rs->value) {
             if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     rs->value.get())) {
-                if (!cl->isDict && currentReturnTypeNode_)
+                if (currentReturnTypeNode_) {
                     if (const sema::TypeRef* rrt =
-                            ctx_.resolvedType(*currentReturnTypeNode_))
-                        v = materializeHeapCollectionLiteral(cl, rrt);
+                            ctx_.resolvedType(*currentReturnTypeNode_)) {
+                        if (!cl->isDict)
+                            v = materializeHeapCollectionLiteral(cl, rrt);
+                        else if (!cl->keys.empty())
+                            v = materializeHeapDictLiteral(cl, rrt);
+                    }
+                }
             }
             if (!v) v = lowerExpr(*rs->value);
         }
