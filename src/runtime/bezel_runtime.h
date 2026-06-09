@@ -267,6 +267,20 @@ void bz_dict_values_gen(void* d, void*** vals_out, int64_t* n_out);
 // element disposal is performed — the removed keys are just freed.
 int32_t bz_set_algebra_gen(void* self, void** keys, int64_t n, int32_t op);
 
+// issue #429 / §28.9 / §4.10: reference-counting helpers for Set<string>.
+// A Set<string> stores each element as a bz_string* in the generic-key table's
+// key slot (key_size == sizeof(void*)). These helpers manage the per-element
+// +1 that the set co-owns:
+//   bz_set_string_keys_release — release every live element's +1 by reading
+//     the string pointer from each key slot. Call BEFORE bz_dict_free.
+//   bz_dict_clear_set_strings  — like bz_dict_clear(d, null) but also releases
+//     each key's string +1 before freeing the key copy.
+//   bz_dict_remove_set_string  — like bz_dict_remove_gen but releases the
+//     string element's +1 before freeing the key copy.
+void bz_set_string_keys_release(void* d);
+void bz_dict_clear_set_strings(void* d);
+bool bz_dict_remove_set_string(void* d, const void* key);
+
 // issue #389 / stdlib §5: wrap a dict-backed Set<T> (§4.10) as a lazy LINQ
 // source (Set is IEnumerable<T> via ICollection<T>, §4.3). Snapshots the set's
 // element keys (bz_dict_keys_gen) into an owned buffer iterated by index; the

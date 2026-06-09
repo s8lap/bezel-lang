@@ -2345,6 +2345,44 @@ llvm::Function* Emitter::stringElementReleaseDisposer(const sema::TypeRef* collT
 }
 
 
+bool Emitter::isStringElementSet(const sema::TypeRef* collTy) {
+    // #429 / §28.9 / §4.10: a dict-backed Set (NOT OwnedSet — string is
+    // forbidden as an owned collection element, §15.2) whose element type is a
+    // non-nullable `string`. Such a set co-owns a +1 per element stored as a
+    // key; the generic-key table stores the bz_string* in `e.key` (key_size ==
+    // sizeof(void*)). EXCLUSION: nullable string? — left to a follow-on to
+    // avoid the tagged-pointer complexity (the null sentinel collides with the
+    // table's empty-slot marker).
+    if (!collTy || !collTy->astNode || !collTy->astNode->name ||
+        collTy->astNode->name->parts.empty())
+        return false;
+    if (collTy->astNode->name->parts[0] != "Set") return false;
+    if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return false;
+    const sema::TypeRef* el = collTy->genericArgs[0];
+    return el->kind == sema::TypeRef::Kind::Primitive &&
+           el->primitive == sema::PrimitiveType::String && !el->nullable;
+}
+
+
+bool Emitter::isStringValueDict(const sema::TypeRef* dictTy) {
+    // #429 / §28.9 / §4.8: a non-owning Dictionary<K, string> (borrowing;
+    // NOT OwnedDictionary which uses owningDictValueDisposer for class values)
+    // whose VALUE type is a non-nullable `string`. Such a dict co-owns a +1 per
+    // stored value (retained at Add/Set/indexer-set, released at Remove/Clear/
+    // free). EXCLUSION: OwnedDictionary, nullable string? — both left to
+    // separate sub-slices (the owned-value path already works; nullable complicates
+    // the sentinel encoding).
+    if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
+        dictTy->astNode->name->parts.empty())
+        return false;
+    if (dictTy->astNode->name->parts[0] != "Dictionary") return false;
+    if (dictTy->genericArgs.size() <= 1 || !dictTy->genericArgs[1]) return false;
+    const sema::TypeRef* val = dictTy->genericArgs[1];
+    return val->kind == sema::TypeRef::Kind::Primitive &&
+           val->primitive == sema::PrimitiveType::String && !val->nullable;
+}
+
+
 llvm::Function* Emitter::owningDictValueDisposer(const sema::TypeRef* dictTy) {
     // #394 / stdlib §4.9: only an OwnedDictionary<K,V> with a CLASS value type
     // owns its values and must dispose each surviving one at scope end. A
@@ -3626,6 +3664,21 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     }
     if (const sema::TypeRef* collTy = collectionTypeOfLocal(ld)) {
         if (isCollectionTypeName(collTy)) {
+            // #429 / §28.9 / §4.10: Set<string> is dict-backed (bz_dict_t*), NOT
+            // array-backed — intercept BEFORE the d.collection = true branch so we
+            // route it through bz_dict_free (with bz_set_string_keys_release) instead
+            // of the erroneous bz_array_free path that every Set<T> currently falls
+            // into (pre-existing safe-but-leaky behavior for non-string sets). This
+            // is the minimal targeted fix for the #429 Set<string> sub-slice; fixing
+            // all Set<T> disposal (replacing bz_array_free with bz_dict_free) is a
+            // broader correctness fix deferred to a separate lane.
+            if (isStringElementSet(collTy)) {
+                Disposal d{it->second, nullptr};
+                d.dict = true;
+                d.dictStringKeys = true;  // signal pre-free string key release
+                disposeStack_.back().push_back(d);
+                return;
+            }
             Disposal d{it->second, nullptr};
             d.collection = true;
             d.collectionElemDisposer = owningCollectionElemDisposer(collTy);
@@ -3644,22 +3697,37 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // hash-backed dictionary (Dictionary<K,V>/OwnedDictionary<K,V>). Dicts are
     // excluded from isCollectionTypeName (they free via bz_dict_free, not
     // bz_array_free), so they get their own disposal kind here. The per-value
-    // callback is one of exactly two mutually exclusive things (or null):
+    // callback is one of exactly three mutually exclusive things (or null):
     //   * #394: an OwnedDictionary<K, class> → cascade disposal into each
     //     surviving CLASS value (dispose + free via its vtable).
     //   * #401: a borrowing Dictionary<K, record> → free each surviving record
     //     value BOX (plain free; a record is a value type with nothing to
     //     dispose, §3.2 / §9).
-    // A borrowing Dictionary with a scalar/string value stores no box, so both
-    // return null and only the backing table + key bytes are freed. Keys are
-    // never disposed (§4.9: keys are value-like; the dictionary owns its values
-    // only).
+    //   * #429 / §28.9: a borrowing Dictionary<K, string> → release each
+    //     surviving string value's +1 (bz_string_release via the
+    //     stringElementReleaseThunk). The dict co-owns a +1 per stored value.
+    // Keys are never disposed via dictValueDisposer (§4.9: keys are value-like;
+    // the dictionary owns its values only). Exception: Set<string> stores strings
+    // as KEYS — that case sets dictStringKeys = true (see below) and leaves
+    // dictValueDisposer null.
     if (const sema::TypeRef* dictTy = dictTypeOfLocal(ld)) {
         Disposal d{it->second, nullptr};
         d.dict = true;
-        d.dictValueDisposer = owningDictValueDisposer(dictTy);
-        if (!d.dictValueDisposer)
-            d.dictValueDisposer = dictValueBoxFreer(dictTy);
+        // Set<string>: elements are KEYS — pre-free key release, not a val disposer.
+        if (isStringElementSet(dictTy)) {
+            d.dictStringKeys = true;
+        } else {
+            d.dictValueDisposer = owningDictValueDisposer(dictTy);
+            if (!d.dictValueDisposer)
+                d.dictValueDisposer = dictValueBoxFreer(dictTy);
+            // #429 / §28.9: a borrowing Dictionary<K, string> co-owns a +1 per
+            // stored value — release each at scope-end free via the string-release
+            // thunk. Mutually exclusive with the owning-class and record-box-free
+            // disposers checked above (isStringValueDict is false for OwnedDictionary
+            // and for record values — those paths return non-null disposers above).
+            if (!d.dictValueDisposer && isStringValueDict(dictTy))
+                d.dictValueDisposer = stringElementReleaseThunk();
+        }
         disposeStack_.back().push_back(d);
         return;
     }
@@ -5945,10 +6013,22 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // value DISPLACED earlier by the indexer setter (#388) was already
         // removed from the table and disposed there, so it is not re-disposed
         // here — no double-free. bz_dict_free is null-safe.
+        // #429 / §28.9 / §4.10: a Set<string> stores its string elements as
+        // KEYS (not values) in the generic-key table. Before bz_dict_free frees
+        // each key copy, emit bz_set_string_keys_release to call
+        // bz_string_release on every live key's string pointer. This discharges
+        // the set's co-owned +1 per element (retained at Add). bz_dict_free is
+        // then called with a null value disposer (sentinels, nothing to dispose).
         if (it->dict) {
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* tbl = builder_.CreateLoad(ptrTy(), addr);
+            if (it->dictStringKeys) {
+                // Set<string>: release each string element's +1 before freeing.
+                auto* relFn = declareC("bz_set_string_keys_release",
+                                       llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(relFn, {tbl});
+            }
             llvm::Value* disp = it->dictValueDisposer
                 ? llvm::cast<llvm::Value>(it->dictValueDisposer)
                 : llvm::ConstantPointerNull::get(ptrTy());

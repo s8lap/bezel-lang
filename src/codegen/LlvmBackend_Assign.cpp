@@ -422,7 +422,6 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);
     if (!k) return false;
-    llvm::Value* vPtr = encodeValue(val);
     // §4.9: an OWNING dictionary (OwnedDictionary<K,V> where V: class) disposes
     // the displaced value before storing the new owner. Unlike owning ARRAYS
     // (whose owned element is genericArgs[0]), an owning dictionary's owned thing
@@ -441,8 +440,22 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // at scope end (no double-free; the scope-end #401 path frees only the
     // surviving box). dictValueBoxFreer is non-null only for that case, and is
     // mutually exclusive with the owning-class disposer above.
+    // #429 / §28.9: a borrowing Dictionary<K, string> co-owns a +1 per stored
+    // value. Overwriting an existing key must release the OLD value's +1 (via the
+    // disposing setter) and take a +1 on the NEW one (retain-before-release so a
+    // self-overwrite `d[k] := d[k]` never dips rc to 0 — no UAF/double-free).
     llvm::Function* valDisp =
         owningDict ? elementDisposerThunk() : dictValueBoxFreer(recvTy);
+    bool isStrVal = isStringValueDict(recvTy);
+    if (!valDisp && isStrVal)
+        valDisp = stringElementReleaseThunk();
+    // #429: retain the new string value BEFORE encoding (val is still the raw
+    // bz_string* here; encodeValue returns it as-is for pointer values). Emit
+    // the retain BEFORE the store so a self-overwrite `d[k] := d[k]` always
+    // sees rc >= 2 when the old value is released. A +1 producer is transferred.
+    if (isStrVal && (!valueExpr || !isPlusOneStringProducer(valueExpr)))
+        emitStringRetain(val);
+    llvm::Value* vPtr = encodeValue(val);
     if (keyTy) {
         llvm::Value* keyPtr = k;
         if (!(keyIsRecord && k->getType()->isPointerTy())) {

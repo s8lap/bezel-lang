@@ -375,8 +375,22 @@ private:
         // It is null for a borrowing Dictionary with a scalar/string value (no
         // box is stored). Keys are never disposed (stdlib §4.9: "Owns its values;
         // keys are value-like"; keys are freed by bz_dict_free's own free(e.key)).
+        //   EXCEPTION — #429 / §28.9 / §4.10: a borrowing Dictionary<K, string>
+        //     has a runtime-managed string VALUE; its +1 per stored value must be
+        //     released at free/clear/remove. Wire dictValueDisposer to the
+        //     stringElementReleaseThunk so bz_dict_free calls bz_string_release
+        //     on each surviving value. Mutually exclusive with the record-box-free
+        //     and the owning-class disposer.
+        //   EXCEPTION — Set<string>: elements are KEYS (not values) in the
+        //     generic-key table. dictValueDisposer does not apply; instead
+        //     dictStringKeys = true signals the scope-end disposal to call
+        //     bz_set_string_keys_release(tbl) before bz_dict_free(tbl, null).
         bool dict = false;
         llvm::Value* dictValueDisposer = nullptr;
+        // #429 / §28.9 / §4.10: true when the dict is a Set<string> and its
+        // key slots carry a co-owned +1 per string element. At scope end the
+        // disposal emits bz_set_string_keys_release(tbl) before bz_dict_free.
+        bool dictStringKeys = false;
         // per §4.6/§4.7: a `using var` bound to a LinkedList<T> or
         // OwnedLinkedList<T>. At scope end it is freed via bz_llist_free.
         // `collectionElemDisposer` (reused) is the per-element dispose callback
@@ -2186,6 +2200,20 @@ private:
     // type is a non-nullable `string`? (the predicate behind
     // stringElementReleaseDisposer, factored so insert sites can retain).
     bool isStringElementArray(const sema::TypeRef* collTy);
+
+    // #429 / §28.9 / §4.10: is `collTy` a Set<string> (the generic-key,
+    // dict-backed set whose elements are non-nullable strings stored as keys)?
+    // Such a set co-owns a +1 per element (retained at Add, released at
+    // Remove/Clear/free). Excludes OwnedSet (string is forbidden as an owned
+    // collection element, §15.2) and nullable string?.
+    bool isStringElementSet(const sema::TypeRef* collTy);
+
+    // #429 / §28.9 / §4.8: is `dictTy` a non-owning Dictionary<K, string>
+    // (borrowing, with a non-nullable string VALUE)? Such a dict co-owns a +1
+    // per stored value (retained at Add/Set/indexer-set, released at
+    // Remove/Clear/free). Excludes OwnedDictionary (different ownership model)
+    // and nullable string?.
+    bool isStringValueDict(const sema::TypeRef* dictTy);
 
     // #429 / §4.6 / §28.9: when `collTy` is a borrowing Array<string> (etc.),
     // emit a bz_array_retain_strings(arr) over the freshly produced array `arr`
