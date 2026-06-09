@@ -1845,6 +1845,34 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
     }
 
+    // #429 (closure FIELD-STORE category) / §27.5 / §28.9: release every CLOSURE
+    // field / auto-property of THIS class (own members only; an inherited slot
+    // is released by the base CORE disposer via emitBaseDisposeChain — so
+    // visiting only ts->members avoids a double-release). A class closure field
+    // holds an INDEPENDENT +1 (retained at store via lowerClosureFieldStore /
+    // emitInstanceInit's initializer path); on disposal that +1 is released
+    // exactly once via bz_closure_release, freeing the cell + env block at rc 0.
+    // bz_closure_release is null-safe (a never-assigned closure field slot is
+    // null in the calloc'd object) and does NOT touch captured values (they are
+    // borrows, §28.9 — no double-dispose of a capture). After releasing, NULL
+    // the slot so a re-entrant / double dispose finds null and is a no-op (the
+    // #396 slot-null precedent, parallel to the string-field nulling above).
+    {
+        llvm::StructType* cst = classStruct(ts);
+        for (const sema::Symbol* m : ts->members) {
+            bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
+            if (!isField && !isAutoProperty(m)) continue;
+            if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
+            if (!isClosureStorageMember(m)) continue;
+            unsigned idx = fieldIndex_[m];
+            llvm::Value* addr = builder_.CreateStructGEP(cst, currentThis_, idx,
+                                                         "clf.addr");
+            llvm::Value* val = builder_.CreateLoad(ptrTy(), addr, "clf.val");
+            emitClosureRelease(val);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        }
+    }
+
     // #480 / §24.1 / §28: free each instance event's backing EventSource.
     // emitInstanceInit allocated one bz_event_source_new per instance EventSymbol;
     // those allocations are NOT visited by the FieldSymbol loop above because
@@ -2969,6 +2997,22 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
         if (v->getType()->isPointerTy() && isStringStorageMember(m) &&
             !isPlusOneStringProducer(init))
             emitStringRetain(v);
+        // #429 (closure FIELD-STORE category) / §27.5 / §28.9: a CLASS closure
+        // field / auto-property initializer gives the field its own reference,
+        // like a later assignment. The field is calloc-zeroed (null) before
+        // this, so there is no old value to release. A fresh +1 producer
+        // (lambda / method-ref / user closure-returning call) is TRANSFERRED
+        // (no retain); anything else is RETAINED so the field's count is
+        // independent of the source's. The disposal release
+        // (emitOwnedFieldDisposals) balances it either way (no UAF, no leak).
+        // emitInstanceInit runs only for CLASS construction (records use the
+        // by-value path in lowerNew, whose function fields are borrows, §9).
+        if (v->getType()->isPointerTy() && isClosureStorageMember(m)) {
+            bool isProducer = isPlusOneClosureProducer(init) ||
+                              isUserMethodClosureReturnCall(init);
+            if (!isProducer)
+                emitClosureRetain(v);
+        }
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
@@ -3493,14 +3537,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (v)
         armStringLocalRefcount(static_cast<const void*>(declNode), slot, v,
                                init);
-    // #422 / §27.5 / §28.9: if this `var` closure (function-typed) local was
-    // proven non-escaping and initialized by a codegen +1 producer (a lambda
-    // expression or a method reference), register a scope-end
+    // #422 / #429 / §27.5 / §28.9: if this `var` closure (function-typed) local
+    // was proven non-escaping and initialized by a +1 closure producer (a lambda
+    // expression, a method reference, or a call to a user-defined closure-
+    // returning method — #429 RETURN category), register a scope-end
     // bz_closure_release of its single producer reference. The slot holds
-    // exactly that one reference (the cell `v` just stored, at rc=1); no other
-    // reference exists (proven by the escape walk), so releasing it at scope end
-    // frees the cell + its env block exactly once — no UAF, no double-free, and
-    // (per §28.9) no captured value is touched (captures are borrows). Gated on
+    // exactly that one reference (the cell `v` just stored); no other reference
+    // exists (proven by the escape walk), so releasing it at scope end frees the
+    // cell + its env block exactly once — no UAF, no double-free, and (per
+    // §28.9) no captured value is touched (captures are borrows). Gated on
     // currentFn_ matching the analyzed function (a lambda/thunk body lowered
     // mid-function is not analyzed → its closure locals just leak, never
     // double-freed).
@@ -4684,6 +4729,132 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     return false;
 }
 
+
+// #429 (closure RETURN category) / §28.9 / §28.3: see the declaration in
+// LlvmBackend_impl.hpp. Recognize a CallExpr whose resolved callee is a
+// USER-DEFINED, LOCALLY-COMPILED MethodSymbol (backed by an ast::MethodDecl,
+// not imported, not an operator) whose declared return type is a function type
+// (Kind::Function). Such a call goes through THIS module's ReturnStmt
+// lowering, which mints exactly +1 for the returned closure cell — so the
+// caller owns that single reference. Cross-module imported methods (their
+// callee does NOT run our ReturnStmt minting) are excluded. Parallel to
+// isUserMethodStringReturnCall for strings.
+bool Emitter::isUserMethodClosureReturnCall(const ast::Expr* init) const {
+    auto* call = dynamic_cast<const ast::CallExpr*>(init);
+    if (!call || !call->callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
+    if (!ms) return false;
+    if (ms->isOperator) return false;
+    if (ctx_.isImported(ms)) return false;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || !md->returnType) return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+    return rt && rt->kind == sema::TypeRef::Kind::Function;
+}
+
+
+// #429 (closure RETURN category) / §28.9 / §28.3: see the declaration in
+// LlvmBackend_impl.hpp. A returned IDENTIFIER names a closure-typed LOCAL
+// that owns a +1 in its slot when EITHER its initializer is a +1 closure
+// producer (lambda / method-ref, from isPlusOneClosureProducer — the
+// producer's +1 was transferred into the slot) OR it is in
+// closureReleaseEligible_ (proven non-escaping at bind, will be released at
+// scope end — the slot still holds the producer's single reference). In both
+// cases the return must TRANSFER that +1 to the caller rather than mint a
+// second one (which would leak, since the escaped local is not released at
+// scope end). Gated on the analyzed function so the eligibility sets describe
+// THIS body (a lambda/thunk body whose locals were not walked returns false
+// here → its returns fall back to the retain path, which is safe — at worst
+// a leak, never a UAF/double-free). Parallel to returnedStringLocalOwnsPlusOne.
+bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
+    if (currentFn_ != closureReleaseEligibleFn_) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (!id) return false;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc || !loc->decl) return false;
+    const void* declNode = static_cast<const void*>(loc->decl);
+    // A producer-initialized closure local: the lambda / method-ref +1 was
+    // transferred into the slot (closureReleaseEligible_ or not — the slot
+    // always holds the producer's +1).
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (ld && !ld->isUsing && ld->initializer &&
+        isPlusOneClosureProducer(ld->initializer.get())) {
+        const sema::TypeRef* lt = nullptr;
+        if (ld->type) lt = ctx_.resolvedType(*ld->type);
+        if (!lt) lt = ctx_.exprType(*ld->initializer);
+        return lt && lt->kind == sema::TypeRef::Kind::Function;
+    }
+    // A non-escaping closure local also in closureReleaseEligible_ was
+    // proven to own its single +1 (codegen registered its scope-end release).
+    if (closureReleaseEligible_.count(declNode)) return true;
+    return false;
+}
+
+
+// #429 (closure FIELD-STORE) / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. A target expression is a closure-typed class
+// instance field / auto-property lvalue iff:
+//   - its resolved type is a function type (Kind::Function),
+//   - it is NOT a plain local / parameter slot,
+//   - it is NOT a ref/out alias,
+//   - it is NOT a program-lifetime static field,
+//   - its symbol is a FieldSymbol or auto-property of a CLASS (not a record).
+// Parallel to isStringFieldLvalue for strings.
+bool Emitter::isClosureFieldLvalue(const ast::Expr& target) {
+    const sema::TypeRef* rt = ctx_.exprType(target);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Function) return false;
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
+        return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
+    if (isAutoProperty(sym)) {
+        auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
+        return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
+    }
+    return false;
+}
+
+
+// #429 (closure FIELD-STORE) / §28.9: see the declaration in
+// LlvmBackend_impl.hpp. Store `newVal` into the class closure field at
+// `fieldAddr` with retain-new / release-old, giving the field an INDEPENDENT
+// +1. Order: load-old → retain-or-transfer-new → store-new → release-old.
+// Retaining the new value BEFORE releasing the old makes a self-assignment
+// safe (rc dips +1 then back, never transiently 0). A +1 producer (a lambda,
+// a method-ref, or a user-defined closure-returning call) is TRANSFERRED (no
+// retain — its single reference becomes the field's); anything else is
+// RETAINED. bz_closure_retain/release are null-safe and no-ops on null.
+// Parallel to lowerStringFieldStore for strings.
+bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
+                                     llvm::Value* fieldAddr,
+                                     llvm::Value* newVal,
+                                     const ast::Expr* valueExpr) {
+    if (!isClosureFieldLvalue(target)) return false;
+    if (!fieldAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "clf.old");
+    // A +1 producer (lambda / method-ref / user closure-returning call) is
+    // TRANSFERRED (no retain) — its single reference flows into the field.
+    // A borrow (a local / param / field read / identifier) is RETAINED so
+    // the field's count is independent of the source's. The transfer vs retain
+    // decision mirrors lowerStringFieldStore.isPlusOneStringProducer exactly,
+    // but for closure-valued expressions.
+    bool isProducer = isPlusOneClosureProducer(valueExpr) ||
+                      isUserMethodClosureReturnCall(valueExpr);
+    if (!isProducer)
+        emitClosureRetain(newVal);
+    builder_.CreateStore(newVal, fieldAddr);
+    emitClosureRelease(oldVal);
+    return true;
+}
+
+
 namespace {
 // #422 / §27.5 / §28.9: a strict, conservative walk that decides whether a
 // SPECIFIC closure (function-typed) `var` local ever escapes its scope. A
@@ -4943,15 +5114,22 @@ void Emitter::collectClosureReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     closureReleaseEligible_.clear();
     // Find every `var` (non-using) closure LocalDecl whose initializer is a
-    // codegen-internal +1 producer (a lambda / method reference), then run the
-    // escape walk for each. A decl survives as eligible iff the walk proves it
-    // never escapes. (Function-typed locals never appear in `using var` — §28.9
-    // — but the isUsing guard mirrors the string path defensively.)
+    // +1 closure producer: either a codegen-internal producer (a lambda /
+    // method reference — isPlusOneClosureProducer) or a call to a
+    // user-defined, locally-compiled method whose declared return type is a
+    // function type (#429 RETURN category — isUserMethodClosureReturnCall;
+    // the callee mints exactly +1 on return, so the caller's local transfers
+    // that single reference and must release it at scope end iff non-escaping).
+    // The escape walk decides which candidates are non-escaping. (Function-typed
+    // locals never appear in `using var` — §28.9 — but the isUsing guard
+    // mirrors the string path defensively.)
     std::vector<const ast::LocalDecl*> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && isPlusOneClosureProducer(ld->initializer.get()))
+            if (!ld->isUsing &&
+                (isPlusOneClosureProducer(ld->initializer.get()) ||
+                 isUserMethodClosureReturnCall(ld->initializer.get())))
                 candidates.push_back(ld);
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {

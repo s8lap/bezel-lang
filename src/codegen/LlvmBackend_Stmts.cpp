@@ -191,6 +191,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled && currentFn_ == stringReleaseEligibleFn_)
                     handled = lowerStringLocalReassign(*as->target, addr, elemTy,
                                                        rhs, as->value.get());
+                // #429 (closure FIELD-STORE category) / §27.5 / §28.9: a store
+                // into a CLASS closure (function-typed) field / auto-property
+                // takes an independent +1 (retain-new or transfer-producer /
+                // release-old), released on the owner's disposal.  Parallel to
+                // lowerStringFieldStore above.
+                if (!handled)
+                    handled = lowerClosureFieldStore(*as->target, addr, rhs,
+                                                     as->value.get());
                 if (!handled)
                     builder_.CreateStore(rhs, addr);
             } else if (as->op == "??=") {
@@ -393,6 +401,30 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 !isPlusOneStringProducer(rs->value.get()) &&
                 !returnedStringLocalOwnsPlusOne(rs->value.get()))
                 emitStringRetain(v);
+        }
+        // #429 (closure RETURN category) / §27.5 / §28.9 / §28.3: a method
+        // whose declared return type is a function type (Kind::Function) mints
+        // EXACTLY +1 for the returned closure cell, transferring ownership of
+        // one reference to the caller. Mirrors the string RETURN-escape logic
+        // immediately above, but for closures via emitClosureRetain. We
+        // TRANSFER (no retain) when the returned expression already owns a +1:
+        //   * a +1 PRODUCER expression (a lambda, a method-ref, or a user-
+        //     defined closure-returning call — isPlusOneClosureProducer or
+        //     isUserMethodClosureReturnCall), whose single reference flows out;
+        //   * an IDENTIFIER naming a closure-typed LOCAL that owns a +1 in its
+        //     slot (returnedClosureLocalOwnsPlusOne — its single +1 flows out).
+        // Otherwise (a param read, a field read, an identifier borrow not owning
+        // a +1) the value is a BORROW → RETAIN via emitClosureRetain to mint
+        // the +1. bz_closure_retain is null-safe (a null closure is a no-op).
+        if (v && rs->value && currentReturnTypeNode_ &&
+            v->getType()->isPointerTy()) {
+            const sema::TypeRef* declRet =
+                ctx_.resolvedType(*currentReturnTypeNode_);
+            if (declRet && declRet->kind == sema::TypeRef::Kind::Function &&
+                !isPlusOneClosureProducer(rs->value.get()) &&
+                !isUserMethodClosureReturnCall(rs->value.get()) &&
+                !returnedClosureLocalOwnsPlusOne(rs->value.get()))
+                emitClosureRetain(v);
         }
         // §28.3 ownership transfer: if the return expression is a bare
         // `using var` local, exclude it from disposal — ownership moves
