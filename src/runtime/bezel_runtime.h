@@ -79,6 +79,15 @@ void bz_array_remove_at_disposing(void* arr, int64_t idx, int64_t elem_size,
 // passing a pointer to the element's storage.
 void bz_array_free(void* arr, void (*dispose_elem)(void*));
 
+// §28.2 v0.135 / issue #621: checked-disposal-mode quarantine. Marks the
+// array as disposed (for the indexer guard) and disposes elements, but does
+// NOT free the header block — mirrors class-instance quarantine in the codegen.
+void bz_array_mark_disposed(void* arr, void (*dispose_elem)(void*));
+
+// §28.2 v0.135 / issue #621: return non-zero if the array has been disposed
+// via bz_array_mark_disposed (checked mode only).
+int8_t bz_array_is_disposed(void* arr);
+
 // Sort in place. `cmp(a, b)` receives pointers to two elements and must return
 // negative/zero/positive analogous to strcmp.
 void bz_array_sort(void* arr, int64_t elem_size,

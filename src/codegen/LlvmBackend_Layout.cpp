@@ -2050,6 +2050,34 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
     // and is dispatched correctly by lowerVirtualPropertyGet before reaching
     // this path.
     if (!obj->getType()->isPointerTy()) return nullptr;
+    // §28.2 v0.135 / issue #621: checked disposal mode guard for stored-field
+    // access through a class receiver. Only class instances carry a per-object
+    // disposed flag (records are value types with no disposal lifetime).
+    //
+    // Skip when the target is `this` or `base`: inside an instance method the
+    // method-entry guard (issue #601) already covers all `this`-qualified
+    // accesses, so adding a second check here is redundant and would double-
+    // raise on the FIRST field access in a disposed method (which is already
+    // caught by the entry guard). This is a deliberate choice documented here.
+    //
+    // This guard fires for both READS (lowerExpr's CG8 path calls fieldAddr to
+    // get the address, then loads) and WRITES (lowerStmt → lvalueAddr →
+    // fieldAddr), so a single insertion covers both.
+    if (checkedDisposal_ && ms->parent->kind == ast::TypeDeclKind::Class) {
+        bool isThis = false;
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                ma.target.get()))
+            isThis = (tid->name == "this" || tid->name == "base");
+        if (!isThis) {
+            unsigned fi = disposedFlagIndex(ms->parent);
+            llvm::Value* flagAddr =
+                builder_.CreateStructGEP(st, obj, fi, "cd.flag");
+            llvm::Value* disposed = builder_.CreateICmpNE(
+                builder_.CreateLoad(disposedFlagTy(), flagAddr),
+                llvm::ConstantInt::get(disposedFlagTy(), 0), "cd.disposed");
+            emitGuardThrow(disposed, "DisposedAccessException");
+        }
+    }
     elemTy = st->getElementType(idxIt->second);
     return builder_.CreateStructGEP(st, obj, idxIt->second);
 }
