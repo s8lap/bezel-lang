@@ -803,6 +803,119 @@ TypeRef* ExprTC::commonTypeOf(TypeRef* a, TypeRef* b) {
     return nullptr;  // no common type
 }
 
+// §31.2.1: nearest common base (NCB) of the types listed in a multi-type
+// catch-arm binding (`var e: T1, T2, ...`). The binding's static type is the
+// most specific type that is a base of ALL listed types.
+//
+// Two-step approach, per §31.2.1:
+//
+// Step 1 — commonTypeOf fold: handles user-defined hierarchies where all
+//   listed types have TypeSymbol base chains. `commonTypeOf` walks the
+//   TypeSymbol base-types list (§12 inheritance) and returns the common type
+//   if one branch is a subtype of the other.
+//
+// Step 2 — AST base-type walk: handles the common case where the shared base
+//   is a built-in (e.g. `Exception`). Built-in exception types have no user
+//   TypeSymbol (their TypeRef carries `declaration == nullptr`), so they are
+//   absent from TypeSymbol::baseTypes even when declared as base types in the
+//   user source. We therefore also walk each type's AST TypeDecl::baseTypes
+//   list (which records ALL declared bases, including built-ins) and collect
+//   base-type names. The NCB is the first name (BFS from the first type's
+//   ancestor chain) that appears in ALL listed types' ancestor name-sets.
+TypeRef* ExprTC::catchArmNcb(
+    const std::vector<std::unique_ptr<ast::Type>>& types) {
+    if (types.empty() || !types[0]) return nullptr;
+    if (types.size() == 1) return ctx_.resolvedType(*types[0]);
+
+    // --- Step 1: fold commonTypeOf ----------------------------------------
+    TypeRef* running = ctx_.resolvedType(*types[0]);
+    for (std::size_t i = 1; i < types.size(); ++i) {
+        TypeRef* ti = types[i] ? ctx_.resolvedType(*types[i]) : nullptr;
+        if (!running || !ti) { running = nullptr; break; }
+        running = commonTypeOf(running, ti);
+    }
+    if (running) return running;
+
+    // --- Step 2: AST base-type walk (handles built-in common bases) --------
+    //
+    // Helper: extract the simple name of a Named TypeRef, for comparing
+    // built-in exception TypeRefs that carry no TypeSymbol declaration.
+    auto namedRefName = [](const TypeRef* ref) -> std::string_view {
+        if (!ref || ref->kind != TypeRef::Kind::Named) return {};
+        if (ref->declaration) return ref->declaration->name;
+        if (!ref->importedName.empty()) return ref->importedName;
+        if (ref->astNode && ref->astNode->name &&
+                !ref->astNode->name->parts.empty())
+            return ref->astNode->name->parts.back();
+        return {};
+    };
+
+    // Helper: collect all ancestor TypeRefs of `ty` in BFS order, walking
+    // both the TypeSymbol base-type chain AND the AST TypeDecl's base-type
+    // list (which captures built-in bases missing from the TypeSymbol chain).
+    // Stops at built-in TypeRefs (declaration==nullptr), which have no AST
+    // TypeDecl to walk further.
+    auto collectAncestors =
+        [&](TypeRef* ty) -> std::vector<std::pair<std::string_view, TypeRef*>> {
+        std::vector<std::pair<std::string_view, TypeRef*>> result;
+        std::unordered_set<std::string_view> seen;
+        std::vector<TypeRef*> queue{ty};
+        while (!queue.empty()) {
+            TypeRef* cur = queue.back();
+            queue.pop_back();
+            if (!cur || cur->kind != TypeRef::Kind::Named) continue;
+            std::string_view curName = namedRefName(cur);
+            if (!curName.empty() && seen.insert(curName).second)
+                result.emplace_back(curName, cur);
+            if (cur->declaration) {
+                // Visit TypeSymbol base-type refs (user-declared bases with
+                // TypeSymbols — these are already resolved and transitively walk).
+                for (TypeRef* b : cur->declaration->baseTypeRefs)
+                    queue.push_back(b);
+                // Visit AST-declared bases (includes built-in bases that have no
+                // TypeSymbol and thus are absent from baseTypeRefs).
+                const auto* astDecl =
+                    dynamic_cast<const ast::TypeDecl*>(cur->declaration->decl);
+                if (astDecl) {
+                    for (const auto& baseAst : astDecl->baseTypes) {
+                        if (baseAst) queue.push_back(ctx_.resolvedType(*baseAst));
+                    }
+                }
+            }
+        }
+        return result;
+    };
+
+    // Helper: does `ty` have an ancestor with the given name?
+    auto hasAncestorNamed =
+        [&](TypeRef* ty, std::string_view ancestorName) -> bool {
+        // Direct name match (the type IS the ancestor).
+        if (namedRefName(ty) == ancestorName) return true;
+        // BFS ancestor search.
+        auto ancestors = collectAncestors(ty);
+        for (const auto& [name, _] : ancestors)
+            if (name == ancestorName) return true;
+        return false;
+    };
+
+    // Compute the ancestor list of the first type. For each ancestor (in
+    // BFS order = most-specific first), check whether ALL other listed types
+    // also have that ancestor. The first match is the NCB.
+    TypeRef* first = ctx_.resolvedType(*types[0]);
+    auto firstAncestors = collectAncestors(first);
+    for (const auto& [name, candidateRef] : firstAncestors) {
+        if (name.empty()) continue;
+        bool allMatch = true;
+        for (std::size_t i = 1; i < types.size(); ++i) {
+            TypeRef* ti = types[i] ? ctx_.resolvedType(*types[i]) : nullptr;
+            if (!hasAncestorNamed(ti, name)) { allMatch = false; break; }
+        }
+        if (allMatch) return candidateRef;
+    }
+
+    return nullptr;  // No common base found.
+}
+
 void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
                              const ast::Expr& e) {
     TypeRef* tt = cnd.thenValue ? ctx_.exprType(*cnd.thenValue) : nullptr;
@@ -2024,7 +2137,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 auto* bnd = ctx_.makeSymbol<LocalSymbol>();
                 bnd->name = arm.varName;
                 bnd->decl = arm.body.get();
-                bnd->declType = ctx_.resolvedType(*arm.types[0]);
+                // per §31.2.1: for a multi-type arm the binding's static type
+                // is the nearest common base (NCB) of all listed types; for a
+                // single-type arm it is the type itself.
+                TypeRef* ncb = catchArmNcb(arm.types);
+                bnd->declType = ncb ? ncb : ctx_.resolvedType(*arm.types[0]);
                 armScope.names[arm.varName] = bnd;
             }
             Scope* saveScope = currentScope_;
