@@ -451,6 +451,7 @@ set(BEZEL_TEST_SOURCES
     codegen/user_exception_tostring_608_test.cpp
     codegen/builtin_collection_incdec_613_test.cpp
     codegen/dict_entry_iter_548_test.cpp
+    codegen/dict_insertion_order_622_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

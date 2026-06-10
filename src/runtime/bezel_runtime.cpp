@@ -320,6 +320,16 @@ struct bz_dict_t {
     int64_t     key_size;  // 0 = string-key mode; >0 = generic key byte count
     uint64_t  (*hash_fn)(const void* key);
     bool      (*eq_fn)(const void* a, const void* b);
+    // issue #622 / stdlib §4.8: insertion-order tracking for Dictionary<K,V>.
+    // order[] holds bucket indices in insertion order; -1 entries are tombstones
+    // (from removes). order_count is the used length (including tombstones);
+    // order_cap is the allocated size. Iterated in 0..order_count order; -1
+    // slots are skipped. Compacted on rehash (tombstones dropped).
+    // OwnedDictionary does NOT promise insertion order (§4.9) but shares this
+    // struct; we still maintain order for it (cheap, harmless).
+    int64_t*    order;       // malloc'd array of bucket indices
+    int64_t     order_count; // used length (including -1 tombstones)
+    int64_t     order_cap;   // allocated slots in order[]
 };
 
 static uint32_t fnv1a(const char* s, int64_t len) {
@@ -327,6 +337,27 @@ static uint32_t fnv1a(const char* s, int64_t len) {
     for (int64_t i = 0; i < len; i++)
         h = (h ^ (uint8_t)s[i]) * 16777619u;
     return h;
+}
+
+// issue #622 / stdlib §4.8: append a bucket index to the insertion-order array.
+static void dict_order_append(bz_dict_t* d, int64_t slot) {
+    if (d->order_count == d->order_cap) {
+        int64_t new_cap = d->order_cap < 8 ? 8 : d->order_cap * 2;
+        d->order = (int64_t*)realloc(d->order, (size_t)new_cap * sizeof(int64_t));
+        d->order_cap = new_cap;
+    }
+    d->order[d->order_count++] = slot;
+}
+
+// issue #622 / stdlib §4.8: mark a bucket index as removed in the order array
+// (set its entry to -1). Linear scan — dictionaries are typically small.
+static void dict_order_remove(bz_dict_t* d, int64_t slot) {
+    for (int64_t i = 0; i < d->order_count; i++) {
+        if (d->order[i] == slot) {
+            d->order[i] = -1;
+            return;
+        }
+    }
 }
 
 static int64_t dict_find(bz_dict_t* d, const char* k, int64_t klen, uint32_t h) {
@@ -350,27 +381,49 @@ static void dict_rehash(bz_dict_t* d) {
     d->buckets = (bz_entry_t*)calloc((size_t)new_cap, sizeof(bz_entry_t));
     d->capacity = new_cap;
     d->count = 0;
+
+    // issue #622 / stdlib §4.8: build a translation table old_slot → new_slot
+    // so we can compact and remap the order array after re-inserting all entries.
+    int64_t* slot_map = (int64_t*)malloc((size_t)old_cap * sizeof(int64_t));
+    for (int64_t i = 0; i < old_cap; i++) slot_map[i] = -1;
+
     for (int64_t i = 0; i < old_cap; i++) {
         bz_entry_t& e = old[i];
         if (!e.key || e.deleted) continue;
-        // Re-insert
+        // Re-insert into new buckets, record new slot index.
         int64_t pos = e.hash & (new_cap - 1);
         for (int64_t p = 0; p < new_cap; p++) {
             int64_t j = (pos + p) & (new_cap - 1);
             if (!d->buckets[j].key) {
                 d->buckets[j] = e;
                 d->count++;
+                slot_map[i] = j;
                 break;
             }
         }
     }
     free(old);
+
+    // Compact the order array: skip tombstones (-1 entries), translate surviving
+    // old bucket indices to their new positions via slot_map.
+    int64_t new_oc = 0;
+    for (int64_t i = 0; i < d->order_count; i++) {
+        int64_t old_slot = d->order[i];
+        if (old_slot < 0) continue;                  // tombstone: skip
+        int64_t new_slot = (old_slot < old_cap) ? slot_map[old_slot] : -1;
+        if (new_slot >= 0)
+            d->order[new_oc++] = new_slot;
+    }
+    d->order_count = new_oc;
+    free(slot_map);
 }
 
 void* bz_dict_alloc(void) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
+    // issue #622: order array starts null; lazily grown on first insert.
+    // order_count and order_cap are zero from calloc.
     return d;
 }
 
@@ -385,6 +438,7 @@ void bz_dict_free(void* dp, void (*dispose_val)(void*)) {
         }
     }
     free(d->buckets);
+    free(d->order);  // issue #622: release the insertion-order tracking array
     free(d);
 }
 
@@ -405,16 +459,18 @@ void bz_dict_set_str(void* dp, const char* k, int64_t k_len, void* val) {
     uint32_t h = fnv1a(k, k_len);
     int64_t idx = dict_find(d, k, k_len, h);
     if (idx >= 0) {
+        // Key already present: update value, no order change (§4.8).
         d->buckets[idx].val = val;
         return;
     }
-    // Insert at the indicated empty slot
+    // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
     int64_t ins = -(idx + 1);
     d->buckets[ins].key = strndup(k, (size_t)k_len);
     d->buckets[ins].key_len = k_len;
     d->buckets[ins].val = val;
     d->buckets[ins].hash = h;
     d->buckets[ins].deleted = false;
+    dict_order_append(d, ins);
     d->count++;
 }
 
@@ -440,6 +496,7 @@ bool bz_dict_remove_str(void* dp, const char* k, int64_t k_len) {
     uint32_t h = fnv1a(k, k_len);
     int64_t idx = dict_find(d, k, k_len, h);
     if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
     free(d->buckets[idx].key);
     d->buckets[idx].key = nullptr;
     d->buckets[idx].deleted = true;
@@ -457,6 +514,7 @@ bool bz_dict_remove_str_disposing(void* dp, const char* k, int64_t k_len,
     uint32_t h = fnv1a(k, k_len);
     int64_t idx = dict_find(d, k, k_len, h);
     if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
     if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
     free(d->buckets[idx].key);
     d->buckets[idx].key = nullptr;
@@ -477,12 +535,15 @@ int64_t bz_dict_count(void* dp) {
 void bz_dict_keys_str(void* dp, char*** keys_out, int64_t** lens_out, int64_t* n_out) {
     auto* d = (bz_dict_t*)dp;
     int64_t n = d ? d->count : 0;
-    auto** keys = (char**)malloc((size_t)(n * sizeof(char*)));
-    auto*  lens = (int64_t*)malloc((size_t)(n * sizeof(int64_t)));
+    auto** keys = (char**)malloc((size_t)(n > 0 ? n : 1) * sizeof(char*));
+    auto*  lens = (int64_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
     int64_t j = 0;
     if (d) {
-        for (int64_t i = 0; i < d->capacity && j < n; i++) {
-            bz_entry_t& e = d->buckets[i];
+        // issue #622 / stdlib §4.8: iterate in insertion order via order[].
+        for (int64_t oi = 0; oi < d->order_count && j < n; oi++) {
+            int64_t slot = d->order[oi];
+            if (slot < 0) continue;  // tombstone from a remove
+            bz_entry_t& e = d->buckets[slot];
             if (e.key && !e.deleted) {
                 keys[j] = strndup(e.key, (size_t)e.key_len);
                 lens[j] = e.key_len;
@@ -530,6 +591,8 @@ void* bz_dict_alloc_generic(int64_t key_size,
     d->key_size = key_size > 0 ? key_size : 1;
     d->hash_fn = hash;
     d->eq_fn = eq;
+    // issue #622: order array starts null; lazily grown on first insert.
+    // order_count and order_cap are zero from calloc.
     return d;
 }
 
@@ -551,9 +614,11 @@ void bz_dict_set_gen(void* dp, const void* key, void* val) {
     uint32_t h = (uint32_t)d->hash_fn(key);
     int64_t idx = dict_find_gen(d, key, h);
     if (idx >= 0) {
+        // Key already present: update value, no order change (§4.8).
         d->buckets[idx].val = val;
         return;
     }
+    // Fresh insertion: record slot in insertion order (§4.8 / issue #622).
     int64_t ins = -(idx + 1);
     char* kc = (char*)malloc((size_t)d->key_size);
     memcpy(kc, key, (size_t)d->key_size);
@@ -562,6 +627,7 @@ void bz_dict_set_gen(void* dp, const void* key, void* val) {
     d->buckets[ins].val = val;
     d->buckets[ins].hash = h;
     d->buckets[ins].deleted = false;
+    dict_order_append(d, ins);
     d->count++;
 }
 
@@ -588,6 +654,7 @@ bool bz_dict_remove_gen(void* dp, const void* key) {
     uint32_t h = (uint32_t)d->hash_fn(key);
     int64_t idx = dict_find_gen(d, key, h);
     if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
     free(d->buckets[idx].key);
     d->buckets[idx].key = nullptr;
     d->buckets[idx].deleted = true;
@@ -606,6 +673,7 @@ bool bz_dict_remove_gen_disposing(void* dp, const void* key,
     uint32_t h = (uint32_t)d->hash_fn(key);
     int64_t idx = dict_find_gen(d, key, h);
     if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
     if (dispose_val && d->buckets[idx].val) dispose_val(d->buckets[idx].val);
     free(d->buckets[idx].key);
     d->buckets[idx].key = nullptr;
@@ -638,23 +706,28 @@ void bz_dict_clear(void* dp, void (*dispose_val)(void*)) {
     }
     memset(d->buckets, 0, (size_t)d->capacity * sizeof(bz_entry_t));
     d->count = 0;
+    // issue #622 / stdlib §4.8: Clear() resets insertion order (§4.8: "Clear()
+    // resets the order"). Reuse the allocated order buffer but set count to 0.
+    d->order_count = 0;
 }
 
 // Enumerate the generic table's keys (issue #370, §4.8 Dictionary.Keys /
 // §4.10 Set iteration). Returns a malloc'd array of `n` pointers, each a
 // malloc'd copy of one live key's `key_size` bytes. Mirrors bz_dict_keys_str
 // (which strdup's string keys) but copies the raw key blob instead, so it
-// serves int/enum/string/record keys uniformly. Iteration order is the
-// table's slot order — the same order bz_dict_keys_str already yields for the
-// string-key path (the open-addressing table does not track insertion order).
+// serves int/enum/string/record keys uniformly.
+// issue #622 / stdlib §4.8: iteration is now in insertion order via order[].
 void bz_dict_keys_gen(void* dp, void*** keys_out, int64_t* n_out) {
     auto* d = (bz_dict_t*)dp;
     int64_t n = d ? d->count : 0;
     auto** keys = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
     int64_t j = 0;
     if (d && d->key_size > 0) {
-        for (int64_t i = 0; i < d->capacity && j < n; i++) {
-            bz_entry_t& e = d->buckets[i];
+        // issue #622 / stdlib §4.8: iterate in insertion order via order[].
+        for (int64_t oi = 0; oi < d->order_count && j < n; oi++) {
+            int64_t slot = d->order[oi];
+            if (slot < 0) continue;  // tombstone from a remove
+            bz_entry_t& e = d->buckets[slot];
             if (e.key && !e.deleted) {
                 void* kc = malloc((size_t)d->key_size);
                 memcpy(kc, e.key, (size_t)d->key_size);
@@ -672,14 +745,18 @@ void bz_dict_keys_gen(void* dp, void*** keys_out, int64_t* n_out) {
 // owned by the dictionary and must NOT be freed by the caller.
 //
 // bz_dict_values_str — string-keyed table (key_size == 0).
+// issue #622 / stdlib §4.8: values are returned in insertion order via order[].
 void bz_dict_values_str(void* dp, void*** vals_out, int64_t* n_out) {
     auto* d = (bz_dict_t*)dp;
     int64_t n = d ? d->count : 0;
     auto** vals = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
     int64_t j = 0;
     if (d) {
-        for (int64_t i = 0; i < d->capacity && j < n; i++) {
-            bz_entry_t& e = d->buckets[i];
+        // issue #622 / stdlib §4.8: iterate in insertion order via order[].
+        for (int64_t oi = 0; oi < d->order_count && j < n; oi++) {
+            int64_t slot = d->order[oi];
+            if (slot < 0) continue;  // tombstone from a remove
+            bz_entry_t& e = d->buckets[slot];
             if (e.key && !e.deleted)
                 vals[j++] = e.val;
         }
@@ -690,14 +767,18 @@ void bz_dict_values_str(void* dp, void*** vals_out, int64_t* n_out) {
 
 // bz_dict_values_gen — generic-key table (key_size > 0). Mirrors
 // bz_dict_values_str; the key_size check guards against null/uninitialized dicts.
+// issue #622 / stdlib §4.8: values are returned in insertion order via order[].
 void bz_dict_values_gen(void* dp, void*** vals_out, int64_t* n_out) {
     auto* d = (bz_dict_t*)dp;
     int64_t n = d ? d->count : 0;
     auto** vals = (void**)malloc((size_t)(n > 0 ? n : 1) * sizeof(void*));
     int64_t j = 0;
     if (d && d->key_size > 0) {
-        for (int64_t i = 0; i < d->capacity && j < n; i++) {
-            bz_entry_t& e = d->buckets[i];
+        // issue #622 / stdlib §4.8: iterate in insertion order via order[].
+        for (int64_t oi = 0; oi < d->order_count && j < n; oi++) {
+            int64_t slot = d->order[oi];
+            if (slot < 0) continue;  // tombstone from a remove
+            bz_entry_t& e = d->buckets[slot];
             if (e.key && !e.deleted)
                 vals[j++] = e.val;
         }
@@ -805,6 +886,7 @@ void bz_dict_clear_set_strings(void* dp) {
     }
     memset(d->buckets, 0, (size_t)d->capacity * sizeof(bz_entry_t));
     d->count = 0;
+    d->order_count = 0;  // issue #622: reset insertion-order tracking on Clear
 }
 
 // issue #429 / §28.9 / §4.10: like bz_dict_remove_gen but releases the
@@ -817,6 +899,7 @@ bool bz_dict_remove_set_string(void* dp, const void* key) {
     uint32_t h = (uint32_t)d->hash_fn(key);
     int64_t idx = dict_find_gen(d, key, h);
     if (idx < 0) return false;
+    dict_order_remove(d, idx);  // issue #622: untrack this slot from insertion order
     // Release the string element's +1 before freeing the key copy.
     if (d->buckets[idx].key) {
         void* strPtr;
