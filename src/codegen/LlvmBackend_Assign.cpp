@@ -1037,6 +1037,36 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         if (!rhs) return false;
         std::string op(as.op);
         if (!op.empty() && op.back() == '=') op.pop_back();
+        // fix #626 / §25.1: if the VALUE element type has a user-defined
+        // `static operator <op>` (two params), dispatch to it and write back —
+        // mirrors the #610 overload check in lowerStmt.  emitCompoundOp cannot
+        // handle struct operands (LLVM rejects sadd.with.overflow on struct
+        // types), so the overload must be checked BEFORE emitCompoundOp.
+        {
+            const sema::TypeRef* valTy =
+                (recvTy && recvTy->genericArgs.size() > 1)
+                    ? recvTy->genericArgs[1] : nullptr;
+            sema::MethodSymbol* opMethod = nullptr;
+            if (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
+                valTy->declaration) {
+                for (sema::Symbol* m : valTy->declaration->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                    if (ms && ms->isOperator && ms->operatorToken == op &&
+                        ms->params.size() == 2) {
+                        opMethod = ms;
+                        break;
+                    }
+                }
+            }
+            if (opMethod) {
+                // §25.1: desugar to get → overload call → set.
+                std::vector<llvm::Value*> args{cur, rhs};
+                llvm::Value* res =
+                    emitMethodCall(opMethod, args, /*baseQualified=*/false);
+                if (!res) return false;
+                return lowerCollectionIndexerSet(*ix, res, /*valueExpr=*/nullptr);
+            }
+        }
         // Determine the value LLVM type to compute newVal in the right type.
         const sema::TypeRef* valTy =
             (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
@@ -1090,6 +1120,40 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     if (!rhs) return false;
     std::string op(as.op);
     if (!op.empty() && op.back() == '=') op.pop_back();
+
+    // fix #626 / §25.1: if the element type has a user-defined
+    // `static operator <op>` (two params), dispatch to it and write back —
+    // mirrors the #610 overload check in lowerStmt and the dict branch above.
+    // emitCompoundOp cannot handle struct operands (LLVM rejects
+    // sadd.with.overflow on struct types), so this must be checked FIRST.
+    {
+        const sema::TypeRef* elemTyRef =
+            (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+        sema::MethodSymbol* opMethod = nullptr;
+        if (elemTyRef && elemTyRef->kind == sema::TypeRef::Kind::Named &&
+            elemTyRef->declaration) {
+            for (sema::Symbol* m : elemTyRef->declaration->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && ms->isOperator && ms->operatorToken == op &&
+                    ms->params.size() == 2) {
+                    opMethod = ms;
+                    break;
+                }
+            }
+        }
+        if (opMethod) {
+            // §25.1: desugar to get → overload call → set.
+            // Use lowerCollectionIndexerSet to write back (handles
+            // bz_array_set / bz_array_set_disposing uniformly).
+            std::vector<llvm::Value*> args{cur, rhs};
+            llvm::Value* res =
+                emitMethodCall(opMethod, args, /*baseQualified=*/false);
+            if (!res) return false;
+            return lowerCollectionIndexerSet(*ix, res, /*valueExpr=*/nullptr);
+        }
+    }
+
     llvm::Value* newVal = emitCompoundOp(
         op, cur, rhs, elemTy->isFloatingPointTy(),
         isUnsignedTargetExpr(*as.target));
