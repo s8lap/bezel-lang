@@ -6130,6 +6130,79 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             return emitClosureCall(closurePtr, calleeTy);
         }
     }
+    // #608 / §8.5: `e.ToString()` on ANY user-class or built-in exception
+    // receiver dispatches through vtable slot 3 (classToStringThunk).
+    //
+    // classToStringThunk handles both the "no override" and "has override"
+    // cases:
+    //   • no user override → returns the class's qualified type name (§8.5 default)
+    //   • user override  → calls the override function body directly (the thunk
+    //     holds a direct non-virtual reference to it, so the thunk is not
+    //     re-entered, and the virtual override slot 4 is bypassed).
+    //
+    // We intercept HERE (before the ms-based emitMethodCall path below) for ALL
+    // user-class and builtin-exception receivers, regardless of whether sema
+    // resolved a MethodSymbol for the override.  Routing through the virtual
+    // override slot 4 instead requires methodFnType(ms) to succeed; for user
+    // exception classes that inherit from a builtin base, the builtin base is
+    // absent from TypeSymbol::baseTypes (no TypeSymbol for it), which can cause
+    // vtable-layout anomalies that make methodFnType return nullptr, causing
+    // emitMethodCall to silently return nullptr and the call-site to emit 0.
+    // Slot 3 avoids that hazard entirely.  per §8.5 / §12 (v0.134).
+    //
+    // Guard for generic contexts: a Named TypeRef with declaration==nullptr can
+    // also be a type parameter (T, U, …) inside a generic body.  Those are
+    // handled by the genericSubstSemaTy_ block in the !ms path below; skip the
+    // early interception for them by requiring either (a) a non-null declaration
+    // (concrete user class) or (b) a known builtin exception name while NOT
+    // inside a generic substitution (no type-param ambiguity).
+    if (auto* cg_ma = dynamic_cast<const ast::MemberAccessExpr*>(
+            call.callee.get())) {
+        if (cg_ma->member == "ToString" && cg_ma->target &&
+                call.args.empty()) {
+            const sema::TypeRef* cg_recvTy =
+                ctx_.exprType(*cg_ma->target);
+            if (cg_recvTy) {
+                using CG_K = sema::TypeRef::Kind;
+                bool cg_isClass =
+                    cg_recvTy->kind == CG_K::Named &&
+                    cg_recvTy->declaration &&
+                    cg_recvTy->declaration->kind ==
+                        ast::TypeDeclKind::Class;
+                // Built-in exception types: Named with no declaration.
+                // Only intercept when not in a generic context (to avoid
+                // confusing a type-parameter T with a builtin exception name).
+                bool cg_isBuiltinEx =
+                    genericSubstSemaTy_.empty() &&
+                    cg_recvTy->kind == CG_K::Named &&
+                    !cg_recvTy->declaration;
+                // Route through lowerObjectToString (vtable slot 3,
+                // classToStringThunk) for ALL ToString calls on user-class and
+                // builtin-exception receivers, regardless of whether sema
+                // resolved a MethodSymbol (override) or not.
+                //
+                // classToStringThunk (slot 3) already handles both cases:
+                //   • no user override → returns the class's qualified type name
+                //   • user override → calls the override body directly (the thunk
+                //     holds a direct reference to the override function, so it is
+                //     not dispatched via the virtual slot 4 and cannot loop).
+                //
+                // Routing through the virtual override slot (slot 4, assigned by
+                // buildVtable when `override method ToString()` exists) is
+                // semantically equivalent BUT requires methodFnType(ms) to
+                // succeed; for user exception classes that inherit from a builtin
+                // base, methodFnType can return nullptr due to a vtable-layout
+                // anomaly (no TypeSymbol base), causing emitMethodCall to return
+                // nullptr and the call-site to silently emit 0.  Slot 3 avoids
+                // that hazard entirely.  per §8.5 / §12 (v0.134).
+                if (cg_isClass || cg_isBuiltinEx) {
+                    llvm::Value* cg_recv = lowerExpr(*cg_ma->target);
+                    if (llvm::Value* cg_r = lowerObjectToString(cg_recv))
+                        return cg_r;
+                }
+            }
+        }
+    }
     auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
     if (!ms) {
         // §8.5 / §8.6 (#417): `o.ToString()` where o: Object / interface (the
@@ -6199,7 +6272,27 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 bool isIfaceRecv =
                     recvTy && recvTy->kind == K::Named && recvTy->declaration &&
                     recvTy->declaration->kind == ast::TypeDeclKind::Interface;
-                if (isObjectRecv || isIfaceRecv) {
+                // #608 / §8.5 / §12: user-defined class types (including user
+                // exception classes that inherit from a built-in exception base)
+                // also dispatch ToString through the uniform vtable slot 3.
+                // When no MethodSymbol exists (ToString not in TypeSymbol::baseTypes
+                // for the built-in exception base), the call reaches here with
+                // ms==nullptr. Extend the dispatch to include named Class receivers
+                // so they use the same lowerObjectToString path as Object/interface.
+                // per §8.5 (v0.134).
+                bool isNamedClassRecv =
+                    recvTy && recvTy->kind == K::Named && recvTy->declaration &&
+                    recvTy->declaration->kind == ast::TypeDeclKind::Class;
+                // #608 / §8.5 / §31: built-in exception types (Named with no
+                // declaration) in a GENERIC context (genericSubstSemaTy_ active)
+                // can reach here when the type-param substitution lookup above
+                // did not handle them (e.g. a bare `Exception`-typed variable in
+                // a generic body).  Dispatch through lowerObjectToString.
+                // per §8.5 (v0.134).
+                bool isBuiltinExRecv =
+                    recvTy && recvTy->kind == K::Named && !recvTy->declaration;
+                if (isObjectRecv || isIfaceRecv || isNamedClassRecv ||
+                        isBuiltinExRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (llvm::Value* r = lowerObjectToString(recv)) return r;
                 }

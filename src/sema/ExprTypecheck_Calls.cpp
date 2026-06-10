@@ -739,6 +739,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // result is `string` (§8.5). An Object-typed receiver is a
                 // Primitive(Object) TypeRef; an interface-typed receiver is a
                 // Named TypeRef whose declaration is an interface.
+                // #608 / §8.5 / §12: also handle user-defined class receivers
+                // (e.g. a user exception class ErrA: Exception) where ToString
+                // has no MethodSymbol (TypeSymbol::baseTypes skips builtin bases,
+                // so lookupMember returns null). Codegen dispatches through vtable
+                // slot 3 for any class receiver, so the return type is always
+                // `string`. per §8.5 (v0.134).
                 if (m == "ToString" && ce.args.empty() && recvTy) {
                     bool isObjectRecv = recvTy->kind == TypeRef::Kind::Primitive &&
                                         recvTy->primitive == P::Object;
@@ -746,7 +752,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         recvTy->kind == TypeRef::Kind::Named &&
                         recvTy->declaration &&
                         recvTy->declaration->kind == ast::TypeDeclKind::Interface;
-                    if (isObjectRecv || isIfaceRecv) {
+                    bool isNamedClassRecv =
+                        recvTy->kind == TypeRef::Kind::Named &&
+                        recvTy->declaration &&
+                        recvTy->declaration->kind == ast::TypeDeclKind::Class;
+                    // #608 / §8.5 / §31: built-in exception types (Exception,
+                    // ArgumentException, …) are Named TypeRefs with no user
+                    // TypeSymbol (declaration == nullptr). `catch var e: Exception`
+                    // gives e a builtin-typed receiver; ToString on it must return
+                    // string just like any other class.  per §8.5 (v0.134).
+                    bool isBuiltinExRecv =
+                        recvTy->kind == TypeRef::Kind::Named &&
+                        !recvTy->declaration;
+                    if (isObjectRecv || isIfaceRecv || isNamedClassRecv ||
+                            isBuiltinExRecv) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                         return;
                     }
@@ -3992,6 +4011,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     "` on type `" + std::string(targetType->name) +
                     "` (§11.3, §12.1)");
         }
+        // #608 / §8.5 / §12: `ToString()` is universal and returns `string`.
+        // Set the MemberAccessExpr's type so that callers (e.g. `.Length` on the
+        // result, or an assignment `var s := e.ToString()`) can infer the type.
+        // This covers the class-with-user-decl case where no MethodSymbol exists
+        // (user exception class inheriting from a built-in exception base does not
+        // have ToString in TypeSymbol::baseTypes, so lookup returns nullptr).
+        // The record/enum cases are handled in their respective branches above.
+        // per §8.5 (v0.134).
+        if (mm == "ToString")
+            ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
         // §8.2 (#487): `GetType` is universal and returns `Type` (stdlib §2.13).
         // Set the MemberAccessExpr's type here so that: (a) a bare `obj.GetType`
         // in value position is typed, and (b) `typeCall` can propagate it to the
