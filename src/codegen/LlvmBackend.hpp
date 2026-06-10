@@ -25,12 +25,25 @@ class SemaContext;
 
 namespace bezel::codegen {
 
+// Per-build codegen options. Passed to emitModule; zero-initialised defaults
+// match unchecked (release) behaviour so existing callers need no changes.
+struct CodegenOptions {
+    // §28.2 v0.134 / issue #601: enable checked disposal mode. When true,
+    // every instance-method entry and property-accessor entry emits a disposed-
+    // flag test; if the flag is set, DisposedAccessException is raised. Also
+    // suppresses the heap-free in emitDisposeAndReclaim (quarantine: the block
+    // remains readable so the flag check after disposal is well-defined).
+    // Default false = unchecked (release) mode: zero extra cost.
+    bool checkedDisposal = false;
+};
+
 // Build an LLVM module for `src` (already checked, using `ctx`'s side tables),
 // constructed in `llvmCtx`. The caller owns `llvmCtx` and must keep it alive
 // for the module's lifetime.
 std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
                                          sema::SemaContext& ctx,
-                                         llvm::LLVMContext& llvmCtx);
+                                         llvm::LLVMContext& llvmCtx,
+                                         const CodegenOptions& opts = {});
 
 // Emit `module` as a native object file at `objectPath` (host target).
 // Returns true on success; on failure returns false and sets `error`.

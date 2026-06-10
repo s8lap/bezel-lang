@@ -423,6 +423,7 @@ set(BEZEL_TEST_SOURCES
     codegen/multitype_catch_ncb_593_test.cpp
     codegen/user_exception_message_595_test.cpp
     codegen/user_exception_isa_596_test.cpp
+    codegen/checked_disposal_601_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "codegen/LlvmBackend.hpp"
+
 namespace bezel {
 
 struct CompileResult {
@@ -47,6 +49,12 @@ public:
     CompileResult compileFile(const std::string& path,
                               const std::string& outputPath,
                               const std::vector<Dependency>& deps);
+
+    // Overload with explicit codegen options (e.g., --checked-disposal / §28.2).
+    CompileResult compileFile(const std::string& path,
+                              const std::string& outputPath,
+                              const std::vector<Dependency>& deps,
+                              const codegen::CodegenOptions& opts);
 
     // §2.4 / §2.6 (issue #328 inc 3): compile `path` to a native OBJECT at
     // `objectPath` (kept, not linked), with its public-interface metadata

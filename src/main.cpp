@@ -17,7 +17,7 @@ constexpr const char* kVersion =
 
 void printUsage(std::ostream& out) {
     out << "usage: bezelc [--version] [--help] [-c] [-o <output>] "
-           "[--import <artifact>]... <source-file>\n"
+           "[--import <artifact>]... [--checked-disposal] <source-file>\n"
            "  -c                 compile to a native object (a library, §2.4) "
            "with embedded\n"
            "                     interface metadata; do not link, no `Main` "
@@ -26,7 +26,11 @@ void printUsage(std::ostream& out) {
            "`.bezel.meta`\n"
            "                     is loaded for `import` resolution (§2.5); its "
            "object is\n"
-           "                     also linked into the executable\n";
+           "                     also linked into the executable\n"
+           "  --checked-disposal enable checked disposal mode (§28.2): "
+           "member access on a\n"
+           "                     disposed instance raises DisposedAccess"
+           "Exception (§31.4)\n";
 }
 
 // Default executable name from the source path: drop the directory and the
@@ -59,6 +63,7 @@ int main(int argc, char** argv) {
     // linked. A dependency's metadata and object live in the same artifact, so
     // one path fills both Dependency fields.
     bool compileObjectOnly = false;
+    bezel::codegen::CodegenOptions codegenOpts;
     std::vector<bezel::Dependency> deps;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
@@ -80,6 +85,13 @@ int main(int argc, char** argv) {
         }
         if (arg == "-c") {
             compileObjectOnly = true;
+            continue;
+        }
+        if (arg == "--checked-disposal") {
+            // §28.2 v0.134 / issue #601: enable checked disposal mode. Every
+            // instance-member entry emits a disposed-flag test; access on a
+            // disposed instance raises DisposedAccessException (§31.4).
+            codegenOpts.checkedDisposal = true;
             continue;
         }
         if (arg == "--import") {
@@ -116,6 +128,6 @@ int main(int argc, char** argv) {
     const bezel::CompileResult result =
         compileObjectOnly
             ? driver.compileObject(inputPath, outputPath, deps)
-            : driver.compileFile(inputPath, outputPath, deps);
+            : driver.compileFile(inputPath, outputPath, deps, codegenOpts);
     return result.success ? 0 : 1;
 }

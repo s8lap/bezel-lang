@@ -75,6 +75,13 @@ CompileResult Driver::compileFile(const std::string& path,
 CompileResult Driver::compileFile(const std::string& path,
                                   const std::string& outputPath,
                                   const std::vector<Dependency>& deps) {
+    return compileFile(path, outputPath, deps, codegen::CodegenOptions{});
+}
+
+CompileResult Driver::compileFile(const std::string& path,
+                                  const std::string& outputPath,
+                                  const std::vector<Dependency>& deps,
+                                  const codegen::CodegenOptions& opts) {
     std::string source;
     if (!readFile(path, source)) {
         std::cerr << "bezelc: error: cannot open '" << path << "'\n";
@@ -144,7 +151,7 @@ CompileResult Driver::compileFile(const std::string& path,
         // executable with clang.
         if (!outputPath.empty() && !diagnostics.hasErrors()) {
             llvm::LLVMContext llvmCtx;
-            auto module = codegen::emitModule(*unit, semaCtx, llvmCtx);
+            auto module = codegen::emitModule(*unit, semaCtx, llvmCtx, opts);
             // §2.6 step 4: embed the module's public-interface metadata in a
             // dedicated `.bezel.meta` object section so downstream `import`
             // resolution (§2.5) can read this module's interface without its

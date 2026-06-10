@@ -2346,6 +2346,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
             llvm::Value* saved = currentThis_;
             currentThis_ = obj;
+            // §28.2 v0.134 / issue #601: checked disposal mode guard for
+            // expression-bodied property getters inlined at call site. The
+            // guard is emitted against the already-loaded `obj` pointer;
+            // only class receivers carry a disposed flag (records and enums
+            // are value types with no disposal lifetime).
+            if (checkedDisposal_ && propSym && propSym->parent &&
+                propSym->parent->kind == ast::TypeDeclKind::Class &&
+                obj->getType()->isPointerTy()) {
+                llvm::StructType* st = classStruct(propSym->parent);
+                unsigned fi = disposedFlagIndex(propSym->parent);
+                llvm::Value* flagAddr =
+                    builder_.CreateStructGEP(st, obj, fi, "cd.flag");
+                llvm::Value* disposed = builder_.CreateICmpNE(
+                    builder_.CreateLoad(disposedFlagTy(), flagAddr),
+                    llvm::ConstantInt::get(disposedFlagTy(), 0), "cd.disposed");
+                emitGuardThrow(disposed, "DisposedAccessException");
+            }
             // #574 / §10.4 / §19.2 (CG30): an enum computed property whose
             // getter body is `case this Red => …` relies on enumTypeOf() to
             // resolve `this` as the declaring enum type so patternMatches can

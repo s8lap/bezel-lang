@@ -18,6 +18,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "ArgumentNullException" || n == "ArithmeticException" ||
         n == "OverflowException" || n == "DivideByZeroException" ||
         n == "InvalidOperationException" ||
+        // §31.4 / issue #601: DisposedAccessException — raised by checked
+        // disposal mode (§28.2) on member access of a disposed instance; it
+        // is under InvalidOperationException in the hierarchy (§31.4).
+        n == "DisposedAccessException" ||
         n == "NotImplementedException" ||
         n == "NullReferenceException" ||
         n == "IndexOutOfRangeException" ||
