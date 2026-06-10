@@ -3189,6 +3189,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #548 / stdlib §4.8 v0.135: `DictionaryEntry<K,V>.Key` is K and
+        // `.Value` is V.  DictionaryEntry has no user TypeSymbol (it is a
+        // builtin synthetic type), so the ordinary member-lookup path never
+        // types these.  Detect by the importedName="DictionaryEntry" tag
+        // (set by the for-loop sema above when element type is derived from
+        // a Dictionary<K,V> source).
+        if (ma.target && (ma.member == "Key" || ma.member == "Value")) {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isDictEntry =
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->importedName == "DictionaryEntry" &&
+                    tt->genericArgs.size() >= 2;
+                if (isDictEntry) {
+                    std::size_t gi = ma.member == "Key" ? 0 : 1;
+                    if (tt->genericArgs[gi])
+                        ctx_.setExprType(&ma, tt->genericArgs[gi]);
+                    return;
+                }
+            }
+        }
         // #370 / §4.8 / fix #556: `Dictionary<K,V>.Keys` is `ICollection<K>`
         // and `.Values` is `ICollection<V>`.  The Dictionary has no user
         // TypeSymbol, so the ordinary member-lookup path never types these

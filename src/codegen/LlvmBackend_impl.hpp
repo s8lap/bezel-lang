@@ -3851,6 +3851,14 @@ private:
     // Returns false if the iterable is not a `<dict>.Values` access.
     bool lowerDictValuesFor(const ast::ForStmt& fs);
 
+    // #548 / stdlib §4.8 v0.135: `for var e in dict` entry iteration over a
+    // non-owning Dictionary<K,V>. The loop variable binds to a synthetic
+    // DictionaryEntry<K,V> struct alloca {K key; V value} per live bucket, in
+    // insertion order. e.Key/e.Value field reads are lowered via GEP on that
+    // struct (field 0 = K, field 1 = V). Value is a borrow (not retained).
+    // Returns false if the iterable is not a bare Dictionary<K,V> local.
+    bool lowerDictEntryFor(const ast::ForStmt& fs);
+
     // issue #370: emit a counted loop over a snapshot of generic-table keys
     // (from bz_dict_keys_gen). `tableObj` is the bz_dict_t*; `elemTyRef` is the
     // key/element TypeRef (its LLVM type is how each key is loaded and bound to

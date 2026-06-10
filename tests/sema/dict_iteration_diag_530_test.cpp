@@ -1,30 +1,18 @@
-// Spec-derived tests for issue #530 — `for var e in dict` on a
-// Dictionary<K,V> or OwnedDictionary<K,V> must emit a CLEAR diagnostic
-// explaining that direct iteration is not supported (stdlib §4.8 / §4.9).
+// Spec-derived tests for issue #530 / #548 — `for var e in dict` iteration
+// on Dictionary<K,V> and OwnedDictionary<K,V>.
 //
-// Per stdlib §4.8: Dictionary<K,V> has NO default `for var e in d` iteration;
-// the idiomatic patterns are `for var k in d.Keys` (key-iteration) or
-// `d.Drain()` (OwnedDictionary only). Per §4.9: OwnedDictionary<K,V> also
-// provides no default direct iteration.
+// v0.134 (#530): `for var e in d` on BOTH Dictionary and OwnedDictionary
+// emitted a clear §4.8 diagnostic (direct iteration not provided).
 //
-// Before fix (#530): `for var e in d do var v: int := e.Value; end;` emitted
-//   "string member `.Value` is not yet supported in codegen"
-// because sema mis-typed the element variable as K (the first generic arg),
-// and the failure surfaced late at `.Value`.
+// v0.135 (#548): the restriction is NARROWED to OwnedDictionary<K,V> only.
+// Dictionary<K,V> now supports `for var e in d`, yielding
+// DictionaryEntry<K,V> (stdlib §4.8 v0.135).  OwnedDictionary still rejects
+// direct iteration (stdlib §4.9 v0.135).
 //
-// After fix: sema emits the §4.8-cited diagnostic at the for-statement
-// (element type is NOT inferred; the loop body is still type-checked as a
-// fallback). Tests assert:
-//   (a) hasErrors() is true
-//   (b) some diagnostic message contains "not directly iterable" or "Keys"
-//       AND contains "§4.8" (i.e. the new, clear message)
-//   (c) the OLD confusing message "not yet supported in codegen" is ABSENT.
-//
-// Control tests verify that the guard does NOT break:
-//   - `for var k in d.Keys` (Dictionary's Keys is ICollection<K> — iterable)
-//   - `for var x in arr` (Array<T>)
-//   - `for var x in someSet` (Set<T>)
-//   - `for var i in 0..5` (range)
+// These tests are updated to reflect the v0.135 widening.  The sema tests
+// that previously checked Dictionary rejection now verify ACCEPTANCE (no error,
+// entry.Key/entry.Value type correctly).  OwnedDictionary rejection is
+// unchanged.  Control tests remain unaffected.
 
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
@@ -77,55 +65,49 @@ std::string wrap(const std::string& body) {
 } // namespace
 
 // ===========================================================================
-// §4.8 — Dictionary<K,V> direct iteration must be rejected with clear message
+// §4.8 v0.135 — Dictionary<K,V> direct entry iteration is NOW ACCEPTED (#548)
 // ===========================================================================
 
-// §4.8: `for var e in d` on a Dictionary<string,int> parameter must emit an
-// error. The old confusing "not yet supported in codegen" message must be
-// absent; the new message must mention "not directly iterable" or "Keys" plus
-// the §4.8 citation (so it is actionable).
-// (Spec basis: stdlib §4.8 — "default `for var entry in dict` iteration is
-// not provided; use key-iteration or Drain()".)
-BEZEL_TEST(sema_dict_iteration_530, dict_direct_iteration_is_rejected_spec_4_8) {
+// §4.8 v0.135 (#548): `for var e in d` on a Dictionary<string,int> parameter
+// must now be ACCEPTED — no error, loop variable typed as DictionaryEntry<K,V>.
+// (Previously rejected per v0.134 #530; widened in v0.135 to allow entry iter.)
+BEZEL_TEST(sema_dict_iteration_530, dict_direct_iteration_now_accepted_v0135_spec_4_8) {
     auto r = parseSemaAll(wrap("for var e in d do n := n + 1; end;"));
-    // Must produce an error.
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    // The new clear message must cite §4.8 and hint at `.Keys`.
-    BEZEL_EXPECT_TRUE(anyDiagContains(r, "\xC2\xA7""4.8"));   // "§4.8" in UTF-8
-    // The old confusing codegen-surfaced message must be gone.
+    // v0.135: Dictionary<K,V> entry iteration is valid — no compile error.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // And the old confusing message is still absent.
     BEZEL_EXPECT_TRUE(noDiagContains(r, "not yet supported in codegen"));
 }
 
-// §4.8: same Dictionary<string,int> iteration with body that accesses .Value
-// (this was the specific scenario that produced the confusing message before
-// the fix — sema typed `e` as `string` (K) and `.Value` failed late).
-BEZEL_TEST(sema_dict_iteration_530, dict_direct_iteration_with_value_access_spec_4_8) {
-    auto r = parseSemaAll(wrap("for var e in d do var v: int := e.Value; end;"));
-    // Must produce an error — the §4.8 early diagnostic, not a late codegen one.
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(anyDiagContains(r, "\xC2\xA7""4.8"));
-    BEZEL_EXPECT_TRUE(noDiagContains(r, "not yet supported in codegen"));
+// §4.8 v0.135 (#548): `for var e in d do ... e.Value ...` must be accepted.
+// entry.Value is typed as V (int for Dictionary<string,int>), so the loop body
+// can read it without compile error.
+BEZEL_TEST(sema_dict_iteration_530, dict_entry_value_access_accepted_v0135_spec_4_8) {
+    auto r = parseSemaAll(wrap("for var e in d do n := n + e.Value; end;"));
+    // v0.135: DictionaryEntry.Value is V = int; adding to n (int) is valid.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §4.8: the diagnostic message must mention "Keys" to give the user the
-// idiomatic fix pattern (`for var k in d.Keys do ... end`).
-BEZEL_TEST(sema_dict_iteration_530, dict_diag_mentions_keys_spec_4_8) {
-    auto r = parseSemaAll(wrap("for var e in d do n := n + 1; end;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(anyDiagContains(r, "Keys"));
+// §4.8 v0.135 (#548): `for var e in d do ... e.Key ...` must be accepted.
+// entry.Key is typed as K (string for Dictionary<string,int>).
+BEZEL_TEST(sema_dict_iteration_530, dict_entry_key_access_accepted_v0135_spec_4_8) {
+    // e.Key is string; use it in a harmless way (no value-use of the key).
+    auto r = parseSemaAll(wrap("for var e in d do var k: string := e.Key; n := n + 1; end;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ===========================================================================
 // §4.9 — OwnedDictionary<K,V> direct iteration must also be rejected
 // ===========================================================================
 
-// §4.9: `for var e in od` on an OwnedDictionary<string,int> parameter must
-// be rejected with the same clear §4.8/§4.9 diagnostic (the spec prose at
-// §4.9 says "Default `for var entry in dict do` iteration is not provided").
+// §4.9 v0.135: `for var e in od` on an OwnedDictionary<string,int> parameter
+// must still be REJECTED (the #530 diagnostic is narrowed to OwnedDictionary
+// only in v0.135; Dictionary is now accepted).
 BEZEL_TEST(sema_dict_iteration_530, owned_dict_direct_iteration_rejected_spec_4_9) {
     auto r = parseSemaAll(wrap("for var e in od do n := n + 1; end;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(anyDiagContains(r, "\xC2\xA7""4.8"));
+    // The diagnostic must mention OwnedDictionary and §4.9.
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "OwnedDictionary"));
     BEZEL_EXPECT_TRUE(noDiagContains(r, "not yet supported in codegen"));
 }
 

@@ -2462,6 +2462,38 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     }
     // CG8: field read `obj.f`.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // #548 / stdlib §4.8 v0.135: `entry.Key` / `entry.Value` on a
+        // DictionaryEntry<K,V> loop variable. The entry alloca is a
+        // {K, V} struct (laid down by lowerDictEntryFor); field 0 is Key,
+        // field 1 is Value. DictionaryEntry has no user TypeSymbol, so
+        // fieldAddr cannot locate its fields — intercept here first.
+        if (ma->target && (ma->member == "Key" || ma->member == "Value")) {
+            if (auto* tt = ctx_.exprType(*ma->target)) {
+                if (tt->kind == sema::TypeRef::Kind::Named &&
+                    !tt->declaration &&
+                    tt->importedName == "DictionaryEntry" &&
+                    tt->genericArgs.size() >= 2) {
+                    // The target must be a local whose alloca holds the
+                    // {K,V} struct written by lowerDictEntryFor.
+                    if (llvm::AllocaInst* slot = localSlot(*ma->target)) {
+                        unsigned fi = ma->member == "Key" ? 0 : 1;
+                        sema::TypeRef* fieldTy = tt->genericArgs[fi];
+                        llvm::Type* llvmFTy = fieldTy ? lowerTypeRef(fieldTy)
+                                                       : ptrTy();
+                        // The entry alloca type is a 2-element struct {K, V}.
+                        llvm::Type* kTy = lowerTypeRef(tt->genericArgs[0]);
+                        llvm::Type* vTy = lowerTypeRef(tt->genericArgs[1]);
+                        llvm::StructType* entryStTy =
+                            llvm::StructType::get(llvm_, {kTy, vTy});
+                        llvm::Value* fieldPtr = builder_.CreateStructGEP(
+                            entryStTy, slot, fi, "de.fld");
+                        (void)llvmFTy;
+                        return builder_.CreateLoad(
+                            entryStTy->getElementType(fi), fieldPtr, "de.load");
+                    }
+                }
+            }
+        }
         llvm::Type* elemTy = nullptr;
         if (llvm::Value* addr = fieldAddr(*ma, elemTy)) {
             return builder_.CreateLoad(elemTy, addr);
