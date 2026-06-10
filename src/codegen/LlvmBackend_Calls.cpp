@@ -4,6 +4,21 @@ namespace bezel::codegen {
 
 llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
                                int fd) {
+    // fix #592 / per §4.6: Bezel strings use a per-string storage width of 1,
+    // 2, or 4 bytes per code point (Python PEP 393 model). The raw data
+    // pointer is NOT UTF-8 for non-ASCII content: a width-1 string stores
+    // code points in uint8_t (Latin-1 range 0x80..0xFF are NOT valid UTF-8
+    // single bytes), and width-2/4 strings store code points in uint16_t /
+    // uint32_t with interior zero bytes. Calling write() with the raw pointer
+    // and the code-point count as the byte length produced garbled output
+    // (e.g. "café" → "caf\xE9", "世界" → 2 raw uint16 bytes).
+    //
+    // Fix: re-encode to a NUL-terminated UTF-8 buffer via bz_string_to_utf8z
+    // (runtime helper already used by the FFI CString marshalling path in
+    // this file), determine the byte length with strlen, write the UTF-8
+    // bytes, then free the buffer.  bz_string_to_utf8z always malloc-allocates
+    // a fresh buffer (even for empty strings), so the free is unconditional.
+
     // Declare POSIX write(2): ssize_t write(int, const void*, size_t)
     auto* writeFn = module_->getFunction("write");
     if (!writeFn) {
@@ -12,10 +27,13 @@ llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
         writeFn = llvm::Function::Create(
             ft, llvm::Function::ExternalLinkage, "write", module_.get());
     }
-    llvm::Value* data = loadStringData(strPtr);
-    llvm::Value* len  = loadStringLen(strPtr);
-    builder_.CreateCall(writeFn,
-                        {builder_.getInt32(fd), data, len});
+    // Re-encode to UTF-8: char* utf8buf = bz_string_to_utf8z(strPtr);
+    llvm::Function* toUtf8 = declareC("bz_string_to_utf8z", ptrTy(), {ptrTy()});
+    llvm::Value* utf8buf = builder_.CreateCall(toUtf8, {strPtr}, "utf8buf");
+    // size_t byteLen = strlen(utf8buf);
+    llvm::Function* strlenFn = declareC("strlen", i64(), {ptrTy()});
+    llvm::Value* byteLen = builder_.CreateCall(strlenFn, {utf8buf}, "utf8.len");
+    builder_.CreateCall(writeFn, {builder_.getInt32(fd), utf8buf, byteLen});
     if (newline) {
         // Write a newline byte.
         llvm::Constant* nlData = llvm::ConstantDataArray::getString(
@@ -27,6 +45,8 @@ llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
                             {builder_.getInt32(fd), nlGV,
                              builder_.getInt64(1)});
     }
+    // free(utf8buf) — bz_string_to_utf8z always malloc-allocates.
+    builder_.CreateCall(freeFn(), {utf8buf});
     return nullptr;  // unit (void)
 }
 
