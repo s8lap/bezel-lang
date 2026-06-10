@@ -47,7 +47,9 @@ inline void ensureNativeTargetInitialized() {
 
 // Lex + parse + sema, then lower and JIT-run. On any front-end error (or JIT
 // failure) `ran` stays false; callers assert on `diagnostics`/`ran`/`exitCode`.
-inline JitResult runJit(std::string_view source) {
+// `opts` allows per-call codegen options (default = unchecked release mode).
+inline JitResult runJitWithOptions(std::string_view source,
+                                   const codegen::CodegenOptions& opts) {
     ensureNativeTargetInitialized();
     JitResult r;
 
@@ -63,7 +65,7 @@ inline JitResult runJit(std::string_view source) {
     if (r.diagnostics.hasErrors()) return r;
 
     auto llvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto module = codegen::emitModule(*unit, ctx, *llvmCtx);
+    auto module = codegen::emitModule(*unit, ctx, *llvmCtx, opts);
     if (!module) return r;
 
     auto jitOrErr = llvm::orc::LLJITBuilder().create();
@@ -98,6 +100,20 @@ inline JitResult runJit(std::string_view source) {
     r.exitCode = fn();
     r.ran = true;
     return r;
+}
+
+// Convenience: run in unchecked (default release) mode.
+inline JitResult runJit(std::string_view source) {
+    return runJitWithOptions(source, codegen::CodegenOptions{});
+}
+
+// §28.2 v0.134 / issue #601: run in checked disposal mode. Equivalent to
+// runJit but with checkedDisposal=true: instance-member entry guards are
+// emitted, and DisposedAccessException is raised on use-after-dispose.
+inline JitResult runJitChecked(std::string_view source) {
+    codegen::CodegenOptions opts;
+    opts.checkedDisposal = true;
+    return runJitWithOptions(source, opts);
 }
 
 }  // namespace bezel::test

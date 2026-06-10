@@ -6425,8 +6425,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                                              slotTy);
                         if (slot) {
                             emitDisposeAndReclaim(recv);
-                            builder_.CreateStore(
-                                llvm::ConstantPointerNull::get(ptrTy()), slot);
+                            // §28.2 v0.134 / issue #601: in checked-disposal
+                            // mode the object is quarantined (not freed), so
+                            // the slot must remain valid — the disposed-flag
+                            // guard at the next member-entry reads through it.
+                            // In unchecked mode, null the slot as usual to
+                            // prevent a second reclaim.
+                            if (!checkedDisposal_)
+                                builder_.CreateStore(
+                                    llvm::ConstantPointerNull::get(ptrTy()),
+                                    slot);
                         } else {
                             emitDynamicDispose(recv);
                         }

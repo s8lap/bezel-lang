@@ -25,6 +25,7 @@
 #include <functional>
 
 #include "ast/Node.hpp"
+#include "codegen/LlvmBackend.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 
@@ -183,10 +184,12 @@ inline std::int64_t parseCharLiteral(std::string_view text) {
 // checked AST. Grows one expression/statement kind per codegen slice.
 class Emitter {
 public:
-    Emitter(sema::SemaContext& ctx, llvm::LLVMContext& llvmCtx)
+    Emitter(sema::SemaContext& ctx, llvm::LLVMContext& llvmCtx,
+            const CodegenOptions& opts = {})
         : ctx_(ctx), llvm_(llvmCtx),
           module_(std::make_unique<llvm::Module>("bezel", llvmCtx)),
-          builder_(llvmCtx) {}
+          builder_(llvmCtx),
+          checkedDisposal_(opts.checkedDisposal) {}
 
     std::unique_ptr<llvm::Module> run() {
         // CG8: build every class's instance layout first (so field
@@ -300,6 +303,11 @@ private:
     llvm::LLVMContext& llvm_;
     std::unique_ptr<llvm::Module> module_;
     llvm::IRBuilder<> builder_;
+    // §28.2 v0.134 / issue #601: true when building in checked disposal mode.
+    // When set, emitFunctionBody and ensurePropertyAccessorFn prepend a
+    // disposed-flag test on every instance-member entry; emitDisposeAndReclaim
+    // suppresses the heap-free (quarantine) so the flag remains readable.
+    bool checkedDisposal_ = false;
     llvm::Function* currentFn_ = nullptr;
     // §8.6: the declared return-type node of the method currently being
     // emitted, so a `return <value>` whose declared return type is

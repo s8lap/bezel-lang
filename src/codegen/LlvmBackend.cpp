@@ -18,12 +18,13 @@ namespace bezel::codegen {
 
 std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
                                          sema::SemaContext& ctx,
-                                         llvm::LLVMContext& llvmCtx) {
+                                         llvm::LLVMContext& llvmCtx,
+                                         const CodegenOptions& opts) {
     // Codegen works off the SemaContext symbol table (each symbol points at
     // its AST decl), so the SourceFile root isn't needed directly; the
     // parameter is kept for API stability / future use.
     (void)src;
-    auto m = Emitter(ctx, llvmCtx).run();
+    auto m = Emitter(ctx, llvmCtx, opts).run();
     if (m && std::getenv("BEZEL_DUMP_IR")) m->print(llvm::errs(), nullptr);
     return m;
 }

@@ -1235,6 +1235,21 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     unwindScopeDepth_   = 0;
     diverged_           = false;
 
+    // §28.2 v0.134 / issue #601: checked disposal mode guard for property
+    // accessors. Class properties only (enum properties are NOT disposable,
+    // and records have no disposed flag). Per §28.2: "a property or indexer
+    // accessor invocation" on a disposed instance raises DisposedAccessException.
+    if (checkedDisposal_ && cls && cls->kind == ast::TypeDeclKind::Class) {
+        llvm::StructType* st = classStruct(cls);
+        unsigned fi = disposedFlagIndex(cls);
+        llvm::Value* flagAddr =
+            builder_.CreateStructGEP(st, currentThis_, fi, "cd.flag");
+        llvm::Value* disposed = builder_.CreateICmpNE(
+            builder_.CreateLoad(disposedFlagTy(), flagAddr),
+            llvm::ConstantInt::get(disposedFlagTy(), 0), "cd.disposed");
+        emitGuardThrow(disposed, "DisposedAccessException");
+    }
+
     // #574 / §10.4 / §19.2 (CG30): if this property belongs to an enum, set
     // currentEnumMethod_ so that enumTypeOf("this") resolves correctly inside
     // a `case this` body — sema does not attach an exprType to `this` inside

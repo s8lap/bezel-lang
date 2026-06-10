@@ -1516,6 +1516,9 @@ Emitter::builtinExceptionHierarchy() {
         {"OverflowException", "ArithmeticException"},
         {"DivideByZeroException", "ArithmeticException"},
         {"InvalidOperationException", "Exception"},
+        // §31.4 / issue #601: DisposedAccessException is under
+        // InvalidOperationException per the spec hierarchy.
+        {"DisposedAccessException", "InvalidOperationException"},
         {"NotImplementedException", "Exception"},
         {"NullReferenceException", "Exception"},
         {"IndexOutOfRangeException", "Exception"},
@@ -2384,7 +2387,14 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // The caller is responsible for null-ing its slot afterward where a second
     // dispatch through the same slot is reachable. free(null) is a no-op.
     emitDynamicDispose(obj);
-    builder_.CreateCall(freeFn(), {obj});
+    // §28.2 v0.134 / issue #601: in checked disposal mode the block is
+    // quarantined (not freed) after disposal so that the per-instance disposed
+    // flag at slot 1 (or 2) remains readable when a subsequent member-entry
+    // guard loads it. This is a deliberate memory leak in checked (debug)
+    // builds; the spec explicitly endorses deferred reclamation here. In
+    // unchecked (release) mode the block is freed immediately as before.
+    if (!checkedDisposal_)
+        builder_.CreateCall(freeFn(), {obj});
 }
 
 
@@ -2735,6 +2745,25 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     }
 
     bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
+
+    // §28.2 v0.134 / issue #601: checked disposal mode guard.
+    // For every instance method of a class (not static, not the entry point,
+    // not constructors — those go through emitConstructorBody — not the
+    // compiler-generated Dispose — that goes through emitDisposerBody): emit
+    // a disposed-flag test at method entry. If the flag is set, raise
+    // DisposedAccessException and unwind. This is a no-op when checkedDisposal_
+    // is false (unchecked mode pays zero cost — the flag test is absent).
+    if (checkedDisposal_ && !isStaticMethod(ms) && !isMain(ms) &&
+        ms->parent && ms->parent->kind == ast::TypeDeclKind::Class) {
+        llvm::StructType* st = classStruct(ms->parent);
+        unsigned fi = disposedFlagIndex(ms->parent);
+        llvm::Value* flagAddr =
+            builder_.CreateStructGEP(st, currentThis_, fi, "cd.flag");
+        llvm::Value* disposed = builder_.CreateICmpNE(
+            builder_.CreateLoad(disposedFlagTy(), flagAddr),
+            llvm::ConstantInt::get(disposedFlagTy(), 0), "cd.disposed");
+        emitGuardThrow(disposed, "DisposedAccessException");
+    }
 
     // CG47: run every static constructor once, before the program's
     // body. The entry point Main is the single root, so calling them at
