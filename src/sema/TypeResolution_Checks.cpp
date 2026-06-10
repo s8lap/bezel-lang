@@ -477,6 +477,48 @@ void Resolver::checkRecordRestrictions() {
     }
 }
 
+void Resolver::checkUserDeclaredDispose() {
+    // #594 (§28.2): "User code does not implement Dispose() directly.  The
+    // customization points are: a destructor for cleanup logic; owned fields
+    // for fields that should be disposed with the containing object."
+    //
+    // A user-declared `Dispose()` on a class or record is never invoked by
+    // the compiler's ownership machinery (using var / owned field teardown /
+    // explicit Dispose call all go through the compiler-generated Dispose) so
+    // the user body silently never runs — a silent trap.  Reject it here.
+    //
+    // Applies to both Class and Record even though records cannot normally
+    // carry a destructor (§9.7): a user who accidentally writes a Dispose()
+    // method on a record also gets a clear diagnostic rather than a silent
+    // no-op (the destructor restriction is a separate, earlier check).
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        if (t->kind != ast::TypeDeclKind::Class &&
+            t->kind != ast::TypeDeclKind::Record)
+            continue;
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms || ms->name != "Dispose") continue;
+            // Only reject a zero-parameter Dispose(): that's the exact
+            // signature the compiler generates per §28.2.  A user method named
+            // Dispose with parameters is unusual but technically unambiguous
+            // and not what §28.2 restricts.
+            if (!ms->params.empty()) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, ms->declLoc,
+                std::string(t->kind == ast::TypeDeclKind::Record ? "record" : "class") +
+                " `" + std::string(t->name) +
+                "` may not declare a `Dispose()` method directly (§28.2): "
+                "the compiler synthesises `Dispose()` from the `destructor`; "
+                "user-declared `Dispose()` bodies are never called by the "
+                "ownership machinery.  Use a `destructor` for cleanup logic "
+                "and `owned` fields for resource fields instead.");
+        }
+    }
+}
+
 void Resolver::checkTopLevelVisibility() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {

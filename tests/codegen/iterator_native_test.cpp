@@ -67,7 +67,9 @@ static const char* kIntRangeBase = R"(
     public constructor(lo: int, hi: int) this.lo:=lo; this.hi:=hi; cur:=lo-1; end constructor;
     public method MoveNext(): bool cur:=cur+1; return cur<=hi; end MoveNext;
     public readonly property Current: int get => cur; end Current;
-    public method Dispose() end Dispose;
+    // §28.2: Dispose() is compiler-synthesised; no user declaration needed.
+    // IEnumerator<T>'s IDisposable requirement is satisfied by the compiler-
+    // generated Dispose() that every class implicitly carries.
   end IntRangeEnum;
   class IntRange: IEnumerable<int>
     private lo: int; private hi: int;

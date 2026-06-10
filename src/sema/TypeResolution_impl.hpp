@@ -196,6 +196,12 @@ private:
     // of the same name is an error.
     void checkDuplicateMembers();
 
+    // #594 (§28.2): user code may not declare a method named `Dispose()` on
+    // a class or record. The compiler synthesises `Dispose()` from the
+    // `destructor` (§28.4); a user-declared `Dispose()` is never called by
+    // the ownership machinery and silently traps.
+    void checkUserDeclaredDispose();
+
     static bool isOverloadable(Symbol* m);
 
     void checkTypeDuplicates(TypeSymbol* t);

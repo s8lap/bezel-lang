@@ -68,8 +68,11 @@ BEZEL_TEST(own_return, owned_return_dispatched_on_param) {
 }
 
 BEZEL_TEST(own_return, owned_return_explicit_dispose_clean) {
+    // §28.2: Dispose() is compiler-synthesised; no user declaration needed.
+    // The ownership checker must accept an explicit `x.Dispose()` call on an
+    // owned local as a valid discharge (§28.3).
     auto r = parseAndCheckOwnership(mod(
-        "class T public method Dispose() _ := 1; end Dispose; end T; "
+        "class T end T; "
         "class C "
         "  public method Make(): owned T => new T(); "
         "  public method M() "
