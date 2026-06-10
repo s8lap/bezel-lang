@@ -3455,6 +3455,42 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         if (!v) return;
         args.push_back(v);
     }
+    // §12 / §14 (issue #617): when the DERIVED class is non-generic but its
+    // base is a CONCRETE generic instantiation (e.g. `class StringBox: Box<string>`
+    // calling `base(s)`), genericSubst_ is empty and the template ctor
+    // `bz$Box$ctor(ptr, i32)` would be called with a `ptr` argument — an ABI
+    // mismatch that LLVM rejects.  Build the concrete substitution from the
+    // base type's recorded TypeRef (TypeSymbol::baseTypeRefs, parallel to
+    // baseTypes, which carries the generic args for each base) and activate it
+    // so the inline-ctor path below uses the right field layout and param types.
+    auto savedSubstForBase = genericSubst_;
+    auto savedSemaTyForBase = genericSubstSemaTy_;
+    bool restoredSubstForBase = false;
+    if (genericSubst_.empty() && targetCls && !targetCls->genericParams.empty()) {
+        const sema::TypeRef* baseRef = nullptr;
+        for (std::size_t bi = 0; bi < cs->parent->baseTypes.size(); ++bi) {
+            if (bi < cs->parent->baseTypeRefs.size() &&
+                cs->parent->baseTypes[bi] == targetCls) {
+                baseRef = cs->parent->baseTypeRefs[bi];
+                break;
+            }
+        }
+        if (baseRef && !baseRef->genericArgs.empty()) {
+            auto* td = dynamic_cast<const ast::TypeDecl*>(targetCls->decl);
+            if (td && td->genericParams.size() == baseRef->genericArgs.size()) {
+                std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+                for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
+                    std::string_view pname = td->genericParams[gi].name;
+                    newSubst[pname] = lowerTypeRef(baseRef->genericArgs[gi]);
+                    newSema[pname] = baseRef->genericArgs[gi];
+                }
+                genericSubst_ = std::move(newSubst);
+                genericSubstSemaTy_ = std::move(newSema);
+                restoredSubstForBase = true;
+            }
+        }
+    }
     // §12 / §14 (issue #585): when a generic substitution is active, the target
     // ctor function in ctorFns_ is the T→i32 TEMPLATE — calling it would store
     // the chained ctor's fields against the unspecialized layout and would
@@ -3489,8 +3525,16 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             currentThis_ = subObj;
             locals_ = std::move(savedLocals);
             paramSlots_ = std::move(savedParams);
+            if (restoredSubstForBase) {
+                genericSubst_ = std::move(savedSubstForBase);
+                genericSubstSemaTy_ = std::move(savedSemaTyForBase);
+            }
             return;
         }
+    }
+    if (restoredSubstForBase) {
+        genericSubst_ = std::move(savedSubstForBase);
+        genericSubstSemaTy_ = std::move(savedSemaTyForBase);
     }
     if (args.size() == it->second->arg_size()) {
         builder_.CreateCall(it->second, args);
