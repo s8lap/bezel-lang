@@ -188,6 +188,16 @@ void bz_llist_free(void* list, void (*dispose_elem)(void*));
 // String-key dictionary (keys are UTF-8 byte slices; copied internally).
 void*   bz_dict_alloc(void);
 void    bz_dict_free(void* d, void (*dispose_val)(void*));
+
+// §28.2 v0.135 / issue #627: checked-disposal-mode quarantine. Disposes values,
+// frees buckets/order arrays, sets disposed=1 on the header, does NOT free the
+// header (so the disposed flag remains readable for method guards).
+void    bz_dict_mark_disposed(void* d, void (*dispose_val)(void*));
+
+// §28.2 v0.135 / issue #627: return non-zero if the dict has been disposed
+// via bz_dict_mark_disposed (checked mode only).
+int8_t  bz_dict_is_disposed(void* d);
+
 bool    bz_dict_try_get_str(void* d, const char* k, int64_t k_len, void** out);
 void    bz_dict_set_str(void* d, const char* k, int64_t k_len, void* val);
 
@@ -953,6 +963,17 @@ void  bz_shared_release(void* handle);
 // Decrement the weak count.  When the strong count is already 0 and the weak
 // count also reaches 0, free the control block. per §28.13 Weak.Dispose().
 void  bz_weak_release(void* weak_handle);
+
+// §28.2 v0.135 / issue #627: checked-disposal-mode quarantine for Shared<T>.
+// Called instead of bz_shared_release for the explicit handle.Dispose() in
+// checked builds. Marks handle_disposed=1 and disposes the value, but does NOT
+// free the control block (deliberate quarantine). bz_shared_release becomes a
+// no-op when handle_disposed is set, so the scope-end auto-dispose is safe.
+void bz_shared_mark_disposed(void* handle);
+
+// §28.2 v0.135 / issue #627: return non-zero if the Shared<T> handle has been
+// quarantined via bz_shared_mark_disposed (checked-disposal builds only).
+int8_t bz_shared_is_disposed(void* handle);
 
 #ifdef __cplusplus
 } // extern "C"

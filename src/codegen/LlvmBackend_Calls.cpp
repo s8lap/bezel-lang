@@ -707,6 +707,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     if (isArr) {
         int64_t esz = collectionElemSize(recvTy);
 
+        // §28.2 v0.135 / issue #627: checked-disposal mode guard for array-backed
+        // collection methods. bz_array_is_disposed reads the disposed byte on the
+        // bz_array_t header (set by bz_array_mark_disposed at Dispose time in
+        // checked builds). Skip for lazy-materialized temporaries (those are
+        // freshly-allocated by bz_lazy_to_array — they cannot be disposed).
+        if (checkedDisposal_ && !lazyTempArr && isCollectionTypeName(recvTy)) {
+            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+            llvm::Value* flag = builder_.CreateCall(isFn, {recv}, "cd.arrdis");
+            llvm::Value* disposed = builder_.CreateICmpNE(
+                flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+            emitGuardThrow(disposed, "DisposedAccessException");
+        }
+
         // issues #343 / D8 / §4.10: a Set<T>/OwnedSet<T> is backed by the
         // generic-key hash table (allocated in the `new` path). Route its core
         // membership operations to the generic dict entry points so set
@@ -2371,6 +2385,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // Dictionary<string, V> methods (string-key variant)
     // -----------------------------------------------------------------------
     if (isDict) {
+        // §28.2 v0.135 / issue #627: checked-disposal mode guard for dict-backed
+        // collection methods. bz_dict_is_disposed reads the disposed byte on the
+        // bz_dict_t header (set by bz_dict_mark_disposed at Dispose time in
+        // checked builds).
+        if (checkedDisposal_) {
+            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* isFn = declareC("bz_dict_is_disposed", i8Ty, {ptrTy()});
+            llvm::Value* flag = builder_.CreateCall(isFn, {recv}, "cd.ddis");
+            llvm::Value* disposed = builder_.CreateICmpNE(
+                flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+            emitGuardThrow(disposed, "DisposedAccessException");
+        }
+
         // issues #343 / D3 / §4.8: a non-string key routes through the generic-
         // key runtime (bz_dict_*_gen), passing a pointer to the lowered key
         // bytes; the STRING key keeps the bz_dict_*_str fast path. `keyTy` is
@@ -4697,6 +4724,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::Value* handle = lowerExpr(*ma2->target);
                     if (!handle) return nullptr;
                     const auto& mname = ma2->member;
+                    // §28.2 v0.135 / issue #627: checked-disposal guard for
+                    // Shared<T> instance methods (Clone/Get/Downgrade).
+                    // bz_shared_is_disposed returns non-zero when the handle's
+                    // strong count is 0 (i.e. it was already Dispose()d).
+                    // Zero default-mode cost — the test is absent in unchecked builds.
+                    if (checkedDisposal_ &&
+                        (mname == "Clone" || mname == "Get" ||
+                         mname == "Downgrade")) {
+                        llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                        auto* isFn = declareC("bz_shared_is_disposed", i8Ty,
+                                              {ptrTy()});
+                        llvm::Value* flag =
+                            builder_.CreateCall(isFn, {handle}, "cd.shrdis");
+                        llvm::Value* disposed = builder_.CreateICmpNE(
+                            flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                        emitGuardThrow(disposed, "DisposedAccessException");
+                    }
                     // Clone(): Shared<T> — increments strong count, returns new handle.
                     if (mname == "Clone" && call.args.empty()) {
                         auto* fn = declareC("bz_shared_clone", ptrTy(), {ptrTy()});
@@ -6556,13 +6600,20 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     }
                 }
                 // §28.13 / stdlib §2.16 (#603): Shared<T>.Dispose() — explicit
-                // release of one strong handle via bz_shared_release.
+                // release of one strong handle.
+                // §28.2 v0.135 / issue #627: in checked-disposal mode, call
+                // bz_shared_mark_disposed (quarantine: dispose value, set
+                // handle_disposed=1, keep block alive for guard reads) instead of
+                // bz_shared_release (which frees the block and prevents guards).
                 {
                     auto* recvTy2 = ctx_.exprType(*ma->target);
                     if (recvTy2 && builtinTypeName(recvTy2) == "Shared") {
                         llvm::Value* recv2 = lowerExpr(*ma->target);
                         if (recv2 && recv2->getType()->isPointerTy()) {
-                            auto* fn = declareC("bz_shared_release",
+                            const char* relName = checkedDisposal_
+                                ? "bz_shared_mark_disposed"
+                                : "bz_shared_release";
+                            auto* fn = declareC(relName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
                             builder_.CreateCall(fn, {recv2});
                         }
@@ -6684,6 +6735,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         // is freed twice.
                         // #602 / §28.11 v0.135: derive owning-class disposer
                         // directly from elementPolicyFor (covers Interface too).
+                        // §28.2 v0.135 / issue #627: checked-disposal mode
+                        // quarantines via bz_dict_mark_disposed (header stays
+                        // alive for method-entry guard reads; bz_dict_free is
+                        // idempotent w.r.t. disposed flag). In checked mode, the
+                        // slot is NOT nulled — the pointer must remain valid so
+                        // subsequent method calls can load and test it. The
+                        // scope-end bz_dict_free is a no-op when disposed=1.
                         {
                             const sema::TypeRef* dictVal =
                                 (recvTy->genericArgs.size() > 1)
@@ -6698,39 +6756,32 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             llvm::Value* disp = valDisp
                                 ? llvm::cast<llvm::Value>(valDisp)
                                 : llvm::ConstantPointerNull::get(ptrTy());
-                            auto* fn = declareC("bz_dict_free",
+                            const char* freeName = checkedDisposal_
+                                ? "bz_dict_mark_disposed"
+                                : "bz_dict_free";
+                            auto* fn = declareC(freeName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                             builder_.CreateCall(fn, {recv, disp});
-                            // §28.2 idempotency: a `using var` dict (or an owned
-                            // dict field) that is explicitly Dispose()d is ALSO
-                            // disposed at scope end (the #394 `it->dict` path) or by
-                            // a later explicit call. bz_dict_free is NOT idempotent
-                            // — a second call on the same freed table double-frees
-                            // it (and would double-dispose its values). Null the
-                            // receiver's slot so any subsequent bz_dict_free reloads
-                            // null and no-ops (bz_dict_free(null) returns). This
-                            // makes "first Dispose disposes; subsequent calls are
-                            // no-ops" (§28.2) hold for the dict's combined paths.
-                            // lvalueAddr yields the slot for an identifier receiver
-                            // (using-var local or owned field, boxed or not); for a
-                            // non-lvalue receiver (a temporary) there is no second
-                            // path to guard. Restricted to the identifier / member-
-                            // access lvalue forms — the ones that name a using-var
-                            // local or an owned field — so re-deriving the address
-                            // re-evaluates only a side-effect-free base (the local's
-                            // slot, or `this`/the owner for a field).
-                            bool lvalueRecv =
-                                dynamic_cast<const ast::IdentifierExpr*>(
-                                    ma->target.get()) ||
-                                dynamic_cast<const ast::MemberAccessExpr*>(
-                                    ma->target.get());
-                            llvm::Type* slotTy = nullptr;
-                            if (lvalueRecv) {
-                                if (llvm::Value* slot =
-                                        lvalueAddr(*ma->target, slotTy)) {
-                                    builder_.CreateStore(
-                                        llvm::ConstantPointerNull::get(ptrTy()),
-                                        slot);
+                            // §28.2 idempotency: in UNCHECKED mode, null the slot so
+                            // any subsequent bz_dict_free reloads null and no-ops
+                            // (bz_dict_free(null) returns immediately). In CHECKED
+                            // mode, the slot is intentionally NOT nulled — the pointer
+                            // must stay valid for guard checks; bz_dict_free is safe
+                            // because it returns early when disposed==1 (#627).
+                            if (!checkedDisposal_) {
+                                bool lvalueRecv =
+                                    dynamic_cast<const ast::IdentifierExpr*>(
+                                        ma->target.get()) ||
+                                    dynamic_cast<const ast::MemberAccessExpr*>(
+                                        ma->target.get());
+                                llvm::Type* slotTy = nullptr;
+                                if (lvalueRecv) {
+                                    if (llvm::Value* slot =
+                                            lvalueAddr(*ma->target, slotTy)) {
+                                        builder_.CreateStore(
+                                            llvm::ConstantPointerNull::get(ptrTy()),
+                                            slot);
+                                    }
                                 }
                             }
                         }
