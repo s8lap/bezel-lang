@@ -6634,12 +6634,20 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         // #362 / stdlib §4.5: explicit Dispose() on an owning
                         // collection cascades disposal into its class elements;
                         // a borrowing collection frees only the backing.
+                        // §28.2 v0.135 / issue #621: in checked-disposal mode use
+                        // bz_array_mark_disposed (quarantine: sets disposed flag,
+                        // disposes elements, frees the data buffer, but keeps the
+                        // header alive so the indexer guard can read the flag).
+                        // In unchecked mode use bz_array_free as before.
                         llvm::Function* elemDisp =
                             owningCollectionElemDisposer(recvTy);
                         llvm::Value* disp = elemDisp
                             ? llvm::cast<llvm::Value>(elemDisp)
                             : llvm::ConstantPointerNull::get(ptrTy());
-                        auto* fn = declareC("bz_array_free",
+                        const char* freeName = checkedDisposal_
+                            ? "bz_array_mark_disposed"
+                            : "bz_array_free";
+                        auto* fn = declareC(freeName,
                             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                         builder_.CreateCall(fn, {recv, disp});
                     } else if (isDictTypeName(recvTy)) {

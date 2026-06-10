@@ -41,6 +41,12 @@ struct bz_array_t {
     void*   data;       // heap buffer holding count*elem_size bytes
     int64_t count;
     int64_t capacity;
+    // §28.2 v0.135 / issue #621: checked disposal mode flag. Set to 1 by
+    // bz_array_mark_disposed (called instead of bz_array_free in checked builds)
+    // so that the indexer guard can detect a use-after-dispose. The struct
+    // header is NOT freed in that path (quarantine), keeping this byte valid.
+    // Calloc-zeroed on alloc — 0 means live, 1 means disposed.
+    int8_t  disposed;
 };
 
 void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
@@ -180,6 +186,41 @@ void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     }
     free(arr->data);
     free(arr);
+}
+
+// §28.2 v0.135 / issue #621: checked-disposal-mode variant of bz_array_free.
+// Instead of freeing the header block, it:
+//  1. Runs element disposal (same as bz_array_free).
+//  2. Frees the DATA buffer (contents are gone, no double-free risk).
+//  3. Sets disposed = 1 on the HEADER, then leaves the header alive
+//     (quarantine) so the disposed flag remains readable for subsequent
+//     indexer-guard loads. This is a deliberate memory leak in checked
+//     (debug) builds — consistent with the class-instance quarantine used
+//     by emitDisposeAndReclaim for §28.2 compliance.
+void bz_array_mark_disposed(void* arrp, void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (arr->disposed) return;  // idempotent
+    if (dispose_elem && arr->data) {
+        for (int64_t i = arr->count - 1; i >= 0; --i) {
+            void* elem_ptr = ((void**)arr->data)[i];
+            if (elem_ptr) dispose_elem(elem_ptr);
+        }
+    }
+    free(arr->data);
+    arr->data  = nullptr;
+    arr->count = 0;
+    arr->disposed = 1;
+    // Do NOT free(arr) — header stays alive for the disposed-flag guard.
+}
+
+// §28.2 v0.135 / issue #621: return the disposed byte for a bz_array_t*.
+// Called by checked-mode indexer guards to test use-after-dispose.
+// Returns 0 (live) or 1 (disposed).  Null pointer treated as non-disposed
+// (a null array hits the bounds-check guard separately).
+int8_t bz_array_is_disposed(void* arrp) {
+    if (!arrp) return 0;
+    return ((bz_array_t*)arrp)->disposed;
 }
 
 void bz_array_sort(void* arrp, int64_t elem_size,

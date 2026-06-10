@@ -68,6 +68,19 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (!isArr && !isDict) return nullptr;
     llvm::Value* recv = lowerExpr(*ix.target);
     if (!recv) return nullptr;
+    // §28.2 v0.135 / issue #621: checked disposal mode guard for the built-in
+    // array-backed collection indexer getter. bz_array_mark_disposed sets a
+    // `disposed` byte on the bz_array_t header and quarantines the struct
+    // (does not free); bz_array_is_disposed reads that byte. Guard arrays only
+    // (isArr); dict and LinkedList have separate disposal paths not yet guarded.
+    if (checkedDisposal_ && isArr) {
+        llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+        llvm::Value* flag = builder_.CreateCall(isFn, {recv}, "cd.arrdis");
+        llvm::Value* disposed = builder_.CreateICmpNE(
+            flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+        emitGuardThrow(disposed, "DisposedAccessException");
+    }
 
     // --- Array<T> / OwnedArray<T> indexer get (§4.4 / §4.5; #401 §4.1-§4.3) --
     // `a[i]` reads the slot at i (the getter borrows for class T, copies for
@@ -359,6 +372,16 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     if (!isArr && !isDict) return false;
     llvm::Value* recv = lowerExpr(*ix.target);
     if (!recv) return false;
+    // §28.2 v0.135 / issue #621: checked disposal mode guard for the built-in
+    // array-backed collection indexer setter. Mirrors the getter guard above.
+    if (checkedDisposal_ && isArr) {
+        llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+        llvm::Value* flag = builder_.CreateCall(isFn, {recv}, "cd.arrdis");
+        llvm::Value* disposed = builder_.CreateICmpNE(
+            flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+        emitGuardThrow(disposed, "DisposedAccessException");
+    }
 
     // --- Array<T> / OwnedArray<T> indexer set (§4.4 / §4.5; #401 §4.1-§4.3) --
     if (isArr) {
