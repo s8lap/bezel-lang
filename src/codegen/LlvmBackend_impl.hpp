@@ -2960,6 +2960,12 @@ private:
     // suspend point (yield / await)? Helper for suspendInTryPosition.
     static bool stmtContainsSuspend(const ast::Stmt* s);
 
+    // §29.6 / #554: does a single statement (e.g. a catch-arm body or a finally
+    // body) contain a `yield`? Used by suspendInTryPosition to enforce the
+    // §29.6 rule that yield in a catch arm body or finally is forbidden (but
+    // `await` in those positions is allowed per §30.9).
+    static bool stmtContainsYield(const ast::Stmt* s);
+
     // §30.9 / §31.2 (#438): does a single statement (a catch-arm body) contain an
     // `await`? Distinct from stmtContainsSuspend (which also reports `yield`):
     // lowerTry uses this to decide whether to frame-back the handler-context

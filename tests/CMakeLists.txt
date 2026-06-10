@@ -452,6 +452,7 @@ set(BEZEL_TEST_SOURCES
     codegen/builtin_collection_incdec_613_test.cpp
     codegen/dict_entry_iter_548_test.cpp
     codegen/dict_insertion_order_622_test.cpp
+    codegen/async_iter_try_finally_554_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

@@ -345,6 +345,18 @@ bool Emitter::stmtContainsSuspend(const ast::Stmt* s) {
     return false;
 }
 
+// §29.6 / #554: does a SINGLE statement contain a `yield` (but not necessarily
+// an `await`)? Used by suspendInTryPosition to check catch arm bodies and finally
+// blocks, where only `yield` is forbidden (§29.6) — `await` in those positions
+// is supported (§30.9 allows await in catch arm bodies and finally).
+bool Emitter::stmtContainsYield(const ast::Stmt* s) {
+    if (!s) return false;
+    if (dynamic_cast<const ast::YieldStmt*>(s)) return true;
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s))
+        return containsYield(db->body);
+    return false;
+}
+
 
 // §30.9 / §31.2 (#438): does a single statement (a catch-arm body) contain an
 // `await`? A catch arm body is one Stmt — a DoEndBlock for the multi-statement
@@ -369,29 +381,56 @@ bool Emitter::stmtContainsAwait(const ast::Stmt* s) {
 }
 
 
-// §30.7 (#440): detect a suspend point (yield / await) inside ANY try region —
-// the try body, a catch arm (guard or body), or a `finally` — in an async
-// iterator body. Resuming the fused state machine INTO a try/catch/finally scope
-// across a suspend (re-establishing the protected region / caught-exception
-// disposal / exit-mode dispatch at the resume entry) is unimplemented, so such a
-// shape is rejected with a diagnostic + a safe stub rather than emitting code
-// that crashes at runtime. Recurses into nested compound statements so a try
-// nested in a loop / if / do-block / outer try is still caught.
+// §29.6 / §30.7 (#554): detect a FORBIDDEN suspend position in an async
+// iterator body. The spec (§29.6) allows `yield return` / `yield break` inside a
+// `try` body whose surrounding statement has ONLY a `finally` (no catch arms) —
+// the same rule that governs synchronous iterators. For async iterators (§30.7),
+// `await` in the try body, a catch arm body, and a finally is also allowed (§30.9
+// plain-async rule applies here too). The FORBIDDEN positions are:
+//
+//   • yield inside a `try` body whose surrounding `try` has any catch arms.
+//   • yield inside a catch arm body (§29.6: "yield inside a catch arm: forbidden").
+//   • yield inside a `finally` block (§29.6: "yield inside finally: forbidden").
+//   • await inside a catch GUARD (`catch E when await ...`) — the guard runs
+//     during catch dispatch before the handler scope exists; §30.9 deferred.
+//
+// Everything else is allowed: yield or await in a try body with only finally
+// (§29.6 "allowed"), await in catch arm bodies and finally bodies (§30.9).
+// Recurses into nested compound statements so a forbidden position nested inside
+// a loop / if / do-block / outer try is still caught.
 bool Emitter::suspendInTryPosition(
     const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
     for (const auto& s : stmts) {
         if (!s) continue;
         if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
-            // A suspend anywhere in the try body, a catch arm, or the finally.
-            if (containsYield(ts->body) || containsAwait(ts->body)) return true;
+            const bool hasCatch = !ts->catches.empty();
+
+            // §29.6: yield in a try body WITH catch arms is forbidden.
+            if (hasCatch && containsYield(ts->body)) return true;
+
+            // §29.6: yield inside a catch arm body is forbidden (regardless of
+            // whether the outer try also has a finally).
             for (const auto& arm : ts->catches) {
+                if (stmtContainsYield(arm.body.get())) return true;
+                // §30.9: await in a catch GUARD is still deferred (runs during
+                // dispatch before the handler scope exists).
                 if (arm.guard && exprContainsAwait(arm.guard.get())) return true;
-                if (stmtContainsSuspend(arm.body.get())) return true;
             }
-            if (containsYield(ts->finallyBody) || containsAwait(ts->finallyBody))
-                return true;
-            // Recurse into the try body for a NESTED try.
+
+            // §29.6: yield inside a finally block is forbidden.
+            if (containsYield(ts->finallyBody)) return true;
+
+            // Recurse into the try body for NESTED try statements.
             if (suspendInTryPosition(ts->body)) return true;
+            // Recurse into catch arm bodies for nested try.
+            for (const auto& arm : ts->catches) {
+                const ast::Stmt* ab = arm.body.get();
+                if (auto* db = dynamic_cast<const ast::DoEndBlock*>(ab)) {
+                    if (suspendInTryPosition(db->body)) return true;
+                }
+            }
+            // Recurse into the finally for nested try.
+            if (suspendInTryPosition(ts->finallyBody)) return true;
             continue;
         }
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
@@ -1143,22 +1182,33 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     if (!ci.stmts) return;
     smKind_ = SuspendKind::AsyncYield;
 
-    // §30.7 (#440): a suspend point (yield / await) inside ANY try region — the
-    // try body, a catch arm, or a `finally` — in an async iterator is deferred.
-    // Resuming the fused yield+await state machine INTO a try scope across a
-    // suspend (re-establishing the protected region / caught-exception disposal /
-    // exit-mode dispatch at the resume entry) is unimplemented. Reject with a
-    // clear diagnostic + a safe stub so no crashing code (or malformed IR) escapes.
-    // This is stricter than the plain-async rule (awaitInDeferredTryPosition,
-    // which allows `await` in a try BODY) because an iterator's `yield` in a try
-    // body is itself a suspend across the protected region.
+    // §29.6 / §30.7 (#554): check for FORBIDDEN suspend positions in this async
+    // iterator body. The allowed positions are (§29.6 / §30.9):
+    //   • `yield` or `await` in a try body with ONLY a finally (no catch arms).
+    //   • `await` in a catch arm body or a finally (§30.9 plain-async rules apply).
+    // The forbidden positions (yield in try-with-catch, yield in catch arm body,
+    // yield in finally, await in catch guard) are rejected with a clean diagnostic.
     if (suspendInTryPosition(*ci.stmts)) {
         ctx_.diagnostics().report(
             Severity::Error,
             ms->decl ? ms->decl->span.begin : SourceLocation{},
-            "not yet implemented: `yield` or `await` inside a try / catch / "
-            "finally in an async iterator — resuming the state machine into the "
-            "protected scope across a suspend is a deferred increment (§30.7)");
+            "not implemented: `yield` in a try/catch arm body, `yield` in a "
+            "finally block, or `await` in a catch guard inside an async iterator "
+            "— forbidden by §29.6 / §30.7 (`yield` in a try body with only a "
+            "finally is allowed; `await` in try/catch/finally bodies is allowed "
+            "per §30.9)");
+        emitAsyncStub(ms, fn, ci);
+        return;
+    }
+    // §30.9: also reject the plain-async deferred position — await in a catch
+    // guard — in the async iterator body, using the same check as emitAsyncMethod.
+    if (awaitInDeferredTryPosition(*ci.stmts)) {
+        ctx_.diagnostics().report(
+            Severity::Error,
+            ms->decl ? ms->decl->span.begin : SourceLocation{},
+            "not yet implemented: `await` inside a catch GUARD (`catch ... when "
+            "await ...`) inside an async iterator — the guard runs during catch "
+            "dispatch before the handler scope exists (§30.9)");
         emitAsyncStub(ms, fn, ci);
         return;
     }
