@@ -412,6 +412,7 @@ set(BEZEL_TEST_SOURCES
     codegen/virtual_generic_override_580_test.cpp
     codegen/indexer_incdec_587_test.cpp
     codegen/catch_expr_body_588_test.cpp
+    codegen/console_write_unicode_592_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
