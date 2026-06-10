@@ -578,7 +578,13 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
         collectInstanceStorage(t, storage);
         std::vector<llvm::Type*> specFieldTys;
         specFieldTys.push_back(ptrTy());            // [0] vtable pointer
-        specFieldTys.push_back(disposedFlagTy());   // [1] disposed run-once flag
+        // #595: a class that directly inherits a built-in exception inserts the
+        // inherited message-ptr slot at [1] so byte offset 8 matches the built-in
+        // exception layout (vtable + message_ptr at offset 0/8).  The disposed
+        // flag moves to [2] in that case.
+        if (hasBuiltinExceptionBase(t))
+            specFieldTys.push_back(ptrTy());        // [1] inherited message ptr
+        specFieldTys.push_back(disposedFlagTy());   // [1 or 2] disposed run-once flag
         for (const sema::Symbol* m : storage)
             specFieldTys.push_back(storageType(m));
         // Cache lookup: specializedStructs_[t][specFieldTys] → existing
@@ -591,9 +597,9 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
         auto* specSt = llvm::StructType::create(llvm_, specName);
         specSt->setBody(specFieldTys);
         specMap[specFieldTys] = specSt;
-        // Register field indices for this specialization (data fields start at
-        // index 2, after the vtable and the disposed flag).
-        unsigned sidx = 2;
+        // Register field indices for this specialization.  Data fields start
+        // after the vtable, the optional message-ptr, and the disposed flag.
+        unsigned sidx = disposedFlagIndex(t) + 1;
         for (const sema::Symbol* m : storage)
             fieldIndex_[m] = sidx++;
         return specSt;
@@ -609,16 +615,22 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     std::vector<llvm::Type*> fieldTys;
     // CG17: slot 0 is the hidden vtable pointer.
     fieldTys.push_back(ptrTy());
-    // §28.2 / §28.6: slot 1 is the per-object i8 "disposed" run-once flag,
-    // calloc-zeroed to 0 = not-disposed. It sits BEFORE all data fields so it is
-    // at a FIXED offset (right after the vtable pointer) for every class — the
-    // same in a base, every derived class (prefix layout preserved: inherited
-    // data fields keep their index 2..), and every generic specialization
-    // (independent of field type sizes). The shared, type-erased generated
-    // Dispose (one per class template, used by all instantiations) therefore
-    // reads/writes the flag at the correct offset regardless of substitution.
+    // #595 / §12 / §31: a user class that directly inherits a built-in exception
+    // (e.g. `class ErrA: Exception`) needs to share the Exception object layout
+    // so that `e.Message` reads the same slot regardless of whether `e` is typed
+    // as the user class or as the built-in base.  Built-in exceptions are laid out
+    // as [vtable_ptr, message_ptr] (16 raw bytes, no TypeSymbol, no disposed flag).
+    // We honour that layout by inserting the message-ptr at slot 1 BEFORE the
+    // disposed flag, giving: [vtable(0), message_ptr(1), disposed(2), own_fields…].
+    // disposedFlagIndex() returns 2 for such classes so the disposer and disposal
+    // checks GEP to the right slot automatically.
+    if (hasBuiltinExceptionBase(t))
+        fieldTys.push_back(ptrTy());          // [1] inherited message ptr (ptr)
+    // §28.2 / §28.6: the per-object i8 "disposed" run-once flag.  It sits at a
+    // fixed index in every class (1 normally, 2 for builtin-exception-derived
+    // classes — see disposedFlagIndex), calloc-zeroed to 0 = not-disposed.
     fieldTys.push_back(disposedFlagTy());
-    unsigned idx = 2;
+    unsigned idx = disposedFlagIndex(t) + 1;
     for (const sema::Symbol* m : storage) {
         fieldTys.push_back(storageType(m));
         fieldIndex_[m] = idx++;
@@ -635,11 +647,20 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
 llvm::Type* Emitter::disposedFlagTy() { return llvm::Type::getInt8Ty(llvm_); }
 
 
-// §28.2 / §28.6: the struct index of every class's disposed flag — fixed at 1,
-// right after the vtable pointer (index 0) and before all data fields. Uniform
-// across the hierarchy and across generic specializations, so the shared
-// generated Dispose accesses it correctly on any instance.
-unsigned Emitter::disposedFlagIndex(const sema::TypeSymbol* /*t*/) {
+// §28.2 / §28.6 / #595: the struct index of a class's disposed flag.
+//
+// For ordinary classes: slot 1 (right after the vtable pointer, before all data
+// fields).  Uniform across the hierarchy and generic specializations, so the
+// shared generated Dispose accesses it correctly.
+//
+// For user classes that directly inherit a built-in exception type (§12 / §31):
+// slot 2 — because slot 1 is occupied by the inherited message-ptr that mirrors
+// the built-in exception's [vtable, message_ptr] layout at byte offsets 0 and 8.
+// Moving the disposed flag to slot 2 ensures byte offset 8 always carries the
+// message pointer, so `e.Message` reads the same slot whether `e` is typed as
+// the user class or as the built-in Exception base type.
+unsigned Emitter::disposedFlagIndex(const sema::TypeSymbol* t) {
+    if (t && hasBuiltinExceptionBase(t)) return 2u;
     return 1u;
 }
 

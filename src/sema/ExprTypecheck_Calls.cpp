@@ -3883,7 +3883,64 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         bool isUniversalObjectMember =
             mm == "ToString" || mm == "Equals" || mm == "GetHashCode" ||
             mm == "GetType" || mm == "ReferenceEquals" || mm == "Dispose";
-        if (knownCompleteUserType && !isUniversalObjectMember) {
+        // #595 / §12 / §31: `Message` is an inherited member on any user class
+        // that derives (directly or via a user-class chain) from a built-in
+        // exception type (Exception, ArgumentException, …).  Built-in exception
+        // types are absent from TypeSymbol::baseTypes so we walk the AST
+        // TypeDecl::baseTypes chain to detect the inheritance.  When `Message` is
+        // found valid here, also set its resolved type to `string` so callers
+        // (e.g. `.Length` on the result) can infer the chain type.
+        bool isBuiltinExInheritedMember = false;
+        if (mm == "Message" && knownCompleteUserType &&
+                targetType->kind == ast::TypeDeclKind::Class) {
+            // Walk the user-class TypeSymbol chain checking each AST TypeDecl's
+            // base-type list for a built-in exception name.
+            auto isBuiltinExName = [](std::string_view n) -> bool {
+                return n == "Exception"             ||
+                       n == "ArgumentException"     ||
+                       n == "ArgumentNullException" ||
+                       n == "ArithmeticException"   ||
+                       n == "OverflowException"     ||
+                       n == "DivideByZeroException" ||
+                       n == "InvalidOperationException" ||
+                       n == "NotImplementedException"   ||
+                       n == "NullReferenceException"    ||
+                       n == "IndexOutOfRangeException"  ||
+                       n == "KeyNotFoundException"      ||
+                       n == "MatchFailureException"     ||
+                       n == "OperationCanceledException"||
+                       n == "TypeInitializationException" ||
+                       n == "FormatException"           ||
+                       n == "StackOverflowException";
+            };
+            for (const TypeSymbol* cur = targetType; cur && !isBuiltinExInheritedMember;) {
+                auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);
+                if (td) {
+                    for (const auto& bt : td->baseTypes) {
+                        if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                        if (isBuiltinExName(bt->name->parts.back())) {
+                            isBuiltinExInheritedMember = true;
+                            break;
+                        }
+                    }
+                }
+                // Advance to next user-class base.
+                const TypeSymbol* next = nullptr;
+                for (const TypeSymbol* b : cur->baseTypes) {
+                    if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
+                        next = b; break;
+                    }
+                }
+                cur = next;
+            }
+            if (isBuiltinExInheritedMember) {
+                // `e.Message` returns a string (§31 / stdlib Exception.Message).
+                ctx_.setExprType(&ma,
+                    ctx_.primitiveTypeRef(PrimitiveType::String));
+            }
+        }
+        if (knownCompleteUserType && !isUniversalObjectMember &&
+                !isBuiltinExInheritedMember) {
             ctx_.diagnostics().report(
                 Severity::Error, ma.span.begin,
                 std::string("no member `") + std::string(ma.member) +
