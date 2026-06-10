@@ -1541,12 +1541,19 @@ private:
     bool lowerIndexerCompound(const ast::AssignmentStmt& as);
 
     // fix #508 / stdlib §4.4 / §4.5 / §17.15: compound assignment `arr[i] OP= v`
-    // on a HEAP-collection Array<T> / OwnedArray<T> indexer. Evaluates receiver and
-    // index ONCE, reads via bz_array_get, applies OP, writes back via bz_array_set
-    // (or bz_array_set_disposing for OwnedArray). Returns true if handled; false if
-    // the target is not an array-backed heap collection (user-defined indexer,
-    // inline array, dict — those have other paths or are handled elsewhere).
+    // on a HEAP-collection Array<T>/OwnedArray<T>/Dictionary<K,V> indexer.
+    // Evaluates receiver and index ONCE (array path), reads via bz_array_get /
+    // lowerCollectionIndexerGet, applies OP, writes back via bz_array_set /
+    // lowerCollectionIndexerSet. Returns true if handled; false if the target is
+    // not a built-in heap collection (user-defined indexer, inline array).
     bool lowerCollectionIndexerCompound(const ast::AssignmentStmt& as);
+
+    // fix #613 / §25.1 / §4.4 / §4.8: `arr[i]++` / `arr[i]--` / `dict[k]++` /
+    // `dict[k]--` on a BUILT-IN heap collection (Array<T>, Dictionary<K,V>, and
+    // their owning/list-interface variants). Reads via lowerCollectionIndexerGet,
+    // computes ±1, writes back via lowerCollectionIndexerSet. Returns true if
+    // handled; false if the target is not a built-in heap-collection IndexExpr.
+    bool lowerCollectionIndexerIncrDecr(const ast::IncrementStmt& inc);
 
     // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer read
     // `a[i]` / `dict[key]` against the runtime backing (bz_array_* / bz_dict_*).
