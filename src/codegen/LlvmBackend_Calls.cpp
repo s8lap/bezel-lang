@@ -6620,43 +6620,61 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             llvm::ConstantPointerNull::get(ptrTy())});
                     } else if (isLinkedListTypeName(recvTy)) {
                         // per §4.6/§4.7: LinkedList<T>.Dispose() → bz_llist_free.
-                        // OwnedLinkedList<T> cascades disposal into class elements
-                        // (same owningCollectionElemDisposer pattern as OwnedArray).
-                        llvm::Function* elemDisp =
-                            owningCollectionElemDisposer(recvTy);
-                        llvm::Value* disp = elemDisp
-                            ? llvm::cast<llvm::Value>(elemDisp)
-                            : llvm::ConstantPointerNull::get(ptrTy());
-                        auto* fn = declareC("bz_llist_free",
-                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                        builder_.CreateCall(fn, {recv, disp});
+                        // OwnedLinkedList<T> cascades disposal into class elements.
+                        // #602 / §28.11 v0.135: route directly through elementPolicyFor.
+                        {
+                            const sema::TypeRef* llElem =
+                                (!recvTy->genericArgs.empty())
+                                    ? recvTy->genericArgs[0] : nullptr;
+                            bool llIsOwning =
+                                recvTy->astNode && recvTy->astNode->name &&
+                                !recvTy->astNode->name->parts.empty() &&
+                                recvTy->astNode->name->parts[0].rfind("Owned",0) == 0;
+                            llvm::Function* elemDisp =
+                                elementPolicyFor(llElem, llIsOwning).disposerThunk;
+                            llvm::Value* disp = elemDisp
+                                ? llvm::cast<llvm::Value>(elemDisp)
+                                : llvm::ConstantPointerNull::get(ptrTy());
+                            auto* fn = declareC("bz_llist_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {recv, disp});
+                        }
                     } else if (isCollectionTypeName(recvTy)) {
                         // #362 / stdlib §4.5: explicit Dispose() on an owning
                         // collection cascades disposal into its class elements;
                         // a borrowing collection frees only the backing.
-                        // §28.2 v0.135 / issue #621: in checked-disposal mode use
-                        // bz_array_mark_disposed (quarantine: sets disposed flag,
-                        // disposes elements, frees the data buffer, but keeps the
-                        // header alive so the indexer guard can read the flag).
-                        // In unchecked mode use bz_array_free as before.
-                        llvm::Function* elemDisp =
-                            owningCollectionElemDisposer(recvTy);
-                        llvm::Value* disp = elemDisp
-                            ? llvm::cast<llvm::Value>(elemDisp)
-                            : llvm::ConstantPointerNull::get(ptrTy());
-                        const char* freeName = checkedDisposal_
-                            ? "bz_array_mark_disposed"
-                            : "bz_array_free";
-                        auto* fn = declareC(freeName,
-                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                        builder_.CreateCall(fn, {recv, disp});
+                        // #602 / §28.11 v0.135: disposer derived from
+                        // elementPolicyFor (covers Interface elements, #619).
+                        // §28.2 v0.135 / #621: checked-disposal mode quarantines
+                        // via bz_array_mark_disposed (flag stays readable for the
+                        // indexer guard); unchecked mode frees as before.
+                        {
+                            const sema::TypeRef* arrElem =
+                                (!recvTy->genericArgs.empty())
+                                    ? recvTy->genericArgs[0] : nullptr;
+                            bool arrIsOwning =
+                                recvTy->astNode && recvTy->astNode->name &&
+                                !recvTy->astNode->name->parts.empty() &&
+                                recvTy->astNode->name->parts[0].rfind("Owned",0) == 0;
+                            llvm::Function* elemDisp =
+                                elementPolicyFor(arrElem, arrIsOwning).disposerThunk;
+                            llvm::Value* disp = elemDisp
+                                ? llvm::cast<llvm::Value>(elemDisp)
+                                : llvm::ConstantPointerNull::get(ptrTy());
+                            const char* freeName = checkedDisposal_
+                                ? "bz_array_mark_disposed"
+                                : "bz_array_free";
+                            auto* fn = declareC(freeName,
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {recv, disp});
+                        }
                     } else if (isDictTypeName(recvTy)) {
                         // #396 / stdlib §4.9 + #401 / stdlib §4.8: explicit
                         // Dispose() on a hash-backed dictionary frees the backing
                         // table (and key bytes) and runs the per-value callback,
                         // the same one the #394/#401 scope-end path uses:
-                        //   * OwnedDictionary<K, class> → dispose+free each
-                        //     surviving class value (#396/#394).
+                        //   * OwnedDictionary<K, class/interface> → dispose+free
+                        //     each surviving value (#396/#394).
                         //   * borrowing Dictionary<K, record> → free each
                         //     surviving record value BOX (#401; a record is a
                         //     value type, nothing to dispose, §3.2 / §9).
@@ -6664,45 +6682,56 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         // box → null disposer (only the backing is freed). The
                         // two value callbacks are mutually exclusive, so no box
                         // is freed twice.
-                        llvm::Function* valDisp =
-                            owningDictValueDisposer(recvTy);
-                        if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
-                        llvm::Value* disp = valDisp
-                            ? llvm::cast<llvm::Value>(valDisp)
-                            : llvm::ConstantPointerNull::get(ptrTy());
-                        auto* fn = declareC("bz_dict_free",
-                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                        builder_.CreateCall(fn, {recv, disp});
-                        // §28.2 idempotency: a `using var` dict (or an owned
-                        // dict field) that is explicitly Dispose()d is ALSO
-                        // disposed at scope end (the #394 `it->dict` path) or by
-                        // a later explicit call. bz_dict_free is NOT idempotent
-                        // — a second call on the same freed table double-frees
-                        // it (and would double-dispose its values). Null the
-                        // receiver's slot so any subsequent bz_dict_free reloads
-                        // null and no-ops (bz_dict_free(null) returns). This
-                        // makes "first Dispose disposes; subsequent calls are
-                        // no-ops" (§28.2) hold for the dict's combined paths.
-                        // lvalueAddr yields the slot for an identifier receiver
-                        // (using-var local or owned field, boxed or not); for a
-                        // non-lvalue receiver (a temporary) there is no second
-                        // path to guard. Restricted to the identifier / member-
-                        // access lvalue forms — the ones that name a using-var
-                        // local or an owned field — so re-deriving the address
-                        // re-evaluates only a side-effect-free base (the local's
-                        // slot, or `this`/the owner for a field).
-                        bool lvalueRecv =
-                            dynamic_cast<const ast::IdentifierExpr*>(
-                                ma->target.get()) ||
-                            dynamic_cast<const ast::MemberAccessExpr*>(
-                                ma->target.get());
-                        llvm::Type* slotTy = nullptr;
-                        if (lvalueRecv) {
-                            if (llvm::Value* slot =
-                                    lvalueAddr(*ma->target, slotTy)) {
-                                builder_.CreateStore(
-                                    llvm::ConstantPointerNull::get(ptrTy()),
-                                    slot);
+                        // #602 / §28.11 v0.135: derive owning-class disposer
+                        // directly from elementPolicyFor (covers Interface too).
+                        {
+                            const sema::TypeRef* dictVal =
+                                (recvTy->genericArgs.size() > 1)
+                                    ? recvTy->genericArgs[1] : nullptr;
+                            bool dictIsOwning =
+                                recvTy->astNode && recvTy->astNode->name &&
+                                !recvTy->astNode->name->parts.empty() &&
+                                recvTy->astNode->name->parts[0] == "OwnedDictionary";
+                            llvm::Function* valDisp =
+                                elementPolicyFor(dictVal, dictIsOwning).disposerThunk;
+                            if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
+                            llvm::Value* disp = valDisp
+                                ? llvm::cast<llvm::Value>(valDisp)
+                                : llvm::ConstantPointerNull::get(ptrTy());
+                            auto* fn = declareC("bz_dict_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {recv, disp});
+                            // §28.2 idempotency: a `using var` dict (or an owned
+                            // dict field) that is explicitly Dispose()d is ALSO
+                            // disposed at scope end (the #394 `it->dict` path) or by
+                            // a later explicit call. bz_dict_free is NOT idempotent
+                            // — a second call on the same freed table double-frees
+                            // it (and would double-dispose its values). Null the
+                            // receiver's slot so any subsequent bz_dict_free reloads
+                            // null and no-ops (bz_dict_free(null) returns). This
+                            // makes "first Dispose disposes; subsequent calls are
+                            // no-ops" (§28.2) hold for the dict's combined paths.
+                            // lvalueAddr yields the slot for an identifier receiver
+                            // (using-var local or owned field, boxed or not); for a
+                            // non-lvalue receiver (a temporary) there is no second
+                            // path to guard. Restricted to the identifier / member-
+                            // access lvalue forms — the ones that name a using-var
+                            // local or an owned field — so re-deriving the address
+                            // re-evaluates only a side-effect-free base (the local's
+                            // slot, or `this`/the owner for a field).
+                            bool lvalueRecv =
+                                dynamic_cast<const ast::IdentifierExpr*>(
+                                    ma->target.get()) ||
+                                dynamic_cast<const ast::MemberAccessExpr*>(
+                                    ma->target.get());
+                            llvm::Type* slotTy = nullptr;
+                            if (lvalueRecv) {
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy)) {
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                                }
                             }
                         }
                     } else {

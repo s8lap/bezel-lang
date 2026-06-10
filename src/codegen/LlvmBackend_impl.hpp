@@ -2455,13 +2455,6 @@ private:
     llvm::Function* sharedReleaseThunk();
     llvm::Function* weakReleaseThunk();
 
-    // #362 / stdlib §4.5: if `collTy` is an OWNING collection (name prefixed
-    // "Owned") whose element type is a class, return the element-disposer thunk
-    // (so disposing the collection cascades into its elements); otherwise null.
-    // A borrowing collection, or one with value/string elements, has no element
-    // disposal obligation and returns null (only the backing is freed).
-    llvm::Function* owningCollectionElemDisposer(const sema::TypeRef* collTy);
-
     // #429 / §4.6 / §28.9: a module-level `void(void*)` thunk that calls
     // bz_string_release on the element (the slot holds a bz_string*). Used as the
     // per-element callback for bz_array_free / bz_array_clear_disposing /
@@ -2470,33 +2463,11 @@ private:
     // literal or null. Built once per module and cached.
     llvm::Function* stringElementReleaseThunk();
 
-    // #429 / §4.6 / §28.9: is `collTy` an array-backed BORROWING collection
-    // (Array/Stack/Queue — NOT an "Owned…" form, NOT a Set which is hash-backed)
-    // whose element type is a non-nullable `string`? Such a collection co-owns a
-    // +1 per element (retained at insert) and must release each at free. Returns
-    // the string-release thunk for those, else null. Set<string> is hash-backed
-    // (dict path) and excluded; nullable string? elements keep the prior leak
-    // (left to a follow-on) to avoid the tagged-pointer ambiguity.
-    llvm::Function* stringElementReleaseDisposer(const sema::TypeRef* collTy);
-
     // #429 / §4.6 / §28.9: is `collTy` an array-backed collection whose element
-    // type is a non-nullable `string`? (the predicate behind
-    // stringElementReleaseDisposer, factored so insert sites can retain).
+    // type is a non-nullable `string`? Used by emitArrayRetainStringsIfStringArray.
+    // All disposal / indexer-set sites derive this from elementPolicyFor directly
+    // (#602 batch 3); this predicate remains only for the bulk-retain path below.
     bool isStringElementArray(const sema::TypeRef* collTy);
-
-    // #429 / §28.9 / §4.10: is `collTy` a Set<string> (the generic-key,
-    // dict-backed set whose elements are non-nullable strings stored as keys)?
-    // Such a set co-owns a +1 per element (retained at Add, released at
-    // Remove/Clear/free). Excludes OwnedSet (string is forbidden as an owned
-    // collection element, §15.2) and nullable string?.
-    bool isStringElementSet(const sema::TypeRef* collTy);
-
-    // #429 / §28.9 / §4.8: is `dictTy` a non-owning Dictionary<K, string>
-    // (borrowing, with a non-nullable string VALUE)? Such a dict co-owns a +1
-    // per stored value (retained at Add/Set/indexer-set, released at
-    // Remove/Clear/free). Excludes OwnedDictionary (different ownership model)
-    // and nullable string?.
-    bool isStringValueDict(const sema::TypeRef* dictTy);
 
     // #429 / §4.6 / §28.9: when `collTy` is a borrowing Array<string> (etc.),
     // emit a bz_array_retain_strings(arr) over the freshly produced array `arr`
@@ -2510,15 +2481,6 @@ private:
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {arr});
     }
-
-    // #394 / stdlib §4.9: if `dictTy` is an OwnedDictionary<K,V> whose VALUE
-    // type (genericArgs[1]) is a class, return the element-disposer thunk (so
-    // freeing the dictionary at scope end cascades disposal into each surviving
-    // value); otherwise null. A borrowing Dictionary, or a value-typed V, has no
-    // value-disposal obligation and returns null (only the backing table and the
-    // malloc'd key bytes are freed). Keys are never disposed (§4.9: keys are
-    // value-like; the dictionary owns its values only).
-    llvm::Function* owningDictValueDisposer(const sema::TypeRef* dictTy);
 
     // #401 / stdlib §4.8 + language spec §3.2 / §9: a standalone `void(void*)`
     // thunk that just `free`s the pointer (null-safe), with NO destructor /

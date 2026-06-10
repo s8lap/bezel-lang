@@ -1900,12 +1900,29 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // cascades disposal into its class elements (for an owning collection).
         // bz_array_free / bz_llist_free are null-safe, so no field null-check needed.
         if (it->collTy) {
-            llvm::Function* elemDisp = owningCollectionElemDisposer(it->collTy);
-            // #429 / §4.6 / §28.9: an `owned Array<string>` field co-owns a +1 per
-            // element (retained at insert / copy); release each on the owner's
-            // disposal via the string-release thunk. owningCollectionElemDisposer
-            // returned null for it (mutually exclusive — string is not a class).
-            if (!elemDisp) elemDisp = stringElementReleaseDisposer(it->collTy);
+            // #602 / §28.11 v0.135: derive element disposer directly from
+            // elementPolicyFor (covering class, interface, Shared/Weak elements).
+            // A borrowing Array/Stack/Queue<string> co-owns a +1 per element
+            // (retainRelease=true); use the string-release thunk for that row.
+            // The two paths are mutually exclusive (string is not a class).
+            const sema::TypeRef* collElem =
+                (!it->collTy->genericArgs.empty()) ? it->collTy->genericArgs[0]
+                                                   : nullptr;
+            bool collIsOwning =
+                it->collTy->astNode && it->collTy->astNode->name &&
+                !it->collTy->astNode->name->parts.empty() &&
+                it->collTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+            ElementPolicy fieldCollPol = elementPolicyFor(collElem, collIsOwning);
+            llvm::Function* elemDisp = fieldCollPol.disposerThunk;
+            if (!elemDisp && fieldCollPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                    collElem && collElem->kind == sema::TypeRef::Kind::Primitive &&
+                    collElem->primitive == sema::PrimitiveType::String &&
+                    !collElem->nullable &&
+                    it->collTy->astNode && it->collTy->astNode->name &&
+                    !it->collTy->astNode->name->parts.empty() &&
+                    [](std::string_view n){ return n == "Array" || n == "Stack" ||
+                        n == "Queue"; }(it->collTy->astNode->name->parts[0]))
+                elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
                 : llvm::ConstantPointerNull::get(ptrTy());
@@ -2544,32 +2561,17 @@ bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
 }
 
 
-llvm::Function* Emitter::owningCollectionElemDisposer(
-        const sema::TypeRef* collTy) {
-    // fix #619 / #602 / #362 / stdlib §4.5 / §28.11 v0.135: thin delegate to
-    // elementPolicyFor.  Per the §28.11 v0.135 table, the owning family ×
-    // class/interface element row produces a disposer thunk; every other
-    // combination returns null.
-    //
-    // elementPolicyFor already handles Class|Interface correctly (it admits
-    // Interface in the Named/declaration branch).  The former Class-only
-    // pre-check here was the only site blocking Interface elements from
-    // reaching the factory.  Removing it fixes the OwnedArray<IFoo> /
-    // OwnedLinkedList<IFoo> leak (§28.11 owned column / §14.4).
-    if (!collTy || !collTy->astNode || !collTy->astNode->name ||
-        collTy->astNode->name->parts.empty())
-        return nullptr;
-    std::string_view n = collTy->astNode->name->parts[0];
-    bool isOwning = (n.rfind("Owned", 0) == 0);
-    if (!isOwning) return nullptr;
-    if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return nullptr;
-    const sema::TypeRef* el = collTy->genericArgs[0];
-    // per §28.11 v0.135: delegate entirely to elementPolicyFor; it handles
-    // Class, Interface, Shared<T>/Weak<T>, and value types correctly.
-    ElementPolicy pol = elementPolicyFor(el, /*owningFamily=*/true);
-    return pol.disposerThunk;   // non-null for ClassOwned (class or interface)
-}
-
+// #602 batch 3: owningCollectionElemDisposer deleted — all call sites now use
+// elementPolicyFor(el, owningFamily).disposerThunk directly.
+// #602 batch 3: owningDictValueDisposer deleted — all call sites now use
+// elementPolicyFor(val, dictIsOwning).disposerThunk directly.
+// #602 batch 3: isStringElementSet deleted — all call sites now use
+// elementPolicyFor(el, false) + string primitive check directly.
+// #602 batch 3: isStringValueDict deleted — all call sites now use
+// elementPolicyFor(val, false) + string primitive check directly.
+// #602 batch 3: stringElementReleaseDisposer deleted — all disposal call sites
+// now use elementPolicyFor directly; isStringElementArray remains for
+// emitArrayRetainStringsIfStringArray (bulk-retain path).
 
 llvm::Function* Emitter::stringElementReleaseThunk() {
     // #429 / §4.6 / §28.9: a standalone `void(void*)` thunk that releases one
@@ -2623,91 +2625,6 @@ bool Emitter::isStringElementArray(const sema::TypeRef* collTy) {
     return pol.cat == ElementPolicy::Category::RuntimeManaged &&
            el->kind == sema::TypeRef::Kind::Primitive &&
            el->primitive == sema::PrimitiveType::String;
-}
-
-
-llvm::Function* Emitter::stringElementReleaseDisposer(const sema::TypeRef* collTy) {
-    // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: thin delegate — delegates
-    // the collection-family + element classification to isStringElementArray
-    // (which delegates to elementPolicyFor); returns the release thunk when the
-    // classification matches, null otherwise.  Behavior unchanged.
-    if (!isStringElementArray(collTy)) return nullptr;
-    return stringElementReleaseThunk();
-}
-
-
-bool Emitter::isStringElementSet(const sema::TypeRef* collTy) {
-    // #602 / #429 / §28.9 / §4.10 / §28.11 v0.134: thin delegate.
-    // Set is dict-backed (not array-backed); OwnedSet cannot carry string
-    // elements (§15.2); nullable string? is excluded (sentinel-collision
-    // risk — same intentional deferral as before).
-    //
-    // Policy check: RuntimeManaged AND specifically a `string` primitive
-    // (same string-vs-function distinction as isStringElementArray — see that
-    // helper for the rationale).  Nullable string? is excluded.
-    if (!collTy || !collTy->astNode || !collTy->astNode->name ||
-        collTy->astNode->name->parts.empty())
-        return false;
-    if (collTy->astNode->name->parts[0] != "Set") return false;
-    if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return false;
-    const sema::TypeRef* el = collTy->genericArgs[0];
-    if (el->nullable) return false;
-    ElementPolicy pol = elementPolicyFor(el, /*owningFamily=*/false);
-    return pol.cat == ElementPolicy::Category::RuntimeManaged &&
-           el->kind == sema::TypeRef::Kind::Primitive &&
-           el->primitive == sema::PrimitiveType::String;
-}
-
-
-bool Emitter::isStringValueDict(const sema::TypeRef* dictTy) {
-    // #602 / #429 / §28.9 / §4.8 / §28.11 v0.134: thin delegate.
-    // For a Dictionary the KEY classification follows the borrowing column
-    // (§28.11 table footnote: "For dictionaries ... keys are value-like and
-    // classified per the borrowing column"); the VALUE classification follows
-    // the owning-or-borrowing family of the dictionary. Here we care only
-    // about BORROWING Dictionary<K, string> (the non-owning form), so
-    // owningFamily=false for the value slot.
-    //
-    // OwnedDictionary is excluded (it routes through owningDictValueDisposer);
-    // nullable string? is excluded (sentinel-collision risk — same deferral).
-    if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
-        dictTy->astNode->name->parts.empty())
-        return false;
-    if (dictTy->astNode->name->parts[0] != "Dictionary") return false;
-    if (dictTy->genericArgs.size() <= 1 || !dictTy->genericArgs[1]) return false;
-    const sema::TypeRef* val = dictTy->genericArgs[1];
-    if (val->nullable) return false;
-    ElementPolicy pol = elementPolicyFor(val, /*owningFamily=*/false);
-    // Require RuntimeManaged AND confirm specifically a `string` primitive
-    // (same string-vs-function distinction as isStringElementArray — see that
-    // helper for the rationale).
-    return pol.cat == ElementPolicy::Category::RuntimeManaged &&
-           val->kind == sema::TypeRef::Kind::Primitive &&
-           val->primitive == sema::PrimitiveType::String;
-}
-
-
-llvm::Function* Emitter::owningDictValueDisposer(const sema::TypeRef* dictTy) {
-    // fix #619 / #602 / #394 / stdlib §4.9 / §28.11 v0.135: thin delegate to
-    // elementPolicyFor.  Per the §28.11 v0.135 table, an OwnedDictionary<K,V>
-    // owns its VALUES (genericArgs[1]); keys are value-like and classified per
-    // the borrowing column (§28.11 footnote).  The owning × class/interface
-    // row produces a disposer thunk; everything else returns null.
-    //
-    // The former Class-only pre-check was the only site blocking Interface
-    // values from reaching elementPolicyFor's correct Class|Interface branch.
-    // Removing it fixes the OwnedDictionary<K,IFoo> value-disposal leak
-    // (§28.11 owned column / §14.4).
-    if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
-        dictTy->astNode->name->parts.empty())
-        return nullptr;
-    if (dictTy->astNode->name->parts[0] != "OwnedDictionary") return nullptr;
-    if (dictTy->genericArgs.size() <= 1 || !dictTy->genericArgs[1]) return nullptr;
-    const sema::TypeRef* val = dictTy->genericArgs[1];
-    // per §28.11 v0.135: delegate entirely to elementPolicyFor; it handles
-    // Class, Interface, Shared<T>/Weak<T>, and value types correctly.
-    ElementPolicy pol = elementPolicyFor(val, /*owningFamily=*/true);
-    return pol.disposerThunk;   // non-null for ClassOwned (class or interface)
 }
 
 
@@ -4354,7 +4271,18 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (const sema::TypeRef* llTy = linkedListTypeOfLocal(ld)) {
         Disposal d{it->second, nullptr};
         d.linkedList = true;
-        d.collectionElemDisposer = owningCollectionElemDisposer(llTy);
+        // #602 / §28.11 v0.135: derive element disposer directly from
+        // elementPolicyFor (covering class/interface elements).
+        {
+            const sema::TypeRef* llEl =
+                (!llTy->genericArgs.empty()) ? llTy->genericArgs[0] : nullptr;
+            bool llIsOwning =
+                llTy->astNode && llTy->astNode->name &&
+                !llTy->astNode->name->parts.empty() &&
+                llTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+            d.collectionElemDisposer =
+                elementPolicyFor(llEl, llIsOwning).disposerThunk;
+        }
         disposeStack_.back().push_back(d);
         return;
     }
@@ -4368,7 +4296,25 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             // is the minimal targeted fix for the #429 Set<string> sub-slice; fixing
             // all Set<T> disposal (replacing bz_array_free with bz_dict_free) is a
             // broader correctness fix deferred to a separate lane.
-            if (isStringElementSet(collTy)) {
+            // #602 / §28.11 v0.135: derive element category from elementPolicyFor.
+            auto isStrElem = [&](const sema::TypeRef* ty, bool owning) {
+                if (!ty || ty->genericArgs.empty() || !ty->genericArgs[0]) return false;
+                const sema::TypeRef* el = ty->genericArgs[0];
+                if (el->nullable) return false;
+                ElementPolicy p = elementPolicyFor(el, owning);
+                return p.cat == ElementPolicy::Category::RuntimeManaged &&
+                       el->kind == sema::TypeRef::Kind::Primitive &&
+                       el->primitive == sema::PrimitiveType::String;
+            };
+            bool collIsOwning =
+                collTy->astNode && collTy->astNode->name &&
+                !collTy->astNode->name->parts.empty() &&
+                collTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+            bool isSetName =
+                collTy->astNode && collTy->astNode->name &&
+                !collTy->astNode->name->parts.empty() &&
+                collTy->astNode->name->parts[0] == "Set";
+            if (isSetName && isStrElem(collTy, /*owning=*/false)) {
                 Disposal d{it->second, nullptr};
                 d.dict = true;
                 d.dictStringKeys = true;  // signal pre-free string key release
@@ -4377,14 +4323,25 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             }
             Disposal d{it->second, nullptr};
             d.collection = true;
-            d.collectionElemDisposer = owningCollectionElemDisposer(collTy);
-            // #429 / §4.6 / §28.9: a borrowing Array<string> co-owns a +1 per
-            // element (retained at insert / copy); at scope end release each via
-            // the string-release thunk. owningCollectionElemDisposer returned null
-            // for it (string is not a class, and Array is not "Owned…"), so the
-            // two disposers are mutually exclusive.
-            if (!d.collectionElemDisposer)
-                d.collectionElemDisposer = stringElementReleaseDisposer(collTy);
+            // #602 / §28.11 v0.135: element disposer from policy (class/interface
+            // owned → vtable thunk; Shared/Weak owned → shared/weak release thunk).
+            {
+                const sema::TypeRef* collEl =
+                    (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
+                ElementPolicy cp = elementPolicyFor(collEl, collIsOwning);
+                d.collectionElemDisposer = cp.disposerThunk;
+                // #429 / §4.6 / §28.9: a borrowing Array/Stack/Queue<string>
+                // co-owns a +1 per element — use the string-release thunk.
+                // Mutually exclusive with the class-disposer above.
+                if (!d.collectionElemDisposer &&
+                        cp.cat == ElementPolicy::Category::RuntimeManaged &&
+                        collEl &&
+                        collEl->kind == sema::TypeRef::Kind::Primitive &&
+                        collEl->primitive == sema::PrimitiveType::String &&
+                        !collEl->nullable) {
+                    d.collectionElemDisposer = stringElementReleaseThunk();
+                }
+            }
             disposeStack_.back().push_back(d);
             return;
         }
@@ -4394,8 +4351,9 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // excluded from isCollectionTypeName (they free via bz_dict_free, not
     // bz_array_free), so they get their own disposal kind here. The per-value
     // callback is one of exactly three mutually exclusive things (or null):
-    //   * #394: an OwnedDictionary<K, class> → cascade disposal into each
-    //     surviving CLASS value (dispose + free via its vtable).
+    //   * #394: an OwnedDictionary<K, class/interface> → cascade disposal into
+    //     each surviving value (dispose + free via vtable) — #602: covers
+    //     Interface too via elementPolicyFor.
     //   * #401: a borrowing Dictionary<K, record> → free each surviving record
     //     value BOX (plain free; a record is a value type with nothing to
     //     dispose, §3.2 / §9).
@@ -4404,25 +4362,59 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     //     stringElementReleaseThunk). The dict co-owns a +1 per stored value.
     // Keys are never disposed via dictValueDisposer (§4.9: keys are value-like;
     // the dictionary owns its values only). Exception: Set<string> stores strings
-    // as KEYS — that case sets dictStringKeys = true (see below) and leaves
-    // dictValueDisposer null.
+    // as KEYS — that case sets dictStringKeys = true (see the collection block
+    // above) and leaves dictValueDisposer null.
     if (const sema::TypeRef* dictTy = dictTypeOfLocal(ld)) {
         Disposal d{it->second, nullptr};
         d.dict = true;
         // Set<string>: elements are KEYS — pre-free key release, not a val disposer.
-        if (isStringElementSet(dictTy)) {
+        // #602 / §28.11 v0.135: use elementPolicyFor for the is-string-element test.
+        bool dictIsOwning =
+            dictTy->astNode && dictTy->astNode->name &&
+            !dictTy->astNode->name->parts.empty() &&
+            dictTy->astNode->name->parts[0] == "OwnedDictionary";
+        bool isSetNameD =
+            dictTy->astNode && dictTy->astNode->name &&
+            !dictTy->astNode->name->parts.empty() &&
+            dictTy->astNode->name->parts[0] == "Set";
+        auto isStrKey = [&]() {
+            if (dictTy->genericArgs.empty() || !dictTy->genericArgs[0]) return false;
+            const sema::TypeRef* k = dictTy->genericArgs[0];
+            if (k->nullable) return false;
+            ElementPolicy p = elementPolicyFor(k, /*owning=*/false);
+            return p.cat == ElementPolicy::Category::RuntimeManaged &&
+                   k->kind == sema::TypeRef::Kind::Primitive &&
+                   k->primitive == sema::PrimitiveType::String;
+        };
+        if (isSetNameD && isStrKey()) {
             d.dictStringKeys = true;
         } else {
-            d.dictValueDisposer = owningDictValueDisposer(dictTy);
+            // #602 / §28.11 v0.135: owning dict value disposer from policy.
+            {
+                const sema::TypeRef* dictVal =
+                    (dictTy->genericArgs.size() > 1) ? dictTy->genericArgs[1]
+                                                     : nullptr;
+                d.dictValueDisposer =
+                    elementPolicyFor(dictVal, dictIsOwning).disposerThunk;
+            }
             if (!d.dictValueDisposer)
                 d.dictValueDisposer = dictValueBoxFreer(dictTy);
             // #429 / §28.9: a borrowing Dictionary<K, string> co-owns a +1 per
             // stored value — release each at scope-end free via the string-release
             // thunk. Mutually exclusive with the owning-class and record-box-free
-            // disposers checked above (isStringValueDict is false for OwnedDictionary
-            // and for record values — those paths return non-null disposers above).
-            if (!d.dictValueDisposer && isStringValueDict(dictTy))
-                d.dictValueDisposer = stringElementReleaseThunk();
+            // disposers checked above.
+            if (!d.dictValueDisposer && !dictIsOwning) {
+                const sema::TypeRef* dictVal =
+                    (dictTy->genericArgs.size() > 1) ? dictTy->genericArgs[1]
+                                                     : nullptr;
+                if (dictVal && !dictVal->nullable) {
+                    ElementPolicy dvp = elementPolicyFor(dictVal, false);
+                    if (dvp.cat == ElementPolicy::Category::RuntimeManaged &&
+                            dictVal->kind == sema::TypeRef::Kind::Primitive &&
+                            dictVal->primitive == sema::PrimitiveType::String)
+                        d.dictValueDisposer = stringElementReleaseThunk();
+                }
+            }
         }
         disposeStack_.back().push_back(d);
         return;
@@ -6783,11 +6775,21 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         // per element, exactly as the `.Add(...)` path does (transfer a +1
         // producer, retain anything else) — so a literal-built array disposed at
         // scope end releases each element symmetrically (no leak, no premature
-        // free of a borrowed element). Keyed on the produced array being a
-        // borrowing Array<string> (etc.).
-        if (isStringElementArray(collTy) &&
-            !isPlusOneStringProducer(elemPtr.get()))
-            emitStringRetain(ev);
+        // free of a borrowed element).
+        // #602 / §28.11 v0.135: derive string-element classification from
+        // elementPolicyFor (RuntimeManaged + string primitive + non-owning
+        // array-backed collection).
+        {
+            bool litIsStrArr =
+                elemRef && !elemRef->nullable &&
+                elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemRef->primitive == sema::PrimitiveType::String &&
+                elementPolicyFor(elemRef, /*owning=*/false).cat ==
+                    ElementPolicy::Category::RuntimeManaged &&
+                (name == "Array" || name == "Stack" || name == "Queue");
+            if (litIsStrArr && !isPlusOneStringProducer(elemPtr.get()))
+                emitStringRetain(ev);
+        }
         llvm::AllocaInst* slot = entryAlloca(ev->getType());
         builder_.CreateStore(ev, slot);
         builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});
@@ -6846,7 +6848,13 @@ llvm::Value* Emitter::materializeHeapSetLiteral(
 
     bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
     // #429 / §28.9: Set<string> co-owns a +1 per element.
-    bool isStrSet = isStringElementSet(setTy);
+    // #602 / §28.11 v0.135: derive string-element classification from
+    // elementPolicyFor (RuntimeManaged + string primitive + non-owning Set).
+    bool isStrSet = !elemTy->nullable &&
+        elemTy->kind == sema::TypeRef::Kind::Primitive &&
+        elemTy->primitive == sema::PrimitiveType::String &&
+        elementPolicyFor(elemTy, /*owning=*/false).cat ==
+            ElementPolicy::Category::RuntimeManaged;
 
     auto* setFn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                            {ptrTy(), ptrTy(), ptrTy()});
