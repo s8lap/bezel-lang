@@ -105,6 +105,8 @@ void Resolver::run(const ast::SourceFile& src) {
     checkTopLevelVisibility();
     // Slice S23: record restrictions (§9.7).
     checkRecordRestrictions();
+    // #594 (§28.2): user code may not declare Dispose() on a class/record.
+    checkUserDeclaredDispose();
     // Slice S28: accessor visibility (§13.6).
     checkAccessorVisibility();
     // Slice S30: const member type must be primitive or string.

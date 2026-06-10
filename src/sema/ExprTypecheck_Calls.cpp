@@ -591,6 +591,61 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // §3: infer return types for stdlib collection and IO instance methods
     // (no MethodSymbol exists, so the normal calleeSym path doesn't apply).
     if (!calleeSym) {
+        // #591: Console.Write / Console.WriteLine have only 0-or-1-argument
+        // overloads (stdlib §2.1). A call with >1 arguments has no matching
+        // overload — codegen's tryLowerConsoleCall returns false and the call
+        // is silently dropped.  Diagnose here in sema so the user sees a clear
+        // error instead of missing output at runtime.
+        //
+        // Similarly, Console.Error.Write / Console.Error.WriteLine (and the
+        // .Out. variants) follow the same overload set; reject wrong-arity
+        // calls on those as well.
+        if (auto* consoleMA =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            const auto& mbr = consoleMA->member;
+            bool isWrite     = (mbr == "Write");
+            bool isWriteLine = (mbr == "WriteLine");
+            if ((isWrite || isWriteLine) && consoleMA->target) {
+                // Direct Console.Write/WriteLine.
+                bool onConsole = false;
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        consoleMA->target.get())) {
+                    onConsole = (id->name == "Console");
+                }
+                // Console.Error.Write/WriteLine or Console.Out.Write/WriteLine.
+                if (!onConsole) {
+                    if (auto* innerMA = dynamic_cast<const ast::MemberAccessExpr*>(
+                            consoleMA->target.get())) {
+                        if (innerMA->target) {
+                            if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(
+                                    innerMA->target.get())) {
+                                if (id2->name == "Console" &&
+                                    (innerMA->member == "Error" ||
+                                     innerMA->member == "Out"))
+                                    onConsole = true;
+                            }
+                        }
+                    }
+                }
+                if (onConsole) {
+                    // Write: exactly 1 arg. WriteLine: 0 or 1 arg.
+                    const std::size_t nargs = ce.args.size();
+                    bool arityOk = isWrite ? (nargs == 1)
+                                           : (nargs == 0 || nargs == 1);
+                    if (!arityOk) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("Console.") + std::string(mbr) +
+                            " has no overload that accepts " +
+                            std::to_string(nargs) +
+                            " argument(s): stdlib §2.1 defines only " +
+                            (isWrite ? "Write(value)" : "WriteLine() and WriteLine(value)") +
+                            " — for composite formatting use string interpolation"
+                            " (`$\"{...}\"`) instead");
+                    }
+                }
+            }
+        }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             if (ma->target) {
                 auto* recvTy = ctx_.exprType(*ma->target);
