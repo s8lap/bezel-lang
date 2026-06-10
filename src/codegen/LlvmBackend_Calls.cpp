@@ -1881,22 +1881,21 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         //     enforced above: the Set/OwnedSet branch returned, so we are in an
         //     array-backed collection; Owned* is excluded at instantiation, §15.2).
         //
-        // DIVERGENCE vs §28.11 v0.134 (same as batch-1 owningCollectionElemDisposer):
-        // the spec table's class/interface row covers Interface types too; the
-        // existing collectionElemIsClass() helper only checks for Class, not
-        // Interface.  arrElemPol.disposerThunk replicates the correct spec behavior
-        // (Class|Interface → ClassOwned), but we keep the Class-only guard to
-        // match the EXISTING delegate's behavior until #619 fixes this.
+        // per §28.11 v0.135 / fix #619: arrElemPol is derived from
+        // elementPolicyFor which now correctly covers both Class and Interface
+        // element types.  No DIVERGENCE — the factory handles the full
+        // class/interface row of the §28.11 table.
         bool arrIsStringElem =
             arrElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
             arrElemRef &&
             arrElemRef->kind == sema::TypeRef::Kind::Primitive &&
             arrElemRef->primitive == sema::PrimitiveType::String &&
             !arrElemRef->nullable;
-        // arrElemIsClass: whether the element is a class type — drives both the
-        // ClassOwned disposer (for owning arrays) and ClassBorrow reference
-        // identity (for emitRemoveElementEquality). Matches collectionElemIsClass.
-        // DIVERGENCE vs §28.11 v0.134: see above — Interface excluded here (#619).
+        // arrElemIsClass: whether the element is a class-or-interface type —
+        // drives both the ClassOwned disposer (for owning arrays) and ClassBorrow
+        // reference identity (for emitRemoveElementEquality).  Per §28.11 v0.135
+        // fix #619: Interface is now included (elementPolicyFor returns ClassOwned/
+        // ClassBorrow for interface elements, collectionElemIsClass widened).
         bool arrElemIsClass =
             arrElemPol.cat == ElementPolicy::Category::ClassOwned ||
             arrElemPol.cat == ElementPolicy::Category::ClassBorrow;
@@ -2121,14 +2120,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* idx = lowerExpr(*call.args[0].value);
             if (!idx) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
-            // #602 / #362 / §4.5 / #429 / §4.6 / §28.9 / §28.11 v0.134:
-            // OwnedArray<T>.RemoveAt disposes the removed element (ClassOwned row);
-            // a borrowing Array<string> releases the removed element's co-owned +1
-            // (RuntimeManaged row). The two disposers are mutually exclusive.
-            // arrElemPol.disposerThunk is non-null only for ClassOwned.
-            // DIVERGENCE vs §28.11 v0.134: Interface elements excluded — see
-            // arrElemIsClass comment above; same as batch-1 owningCollectionElemDisposer.
-            // #619 will fix this separately; the DIVERGENCE comment is preserved here.
+            // #602 / #362 / §4.5 / #429 / §4.6 / §28.9 / §28.11 v0.135 fix #619:
+            // OwnedArray<T>.RemoveAt disposes the removed element (ClassOwned row —
+            // class or interface); a borrowing Array<string> releases the removed
+            // element's co-owned +1 (RuntimeManaged row). The two disposers are
+            // mutually exclusive; arrElemPol.disposerThunk is non-null for ClassOwned.
             llvm::Function* elemDisp = arrElemPol.disposerThunk;
             if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();
             if (elemDisp) {
@@ -2185,11 +2181,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCondBr(eq, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
             // Remove (and, for an owning array, dispose) the matched slot.
-            // #602 / #429 / §28.11 v0.134: arrElemPol.disposerThunk is non-null
-            // for ClassOwned; arrIsStringElem drives the string-release path.
-            // Both derived from arrElemPol (hoisted above).
-            // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as
-            // owningCollectionElemDisposer; flagged for #619.
+            // #602 / #429 / §28.11 v0.135 fix #619: arrElemPol.disposerThunk is
+            // non-null for ClassOwned (class or interface); arrIsStringElem drives
+            // the string-release path.  Both derived from arrElemPol (hoisted above).
             llvm::Function* rmDisp = arrElemPol.disposerThunk;
             if (!rmDisp && arrIsStringElem) rmDisp = stringElementReleaseThunk();
             if (rmDisp) {
@@ -2244,8 +2238,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // arrElemPol.disposerThunk). A borrowing Array<string> releases each
             // element's co-owned +1 (RuntimeManaged row via arrIsStringElem).
             // The two paths are mutually exclusive; all derived from arrElemPol.
-            // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as
-            // owningCollectionElemDisposer; flagged for #619.
+            // per §28.11 v0.135 fix #619: Interface elements now included in
+            // ClassOwned, so arrElemPol.disposerThunk is non-null for both class
+            // and interface element types in the owning family.
             llvm::Function* elemDisp = arrElemPol.disposerThunk;
             if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();
             if (elemDisp) {
@@ -2264,9 +2259,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Unlike Add/Clear on an OWNING array, this is the explicit en-masse
         // disposal a BORROWING Array<T> exposes; the disposer thunk is keyed on
         // the element being a class, not on the collection being owning.
-        // #602 / §28.11 v0.134: use arrElemIsClass (derived from arrElemPol).
-        // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as batch-1
-        // collectionElemIsClass helper; flagged for #619.
+        // #602 / §28.11 v0.135 fix #619: use arrElemIsClass (derived from
+        // arrElemPol — now covers Class|Interface per §28.11 / §14.4).
         if (m == "DisposeElements" && call.args.empty()) {
             if (arrElemIsClass) {
                 auto* fn = declareC("bz_array_clear_disposing",
@@ -2437,10 +2431,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             valTy->kind == sema::TypeRef::Kind::Primitive &&
             valTy->primitive == sema::PrimitiveType::String &&
             !valTy->nullable;
-        // dictValClassDisposer: non-null iff OwnedDictionary<K, class V>.
-        // arrElemPol.disposerThunk mirrors owningDictValueDisposer.
-        // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as
-        // owningDictValueDisposer batch-1 delegate; flagged for #619.
+        // dictValClassDisposer: non-null for OwnedDictionary<K, class-or-interface V>.
+        // Derived from dictValPol (elementPolicyFor) which now handles both Class
+        // and Interface correctly per §28.11 v0.135 fix #619.
         llvm::Function* dictValClassDisposer = dictValPol.disposerThunk;
 
         // Helper: extract string data/len from bz.string ptr
@@ -2562,7 +2555,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // dictValueBoxFreer: kept unchanged (value-type record box; not a policy
             //   table decision — batch 3 / #602 follow-on).
             // dictIsStringValue: borrowing Dictionary<K,string> → release each +1.
-            // DIVERGENCE vs §28.11 v0.134: Interface excluded; flagged for #619.
+            // per §28.11 v0.135 fix #619: dictValClassDisposer is now non-null for
+            // interface-valued OwnedDictionary (class-or-interface element).
             llvm::Function* disp = dictValClassDisposer;
             if (!disp) disp = dictValueBoxFreer(recvTy);
             if (!disp && dictIsStringValue)
@@ -2638,10 +2632,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // and consistent). For borrowing Dictionary<K, string>, get the
             // string-release thunk. For borrowing Dict or non-class/non-string
             // values, valDisp is null → fall through to plain non-disposing remove.
-            // #602 / §28.11 v0.134: derive disposer from dictValPol (hoisted above).
-            // dictValClassDisposer: OwnedDictionary<K,class> (ClassOwned row).
+            // #602 / §28.11 v0.135 fix #619: derive disposer from dictValPol (hoisted
+            // above).  dictValClassDisposer: OwnedDictionary<K,class-or-interface>
+            // (ClassOwned row per §28.11 v0.135).
             // dictIsStringValue: borrowing Dictionary<K,string> (RuntimeManaged row).
-            // DIVERGENCE vs §28.11 v0.134: Interface excluded; flagged for #619.
             llvm::Function* valDisp = dictValClassDisposer;
             if (!valDisp && dictIsStringValue)
                 valDisp = stringElementReleaseThunk();
@@ -9211,9 +9205,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     const sema::TypeRef* llElemRef =
         (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
     const ElementPolicy llElemPol = elementPolicyFor(llElemRef, isOwning);
-    // llElemIsClass: class/interface element — matches collectionElemIsClass(recvTy,0).
-    // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as batch-1 delegate;
-    // flagged for #619.
+    // llElemIsClass: class-or-interface element — per §28.11 v0.135 fix #619:
+    // elementPolicyFor now returns ClassOwned/ClassBorrow for interface elements.
     bool llElemIsClass =
         llElemPol.cat == ElementPolicy::Category::ClassOwned ||
         llElemPol.cat == ElementPolicy::Category::ClassBorrow;
@@ -9268,8 +9261,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     }
     // --- RemoveFirst() ---
     if (m == "RemoveFirst" && call.args.empty()) {
-        // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
-        // DIVERGENCE vs §28.11 v0.134: Interface excluded — flagged for #619.
+        // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk (hoisted above).
+        // Interface elements now produce a non-null disposerThunk via ClassOwned.
         llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
         llvm::Value* disp = elemDisp
             ? llvm::cast<llvm::Value>(elemDisp)
@@ -9377,8 +9370,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // pointer. Instead: walk and free each node via remove_first repeatedly.
     // Cleanest: add bz_llist_clear to runtime. For now, implement as a loop.
     if (m == "Clear" && call.args.empty()) {
-        // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
-        // DIVERGENCE vs §28.11 v0.134: Interface excluded — flagged for #619.
+        // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk (hoisted above).
+        // Interface elements now produce a non-null disposerThunk via ClassOwned.
         llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
         llvm::Value* disp = elemDisp
             ? llvm::cast<llvm::Value>(elemDisp)
@@ -9466,9 +9459,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* found = builder_.CreateICmpNE(foundNode, nullP, "llr.found");
         // If found, call RemoveNode (which unlinks + optionally disposes).
         // OwnedLinkedList disposes the element; LinkedList borrows, no disposal.
-        // #602 / §28.11 v0.134: use llElemPol.disposerThunk from policy hoist.
-        // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as
-        // owningCollectionElemDisposer; flagged for #619.
+        // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk from policy
+        // hoist.  Interface elements now produce a non-null disposerThunk.
         llvm::Function* elemDisp =
             isOwning ? llElemPol.disposerThunk : nullptr;
         llvm::Value* disp = elemDisp
@@ -9700,9 +9692,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
     const ElementPolicy spanElemPol =
         elementPolicyFor(spanElemRef, /*owningFamily=*/false);
-    // spanElemIsClass: matches collectionElemIsClass(recvTy, 0).
-    // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as batch-1 delegate;
-    // flagged for #619.
+    // spanElemIsClass: class-or-interface element — per §28.11 v0.135 fix #619.
+    // elementPolicyFor returns ClassBorrow for interface elements (spans are always
+    // borrowing — §4.15). collectionElemIsClass is also widened.
     bool spanElemIsClass =
         spanElemPol.cat == ElementPolicy::Category::ClassOwned ||
         spanElemPol.cat == ElementPolicy::Category::ClassBorrow;

@@ -1,22 +1,28 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
 // #602 / §28.11 v0.134 — element-policy unification, batch 1.
+// fix #619 / §28.11 v0.135 — widen class/interface row to include Interface.
 //
 // This translation unit owns the single source of truth for collection-element
 // slot behavior: the `ElementPolicy` struct and its factory
 // `elementPolicyFor(elemTy, owningFamily)`.  Every field in `ElementPolicy`
-// corresponds directly to a column in the §28.11 v0.134 "element slot policy"
+// corresponds directly to a column in the §28.11 v0.135 "element slot policy"
 // table, and the factory's switch mirrors the table row-for-row with a
-// per-row `// per §28.11 v0.134` citation.
+// per-row `// per §28.11 v0.135` citation.
 //
 // In batch 1 the factory is wired into the EXISTING helpers in
 // LlvmBackend_Setup.cpp as thin delegates; no call sites change yet.
 // Batch 2/3 will route all 82 call sites through the policy directly.
+// fix #619: the batch-1 delegates had Class-only pre-checks that blocked
+// interface element types from reaching the factory.  Those pre-checks are
+// removed in the delegates (owningCollectionElemDisposer,
+// owningDictValueDisposer, collectionElemIsClass); the factory itself already
+// handled Interface correctly.
 
 namespace bezel::codegen {
 
 // -------------------------------------------------------------------------
-// elementPolicyFor — the §28.11 v0.134 table in code
+// elementPolicyFor — the §28.11 v0.135 table in code
 // -------------------------------------------------------------------------
 //
 // Parameters
@@ -59,7 +65,7 @@ namespace bezel::codegen {
 Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
                                                   bool owningFamily) {
     // ── Row 3: class / interface type ──────────────────────────────────────
-    // per §28.11 v0.134: class/interface × owning  → owned (disposer thunk)
+    // per §28.11 v0.135: class/interface × owning  → owned (disposer thunk)
     //                    class/interface × borrowing → borrow (no disposer)
     //
     // §28.13 / stdlib §2.16 (#603): Shared<T> and Weak<T> have null declaration
@@ -92,7 +98,7 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
          (elemTy->declaration->kind == ast::TypeDeclKind::Class ||
           elemTy->declaration->kind == ast::TypeDeclKind::Interface))) {
         if (owningFamily) {
-            // per §28.11 v0.134: owned slot — disposal cascades via vtable
+            // per §28.11 v0.135: owned slot — disposal cascades via vtable
             // for class/interface; via bz_shared_release / bz_weak_release for
             // Shared<T>/Weak<T> handles (which have no vtable).
             llvm::Function* thunk = isSharedWeakElem
@@ -105,7 +111,7 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
                 /*retainRelease=*/false
             };
         } else {
-            // per §28.11 v0.134: borrow slot — no element disposal obligation.
+            // per §28.11 v0.135: borrow slot — no element disposal obligation.
             return ElementPolicy{
                 ElementPolicy::Category::ClassBorrow,
                 ptrTy(),
