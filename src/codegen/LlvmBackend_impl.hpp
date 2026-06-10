@@ -2390,6 +2390,46 @@ private:
     llvm::Value* explicitDisposeOwnedReceiverSlot(const ast::Expr& receiver,
                                                   llvm::Type*& slotTy);
 
+    // ── §28.11 v0.134 element-slot policy ────────────────────────────────
+    // #602: a classification of a single collection element type and family
+    // that drives all per-slot bookkeeping decisions.  The factory
+    // `elementPolicyFor` is the ONLY place this classification is encoded;
+    // the existing helpers below are thin delegates to it (batch 1).
+    struct ElementPolicy {
+        // Mirrors the four rows of the §28.11 v0.134 "element slot policy"
+        // table (column: element category).
+        enum class Category {
+            // Row 1: value type (non-move-only) — copies; no slot bookkeeping.
+            Value,
+            // Row 2: runtime-managed reference (string, function types, boxed
+            // values) — shared references; retain/release on insert/remove.
+            RuntimeManaged,
+            // Row 3, borrowing family: class/interface borrow — stores a
+            // reference; no disposal obligation on the collection side.
+            ClassBorrow,
+            // Row 3, owning family: class/interface owned — disposal cascades
+            // via vtable at collection Dispose/Remove/Clear.
+            ClassOwned,
+        };
+
+        Category cat;
+        // LLVM type for a slot of this category.  Null for Value (concrete
+        // type varies per-element; callers use lowerTypeRef directly).
+        llvm::Type* slotTy;
+        // The `void(void*)` dispose callback for ClassOwned; null for all
+        // other categories.
+        llvm::Function* disposerThunk;
+        // True iff this category requires retain/release bookkeeping (i.e.
+        // strings and function-type elements in the RuntimeManaged row).
+        bool retainRelease;
+    };
+
+    // #602 / §28.11 v0.134: classify `elemTy` against the slot-policy table.
+    // `owningFamily` is true when the containing collection is in the "Owned"
+    // family.  The factory's rows mirror the spec table with per-row citations.
+    ElementPolicy elementPolicyFor(const sema::TypeRef* elemTy,
+                                   bool owningFamily);
+
     // #362 / stdlib §4.5: a module-level `void(void*)` thunk that runs an
     // owning collection element's destructor via dynamic dispatch (vtable
     // slot 1), null-checking the element first. Suitable as the `dispose_elem`
