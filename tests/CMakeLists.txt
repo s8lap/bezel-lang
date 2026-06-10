@@ -242,6 +242,7 @@ set(BEZEL_TEST_SOURCES
     codegen/math_sign_test.cpp
     codegen/unsigned_int_test.cpp
     codegen/compound_assign_test.cpp
+    codegen/compound_assign_operator_overload_610_test.cpp
     codegen/char_literal_test.cpp
     codegen/char_escape_527_test.cpp
     codegen/auto_property_test.cpp
