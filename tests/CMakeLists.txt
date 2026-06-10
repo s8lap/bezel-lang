@@ -450,6 +450,7 @@ set(BEZEL_TEST_SOURCES
     codegen/shared_weak_nullable_620_test.cpp
     codegen/user_exception_tostring_608_test.cpp
     codegen/builtin_collection_incdec_613_test.cpp
+    codegen/builtin_collection_compound_overload_626_test.cpp
     codegen/dict_entry_iter_548_test.cpp
     codegen/dict_insertion_order_622_test.cpp
     codegen/async_iter_try_finally_554_test.cpp
