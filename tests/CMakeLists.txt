@@ -415,6 +415,7 @@ set(BEZEL_TEST_SOURCES
     codegen/indexer_incdec_587_test.cpp
     codegen/catch_expr_body_588_test.cpp
     codegen/console_write_unicode_592_test.cpp
+    codegen/multitype_catch_ncb_593_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

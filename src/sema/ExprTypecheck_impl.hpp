@@ -275,6 +275,15 @@ private:
     // `Object` operand is the universal common supertype.
     TypeRef* commonTypeOf(TypeRef* a, TypeRef* b);
 
+    // §31.2.1: nearest common base of the types listed in a multi-type catch
+    // arm binding (`var e: T1, T2, ...`). Returns the TypeRef to use as the
+    // binding's static type: the most specific Named type that is a base of
+    // every listed type. When no user-declared common base exists (e.g. all
+    // types directly inherit a built-in like `Exception`), the built-in base
+    // TypeRef is returned. Returns null if the types are empty or unresolved.
+    TypeRef* catchArmNcb(
+        const std::vector<std::unique_ptr<ast::Type>>& types);
+
     // Slice S7: diagnose assignment to a readonly field outside the
     // declaring class's constructor. Tracks only the `this.<field>`
     // target shape; `other.f := X` would need cross-object readonly
