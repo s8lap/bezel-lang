@@ -391,7 +391,15 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // state pointer is stored at full width.
                     // CancellationTokenSource is an owned class type — also a ptr.
                     n == "CancellationToken" ||
-                    n == "CancellationTokenSource") {
+                    n == "CancellationTokenSource" ||
+                    // §28.13 / stdlib §2.16 (#620): Shared<T> and Weak<T> are
+                    // compiler-known heap-pointer types (no user TypeDecl).
+                    // Without these entries lowerTypeRef fell through to the i32
+                    // default → bz_shared_get/bz_weak_release called with i32
+                    // instead of ptr (IR verification failure); Shared<T>? fell
+                    // into the bare type-param nullable branch (returns {i8,i32}
+                    // instead of ptr) → checkGEPType LLVM-assert crash.
+                    n == "Shared" || n == "Weak") {
                     return ptrTy();
                 }
             }
@@ -449,7 +457,11 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "UIntPtr"     || n == "CString"         ||
                     n == "WString"     || n == "RawBytes"        ||
                     n == "CancellationToken" ||
-                    n == "CancellationTokenSource") {
+                    n == "CancellationTokenSource" ||
+                    // §28.13 / stdlib §2.16 (#620): imported Shared<T>/Weak<T>
+                    // (type name carried in importedName — same fix as the
+                    // astNode path above).
+                    n == "Shared" || n == "Weak") {
                     return ptrTy();
                 }
             }

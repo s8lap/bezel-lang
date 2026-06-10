@@ -446,6 +446,7 @@ set(BEZEL_TEST_SOURCES
     codegen/user_exception_isa_596_test.cpp
     codegen/checked_disposal_601_test.cpp
     codegen/shared_weak_603_test.cpp
+    codegen/shared_weak_nullable_620_test.cpp
     codegen/user_exception_tostring_608_test.cpp
     codegen/builtin_collection_incdec_613_test.cpp
     codegen/dict_entry_iter_548_test.cpp

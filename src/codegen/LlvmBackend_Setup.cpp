@@ -1848,10 +1848,17 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
 void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // Each owned field carries either a class/interface object (disposed via
     // its vtable) or — #362 / stdlib §4.5 — a heap collection (freed via
-    // bz_array_free, cascading into class elements for an owning collection).
+    // bz_array_free, cascading into class elements for an owning collection),
+    // or — §28.13 / stdlib §2.16 (#620) — a Shared<T>/Weak<T> handle (released
+    // via bz_shared_release / bz_weak_release).
     struct OwnedField {
         const sema::FieldSymbol* fs;
         const sema::TypeRef* collTy;  // non-null → collection field
+        // §28.13 (#620): true for Shared<T> owned field (bz_shared_release),
+        // false for ordinary class/exception/collection field.
+        bool sharedField = false;
+        // §28.13 (#620): true for Weak<T> owned field (bz_weak_release).
+        bool weakField = false;
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -1870,6 +1877,18 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             owned.push_back({fs, nullptr});
         } else if (const sema::TypeRef* ct = ownedCollectionFieldType(fs)) {
             owned.push_back({fs, ct});
+        } else {
+            // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
+            // Weak<T> type.  These are compiler-known ref-counted heap objects
+            // with no user TypeDecl / no vtable; release via the appropriate
+            // runtime function instead of the vtable-Dispose path.
+            bool isWeak = false;
+            if (isOwnedSharedWeakField(fs, &isWeak)) {
+                OwnedField of{fs, nullptr};
+                if (isWeak) of.weakField = true;
+                else        of.sharedField = true;
+                owned.push_back(of);
+            }
         }
     }
     for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
@@ -1896,6 +1915,18 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             auto* fn = declareC(freeName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {val, disp});
+            continue;
+        }
+        // §28.13 / stdlib §2.16 (#620): owned Shared<T>/Weak<T> field —
+        // release via bz_shared_release / bz_weak_release (null-safe, no vtable).
+        // Null the field after so a re-entrant dispose is a no-op.
+        if (it->sharedField || it->weakField) {
+            const char* relName = it->weakField ? "bz_weak_release"
+                                                : "bz_shared_release";
+            auto* relFn = declareC(relName, llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy()});
+            builder_.CreateCall(relFn, {val});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             continue;
         }
         llvm::Value* isNull = builder_.CreateICmpEQ(
@@ -3148,7 +3179,10 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
         if (fs && (isOwnedReferenceField(fs) ||
                    isOwnedBuiltinExceptionField(fs) ||
-                   ownedCollectionFieldType(fs))) {
+                   ownedCollectionFieldType(fs) ||
+                   // §28.13 (#620): owned Shared<T>/Weak<T> field also needs
+                   // cleanup if the constructor body throws.
+                   isOwnedSharedWeakField(fs))) {
             hasOwnedToClean = true;
             break;
         }
