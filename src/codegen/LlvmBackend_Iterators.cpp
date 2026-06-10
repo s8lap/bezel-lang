@@ -282,6 +282,14 @@ void Emitter::collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             if (ifs->hasElse) collectYields(ifs->elseBody, out);
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
             collectYields(db->body, out);
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // §29.6 / §30.7 (#554): `yield return` inside a try body with ONLY a
+            // finally is now supported in async iterators. Collect yields from the
+            // try body so the resume-switch has the correct number of state blocks.
+            // Do NOT collect from catch arm bodies or the finally: §29.6 forbids
+            // yield there, and suspendInTryPosition rejects such programs before
+            // the resume switch is built.
+            collectYields(ts->body, out);
         }
     }
 }
