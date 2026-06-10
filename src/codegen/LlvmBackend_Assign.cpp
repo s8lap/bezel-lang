@@ -195,7 +195,16 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         // Only an OWNING array's slot carries ownership to transfer; a borrowing
         // Array<T> slot is a borrow and `move arr[i]` is rejected by sema. Guard
         // on the disposer so a non-owning array (defensively) never nulls a slot.
-        if (!owningCollectionElemDisposer(recvTy)) return nullptr;
+        // #602 / §28.11 v0.135: derive ownership from elementPolicyFor directly.
+        {
+            const sema::TypeRef* arrEl =
+                (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+            bool arrIsOwning =
+                recvTy->astNode && recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+            if (!elementPolicyFor(arrEl, arrIsOwning).disposerThunk) return nullptr;
+        }
         llvm::Value* recv = lowerExpr(*ix.target);
         if (!recv) return nullptr;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);   // evaluate once
@@ -400,17 +409,38 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         // rc dips +1 then back, never transiently 0 — no UAF / double-free). This
         // is checked BEFORE the owning-class disposer below; a string element is
         // never a class, so the two paths are mutually exclusive.
-        if (llvm::Function* strDisp = stringElementReleaseDisposer(recvTy)) {
-            if (!valueExpr || !isPlusOneStringProducer(valueExpr))
-                emitStringRetain(val);
-            llvm::AllocaInst* slot = entryAlloca(val->getType());
-            builder_.CreateStore(val, slot);
-            auto* fn = declareC("bz_array_set_disposing",
-                llvm::Type::getVoidTy(llvm_),
-                {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
-            builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
-                                     strDisp});
-            return true;
+        // #602 / §28.11 v0.135: derive element policy from elementPolicyFor.
+        {
+            const sema::TypeRef* arrEl =
+                (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+            bool arrIsOwning =
+                recvTy->astNode && recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+            ElementPolicy arrPol = elementPolicyFor(arrEl, arrIsOwning);
+            bool isStrElemArr =
+                !arrIsOwning &&
+                arrPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                arrEl && !arrEl->nullable &&
+                arrEl->kind == sema::TypeRef::Kind::Primitive &&
+                arrEl->primitive == sema::PrimitiveType::String &&
+                recvTy->astNode && recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                [](std::string_view n){return n=="Array"||n=="Stack"||n=="Queue";}(
+                    recvTy->astNode->name->parts[0]);
+            if (isStrElemArr) {
+                if (!valueExpr || !isPlusOneStringProducer(valueExpr))
+                    emitStringRetain(val);
+                llvm::AllocaInst* slot = entryAlloca(val->getType());
+                builder_.CreateStore(val, slot);
+                llvm::Function* strDisp = stringElementReleaseThunk();
+                auto* fn = declareC("bz_array_set_disposing",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
+                                         strDisp});
+                return true;
+            }
         }
         llvm::AllocaInst* slot = entryAlloca(val->getType());
         builder_.CreateStore(val, slot);
@@ -421,15 +451,26 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         // owningCollectionElemDisposer keys on the concrete "Owned…" name, so it
         // misses IOwnedList<T>; supply the shared class-element disposer for the
         // owning-interface case (T: class is guaranteed by §4.2's constraint).
-        llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy);
-        if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
-        if (elemDisp) {
-            auto* fn = declareC("bz_array_set_disposing",
-                llvm::Type::getVoidTy(llvm_),
-                {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
-            builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
-                                     elemDisp});
-            return true;
+        // #602 / §28.11 v0.135: element disposer from elementPolicyFor (covers
+        // Interface elements too).
+        {
+            const sema::TypeRef* arrEl =
+                (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+            bool arrIsOwning2 =
+                recvTy->astNode && recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+            llvm::Function* elemDisp =
+                elementPolicyFor(arrEl, arrIsOwning2).disposerThunk;
+            if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
+            if (elemDisp) {
+                auto* fn = declareC("bz_array_set_disposing",
+                    llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
+                                         elemDisp});
+                return true;
+            }
         }
         auto* fn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), i64(), ptrTy(), i64()});
@@ -518,11 +559,16 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // is its VALUE = genericArgs[1]; owningCollectionElemDisposer keys on idx 0,
     // so compute the value-disposer here. The shared elementDisposerThunk
     // disposes+frees any class object via its own vtable, so it applies as-is.
-    bool owningDict =
+    // #602 / §28.11 v0.135: derive value disposer for the dict indexer-set
+    // overwrite path directly from elementPolicyFor (covers class AND interface
+    // value types; previously collectionElemIsClass was Class-only here).
+    bool dictIsOwning2 =
         recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
-        recvTy->astNode->name->parts[0] == "OwnedDictionary" &&
-        collectionElemIsClass(recvTy, 1);
+        recvTy->astNode->name->parts[0] == "OwnedDictionary";
+    const sema::TypeRef* dictValTy2 =
+        (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
+                                                    : nullptr;
     // #401 / §4.8: a borrowing Dictionary<K, record> heap-boxes its values, so
     // OVERWRITING an existing key would otherwise leak the displaced box. Free
     // the displaced box here (plain free — a record is a value type, §3.2 / §9)
@@ -535,8 +581,15 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // disposing setter) and take a +1 on the NEW one (retain-before-release so a
     // self-overwrite `d[k] := d[k]` never dips rc to 0 — no UAF/double-free).
     llvm::Function* valDisp =
-        owningDict ? elementDisposerThunk() : dictValueBoxFreer(recvTy);
-    bool isStrVal = isStringValueDict(recvTy);
+        elementPolicyFor(dictValTy2, dictIsOwning2).disposerThunk;
+    if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
+    // isStrVal: borrowing Dictionary<K, string> — detect via elementPolicyFor.
+    bool isStrVal =
+        !dictIsOwning2 && dictValTy2 && !dictValTy2->nullable &&
+        dictValTy2->kind == sema::TypeRef::Kind::Primitive &&
+        dictValTy2->primitive == sema::PrimitiveType::String &&
+        elementPolicyFor(dictValTy2, /*owning=*/false).cat ==
+            ElementPolicy::Category::RuntimeManaged;
     if (!valDisp && isStrVal)
         valDisp = stringElementReleaseThunk();
     // #429: retain the new string value BEFORE encoding (val is still the raw
@@ -1042,18 +1095,28 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
 
     bool listIfaceOwning = false;
     if (isListInterfaceName(recvTy, &listIfaceOwning)) { /* already set */ }
-    llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy);
-    if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
-    if (elemDisp) {
-        auto* setFn = declareC("bz_array_set_disposing",
-                               llvm::Type::getVoidTy(llvm_),
-                               {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
-        builder_.CreateCall(setFn,
-                            {recv, idx, setSlot, builder_.getInt64(esz), elemDisp});
-    } else {
-        auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
-                               {ptrTy(), i64(), ptrTy(), i64()});
-        builder_.CreateCall(setFn, {recv, idx, setSlot, builder_.getInt64(esz)});
+    // #602 / §28.11 v0.135: derive element disposer from elementPolicyFor.
+    {
+        const sema::TypeRef* ixEl =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        bool ixIsOwning =
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0;
+        llvm::Function* elemDisp =
+            elementPolicyFor(ixEl, ixIsOwning).disposerThunk;
+        if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
+        if (elemDisp) {
+            auto* setFn = declareC("bz_array_set_disposing",
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(setFn,
+                                {recv, idx, setSlot, builder_.getInt64(esz), elemDisp});
+        } else {
+            auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(setFn, {recv, idx, setSlot, builder_.getInt64(esz)});
+        }
     }
     return true;
 }
