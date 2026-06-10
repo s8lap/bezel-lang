@@ -8,7 +8,7 @@ time rather than enforced by a runtime.
 
 The language is paper-designed: the normative spec lives in `docs/`, and this
 repository hosts the compiler that implements it. Start with `CLAUDE.md` for the
-project's working discipline and `docs/Bezel_Language_Spec_0_130.md` for the
+project's working discipline and `docs/Bezel_Language_Spec_0_131.md` for the
 language itself.
 
 ## Status
@@ -215,10 +215,10 @@ docs/         Normative spec, standard library, design rationale, guides
 
 ## Further reading
 
-- `docs/Bezel_Language_Spec_0_130.md` — the normative reference; Appendix A is
+- `docs/Bezel_Language_Spec_0_131.md` — the normative reference; Appendix A is
   the complete grammar, Appendix C lists compiler-enforced invariants
-- `docs/Bezel_Standard_Library_0_130.md` — every stdlib type and method
-- `docs/Bezel_Design_Rationale_0_130.md` — the recorded reasoning behind each
+- `docs/Bezel_Standard_Library_0_131.md` — every stdlib type and method
+- `docs/Bezel_Design_Rationale_0_131.md` — the recorded reasoning behind each
   language decision
 - `docs/Bezel_Guide_01_Memory_and_Ownership.md` and
   `docs/Bezel_Guide_02_Errors_and_Nullability.md` — example-first guides to
