@@ -2038,26 +2038,47 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                !tt->genericArgs.empty() &&
                                tt->genericArgs[0]) {
                         // Check whether the Named type is Dictionary or
-                        // OwnedDictionary and reject direct iteration (§4.8).
+                        // OwnedDictionary.
+                        // §4.8 v0.135 (#548): Dictionary<K,V> is directly
+                        // iterable — `for var e in d` yields DictionaryEntry<K,V>
+                        // (the ICollection element type), one per live entry in
+                        // insertion order.
+                        // §4.9 v0.135: OwnedDictionary<K,V> is NOT directly
+                        // iterable — the #530 diagnostic is narrowed to it only.
                         std::string_view colTypeName;
                         if (tt->astNode && tt->astNode->name &&
                             !tt->astNode->name->parts.empty())
                             colTypeName = tt->astNode->name->parts[0];
                         else if (!tt->importedName.empty())
                             colTypeName = tt->importedName;
-                        if (colTypeName == "Dictionary" ||
-                            colTypeName == "OwnedDictionary") {
-                            // per §4.8 / §4.9: direct iteration is not supported.
-                            // Do NOT set lsym->declType — leave the loop variable
-                            // untyped so the body is still walked (cascade
-                            // suppression), but report the early clear diagnostic.
+                        if (colTypeName == "Dictionary" &&
+                            tt->genericArgs.size() >= 2 &&
+                            tt->genericArgs[1]) {
+                            // per stdlib §4.8 (v0.135) / §21: `for var e in d`
+                            // on a Dictionary<K,V> yields DictionaryEntry<K,V>.
+                            // DictionaryEntry<K,V> is a builtin record with no
+                            // user TypeSymbol; represent it as a synthetic Named
+                            // TypeRef with importedName="DictionaryEntry" and
+                            // genericArgs=[K, V] so sema can type e.Key/e.Value.
+                            static const char kDictEntryName[] = "DictionaryEntry";
+                            auto* entryTy = ctx_.makeTypeRef();
+                            entryTy->kind = TypeRef::Kind::Named;
+                            entryTy->declaration = nullptr;
+                            entryTy->astNode = nullptr;
+                            entryTy->importedName = kDictEntryName;
+                            entryTy->genericArgs.push_back(tt->genericArgs[0]); // K
+                            entryTy->genericArgs.push_back(tt->genericArgs[1]); // V
+                            lsym->declType = entryTy;
+                        } else if (colTypeName == "OwnedDictionary") {
+                            // per §4.9 (v0.135): OwnedDictionary direct iteration
+                            // is not provided (#530 diagnostic, narrowed from
+                            // both dict kinds to owning kind only).
                             ctx_.diagnostics().report(
                                 Severity::Error, fs->span.begin,
-                                std::string(colTypeName) +
-                                "<K,V> is not directly iterable (stdlib \xC2\xA7""4.8); "
-                                "iterate `d.Keys` (key-iteration) or "
-                                "`d.Drain()` (OwnedDictionary, ownership-transfer) "
-                                "instead of `for var e in d`");
+                                "OwnedDictionary<K,V> is not directly iterable "
+                                "(stdlib \xC2\xA7""4.9); use `d.Drain()` "
+                                "(ownership-transfer) instead of "
+                                "`for var e in d`");
                         } else {
                             // Covers Array<T>, Stack<T>, Queue<T>, Set<T>,
                             // LinkedList<T>, and other IEnumerable<T> types that
