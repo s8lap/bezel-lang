@@ -177,11 +177,11 @@ set(BEZEL_TEST_SOURCES
     # The implementation lane enables them by uncommenting the lines below.
     # DO NOT uncomment until the sendability-check implementation lands.
     #
-    # sema/send_600_sendability_value_types_test.cpp
-    # sema/send_600_sendability_class_types_test.cpp
-    # sema/send_600_spawn_callsite_test.cpp
-    # sema/send_600_channel_rules_test.cpp
-    # sema/send_600_runtime_semantics_test.cpp
+    sema/send_600_sendability_value_types_test.cpp
+    sema/send_600_sendability_class_types_test.cpp
+    sema/send_600_spawn_callsite_test.cpp
+    sema/send_600_channel_rules_test.cpp
+    # sema/send_600_runtime_semantics_test.cpp   # pending #600c (runtime phase)
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp

@@ -617,6 +617,43 @@ private:
     // them — so a non-empty result is rejected by `typeUnary`'s `move` branch.
     std::string moveThroughInterfaceSlotName(const ast::Expr& operand) const;
 
+    // §30.14 / §3.6 (#600): sendability derived-type property.
+    // Returns true iff `rt` satisfies the §30.14 sendable table for a
+    // Channel<T> element or Domain.Spawn argument/result.
+    //
+    // The `inProgress` set implements the coinductive recursion rule:
+    // a class or named type being evaluated is assumed sendable until
+    // proven otherwise.  Callers should pass an empty set on initial
+    // call; recursive sub-calls share the same set.
+    bool isSendable(const TypeRef* rt,
+                    std::unordered_set<const TypeSymbol*>& inProgress) const;
+
+    // Convenience overload with a private inProgress set (top-level call).
+    bool isSendable(const TypeRef* rt) const {
+        std::unordered_set<const TypeSymbol*> ip;
+        return isSendable(rt, ip);
+    }
+
+    // §30.14 (#600): true iff the entry argument to Domain.Spawn is
+    // capture-free: a static-method-reference (MemberAccessExpr whose
+    // target is a TypeSymbol) or a non-capturing lambda (a LambdaExpr
+    // whose body references no locals from the enclosing scope).
+    bool isCaptureFreeEntry(const ast::Expr* entryExpr) const;
+
+    // Helper: does the lambda body (recursively) reference any identifier
+    // whose resolved symbol is NOT in `ownParamSyms` and is a local or
+    // parameter symbol (i.e. captured from the outer scope)?
+    bool lambdaBodyCaptures(
+        const ast::LambdaExpr* lam,
+        const std::unordered_set<const Symbol*>& ownParamSyms) const;
+
+    // Walk the given expression tree and check if any IdentifierExpr
+    // resolves to a symbol that is a local/parameter NOT in ownParamSyms.
+    bool exprCaptures(const ast::Expr& e,
+                      const std::unordered_set<const Symbol*>& ownParamSyms) const;
+    bool stmtCaptures(const ast::Stmt& s,
+                      const std::unordered_set<const Symbol*>& ownParamSyms) const;
+
     void visitChildren(const ast::Expr& e);
 };
 

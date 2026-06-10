@@ -135,8 +135,7 @@ BEZEL_TEST(send_600_channel_rules,
         "class C "
         "  public static method Test() "
         "    using var ch := new Channel<Packet>(); "
-        "    out using var item: Packet?; "
-        "    var got := ch.TryReceive(out item); "
+        "    var got := ch.TryReceive(out using var item); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

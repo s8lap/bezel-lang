@@ -200,7 +200,7 @@ BEZEL_TEST(send_600_value_types,
         "end Worker; "
         "class Main "
         "  public static method Go() "
-        "    var arg := BorrowArg(); "
+        "    var arg := new BorrowArg(); "
         "    using var t := Domain.Spawn(Worker.Run, arg); "
         "  end Go; "
         "end Main;");

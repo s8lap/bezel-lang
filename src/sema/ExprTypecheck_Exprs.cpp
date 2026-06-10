@@ -242,7 +242,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    // §30.10 / stdlib §6.7: the `Task` static-helper class is
                    // auto-imported (Task.Delay, Task.FromResult, …). Only used in
                    // expression position as the receiver of a static helper call.
-                   id->name == "Task") {
+                   id->name == "Task" ||
+                   // §30.14 (#600): Domain is a static class auto-imported for
+                   // Domain.Spawn; recognized here so Domain.Spawn(…) can resolve
+                   // as a call on a known-class receiver.
+                   id->name == "Domain") {
             // §2.3: these System classes are auto-imported and always
             // available without an explicit import. Give them a synthetic
             // TypeSymbol (null decl) so member access can proceed; the
@@ -700,6 +704,57 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 "runtime-managed and value types have no "
                                 "disposal obligation to share "
                                 "(\xC2\xA7""28.13 / stdlib \xC2\xA7""2.16, #603)");
+                        }
+                    }
+                }
+                // §30.14 / §30.15 (#600): Channel<T> and ChannelSender<T>
+                // instantiation — element type T must be sendable per §3.6.
+                // Checked at instantiation so the error is at the `new` site.
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty()) {
+                    std::string_view chName = rt->astNode->name->parts[0];
+                    if (chName == "Channel" || chName == "ChannelSender") {
+                        if (rt->genericArgs.empty() || !rt->genericArgs[0]) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ne->span.begin,
+                                std::string(chName) +
+                                "<T> requires a type argument (§30.15, #600)");
+                        } else {
+                            const TypeRef* elemTy = rt->genericArgs[0];
+                            if (!isSendable(elemTy)) {
+                                // Produce a human-readable name for the type arg.
+                                std::string tName;
+                                if (elemTy->kind == TypeRef::Kind::Named) {
+                                    if (elemTy->declaration)
+                                        tName = std::string(elemTy->declaration->name);
+                                    else if (elemTy->astNode && elemTy->astNode->name &&
+                                             !elemTy->astNode->name->parts.empty())
+                                        tName = std::string(elemTy->astNode->name->parts[0]);
+                                } else if (elemTy->kind == TypeRef::Kind::Primitive) {
+                                    using P = sema::PrimitiveType;
+                                    switch (elemTy->primitive) {
+                                        case P::Bool:    tName = "bool"; break;
+                                        case P::Int:     tName = "int"; break;
+                                        case P::String:  tName = "string"; break;
+                                        default:         tName = "primitive type"; break;
+                                    }
+                                } else if (elemTy->kind == TypeRef::Kind::Function) {
+                                    tName = "function type";
+                                } else if (elemTy->kind == TypeRef::Kind::InlineArray) {
+                                    tName = elemTy->arrayOwned ? "[N owned]T" : "[N]T";
+                                }
+                                if (tName.empty()) tName = "<type>";
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ne->span.begin,
+                                    std::string("type argument `") + tName +
+                                    "` of `" + std::string(chName) + "<T>` is not "
+                                    "sendable: the element type must satisfy the §30.14 "
+                                    "sendable-type rules (not borrow-bearing, not "
+                                    "move-only, not function-typed, not domain-local; "
+                                    "class types must be transfer-closed/sealed) "
+                                    "(\xC2\xA7""30.14/\xC2\xA7""30.15, #600)");
+                            }
                         }
                     }
                 }
