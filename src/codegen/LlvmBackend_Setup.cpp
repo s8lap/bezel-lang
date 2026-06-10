@@ -3331,7 +3331,27 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                    sema::ConstructorSymbol* cs) {
     const sema::TypeSymbol* targetCls =
         isThis ? cs->parent : baseClassOf(cs->parent);
-    if (!targetCls) return;  // base() at the root (Object): nothing to run
+    if (!targetCls) {
+        // #595 / §12 / §31: base() at the root — OR — the AST-declared base is a
+        // built-in exception type (which has no TypeSymbol in baseTypes, so
+        // baseClassOf returns null).  For a built-in exception base, store the
+        // first constructor argument (the message string) to the inherited message-
+        // ptr slot at struct slot 1 / byte offset 8 so `e.Message` returns it.
+        // Only applies to a `base(...)` chain (isThis==false) on a class whose
+        // direct AST base is a built-in exception.
+        if (!isThis && !call->args.empty() && call->args[0].value &&
+            hasBuiltinExceptionBase(cs->parent) && currentThis_) {
+            llvm::Value* msgVal = lowerExpr(*call->args[0].value);
+            if (msgVal) {
+                // message_ptr is at byte offset 8 — store directly via byte GEP.
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* msgSlot = builder_.CreateGEP(
+                    i8Ty, currentThis_, builder_.getInt64(8));
+                builder_.CreateStore(msgVal, msgSlot);
+            }
+        }
+        return;
+    }
     std::size_t n = call->args.size();
     sema::ConstructorSymbol* target =
         ctorByArity(targetCls, n, isThis ? cs : nullptr);

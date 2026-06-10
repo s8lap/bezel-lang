@@ -2181,15 +2181,32 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
-    // CG22+: Exception.Message — built-in exceptions store a message
-    // string pointer at byte offset 8 (slot 1) of the exception object.
+    // CG22+: Exception.Message — built-in exceptions store a message string
+    // pointer at byte offset 8 (struct slot 1) of the exception object.
+    //
+    // #595: user-defined classes that directly inherit a built-in exception
+    // (e.g. `class ErrA: Exception`) embed the same message-ptr at struct
+    // slot 1 (byte offset 8) as part of the inherited layout inserted by
+    // classStruct.  Both cases use the same GEP-at-byte-8 path; the
+    // recognition is extended to cover the user-class case via
+    // hasBuiltinExceptionBase.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Message") {
             auto* tt = ctx_.exprType(*ma->target);
-            if (tt && isBuiltinExceptionType(tt)) {
+            // Case A: receiver is a built-in exception TypeRef (no user declaration).
+            bool isBuiltinEx = tt && isBuiltinExceptionType(tt);
+            // Case B: receiver is a user class that directly inherits a built-in
+            // exception — it embeds the message slot at the same byte offset 8.
+            bool isUserDerivedEx = false;
+            if (!isBuiltinEx && tt &&
+                tt->kind == sema::TypeRef::Kind::Named && tt->declaration)
+                isUserDerivedEx = hasBuiltinExceptionBase(tt->declaration);
+            if (isBuiltinEx || isUserDerivedEx) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
                 if (!excObj) return nullptr;
-                // slot 1 = message string ptr (at byte offset 8)
+                // The message ptr is always at byte offset 8 — slot 1 of the
+                // raw built-in layout AND slot 1 of the user-class struct
+                // (classStruct inserts it before the disposed flag).
                 auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
                 llvm::Value* msgSlot = builder_.CreateGEP(
                     i8Ty, excObj, builder_.getInt64(8));

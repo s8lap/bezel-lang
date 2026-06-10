@@ -2043,6 +2043,56 @@ private:
         return isBuiltinExceptionTypeRef(ctx_.resolvedType(*fd->type));
     }
 
+    // #595 / §12 / §31: detect whether a user-defined class or any of its user-
+    // class ancestors has a built-in exception type as a direct AST-declared base
+    // (e.g. `class ErrA: Exception`, or `class ErrB: ErrA` where ErrA: Exception).
+    //
+    // Built-in exception types have no user TypeSymbol (their TypeRef carries
+    // `declaration == nullptr` and they are absent from TypeSymbol::baseTypes —
+    // see ExprTypecheck.cpp line ~820).  We walk the AST TypeDecl::baseTypes list
+    // at each level of the user class hierarchy, matching base-type names against
+    // builtinVtable_.
+    //
+    // The FULL ancestor chain is checked (not just the direct base) because a
+    // multi-level user hierarchy (ErrB: ErrA, ErrA: Exception) must embed the same
+    // message-ptr prefix in ErrB's struct so byte offset 8 is uniform across the
+    // entire user-exception subtree.
+    //
+    // Returns the built-in exception base name (e.g. "Exception"), or "" if none.
+    std::string directBuiltinExceptionBase(const sema::TypeSymbol* t) const {
+        if (!t || t->kind != ast::TypeDeclKind::Class) return {};
+        // Walk up the user-class chain (TypeSymbol::baseTypes gives us user bases).
+        for (const sema::TypeSymbol* cur = t; cur;) {
+            auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);
+            if (td) {
+                // Check each AST-declared base for a builtin exception name.
+                for (const auto& bt : td->baseTypes) {
+                    if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                    std::string n(bt->name->parts.back());
+                    if (builtinVtable_.find(n) != builtinVtable_.end()) return n;
+                }
+            }
+            // Advance to the next user-class base via the TypeSymbol chain.
+            const sema::TypeSymbol* next = nullptr;
+            for (const sema::TypeSymbol* b : cur->baseTypes) {
+                if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
+                    next = b;
+                    break;
+                }
+            }
+            cur = next;
+        }
+        return {};
+    }
+
+    // #595: true when `t` (or any user-class ancestor) inherits a built-in
+    // exception type.  Used by classStruct / disposedFlagIndex to insert the
+    // inherited message-ptr slot so `e.Message` reads the right offset whether
+    // `e` is typed as the user class OR as the built-in Exception base.
+    bool hasBuiltinExceptionBase(const sema::TypeSymbol* t) const {
+        return !directBuiltinExceptionBase(t).empty();
+    }
+
     // CG22: construct + throw a built-in exception by name, then unwind.
     void emitThrowBuiltin(const char* name);
 
