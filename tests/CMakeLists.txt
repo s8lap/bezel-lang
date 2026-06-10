@@ -418,6 +418,7 @@ set(BEZEL_TEST_SOURCES
     codegen/console_write_unicode_592_test.cpp
     codegen/multitype_catch_ncb_593_test.cpp
     codegen/user_exception_message_595_test.cpp
+    codegen/user_exception_isa_596_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

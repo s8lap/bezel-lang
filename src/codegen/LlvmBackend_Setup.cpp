@@ -1171,8 +1171,27 @@ void Emitter::declareVtables() {
     // Pass B: declare a descriptor-array global (correctly sized, no
     // initializer yet) for every class/interface, so descriptors can
     // cross-reference each other in pass C.
+    //
+    // #596 / §21 / §31 / §12: built-in exception types (e.g. Exception,
+    // ArgumentException) have no user TypeSymbol and are absent from
+    // TypeSymbol::baseTypes (declaration == nullptr), so collectTypeAndBases
+    // never reaches them.  For a user class that inherits a built-in exception
+    // base (e.g. `class ErrA: Exception`), the descriptor array must also list
+    // the builtin ancestor descriptors (btd$Exception, …) so emitIsA's linear
+    // walk finds them when testing `e is Exception` or matching a catch arm.
+    // We build a parallel map builtinChainOf to record the names, then use it
+    // in Pass C to append the builtin GlobalVariable* entries.
+    //
+    // Build a parent map once for the builtin hierarchy so we can walk upward.
+    std::unordered_map<std::string, std::string> builtinParent;
+    for (const auto& [name, par] : builtinExceptionHierarchy())
+        builtinParent[name] = par;
+
     std::unordered_map<const sema::TypeSymbol*,
                        std::vector<const sema::TypeSymbol*>> supersOf;
+    // #596: builtin ancestor-chain names per user-class TypeSymbol.
+    std::unordered_map<const sema::TypeSymbol*,
+                       std::vector<std::string>> builtinChainOf;
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts) continue;
@@ -1182,7 +1201,21 @@ void Emitter::declareVtables() {
         std::vector<const sema::TypeSymbol*> supers;
         collectTypeAndBases(ts, supers);
         supersOf[ts] = supers;
-        auto* arrTy = llvm::ArrayType::get(ptrTy(), supers.size() + 1);
+        // #596 / §12 / §21 / §31: collect the full builtin ancestor chain
+        // for any user class (or user-class ancestor) that directly inherits a
+        // built-in exception type.  directBuiltinExceptionBase walks the AST
+        // TypeDecl::baseTypes chain at each user-class level to find the first
+        // built-in name; we then walk builtinParent to reach the root.
+        std::vector<std::string> builtinChain;
+        std::string bn = directBuiltinExceptionBase(ts);
+        while (!bn.empty()) {
+            builtinChain.push_back(bn);
+            auto pit = builtinParent.find(bn);
+            bn = (pit != builtinParent.end()) ? pit->second : std::string{};
+        }
+        builtinChainOf[ts] = builtinChain;
+        auto* arrTy = llvm::ArrayType::get(
+            ptrTy(), supers.size() + builtinChain.size() + 1);
         // §2.5 / §2.6 / §12 (issue #328 / #103): a PUBLIC, non-generic class or
         // interface's type DESCRIPTOR (`td$<Type>`) is part of its cross-module
         // surface. A LOCAL class deriving from an IMPORTED base must embed the
@@ -1240,12 +1273,23 @@ void Emitter::declareVtables() {
     // above; guard with .find so a not-yet-reconstructed base lowers to null
     // rather than a default-inserted null map entry (which yields a malformed
     // ConstantArray and crashes global emission, issue #103).
+    // #596 / §21 / §31 / §12: after user-type supers, also append the builtin
+    // ancestor descriptors (builtinDesc_) so emitIsA finds them when testing
+    // `e is Exception` or dispatching a `catch var e: Exception` arm.
     for (auto& [ts, supers] : supersOf) {
         std::vector<llvm::Constant*> elems;
         for (const sema::TypeSymbol* s : supers) {
             auto it = descArray_.find(s);
             elems.push_back(it != descArray_.end()
                                 ? llvm::cast<llvm::Constant>(it->second)
+                                : llvm::ConstantPointerNull::get(ptrTy()));
+        }
+        // #596: append builtin exception ancestor descriptors (btd$Exception, …)
+        // for any user class that inherits a built-in exception type.
+        for (const std::string& bn : builtinChainOf[ts]) {
+            auto bit = builtinDesc_.find(bn);
+            elems.push_back(bit != builtinDesc_.end()
+                                ? llvm::cast<llvm::Constant>(bit->second)
                                 : llvm::ConstantPointerNull::get(ptrTy()));
         }
         elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
