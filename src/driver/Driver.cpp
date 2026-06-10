@@ -162,7 +162,15 @@ CompileResult Driver::compileFile(const std::string& path,
             std::string objectPath = outputPath + ".o";
             std::string err;
             if (!module || !codegen::emitObjectFile(*module, objectPath, err)) {
-                std::cerr << "bezelc: codegen error: " << err << "\n";
+                // Print any diagnostics recorded during codegen (e.g. "not yet
+                // implemented") before reporting the codegen failure (#628 pt 1).
+                for (const Diagnostic& diag : diagnostics.diagnostics()) {
+                    std::cerr << path << ":" << diag.location.line << ":"
+                              << diag.location.column << ": " << diag.message
+                              << "\n";
+                }
+                if (!err.empty())
+                    std::cerr << "bezelc: codegen error: " << err << "\n";
                 return CompileResult{false, diagnostics.errorCount() + 1};
             }
             // §2.6 step 4: link the importer's object together with each
@@ -239,7 +247,15 @@ CompileResult Driver::compileObject(const std::string& path,
             if (module) bezel::module::embedModuleMetadata(*module, semaCtx);
             std::string err;
             if (!module || !codegen::emitObjectFile(*module, objectPath, err)) {
-                std::cerr << "bezelc: codegen error: " << err << "\n";
+                // Print codegen diagnostics (e.g. "not yet implemented") before
+                // failing (#628 pt 1).
+                for (const Diagnostic& diag : diagnostics.diagnostics()) {
+                    std::cerr << path << ":" << diag.location.line << ":"
+                              << diag.location.column << ": " << diag.message
+                              << "\n";
+                }
+                if (!err.empty())
+                    std::cerr << "bezelc: codegen error: " << err << "\n";
                 return CompileResult{false, diagnostics.errorCount() + 1};
             }
         }

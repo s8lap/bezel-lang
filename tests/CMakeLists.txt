@@ -454,6 +454,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_entry_iter_548_test.cpp
     codegen/dict_insertion_order_622_test.cpp
     codegen/async_iter_try_finally_554_test.cpp
+    codegen/codegen_unimplemented_hard_error_628_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
