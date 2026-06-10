@@ -4683,6 +4683,70 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // source, they are implemented via the builtin binary path below).
     // ---------------------------------------------------------------------------
 
+    // ---------------------------------------------------------------------------
+    // §28.13 / stdlib §2.16 (#603): Shared<T> and Weak<T> instance methods.
+    // Receiver is identified by builtinTypeName "Shared" or "Weak".
+    // Shared<T> methods: Clone() → bz_shared_clone; Get() → bz_shared_get;
+    //   Downgrade() → bz_shared_downgrade; Dispose() → bz_shared_release.
+    // Weak<T> methods: TryUpgrade(out using var h) → bz_weak_try_upgrade;
+    //   Dispose() → bz_weak_release.
+    // NOTE: explicit Dispose() on these types is intercepted in lowerCall's
+    // Dispose() block (around the CTS Dispose arm) — see below.
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                std::string_view btn = builtinTypeName(recvTy);
+                // ── Shared<T> instance methods ──────────────────────────────
+                if (btn == "Shared") {
+                    llvm::Value* handle = lowerExpr(*ma2->target);
+                    if (!handle) return nullptr;
+                    const auto& mname = ma2->member;
+                    // Clone(): Shared<T> — increments strong count, returns new handle.
+                    if (mname == "Clone" && call.args.empty()) {
+                        auto* fn = declareC("bz_shared_clone", ptrTy(), {ptrTy()});
+                        return builder_.CreateCall(fn, {handle}, "shared.clone");
+                    }
+                    // Get(): T — returns raw pointer to the owned value (borrow).
+                    if (mname == "Get" && call.args.empty()) {
+                        auto* fn = declareC("bz_shared_get", ptrTy(), {ptrTy()});
+                        return builder_.CreateCall(fn, {handle}, "shared.get");
+                    }
+                    // Downgrade(): Weak<T> — returns a weak handle to the same ctrl block.
+                    if (mname == "Downgrade" && call.args.empty()) {
+                        auto* fn = declareC("bz_shared_downgrade", ptrTy(), {ptrTy()});
+                        return builder_.CreateCall(fn, {handle}, "shared.downgrade");
+                    }
+                    // Dispose() is handled in the explicit-Dispose block; fall through.
+                }
+                // ── Weak<T> instance methods ────────────────────────────────
+                if (btn == "Weak") {
+                    llvm::Value* handle = lowerExpr(*ma2->target);
+                    if (!handle) return nullptr;
+                    const auto& mname = ma2->member;
+                    // TryUpgrade(out using var s: Shared<T>): bool
+                    // bz_weak_try_upgrade(weak_handle, &out_slot) → int (1=success).
+                    // The out-slot was pre-created in ensureOutVarSlots.
+                    if (mname == "TryUpgrade" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Type* slotTy = nullptr;
+                        llvm::Value* outAddr = lvalueAddr(*call.args[0].value,
+                                                          slotTy);
+                        if (!outAddr) return builder_.getFalse();
+                        auto* fn = declareC("bz_weak_try_upgrade", i32(),
+                                            {ptrTy(), ptrTy()});
+                        llvm::Value* r = builder_.CreateCall(fn, {handle, outAddr},
+                                                             "weak.tryupgrade");
+                        return builder_.CreateICmpNE(r, builder_.getInt32(0),
+                                                     "weak.upgraded");
+                    }
+                    // Dispose() is handled in the explicit-Dispose block; fall through.
+                }
+            }
+        }
+    }
+
     return nullptr;
 }
 
@@ -5195,6 +5259,39 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
 
     std::size_t pos = 0;
     for (const auto& a : call.args) {
+        // §28.13 / stdlib §2.16 (#603): Weak<T>.TryUpgrade(out using var h).
+        // The modifier is "out using var" — pre-create a null-initialized ptr
+        // slot so lvalueAddr finds it. Register a sharedHandle disposal so the
+        // handle is released at scope end: if TryUpgrade succeeded the slot
+        // holds a valid Shared<T> handle; if it failed the slot is null and
+        // emitDisposals' null-guard skips the release (no-op).
+        if (a.modifier == "out using var" && a.value) {
+            auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (id2) {
+                sema::Symbol* sym2 = ctx_.exprSymbol(*id2);
+                auto* loc2 = dynamic_cast<sema::LocalSymbol*>(sym2);
+                bool alreadyMapped = (loc2 && loc2->decl &&
+                                      locals_.count(loc2->decl)) ||
+                                     locals_.count(id2);
+                if (!alreadyMapped) {
+                    llvm::AllocaInst* outSlot = entryAlloca(ptrTy());
+                    // Zero-initialize: null → upgrade did not happen (no-op on release).
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), outSlot);
+                    locals_[id2] = outSlot;
+                    if (loc2 && loc2->decl) locals_[loc2->decl] = outSlot;
+                    // Register a sharedHandle disposal so bz_shared_release is
+                    // called at scope end (null-guarded by emitDisposals).
+                    if (!disposeStack_.empty()) {
+                        Disposal disp{outSlot, nullptr};
+                        disp.sharedHandle = true;
+                        disposeStack_.back().push_back(disp);
+                    }
+                }
+            }
+            pos++;
+            continue;
+        }
         if (a.modifier != "out var" || !a.value) { pos++; continue; }
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
         if (!id) { pos++; continue; }
@@ -6460,6 +6557,34 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             auto* fn = declareC("bz_cts_dispose",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
                             builder_.CreateCall(fn, {recv});
+                        }
+                        return nullptr;
+                    }
+                }
+                // §28.13 / stdlib §2.16 (#603): Shared<T>.Dispose() — explicit
+                // release of one strong handle via bz_shared_release.
+                {
+                    auto* recvTy2 = ctx_.exprType(*ma->target);
+                    if (recvTy2 && builtinTypeName(recvTy2) == "Shared") {
+                        llvm::Value* recv2 = lowerExpr(*ma->target);
+                        if (recv2 && recv2->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_shared_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {recv2});
+                        }
+                        return nullptr;
+                    }
+                }
+                // §28.13 / stdlib §2.16 (#603): Weak<T>.Dispose() — explicit
+                // release of one weak handle via bz_weak_release.
+                {
+                    auto* recvTy2 = ctx_.exprType(*ma->target);
+                    if (recvTy2 && builtinTypeName(recvTy2) == "Weak") {
+                        llvm::Value* recv2 = lowerExpr(*ma->target);
+                        if (recv2 && recv2->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_weak_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {recv2});
                         }
                         return nullptr;
                     }

@@ -1735,6 +1735,53 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Fill/CopyFrom/CopyTo/Reverse → unit (void); no type set.
                     }
+                    // §28.13 / stdlib §2.16 (#603): Shared<T> instance method
+                    // return types.  The receiver TypeRef has no declaration
+                    // (builtin) and astNode carries "Shared"; genericArgs[0] is T.
+                    if (rcn == "Shared" && recvTy &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                        const TypeRef* elemTy = recvTy->genericArgs[0];
+                        if (m == "Clone") {
+                            // Clone(): owned Shared<T> — returns a TypeRef
+                            // identical to the receiver (same structure).
+                            ctx_.setExprType(&ce, const_cast<TypeRef*>(recvTy));
+                        } else if (m == "Get") {
+                            // Get(): T (borrow; source = the handle, handled
+                            // via Shape-1 in borrowSourceForExpr when T is a
+                            // class — the MemberAccessExpr's identifierRoot
+                            // resolves to the Shared handle local). per §28.13.
+                            ctx_.setExprType(&ce, const_cast<TypeRef*>(elemTy));
+                        } else if (m == "Downgrade") {
+                            // Downgrade(): owned Weak<T>. Build a Weak<T>
+                            // TypeRef with the same element type argument.
+                            auto* weakTy = ctx_.makeTypeRef();
+                            weakTy->kind = TypeRef::Kind::Named;
+                            weakTy->declaration = nullptr;
+                            // Re-use the same synthetic astNode shape as
+                            // Shared<T> but with name "Weak".
+                            static const ast::Type* kWeakNode = []() -> ast::Type* {
+                                auto* qn = new ast::QualifiedName;
+                                qn->parts.push_back("Weak");
+                                auto* t  = new ast::Type;
+                                t->kind  = ast::TypeKind::Named;
+                                t->name.reset(qn);
+                                return t;
+                            }();
+                            weakTy->astNode = kWeakNode;
+                            weakTy->genericArgs.push_back(
+                                const_cast<TypeRef*>(elemTy));
+                            ctx_.setExprType(&ce, weakTy);
+                        }
+                        // Dispose(): unit; no return type set.
+                    }
+                    // §28.13 / stdlib §2.16 (#603): Weak<T> instance methods.
+                    if (rcn == "Weak") {
+                        if (m == "TryUpgrade") {
+                            // TryUpgrade(out owned s: Shared<T>?): bool.
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        }
+                        // Dispose(): unit; no return type set.
+                    }
                 }
             }
         }
