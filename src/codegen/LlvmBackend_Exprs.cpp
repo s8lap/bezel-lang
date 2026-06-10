@@ -4957,7 +4957,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // class path below carries the subst through classStruct + the inline
     // constructor). Restore the outer substitution afterward.
     if (t->kind == ast::TypeDeclKind::Record) {
-        llvm::Value* rec = buildRecordValue(t, ne.args);
+        // issue #597: pass the OUTER substitution (savedSubst/savedSemaTy) so
+        // construction-argument expressions are lowered under the enclosing
+        // scope's binding while the record's field layout uses the new type's
+        // substitution (active in genericSubst_).
+        llvm::Value* rec = buildRecordValue(t, ne.args, savedSubst, savedSemaTy);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         return rec;
@@ -5023,7 +5027,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         auto idxIt = fieldIndex_.find(fs);
                         if (idxIt == fieldIndex_.end()) break;
                         if (!ne.args[pi].value) break;
+                        // issue #597: a positional primary-ctor argument is an
+                        // enclosing-scope expression — lower it under the outer
+                        // substitution, then restore the new type's subst for
+                        // the field-type coercion + store below.
+                        auto posSubst = genericSubst_;
+                        auto posSemaTy = genericSubstSemaTy_;
+                        genericSubst_ = savedSubst;
+                        genericSubstSemaTy_ = savedSemaTy;
                         llvm::Value* v = lowerExpr(*ne.args[pi].value);
+                        genericSubst_ = std::move(posSubst);
+                        genericSubstSemaTy_ = std::move(posSemaTy);
                         if (!v) break;
                         llvm::Type* fieldTy =
                             st->getElementType(idxIt->second);
@@ -5117,7 +5131,27 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         if (it != ctorFns_.end() && cd) {
             std::vector<llvm::Value*> args;
             args.push_back(obj);
-            if (buildOrderedArgs(cd->params, ne.args, args) &&
+            // issue #597 (§14.1 / §22.4): the constructor ARGUMENT expressions
+            // belong to the ENCLOSING scope, so they must be lowered under the
+            // outer substitution (`savedSubst`), not the new type's own
+            // substitution that was activated above for the constructor body /
+            // field layout.  Inside `Pair<int,string>.Swap()` the body is
+            // `new Pair<B,A>(_b, _a)`: the new type's subst is `{A→string,
+            // B→int}` (the swapped result), but `_b`/`_a` read `this`, whose
+            // layout is the receiver's `{A→int, B→string}`.  Lowering the args
+            // under the new subst laid `this` out as `Pair<string,int>` and
+            // read the fields at the wrong offsets/widths (returned garbage).
+            // Lower the arg values under the outer subst, then restore the new
+            // subst so the constructor body / field stores keep the right
+            // (specialized) layout.
+            auto ctorArgSubst = genericSubst_;
+            auto ctorArgSemaTy = genericSubstSemaTy_;
+            genericSubst_ = savedSubst;
+            genericSubstSemaTy_ = savedSemaTy;
+            bool builtArgs = buildOrderedArgs(cd->params, ne.args, args);
+            genericSubst_ = std::move(ctorArgSubst);
+            genericSubstSemaTy_ = std::move(ctorArgSemaTy);
+            if (builtArgs &&
                 args.size() == it->second->arg_size()) {
                 // Check for type mismatch (generic substitution active).
                 bool typesMismatch = false;
@@ -5352,8 +5386,12 @@ llvm::Value* Emitter::lowerEnumCast(const ast::CallExpr& call) {
 }
 
 
-llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
-                              const std::vector<ast::CallArgument>& args) {
+llvm::Value* Emitter::buildRecordValue(
+        const sema::TypeSymbol* t,
+        const std::vector<ast::CallArgument>& args,
+        const std::unordered_map<std::string_view, llvm::Type*>& argSubst,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            argSemaTy) {
     llvm::StructType* st = recordStruct(t);
     llvm::Value* slot = entryAlloca(st);
     // §9.1 / §9.2: storage = positional/body FieldSymbols + body
@@ -5416,7 +5454,17 @@ llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
         if (mappingOk) {
             for (std::size_t i = 0; i < fields.size(); ++i) {
                 if (!fieldArg[i] || !fieldArg[i]->value) return nullptr;
+                // issue #597: lower the construction argument under the
+                // ENCLOSING substitution (its expression belongs to the outer
+                // scope), then restore the record's own substitution for the
+                // field-index store below.
+                auto recSubst = genericSubst_;
+                auto recSemaTy = genericSubstSemaTy_;
+                genericSubst_ = argSubst;
+                genericSubstSemaTy_ = argSemaTy;
                 llvm::Value* v = lowerExpr(*fieldArg[i]->value);
+                genericSubst_ = std::move(recSubst);
+                genericSubstSemaTy_ = std::move(recSemaTy);
                 if (!v) return nullptr;
                 // CG-nullable: a NULLABLE VALUE field (int?, bool?, …, and a
                 // nullable enum — issue #364) stores the tagged struct {i8
@@ -5489,7 +5537,17 @@ llvm::Value* Emitter::buildRecordValue(const sema::TypeSymbol* t,
         // the parameters bound to fresh slots.
         std::vector<llvm::Value*> ordered;
         ordered.push_back(slot);  // placeholder for the implicit receiver
-        if (!buildOrderedArgs(cd->params, args, ordered)) return nullptr;
+        // issue #597: lower the constructor arguments under the enclosing
+        // substitution (see the positional path above), then restore the
+        // record's own substitution for the inlined constructor body.
+        auto recSubst = genericSubst_;
+        auto recSemaTy = genericSubstSemaTy_;
+        genericSubst_ = argSubst;
+        genericSubstSemaTy_ = argSemaTy;
+        bool builtRecArgs = buildOrderedArgs(cd->params, args, ordered);
+        genericSubst_ = std::move(recSubst);
+        genericSubstSemaTy_ = std::move(recSemaTy);
+        if (!builtRecArgs) return nullptr;
         llvm::Value* savedThis = currentThis_;
         auto savedLocals = locals_;
         auto savedParams = paramSlots_;

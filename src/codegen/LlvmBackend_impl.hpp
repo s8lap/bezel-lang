@@ -4071,8 +4071,19 @@ private:
     // materialized in a stack slot and returned by value (records are value
     // types, no heap allocation). Named arguments and defaults are a later
     // refinement.
-    llvm::Value* buildRecordValue(const sema::TypeSymbol* t,
-                                  const std::vector<ast::CallArgument>& args);
+    // issue #597 (§14.1 / §22.4): `argSubst`/`argSemaTy` give the substitution
+    // under which the constructor ARGUMENT expressions must be lowered — the
+    // ENCLOSING scope's binding, which differs from the new record's own
+    // substitution (`genericSubst_`, active for `recordStruct`/field layout)
+    // when the record is built from an enclosing param in a non-identity
+    // position (e.g. `new RBox<B>(_b)` inside `Pair<A,B>`). The field STORES
+    // still run under the record's own substitution.
+    llvm::Value* buildRecordValue(
+        const sema::TypeSymbol* t,
+        const std::vector<ast::CallArgument>& args,
+        const std::unordered_map<std::string_view, llvm::Type*>& argSubst,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            argSemaTy);
 
     // CG-console: emit a Console.Write/Console.WriteLine call as an
     // intrinsic. Uses libc write(1, data, len) for Write and additionally

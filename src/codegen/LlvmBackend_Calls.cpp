@@ -6915,39 +6915,48 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
     }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
-    // Record the concrete subst that was active during this call so that
+    // Record the concrete subst that drives the RESULT local's layout so that
     // lowerLocalDecl can associate it with the result's local variable.
-    if (!genericSubst_.empty()) {
-        lastCallGenericSubst_ = genericSubst_;
-    } else {
-        // Even if genericSubst_ is empty (non-generic caller), try to
-        // derive the subst from the method's return type so that
-        // 'var primes := CreatePrimes(...)' correctly associates
-        // the Gen<int> substitution rather than inheriting stale
-        // lastCallGenericSubst_ from prior generic method calls.
-        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-            if (md->returnType) {
-                sema::TypeRef* retTy = ctx_.resolvedType(*md->returnType);
-                if (retTy && retTy->kind == sema::TypeRef::Kind::Named &&
-                    retTy->declaration && !retTy->genericArgs.empty()) {
-                    auto* td = dynamic_cast<const ast::TypeDecl*>(
-                        retTy->declaration->decl);
-                    if (td && td->genericParams.size() ==
-                              retTy->genericArgs.size()) {
-                        std::unordered_map<std::string_view, llvm::Type*> newSubst;
-                        for (std::size_t gi = 0;
-                             gi < td->genericParams.size(); ++gi) {
-                            llvm::Type* concrTy =
-                                lowerTypeRef(retTy->genericArgs[gi]);
-                            newSubst[td->genericParams[gi].name] = concrTy;
-                        }
-                        if (!newSubst.empty())
-                            lastCallGenericSubst_ = std::move(newSubst);
-                    }
+    //
+    // issue #597 (§14.1 / §22.4): the layout of the call result is governed by
+    // the call's RESULT type, which is NOT necessarily the substitution active
+    // during the call.  For `Pair<int,string>.Swap(): Pair<B,A>` the active
+    // genericSubst_ binds the RECEIVER's params (A→int, B→string), but the
+    // result is `Pair<string,int>` (params swapped); recording the receiver's
+    // subst as the result local's subst laid `s` out as the receiver type
+    // `Pair<int,string>` and the later `s._b` read used the wrong field type
+    // (ptr vs i32) → malformed `ret ptr` in an i32 function.  Derive the subst
+    // from the call's sema exprType (the SUBSTITUTED result type) — its
+    // genericArgs are the concrete types in declaration order — binding the
+    // result class's own params positionally against them.  This runs while
+    // genericSubst_/genericSubstSemaTy_ are still active, so a result type that
+    // still references an enclosing param (`Box<U>` inside a `Foo<U>` body)
+    // lowers its args through that binding correctly.  Only when the result
+    // type is not a concrete generic Named do we fall back to the active subst.
+    bool recorded = false;
+    if (sema::TypeRef* resultTy = ctx_.exprType(call)) {
+        if (resultTy->kind == sema::TypeRef::Kind::Named &&
+            resultTy->declaration && !resultTy->genericArgs.empty()) {
+            auto* td = dynamic_cast<const ast::TypeDecl*>(
+                resultTy->declaration->decl);
+            if (td && td->genericParams.size() ==
+                      resultTy->genericArgs.size()) {
+                std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                for (std::size_t gi = 0;
+                     gi < td->genericParams.size(); ++gi) {
+                    llvm::Type* concrTy =
+                        lowerTypeRef(resultTy->genericArgs[gi]);
+                    newSubst[td->genericParams[gi].name] = concrTy;
+                }
+                if (!newSubst.empty()) {
+                    lastCallGenericSubst_ = std::move(newSubst);
+                    recorded = true;
                 }
             }
         }
     }
+    if (!recorded && !genericSubst_.empty())
+        lastCallGenericSubst_ = genericSubst_;
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSemaTy);
     return result;

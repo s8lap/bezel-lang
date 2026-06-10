@@ -2420,14 +2420,19 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
                                       TypeSymbol* parent) {
     if (!declared || !target || !parent) return declared;
     if (parent->genericParams.empty()) return declared;
-    // Only a bare type-parameter reference needs substitution: an unresolved
-    // Named type whose single name part matches one of parent's params.
-    if (declared->kind != TypeRef::Kind::Named || declared->declaration)
-        return declared;
-    if (!declared->astNode || !declared->astNode->name ||
-        declared->astNode->name->parts.size() != 1)
-        return declared;
-    std::string_view paramName = declared->astNode->name->parts[0];
+    // Substitution applies both to a bare type-parameter reference (`v: T`)
+    // and to a constructed type that *embeds* a parent type parameter
+    // (`method BoxB(): Box<B>` on `Pair<A,B>`).  issue #597 (§14.1 / §22.4):
+    // a method returning `Box<B>` / `Pair<B,A>` — a Named TypeRef with a
+    // non-null declaration whose genericArgs reference the parent's params —
+    // was returned unchanged by the old `declared->declaration` early-out, so
+    // the class-level params inside the constructed type stayed unsubstituted.
+    // Codegen then defaulted each unresolved param to the i32 placeholder,
+    // which happens to equal the *first* type argument's lowering when it is
+    // `int` (so `Box<A>` with A=int worked by luck) but is wrong for any
+    // other param — `Box<B>` with B=string laid out as `Box<int>` (zero-init)
+    // and `Pair<B,A>` laid out as `Pair<int,int>` (malformed IR on return).
+    if (declared->kind != TypeRef::Kind::Named) return declared;
     // Find the receiver's resolved TypeRef (carries the concrete generic args).
     // Prefer the target's exprType; fall back to a local/parameter's declared
     // type when the target itself was not given an exprType.
@@ -2449,23 +2454,21 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
     }
     if (!recvTy || recvTy->declaration != parent || recvTy->genericArgs.empty())
         return declared;
-    // Map the param name to its positional concrete arg.
+    // Build the parent-param-name -> concrete-arg map, positional by index so
+    // each param maps to the same-index argument (param `B` at genericParams[1]
+    // -> recvTy->genericArgs[1]) rather than to the first argument.
+    std::unordered_map<std::string_view, TypeRef*> classSubst;
     for (std::size_t gi = 0; gi < parent->genericParams.size() &&
                              gi < recvTy->genericArgs.size(); ++gi) {
-        if (parent->genericParams[gi] &&
-            parent->genericParams[gi]->name == paramName) {
-            TypeRef* arg = recvTy->genericArgs[gi];
-            if (!arg) return declared;
-            // Preserve a `T?` annotation on the field through substitution.
-            if (declared->nullable && !arg->nullable) {
-                TypeRef* nn = ctx_.makeTypeRef(*arg);
-                nn->nullable = true;
-                return nn;
-            }
-            return arg;
-        }
+        if (parent->genericParams[gi] && recvTy->genericArgs[gi])
+            classSubst[parent->genericParams[gi]->name] =
+                recvTy->genericArgs[gi];
     }
-    return declared;
+    if (classSubst.empty()) return declared;
+    // substituteReturnType handles both the bare-param case (with the `T?`
+    // nullable-companion preservation) and recursion into the genericArgs of a
+    // constructed type — exactly what `Box<B>` / `Pair<B,A>` need.
+    return substituteReturnType(declared, classSubst);
 }
 
 // issue #391 helper: collect the subset of `paramNames` that the declared
