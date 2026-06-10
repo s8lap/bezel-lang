@@ -909,6 +909,18 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             if (dit != descArray_.end()) targetDesc = dit->second;
         }
     }
+    // #596 / §21 / §12: built-in exception types (e.g. Exception,
+    // ArgumentException) have no user TypeSymbol (declaration == nullptr),
+    // so neither boxDescriptorFor nor the descArray_ lookup above resolves
+    // them.  Fall back to builtinDesc_ via the type name so that `e is
+    // Exception` and `e as Exception` work when `e`'s runtime type is a user
+    // class that inherits Exception.
+    if (!targetDesc && te.testType && te.testType->name &&
+            !te.testType->name->parts.empty()) {
+        std::string tn(te.testType->name->parts.back());
+        auto bit = builtinDesc_.find(tn);
+        if (bit != builtinDesc_.end()) targetDesc = bit->second;
+    }
     if (!targetDesc) return nullptr;
     // §12.7 / §7 / issues #447 + #448: a nullable VALUE type operand is a
     // tagged {i8 hasValue; T value} struct, NOT a pointer. emitIsA walks a
