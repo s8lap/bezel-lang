@@ -738,11 +738,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // sentinel non-null value stored for present elements
                 llvm::Value* sentinel = builder_.CreateIntToPtr(
                     builder_.getInt64(1), ptrTy());
-                // #429 / §28.9 / §4.10: is this a Set<string>? If so, the set
-                // co-owns a +1 per string element (retained at Add, released at
-                // Remove/Clear/free). Mirror the Array<string> rule: a fresh +1
-                // producer is TRANSFERRED (no retain); anything else is RETAINED.
-                bool isStrSet = isStringElementSet(recvTy);
+                // #602 / #429 / §28.9 / §4.10 / §28.11 v0.134: consult the
+                // element-slot policy to decide whether this Set<T> co-owns a +1
+                // per element (Set is the dict-backed BORROWING collection; its
+                // element type must be in the RuntimeManaged row AND be specifically
+                // a non-nullable string primitive — same exclusions as batch-1's
+                // isStringElementSet delegate).
+                const ElementPolicy setElemPol =
+                    elementPolicyFor(elemTy, /*owningFamily=*/false);
+                // isStrSet: RuntimeManaged AND specifically a `string` primitive
+                // (not a function type, which shares the RuntimeManaged row but uses
+                // a different release path — per §28.11 v0.134; same exclusion as
+                // the isStringElementSet delegate in LlvmBackend_Setup.cpp).
+                bool isStrSet =
+                    setElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                    elemTy->kind == sema::TypeRef::Kind::Primitive &&
+                    elemTy->primitive == sema::PrimitiveType::String &&
+                    !elemTy->nullable;
                 // .Add(item) — insert (idempotent by content; §4.10 dedup).
                 if (m == "Add" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
@@ -1842,6 +1854,53 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return copy;
         }
 
+        // #602 / §28.11 v0.134: hoist one element-slot policy lookup for all
+        // array-backed collection operations that need to know whether elements
+        // need retain/release bookkeeping (RuntimeManaged row), disposal
+        // (ClassOwned row), or class-reference equality (ClassBorrow row).
+        //
+        // arrElemRef: the sema TypeRef for the element type (genericArgs[0]);
+        // null for unparameterized collections (handled safely by elementPolicyFor).
+        //
+        // owning family flag: the collection name starts with "Owned" (§28.11 table).
+        // NOTE: the Set/OwnedSet branch above already handled dict-backed sets and
+        // returned; everything from here down is array-backed.
+        const sema::TypeRef* arrElemRef =
+            (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                     : nullptr;
+        bool arrIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
+                           !recvTy->astNode->name->parts.empty() &&
+                           (recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0);
+        const ElementPolicy arrElemPol =
+            elementPolicyFor(arrElemRef, arrIsOwning);
+        // Convenience predicates derived from the policy (replacing the old
+        // delegate calls; behavior preserved exactly):
+        //
+        //   arrIsStringElem: RuntimeManaged + non-nullable string primitive
+        //     (mirrors isStringElementArray — same collection-name guard already
+        //     enforced above: the Set/OwnedSet branch returned, so we are in an
+        //     array-backed collection; Owned* is excluded at instantiation, §15.2).
+        //
+        // DIVERGENCE vs §28.11 v0.134 (same as batch-1 owningCollectionElemDisposer):
+        // the spec table's class/interface row covers Interface types too; the
+        // existing collectionElemIsClass() helper only checks for Class, not
+        // Interface.  arrElemPol.disposerThunk replicates the correct spec behavior
+        // (Class|Interface → ClassOwned), but we keep the Class-only guard to
+        // match the EXISTING delegate's behavior until #619 fixes this.
+        bool arrIsStringElem =
+            arrElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            arrElemRef &&
+            arrElemRef->kind == sema::TypeRef::Kind::Primitive &&
+            arrElemRef->primitive == sema::PrimitiveType::String &&
+            !arrElemRef->nullable;
+        // arrElemIsClass: whether the element is a class type — drives both the
+        // ClassOwned disposer (for owning arrays) and ClassBorrow reference
+        // identity (for emitRemoveElementEquality). Matches collectionElemIsClass.
+        // DIVERGENCE vs §28.11 v0.134: see above — Interface excluded here (#619).
+        bool arrElemIsClass =
+            arrElemPol.cat == ElementPolicy::Category::ClassOwned ||
+            arrElemPol.cat == ElementPolicy::Category::ClassBorrow;
+
         // per §3/§25.2: .IndexOf(item): int — index of first match, -1 if not
         // found. Match semantics (issue #424 / §25.2): dispatched per element
         // type by emitRemoveElementEquality — record structural equality (§8.3),
@@ -1852,10 +1911,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
             llvm::Type* elemTy = getElemTy();
-            bool elemIsClass = collectionElemIsClass(recvTy, 0);
-            const sema::TypeRef* elemRef =
-                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
-                                                         : nullptr;
+            // #602 / §28.11 v0.134: derive elemIsClass from arrElemPol (hoisted above)
+            // instead of calling collectionElemIsClass(recvTy, 0) per-handler.
+            const sema::TypeRef* elemRef = arrElemRef;  // from policy hoist
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             auto* idxSlot = entryAlloca(i64());
@@ -1874,7 +1932,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
             llvm::Value* eq =
-                emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+                emitRemoveElementEquality(el, target, elemRef, arrElemIsClass);
             if (!eq) return nullptr;
             builder_.CreateCondBr(eq, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
@@ -1945,14 +2003,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
             v = ensureNullableElem(v);
-            // #429 / §4.6 / §28.9: a borrowing Array<string> co-owns a +1 per
-            // element. Take an INDEPENDENT +1 at insert, released per element on
-            // free (stringElementReleaseDisposer). Mirror the field-store rule: a
-            // fresh +1 producer (`+`/interp/range-slice/string-return call) is
-            // TRANSFERRED (its single reference becomes the array's — no retain),
-            // anything else (literal/param/field/identifier alias) is RETAINED.
+            // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: a borrowing Array<string>
+            // co-owns a +1 per element. Take an INDEPENDENT +1 at insert, released
+            // per element on free (stringElementReleaseDisposer). Mirror the
+            // field-store rule: a fresh +1 producer is TRANSFERRED (its single
+            // reference becomes the array's — no retain); anything else is RETAINED.
             // retain is null-safe and a no-op on a sentinel/literal.
-            if (isStringElementArray(recvTy) &&
+            // arrIsStringElem is derived from arrElemPol (hoisted above).
+            if (arrIsStringElem &&
                 !isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRetain(v);
             // Store elem to stack alloca, pass pointer to runtime
@@ -1975,9 +2033,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!idx || !v) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
             v = ensureNullableElem(v);
-            // #429 / §4.6 / §28.9: Insert co-owns a +1 per string element,
-            // exactly like Add — transfer a +1 producer, retain anything else.
-            if (isStringElementArray(recvTy) &&
+            // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: Insert co-owns a +1
+            // per string element, exactly like Add — transfer a +1 producer,
+            // retain anything else. arrIsStringElem derived from arrElemPol.
+            if (arrIsStringElem &&
                 !isPlusOneStringProducer(call.args[1].value.get()))
                 emitStringRetain(v);
             llvm::AllocaInst* slot = entryAlloca(v->getType());
@@ -2024,14 +2083,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!idx || !v) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
             v = ensureNullableElem(v);  // fix #455: lift inner type to tagged struct
-            // #429 / §4.6 / §28.9: .Set(i, v) OVERWRITES slot i on a borrowing
-            // Array<string> — release the displaced old element and take a +1 on
-            // the new one (transfer a +1 producer, retain otherwise). Use the
-            // disposing setter so the runtime releases the old value AFTER reading
-            // it (retain-new-before-release-old via the disposing path keeps a
-            // self-set `a[i] := a[i]` safe — the new retain runs before the old
-            // release). The disposer is the string-release thunk.
-            if (llvm::Function* strDisp = stringElementReleaseDisposer(recvTy)) {
+            // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: .Set(i, v) OVERWRITES
+            // slot i on a borrowing Array<string> — release the displaced old
+            // element and take a +1 on the new one. Use the disposing setter so
+            // the runtime releases the old value AFTER reading it (retain-new-
+            // before-release-old keeps a self-set `a[i] := a[i]` safe). The
+            // disposer is the string-release thunk.
+            // arrIsStringElem and arrElemPol.retainRelease derived from arrElemPol.
+            if (llvm::Function* strDisp = arrIsStringElem
+                                          ? stringElementReleaseThunk()
+                                          : nullptr) {
                 if (!isPlusOneStringProducer(call.args[1].value.get()))
                     emitStringRetain(v);
                 llvm::Value* oor2 = builder_.CreateICmpUGE(
@@ -2060,15 +2121,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* idx = lowerExpr(*call.args[0].value);
             if (!idx) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
-            // #362 / stdlib §4.5: OwnedArray<T>.RemoveAt disposes the removed
-            // element. Use the disposing variant for an owning class-element
-            // array; a borrowing array just removes the slot.
-            // #429 / §4.6 / §28.9: a borrowing Array<string> co-owns the removed
-            // element's +1, so RemoveAt must release it (else it leaks). The
-            // string-release thunk is mutually exclusive with the owning-class
-            // disposer (string is not a class).
-            llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy);
-            if (!elemDisp) elemDisp = stringElementReleaseDisposer(recvTy);
+            // #602 / #362 / §4.5 / #429 / §4.6 / §28.9 / §28.11 v0.134:
+            // OwnedArray<T>.RemoveAt disposes the removed element (ClassOwned row);
+            // a borrowing Array<string> releases the removed element's co-owned +1
+            // (RuntimeManaged row). The two disposers are mutually exclusive.
+            // arrElemPol.disposerThunk is non-null only for ClassOwned.
+            // DIVERGENCE vs §28.11 v0.134: Interface elements excluded — see
+            // arrElemIsClass comment above; same as batch-1 owningCollectionElemDisposer.
+            // #619 will fix this separately; the DIVERGENCE comment is preserved here.
+            llvm::Function* elemDisp = arrElemPol.disposerThunk;
+            if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();
             if (elemDisp) {
                 auto* fn = declareC("bz_array_remove_at_disposing",
                     llvm::Type::getVoidTy(llvm_),
@@ -2097,10 +2159,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
             llvm::Type* elemTy = getElemTy();
-            bool elemIsClass = collectionElemIsClass(recvTy, 0);
-            const sema::TypeRef* elemRef =
-                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
-                                                         : nullptr;
+            // #602 / §28.11 v0.134: derive elemIsClass and elemRef from arrElemPol
+            // (hoisted above) instead of per-handler collectionElemIsClass calls.
+            const sema::TypeRef* elemRef = arrElemRef;  // from policy hoist
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             auto* idxSlot = entryAlloca(i64());
@@ -2119,17 +2180,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
             llvm::Value* eq =
-                emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+                emitRemoveElementEquality(el, target, elemRef, arrElemIsClass);
             if (!eq) return nullptr;
             builder_.CreateCondBr(eq, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
             // Remove (and, for an owning array, dispose) the matched slot.
-            // #429: a borrowing Array<string> releases the removed element's
-            // co-owned +1 (string-release thunk; mutually exclusive with the
-            // owning-class disposer). The query `target` is a pure borrow and is
-            // never released here — only the slot's stored element is.
-            llvm::Function* rmDisp = owningCollectionElemDisposer(recvTy);
-            if (!rmDisp) rmDisp = stringElementReleaseDisposer(recvTy);
+            // #602 / #429 / §28.11 v0.134: arrElemPol.disposerThunk is non-null
+            // for ClassOwned; arrIsStringElem drives the string-release path.
+            // Both derived from arrElemPol (hoisted above).
+            // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as
+            // owningCollectionElemDisposer; flagged for #619.
+            llvm::Function* rmDisp = arrElemPol.disposerThunk;
+            if (!rmDisp && arrIsStringElem) rmDisp = stringElementReleaseThunk();
             if (rmDisp) {
                 auto* fn = declareC("bz_array_remove_at_disposing",
                     llvm::Type::getVoidTy(llvm_),
@@ -2177,17 +2239,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // .Clear()
         if (m == "Clear" && call.args.empty()) {
-            // #362 / stdlib §4.5: OwnedArray<T>.Clear disposes every element.
-            // Use the disposing variant for an owning class-element array; a
-            // borrowing array just resets the count.
-            // #429 / §4.6 / §28.9 / §28.11: a borrowing Array<string> co-owns a +1
-            // per element. Clear "removes all elements WITHOUT disposing them"
-            // (§28.11) — strings have no Dispose, so nothing is disposed; but the
-            // array's runtime-managed refcount references (§28.9) are reclaimed by
-            // releasing each, else the cleared elements leak. The string-release
-            // thunk is mutually exclusive with the owning-class disposer.
-            llvm::Function* elemDisp = owningCollectionElemDisposer(recvTy);
-            if (!elemDisp) elemDisp = stringElementReleaseDisposer(recvTy);
+            // #602 / #362 / §4.5 / #429 / §4.6 / §28.9 / §28.11 v0.134:
+            // OwnedArray<T>.Clear disposes every element (ClassOwned row via
+            // arrElemPol.disposerThunk). A borrowing Array<string> releases each
+            // element's co-owned +1 (RuntimeManaged row via arrIsStringElem).
+            // The two paths are mutually exclusive; all derived from arrElemPol.
+            // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as
+            // owningCollectionElemDisposer; flagged for #619.
+            llvm::Function* elemDisp = arrElemPol.disposerThunk;
+            if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();
             if (elemDisp) {
                 auto* fn = declareC("bz_array_clear_disposing",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
@@ -2204,8 +2264,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Unlike Add/Clear on an OWNING array, this is the explicit en-masse
         // disposal a BORROWING Array<T> exposes; the disposer thunk is keyed on
         // the element being a class, not on the collection being owning.
+        // #602 / §28.11 v0.134: use arrElemIsClass (derived from arrElemPol).
+        // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as batch-1
+        // collectionElemIsClass helper; flagged for #619.
         if (m == "DisposeElements" && call.args.empty()) {
-            if (collectionElemIsClass(recvTy, 0)) {
+            if (arrElemIsClass) {
                 auto* fn = declareC("bz_array_clear_disposing",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {recv, elementDisposerThunk()});
@@ -2241,13 +2304,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(bodyBB);
             auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(ptrFn, {other, idx, builder_.getInt64(esz)});
-            // #429 / §4.6 / §28.9: AddRange into a borrowing Array<string> takes an
-            // INDEPENDENT +1 per appended element (the source `other` keeps its own
-            // +1). Without this the destination would release at free a +1 it never
-            // took — a premature free of strings `other` still co-owns. The element
-            // is a borrowed copy from `other`, so it is always RETAINED (never a
-            // transferred producer). retain is null/sentinel-safe.
-            if (isStringElementArray(recvTy)) {
+            // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: AddRange into a
+            // borrowing Array<string> takes an INDEPENDENT +1 per appended element
+            // (the source `other` keeps its own +1). The element is always RETAINED
+            // (a borrowed copy from `other`). arrIsStringElem derived from arrElemPol.
+            if (arrIsStringElem) {
                 llvm::Value* elemVal = builder_.CreateLoad(ptrTy(), ep, "ar.elem");
                 emitStringRetain(elemVal);
             }
@@ -2269,10 +2330,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* target = lowerExpr(*call.args[0].value);
             if (!target) return nullptr;
             llvm::Type* elemTy = getElemTy();
-            bool elemIsClass = collectionElemIsClass(recvTy, 0);
-            const sema::TypeRef* elemRef =
-                (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
-                                                         : nullptr;
+            // #602 / §28.11 v0.134: derive elemIsClass and elemRef from arrElemPol.
+            const sema::TypeRef* elemRef = arrElemRef;  // from policy hoist
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             auto* idxSlot = entryAlloca(i64());
@@ -2291,7 +2350,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
             llvm::Value* eq =
-                emitRemoveElementEquality(el, target, elemRef, elemIsClass);
+                emitRemoveElementEquality(el, target, elemRef, arrElemIsClass);
             if (!eq) return nullptr;
             builder_.CreateCondBr(eq, foundBB, nextBB);
             builder_.SetInsertPoint(foundBB);
@@ -2348,6 +2407,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // valRec above covers non-nullable records; valNullableVal covers the
         // nullable-value-type case (which slipped to ZExt/Trunc and crashed).
         bool valNullableVal = valTy && isNullableValueTy(valTy);
+
+        // #602 / §28.11 v0.134: hoist one element-slot policy lookup for the
+        // dictionary VALUE slot.  Per §28.11 the "value" slot of a Dictionary
+        // follows the same borrowing/owning column as the collection family.
+        // OwnedDictionary owns its values; borrowing Dictionary borrows/
+        // runtime-manages them (string values in the RuntimeManaged row).
+        //
+        // dictValIsOwning: a dictionary name starting with "Owned" (OwnedDictionary).
+        // Note: dictValueBoxFreer (record-value boxing path) is not a policy-table
+        // concern — record values are value types and land in the Value row of the
+        // §28.11 table.  Their heap-boxing is a STORAGE encoding detail (inttoptr
+        // cannot hold an aggregate), not an element-slot lifecycle decision.  We
+        // keep dictValueBoxFreer calls unchanged (batch 3 / #602 follow-on).
+        bool dictValIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
+                               !recvTy->astNode->name->parts.empty() &&
+                               (recvTy->astNode->name->parts[0].rfind("Owned", 0) == 0);
+        const ElementPolicy dictValPol =
+            elementPolicyFor(valTy, dictValIsOwning);
+        // Convenience predicate: is this a borrowing Dictionary<K, string>?
+        //   RuntimeManaged + non-nullable string primitive + NOT owning.
+        // Mirrors isStringValueDict (same exclusions: OwnedDictionary excluded,
+        // nullable string? excluded, function types share RuntimeManaged but
+        // use a different release path — same string-vs-function distinction).
+        bool dictIsStringValue =
+            !dictValIsOwning &&
+            dictValPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            valTy &&
+            valTy->kind == sema::TypeRef::Kind::Primitive &&
+            valTy->primitive == sema::PrimitiveType::String &&
+            !valTy->nullable;
+        // dictValClassDisposer: non-null iff OwnedDictionary<K, class V>.
+        // arrElemPol.disposerThunk mirrors owningDictValueDisposer.
+        // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as
+        // owningDictValueDisposer batch-1 delegate; flagged for #619.
+        llvm::Function* dictValClassDisposer = dictValPol.disposerThunk;
 
         // Helper: extract string data/len from bz.string ptr
         auto strDataLen = [&](llvm::Value* s) -> std::pair<llvm::Value*, llvm::Value*> {
@@ -2463,10 +2557,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // frees e.key — a strndup'd copy in string mode, a malloc'd byte copy in
         // generic mode — for every live entry).
         if (m == "Clear" && call.args.empty()) {
-            llvm::Function* disp = owningDictValueDisposer(recvTy);
+            // #602 / §28.11 v0.134: derive disposer from dictValPol (hoisted above).
+            // dictValClassDisposer: non-null for OwnedDictionary<K,class> (ClassOwned).
+            // dictValueBoxFreer: kept unchanged (value-type record box; not a policy
+            //   table decision — batch 3 / #602 follow-on).
+            // dictIsStringValue: borrowing Dictionary<K,string> → release each +1.
+            // DIVERGENCE vs §28.11 v0.134: Interface excluded; flagged for #619.
+            llvm::Function* disp = dictValClassDisposer;
             if (!disp) disp = dictValueBoxFreer(recvTy);
-            // #429 / §28.9: release string values at Clear, same as at free.
-            if (!disp && isStringValueDict(recvTy))
+            if (!disp && dictIsStringValue)
                 disp = stringElementReleaseThunk();
             llvm::Value* dispV = disp
                 ? llvm::cast<llvm::Value>(disp)
@@ -2505,9 +2604,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             llvm::Value* v = lowerExpr(*call.args[1].value);
             if (!k || !v) return nullptr;
-            // #429: retain the string value BEFORE encoding (v is still the raw
-            // bz_string* at this point; encodeValue returns it as-is for pointers).
-            if (isStringValueDict(recvTy) &&
+            // #602 / #429 / §28.9 / §28.11 v0.134: retain the string value BEFORE
+            // encoding (v is still the raw bz_string* at this point; encodeValue
+            // returns it as-is for pointers). dictIsStringValue derived from dictValPol.
+            if (dictIsStringValue &&
                 !isPlusOneStringProducer(call.args[1].value.get()))
                 emitStringRetain(v);
             llvm::Value* vPtr = encodeValue(v);
@@ -2538,9 +2638,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // and consistent). For borrowing Dictionary<K, string>, get the
             // string-release thunk. For borrowing Dict or non-class/non-string
             // values, valDisp is null → fall through to plain non-disposing remove.
-            llvm::Function* valDisp = owningDictValueDisposer(recvTy);
-            // #429: borrowing Dictionary<K, string> releases the removed value.
-            if (!valDisp && isStringValueDict(recvTy))
+            // #602 / §28.11 v0.134: derive disposer from dictValPol (hoisted above).
+            // dictValClassDisposer: OwnedDictionary<K,class> (ClassOwned row).
+            // dictIsStringValue: borrowing Dictionary<K,string> (RuntimeManaged row).
+            // DIVERGENCE vs §28.11 v0.134: Interface excluded; flagged for #619.
+            llvm::Function* valDisp = dictValClassDisposer;
+            if (!valDisp && dictIsStringValue)
                 valDisp = stringElementReleaseThunk();
             if (keyTy) {
                 if (valDisp) {
@@ -8570,18 +8673,22 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
         llvm::Value* arr =
             builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)}, "linq.toarr");
-        // #429 / §4.6 / §28.9: a materialized Array<string> co-owns a +1 per
-        // element so it can be released symmetrically if bound to a disposable
-        // local/field. Elements are either borrowed source pointers (a Where /
-        // identity pipeline — retain co-owns them) or fresh +1 strings produced by
-        // a Select lambda (retain → rc 2; the lambda's transient +1 leaks, a
-        // pre-existing safe leak, never a double-free). Keyed on the produced
-        // element type being a non-nullable string.
-        if (elemRef && elemRef->kind == sema::TypeRef::Kind::Primitive &&
-            elemRef->primitive == sema::PrimitiveType::String && !elemRef->nullable) {
-            auto* rf = declareC("bz_array_retain_strings",
-                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(rf, {arr});
+        // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: a materialized Array<string>
+        // co-owns a +1 per element so it can be released symmetrically. Keyed on
+        // the produced element type being in the RuntimeManaged row AND specifically
+        // a non-nullable string primitive (same exclusions as isStringElementArray).
+        {
+            const ElementPolicy toArrPol =
+                elementPolicyFor(elemRef, /*owningFamily=*/false);
+            if (toArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                elemRef &&
+                elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemRef->primitive == sema::PrimitiveType::String &&
+                !elemRef->nullable) {
+                auto* rf = declareC("bz_array_retain_strings",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(rf, {arr});
+            }
         }
         return arr;
     }
@@ -8971,6 +9078,21 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
         elemLLTy = lowerTypeRef(recvTy->genericArgs[0]);
 
+    // #602 / §28.11 v0.134: hoist one element-slot policy lookup for LinkedList
+    // operations that need per-element equality (Find/Remove/Contains) or disposal
+    // (OwnedLinkedList RemoveFirst/RemoveLast/Clear/Remove).
+    // LinkedList is always in the borrowing family (no Owned* string elements);
+    // OwnedLinkedList is in the owning family (isOwning flag above).
+    const sema::TypeRef* llElemRef =
+        (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+    const ElementPolicy llElemPol = elementPolicyFor(llElemRef, isOwning);
+    // llElemIsClass: class/interface element — matches collectionElemIsClass(recvTy,0).
+    // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as batch-1 delegate;
+    // flagged for #619.
+    bool llElemIsClass =
+        llElemPol.cat == ElementPolicy::Category::ClassOwned ||
+        llElemPol.cat == ElementPolicy::Category::ClassBorrow;
+
     // --- AddFirst(item): LinkedListNode<T> ---
     if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
@@ -9021,8 +9143,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     }
     // --- RemoveFirst() ---
     if (m == "RemoveFirst" && call.args.empty()) {
-        llvm::Function* elemDisp =
-            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
+        // DIVERGENCE vs §28.11 v0.134: Interface excluded — flagged for #619.
+        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
         llvm::Value* disp = elemDisp
             ? llvm::cast<llvm::Value>(elemDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -9033,8 +9156,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     }
     // --- RemoveLast() ---
     if (m == "RemoveLast" && call.args.empty()) {
-        llvm::Function* elemDisp =
-            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
+        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
         llvm::Value* disp = elemDisp
             ? llvm::cast<llvm::Value>(elemDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -9047,8 +9170,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "RemoveNode" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* node = lowerExpr(*call.args[0].value);
         if (!node) return nullptr;
-        llvm::Function* elemDisp =
-            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
+        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
         llvm::Value* disp = elemDisp
             ? llvm::cast<llvm::Value>(elemDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -9068,10 +9191,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "Find" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
-        const sema::TypeRef* elemRef =
-            (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
-                                                      : nullptr;
-        bool elemIsClass = collectionElemIsClass(recvTy, 0);
+        // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
+        const sema::TypeRef* elemRef = llElemRef;
         // Spill the search target to a stable alloca slot.
         llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
         builder_.CreateStore(v, tgtSlot);
@@ -9103,7 +9224,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llf.vp");
         llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llf.el");
         llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llf.tgt");
-        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, elemIsClass);
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, llElemIsClass);
         if (!eq) return nullptr;
         builder_.CreateCondBr(eq, matchBB, nextBB);
         // Match: save the node pointer and exit the loop.
@@ -9131,8 +9252,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // pointer. Instead: walk and free each node via remove_first repeatedly.
     // Cleanest: add bz_llist_clear to runtime. For now, implement as a loop.
     if (m == "Clear" && call.args.empty()) {
-        llvm::Function* elemDisp =
-            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+        // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
+        // DIVERGENCE vs §28.11 v0.134: Interface excluded — flagged for #619.
+        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
         llvm::Value* disp = elemDisp
             ? llvm::cast<llvm::Value>(elemDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -9167,10 +9289,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
-        const sema::TypeRef* elemRef =
-            (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
-                                                      : nullptr;
-        bool elemIsClass = collectionElemIsClass(recvTy, 0);
+        // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
+        const sema::TypeRef* elemRef = llElemRef;
         // Spill the search target to a stable alloca slot.
         llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
         builder_.CreateStore(v, tgtSlot);
@@ -9202,7 +9322,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llr.vp");
         llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llr.el");
         llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llr.tgt");
-        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, elemIsClass);
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, llElemIsClass);
         if (!eq) return nullptr;
         builder_.CreateCondBr(eq, matchBB, nextBB);
         // Match: save the node pointer and exit the loop.
@@ -9221,8 +9341,11 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* found = builder_.CreateICmpNE(foundNode, nullP, "llr.found");
         // If found, call RemoveNode (which unlinks + optionally disposes).
         // OwnedLinkedList disposes the element; LinkedList borrows, no disposal.
+        // #602 / §28.11 v0.134: use llElemPol.disposerThunk from policy hoist.
+        // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as
+        // owningCollectionElemDisposer; flagged for #619.
         llvm::Function* elemDisp =
-            isOwning ? owningCollectionElemDisposer(recvTy) : nullptr;
+            isOwning ? llElemPol.disposerThunk : nullptr;
         llvm::Value* disp = elemDisp
             ? llvm::cast<llvm::Value>(elemDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -9249,10 +9372,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "Contains" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
-        const sema::TypeRef* elemRef =
-            (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
-                                                      : nullptr;
-        bool elemIsClass = collectionElemIsClass(recvTy, 0);
+        // #602 / §28.11 v0.134: use llElemRef and llElemIsClass from policy hoist.
+        const sema::TypeRef* elemRef = llElemRef;
         // Spill the search target to a stable alloca slot (same pattern as the
         // `in` operator LinkedList path in LlvmBackend_Exprs.cpp §2764).
         llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
@@ -9279,7 +9400,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* vp = builder_.CreateCall(valFn, {curNode}, "llc.vp");
         llvm::Value* el = builder_.CreateLoad(elemLLTy, vp, "llc.el");
         llvm::Value* tgt = builder_.CreateLoad(v->getType(), tgtSlot, "llc.tgt");
-        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, elemIsClass);
+        llvm::Value* eq = emitRemoveElementEquality(el, tgt, elemRef, llElemIsClass);
         if (!eq) return nullptr;
         builder_.CreateCondBr(eq, foundBB, nextBB);
         builder_.SetInsertPoint(foundBB);
@@ -9446,6 +9567,21 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
             builder_.CreateStructGEP(spanSt, spanSlot, 2), "sp.len");
     };
 
+    // #602 / §28.11 v0.134: hoist one element-slot policy lookup for ArraySpan
+    // operations that need per-element equality (IndexOf / Contains /
+    // SequenceEqual). Spans are always in the borrowing family (they never own
+    // elements — §4.15: "the span's lifetime is bounded by the source").
+    const sema::TypeRef* spanElemRef =
+        (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+    const ElementPolicy spanElemPol =
+        elementPolicyFor(spanElemRef, /*owningFamily=*/false);
+    // spanElemIsClass: matches collectionElemIsClass(recvTy, 0).
+    // DIVERGENCE vs §28.11 v0.134: Interface excluded — same as batch-1 delegate;
+    // flagged for #619.
+    bool spanElemIsClass =
+        spanElemPol.cat == ElementPolicy::Category::ClassOwned ||
+        spanElemPol.cat == ElementPolicy::Category::ClassBorrow;
+
     // -- Length / IsEmpty -------------------------------------------------------
     if (m == "Length" && call.args.empty()) {
         return loadLen();  // i32
@@ -9517,9 +9653,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         llvm::Value* ep = builder_.CreateCall(ptrAtFn,
             {src, absIdx, builder_.getInt64(esz)}, "iof.ep");
         llvm::Value* el = builder_.CreateLoad(ety, ep, "iof.el");
+        // #602 / §28.11 v0.134: spanElemRef and spanElemIsClass from policy hoist.
         llvm::Value* eq = emitRemoveElementEquality(el, v,
-            recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0],
-            collectionElemIsClass(recvTy, 0));
+            spanElemRef, spanElemIsClass);
         if (!eq) return nullptr;
         builder_.CreateCondBr(eq, foundBB, nextBB);
         builder_.SetInsertPoint(nextBB);
@@ -9571,9 +9707,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         llvm::Value* ep = builder_.CreateCall(ptrAtFn,
             {src, absIdx, builder_.getInt64(esz)});
         llvm::Value* el = builder_.CreateLoad(ety, ep);
+        // #602 / §28.11 v0.134: spanElemRef and spanElemIsClass from policy hoist.
         llvm::Value* eq = emitRemoveElementEquality(el, v,
-            recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0],
-            collectionElemIsClass(recvTy, 0));
+            spanElemRef, spanElemIsClass);
         if (!eq) return nullptr;
         builder_.CreateCondBr(eq, foundBB, nextBB);
         builder_.SetInsertPoint(nextBB);
@@ -9785,9 +9921,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
             {bSrc, bi, builder_.getInt64(esz)});
         llvm::Value* aEl = builder_.CreateLoad(ety, ap);
         llvm::Value* bEl = builder_.CreateLoad(ety, bp);
+        // #602 / §28.11 v0.134: spanElemRef and spanElemIsClass from policy hoist.
         llvm::Value* eq = emitRemoveElementEquality(aEl, bEl,
-            recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0],
-            collectionElemIsClass(recvTy, 0));
+            spanElemRef, spanElemIsClass);
         if (!eq) return nullptr;
         builder_.CreateCondBr(eq, incBB, neqBB);
         builder_.SetInsertPoint(neqBB);
