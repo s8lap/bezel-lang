@@ -6083,9 +6083,28 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 locals_[vbp] = slot;
             } else if (sp.pattern) {
                 // Non-binding sub-pattern: check it against the field value.
-                // For constant patterns (e.g. `0`), emit an equality check.
+                // §19.3 / fix #615: resolve the field's declared type so that
+                // enum-constant NamedPatterns and string ConstantPatterns get
+                // the same enumTy / isStr arguments that a top-level pattern
+                // match would receive.  Without these, enum sub-patterns always
+                // returned nullptr (enumTy==nullptr → NamedPattern fell through
+                // → AND skipped → always matched) and string sub-patterns used
+                // pointer equality instead of content equality.
+                const sema::TypeRef* fieldTy = recordMemberType(fields[i]);
+                const sema::TypeSymbol* subEnumTy = nullptr;
+                bool subIsStr = false;
+                if (fieldTy && fieldTy->kind == sema::TypeRef::Kind::Named &&
+                    fieldTy->declaration &&
+                    fieldTy->declaration->kind == ast::TypeDeclKind::Enum) {
+                    subEnumTy = fieldTy->declaration;
+                } else if (fieldTy &&
+                           fieldTy->kind == sema::TypeRef::Kind::Primitive &&
+                           fieldTy->primitive == sema::PrimitiveType::String) {
+                    subIsStr = true;
+                }
                 llvm::Value* subMatch =
-                    patternMatches(sp.pattern.get(), fieldVal);
+                    patternMatches(sp.pattern.get(), fieldVal,
+                                   subEnumTy, subIsStr, fieldTy);
                 if (subMatch)
                     matched = builder_.CreateAnd(matched, subMatch);
             }
