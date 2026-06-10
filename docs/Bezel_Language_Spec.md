@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.134 — June 2026**
+**Version 0.135 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -8,7 +8,7 @@ This document is the normative reference for the language. It defines syntax, ty
 
 If this is your first encounter with Bezel, the rationale's opening section is a gentler starting point: it sketches the goals of the language and the shape of its memory model before the spec's formal definitions begin. If you want concrete code first, the short companion guides (memory and ownership; errors and nullability) work from worked examples. Once you know what you are looking for, this document is the place to look it up.
 
-**Changes since v0.132** are summarized at the end of the design rationale; this file is the normative reference and does not narrate its own history.
+**Changes since v0.133** are summarized at the end of the design rationale; this file is the normative reference and does not narrate its own history.
 
 <a id="sec-contents"></a>
 ## Contents
@@ -6952,6 +6952,8 @@ The inheritance hierarchy is relevant for arm ordering: an arm pattern of `Arith
 All exceptions in the list above are catchable except `StackOverflowException`. In particular, `NullReferenceException` (raised by `!` on a null value), `MatchFailureException` (raised by a non-exhaustive `case` expression), `OverflowException`, and `IndexOutOfRangeException` are ordinary exceptions that propagate through `try`/`catch` normally.
 
 `DisposedAccessException` is raised only by implementations operating in checked disposal mode ([§28.2](#sec-checked-disposal)); in unchecked mode the same access is undefined behavior. Programs must not rely on it for control flow — it exists to convert a heisenbug into a deterministic fault during development, and a build is free to omit it.
+
+`TypeInitializationException` is the one built-in whose surface extends `Exception`'s: it exposes `public readonly property InnerException: Exception?`, carrying the original exception that escaped the static initializer ([§22.13](#sec-static-initialization-order); stdlib [§2.17](Bezel_Standard_Library.md#sec-built-in-exceptions-cross-reference)).
 
 The principle behind the built-in list: an exception is built-in iff its only producer is a built-in operation (an array or string indexer, an integer arithmetic operation, the `case` construct, an async cancellation). Exceptions whose producer requires explicit `import` live alongside their producer in the standard library and require the same import.
 

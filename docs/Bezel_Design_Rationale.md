@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.134 — June 2026**
+**Companion to the Bezel Language Specification, v0.135 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6614,6 +6614,37 @@ Purely additive. No existing program changes meaning. The new names are auto-imp
 #### Editorial note
 
 The `linkify_refs.py` toolchain was not re-run for this revision. The substantive edits are localized (one new spec §28.13, one §30.14 list edit, two Appendix D edits, one new stdlib §2.16, one new rationale §5.21 plus the §5.4 note, this changelog entry). The new cross-references were verified against existing anchors.
+
+---
+
+<a id="sec-v0-134-to-v0-135-changelog"></a>
+### v0.135 changelog (v0.134 → v0.135)
+
+v0.135 folds two small decided amendments — a documentation-defect fix and a scoping correction. Neither changes the meaning of a conforming program; the second *widens* what is accepted (it licenses an implementation feature the prior text over-restricted).
+
+<a id="sec-v0-134-to-v0-135-changelog-summary"></a>
+#### Summary
+
+1. **`TypeInitializationException` surface documented (#555).** The type appeared in [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)'s tree and §22.13's semantics, but its `InnerException: Exception?` property was stated only in prose and the standard-library document never mentioned the type. §31.4 now declares the property explicitly, and a new stdlib [§2.17](Bezel_Standard_Library.md#sec-built-in-exceptions-cross-reference) records the built-in/import-required split (built-ins are normative in spec §31.4; producers' exceptions live with their producers) and the one built-in with extra surface.
+
+2. **Borrowing-`Dictionary` entry iteration scoped correctly (#548).** The spec's `for` chapter has always shown `for var entry in dict` as a working example, and stdlib §4.8 stated that iteration yields entries in insertion order — but a blanket sentence in stdlib §4.9 ("default `for var entry in dict do` iteration is not provided") read as covering both dictionary kinds, and the implementation's #530 diagnostic enforced it that way. The ownership argument behind the restriction (a record entry cannot *own* a value) only bites the owning dictionary. Amended: stdlib [§4.8](Bezel_Standard_Library.md#sec-dictionaryk-v) now states the entry-iteration form explicitly — single-pass, `DictionaryEntry<K, V>` elements, class-typed `Value` reads are borrows per the [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy) borrowing column; stdlib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)'s restriction is now explicitly scoped to `OwnedDictionary<K, V>` (whose look-don't-take entry view remains a deliberately untaken separate decision). This licenses the implementation to narrow the #530 diagnostic to the owning dictionary and implement borrowing entry iteration (#548).
+
+<a id="sec-v0-134-to-v0-135-changelog-changes"></a>
+#### Changes
+
+- **Spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)** — one paragraph declaring `TypeInitializationException.InnerException`.
+- **Stdlib [§2.17](Bezel_Standard_Library.md#sec-built-in-exceptions-cross-reference)** — new cross-reference subsection.
+- **Stdlib [§4.8](Bezel_Standard_Library.md#sec-dictionaryk-v)** — entry-iteration form stated explicitly with element type and borrow semantics.
+- **Stdlib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)** — the not-provided sentence scoped to `OwnedDictionary<K, V>` with a cross-reference to §4.8.
+- **Rationale** — this changelog entry.
+
+#### Migration
+
+None. Amendment 2 only widens acceptance: programs previously rejected by the over-broad diagnostic become legal once the implementation lands; no existing program changes meaning.
+
+#### Editorial note
+
+The `linkify_refs.py` toolchain was not re-run; the four edits are localized and the new cross-references were verified against existing anchors.
 
 ---
 

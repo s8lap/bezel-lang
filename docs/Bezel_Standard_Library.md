@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.134 — June 2026**
+**Companion to the Bezel Language Specification, v0.135 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -769,6 +769,21 @@ Usage notes:
 - Ownership cycles through `Shared<T>` keep the count above zero and leak; break them with `Weak<T>` (the standard parent-strong/child-weak shape). The compiler does not detect such cycles.
 - `TryUpgrade` follows the Try pattern: `if w.TryUpgrade(out using var s) then ... end;` — on `true` the caller owns a fresh handle, discharged by the `out using var`.
 
+<a id="sec-built-in-exceptions-cross-reference"></a>
+### 2.17 Built-in exception types (cross-reference)
+
+The built-in exception hierarchy — `Exception` and the types available without `import` — is normative in the language spec ([§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); this document does not repeat it. Exceptions whose producers live in this document require the producer's `import` and are declared alongside it (e.g. `KeyNotFoundException` in [§4.8](#sec-dictionaryk-v), the IO exceptions in [§7.5](#sec-io-exception-types)).
+
+One built-in carries surface beyond `Exception`'s and is recorded here for completeness:
+
+```bezel
+public class TypeInitializationException: Exception
+  public readonly property InnerException: Exception?;   // the original initializer exception
+end TypeInitializationException;
+```
+
+Raised on access to a static member of a type whose static initialization failed; `InnerException` carries the original exception (language spec [§22.13](Bezel_Language_Spec.md#sec-static-initialization-order), [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)).
+
 ---
 
 <a id="sec-system-text-auto-imported"></a>
@@ -1411,7 +1426,7 @@ end IEqualityComparer;
 
 Indexer `dict[key]` raises `KeyNotFoundException` if the key is not present. Use `TryGetValue` for safe lookup.
 
-Iteration over a `Dictionary<K, V>` yields entries in insertion order. Removing a key and re-adding it places it at the end of the iteration order. `Clear()` resets the order. `Contains(key)` is an alias for `ContainsKey(key)`, enabling the `in` operator (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)) to test key membership: `key in dict` is equivalent to `dict.ContainsKey(key)`.
+Iteration over a `Dictionary<K, V>` — `for var entry in dict do ... end` — yields `DictionaryEntry<K, V>` values (the element type of the `ICollection<DictionaryEntry<K, V>>` conformance), one per live entry in a single pass, in insertion order. `entry.Key` and `entry.Value` read the entry; for class-typed values, `entry.Value` is a *borrow* of the stored value — the dictionary retains ownership (the borrowing column of language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)). Removing a key and re-adding it places it at the end of the iteration order. `Clear()` resets the order. `Contains(key)` is an alias for `ContainsKey(key)`, enabling the `in` operator (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)) to test key membership: `key in dict` is equivalent to `dict.ContainsKey(key)`.
 
 **Construction via collection literal.** A `Dictionary<K, V>` may be constructed with the dictionary-literal form `[k1: v1, k2: v2, ...]` (language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals)):
 
@@ -1472,7 +1487,7 @@ end DrainedEntry;
 
 `OwnedDictionary<K, V>` requires `V: class` (the value type is owned). Keys can be any type with the standard equality contract.
 
-The interface conformance is `IDisposable` only — not `IOwnedCollection<DictionaryEntry<K, V>>`. The `DictionaryEntry<K, V>` record (used by the borrowing `Dictionary<K, V>` in [§4.8](#sec-dictionaryk-v)) is a record, and records cannot have an owned `Value` field per language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields); a borrowing entry view over an owning dictionary would hand out a borrow of a value the dictionary still owns, which is the upcast-iteration behavior, not an ownership-transferring drain. For the ownership-transferring case, `Drain()` (below) yields `DrainedEntry<K, V>` — a *class*, which per the same [§28.5](Bezel_Language_Spec.md#sec-owned-fields) rule *may* own its `Value`. Default `for var entry in dict do` iteration is not provided; use either the key-iteration pattern (borrowing) or `Drain()` (ownership-transferring):
+The interface conformance is `IDisposable` only — not `IOwnedCollection<DictionaryEntry<K, V>>`. The `DictionaryEntry<K, V>` record (used by the borrowing `Dictionary<K, V>` in [§4.8](#sec-dictionaryk-v)) is a record, and records cannot have an owned `Value` field per language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields); a borrowing entry view over an owning dictionary would hand out a borrow of a value the dictionary still owns, which is the upcast-iteration behavior, not an ownership-transferring drain. For the ownership-transferring case, `Drain()` (below) yields `DrainedEntry<K, V>` — a *class*, which per the same [§28.5](Bezel_Language_Spec.md#sec-owned-fields) rule *may* own its `Value`. Default `for var entry in ownedDict do` iteration is not provided **on `OwnedDictionary<K, V>`** — its common intent is ownership transfer, and a borrowing look-don't-take entry view over an owning dictionary is a separate decision deliberately not taken here; use either the key-iteration pattern (borrowing) or `Drain()` (ownership-transferring). (The borrowing `Dictionary<K, V>` *does* provide single-pass entry iteration — [§4.8](#sec-dictionaryk-v).)
 
 ```bezel
 // Borrowing key-iteration, one value taken at a time:
