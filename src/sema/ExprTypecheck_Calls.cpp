@@ -4111,6 +4111,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     substituteMemberType(rt, ma.target.get(), ps->parent));
             }
         }
+    } else if (auto* cs = dynamic_cast<ConstMemberSymbol*>(member)) {
+        // per §22.12 / issue #609: a class-level const member access
+        // `Class.ConstName` must carry the const's type so that type
+        // inference (`var x := Class.Const`) and subsequent member access
+        // (`x.ToString()`) resolve correctly. The exprType is read from
+        // the explicit `: Type` annotation when present; when the const
+        // has no annotation, fall back to the value expression's exprType
+        // (which sema has already set via visitMember → visitExpr).
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
+        if (cd) {
+            if (cd->type) {
+                if (auto* rt = ctx_.resolvedType(*cd->type))
+                    ctx_.setExprType(&ma, rt);
+            } else if (cd->value) {
+                if (auto* rt = ctx_.exprType(*cd->value))
+                    ctx_.setExprType(&ma, rt);
+            }
+        }
     } else if (dynamic_cast<EnumConstantSymbol*>(member) && targetType) {
         // §10: an enum-constant access `E.Green` has the enum type, so a
         // local inferred from it (`var e := E.Green`) and a `case`
