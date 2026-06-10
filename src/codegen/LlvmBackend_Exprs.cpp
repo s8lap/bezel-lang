@@ -366,6 +366,33 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                                    "NullReferenceException");
                     return nullablePrimValue(v);
                 }
+                // issue #604 / §14.1 / §22.4: a NULLABLE BARE TYPE-PARAMETER
+                // (`TFirst?` where TFirst is a class generic param) lowers to
+                // the {i8, T} nullable struct in a monomorphized body, but
+                // isNullableValueTy returns false for it (the TypeRef has
+                // kind=Named, nullable=true, no declaration — it looks like an
+                // unresolved type, not a concrete value type). Without this
+                // guard the `!` operator falls through and returns the entire
+                // {i8, T} struct instead of extracting the value field, so a
+                // `GetFirst(): TFirst` body `return _first!` emits a
+                // `ret { i8, i32 } %2` against an `i32` function → IR-verify
+                // failure. Fix: when the operand TypeRef is a nullable bare
+                // type-param, resolve it through genericSubstSemaTy_ to its
+                // concrete sema type (nullableTypeParamConcrete does this),
+                // and if that concrete nullable IS a nullable value type,
+                // treat it the same as the direct isNullableValueTy case.
+                if (rt->nullable &&
+                    rt->kind == sema::TypeRef::Kind::Named &&
+                    !rt->declaration && !genericSubstSemaTy_.empty()) {
+                    sema::TypeRef concNullable;
+                    if (nullableTypeParamConcrete(rt, concNullable) &&
+                        isNullableValueTy(&concNullable)) {
+                        llvm::Value* hasVal = nullablePrimHasValue(v);
+                        emitGuardThrow(builder_.CreateNot(hasVal),
+                                       "NullReferenceException");
+                        return nullablePrimValue(v);
+                    }
+                }
             }
         }
         if (v->getType()->isPointerTy()) {
