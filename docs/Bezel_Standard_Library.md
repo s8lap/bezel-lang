@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.132 — June 2026**
+**Companion to the Bezel Language Specification, v0.133 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2987,6 +2987,95 @@ end ProcessAll;
 The `using var f := file;` shape on entry to the body is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
 
 The async-iterator form is preferable when the consumer processes each result before requesting the next; `WhenAllOwned` is preferable when the consumer needs all results at once.
+
+<a id="sec-domain"></a>
+### 6.8 `Domain`
+
+Static class for spawning execution domains (language spec [§30.14](Bezel_Language_Spec.md#sec-multiple-domains)). The compiler enforces the call-site rules of §30.14: the entry must be a non-capturing lambda or a static method reference, and the argument and result types must be sendable (the derived type property of language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)/[§30.14](Bezel_Language_Spec.md#sec-sendable-types)).
+
+```bezel
+public static class Domain
+  // No result.
+  public static method Spawn(entry: () -> ()): owned Task;
+  public static method Spawn<A>(entry: (owned A) -> (), owned arg: A): owned Task
+      where A: class;                                      // A sendable (compiler-checked)
+  public static method Spawn<A>(entry: (A) -> (), arg: A): owned Task
+      where A: notnull;                                    // A sendable value type or string
+
+  // Class-typed result: ownership transfers to the awaiter (Pattern B).
+  public static method Spawn<R>(entry: () -> owned R): owned OwnedTask<R>
+      where R: class;                                      // R sendable (compiler-checked)
+  public static method Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwnedTask<R>
+      where A: class, R: class;
+  public static method Spawn<A, R>(entry: (A) -> owned R, arg: A): owned OwnedTask<R>
+      where A: notnull, R: class;
+
+  // Value-typed or string result (Pattern A).
+  public static method Spawn<R>(entry: () -> R): owned Task<R>
+      where R: notnull;                                    // R sendable value type or string
+  public static method Spawn<A, R>(entry: (owned A) -> R, owned arg: A): owned Task<R>
+      where A: class, R: notnull;
+  public static method Spawn<A, R>(entry: (A) -> R, arg: A): owned Task<R>
+      where A: notnull, R: notnull;
+end Domain;
+```
+
+The `where` clauses above are the declared constraints; sendability is the stronger compiler-checked requirement and is diagnosed at the call site naming the failing rule (it is not expressible as a `where` constraint — it is a derived type property). For more than one argument, pass a sendable class aggregating them, an `OwnedArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
+
+The join handle completes when the entry's task completes. A fault in the entry surfaces at the join as `DomainFaultedException`:
+
+```bezel
+public class DomainFaultedException: Exception
+  public readonly property FaultStackTrace: string;   // stack trace text of the original exception
+  // Message carries the original exception's message text.
+end DomainFaultedException;
+```
+
+The original exception object never crosses the boundary (exception classes are not in general sendable); `Message` and `FaultStackTrace` are copied strings. `DomainFaultedException` requires `import System.Threading` like the rest of this module.
+
+There is no built-in cross-domain cancellation: `CancellationToken` is a borrow-bearing record and not sendable. The pattern is a dedicated channel carrying a cancel message, polled by the spawned domain at its safe points.
+
+<a id="sec-channel"></a>
+### 6.9 `Channel<T>` and `ChannelSender<T>`
+
+Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized — the only standard types two domains may reach simultaneously. T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)).
+
+The signature surface dispatches on T's category, as with `OwnedBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
+
+```bezel
+public class Channel<T>: IDisposable                       // the receiving end; class T form
+  public constructor();                                    // unbounded
+
+  public readonly property Count: int;                     // items currently buffered
+  public readonly property IsClosed: bool;                 // true once closed (see below)
+
+  public method NewSender(): owned ChannelSender<T>;       // mint a sender endpoint
+
+  public method Receive(): OwnedTask<T>;                   // await transfers ownership of one item
+  public method TryReceive(out owned item: T?): bool;      // non-blocking; false when none available
+end Channel;
+
+public class ChannelSender<T>: IDisposable                 // class T form
+  public method Send(owned item: T);                       // transfers ownership into the channel;
+                                                           //   never blocks (unbounded);
+                                                           //   ChannelClosedException if closed
+end ChannelSender;
+```
+
+For sendable value-typed T and `string`, the ownership modifiers drop out: `Receive(): Task<T>`, `TryReceive(out item: T?): bool`, `Send(item: T)`.
+
+Semantics (normative statement: language spec [§30.15](Bezel_Language_Spec.md#sec-channels)):
+
+- `Channel<T>` and `ChannelSender<T>` are themselves sendable: each endpoint is an independently owned object and may be moved to another domain (as a spawn argument or through another channel). Typical use keeps the channel in the receiving domain and moves senders out.
+- **Closing.** Disposing the last sender closes the channel; buffered items remain receivable, and after the drain `Receive` raises `ChannelClosedException`. Disposing the `Channel<T>` closes it immediately and disposes every undelivered class-typed item in reverse insertion order; subsequent `Send` raises `ChannelClosedException`. `TryReceive` returns `false` for both empty-open and drained-closed; consult `IsClosed` to distinguish.
+- **Ordering.** Per-sender FIFO; cross-sender interleaving is an unspecified consistent total order; each item is received exactly once.
+
+```bezel
+public class ChannelClosedException: Exception
+end ChannelClosedException;
+```
+
+Bounded channels (asynchronous `Send` awaiting capacity) and multi-consumer channels (receiver cloning, which requires shared ownership) are deferred — see the design rationale.
 
 ---
 

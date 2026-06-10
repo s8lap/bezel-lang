@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.132 — June 2026**
+**Companion to the Bezel Language Specification, v0.133 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -1004,7 +1004,22 @@ Through v0.130 the spec said async continuations "may resume on any thread-pool 
 
 Three alternatives were considered and **declined**. *Send/Sync-style thread-safety typing* (Rust's approach) statically tracks which types may cross threads; it is the right tool for a language committed to shared-memory parallelism, but it infects every generic signature, roughly doubles the constraint vocabulary, and buys safety for a parallelism model Bezel does not actually offer — the cost lands on every user, the benefit on few. *Documenting the status quo* (keep "any thread, synchronize it yourself") was declined because it leaves the flagship feature unsound and outsources the hardest correctness problem to convention — the precise failure C++ shows daily. *Locks as discipline* (rely on `Mutex` use) was declined because nothing checks it; a forgotten lock is exactly as silent as the race it permits. The serial-domain model, by contrast, requires no new constructs, no new annotations, and no migration.
 
-The decided direction for *parallelism* — multiple domains communicating by ownership transfer over channels, with sendability derived from existing type properties (owned transfer for classes, the §9.7 borrow-bearing computation for value types) — is recorded in the project tracker (#600) and deferred to a later revision. The one capability genuinely given up in the interim is CPU-bound parallelism inside one process; I/O-bound concurrency, the dominant async workload, is interleaving at suspension points and is unaffected by serialization of continuations. `Mutex`, `Semaphore`, and `Atomic<T>` (§30.12) are retained: foreign threads can still enter through the FFI, and the types are forward-compatible with multi-domain programs.
+The decided direction for *parallelism* — multiple domains communicating by ownership transfer over channels, with sendability derived from existing type properties (owned transfer for classes, the §9.7 borrow-bearing computation for value types) — is recorded in the project tracker (#600) and deferred to a later revision. The one capability genuinely given up in the interim is CPU-bound parallelism inside one process; I/O-bound concurrency, the dominant async workload, is interleaving at suspension points and is unaffected by serialization of continuations. `Mutex`, `Semaphore`, and `Atomic<T>` (§30.12) are retained: foreign threads can still enter through the FFI, and the types are forward-compatible with multi-domain programs. *(v0.133: the deferred direction was delivered — language spec [§30.14](Bezel_Language_Spec.md#sec-multiple-domains)–[§30.15](Bezel_Language_Spec.md#sec-channels); the reasoning is §12.6 below.)*
+
+<a id="sec-sendability-spawning-channels"></a>
+### 12.6 Sendability, spawning, and channels
+
+v0.133 delivers the parallelism half of the domain model: `Domain.Spawn` creates domains, `Channel<T>` moves data between them, and the **sendable** derived type property ([§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) instance, defined in [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) is the entire safety story. The design's one invariant — *no mutable state is reachable from two domains* — is what makes the v0.131 single-domain guarantees survive parallelism unchanged: every crossing value is moved (the origin domain provably loses it, by the same machinery as `move` and owned parameters) or immutable (`string`, value copies), and the channel core is the single compiler-known synchronized exception. Data-race freedom is purchased with the ownership system the language already had, not with a new type system. The decisions, and what was declined:
+
+**Sendable classes must be `sealed` (or `sealed abstract` over a fully-sendable closed hierarchy).** The subtyping hole forced this: sendability is checked on static types, but an owned field typed at a sendable open class could hold, at runtime, a subclass instance carrying a back-reference into the origin domain — a data race smuggled past the static check. Three closures of the hole were considered. *Sealing* (chosen): zero runtime cost, compile-time diagnosis, statically airtight — at the price of excluding open classes from crossing domains. *A runtime send-check* (walk the transferred ownership tree at the send site, verifying each concrete class is transfer-closed): sound and more permissive, **declined for now** because it hides a per-send cost proportional to the transferred graph and converts a compile-time error into a runtime one; it remains the natural widening if sealing proves too narrow, and admitting it later is non-breaking. *Subclass-must-be-sendable inheritance rules* (deriving from a sendable class may not break self-containment): declined because it inverts the dependency — a base author's coincidental sendability would constrain every subclass author, violating the principle that derived type properties are observations, not obligations.
+
+**Spawn entries are capture-free; data enters through explicit arguments.** The alternative — *move-capturing lambdas* (a closure form that takes ownership of its captures) — was declined: §28.9's capture-is-borrow rule is a single uniform story for every closure in the language, and carving out a second capture mode for one call site would ripple into closure typing, disposal of captured-but-never-run closures, and the §28.3 escape analysis. An explicit `owned arg` parameter is semantically identical, visibly costed at the call site, and required no new machinery. Multiple values aggregate into a sendable class, an `OwnedArray`, or flow through a channel.
+
+**Faults cross as `DomainFaultedException`, not as the original exception object.** Exception classes are not in general sendable (they are open classes, often carrying arbitrary state), and special-casing "exception objects may cross anyway" would reopen the invariant exactly where programs are least disciplined. Copying the message and stack-trace text (strings — sendable) preserves the diagnostic value; programs needing structured fault data return it as a sendable result or send it over a channel. Declined: a sendability requirement on throwable types (intrusive, retroactive) and runtime graph-checking of exception objects (the runtime-check costs above, on the unhappy path).
+
+**Channels are MPSC, with the `Channel<T>` object as the receiving end and `NewSender()` minting sender endpoints.** Declined alternatives: *a `Create` returning two endpoints via `out owned` parameters* — more ceremony at every creation site and a third type, for no expressiveness gain over minting senders on demand; *multi-consumer channels* (receiver cloning) — cloning a receiving end is shared ownership of the consume capability, which is #603's territory and is deferred until `Shared<T>` exists; *bounded channels* — back-pressure wants an asynchronous `Send` that awaits capacity, a useful but separable design, deferred. The unbounded MPSC form covers the dominant fan-in/pipeline shapes and every deferral is an additive extension.
+
+**`CancellationToken` does not cross domains.** Not by a new rule — it falls out: the token is a borrow-bearing record, hence not sendable. The cross-domain cancellation pattern (a dedicated channel carrying a cancel message) is documented rather than mechanized; a sendable cancellation primitive can be added later without disturbing anything in this revision.
 
 <a id="sec-events"></a>
 ## 13. Events
@@ -6486,6 +6501,60 @@ No conforming program changes meaning. Leg A and leg C are purely declarative. L
 #### Editorial note
 
 The `linkify_refs.py` toolchain was not re-run for this revision. The substantive edits are localized (one new §3.6, four one-line backlinks, one new §28.11 subsection, one new appendix plus Contents/intro pointers, one stdlib §4.3 paragraph, one new rationale §5.20, this changelog entry). No filename references changed (stable filenames as of this revision). The new cross-references were verified against existing anchors, including the §29 anchor disambiguation (`sec-iteration-2` for the chapter; `sec-iteration` is §16.5's range-iteration anchor).
+
+---
+
+<a id="sec-v0-132-to-v0-133-changelog"></a>
+### v0.132 to v0.133 changelog
+
+v0.133 delivers #600 phases 2–3 — parallelism by ownership transfer. v0.131 made the single-domain language sound; v0.133 makes it parallel without weakening anything: new domains are spawned explicitly, and the **sendable** derived type property guarantees that no mutable state is ever reachable from two domains. Every addition is within the *Asynchronous programming* Extended feature (Appendix D); a Core implementation is unaffected, and single-domain async programs are unaffected.
+
+<a id="sec-v0-132-to-v0-133-changelog-summary"></a>
+#### Summary
+
+Three additions:
+
+1. **Sendable types ([§30.14](Bezel_Language_Spec.md#sec-sendable-types)).** The sixth derived type property ([§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)): value types sendable iff not borrow-bearing and not move-only; `string` sendable (shared-immutable); function values never sendable; class types sendable iff **transfer-closed** — `sealed` (or a fully-sendable `sealed abstract` closed hierarchy), every field a sendable value / `string` / `owned` field of sendable class type / owning-inline-array of sendable element class, and no function-typed, boxed, interface-typed, or non-`owned` class-typed fields. Compiler-known stdlib types state their sendability per their structure.
+
+2. **`Domain.Spawn` ([§30.14](Bezel_Language_Spec.md#sec-spawning-domains), stdlib [§6.8](Bezel_Standard_Library.md#sec-domain)).** Spawns a domain running a **capture-free** entry (non-capturing lambda or static method reference) with sendable arguments (class-typed ones moved as `owned`) and a sendable result. The join handle is an ordinary `OwnedTask<R>` / `Task` / `Task<R>` — Pattern B's single-consumer ownership transfer ([§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)) *is* the cross-domain join, unchanged. Entry faults surface as `DomainFaultedException` carrying copied message/stack-trace strings.
+
+3. **Channels ([§30.15](Bezel_Language_Spec.md#sec-channels), stdlib [§6.9](Bezel_Standard_Library.md#sec-channel)).** Unbounded MPSC `Channel<T>` (the receiving end) and `ChannelSender<T>` endpoints minted by `NewSender()`; `Send(owned item)` consumes in the sender's domain, awaiting `Receive()` (an `OwnedTask<T>` for class T) produces owned in the receiver's; last-sender disposal closes (drain, then `ChannelClosedException`); channel disposal disposes undelivered class-typed items in reverse insertion order per the [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy) owned column. Both endpoint types are sendable; they are the only standard types two domains may reach simultaneously, and they are compiler-known and internally synchronized.
+
+<a id="sec-v0-132-to-v0-133-changelog-600"></a>
+#### The #600 phases 2–3 decisions
+
+Recorded in full as rationale [§12.6](#sec-sendability-spawning-channels): the no-shared-mutable-state invariant and why sendability needs no new type system (ownership transfer is the existing `move` machinery; the borrow-bearing computation supplies value-type transitivity); the `sealed` requirement that closes the static-types-vs-runtime-objects subtyping hole, with the runtime send-check recorded as the declined-for-now widening; capture-free entries over move-capturing lambdas; `DomainFaultedException` over cross-domain exception objects; MPSC with minted senders over two-endpoint `Create` and over multi-consumer forms (deferred to #603's shared ownership); bounded channels deferred; cancellation falling out as domain-local because `CancellationToken` is borrow-bearing.
+
+<a id="sec-v0-132-to-v0-133-changelog-language-spec-changes"></a>
+#### Language spec changes
+
+- **[§30.14](Bezel_Language_Spec.md#sec-multiple-domains)** — new section "Multiple domains and sendable types": the no-shared-mutable-state discipline, the sendable property (value/string/boxed/function/class/interface/stdlib rules, coinductive evaluation, §3.6 instantiation-site checking), `Domain.Spawn` call-site rules (capture-free entry, sendable arguments/results), join semantics, faults, domain completion.
+- **[§30.15](Bezel_Language_Spec.md#sec-channels)** — new section "Channels": the MPSC model, endpoint ownership and sendability, send/receive ownership transfer, closing and disposal semantics (slot-policy owned column), ordering.
+- **[§30.13](Bezel_Language_Spec.md#sec-runtime-model)** — the single-domain-only paragraph replaced with the spawn/channel pointers and the "domains share no mutable state" statement.
+- **[§30.12](Bezel_Language_Spec.md#sec-thread-synchronization)** — closing paragraph updated: multi-domain programs create no synchronization obligations; the synchronization types remain only for FFI threads.
+- **[§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)** — sendable added to the property table.
+- **[Appendix D](Bezel_Language_Spec.md#appendix-d-conformance-levels)** — the Asynchronous-programming feature row now names domains, spawning, and channels (§30.13–§30.15) and the `Domain`/`Channel` stdlib types.
+
+<a id="sec-v0-132-to-v0-133-changelog-standard-library-changes"></a>
+#### Standard library changes
+
+- **[§6.8](Bezel_Standard_Library.md#sec-domain)** — new: `Domain` (the `Spawn` overload set over argument/result categories) and `DomainFaultedException`.
+- **[§6.9](Bezel_Standard_Library.md#sec-channel)** — new: `Channel<T>`, `ChannelSender<T>` (category-dispatched signatures per the `OwnedBuffer<T>` precedent), and `ChannelClosedException`.
+
+<a id="sec-v0-132-to-v0-133-changelog-rationale-changes"></a>
+#### Rationale changes
+
+- New [§12.6](#sec-sendability-spawning-channels) recording the decisions and declined alternatives; a delivery note appended to [§12.5](#sec-execution-domains).
+- This changelog entry.
+
+<a id="sec-v0-132-to-v0-133-changelog-migration"></a>
+#### Migration
+
+Purely additive. No existing program changes meaning: programs that never call `Domain.Spawn` remain single-domain programs with v0.131's guarantees verbatim. The new names (`Domain`, `Channel<T>`, `ChannelSender<T>`, `DomainFaultedException`, `ChannelClosedException`) live in `System.Threading` and require its import. Core implementations (Appendix D) reject the new constructs as part of the Asynchronous-programming feature.
+
+#### Editorial note
+
+The `linkify_refs.py` toolchain was not re-run for this revision. The substantive edits are localized (two new spec sections §30.14–§30.15, two §30.12/§30.13 reword paragraphs, one §3.6 table row, one Appendix D row, two new stdlib sections §6.8–§6.9, one new rationale §12.6 plus the §12.5 note, this changelog entry). The new cross-references were verified against existing anchors.
 
 ---
 

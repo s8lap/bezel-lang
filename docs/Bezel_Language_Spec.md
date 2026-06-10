@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.132 — June 2026**
+**Version 0.133 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -8,7 +8,7 @@ This document is the normative reference for the language. It defines syntax, ty
 
 If this is your first encounter with Bezel, the rationale's opening section is a gentler starting point: it sketches the goals of the language and the shape of its memory model before the spec's formal definitions begin. If you want concrete code first, the short companion guides (memory and ownership; errors and nullability) work from worked examples. Once you know what you are looking for, this document is the place to look it up.
 
-**Changes since v0.130** are summarized at the end of the design rationale; this file is the normative reference and does not narrate its own history.
+**Changes since v0.131** are summarized at the end of the design rationale; this file is the normative reference and does not narrate its own history.
 
 <a id="sec-contents"></a>
 ## Contents
@@ -279,6 +279,7 @@ The derived type properties of this revision:
 | **auto-equality-bearing** | [§9.2](#sec-body-records) | records for which `=`, `GetHashCode`, and `ToString` are synthesized |
 | **serialization-eligible** | [§9.8](#sec-serialization-synthesis) | records and enums for which `Serialize`/`Deserialize` are synthesized |
 | **element category** | [§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans) | every type, as collection-element: value, runtime-managed reference, class/interface, or move-only value — the classification on which collection and buffer slot semantics dispatch |
+| **sendable** | [§30.14](#sec-sendable-types) | types whose values may cross an execution-domain boundary (spawn arguments and results, channel elements) |
 
 Common rules, normative for every derived type property:
 
@@ -4799,7 +4800,7 @@ interface IDisposable
 end IDisposable;
 ```
 
-`Dispose()` on any class instance is idempotent: the first call performs the disposal; subsequent calls are no-ops. The compiler-generated `Dispose()` is thread-safe with respect to idempotency: concurrent calls from multiple threads will execute the disposal logic exactly once; all other concurrent callers observe the no-op path. (Within a single execution domain concurrent calls cannot arise — [§30.13](#sec-runtime-model); the thread-safety guarantee matters where disposal is reachable from foreign threads through the FFI, and for future multi-domain programs.)
+`Dispose()` on any class instance is idempotent: the first call performs the disposal; subsequent calls are no-ops. The compiler-generated `Dispose()` is thread-safe with respect to idempotency: concurrent calls from multiple threads will execute the disposal logic exactly once; all other concurrent callers observe the no-op path. (Within a single execution domain concurrent calls cannot arise — [§30.13](#sec-runtime-model) — and they cannot arise across domains either, since domains share no mutable state ([§30.14](#sec-multiple-domains)); the thread-safety guarantee matters where disposal is reachable from foreign threads through the FFI.)
 
 <a id="sec-checked-disposal"></a>
 #### Use after disposal; checked disposal mode
@@ -6615,7 +6616,7 @@ class BankAccount
 end BankAccount;
 ```
 
-Within a single execution domain ([§30.13](#sec-runtime-model)), continuations never run concurrently, so a single-domain program — every program expressible in this revision — needs no synchronization for state shared between its own tasks; interleaving occurs only at suspension points. The synchronization types above remain necessary where foreign threads enter through the FFI ([§32](#sec-foreign-function-interface)), and they are forward-compatible with planned multi-domain parallelism (see the design rationale). They are safe to use from both sync and async code.
+Within a single execution domain ([§30.13](#sec-runtime-model)), continuations never run concurrently, so a program needs no synchronization for state shared between one domain's tasks; interleaving occurs only at suspension points. Nor does spawning additional domains ([§30.14](#sec-multiple-domains)) create synchronization obligations: domains share no mutable state — everything that crosses a boundary is moved or immutable, and the channel types ([§30.15](#sec-channels)) are internally synchronized. The synchronization types above remain necessary only where foreign threads enter through the FFI ([§32](#sec-foreign-function-interface)). They are safe to use from both sync and async code.
 
 <a id="sec-runtime-model"></a>
 ### 30.13 Runtime model
@@ -6625,7 +6626,7 @@ Within a single execution domain ([§30.13](#sec-runtime-model)), continuations 
 
 All Bezel code executes within an **execution domain**. A domain is a unit of *serial* execution: at any instant, at most one continuation belonging to a domain is running, and a continuation, once started, runs without interruption from the domain's other work until it suspends at an `await`, completes, or propagates an exception (*run-to-completion*). Continuations of a domain's tasks therefore interleave only at suspension points and never overlap.
 
-A program begins in a single domain (the *main domain*), which executes the entry point and every task the program creates. This revision provides no construct that creates additional domains: every conforming program is a single-domain program. (Facilities for creating additional domains and for communicating between domains by ownership transfer are planned; see the design rationale.)
+A program begins in a single domain (the *main domain*), which executes the entry point. A program that never spawns is a single-domain program. Additional domains are created explicitly with `Domain.Spawn` ([§30.14](#sec-multiple-domains)); data crosses a domain boundary only by ownership transfer or immutable sharing — through spawn arguments, join results, and channels ([§30.15](#sec-channels)) — under the *sendable* discipline of [§30.14](#sec-multiple-domains). Domains share no mutable state.
 
 The guarantees that follow from serial execution within a domain are normative:
 
@@ -6642,6 +6643,84 @@ The guarantees that follow from serial execution within a domain are normative:
 - Foreign threads introduced through the FFI ([§32](#sec-foreign-function-interface)) are outside the domain model. Bezel-level state shared with such threads requires the synchronization types of [§30.12](#sec-thread-synchronization).
 
 The runtime does not provide synchronization contexts in this version.
+
+<a id="sec-multiple-domains"></a>
+### 30.14 Multiple domains and sendable types
+
+Domains run in parallel: while each domain's continuations are serial ([§30.13](#sec-runtime-model)), continuations of *different* domains may run simultaneously on different threads. The data-race freedom of the single-domain guarantees is preserved across domains by one discipline: **no mutable state is ever reachable from two domains.** Every value that crosses a domain boundary is either *moved* (ownership transfers; the origin domain provably loses access, by the same `move`/owned-transfer machinery as [§28.8](#sec-ownership-transfer)) or *immutable* (`string`, copies of values). The compiler enforces the discipline through the *sendable* property below; the channel types ([§30.15](#sec-channels)) are the only objects two domains may reach simultaneously, and they are compiler-known and internally synchronized.
+
+<a id="sec-sendable-types"></a>
+#### Sendable types
+
+A type is **sendable** — a derived type property ([§3.6](#sec-derived-type-properties)) — when a value of the type may cross a domain boundary: as a spawn argument, a spawn result, or a channel element. Sendability is determined by category:
+
+- **Value types** are sendable iff they are not borrow-bearing ([§9.7](#sec-records-and-disposal)) and not move-only ([§15.3](#sec-move-only-value-types)). All primitives and enums are sendable; a record is sendable per its fields, transitively (the borrow-bearing computation already supplies the transitivity). A sendable value crosses as a copy.
+- **`string`** is sendable; it crosses as a shared reference, which is safe because strings are immutable (implementation note: the runtime's reclamation bookkeeping for strings must tolerate cross-domain sharing). A **boxed value** is sendable iff the boxed value's type is sendable. **Function-typed values are never sendable**: their captures are borrows of the origin domain's scopes ([§28.9](#sec-runtime-managed-types)).
+- **Class types** are sendable iff the class is **transfer-closed**:
+  1. The class is `sealed` ([§12.4](#sec-sealing)); or it is `sealed abstract` and every class in its module-closed hierarchy is itself transfer-closed (then the whole closed hierarchy is sendable). Open classes are not sendable — an open class's sendable-looking surface could be extended by a subclass holding origin-domain references, and a base-typed owned field could carry that subclass across.
+  2. Every instance field, including inherited fields, is: a sendable value type; `string`-typed; an `owned` field whose declared type is a sendable class type; or an owning-inline-array field (`[N owned]C` / `[N owned]C?`) whose element class is a sendable class type.
+  3. The class has no function-typed fields, no `Object`-typed or interface-typed fields (boxed contents and runtime types behind interfaces cannot be statically verified), and no non-`owned` class-typed fields (a back-reference aliases an object owned in the origin domain).
+  Mutually-recursive `owned` references among sendable classes are admitted; the property is evaluated coinductively (assume the types under test sendable, then check the rules). A sendable class instance crosses as an **owned transfer** — the entire ownership tree under it moves with it, and rule 2 guarantees that tree contains everything the instance can reach.
+- **Interface types** are never sendable (rule 3's reasoning, applied at the root).
+- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwnedBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwnedTask<T>`, enumerators, `EventSource<T>`, `CancellationTokenSource`, and the [§30.12](#sec-thread-synchronization) types are domain-local and not sendable; `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
+
+Sendability of a generic instantiation is checked at the instantiation or call site under the rules of [§3.6](#sec-derived-type-properties); diagnostics name the property ("not sendable"), the offending type, and the failing rule.
+
+<a id="sec-spawning-domains"></a>
+#### Spawning
+
+`Domain.Spawn` (stdlib [§6.8](Bezel_Standard_Library.md#sec-domain)) creates a new domain, runs an entry function as its first continuation, and returns a join handle in the spawning domain:
+
+```bezel
+// Representative forms; the stdlib section declares the full set.
+Domain.Spawn(entry: () -> ()): owned Task
+Domain.Spawn<R>(entry: () -> owned R): owned OwnedTask<R>            // R: sendable class
+Domain.Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwnedTask<R>
+Domain.Spawn<R>(entry: () -> R): owned Task<R>                       // R: sendable value type
+```
+
+The compiler enforces at the call site:
+
+- **The entry must be capture-free**: a non-capturing lambda or a static method reference. A capturing lambda or an instance method reference is rejected — captures and receivers are borrows of the origin domain ([§28.9](#sec-runtime-managed-types)). Data enters the new domain only through the explicit `arg` parameters, which must be of sendable types; class-typed arguments are `owned` and are moved through the spawn into the entry's parameter.
+- **Argument and result types must be sendable**, per the rules above.
+
+The join handle is an ordinary task of the spawning domain. Awaiting an `OwnedTask<R>` join follows Pattern B ([§30.5](#sec-result-lifetime-and-task-disposal)): single consumer, ownership of the (sendable) result transfers to the awaiter — the existing single-consumer transfer semantics are exactly the cross-domain join semantics, unchanged. `Task`/`Task<R>` joins follow Pattern A.
+
+**Faults.** An exception that propagates out of the entry does not cross the boundary as an object (exception classes are not in general sendable). The join instead raises `DomainFaultedException` (stdlib [§6.8](Bezel_Standard_Library.md#sec-domain)), whose `Message` and `FaultStackTrace` carry copies of the original exception's message and stack-trace text (`string`s — sendable). Programs that need richer fault data return it as a sendable result or send it over a channel.
+
+**Domain completion.** When the entry's task completes, the join handle completes (with the result or fault). Tasks started within the spawned domain that are still pending continue to run in that domain; their eventual exceptions are handled as `Task.FireAndForget` handles them (logged, not propagated — stdlib [§6.7](Bezel_Standard_Library.md#sec-task-static-helpers)). The domain's resources are reclaimed when its last continuation completes.
+
+<a id="sec-channels"></a>
+### 30.15 Channels
+
+A **channel** carries sendable values from one domain to another with ownership transfer at both ends: `Send` consumes the value in the sending domain; `Receive` produces it owned in the receiving domain. Channels are the only mutable objects reachable from more than one domain; they are compiler-known, internally synchronized, and their element type must be sendable (checked at instantiation per [§3.6](#sec-derived-type-properties)).
+
+The shape is multiple-producer, single-consumer. The `Channel<T>` object is the *receiving* end, owned like any class instance (typically by a `using var` or an `owned` field in the receiving domain). Sender endpoints are minted from it and moved to wherever sending happens:
+
+```bezel
+using var inbox := new Channel<Report>();          // unbounded; this domain receives
+using var worker := Domain.Spawn(ProcessAll, inbox.NewSender());   // sender moves to the new domain
+
+// in this domain:
+using var first := await inbox.Receive();          // ownership of one Report transfers in
+
+// in the spawned domain (static method):
+public static method ProcessAll(owned tx: ChannelSender<Report>)
+  using var sender := tx;
+  sender.Send(BuildReport(1));                     // ownership of each Report transfers out
+  sender.Send(BuildReport(2));
+end ProcessAll;                                    // sender disposed: last sender closes the channel
+```
+
+Normative semantics (full API: stdlib [§6.9](Bezel_Standard_Library.md#sec-channel)):
+
+- **`new Channel<T>()`** creates an unbounded channel. **`NewSender(): owned ChannelSender<T>`** mints a sender endpoint; any number may be minted, and each is an independently owned, sendable object. The channel and its senders share an internal core whose synchronization is the implementation's responsibility and invisible to programs.
+- **`Send(owned item: T)`** (class-typed T; for sendable value types and `string` the parameter is unmodified) appends the item, transferring ownership into the channel. Unbounded channels never block on send. Sending on a closed channel raises `ChannelClosedException`.
+- **`Receive()`** is asynchronous — `OwnedTask<T>` for class-typed T (Pattern B: awaiting transfers ownership of the item to the receiver), `Task<T>` otherwise. If the channel is empty and open, the receive completes when an item arrives; if empty and closed, it raises `ChannelClosedException`. **`TryReceive(out owned item: T?): bool`** is the non-blocking form (Try pattern; `out using var` at the call site); it returns `false` when no item is available — consult **`IsClosed`** to distinguish empty-but-open from closed.
+- **Closing.** Disposing the last `ChannelSender<T>` *closes* the channel: items already sent remain receivable (the channel drains), and after the drain, receives raise `ChannelClosedException`. Disposing the `Channel<T>` itself closes it immediately and disposes every undelivered class-typed item in reverse insertion order (the owned column of [§28.11](#sec-element-slot-policy)); subsequent sends raise `ChannelClosedException`.
+- **Ordering.** Items from one sender are received in the order sent; items from different senders interleave in an unspecified but consistent total order (each item is received exactly once).
+
+Bounded channels (back-pressure: an async `Send` that awaits capacity) and multi-consumer channels (receiver cloning, which requires shared ownership) are deferred; see the design rationale.
 
 ---
 
@@ -8176,7 +8255,7 @@ An implementation may also conform at "Core plus named features" (e.g., *Core + 
 | Feature | Specification sections | Standard-library sections |
 |---|---|---|
 | **Events** | [§24](#sec-events) | `EventSource<T>`, `IEvent<T>`, `AsyncEventSource<T>`, `IAsyncEvent<T>`, `Subscription` (stdlib [§2.11](Bezel_Standard_Library.md#sec-subscription)) |
-| **Asynchronous programming** | [§30](#sec-asynchronous-programming) entire; [§28.12](#sec-asynchronous-disposal) (`await using`, `IAsyncDisposable`); the async-iterator forms of [§29](#sec-iteration-2) (`IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `OwnedAsyncEnumerable<T>`, `OwnedAsyncEnumerator<T>`) | `Task`, `Task<T>`, `OwnedTask<T>`, completion sources, `CancellationToken`/`CancellationTokenSource`, `Mutex`/`Semaphore`/`Atomic<T>`, the async forms of IO and sequence operations |
+| **Asynchronous programming** | [§30](#sec-asynchronous-programming) entire — including domains, spawning, and channels ([§30.13](#sec-runtime-model)–[§30.15](#sec-channels)); [§28.12](#sec-asynchronous-disposal) (`await using`, `IAsyncDisposable`); the async-iterator forms of [§29](#sec-iteration-2) (`IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `OwnedAsyncEnumerable<T>`, `OwnedAsyncEnumerator<T>`) | `Task`, `Task<T>`, `OwnedTask<T>`, completion sources, `CancellationToken`/`CancellationTokenSource`, `Mutex`/`Semaphore`/`Atomic<T>`, `Domain`, `Channel<T>`/`ChannelSender<T>`, the async forms of IO and sequence operations |
 | **Serialization synthesis** | [§9.8](#sec-serialization-synthesis) | stdlib §2.14–2.15 |
 | **Foreign Function Interface** | [§32](#sec-foreign-function-interface); the FFI clauses of [§15.1.3](#sec-inline-array-ffi) | — |
 | **Buffers and spans** | the buffer/span clauses of [§28.11](#sec-collection-element-ownership) (`move` on `OwnedBuffer`/`Span` slots) | stdlib §3.3–3.4, §4.14–4.16 |
