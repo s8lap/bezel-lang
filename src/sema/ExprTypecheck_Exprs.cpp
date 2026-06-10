@@ -1342,21 +1342,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 "catch arm body (§31.5)");
         }
     } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
-        // per §30.6: an `async` lambda requires full async state-machine
-        // lowering in codegen, which is not yet implemented. Without the guard
-        // the codegen path (lowerLambda) reuses the outer async method's
-        // frame/blocks/args inside the lambda's own LLVM function, producing
-        // cross-function basic-block references → malformed IR → SIGILL.
-        // Emit a clean compile error here so the program never reaches codegen.
-        // (Decline-with-reasons: full §30.6 async-lambda state-machine codegen
-        // is a separate milestone.)
-        if (lam->isAsync) {
-            ctx_.diagnostics().report(
-                Severity::Error, lam->span.begin,
-                "async lambdas are not yet supported (§30.6); "
-                "use a named async method instead");
-            return;
-        }
+        // §30.6 (#488): an `async` lambda is the intersection of a closure
+        // (§27.5) and an async state machine (§30.1/§30.2) — codegen lowers it
+        // via emitAsyncLambda (the closure entry drives the state machine; the
+        // captures + params round-trip the async frame). No diagnostic here:
+        // the async-readiness gate below (`inAsyncContext_ = lam->isAsync`)
+        // makes `await` valid inside the body, and the lambda's function type is
+        // inferred normally (the funcReturn is the body's natural result T — the
+        // awaited value). The lambda's `(…) -> Task<T>` form is supplied by the
+        // call-site annotation (a typed local / function-typed parameter), which
+        // codegen reads as the authoritative Task<T> at the closure-call site;
+        // function-to-function assignability is not signature-checked (§5.1
+        // function-type matching is a future slice), so the inferred `(…) -> T`
+        // and the annotated `(…) -> Task<T>` coexist without a spurious error.
         // §A.7 / §21.7: lambdas create their own scope with parameter
         // symbols. Each parameter becomes a ParameterSymbol whose
         // declType is inferred from the explicit type annotation (untyped

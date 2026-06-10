@@ -621,6 +621,20 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+        // #422 / §27.5 / §28.9 (#488 follow): a `var` CLOSURE local in an async
+        // method body — e.g. the canonical async-lambda form `var f := async …`
+        // (§30.6) — must be released at scope end, exactly like in a synchronous
+        // method. The async routing in emitFunctionBody returns BEFORE that pass's
+        // collectClosureReleaseEligible / eligible-fn setup runs, so without this
+        // the closure cell (+ its env block) leaks. Compute eligibility for the
+        // async body here and key it to the resume fn (where the body lowers); the
+        // release registers in the resume's disposeStack_ and emitAllDisposals
+        // (run on every async `return` / fall-off before emitAsyncComplete) frees
+        // it. (Scoped to closures — the allocation async lambdas introduce. Boxes
+        // / strings in async-method locals are a distinct pre-existing leak left
+        // to a separate fix to keep this change bounded.)
+        collectClosureReleaseEligible(*ci.stmts);
+        closureReleaseEligibleFn_ = resumeFn;
         // §30.9 / §31.2 (#438): start with no pending handler-context spill slots;
         // lowerTry registers them as it lowers any in-handler await.
         asyncHandlerSpillSlots_.clear();
@@ -737,6 +751,365 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // which the dispatch switch / loop back-edge re-enters. Named locals
         // already round-trip through the frame; this demotes the remaining
         // anonymous temporaries to stack slots so the resume function verifies.
+        fixupSuspendDominance(resumeFn);
+
+        // Clear state-machine state.
+        smStateStruct_ = nullptr;
+        smSelf_ = nullptr;
+        smLocalFields_.clear();
+        smAllocaToField_.clear();
+        asyncResumeFn_ = nullptr;
+        asyncResultTy_ = nullptr;
+        asyncResultSemaType_ = nullptr;
+    }
+}
+
+
+// §30.6 (#488): async-lambda state machine. See the impl-header doc comment.
+//
+// This is the LAMBDA analogue of emitAsyncMethod. The structural difference is
+// the capture set: a named async method captures `this` + its method params; an
+// async lambda captures its OWN user params (arriving as the entry fn's args
+// 1..N, already bound into paramSlots_ by lowerLambda's prologue) PLUS the
+// outer-scope variables it closes over (arriving via the env pointer, already
+// bound into paramSlots_/locals_ as shared-cell holders — cellVars_ marks those
+// slots) PLUS `this` (when the lambda was created inside an instance method).
+// All of these are live across the lambda body's awaits, so all must round-trip
+// the heap frame, exactly like a method's captures do. Everything else — the
+// await suspend lowering, ReturnStmt completion, the fault boundary, the
+// suspend-local spill/restore — is the kind-agnostic scaffolding, driven by the
+// sm*_/async*Field_ state, identical to the method path.
+void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
+                              const std::vector<sema::Symbol*>* paramSyms,
+                              const sema::TypeRef* resultElemSemaTy) {
+    // `fn` is the closure entry; the builder is already positioned at its entry
+    // block (lowerLambda's prologue), and currentFn_ == fn. We drive the entry
+    // through builder_ / currentFn_, so `fn` itself is referenced only for the
+    // contract (kept as a parameter for clarity / future use).
+    (void)fn;
+    smKind_ = SuspendKind::Await;
+
+    // §30.6 result element type T (from the lambda's Task<T>/OwnedTask<T> return
+    // type; null for a no-value `Task`). Mirrors emitAsyncMethod's resultTy/
+    // resultSemaTy setup (which reads it from the method's declared return type).
+    llvm::Type* resultTy =
+        resultElemSemaTy ? lowerTypeRef(resultElemSemaTy) : nullptr;
+    asyncResultTy_ = resultTy;
+    asyncResultSemaType_ = resultElemSemaTy;
+
+    // ---- Snapshot the capture set bound by lowerLambda's prologue ----
+    // A FrameCapture records how to spill (in the entry, from the current slot)
+    // and restore (in the resume, into a fresh slot). `isThis` captures the
+    // receiver by value; `isCell` captures a shared-cell POINTER (the lambda's
+    // capture of an outer variable, §27.5) and must re-mark cellVars_ on restore
+    // so body reads/writes route through the cell; otherwise it is a plain
+    // by-value lambda param.
+    struct FrameCapture {
+        llvm::Type*          fieldTy;   // frame field type (value type, or ptr)
+        llvm::Value*         spillVal;  // value to store into the frame (entry)
+        const sema::Symbol*  paramSym;  // non-null → rebind paramSlots_[sym]
+        const ast::Node*     localDecl; // non-null → rebind locals_[decl]
+        llvm::Type*          cellValTy; // non-null → this is a shared cell (§27.5)
+        bool                 isThis;
+    };
+    std::vector<FrameCapture> caps;
+
+    // Lambda params + captured outer PARAMS live in paramSlots_. Distinguish a
+    // by-value lambda param (no cellVars_ entry) from a captured outer-param cell
+    // (cellVars_ entry present). The order is the iteration order of paramSlots_;
+    // it is stable within this single emission (we snapshot now and rebuild the
+    // same order in the resume).
+    for (auto& [sym, slot] : paramSlots_) {
+        FrameCapture fc{};
+        fc.paramSym = sym;
+        fc.localDecl = nullptr;
+        fc.isThis = false;
+        auto cv = cellVars_.find(slot);
+        if (cv != cellVars_.end()) {
+            // Captured outer param: slot holds the cell pointer (§27.5).
+            fc.cellValTy = cv->second;
+            fc.fieldTy = ptrTy();
+            fc.spillVal = builder_.CreateLoad(ptrTy(), slot, "asynclam.cap.cell");
+        } else {
+            // By-value lambda param.
+            fc.cellValTy = nullptr;
+            fc.fieldTy = slot->getAllocatedType();
+            fc.spillVal = builder_.CreateLoad(fc.fieldTy, slot, "asynclam.param");
+        }
+        caps.push_back(fc);
+    }
+    // Captured outer LOCALS live in locals_ (each a shared-cell holder).
+    for (auto& [decl, slot] : locals_) {
+        auto cv = cellVars_.find(slot);
+        if (cv == cellVars_.end()) continue;  // a non-cell local is body-private
+        FrameCapture fc{};
+        fc.paramSym = nullptr;
+        fc.localDecl = decl;
+        fc.cellValTy = cv->second;
+        fc.fieldTy = ptrTy();
+        fc.spillVal = builder_.CreateLoad(ptrTy(), slot, "asynclam.cap.cell");
+        fc.isThis = false;
+        caps.push_back(fc);
+    }
+    // `this` (captured by value from the enclosing instance method, §27.5).
+    llvm::Value* capturedThis = currentThis_;
+    if (capturedThis) {
+        FrameCapture fc{};
+        fc.fieldTy = ptrTy();
+        fc.spillVal = capturedThis;
+        fc.paramSym = nullptr;
+        fc.localDecl = nullptr;
+        fc.cellValTy = nullptr;
+        fc.isThis = true;
+        caps.push_back(fc);
+    }
+
+    // ---- Build the state frame ----
+    // Layout: { ptr vtable, i32 state, captures..., bodyLocals...,
+    //           ptr outerTask, ptr pendingTask, ptr spill }. The three trailing
+    //           async slots mirror emitAsyncMethod exactly.
+    std::vector<std::pair<const ast::Node*, llvm::Type*>> bodyLocals;
+    if (!lam.exprBody) collectSuspendLocals(lam.stmts, bodyLocals);
+
+    std::vector<llvm::Type*> fields;
+    fields.push_back(ptrTy());          // vtable → 0 (unused; kept for layout parity)
+    fields.push_back(i32());            // state  → 1
+    const unsigned STATE_FIELD = 1;
+    const unsigned CAPTURE_START = 2;
+    for (auto& fc : caps) fields.push_back(fc.fieldTy);
+    const unsigned LOCAL_START = (unsigned)(CAPTURE_START + caps.size());
+    for (auto& [node, ty] : bodyLocals) fields.push_back(ty);
+    const unsigned OUTER_TASK_FIELD = (unsigned)(LOCAL_START + bodyLocals.size());
+    const unsigned PENDING_TASK_FIELD = OUTER_TASK_FIELD + 1;
+    const unsigned SPILL_PTR_FIELD = OUTER_TASK_FIELD + 2;
+    fields.push_back(ptrTy());          // outerTask
+    fields.push_back(ptrTy());          // pendingTask
+    fields.push_back(ptrTy());          // spill
+
+    static std::atomic<unsigned> lamSmCounter{0};
+    unsigned smId = lamSmCounter.fetch_add(1);
+    auto* stateStructTy = llvm::StructType::create(
+        llvm_, fields, "async.lambda." + std::to_string(smId));
+
+    asyncOuterTaskField_ = OUTER_TASK_FIELD;
+    asyncPendingTaskField_ = PENDING_TASK_FIELD;
+    asyncSpillPtrField_ = SPILL_PTR_FIELD;
+
+    // bodyLocal AST-node → frame field index (consumed by lowerLocalDecl's
+    // frame-backing path, which keys off smLocalFields_).
+    std::unordered_map<const ast::Node*, unsigned> localFields;
+    for (unsigned li = 0; li < bodyLocals.size(); ++li)
+        localFields[bodyLocals[li].first] = LOCAL_START + li;
+
+    // ---- Resume(ptr completedTask, ptr frame) -> void ----
+    auto* resumeTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false);
+    std::string prefix = "bz$asynclam$" + std::to_string(smId) + "$";
+    auto* resumeFn = llvm::Function::Create(
+        resumeTy, llvm::Function::InternalLinkage, prefix + "Resume",
+        module_.get());
+    asyncResumeFn_ = resumeFn;
+
+    // ---- ENTRY (= the closure body fn, builder positioned at its entry block,
+    //              with caps already bound) ----
+    {
+        // outerTask = bz_task_alloc()
+        auto* allocFn = declareC("bz_task_alloc", ptrTy(), {});
+        llvm::Value* outerTask = builder_.CreateCall(allocFn, {}, "asynclam.task");
+
+        // frame = calloc(1, sizeof(Frame))
+        uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stateStructTy);
+        auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+        llvm::Value* st = builder_.CreateCall(
+            callocFn2, {builder_.getInt64(1), builder_.getInt64(stSz)},
+            "asynclam.frame");
+
+        // state = 0
+        builder_.CreateStore(
+            builder_.getInt32(0),
+            builder_.CreateStructGEP(stateStructTy, st, STATE_FIELD));
+        // outerTask field
+        builder_.CreateStore(
+            outerTask,
+            builder_.CreateStructGEP(stateStructTy, st, OUTER_TASK_FIELD));
+        // captures (lambda params + cell pointers + this), spilled from the
+        // values captured above (in entry context, before any state mutation).
+        for (unsigned i = 0; i < caps.size(); ++i) {
+            llvm::Value* capField =
+                builder_.CreateStructGEP(stateStructTy, st,
+                                         (unsigned)(CAPTURE_START + i));
+            if (caps[i].spillVal)
+                builder_.CreateStore(caps[i].spillVal, capField);
+        }
+
+        // Drive the state machine once synchronously (§30.1 synchronous prefix).
+        builder_.CreateCall(resumeFn,
+                            {llvm::ConstantPointerNull::get(ptrTy()), st});
+        // Return the outer task pointer (the closure's Task / Task<T> result).
+        builder_.CreateRet(outerTask);
+    }
+
+    // ---- Resume: the state machine body ----
+    {
+        // Reset emitter state for the resume function context. The lambda's
+        // captures are rebound below from the frame; no outer-frame slot state
+        // carries over (the resume runs on a fresh — possibly cross-thread —
+        // activation, reading only the heap frame).
+        currentFn_ = resumeFn;
+        currentThis_ = nullptr;
+        locals_.clear(); paramSlots_.clear(); refParams_.clear();
+        cellVars_.clear();
+        disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+        propagateBB_ = nullptr; unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+        asyncHandlerSpillSlots_.clear();
+        // #422 (see emitAsyncMethod): a `var` CLOSURE local in the async LAMBDA's
+        // own block body must be released at scope end. Compute eligibility for
+        // the lambda body and key it to the lambda resume fn (where the body
+        // lowers). An expression-bodied lambda has no stmts (and no such local).
+        if (!lam.exprBody)
+            collectClosureReleaseEligible(lam.stmts);
+        else
+            closureReleaseEligible_.clear();
+        closureReleaseEligibleFn_ = resumeFn;
+        // CRITICAL (nested lambda): the await spill/restore loop iterates
+        // smAllocaToField_, mapping a suspend-local's alloca → its frame field.
+        // An ENCLOSING async method's resume populated this with ITS allocas
+        // before lowerLambda was reached; if not cleared, the lambda's await
+        // would spill/restore those foreign allocas inside the lambda's resume
+        // function — a cross-function instruction reference (IR verifier failure).
+        // Reset it so only the lambda body's own suspend-locals are tracked.
+        // (smLocalFields_ is overwritten wholesale by emitResumeDispatch below.)
+        smAllocaToField_.clear();
+
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
+        builder_.SetInsertPoint(entry);
+
+        llvm::Value* self = resumeFn->getArg(1);
+
+        // Restore captures from the frame into fresh slots, re-establishing the
+        // exact binding lowerLambda's prologue set up (so body identifier reads
+        // resolve identically). A shared-cell capture (§27.5) re-marks cellVars_
+        // so reads/writes route through the cell; `this` sets currentThis_.
+        for (unsigned i = 0; i < caps.size(); ++i) {
+            const FrameCapture& fc = caps[i];
+            llvm::Value* capField =
+                builder_.CreateStructGEP(stateStructTy, self,
+                                         (unsigned)(CAPTURE_START + i));
+            llvm::Value* val = builder_.CreateLoad(fc.fieldTy, capField);
+            if (fc.isThis) {
+                currentThis_ = val;
+                continue;
+            }
+            auto* slot = entryAlloca(fc.fieldTy);
+            builder_.CreateStore(val, slot);
+            if (fc.cellValTy) cellVars_[slot] = fc.cellValTy;
+            if (fc.paramSym) paramSlots_[fc.paramSym] = slot;
+            if (fc.localDecl) locals_[fc.localDecl] = slot;
+        }
+        (void)paramSyms;  // params are restored via caps (paramSlots_) above
+
+        // State field GEP — read by the resume dispatch, written at each await.
+        llvm::Value* stateGEP =
+            builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
+
+        // Build a StateMachineFrame view for the kind-agnostic dispatch + the
+        // lowerLocalDecl frame-backing path (which keys off smLocalFields_).
+        StateMachineFrame frame;
+        frame.structTy = stateStructTy;
+        frame.stateField = STATE_FIELD;
+        frame.captureStart = CAPTURE_START;
+        frame.localStart = LOCAL_START;
+        frame.currentValField = OUTER_TASK_FIELD;
+        frame.bodyLocals = bodyLocals;
+        frame.localFields = localFields;
+
+        unsigned numAwaits = lam.exprBody
+                                 ? countAwaitsInExpr(lam.exprBody.get())
+                                 : countAwaits(lam.stmts);
+
+        // Publish the live state BEFORE emitResumeDispatch: its `emitDone`
+        // callback (the switch-default "exhausted" block) runs emitAsyncComplete,
+        // which reads smStateStruct_/smSelf_/asyncOuterTaskField_. emitResumeDispatch
+        // sets these only AFTER calling emitDone, so for a NESTED async lambda the
+        // enclosing method's (stale) frame would otherwise be used — producing a
+        // GEP into %async.Main with the lambda resume's frame arg (cross-function
+        // reference → IR verifier failure). Setting them here makes emitDone use
+        // the LAMBDA's frame. (A top-level async method is unaffected: there the
+        // enclosing smStateStruct_ is null, so emitAsyncComplete is a no-op in the
+        // method's mn.done — which is never the real completion path anyway.)
+        smStateStruct_ = stateStructTy;
+        smSelf_ = self;
+
+        std::vector<llvm::BasicBlock*> stateBBs = emitResumeDispatch(
+            frame, self, stateGEP, numAwaits,
+            [&]() {
+                emitAsyncComplete(/*value=*/nullptr);
+                builder_.CreateRetVoid();
+            });
+
+        // §30.9 (basic): the async fault boundary — an uncaught throw / faulted-
+        // await re-raise completes the OUTER task with the in-flight exception
+        // object and returns. Identical to emitAsyncMethod.
+        auto* faultBB = llvm::BasicBlock::Create(llvm_, "asynclam.fault", resumeFn);
+        unwindTarget_ = faultBB;
+        {
+            llvm::IRBuilder<>::InsertPointGuard guard(builder_);
+            builder_.SetInsertPoint(faultBB);
+            llvm::Value* otField = builder_.CreateStructGEP(
+                stateStructTy, self, OUTER_TASK_FIELD);
+            llvm::Value* outerTask = builder_.CreateLoad(ptrTy(), otField);
+            llvm::Value* excObj =
+                builder_.CreateLoad(ptrTy(), excGlobal(), "asynclam.fault.exc");
+            auto* completeErrObjFn = declareC("bz_task_complete_error_obj",
+                                              llvm::Type::getVoidTy(llvm_),
+                                              {ptrTy(), ptrTy()});
+            builder_.CreateCall(completeErrObjFn, {outerTask, excObj});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 excGlobal());
+            emitFreeSpillArea(self);
+            auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                     {ptrTy()});
+            builder_.CreateCall(freeFn2, {self});
+            builder_.CreateRetVoid();
+        }
+
+        // Emit the body from state 0.
+        builder_.SetInsertPoint(stateBBs[0]);
+        disposeStack_.emplace_back();
+        if (lam.exprBody) {
+            // §30.6: an expression-bodied async lambda's value completes the
+            // outer task (§30.1 `return expression;`). `await` inside the
+            // expression lowers as a suspend point; the resulting value is what
+            // completes the task. A no-value `Task` lambda (resultTy == null)
+            // ignores the value and completes with no result.
+            llvm::Value* v = lowerExpr(*lam.exprBody);
+            if (!builder_.GetInsertBlock()->getTerminator()) {
+                emitAsyncComplete(resultTy ? v : nullptr);
+                builder_.CreateRetVoid();
+            }
+        } else {
+            bool term = lowerBody(lam.stmts);
+            if (!term && !builder_.GetInsertBlock()->getTerminator()) {
+                emitAsyncComplete(/*value=*/nullptr);
+                builder_.CreateRetVoid();
+            }
+        }
+        disposeStack_.pop_back();
+
+        // `await using` orphan-state termination (parity with emitAsyncMethod).
+        if (smDoneBB_) {
+            for (unsigned s = smNextSuspendState_ + 1; s < smStateBBs_.size();
+                 ++s) {
+                auto* orphanBB = smStateBBs_[s];
+                if (orphanBB && !orphanBB->getTerminator()) {
+                    llvm::IRBuilder<> tmp(orphanBB);
+                    tmp.CreateBr(smDoneBB_);
+                }
+            }
+        }
+
+        // Repair SSA dominance broken by awaits in larger expressions (#438).
         fixupSuspendDominance(resumeFn);
 
         // Clear state-machine state.
