@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.133 — June 2026**
+**Version 0.134 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -8,7 +8,7 @@ This document is the normative reference for the language. It defines syntax, ty
 
 If this is your first encounter with Bezel, the rationale's opening section is a gentler starting point: it sketches the goals of the language and the shape of its memory model before the spec's formal definitions begin. If you want concrete code first, the short companion guides (memory and ownership; errors and nullability) work from worked examples. Once you know what you are looking for, this document is the place to look it up.
 
-**Changes since v0.131** are summarized at the end of the design rationale; this file is the normative reference and does not narrate its own history.
+**Changes since v0.132** are summarized at the end of the design rationale; this file is the normative reference and does not narrate its own history.
 
 <a id="sec-contents"></a>
 ## Contents
@@ -5726,6 +5726,29 @@ end ProcessAsync;
 
 When a class implements both `IDisposable` and `IAsyncDisposable`, prefer `await using` in async contexts.
 
+<a id="sec-shared-ownership"></a>
+### 28.13 Shared ownership: `Shared<T>` and `Weak<T>`
+
+The ownership model is single-owner: every disposal obligation has exactly one holder. `Shared<T>` (stdlib [§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)) is the scoped exception — a compiler-known class whose instances (*handles*) jointly own one underlying value; the value is disposed exactly once, when the last handle is disposed. Shared ownership is opt-in, visible at every site (`Clone()` is an explicit call), and **domain-local** (`Shared<T>` is not sendable, [§30.14](#sec-sendable-types)).
+
+```bezel
+using var primary := new Shared<Connection>(Connect("db"));   // consumes the owned Connection; count = 1
+using var second  := primary.Clone();                          // count = 2; an independent owned handle
+second.Get().Ping();                                           // borrow of the underlying Connection
+// scope end: second disposed (count 1), then primary disposed (count 0) → Connection disposed
+```
+
+The semantics, stated against the existing model:
+
+- **Handles are ordinary owned class instances.** Every rule of this chapter applies to a handle unchanged: it is produced owned (by `new Shared<T>(...)` or `Clone()`), discharged by `using var`, an `owned` field, an `owned` parameter or return, `move`, or explicit `Dispose()`; branch joins, exception-path discharge, and the leak-prevention rules of [§28.6](#sec-leak-prevention) see nothing new. A handle may be stored in owning collections (`OwnedArray<Shared<T>>`) like any class instance. The *only* novel behavior is inside the compiler-known type: the shared count, and last-one-disposes.
+- **`new Shared<T>(owned value: T)`** consumes an owned T — the constructor is an owned-consuming position like any other ([§28.3](#sec-local-variables-ownership-and-borrows)); after construction the handle's disposal obligation *is* the value's. `T` must be a proper class type; runtime-managed and value types are rejected at instantiation ([§14.4](#sec-owned-as-a-generic-argument) pattern — they have no disposal obligation to share).
+- **`Clone(): owned Shared<T>`** produces a new handle and increments the count. Cost and intent are visible at the call site; there is no implicit handle duplication anywhere in the language (assigning a handle moves or borrows it per the ordinary rules — it never silently clones).
+- **`Get(): T`** produces a *borrow of the underlying value whose source is the handle*, valid while that handle lives — the same shape as the owning-collection indexer-get ([§28.11](#sec-element-slot-policy) owned column: borrow out, source: the collection). The borrow does not extend the value's lifetime; the handle does. [§28.6](#sec-leak-prevention)'s owned-field-return rule is not violated: `Get()` is the compiler-known accessor dispensation that owning-collection reads already have.
+- **Disposal.** Disposing a handle decrements the count; disposing the last live handle disposes the underlying value (running its destructor cascade normally). Handle disposal is idempotent per [§28.2](#sec-the-idisposable-contract). The exactly-once invariant of [Appendix C](#sec-appendix-c) is preserved: the value's `Dispose()` runs once, from the last handle.
+- **Cycles leak.** A value that (transitively, through owned fields) holds a `Shared<T>` handle participating in its own ownership keeps its count above zero forever — the standard reference-counting hazard. The compiler does not detect ownership cycles through `Shared<T>`. Break cycles with `Weak<T>`.
+- **`Weak<T>`** (stdlib [§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)) is a non-owning observer minted from a handle (`shared.Downgrade(): owned Weak<T>`). A weak handle does not keep the underlying value alive; **`TryUpgrade(out owned s: Shared<T>?): bool`** atomically produces a new strong handle if the value is still alive (Try pattern, `out using var` at the call site — [§22.3](#sec-parameter-modifiers)'s `out owned` rules). Weak handles are themselves ordinary owned class instances and are disposed like any other.
+- **Aliasing.** Multiple handles give multiple borrows of one mutable value within a domain. This is serial-execution-safe ([§30.13](#sec-runtime-model)) and carries the same *logical* aliasing hazards as any other long-lived borrow; nothing about `Shared<T>` relaxes use-after-dispose ([§28.2](#sec-checked-disposal)) for borrows taken from a handle that is then disposed.
+- **Not sendable.** The count is not synchronized; handles and weak handles are domain-local ([§30.14](#sec-sendable-types)). A synchronized cross-domain form is deferred; see the design rationale.
 
 ---
 
@@ -6662,7 +6685,7 @@ A type is **sendable** — a derived type property ([§3.6](#sec-derived-type-pr
   3. The class has no function-typed fields, no `Object`-typed or interface-typed fields (boxed contents and runtime types behind interfaces cannot be statically verified), and no non-`owned` class-typed fields (a back-reference aliases an object owned in the origin domain).
   Mutually-recursive `owned` references among sendable classes are admitted; the property is evaluated coinductively (assume the types under test sendable, then check the rules). A sendable class instance crosses as an **owned transfer** — the entire ownership tree under it moves with it, and rule 2 guarantees that tree contains everything the instance can reach.
 - **Interface types** are never sendable (rule 3's reasoning, applied at the root).
-- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwnedBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwnedTask<T>`, enumerators, `EventSource<T>`, `CancellationTokenSource`, and the [§30.12](#sec-thread-synchronization) types are domain-local and not sendable; `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
+- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwnedBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwnedTask<T>`, enumerators, `EventSource<T>`, `CancellationTokenSource`, `Shared<T>` and `Weak<T>` ([§28.13](#sec-shared-ownership) — the shared count is not synchronized), and the [§30.12](#sec-thread-synchronization) types are domain-local and not sendable; `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
 
 Sendability of a generic instantiation is checked at the instantiation or call site under the rules of [§3.6](#sec-derived-type-properties); diagnostics name the property ("not sendable"), the offending type, and the failing rule.
 
@@ -8260,14 +8283,15 @@ An implementation may also conform at "Core plus named features" (e.g., *Core + 
 | **Foreign Function Interface** | [§32](#sec-foreign-function-interface); the FFI clauses of [§15.1.3](#sec-inline-array-ffi) | — |
 | **Buffers and spans** | the buffer/span clauses of [§28.11](#sec-collection-element-ownership) (`move` on `OwnedBuffer`/`Span` slots) | stdlib §3.3–3.4, §4.14–4.16 |
 | **Sequence operations (LINQ-style)** | — | stdlib §5 entire |
+| **Shared ownership** | [§28.13](#sec-shared-ownership) | `Shared<T>`, `Weak<T>` (stdlib §2.16) |
 
-Everything not listed is **Core**: lexical structure through generics, records, enums, classes, interfaces, inheritance, nullability, patterns and `case`, expressions and statements, operators and overloading, properties and indexers, the entire ownership system of [§28](#sec-resource-management) (except §28.12), synchronous iteration ([§29](#sec-iteration-2)'s non-async forms, including iterator methods and `OwnedEnumerable<T>`), exceptions ([§31](#sec-exception-handling)), the entry point, and the corresponding standard-library sections.
+Everything not listed is **Core**: lexical structure through generics, records, enums, classes, interfaces, inheritance, nullability, patterns and `case`, expressions and statements, operators and overloading, properties and indexers, the entire ownership system of [§28](#sec-resource-management) (except §28.12 and §28.13), synchronous iteration ([§29](#sec-iteration-2)'s non-async forms, including iterator methods and `OwnedEnumerable<T>`), exceptions ([§31](#sec-exception-handling)), the entry point, and the corresponding standard-library sections.
 
 <a id="sec-feature-dependencies"></a>
 ### D.3 Dependencies and closure
 
 - Extended features depend on Core; Core depends on no Extended feature. The Core sections' references *into* Extended sections (e.g., [§28.3](#sec-local-variables-ownership-and-borrows)'s notes on async lambdas, [§9.7](#sec-records-and-disposal)'s span examples) are normative only for implementations of the referenced feature.
-- The async-iterator forms belong to **Asynchronous programming** and additionally require synchronous iteration (Core). **Buffers and spans** and **Sequence operations** depend only on Core. **Events**' async event source requires **Asynchronous programming**; the synchronous `EventSource<T>` does not.
+- The async-iterator forms belong to **Asynchronous programming** and additionally require synchronous iteration (Core). **Buffers and spans**, **Sequence operations**, and **Shared ownership** depend only on Core. **Events**' async event source requires **Asynchronous programming**; the synchronous `EventSource<T>` does not.
 - A Core implementation's standard library omits the types of unimplemented Extended features entirely (they are absent, not stubbed); programs referencing them fail name resolution with the feature-naming diagnostic of D.1.
 
 <a id="sec-conformance-and-the-runtime-model"></a>

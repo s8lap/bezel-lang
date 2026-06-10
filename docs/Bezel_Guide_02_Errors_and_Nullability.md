@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification v0.133.*
+*A short, example-first guide. Companion to the Bezel Language Specification v0.134.*
 
 If you know C#, Kotlin, or Swift, most of this chapter is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. Skim those parts. The three places where the ownership model changes how you write this code — and where a habit from those languages produces a *compile error* — are headed **How Bezel does it**. Read those.
 

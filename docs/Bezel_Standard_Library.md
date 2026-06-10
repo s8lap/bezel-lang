@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.133 — June 2026**
+**Companion to the Bezel Language Specification, v0.134 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -729,6 +729,45 @@ end LoadPoint;
 **Unknown-field policy.** A field present in the input that matches no declared component of the target type is, by default, a `SerializationException` — the strict default established when synthesis shipped (v0.116), because silently dropping unrecognized input masks producer/consumer schema drift and field-name typos. This behavior is a property of the deserialization *operation*, not of the target type: the same type may legitimately be read strictly when consuming a trusted internal message and leniently when consuming a third-party producer that adds fields freely, a decision that belongs to the caller performing the read, not to the type's serialization contract (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)). It is therefore configured on the deserializer: `JsonOptions.IgnoreUnknownFields` (default `false`) for JSON, the `ignoreUnknownFields` constructor parameter for `BinaryDeserializer`. When set, the deserializer skips an unrecognized field's value (via `IDeserializer.SkipValue`, [§2.14](#sec-serialization-vocabulary), which consumes the value including any nested object/array structure) and continues rather than raising. The synthesized `Deserialize` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) is identical regardless of policy — it always delegates an unrecognized field to the deserializer; strictness lives entirely in the deserializer's configuration. This policy governs only *unknown* fields; missing required fields, duplicates, and type mismatches remain unconditional errors regardless of the setting, and a *missing* declared field is tolerated only by the per-member `serialized optional` clause (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — the two leniencies are orthogonal and compose.
 
 `JsonSerializer`, `JsonDeserializer`, `BinarySerializer`, `BinaryDeserializer`, `JsonOptions`, and `SerializationException` are declared in `System.Serialization` and require an explicit `import System.Serialization`. The vocabulary interfaces they implement (`ISerializer`/`IDeserializer`/`ISerializable`/`IDeserializable`, [§2.14](#sec-serialization-vocabulary)) remain auto-imported, so a type's `: ISerializable` conformance never requires the import — only the code that picks a concrete format does.
+
+<a id="sec-shared-and-weak"></a>
+### 2.16 `Shared<T>` and `Weak<T>`
+
+Scoped shared ownership (language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership)): N handles jointly own one underlying value; the last handle's disposal disposes it. Both types are compiler-known; the shared count and last-one-disposes behavior are not expressible in user Bezel. Both are auto-imported with `System`. Neither is sendable (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) — the count is not synchronized; handles are domain-local.
+
+```bezel
+public class Shared<T>: IDisposable where T: class      // proper class types only;
+                                                         //   runtime-managed T rejected at instantiation
+  public constructor(owned value: T);                    // consumes the value; count = 1
+
+  public method Clone(): owned Shared<T>;                // count + 1; a new independent handle
+  public method Get(): T;                                // borrow of the underlying value;
+                                                         //   source: this handle (valid while it lives)
+  public method Downgrade(): owned Weak<T>;              // mint a non-owning observer
+
+  // Dispose(): count - 1; the last disposal disposes the underlying value.
+end Shared;
+
+public class Weak<T>: IDisposable where T: class
+  public method TryUpgrade(out owned s: Shared<T>?): bool;   // true + a new strong handle
+                                                              //   if the value is still alive
+  // Does not keep the underlying value alive. Dispose() releases the observer.
+end Weak;
+```
+
+```bezel
+using var cacheEntry := new Shared<ParsedConfig>(Parse(text));
+_index.Add("primary", cacheEntry.Clone());   // the index owns its own handle
+                                             //   (_index: OwnedDictionary<string, Shared<ParsedConfig>>)
+Apply(cacheEntry.Get());                     // borrow for the call
+```
+
+Usage notes:
+
+- Handles are ordinary owned class instances; `using var`, `owned` fields, `move`, owning collections, and every other language-spec [§28](Bezel_Language_Spec.md#sec-resource-management) rule apply unchanged. Handle duplication is never implicit — only `Clone()` increments the count.
+- `Get()`'s borrow is valid while *that handle* lives; disposing the handle while borrows from it are live is the ordinary borrow-lifetime error, caught by the same rules as any other source.
+- Ownership cycles through `Shared<T>` keep the count above zero and leak; break them with `Weak<T>` (the standard parent-strong/child-weak shape). The compiler does not detect such cycles.
+- `TryUpgrade` follows the Try pattern: `if w.TryUpgrade(out using var s) then ... end;` — on `true` the caller owns a fresh handle, discharged by the `out using var`.
 
 ---
 

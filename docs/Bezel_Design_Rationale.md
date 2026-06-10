@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.133 — June 2026**
+**Companion to the Bezel Language Specification, v0.134 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -156,7 +156,7 @@ There is no `Rc<T>` or `Arc<T>`. Single ownership only.
 
 The cases where shared ownership is genuinely needed are rare in Bezel's target use cases and are served by other patterns: handle-and-table indirection, channels, or the runtime-managed region for shared immutable data.
 
-If shared ownership turns out to be needed, it can be added as a library type without language changes.
+If shared ownership turns out to be needed, it can be added as a library type without language changes. *(v0.134: it was — `Shared<T>`/`Weak<T>`, scoped, explicit, and domain-local; see [§5.21](#sec-shared-t) and language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership). The position of this section otherwise stands: single ownership remains the default and the only implicit regime.)*
 
 <a id="sec-local-variable-ownership-is-inferred-not-annotated"></a>
 ### 5.5 Local-variable ownership is inferred, not annotated
@@ -626,6 +626,19 @@ v0.132 adds the element slot policy (language spec [§28.11](Bezel_Language_Spec
 **What was already in place.** The owning column's storage embodiment, `OwnedBuffer<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans), [§5.15](#sec-owned-buffers-and-spans) above), existed since v0.99/v0.102, and its category-dispatched slot semantics were the prototype for the table; the owning family's rejection of runtime-managed element types was likewise already normative ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)). v0.132 did not have to invent the policy — it had to *name* it, state it once, and subordinate the per-collection prose to it.
 
 **The deferred half: a borrow-storing primitive.** The table's borrowing column has no user-expressible storage embodiment, and v0.132 deliberately does not add one. The blocker is principled: outside the compiler-known borrowing collections, storing a borrow in a field is rejected ([§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) — that rule is what makes borrow lifetimes statically trackable. A user-expressible `Buffer<T>`-of-borrows would need its own lifetime discipline (the collection-as-transit rules of [§28.11](Bezel_Language_Spec.md#sec-collection-element-ownership), generalized and made checkable for arbitrary user containers), which is real design work, not transcription. Until that work is done, borrowing collections remain compiler intrinsics specified by the table. **Declined** rather than attempted now: a quick dispensation ("classes marked somehow may store borrows") would re-open the soundness of the borrow tracker for a convenience the standard library does not itself need — the same shape of reasoning that declined `<owned T>` generic parameterization in v0.97 ([§5.11](#sec-owning-collections)).
+
+<a id="sec-shared-t"></a>
+### 5.21 `Shared<T>`: scoped shared ownership
+
+v0.134 adds `Shared<T>`/`Weak<T>` (language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership), stdlib [§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)) — the library type [§5.4](#sec-no-shared-ownership) predicted. The addition keeps every commitment that section made: single ownership remains the default and the only *implicit* regime; sharing is opt-in, and its cost is visible at every site (`Clone()` is an explicit call — there is no implicit handle duplication, consistent with the no-implicit-conversions discipline of [§14](#sec-operators)). What changed since §5.4 was written is that the gap stopped being hypothetical: caches handing out entries, registries whose entries outlive any single owner, and the multi-consumer channel question (§12.6) all reduce to "N holders, last one cleans up," and the workarounds (handle tables) push the same reference counting into user code where the compiler cannot see it.
+
+**Why compiler-known rather than pure library.** Faithful shared ownership cannot be built from unique ownership in user Bezel: N handles must keep one control block alive, and "kept alive by N owners" *is* the feature. The precedent is the collection library — compiler-known types with ownership semantics user code cannot express (§28.11) — and the runtime already maintains invisible reference counts for strings and closures (§28.9); `Shared<T>` reuses that machinery with user-visible semantics.
+
+**Why the handles are ordinary owned objects.** The design's entire surface area is the *inside* of the type: count, last-one-disposes, and `Get()`'s borrow-from-handle sourcing (the same dispensation owning-collection indexer reads already have). Everything else — `using var`, owned fields, `move`, branch joins, exception-path discharge, storage in owning collections — applies to handles by virtue of their being class instances, with zero new checker rules. A design where sharing was a new *reference kind* (a third state beside owned and borrowed) was **declined**: it would have touched every join rule, every producer table entry, and every feature that dispatches on ownership state, for no expressiveness the handle form lacks.
+
+**Why domain-local.** The count is unsynchronized; making `Shared<T>` sendable would either race the count or impose atomic operations on every single-domain user. A synchronized `SharedAtomic<T>` (or sendable-`Shared` mode) is the known follow-on — it is also what multi-consumer channels need (§12.6) — and is deferred until a use case forces the cost question; adding it later is non-breaking. Also **declined**: refcounting arbitrary classes via an annotation (hides cost, breaks the structural-facts discipline of [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)-style reasoning), and compiler-inferred sharing via escape analysis (implicit magic; the language's position is that ownership transitions are visible in source).
+
+**The accepted hazard.** Reference cycles through `Shared<T>` leak, and the compiler does not detect them. This is the standard refcount trade, accepted with the standard mitigation (`Weak<T>`, with `TryUpgrade` in the Try-pattern shape the language already has). Cycle *detection* would be a tracing collector by another name — exactly what the language promises not to have.
 
 <a id="sec-nullability"></a>
 ## 6. Nullability
@@ -6555,6 +6568,52 @@ Purely additive. No existing program changes meaning: programs that never call `
 #### Editorial note
 
 The `linkify_refs.py` toolchain was not re-run for this revision. The substantive edits are localized (two new spec sections §30.14–§30.15, two §30.12/§30.13 reword paragraphs, one §3.6 table row, one Appendix D row, two new stdlib sections §6.8–§6.9, one new rationale §12.6 plus the §12.5 note, this changelog entry). The new cross-references were verified against existing anchors.
+
+---
+
+<a id="sec-v0-133-to-v0-134-changelog"></a>
+### v0.133 to v0.134 changelog
+
+v0.134 adds **scoped shared ownership** (#603): `Shared<T>` and `Weak<T>`, the library type [§5.4](#sec-no-shared-ownership) said could be added without language changes — and it was: no new syntax, no new ownership state, no checker changes. Purely additive; a new Extended feature ("Shared ownership", Appendix D), so Core implementations are unaffected.
+
+<a id="sec-v0-133-to-v0-134-changelog-summary"></a>
+#### Summary
+
+One addition:
+
+1. **`Shared<T>` / `Weak<T>` ([§28.13](Bezel_Language_Spec.md#sec-shared-ownership), stdlib [§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)).** Compiler-known classes: N *handles* jointly own one underlying class-typed value; `new Shared<T>(owned value)` consumes the value, `Clone()` explicitly mints another owned handle, `Get()` borrows the value with the handle as source (the owning-collection indexer-get dispensation), `Downgrade()`/`TryUpgrade(out owned …)` give the weak/upgrade pair in the existing Try-pattern shape. The last handle's disposal disposes the value — the exactly-once invariant (Appendix C) is preserved. Handles are *ordinary owned class instances*: every §28 rule applies to them unchanged; the only novel semantics are inside the compiler-known type. `Shared<T>`/`Weak<T>` are domain-local (not sendable; the count is unsynchronized). Cycles through `Shared<T>` leak (standard refcount hazard, documented; `Weak<T>` is the mitigation; no cycle detection — that would be tracing collection by another name).
+
+<a id="sec-v0-133-to-v0-134-changelog-603"></a>
+#### The #603 decision
+
+Recorded in full as rationale [§5.21](#sec-shared-t): why the gap stopped being hypothetical (caches, registries, the multi-consumer-channel question of §12.6); why compiler-known rather than pure library (N-holders-keep-alive *is* the feature and cannot be built from unique ownership; precedent: the compiler-known collections, and the runtime's existing invisible refcounts for strings/closures); why handles-as-ordinary-objects rather than a third reference kind (**declined**: a new ownership state would touch every join rule and producer-table entry for no added expressiveness); why domain-local (**deferred**: a synchronized `SharedAtomic<T>` — also the prerequisite for multi-consumer channels — until a use case forces the atomic-cost question; adding it later is non-breaking). Also **declined**: annotation-driven refcounting of arbitrary classes (hides cost) and compiler-inferred sharing (implicit magic). [§5.4](#sec-no-shared-ownership)'s position stands with a delivery note: single ownership remains the default and the only implicit regime.
+
+<a id="sec-v0-133-to-v0-134-changelog-language-spec-changes"></a>
+#### Language spec changes
+
+- **[§28.13](Bezel_Language_Spec.md#sec-shared-ownership)** — new section "Shared ownership: `Shared<T>` and `Weak<T>`": semantics stated against the existing model (handles as ordinary owned instances; constructor consumes; explicit `Clone`; `Get` borrow-from-handle; last-one-disposes; cycle hazard; aliasing note; not sendable).
+- **[§30.14](Bezel_Language_Spec.md#sec-sendable-types)** — `Shared<T>`/`Weak<T>` added to the not-sendable stdlib list.
+- **[Appendix D](Bezel_Language_Spec.md#appendix-d-conformance-levels)** — new Extended feature row "Shared ownership"; the Core enumeration's §28 carve-out now reads "except §28.12 and §28.13"; D.3 notes the feature depends only on Core.
+
+<a id="sec-v0-133-to-v0-134-changelog-standard-library-changes"></a>
+#### Standard library changes
+
+- **[§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)** — new: `Shared<T>` and `Weak<T>` declarations, usage notes, and the cache example. Auto-imported with `System`.
+
+<a id="sec-v0-133-to-v0-134-changelog-rationale-changes"></a>
+#### Rationale changes
+
+- New [§5.21](#sec-shared-t) recording the decision and declined alternatives; a delivery note appended to [§5.4](#sec-no-shared-ownership).
+- This changelog entry.
+
+<a id="sec-v0-133-to-v0-134-changelog-migration"></a>
+#### Migration
+
+Purely additive. No existing program changes meaning. The new names are auto-imported with `System`; programs that already declare types named `Shared` or `Weak` shadow the library types per the ordinary name-resolution rules. Core implementations (Appendix D) reject the types as part of the Shared-ownership feature.
+
+#### Editorial note
+
+The `linkify_refs.py` toolchain was not re-run for this revision. The substantive edits are localized (one new spec §28.13, one §30.14 list edit, two Appendix D edits, one new stdlib §2.16, one new rationale §5.21 plus the §5.4 note, this changelog entry). The new cross-references were verified against existing anchors.
 
 ---
 
