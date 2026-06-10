@@ -181,6 +181,7 @@ set(BEZEL_TEST_SOURCES
     codegen/static_call_test.cpp
     codegen/native_exe_test.cpp
     codegen/async_test.cpp
+    codegen/async_lambda_488_test.cpp
     codegen/task_combinators_test.cpp
     codegen/instances_test.cpp
     codegen/instance_methods_test.cpp

@@ -4289,6 +4289,38 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         envFieldTys.push_back(ptrTy());
     }
 
+    // §30.6 (#488): an `async` lambda's closure entry function ALWAYS returns a
+    // Task pointer (the body's natural result is the awaited value T, which the
+    // state machine wraps into the outer Task — see emitAsyncLambda). Override
+    // the body-derived retTy to `ptr` so the closure's fn type matches what
+    // emitClosureCall expects (the declared `(…) -> Task<T>`). The element type T
+    // (for completing the task with a value) comes from the call-site expected
+    // function type's `Task<T>` return annotation; null means a no-value `Task`.
+    const sema::TypeRef* asyncResultElemSemaTy = nullptr;
+    if (lam.isAsync) {
+        bool haveAnnotation =
+            expectedFunctionType_ && expectedFunctionType_->funcReturn &&
+            expectedFunctionType_->funcReturn->kind ==
+                sema::TypeRef::Kind::Named;
+        if (haveAnnotation) {
+            // The annotation IS authoritative for the void-vs-value distinction
+            // (§30.6): a bare `Task` (no generic arg) is a no-value task — leave
+            // T null; `Task<T>` / `OwnedTask<T>` carries the element type T.
+            const sema::TypeRef* taskTy = expectedFunctionType_->funcReturn;
+            if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0])
+                asyncResultElemSemaTy = taskTy->genericArgs[0];
+        } else if (retSemaTy && retSemaTy->kind != sema::TypeRef::Kind::Unit &&
+                   retTy != i32()) {
+            // No annotation visible (e.g. an IIFE-invoked async lambda): fall
+            // back to the body's natural result type as T, so `async () => 42`
+            // still completes its task with 42. A void / Unit body leaves T null
+            // (no result), avoiding lowering Unit to an unsized type.
+            asyncResultElemSemaTy = retSemaTy;
+        }
+        retTy = ptrTy();  // the closure returns the outer Task pointer
+        retSemaTy = nullptr;
+    }
+
     // Build the LLVM function type: (ptr env, user_params...) -> ret.
     std::vector<llvm::Type*> allParamTys;
     allParamTys.push_back(ptrTy());  // env_ptr (slot 0)
@@ -4367,6 +4399,71 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
     }
 
+    // §30.6 (#488): an `async` lambda's body is an async STATE MACHINE, not a
+    // straight-line body. The closure entry fn (with its params + captured cells
+    // + this now bound above) becomes the async ENTRY; emitAsyncLambda takes
+    // over body emission (alloc the outer Task, frame, drive a Resume that holds
+    // the suspend/resume body, return the Task) and terminates `fn`. Skip the
+    // synchronous body-emission + fall-through-return below.
+    //
+    // CRITICAL: an async lambda is frequently nested inside an ENCLOSING async
+    // method / lambda whose own state machine is mid-emission (lowerLambda was
+    // called from the enclosing resume body). emitAsyncLambda overwrites and
+    // then clears every sm*_/async*_ live-state field for the lambda's own
+    // machine. Save and restore them ALL here so the enclosing machine's await
+    // lowering (which resumes after the closure value is built) is unperturbed.
+    // The non-async lambda body never touches these, so the save/restore is
+    // scoped to the async branch.
+    if (lam.isAsync) {
+        SuspendKind savedSmKind = smKind_;
+        llvm::StructType* savedSmStateStruct = smStateStruct_;
+        llvm::Value* savedSmSelf = smSelf_;
+        llvm::Value* savedSmStateGEP = smStateGEP_;
+        auto savedSmStateBBs = smStateBBs_;
+        llvm::BasicBlock* savedSmDoneBB = smDoneBB_;
+        unsigned savedSmNextState = smNextSuspendState_;
+        auto savedSmLocalFields = smLocalFields_;
+        auto savedSmAllocaToField = smAllocaToField_;
+        unsigned savedIterCurrentValField = iterCurrentValField_;
+        llvm::Type* savedIterElemTy = iterElemTy_;
+        unsigned savedAsyncOuterTaskField = asyncOuterTaskField_;
+        unsigned savedAsyncPendingTaskField = asyncPendingTaskField_;
+        unsigned savedAsyncSpillPtrField = asyncSpillPtrField_;
+        auto savedAsyncHandlerSpillSlots = asyncHandlerSpillSlots_;
+        llvm::Function* savedAsyncResumeFn = asyncResumeFn_;
+        llvm::Type* savedAsyncResultTy = asyncResultTy_;
+        const sema::TypeRef* savedAsyncResultSemaType = asyncResultSemaType_;
+        // emitAsyncLambda recomputes closure-release eligibility for the LAMBDA's
+        // own body and keys it to the lambda resume fn. The ENCLOSING function's
+        // eligibility (which governs whether THIS `var f := <lambda>` local gets
+        // its scope-end closure release — registered AFTER lowerLambda returns)
+        // must be preserved; save and restore it across the call.
+        auto savedClosureRelElig = closureReleaseEligible_;
+        llvm::Function* savedClosureRelEligFn = closureReleaseEligibleFn_;
+
+        emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy);
+
+        closureReleaseEligible_ = std::move(savedClosureRelElig);
+        closureReleaseEligibleFn_ = savedClosureRelEligFn;
+        smKind_ = savedSmKind;
+        smStateStruct_ = savedSmStateStruct;
+        smSelf_ = savedSmSelf;
+        smStateGEP_ = savedSmStateGEP;
+        smStateBBs_ = std::move(savedSmStateBBs);
+        smDoneBB_ = savedSmDoneBB;
+        smNextSuspendState_ = savedSmNextState;
+        smLocalFields_ = std::move(savedSmLocalFields);
+        smAllocaToField_ = std::move(savedSmAllocaToField);
+        iterCurrentValField_ = savedIterCurrentValField;
+        iterElemTy_ = savedIterElemTy;
+        asyncOuterTaskField_ = savedAsyncOuterTaskField;
+        asyncPendingTaskField_ = savedAsyncPendingTaskField;
+        asyncSpillPtrField_ = savedAsyncSpillPtrField;
+        asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpillSlots);
+        asyncResumeFn_ = savedAsyncResumeFn;
+        asyncResultTy_ = savedAsyncResultTy;
+        asyncResultSemaType_ = savedAsyncResultSemaType;
+    } else
     // Emit body.
     if (lam.exprBody) {
         llvm::Value* v = lowerExpr(*lam.exprBody);

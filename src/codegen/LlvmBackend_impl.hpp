@@ -2875,6 +2875,27 @@ private:
     void emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                          const CallableInfo& ci);
 
+    // §30.6 (#488): emit the async state machine for an `async` LAMBDA. Called
+    // from lowerLambda after the closure entry function `fn(env, params...)` is
+    // created and its prologue has bound the lambda params (from args) and the
+    // captured outer cells / `this` (from env) into paramSlots_/locals_/
+    // cellVars_/currentThis_. This takes over body emission: `fn` becomes the
+    // async ENTRY (alloc the outer Task, calloc the frame, spill the bound
+    // params + captures into it, drive a Resume continuation once, return the
+    // Task pointer); a sibling Resume(ptr completedTask, ptr frame) holds the
+    // suspend/resume body — reusing the kind-agnostic scaffolding (await
+    // suspend, ReturnStmt completion, fault boundary) exactly as emitAsyncMethod
+    // does. `resultElemSemaTy` is T in the lambda's `Task<T>`/`OwnedTask<T>`
+    // return type (null for a no-value `Task`), taken from the call-site
+    // expected function type. `paramSyms` are the lambda's user parameter
+    // symbols (already bound from the entry fn's args 1..N). On return `fn` is
+    // fully terminated; the builder is left at the resume function's end and
+    // lowerLambda restores its saved insert point. Leaves the sm*_ async state
+    // cleared.
+    void emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
+                         const std::vector<sema::Symbol*>* paramSyms,
+                         const sema::TypeRef* resultElemSemaTy);
+
     // §30.1 / §30.9: complete the in-flight async method's outer task with the
     // given lowered return value (null for `Task` / fall-off / `return;`). Reads
     // the outer-task pointer from the frame and calls bz_task_complete. Requires
