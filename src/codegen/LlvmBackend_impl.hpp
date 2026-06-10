@@ -2720,6 +2720,29 @@ private:
         return k == ast::TypeDeclKind::Class || k == ast::TypeDeclKind::Interface;
     }
 
+    // §28.13 / stdlib §2.16 (#620): true when `fs` is an `owned` field of type
+    // Shared<T> or Weak<T>.  These are compiler-known heap-pointer types with no
+    // user TypeDecl; they are not caught by isOwnedReferenceField (which requires
+    // a class/interface declaration) and have no vtable (so dynamic Dispose does
+    // not apply). The enclosing class's disposal cascade must call
+    // bz_shared_release / bz_weak_release directly on the field value.
+    // isWeak is set to true for Weak<T> fields (selects bz_weak_release).
+    bool isOwnedSharedWeakField(const sema::FieldSymbol* fs,
+                                bool* isWeak = nullptr) const {
+        if (!hasOwnedModifier(fs)) return false;
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return false;
+        auto* rt = ctx_.resolvedType(*fd->type);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        if (rt->declaration) return false;  // user TypeDecl — not a builtin
+        if (!rt->astNode || !rt->astNode->name ||
+            rt->astNode->name->parts.empty()) return false;
+        auto n = rt->astNode->name->parts[0];
+        if (n == "Shared") { if (isWeak) *isWeak = false; return true; }
+        if (n == "Weak")   { if (isWeak) *isWeak = true;  return true; }
+        return false;
+    }
+
     // #362 / stdlib §4.5: if `fs` is an `owned` field whose type is a heap
     // collection (Array<T>/OwnedArray<T>/…, builtins with no TypeSymbol so
     // isOwnedReferenceField does not match them), return its resolved TypeRef;
@@ -4221,6 +4244,13 @@ private:
             "IReadOnlyCollection", "IReadOnlyList", "ICollection", "IList",
             "IOwnedCollection", "IOwnedList", "Task", "OwnedTask",
             "Subscription", "CancellationToken", "CancellationTokenSource",
+            // §28.13 / stdlib §2.16 (#620): Shared<T> and Weak<T> are
+            // compiler-known heap-pointer types.  Without them a bare
+            // `Shared<T>?` annotation (no declaration) was mis-classified as
+            // a naked generic type-parameter, and the nullable-type-param branch
+            // lowered it to {i8,i32} instead of ptr → LLVM GEP type assertion
+            // crash on `Shared<T>? := null` / null-compare / `?.` / `!`.
+            "Shared", "Weak",
         };
         if (kBuiltins.count(name)) return true;
         // §31.4: a built-in exception type (Exception / a subtype).
