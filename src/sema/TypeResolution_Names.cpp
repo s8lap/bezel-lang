@@ -68,6 +68,12 @@ int Resolver::builtinTypeArity(std::string_view n) {
     }
     // §3 stdlib two-parameter collection types (arity 2):
     if (n == "Dictionary" || n == "OwnedDictionary") return 2;
+    // §30.14 / §30.15 (#600): Channel<T> and ChannelSender<T> (arity 1).
+    // Domain is a static class (arity 0); ChannelClosedException is a nullary
+    // exception type (§30.15); DomainFaultedException is a nullary exception.
+    if (n == "Channel" || n == "ChannelSender") return 1;
+    if (n == "Domain" || n == "ChannelClosedException" ||
+        n == "DomainFaultedException") return 0;
     // §3 nullary stdlib classes:
     if (n == "StringBuilder" || n == "Random" ||
         n == "DateTime" || n == "TimeSpan" ||

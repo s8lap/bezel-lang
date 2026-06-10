@@ -1782,6 +1782,225 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
+
+                    // §30.15 / stdlib §6.9 (#600): Channel<T> instance methods.
+                    // Channel<T> TypeRef: Named, no declaration, astNode name "Channel",
+                    // genericArgs[0] = T.
+                    if (rcn == "Channel" && recvTy &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                        const TypeRef* elemTy = recvTy->genericArgs[0];
+                        // Helper: build an OwnedTask / OwnedTask<T> TypeRef.
+                        auto makeOwnedTask = [&](const TypeRef* inner) -> TypeRef* {
+                            auto* ot = ctx_.makeTypeRef();
+                            ot->kind = TypeRef::Kind::Named;
+                            ot->nullable = false;
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("OwnedTask");
+                            ann->name.reset(nm);
+                            ot->astNode = ann;
+                            if (inner) ot->genericArgs.push_back(const_cast<TypeRef*>(inner));
+                            return ot;
+                        };
+                        // Helper: build a Task / Task<T> TypeRef.
+                        auto makeTask = [&](const TypeRef* inner) -> TypeRef* {
+                            auto* tt = ctx_.makeTypeRef();
+                            tt->kind = TypeRef::Kind::Named;
+                            tt->nullable = false;
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("Task");
+                            ann->name.reset(nm);
+                            tt->astNode = ann;
+                            if (inner) tt->genericArgs.push_back(const_cast<TypeRef*>(inner));
+                            return tt;
+                        };
+                        // Helper: build ChannelSender<T> TypeRef.
+                        auto makeChannelSender = [&](const TypeRef* inner) -> TypeRef* {
+                            auto* cs = ctx_.makeTypeRef();
+                            cs->kind = TypeRef::Kind::Named;
+                            cs->nullable = false;
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("ChannelSender");
+                            ann->name.reset(nm);
+                            cs->astNode = ann;
+                            if (inner) cs->genericArgs.push_back(const_cast<TypeRef*>(inner));
+                            return cs;
+                        };
+
+                        if (m == "Receive") {
+                            // §30.15: Receive() returns:
+                            //   OwnedTask<T> when T is a class type (owned transfer),
+                            //   Task<T>      when T is a value type or string.
+                            bool elemIsClass = (elemTy->kind == TypeRef::Kind::Named &&
+                                               elemTy->declaration &&
+                                               elemTy->declaration->kind ==
+                                                   ast::TypeDeclKind::Class);
+                            if (elemIsClass)
+                                ctx_.setExprType(&ce, makeOwnedTask(elemTy));
+                            else
+                                ctx_.setExprType(&ce, makeTask(elemTy));
+                        } else if (m == "TryReceive") {
+                            // TryReceive(out owned item: T?) → bool.
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        } else if (m == "NewSender") {
+                            // NewSender() → owned ChannelSender<T>.
+                            ctx_.setExprType(&ce, makeChannelSender(elemTy));
+                        } else if (m == "Send") {
+                            // Send(owned item: T) → void (no return type set = unit).
+                        } else if (m == "Count" || m == "IsClosed") {
+                            // Count → int; IsClosed → bool.
+                            if (m == "Count")
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                            else
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        }
+                    }
+
+                    // §30.15 / stdlib §6.9 (#600): ChannelSender<T> instance methods.
+                    if (rcn == "ChannelSender" && recvTy &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                        if (m == "Send") {
+                            // Send(owned item: T) → void (no return type set = unit).
+                        }
+                        // Dispose(): unit; no return type set.
+                    }
+                }
+
+                // §30.14 (#600): Domain.Spawn — static class, colName == "Domain".
+                // Domain.Spawn(entry, args...) validates:
+                //   1. entry must be capture-free (static ref or non-capturing lambda)
+                //   2. entry args must be sendable value/string or owned sendable class
+                //   3. entry result type (if any) must be sendable
+                // Returns: OwnedTask (void entry) or OwnedTask<R> (R = sendable result).
+                if (colName == "Domain" && m == "Spawn" && !ce.args.empty()) {
+                    // Build an OwnedTask TypeRef helper (static, reused below).
+                    auto makeOwnedTask = [&](const TypeRef* inner) -> TypeRef* {
+                        auto* ot = ctx_.makeTypeRef();
+                        ot->kind = TypeRef::Kind::Named;
+                        ot->nullable = false;
+                        auto* ann = new ast::Type();
+                        ann->kind = ast::TypeKind::Named;
+                        auto* nm = new ast::QualifiedName();
+                        nm->parts.push_back("OwnedTask");
+                        ann->name.reset(nm);
+                        ot->astNode = ann;
+                        if (inner) ot->genericArgs.push_back(const_cast<TypeRef*>(inner));
+                        return ot;
+                    };
+
+                    // Arg 0: the entry function reference or lambda.
+                    const ast::Expr* entryExpr = ce.args[0].value.get();
+
+                    // Check 1: capture-free entry.
+                    bool entryOk = isCaptureFreeEntry(entryExpr);
+                    if (!entryOk) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "Domain.Spawn entry must be capture-free: a non-"
+                            "capturing lambda or a static method reference — "
+                            "a capturing lambda or an instance method reference "
+                            "is rejected because captures and receivers are "
+                            "borrows of the origin domain (\xC2\xA7""30.14, #600)");
+                    }
+
+                    // Determine the entry function's parameter types and return type
+                    // from the resolved entry expression's Function TypeRef.
+                    const TypeRef* entryFnTy = entryExpr ? ctx_.exprType(*entryExpr)
+                                                          : nullptr;
+                    const TypeRef* entryReturnTy = nullptr;
+                    std::vector<const TypeRef*> entryParamTypes;
+
+                    if (entryFnTy && entryFnTy->kind == TypeRef::Kind::Function) {
+                        entryReturnTy = entryFnTy->funcReturn;
+                        // entryFnTy->funcReturnOwned unused in sema phase (c = runtime)
+                        for (const auto& fp : entryFnTy->funcParams)
+                            entryParamTypes.push_back(fp.type);
+                    }
+
+                    // Check 2: per-argument sendability (args 1..N match params).
+                    // For a static method reference, the entry's params come from the
+                    // method symbol. For a lambda, from the lambda type.
+                    // Arguments 1..N of Domain.Spawn correspond to entry params 0..N-1.
+                    for (std::size_t i = 1; i < ce.args.size(); ++i) {
+                        const ast::Expr* argExpr = ce.args[i].value.get();
+                        if (!argExpr) continue;
+                        const TypeRef* argTy = ctx_.exprType(*argExpr);
+                        if (!argTy) continue;
+
+                        // The arg must be sendable.
+                        bool argSendable = isSendable(argTy);
+
+                        // For class-typed args: the entry param must also declare
+                        // `owned` (ownership transfer) — check via the entry function
+                        // type's param modifier if available.
+                        if (!argSendable) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, argExpr->span.begin,
+                                "Domain.Spawn argument is not sendable: argument "
+                                "types to a spawned domain must satisfy §30.14 "
+                                "sendable-type rules (not borrow-bearing, not "
+                                "function-typed, class types must be "
+                                "transfer-closed/sealed owned) "
+                                "(\xC2\xA7""30.14, #600)");
+                        }
+
+                        // For class-typed args: check that the entry param is `owned`.
+                        // (A class passed by borrow — `m: Msg?` — cannot cross the
+                        // domain boundary; it must be `owned m: Msg`.)
+                        std::size_t pi = i - 1;  // param index
+                        if (pi < entryParamTypes.size() && entryParamTypes[pi]) {
+                            const TypeRef* paramTy = entryParamTypes[pi];
+                            bool paramIsClass = paramTy->kind == TypeRef::Kind::Named &&
+                                               paramTy->declaration &&
+                                               paramTy->declaration->kind ==
+                                                   ast::TypeDeclKind::Class;
+                            if (paramIsClass) {
+                                // Check if the entry function type param has "owned".
+                                bool paramOwned = false;
+                                if (entryFnTy && pi < entryFnTy->funcParams.size())
+                                    paramOwned = (entryFnTy->funcParams[pi].modifier
+                                                 == "owned");
+                                if (!paramOwned) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, argExpr->span.begin,
+                                        "Domain.Spawn argument is a class type but "
+                                        "the entry function does not take it as "
+                                        "`owned`: class arguments to Domain.Spawn must "
+                                        "be transferred (entry parameter must be "
+                                        "`owned`) (\xC2\xA7""30.14, #600)");
+                                }
+                            }
+                        }
+                    }
+
+                    // Check 3: return-type sendability (if entry returns a value).
+                    // entryReturnTy is null / Unit for void entries.
+                    if (entryReturnTy && entryReturnTy->kind != TypeRef::Kind::Unit) {
+                        if (!isSendable(entryReturnTy)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "Domain.Spawn entry result type is not sendable: "
+                                "the result must satisfy §30.14 sendable-type "
+                                "rules (not borrow-bearing, class types must be "
+                                "transfer-closed/sealed owned) "
+                                "(\xC2\xA7""30.14, #600)");
+                        }
+                    }
+
+                    // Type the Spawn call:
+                    //   - void entry → OwnedTask (bare, no T)
+                    //   - owned R entry → OwnedTask<R>
+                    //   - value-type R entry → OwnedTask<R> (value crossed as copy)
+                    if (!entryReturnTy || entryReturnTy->kind == TypeRef::Kind::Unit) {
+                        ctx_.setExprType(&ce, makeOwnedTask(nullptr));
+                    } else {
+                        ctx_.setExprType(&ce, makeOwnedTask(entryReturnTy));
+                    }
                 }
             }
         }
@@ -4297,6 +4516,500 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         nn->nullable = true;
         ctx_.setExprType(&nm, nn);
     }
+}
+
+// ===========================================================================
+// §30.14 / §3.6 (#600): sendability derived-type property.
+// Implements the §30.14 table: value-type rule, string, function types,
+// class "transfer-closed" rule, stdlib overrides (Task/Shared/Channel/…),
+// OwnedArray/Array per-element rules. Coinductive via `inProgress`.
+// ===========================================================================
+
+// Helper: extract the builtin-name of a TypeRef whose declaration is null
+// (i.e., a builtin Named TypeRef with an astNode carrying the type name).
+static std::string_view builtinTypeName(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named || rt->declaration)
+        return {};
+    if (rt->astNode && rt->astNode->name &&
+        !rt->astNode->name->parts.empty())
+        return rt->astNode->name->parts[0];
+    return {};
+}
+
+// Helper: does the TypeRef represent a user-declared class (not builtin)?
+static bool isUserClass(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Named &&
+           rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Class;
+}
+
+// Helper: does the TypeRef represent a user-declared record?
+static bool isUserRecord(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Named &&
+           rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Record;
+}
+
+
+bool ExprTC::isSendable(const TypeRef* rt,
+                         std::unordered_set<const TypeSymbol*>& inProgress) const {
+    if (!rt) return false;
+    if (rt->kind == TypeRef::Kind::Error) return false;
+
+    // §30.14: function-typed values are NEVER sendable.
+    if (rt->kind == TypeRef::Kind::Function) return false;
+
+    // §30.14 / §3.6: Unit type is sendable (no state).
+    if (rt->kind == TypeRef::Kind::Unit) return true;
+
+    // §30.14 value-type rule:
+    //   "Value types are sendable iff they are not borrow-bearing (§9.7)
+    //    and not move-only (§15.3 [N owned]T)."
+    //
+    // Inline array `[N]T` (not owned) is a value type but its element
+    // determines borrow-bearing; `[N owned]T` is move-only → not sendable.
+    if (rt->kind == TypeRef::Kind::InlineArray) {
+        // [N owned]T is move-only per §15.3 → not sendable.
+        if (rt->arrayOwned) return false;
+        // [N]T is a value array; sendable iff element is sendable-value or string.
+        // (An inline array of class elements makes the array borrow-bearing.)
+        if (!rt->arrayElement) return false;
+        const TypeRef* elem = rt->arrayElement;
+        // Element must be a primitive (non-class) or string to be sendable.
+        if (elem->kind == TypeRef::Kind::Primitive) return true;
+        if (isUserRecord(elem)) {
+            // A record in an inline array: sendable iff not borrow-bearing.
+            // We reuse the full isSendable check on the record.
+            return isSendable(elem, inProgress);
+        }
+        return false;
+    }
+
+    // §30.14: string is sendable.
+    if (rt->kind == TypeRef::Kind::Primitive) {
+        if (rt->primitive == PrimitiveType::String) return true;
+        // Object is NOT sendable (runtime type behind it is unverifiable).
+        if (rt->primitive == PrimitiveType::Object) return false;
+        // All other primitives (int, bool, char, byte, etc.) are sendable
+        // value types.
+        return true;
+    }
+
+    // Named types:
+    if (rt->kind == TypeRef::Kind::Named) {
+        // --- Stdlib-specific overrides (§30.14 stdlib table) ---
+        std::string_view bname = builtinTypeName(rt);
+        if (!bname.empty()) {
+            // §30.14 stdlib table: NOT sendable (domain-local or borrow-carrying).
+            //   Task<T>, OwnedTask<T>, Task (bare): domain-local.
+            //   Shared<T>, Weak<T>: ref-count not synchronized (§28.13).
+            //   EventSource<T>, AsyncEventSource<T>: domain-local.
+            //   Mutex, Semaphore: domain-local synchronization primitives.
+            //   CancellationTokenSource, CancellationToken: borrow-bearing record.
+            if (bname == "Task" || bname == "OwnedTask" ||
+                bname == "Shared" || bname == "Weak" ||
+                bname == "EventSource" || bname == "AsyncEventSource" ||
+                bname == "Mutex" || bname == "Semaphore" ||
+                bname == "CancellationTokenSource")
+                return false;
+            // CancellationToken is a borrow-bearing record per §30.14
+            // ("CancellationToken is a borrow-bearing record and therefore
+            //  not sendable by the value-type rule").
+            if (bname == "CancellationToken") return false;
+
+            // §30.14 stdlib table: sendable iff element sendable.
+            //   OwnedArray<T>, OwnedStack<T>, OwnedQueue<T>, OwnedSet<T>,
+            //   OwnedLinkedList<T>, OwnedDictionary<K,V>: owning collections.
+            if (bname == "OwnedArray" || bname == "OwnedStack" ||
+                bname == "OwnedQueue" || bname == "OwnedSet" ||
+                bname == "OwnedLinkedList") {
+                // Sendable iff element type is sendable.
+                if (rt->genericArgs.empty() || !rt->genericArgs[0])
+                    return false;
+                return isSendable(rt->genericArgs[0], inProgress);
+            }
+            if (bname == "OwnedDictionary") {
+                // Both K and V must be sendable.
+                if (rt->genericArgs.size() < 2) return false;
+                if (!rt->genericArgs[0] || !rt->genericArgs[1]) return false;
+                return isSendable(rt->genericArgs[0], inProgress) &&
+                       isSendable(rt->genericArgs[1], inProgress);
+            }
+
+            // §30.14 stdlib table: borrowing collections (Array<T>, Stack<T>, etc.)
+            //   sendable iff element is a value-sendable type (primitive or string)
+            //   or a sendable class. Per spec: "A borrowing collection of sendable
+            //   value/string elements is sendable; a borrowing collection of class
+            //   elements (borrow slots) is NOT sendable."
+            if (bname == "Array" || bname == "Stack" || bname == "Queue" ||
+                bname == "Set" || bname == "LinkedList") {
+                if (rt->genericArgs.empty() || !rt->genericArgs[0])
+                    return false;
+                const TypeRef* elem = rt->genericArgs[0];
+                // String element: sendable.
+                if (elem->kind == TypeRef::Kind::Primitive &&
+                    elem->primitive == PrimitiveType::String)
+                    return true;
+                // Primitive (non-Object) element: sendable.
+                if (elem->kind == TypeRef::Kind::Primitive &&
+                    elem->primitive != PrimitiveType::Object)
+                    return true;
+                // Class element: NOT sendable (array carries borrow slots).
+                if (isUserClass(elem)) return false;
+                // Record element: sendable iff not borrow-bearing.
+                if (isUserRecord(elem)) return isSendable(elem, inProgress);
+                return false;
+            }
+
+            // §30.14 / stdlib §6.9: Channel<T> and ChannelSender<T> are
+            // themselves sendable (they carry ownership of the underlying
+            // channel object — a move-transfer).
+            if (bname == "Channel" || bname == "ChannelSender")
+                return true;
+
+            // Other builtin types with no user TypeDecl: conservatively
+            // not sendable unless on the explicit list above.
+            return false;
+        }
+
+        // --- User-declared types ---
+        TypeSymbol* decl = rt->declaration;
+        if (!decl) return false;
+
+        // Enum: value type → sendable.
+        if (decl->kind == ast::TypeDeclKind::Enum) return true;
+
+        // Interface: NOT sendable ("no interface-typed fields" rule
+        // means interface types themselves cannot be verified).
+        if (decl->kind == ast::TypeDeclKind::Interface) return false;
+
+        // Record: sendable iff not borrow-bearing per §9.7 / §30.14.
+        // A record is borrow-bearing if any field is a class/interface
+        // reference (non-owned) or a function type. Already covered
+        // by value-type rule.
+        if (decl->kind == ast::TypeDeclKind::Record) {
+            const auto* td =
+                dynamic_cast<const ast::TypeDecl*>(decl->decl);
+            if (!td) return true; // no decl → conservative: accept
+
+            // Collect all fields and check each.
+            auto fieldSendable = [&](const TypeRef* ft) -> bool {
+                if (!ft) return true;
+                // Function-typed fields: never sendable per §30.14.
+                if (ft->kind == TypeRef::Kind::Function) return false;
+                // Class-typed field that is NOT owned: borrow → not sendable.
+                // (Record fields of class type are borrows by default; only
+                // an `owned` field modifier makes it an ownership transfer,
+                // but records cannot have owned fields per §9.7 / §15.3.)
+                // NOTE: per §9.7, record fields of class type are always
+                // borrows — so a class field makes the record borrow-bearing.
+                if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+                    ft->declaration->kind == ast::TypeDeclKind::Class)
+                    return false;
+                // Interface-typed field: not sendable.
+                if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+                    ft->declaration->kind == ast::TypeDeclKind::Interface)
+                    return false;
+                // Object-typed primitive: not sendable.
+                if (ft->kind == TypeRef::Kind::Primitive &&
+                    ft->primitive == PrimitiveType::Object)
+                    return false;
+                // Builtin non-sendable: defer to recursive check.
+                if (ft->kind == TypeRef::Kind::Named && !ft->declaration)
+                    return isSendable(ft, inProgress);
+                // Nested record: recurse.
+                if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+                    ft->declaration->kind == ast::TypeDeclKind::Record)
+                    return isSendable(ft, inProgress);
+                // Primitive (non-Object) / string: sendable.
+                if (ft->kind == TypeRef::Kind::Primitive)
+                    return true;
+                // InlineArray: defer.
+                if (ft->kind == TypeRef::Kind::InlineArray)
+                    return isSendable(ft, inProgress);
+                return true; // conservative: accept unknown
+            };
+
+            // Check positional fields.
+            for (const ast::Param& f : td->positionalFields) {
+                if (f.type) {
+                    const TypeRef* ft = ctx_.resolvedType(*f.type);
+                    if (!fieldSendable(ft)) return false;
+                }
+            }
+            // Check body fields and auto-properties.
+            // In Bezel records, properties declared as `public Name: T;` are
+            // auto-properties (PropertyDecl with bodyKind=Auto) — these are
+            // semantically fields and must be checked for sendability (§30.14).
+            for (const auto& m : td->members) {
+                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                    if (fd->type) {
+                        const TypeRef* ft = ctx_.resolvedType(*fd->type);
+                        if (!fieldSendable(ft)) return false;
+                    }
+                } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                    // Auto-property: check its type for sendability.
+                    if (pd->bodyKind == ast::PropertyBodyKind::Auto && pd->type) {
+                        const TypeRef* ft = ctx_.resolvedType(*pd->type);
+                        if (!fieldSendable(ft)) return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        // Class: sendable iff "transfer-closed" per §30.14.
+        if (decl->kind == ast::TypeDeclKind::Class) {
+            // Coinductive: if already in progress, assume sendable
+            // (break mutual recursion).
+            if (inProgress.count(decl)) return true;
+            inProgress.insert(decl);
+
+            // Rule 1: must be `sealed` (or `sealed abstract` with all-sendable
+            // closed hierarchy).
+            bool isSealed = false;
+            bool isAbstract = false;
+            for (auto mod : decl->modifiers) {
+                if (mod == "sealed") isSealed = true;
+                if (mod == "abstract") isAbstract = true;
+            }
+            if (!isSealed) { inProgress.erase(decl); return false; }
+
+            if (isAbstract) {
+                // `sealed abstract`: sendable iff every concrete subclass in the
+                // module is also sendable (coinductive over the closed hierarchy).
+                // Collect subclasses: scan all TypeSymbols in the module whose
+                // base-type chain includes this class.
+                // Implementation: walk all symbols in context and find those that
+                // have `decl` in their baseTypes chain.
+                bool allSendable = true;
+                for (const auto& sym : ctx_.symbols()) {
+                    auto* sub = dynamic_cast<TypeSymbol*>(sym.get());
+                    if (!sub || sub == decl) continue;
+                    if (sub->kind != ast::TypeDeclKind::Class) continue;
+                    // Check if sub is a direct or indirect subclass of decl.
+                    bool isSubclass = false;
+                    // Simple: check baseTypes directly (direct subclasses only
+                    // for the sealed-abstract case, since in Bezel a sealed abstract
+                    // hierarchy is always closed and shallow per §12.5).
+                    for (TypeSymbol* base : sub->baseTypes) {
+                        if (base == decl) { isSubclass = true; break; }
+                    }
+                    if (!isSubclass) continue;
+                    // This is a direct subclass: check sendability.
+                    auto* subTy = ctx_.makeTypeRef();
+                    subTy->kind = TypeRef::Kind::Named;
+                    subTy->declaration = sub;
+                    if (!isSendable(subTy, inProgress)) {
+                        allSendable = false;
+                        break;
+                    }
+                }
+                inProgress.erase(decl);
+                return allSendable;
+            }
+
+            // Sealed (non-abstract) class: apply Rule 2 + Rule 3.
+            // Walk fields directly from the TypeDecl to check owned modifiers.
+            {
+                const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
+                if (!td) { inProgress.erase(decl); return true; }
+
+                // Helper: check one TypeRef + owned modifier pair.
+                // Rule 2: class-typed fields must be `owned` AND the class sendable.
+                // Rule 3: no function, Object, or interface-typed fields.
+                auto checkField = [&](const TypeRef* ft, bool isOwned) -> bool {
+                    if (!ft) return true;
+                    if (ft->kind == TypeRef::Kind::Function) return false;
+                    if (ft->kind == TypeRef::Kind::Primitive &&
+                        ft->primitive == PrimitiveType::Object) return false;
+                    if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+                        ft->declaration->kind == ast::TypeDeclKind::Interface)
+                        return false;
+                    if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+                        ft->declaration->kind == ast::TypeDeclKind::Class) {
+                        // Class field: must be owned AND the class must be sendable.
+                        if (!isOwned) return false;
+                        return isSendable(ft, inProgress);
+                    }
+                    return isSendable(ft, inProgress);
+                };
+
+                // Walk own fields and auto-properties.
+                // (Auto-properties in classes are stored as PropertyDecl with
+                // bodyKind=Auto; they are semantically fields for §30.14.)
+                auto walkMembersForSend = [&](const ast::TypeDecl* atd) -> bool {
+                    for (const auto& m : atd->members) {
+                        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                            if (!fd->type) continue;
+                            const TypeRef* ft = ctx_.resolvedType(*fd->type);
+                            bool isOwned = false;
+                            for (auto mod : fd->modifiers)
+                                if (mod == "owned") { isOwned = true; break; }
+                            if (!checkField(ft, isOwned)) return false;
+                        } else if (auto* pd =
+                                       dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                            // Auto-properties (field-like) must also satisfy §30.14.
+                            if (pd->bodyKind != ast::PropertyBodyKind::Auto ||
+                                !pd->type) continue;
+                            const TypeRef* ft = ctx_.resolvedType(*pd->type);
+                            bool isOwned = false;
+                            for (auto mod : pd->modifiers)
+                                if (mod == "owned") { isOwned = true; break; }
+                            if (!checkField(ft, isOwned)) return false;
+                        }
+                    }
+                    return true;
+                };
+
+                if (!walkMembersForSend(td)) {
+                    inProgress.erase(decl); return false;
+                }
+                // Walk inherited fields from base classes.
+                for (TypeSymbol* base : decl->baseTypes) {
+                    if (!base || base->kind != ast::TypeDeclKind::Class) continue;
+                    const auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
+                    if (!btd) continue;
+                    if (!walkMembersForSend(btd)) {
+                        inProgress.erase(decl); return false;
+                    }
+                }
+            }
+            inProgress.erase(decl);
+            return true;
+        }
+    }
+    return false; // unknown kind
+}
+
+// ===========================================================================
+// §30.14 (#600): capture-free entry detection for Domain.Spawn.
+// A "capture-free" entry is either:
+//   (a) a static method reference `Type.Method` (MemberAccessExpr whose
+//       target resolves to a TypeSymbol), or
+//   (b) a non-capturing lambda (a LambdaExpr whose body does NOT reference
+//       any local or parameter from the enclosing scope).
+// ===========================================================================
+
+bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) const {
+    if (!entryExpr) return false;
+
+    // (a) Static method reference: MemberAccessExpr whose target is a type.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(entryExpr)) {
+        // The target should resolve to a TypeSymbol for a static method ref.
+        if (ma->target) {
+            Symbol* tgtSym = ctx_.exprSymbol(*ma->target);
+            if (dynamic_cast<TypeSymbol*>(tgtSym)) return true; // static ref
+        }
+        return false; // instance method ref
+    }
+
+    // (b) Non-capturing lambda.
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(entryExpr)) {
+        const std::vector<Symbol*>* paramSyms = ctx_.lambdaParams(lam);
+        std::unordered_set<const Symbol*> ownParams;
+        if (paramSyms) {
+            for (const Symbol* ps : *paramSyms) ownParams.insert(ps);
+        }
+        return !lambdaBodyCaptures(lam, ownParams);
+    }
+
+    // Any other expression kind: not a recognized capture-free entry form.
+    return false;
+}
+
+bool ExprTC::lambdaBodyCaptures(
+    const ast::LambdaExpr* lam,
+    const std::unordered_set<const Symbol*>& ownParamSyms) const {
+    if (!lam) return false;
+    if (lam->exprBody && exprCaptures(*lam->exprBody, ownParamSyms))
+        return true;
+    for (const auto& s : lam->stmts) {
+        if (s && stmtCaptures(*s, ownParamSyms)) return true;
+    }
+    return false;
+}
+
+bool ExprTC::exprCaptures(const ast::Expr& e,
+                           const std::unordered_set<const Symbol*>& ownParamSyms) const {
+    // Check this node.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) return false;
+        // Captured if it resolves to a local or parameter NOT in our own params.
+        bool isLocal = dynamic_cast<LocalSymbol*>(sym) != nullptr;
+        bool isParam = dynamic_cast<ParameterSymbol*>(sym) != nullptr;
+        if ((isLocal || isParam) && !ownParamSyms.count(sym)) return true;
+        return false;
+    }
+    // Recurse into children.
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left && exprCaptures(*be->left, ownParamSyms)) return true;
+        if (be->right && exprCaptures(*be->right, ownParamSyms)) return true;
+    } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->operand && exprCaptures(*ue->operand, ownParamSyms)) return true;
+    } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && exprCaptures(*ma->target, ownParamSyms)) return true;
+    } else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target && exprCaptures(*nm->target, ownParamSyms)) return true;
+    } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee && exprCaptures(*ce->callee, ownParamSyms)) return true;
+        for (const auto& a : ce->args)
+            if (a.value && exprCaptures(*a.value, ownParamSyms)) return true;
+    } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value && exprCaptures(*a.value, ownParamSyms)) return true;
+    } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target && exprCaptures(*ix->target, ownParamSyms)) return true;
+        for (const auto& idx : ix->indices)
+            if (idx.value && exprCaptures(*idx.value, ownParamSyms)) return true;
+    } else if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (co->condition && exprCaptures(*co->condition, ownParamSyms)) return true;
+        if (co->thenValue && exprCaptures(*co->thenValue, ownParamSyms)) return true;
+        if (co->elseValue && exprCaptures(*co->elseValue, ownParamSyms)) return true;
+    } else if (auto* innerLam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // A nested lambda: it has its OWN params; captures from its perspective
+        // may or may not propagate. For Domain.Spawn capture check, a nested
+        // lambda that captures outer scope IS a capture of the Spawn entry lambda.
+        const std::vector<Symbol*>* innerParams = ctx_.lambdaParams(innerLam);
+        std::unordered_set<const Symbol*> allHidden = ownParamSyms;
+        if (innerParams) {
+            for (const Symbol* ps : *innerParams) allHidden.insert(ps);
+        }
+        if (lambdaBodyCaptures(innerLam, allHidden)) return true;
+    }
+    return false;
+}
+
+bool ExprTC::stmtCaptures(const ast::Stmt& s,
+                           const std::unordered_set<const Symbol*>& ownParamSyms) const {
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value && exprCaptures(*rs->value, ownParamSyms)) return true;
+    } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target && exprCaptures(*as->target, ownParamSyms)) return true;
+        if (as->value && exprCaptures(*as->value, ownParamSyms)) return true;
+    } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr && exprCaptures(*es->expr, ownParamSyms)) return true;
+    } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer && exprCaptures(*ld->initializer, ownParamSyms)) return true;
+    } else if (auto* is = dynamic_cast<const ast::IfStmt*>(&s)) {
+        // IfStmt: condition is in ifBranch.condition per ast::IfStmt::Branch.
+        if (is->ifBranch.condition &&
+            exprCaptures(*is->ifBranch.condition, ownParamSyms)) return true;
+        for (const auto& sub : is->ifBranch.body)
+            if (sub && stmtCaptures(*sub, ownParamSyms)) return true;
+        for (const auto& elif : is->elifBranches) {
+            if (elif.condition && exprCaptures(*elif.condition, ownParamSyms)) return true;
+            for (const auto& sub : elif.body)
+                if (sub && stmtCaptures(*sub, ownParamSyms)) return true;
+        }
+        for (const auto& sub : is->elseBody)
+            if (sub && stmtCaptures(*sub, ownParamSyms)) return true;
+    } else if (auto* wb = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& sub : wb->body)
+            if (sub && stmtCaptures(*sub, ownParamSyms)) return true;
+    }
+    return false;
 }
 
 } // namespace bezel::sema
