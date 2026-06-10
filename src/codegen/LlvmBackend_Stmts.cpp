@@ -300,11 +300,52 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     builder_.SetInsertPoint(endBB);
                 }
             } else {
-                // CG31: compound assignment `target OP= value` — read,
-                // apply OP (overflow-checked like plain arithmetic),
-                // write back.
+                // fix #610 / §25.1 / §6.6: compound assignment `target OP= value`
+                // on a record or class whose type declares a user-defined
+                // `static operator <op>` — desugar mechanically to
+                //   target := target.operator_op_(target, value)
+                // (per §25.1: "the compound forms desugar mechanically to
+                // read-modify-write using the underlying binary operator's
+                // overload"). Must be checked BEFORE the built-in
+                // emitCompoundOp path, which cannot handle struct operands and
+                // would SIGABRT by passing the struct type to
+                // llvm.sadd.with.overflow.
                 std::string op(as->op);
                 if (!op.empty() && op.back() == '=') op.pop_back();
+                {
+                    sema::MethodSymbol* opMethod = nullptr;
+                    if (const sema::TypeRef* targetTy =
+                            ctx_.exprType(*as->target)) {
+                        if (targetTy->kind == sema::TypeRef::Kind::Named &&
+                            targetTy->declaration) {
+                            for (sema::Symbol* m :
+                                 targetTy->declaration->members) {
+                                auto* ms =
+                                    dynamic_cast<sema::MethodSymbol*>(m);
+                                if (ms && ms->isOperator &&
+                                    ms->operatorToken == op &&
+                                    ms->params.size() == 2) {
+                                    opMethod = ms;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (opMethod) {
+                        // §25.1: dispatch to user-defined binary operator.
+                        // Load the current value (struct by value) and call
+                        // the overload, then store the result back.
+                        llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                        std::vector<llvm::Value*> args{cur, rhs};
+                        llvm::Value* res = emitMethodCall(
+                            opMethod, args, /*baseQualified=*/false);
+                        if (res) builder_.CreateStore(res, addr);
+                        return false;
+                    }
+                }
+                // CG31: built-in numeric compound assignment — read,
+                // apply OP (overflow-checked like plain arithmetic),
+                // write back.
                 llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                 llvm::Value* res = emitCompoundOp(
                     op, cur, rhs, elemTy->isFloatingPointTy(),
