@@ -4951,6 +4951,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 auto* allocFn = declareC("bz_random_alloc", ptrTy(), {i64()});
                 return builder_.CreateCall(allocFn, {ts});
             }
+            // §28.13 / stdlib §2.16 (#603): new Shared<T>(owned_value) —
+            // allocate a control block and store the owned object pointer.
+            // bz_shared_new(value: ptr, dispose_value: fn) → ptr (control block).
+            // The dispose_value callback is the class element disposer thunk
+            // (vtable Dispose + free), so the inner T is disposed exactly once
+            // when the last strong handle is released (§28.13).
+            if (colName == "Shared" && ne.args.size() == 1 && ne.args[0].value) {
+                llvm::Value* val = lowerExpr(*ne.args[0].value);
+                if (!val) return nullptr;
+                // Get the element disposer thunk for T (the inner class type).
+                // elementDisposerThunk() returns the shared void(void*) shim that
+                // calls vtable slot 2 (Dispose) then free — same thunk used for
+                // OwnedArray<T> element disposal.
+                llvm::Function* dispFn = elementDisposerThunk();
+                auto* newFn = declareC("bz_shared_new", ptrTy(), {ptrTy(), ptrTy()});
+                return builder_.CreateCall(newFn, {val, dispFn}, "shared.new");
+            }
             // §6.1 / §30.8: new CancellationTokenSource() — allocate via
             // bz_cts_alloc (stdlib §6.1 default constructor).
             if (colName == "CancellationTokenSource") {

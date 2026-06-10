@@ -903,6 +903,48 @@ void bz_unhandled_exception(void);
 // Null means "no exception in flight"; non-null is the heap-allocated object.
 extern void* bz_exc;
 
+// ---------------------------------------------------------------------------
+// Shared<T> / Weak<T> — domain-local shared ownership (§28.13 / stdlib §2.16)
+//
+// A bz_shared_t control block owns one underlying value and tracks strong +
+// weak reference counts (unsynchronised — domain-local per spec §28.13).
+// Shared handles (bz_shared_t*) and Weak handles (bz_weak_t*, which is the
+// same struct) are opaque to Bezel code; codegen stores them as plain ptr.
+// ---------------------------------------------------------------------------
+
+// Allocate a control block wrapping `value`.  The block's strong count is 1
+// and weak count is 0.  `dispose_value` is the void(void*) thunk that runs
+// the value's vtable Dispose and frees the block — the same thunk used by
+// elementDisposerThunk() for owning collections.  Returns the new strong
+// handle (bz_shared_t*).
+void* bz_shared_new(void* value, void (*dispose_value)(void*));
+
+// Increment the strong count and return a new handle pointing to the same
+// control block.  The caller becomes an additional owner. per §28.13 Clone().
+void* bz_shared_clone(void* handle);
+
+// Return the underlying value pointer (a borrow; the handle's lifetime gates
+// the value's lifetime). per §28.13 Get().  Does NOT transfer ownership.
+void* bz_shared_get(void* handle);
+
+// Mint a Weak<T> handle (increments the weak count; does not affect the strong
+// count). per §28.13 Downgrade().  Returns a bz_weak_t*.
+void* bz_shared_downgrade(void* handle);
+
+// TryUpgrade: if strong count > 0, increment it and write a new strong handle
+// to *out_handle, then return 1 (true).  If strong count is 0 (value already
+// disposed), write null to *out_handle and return 0 (false). per §28.13.
+int   bz_weak_try_upgrade(void* weak_handle, void** out_handle);
+
+// Decrement the strong count.  When it reaches 0: run dispose_value on the
+// value (disposing via vtable + freeing the block if the weak count is also
+// 0).  Idempotent via the disposed-flag convention. per §28.13 Dispose().
+void  bz_shared_release(void* handle);
+
+// Decrement the weak count.  When the strong count is already 0 and the weak
+// count also reaches 0, free the control block. per §28.13 Weak.Dispose().
+void  bz_weak_release(void* weak_handle);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -61,16 +61,47 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
     // ── Row 3: class / interface type ──────────────────────────────────────
     // per §28.11 v0.134: class/interface × owning  → owned (disposer thunk)
     //                    class/interface × borrowing → borrow (no disposer)
-    if (elemTy && elemTy->kind == sema::TypeRef::Kind::Named &&
-        elemTy->declaration &&
-        (elemTy->declaration->kind == ast::TypeDeclKind::Class ||
-         elemTy->declaration->kind == ast::TypeDeclKind::Interface)) {
+    //
+    // §28.13 / stdlib §2.16 (#603): Shared<T> and Weak<T> have null declaration
+    // (they are compiler-known builtins, not user TypeDecls). They are ref-counted
+    // heap pointers that behave like class instances in collection slots: an
+    // OwnedArray<Shared<T>> OWNS its handles (releases on remove/clear/free) and
+    // a borrowing Array<Shared<T>> just borrows them. Detect by astNode name before
+    // the declaration check so they fall into the ClassOwned/ClassBorrow arm, not
+    // the Value arm (the fall-through after this block).
+    auto isSharedOrWeak = [](const sema::TypeRef* t) {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+        if (t->declaration) return false;
+        if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+            return false;
+        auto n = t->astNode->name->parts[0];
+        return n == "Shared" || n == "Weak";
+    };
+    bool isSharedWeakElem = isSharedOrWeak(elemTy);
+    // Distinguish Shared vs Weak for per-element release thunk selection.
+    auto isWeakElem = [](const sema::TypeRef* t) {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+        if (t->declaration) return false;
+        if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+            return false;
+        return t->astNode->name->parts[0] == "Weak";
+    };
+    if (isSharedWeakElem ||
+        (elemTy && elemTy->kind == sema::TypeRef::Kind::Named &&
+         elemTy->declaration &&
+         (elemTy->declaration->kind == ast::TypeDeclKind::Class ||
+          elemTy->declaration->kind == ast::TypeDeclKind::Interface))) {
         if (owningFamily) {
-            // per §28.11 v0.134: owned slot — disposal cascades via vtable.
+            // per §28.11 v0.134: owned slot — disposal cascades via vtable
+            // for class/interface; via bz_shared_release / bz_weak_release for
+            // Shared<T>/Weak<T> handles (which have no vtable).
+            llvm::Function* thunk = isSharedWeakElem
+                ? (isWeakElem(elemTy) ? weakReleaseThunk() : sharedReleaseThunk())
+                : elementDisposerThunk();
             return ElementPolicy{
                 ElementPolicy::Category::ClassOwned,
                 ptrTy(),
-                elementDisposerThunk(),   // void(void*) via vtable slot 2
+                thunk,
                 /*retainRelease=*/false
             };
         } else {

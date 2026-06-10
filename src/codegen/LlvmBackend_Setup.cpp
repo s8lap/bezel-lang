@@ -2439,6 +2439,64 @@ llvm::Function* Emitter::elementDisposerThunk() {
 }
 
 
+// §28.13 / stdlib §2.16 (#603): void(void*) thunk that calls
+// bz_shared_release(ptr), used as the per-element disposal callback for an
+// OwnedArray<Shared<T>> (or similar owning collection of shared handles).
+// Mirrors elementDisposerThunk but calls the runtime release rather than
+// dispatching through a class vtable (Shared<T> has no vtable).
+llvm::Function* Emitter::sharedReleaseThunk() {
+    if (sharedReleaseThunk_) return sharedReleaseThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$sharedRelease", module_.get());
+    llvm::Argument* h = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* relBB  = llvm::BasicBlock::Create(llvm_, "h.rel",  fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "h.ret",  fn);
+    llvm::IRBuilder<> b(entry);
+    b.CreateCondBr(
+        b.CreateICmpEQ(h, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, relBB);
+    b.SetInsertPoint(relBB);
+    auto* relFn = declareC("bz_shared_release",
+                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    b.CreateCall(relFn, {h});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    sharedReleaseThunk_ = fn;
+    return fn;
+}
+
+// §28.13 / stdlib §2.16 (#603): void(void*) thunk that calls
+// bz_weak_release(ptr), used as the per-element disposal callback for an
+// OwnedArray<Weak<T>>.
+llvm::Function* Emitter::weakReleaseThunk() {
+    if (weakReleaseThunk_) return weakReleaseThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$weakRelease", module_.get());
+    llvm::Argument* h = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* relBB  = llvm::BasicBlock::Create(llvm_, "h.rel",  fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "h.ret",  fn);
+    llvm::IRBuilder<> b(entry);
+    b.CreateCondBr(
+        b.CreateICmpEQ(h, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, relBB);
+    b.SetInsertPoint(relBB);
+    auto* relFn = declareC("bz_weak_release",
+                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    b.CreateCall(relFn, {h});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    weakReleaseThunk_ = fn;
+    return fn;
+}
+
 bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
     if (!collTy || collTy->genericArgs.size() <= idx) return false;
     const sema::TypeRef* el = collTy->genericArgs[idx];
@@ -4166,6 +4224,75 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (isCTS) {
             Disposal d{it->second, nullptr};
             d.cancellationTokenSource = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+    // §28.13 / stdlib §2.16 (#603): a `using var` bound to a Shared<T> handle.
+    // No user TypeSymbol; recognised by type name "Shared". At scope end,
+    // bz_shared_release decrements the strong count and disposes the inner
+    // value exactly once when the last strong handle is released.
+    // Detection patterns mirror CTS (declared type OR NewExpr type name):
+    //   1. Explicit type annotation names Shared<T>.
+    //   2. Initializer is `new Shared<T>(...)` (NewExpr type name).
+    //   3. Initializer is a call returning Shared<T> (Clone()).
+    {
+        bool isShared = false;
+        auto isSharedTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "Shared";
+        };
+        if (ld->type)
+            isShared = isSharedTypeName(ctx_.resolvedType(*ld->type));
+        if (!isShared && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isShared = ne->type && ne->type->name &&
+                           !ne->type->name->parts.empty() &&
+                           ne->type->name->parts[0] == "Shared";
+        }
+        if (!isShared && ld->initializer)
+            isShared = isSharedTypeName(ctx_.exprType(*ld->initializer));
+        if (isShared) {
+            Disposal d{it->second, nullptr};
+            d.sharedHandle = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+    // §28.13 / stdlib §2.16 (#603): a `using var` bound to a Weak<T> handle.
+    // No user TypeSymbol; recognised by type name "Weak". At scope end,
+    // bz_weak_release decrements the weak count and frees the control block
+    // when both strong and weak counts are 0.
+    // The `out using var` slot created by TryUpgrade also ends up here (its
+    // declared type is Weak<T> if the upgrade failed, but actually the SUCCESS
+    // path binds a Shared<T> handle — handled by sharedHandle above because
+    // TryUpgrade stores a Shared<T> into the out-slot and that slot's type is
+    // Shared<T> not Weak<T>).
+    {
+        bool isWeak = false;
+        auto isWeakTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "Weak";
+        };
+        if (ld->type)
+            isWeak = isWeakTypeName(ctx_.resolvedType(*ld->type));
+        if (!isWeak && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isWeak = ne->type && ne->type->name &&
+                         !ne->type->name->parts.empty() &&
+                         ne->type->name->parts[0] == "Weak";
+        }
+        if (!isWeak && ld->initializer)
+            isWeak = isWeakTypeName(ctx_.exprType(*ld->initializer));
+        if (isWeak) {
+            Disposal d{it->second, nullptr};
+            d.weakHandle = true;
             disposeStack_.back().push_back(d);
             return;
         }
@@ -7192,6 +7319,44 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_cts_dispose",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {cts});
+            continue;
+        }
+        // §28.13 / stdlib §2.16 (#603): a `using var` Shared<T> handle.
+        // Null-guarded: bz_shared_release handles null gracefully, but we load
+        // and call only when non-null for consistency with other disposal sites.
+        if (it->sharedHandle) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                h, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* relBB  = llvm::BasicBlock::Create(llvm_, "shared.rel",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "shared.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, relBB);
+            builder_.SetInsertPoint(relBB);
+            auto* fn = declareC("bz_shared_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {h});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §28.13 / stdlib §2.16 (#603): a `using var` Weak<T> handle.
+        if (it->weakHandle) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                h, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* relBB  = llvm::BasicBlock::Create(llvm_, "weak.rel",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "weak.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, relBB);
+            builder_.SetInsertPoint(relBB);
+            auto* fn = declareC("bz_weak_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {h});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // stdlib §6.7 / §30.5: a `using var` Task / Task<T>. At scope end, the

@@ -511,6 +511,17 @@ private:
         // bz_cts_dispose (idempotent — signals surviving tokens and frees the
         // source). Recognised by the local's declared/resolved type name.
         bool cancellationTokenSource = false;
+        // §28.13 / stdlib §2.16 (#603): a `using var` bound to a Shared<T>
+        // handle. At scope end it is released via bz_shared_release (decrements
+        // strong count; at 0 disposes the value then frees the control block if
+        // the weak count is also 0). No user TypeSymbol; recognised by builtin
+        // type name "Shared".
+        bool sharedHandle = false;
+        // §28.13 / stdlib §2.16 (#603): a `using var` bound to a Weak<T>
+        // handle. At scope end it is released via bz_weak_release (decrements
+        // weak count; frees the control block if both strong and weak counts are
+        // now 0). No user TypeSymbol; recognised by builtin type name "Weak".
+        bool weakHandle = false;
         // stdlib §6.7 / §30.5: a `using var` bound to a Task / Task<T>.
         // Tasks have no user TypeSymbol; at scope end the task is disposed via
         // bz_task_fire_and_forget (non-blocking per §30.5: "does not block waiting
@@ -551,6 +562,11 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> initFns_;
     // #362 / stdlib §4.5: the cached per-element dispose thunk (built lazily).
     llvm::Function* elementDisposerThunk_ = nullptr;
+    // §28.13 / stdlib §2.16 (#603): void(void*) thunks that call
+    // bz_shared_release / bz_weak_release, used as per-element disposal
+    // callbacks for OwnedArray<Shared<T>> / OwnedArray<Weak<T>>.
+    llvm::Function* sharedReleaseThunk_ = nullptr;
+    llvm::Function* weakReleaseThunk_ = nullptr;
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
     // lazily) for a borrowing Array<string>'s co-owned string elements.
     llvm::Function* stringElementReleaseThunk_ = nullptr;
@@ -2436,6 +2452,8 @@ private:
     // callback for bz_array_free / bz_array_clear_disposing /
     // bz_array_remove_at_disposing. Built once per module and cached.
     llvm::Function* elementDisposerThunk();
+    llvm::Function* sharedReleaseThunk();
+    llvm::Function* weakReleaseThunk();
 
     // #362 / stdlib §4.5: if `collTy` is an OWNING collection (name prefixed
     // "Owned") whose element type is a class, return the element-disposer thunk

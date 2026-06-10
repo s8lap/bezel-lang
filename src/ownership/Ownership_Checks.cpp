@@ -51,8 +51,19 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         // §28.8: find the matching constructor to detect implicit owned params.
         // Build a synthetic check by examining the ctor's parameter list directly.
         const ast::ConstructorDecl* cd = nullptr;
+        // §28.13 / stdlib §2.16 (#603): `new Shared<T>(value)` is a builtin
+        // type with no user ConstructorDecl. Its sole constructor takes an
+        // `owned value: T` at position 0 (per stdlib §2.16). Detect this so
+        // the implicit-transfer path below correctly consumes the argument.
+        bool isSharedNew = false;
         if (ne->type) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->astNode->name->parts[0] == "Shared" &&
+                    ne->args.size() == 1) {
+                    isSharedNew = true;
+                }
                 if (rt->declaration) {
                     std::size_t nArgs = ne->args.size();
                     for (sema::Symbol* m : rt->declaration->members) {
@@ -107,6 +118,24 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     // into an owned ctor param is a borrow, not a transfer — the
                     // double-dispose hazard (findings 18, 20). (Bare `this` was
                     // handled by the identifier branch above.)
+                    ++pos; continue;
+                }
+            }
+            // §28.13 / stdlib §2.16 (#603): `new Shared<T>(value)` has an
+            // implicit owned parameter at position 0. Apply the same owned-
+            // argument checks as a user ctor with `owned value: T` would.
+            // per §28.8 / §28.13.
+            if (a.modifier.empty() && isSharedNew && pos == 0) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                    if (!checkOwnedArgSource(*a.value, id->span.begin))
+                        markMovedByName(id->name, id->span.begin);
+                    ++pos; continue;
+                }
+                if (exprIsOwnedFieldRead(*a.value)) {
+                    checkOwnedArgSource(*a.value, a.value->span.begin);
+                    ++pos; continue;
+                }
+                if (checkOwnedArgOtherBorrow(*a.value)) {
                     ++pos; continue;
                 }
             }

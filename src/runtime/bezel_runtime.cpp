@@ -1572,6 +1572,99 @@ char* bz_path_absolute(const char* path) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared<T> / Weak<T> — domain-local shared ownership (§28.13 / stdlib §2.16)
+//
+// Control block layout: { void* value; long strong; long weak;
+//                          void (*dispose_value)(void*); bool disposed }
+// Handles (strong and weak) are both pointers to this struct; the compiler
+// passes them as `ptr` and calls the functions below.  Everything is
+// unsynchronised (domain-local per §28.13 / §30.14 — not sendable).
+// ---------------------------------------------------------------------------
+
+struct bz_shared_t {
+    void*  value;
+    long   strong;
+    long   weak;
+    void (*dispose_value)(void*);
+    int    value_disposed;   // 1 after the value has been disposed (idempotent guard)
+};
+
+// Allocate a new control block.  strong=1, weak=0. per §28.13 constructor.
+void* bz_shared_new(void* value, void (*dispose_value)(void*)) {
+    bz_shared_t* cb = (bz_shared_t*)calloc(1, sizeof(bz_shared_t));
+    cb->value = value;
+    cb->strong = 1;
+    cb->weak = 0;
+    cb->dispose_value = dispose_value;
+    cb->value_disposed = 0;
+    return (void*)cb;
+}
+
+// Increment the strong count and return the same handle (a new alias). §28.13 Clone.
+void* bz_shared_clone(void* handle) {
+    bz_shared_t* cb = (bz_shared_t*)handle;
+    if (!cb) return nullptr;
+    cb->strong++;
+    return handle;
+}
+
+// Return the underlying value pointer (borrow). §28.13 Get.
+void* bz_shared_get(void* handle) {
+    bz_shared_t* cb = (bz_shared_t*)handle;
+    if (!cb) return nullptr;
+    return cb->value;
+}
+
+// Mint a Weak handle (same control block, weak count +1). §28.13 Downgrade.
+void* bz_shared_downgrade(void* handle) {
+    bz_shared_t* cb = (bz_shared_t*)handle;
+    if (!cb) return nullptr;
+    cb->weak++;
+    return handle;   // same block; bz_weak_t* aliases bz_shared_t*
+}
+
+// TryUpgrade: produce a new strong handle if the value is still alive. §28.13.
+// Returns 1 on success (strong count was > 0), 0 if the value is gone.
+int bz_weak_try_upgrade(void* weak_handle, void** out_handle) {
+    bz_shared_t* cb = (bz_shared_t*)weak_handle;
+    if (!cb || cb->strong == 0) {
+        if (out_handle) *out_handle = nullptr;
+        return 0;
+    }
+    cb->strong++;
+    if (out_handle) *out_handle = weak_handle;
+    return 1;
+}
+
+// Release one strong reference.  When the count hits 0, dispose the value;
+// when both counts hit 0 free the control block. §28.13 Dispose / Dispose().
+void bz_shared_release(void* handle) {
+    bz_shared_t* cb = (bz_shared_t*)handle;
+    if (!cb) return;
+    cb->strong--;
+    if (cb->strong == 0 && !cb->value_disposed) {
+        cb->value_disposed = 1;
+        if (cb->dispose_value && cb->value)
+            cb->dispose_value(cb->value);
+        cb->value = nullptr;
+        // Free the block only when there are no outstanding weak handles.
+        if (cb->weak == 0)
+            free(cb);
+    }
+}
+
+// Release one weak reference.  Free the block when both counts are 0. §28.13.
+void bz_weak_release(void* weak_handle) {
+    bz_shared_t* cb = (bz_shared_t*)weak_handle;
+    if (!cb) return;
+    cb->weak--;
+    // The value was already disposed (strong == 0 got here first).
+    // Free the block only when this was the last weak handle.
+    if (cb->strong == 0 && cb->weak == 0)
+        free(cb);
+}
+
+// ---------------------------------------------------------------------------
 // Task scheduler — pthread-based thread pool
 // ---------------------------------------------------------------------------
 

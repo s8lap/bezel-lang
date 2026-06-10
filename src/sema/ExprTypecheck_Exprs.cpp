@@ -598,7 +598,10 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         colName == "Set"       || colName == "OwnedSet"    ||
                         colName == "LinkedList"|| colName == "OwnedLinkedList" ||
                         colName == "Dictionary"|| colName == "OwnedDictionary" ||
-                        colName == "StringBuilder";
+                        colName == "StringBuilder"  ||
+                        // §28.13 / stdlib §2.16: Shared<T>/Weak<T> constructors
+                        // take an owned value, not a collection literal.
+                        colName == "Shared"    || colName == "Weak";
                     if (isBuiltinColl) {
                         for (const auto& a : ne->args) {
                             if (a.value && dynamic_cast<const ast::CollectionLiteralExpr*>(
@@ -615,6 +618,88 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                     "`var x: " + std::string(colName) +
                                     "<T> := [...]` (\xC2\xA7""15.4, #599)");
                             }
+                        }
+                    }
+                }
+                // §28.13 / stdlib §2.16 (#603): Shared<T> / Weak<T> require T to
+                // be a proper class type.  Runtime-managed (string, function),
+                // value (int/record/enum), and interface types have no disposal
+                // obligation to share and are rejected at instantiation, mirroring
+                // the §14.4 / OwnedArray<T: class> constraint.
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty()) {
+                    std::string_view shName = rt->astNode->name->parts[0];
+                    if (shName == "Shared" || shName == "Weak") {
+                        // Check the first generic argument for a proper class type.
+                        bool argIsClass = false;
+                        std::string badTypeName;
+                        if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
+                            const TypeRef* ta = rt->genericArgs[0];
+                            if (ta->kind == TypeRef::Kind::Named &&
+                                ta->declaration &&
+                                ta->declaration->kind == ast::TypeDeclKind::Class) {
+                                argIsClass = true;
+                            } else {
+                                // Produce a human-readable type name for the diagnostic.
+                                if (ta->kind == TypeRef::Kind::Primitive) {
+                                    // Map PrimitiveType → name for the diagnostic.
+                                    using P = sema::PrimitiveType;
+                                    switch (ta->primitive) {
+                                        case P::Bool:    badTypeName = "bool"; break;
+                                        case P::Char:    badTypeName = "char"; break;
+                                        case P::String:  badTypeName = "string"; break;
+                                        case P::Byte:    badTypeName = "byte"; break;
+                                        case P::SByte:   badTypeName = "sbyte"; break;
+                                        case P::Short:   badTypeName = "short"; break;
+                                        case P::UShort:  badTypeName = "ushort"; break;
+                                        case P::Int:     badTypeName = "int"; break;
+                                        case P::UInt:    badTypeName = "uint"; break;
+                                        case P::Long:    badTypeName = "long"; break;
+                                        case P::ULong:   badTypeName = "ulong"; break;
+                                        case P::Float:   badTypeName = "float"; break;
+                                        case P::Double:  badTypeName = "double"; break;
+                                        case P::Decimal: badTypeName = "decimal"; break;
+                                        case P::Object:  badTypeName = "Object"; break;
+                                        default:         badTypeName = "primitive type"; break;
+                                    }
+                                }
+                                else if (ta->kind == TypeRef::Kind::Function)
+                                    badTypeName = "function type";
+                                else if (ta->kind == TypeRef::Kind::Named) {
+                                    if (ta->declaration) {
+                                        badTypeName = std::string(ta->declaration->name);
+                                        if (ta->declaration->kind ==
+                                            ast::TypeDeclKind::Interface)
+                                            badTypeName += " (interface)";
+                                        else if (ta->declaration->kind ==
+                                                 ast::TypeDeclKind::Record)
+                                            badTypeName += " (record/value type)";
+                                        else if (ta->declaration->kind ==
+                                                 ast::TypeDeclKind::Enum)
+                                            badTypeName += " (enum/value type)";
+                                    } else if (ta->astNode && ta->astNode->name &&
+                                               !ta->astNode->name->parts.empty()) {
+                                        badTypeName = std::string(
+                                            ta->astNode->name->parts.back());
+                                        badTypeName += " (runtime-managed or value type)";
+                                    }
+                                }
+                                if (badTypeName.empty())
+                                    badTypeName = "<unknown>";
+                            }
+                        } else {
+                            badTypeName = "<no type argument>";
+                        }
+                        if (!argIsClass && !badTypeName.empty()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ne->span.begin,
+                                std::string(shName) +
+                                "<T> requires T to be a proper class type: "
+                                "`" + badTypeName + "` is not a class — "
+                                "runtime-managed and value types have no "
+                                "disposal obligation to share "
+                                "(\xC2\xA7""28.13 / stdlib \xC2\xA7""2.16, #603)");
                         }
                     }
                 }
@@ -1326,6 +1411,58 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
                             nn->nullable = false;
                             lsym->declType = nn;
+                        }
+                    }
+                    currentScope_->names[id->name] = lsym;
+                }
+            }
+            // §28.13 / stdlib §2.16 (#603): `out using var x` declares a
+            // using-var–scoped Shared<T> handle from Weak<T>.TryUpgrade.
+            // Mirror the `out var` path above but skip the formal-param
+            // type inference (TryUpgrade is a builtin with no MethodDecl)
+            // and instead derive the type directly from the receiver:
+            //   Weak<T> receiver → Shared<T> out type.
+            if (a.modifier == "out using var" && a.value && currentScope_) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                   a.value.get())) {
+                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                    lsym->name = id->name;
+                    lsym->decl = id;
+                    // Derive Shared<T> from Weak<T> receiver type.
+                    if (auto* maCallee =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                ce->callee.get())) {
+                        if (maCallee->target) {
+                            if (const TypeRef* rt =
+                                    ctx_.exprType(*maCallee->target)) {
+                                if (rt->kind == TypeRef::Kind::Named &&
+                                    !rt->declaration && rt->astNode &&
+                                    rt->astNode->name &&
+                                    !rt->astNode->name->parts.empty() &&
+                                    rt->astNode->name->parts[0] == "Weak" &&
+                                    !rt->genericArgs.empty() &&
+                                    rt->genericArgs[0]) {
+                                    // Build a synthetic Shared<T> astNode
+                                    // (same lambda pattern as kWeakNode in
+                                    // ExprTypecheck_Calls.cpp ~L1762).
+                                    static const ast::Type* kSharedNode =
+                                        []() -> ast::Type* {
+                                            auto* qn = new ast::QualifiedName;
+                                            qn->parts.push_back("Shared");
+                                            auto* t  = new ast::Type;
+                                            t->kind  = ast::TypeKind::Named;
+                                            t->name.reset(qn);
+                                            return t;
+                                        }();
+                                    TypeRef* sharedTy = ctx_.makeTypeRef();
+                                    sharedTy->kind = TypeRef::Kind::Named;
+                                    sharedTy->declaration = nullptr;
+                                    sharedTy->astNode = kSharedNode;
+                                    sharedTy->genericArgs.push_back(
+                                        const_cast<TypeRef*>(rt->genericArgs[0]));
+                                    lsym->declType = sharedTy;
+                                }
+                            }
                         }
                     }
                     currentScope_->names[id->name] = lsym;
