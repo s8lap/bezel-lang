@@ -2498,27 +2498,33 @@ llvm::Function* Emitter::weakReleaseThunk() {
 }
 
 bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
+    // fix #619 / §28.11 v0.135 / §14.4: the §28.11 table's owned/borrow column
+    // applies to "class / interface type" — both class AND interface elements are
+    // class-like from the collection's perspective (vtable-dispatch, pointer slot).
+    // Widening to Class|Interface fixes the Class-only check that caused
+    // OwnedDictionary<K,IFoo> indexer-set and move-out to skip disposal for
+    // interface-valued slots.
     if (!collTy || collTy->genericArgs.size() <= idx) return false;
     const sema::TypeRef* el = collTy->genericArgs[idx];
     if (!el || el->kind != sema::TypeRef::Kind::Named || !el->declaration)
         return false;
-    return el->declaration->kind == ast::TypeDeclKind::Class;
+    return el->declaration->kind == ast::TypeDeclKind::Class ||
+           el->declaration->kind == ast::TypeDeclKind::Interface;
 }
 
 
 llvm::Function* Emitter::owningCollectionElemDisposer(
         const sema::TypeRef* collTy) {
-    // #602 / #362 / stdlib §4.5 / §28.11 v0.134: thin delegate to
-    // elementPolicyFor.  Per the table, only the owning family × class/interface
-    // element row produces a disposer thunk; every other combination returns null.
+    // fix #619 / #602 / #362 / stdlib §4.5 / §28.11 v0.135: thin delegate to
+    // elementPolicyFor.  Per the §28.11 v0.135 table, the owning family ×
+    // class/interface element row produces a disposer thunk; every other
+    // combination returns null.
     //
-    // DIVERGENCE vs §28.11 v0.134: the §28.11 table lists "class / interface
-    // type" in the class row, but the original collectionElemIsClass() helper
-    // (and therefore this function) only checks for Class, not Interface.
-    // An OwnedArray<IFoo> (interface-typed element) would return null here
-    // instead of the disposer thunk, leaving interface elements undisposed.
-    // Per batch-1 discipline (zero behavior change), we keep the existing
-    // behavior and flag it here for triage in batch 2/3.
+    // elementPolicyFor already handles Class|Interface correctly (it admits
+    // Interface in the Named/declaration branch).  The former Class-only
+    // pre-check here was the only site blocking Interface elements from
+    // reaching the factory.  Removing it fixes the OwnedArray<IFoo> /
+    // OwnedLinkedList<IFoo> leak (§28.11 owned column / §14.4).
     if (!collTy || !collTy->astNode || !collTy->astNode->name ||
         collTy->astNode->name->parts.empty())
         return nullptr;
@@ -2527,14 +2533,10 @@ llvm::Function* Emitter::owningCollectionElemDisposer(
     if (!isOwning) return nullptr;
     if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return nullptr;
     const sema::TypeRef* el = collTy->genericArgs[0];
-    // Keep the original Class-only check (not Interface) to preserve behavior
-    // until the above DIVERGENCE is resolved.  The factory uses Class|Interface
-    // per the spec; we override here deliberately.
-    if (el->kind != sema::TypeRef::Kind::Named || !el->declaration ||
-        el->declaration->kind != ast::TypeDeclKind::Class)
-        return nullptr;
+    // per §28.11 v0.135: delegate entirely to elementPolicyFor; it handles
+    // Class, Interface, Shared<T>/Weak<T>, and value types correctly.
     ElementPolicy pol = elementPolicyFor(el, /*owningFamily=*/true);
-    return pol.disposerThunk;   // non-null for ClassOwned
+    return pol.disposerThunk;   // non-null for ClassOwned (class or interface)
 }
 
 
@@ -2655,30 +2657,26 @@ bool Emitter::isStringValueDict(const sema::TypeRef* dictTy) {
 
 
 llvm::Function* Emitter::owningDictValueDisposer(const sema::TypeRef* dictTy) {
-    // #602 / #394 / stdlib §4.9 / §28.11 v0.134: thin delegate to
-    // elementPolicyFor.  Per the table, an OwnedDictionary<K,V> owns its
-    // VALUES (genericArgs[1]); keys are value-like and classified per the
-    // borrowing column (§28.11 footnote).  Only the owning × class row
-    // produces a disposer thunk; everything else returns null.
+    // fix #619 / #602 / #394 / stdlib §4.9 / §28.11 v0.135: thin delegate to
+    // elementPolicyFor.  Per the §28.11 v0.135 table, an OwnedDictionary<K,V>
+    // owns its VALUES (genericArgs[1]); keys are value-like and classified per
+    // the borrowing column (§28.11 footnote).  The owning × class/interface
+    // row produces a disposer thunk; everything else returns null.
     //
-    // DIVERGENCE vs §28.11 v0.134 (same as owningCollectionElemDisposer):
-    // the spec lists "class / interface type" in the owned column, but the
-    // original collectionElemIsClass() helper only checked for Class, not
-    // Interface.  An OwnedDictionary<K, IFoo> value slot would return null
-    // here instead of the disposer thunk.  Preserved in batch 1 (zero
-    // behavior change); flag for triage in batch 2/3.
+    // The former Class-only pre-check was the only site blocking Interface
+    // values from reaching elementPolicyFor's correct Class|Interface branch.
+    // Removing it fixes the OwnedDictionary<K,IFoo> value-disposal leak
+    // (§28.11 owned column / §14.4).
     if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
         dictTy->astNode->name->parts.empty())
         return nullptr;
     if (dictTy->astNode->name->parts[0] != "OwnedDictionary") return nullptr;
     if (dictTy->genericArgs.size() <= 1 || !dictTy->genericArgs[1]) return nullptr;
     const sema::TypeRef* val = dictTy->genericArgs[1];
-    // Keep the original Class-only check (not Interface) to preserve behavior.
-    if (val->kind != sema::TypeRef::Kind::Named || !val->declaration ||
-        val->declaration->kind != ast::TypeDeclKind::Class)
-        return nullptr;
+    // per §28.11 v0.135: delegate entirely to elementPolicyFor; it handles
+    // Class, Interface, Shared<T>/Weak<T>, and value types correctly.
     ElementPolicy pol = elementPolicyFor(val, /*owningFamily=*/true);
-    return pol.disposerThunk;   // non-null for ClassOwned
+    return pol.disposerThunk;   // non-null for ClassOwned (class or interface)
 }
 
 
