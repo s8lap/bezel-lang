@@ -3142,7 +3142,12 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 return phi;
             }
         }
-        return nullptr;  // other `in` forms — not yet implemented
+        // #628 (part 1): unhandled `in` form — emit a hard error so the
+        // caller sees a failed compile rather than silent garbage IR.
+        ctx_.diagnostics().report(
+            Severity::Error, bin.span.begin,
+            "not yet implemented: codegen for this `in` expression form");
+        return nullptr;
     }
     llvm::Value* l = lowerExpr(*bin.left);
     llvm::Value* r = lowerExpr(*bin.right);

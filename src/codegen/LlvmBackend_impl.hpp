@@ -295,6 +295,13 @@ public:
             llvm::errs() << "bezel codegen: IR verification failed "
                             "(malformed IR emitted; see report above)\n";
         }
+        // #628 (part 1): any Error-severity diagnostic emitted during codegen
+        // (e.g. "not yet implemented: codegen for this for statement", `typeof`,
+        // `GetType`, `await` in a catch guard) must abort emission — return
+        // nullptr so the caller sees a failed module and produces no binary.
+        // The diagnostic was already printed; the module may be partially built
+        // and must not be handed to the AOT/JIT paths.
+        if (ctx_.diagnostics().hasErrors()) return nullptr;
         return std::move(module_);
     }
 
