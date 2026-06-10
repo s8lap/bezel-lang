@@ -167,13 +167,12 @@ void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;
     if (dispose_elem && arr->data) {
-        // Call dispose for each element (element size unknown here — codegen
-        // must pass dispose only when elements are pointer-typed).
-        // For pointer-sized elements, elem_size = sizeof(void*).
-        // We can't know elem_size here; the codegen generates a loop instead
-        // for owned arrays. bz_array_free with non-null dispose is for
-        // pointer-element arrays only (the codegen ensures this).
-        for (int64_t i = 0; i < arr->count; ++i) {
+        // Dispose elements in REVERSE insertion order per §28.11: ordered owning
+        // collections (OwnedArray, OwnedStack, OwnedQueue) dispose last-inserted
+        // first. For pointer-sized elements, elem_size = sizeof(void*).
+        // bz_array_free with non-null dispose is for pointer-element arrays only
+        // (the codegen ensures this).
+        for (int64_t i = arr->count - 1; i >= 0; --i) {
             void* elem_ptr = ((void**)arr->data)[i];
             if (elem_ptr) dispose_elem(elem_ptr);
         }
@@ -958,16 +957,19 @@ void* bz_llist_node_prev(void* nodep) {
 void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
     auto* l = (bz_llist_t*)listp;
     if (!l) return;
-    bz_llist_node_t* n = l->head;
+    // Dispose elements in REVERSE insertion order per §28.11: OwnedLinkedList
+    // disposes last-inserted first (tail to head). Free nodes in the same
+    // reverse pass so no separate traversal is needed.
+    bz_llist_node_t* n = l->tail;
     while (n) {
-        bz_llist_node_t* nxt = n->next;
+        bz_llist_node_t* prv = n->prev;
         if (dispose_elem) {
             void* vp = (char*)n + sizeof(bz_llist_node_t);
             void* obj = *(void**)vp;
             if (obj) dispose_elem(obj);
         }
         free(n);
-        n = nxt;
+        n = prv;
     }
     free(l);
 }
