@@ -23,7 +23,6 @@
 
 // C++ std for the thread-pool implementation
 #include <atomic>
-#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
@@ -1573,88 +1572,7 @@ char* bz_path_absolute(const char* path) {
 }
 
 // ---------------------------------------------------------------------------
-// Task scheduler — pthread-based thread pool + §30.13 serial-per-domain layer
-// ---------------------------------------------------------------------------
-//
-// §30.13 (v0.131+): every Bezel async continuation belongs to an *execution
-// domain*.  Within a domain, at most one continuation runs at any instant
-// (run-to-completion semantics): the domain serializes its own work while
-// pool threads can still serve different domains concurrently (reserved for
-// future Domain.Spawn).
-//
-// Implementation sketch:
-//   bz_domain_t — owns a deque of ready continuations, a mutex, and an
-//     `active` flag.  When a continuation is enqueued and the domain is NOT
-//     active, the domain is marked active and handed (as a unit) to a pool
-//     worker.  The worker drains the deque one continuation at a time under
-//     the domain mutex, re-checking under lock after each item; when the
-//     deque is empty it clears `active` and releases the domain.  If the
-//     domain IS already active when a continuation is enqueued, the enqueue
-//     just appends — the active runner will pick it up on its next check.
-//     This achieves at-most-one-running-continuation-per-domain with the pool
-//     providing the parallelism budget for multi-domain programs.
-//
-//   g_main_domain — the single domain used by all tasks in current single-
-//     domain programs.  All bz_task_alloc() tasks attach to it.
-//
-//   bz_task_t.domain — pointer to the owning domain (always g_main_domain
-//     for now; Domain.Spawn will supply a fresh domain).
-//
-// Inline fast-path in bz_task_then (already-done):
-//   The caller of bz_task_then is itself a continuation running inside the
-//   domain's active runner.  Firing the next continuation *inline* (on the
-//   same C call stack) would be correct for the memory-safety contract, but
-//   it would (a) recursively deepen the C stack for every already-done await
-//   chain and (b) skip the domain-queue round-trip that lets other
-//   continuations that arrived concurrently interleave at the right points.
-//   Routing through domain_enqueue is the correct run-to-completion
-//   implementation: the current continuation returns to the domain drain loop,
-//   which finds the newly-enqueued item and runs it next — a domain-level tail
-//   call without stack growth.
-//
-// bz_task_await_sync (blocking sync-wait for async Main):
-//   The main OS thread calls this to block until the top-level Task completes.
-//   It parks on the task's condition variable; pool workers running domain
-//   drains eventually complete the task (via bz_task_complete → task_notify),
-//   which calls notify_all on the task cv, waking the main thread.  The main
-//   thread is NOT a domain runner — it holds no domain mutex while waiting —
-//   so this cannot deadlock.
-
-// Forward declaration: bz_domain_t drain uses bz_task_t::Cont signature.
-struct bz_domain_t;
-struct bz_task_t;
-static void domain_enqueue(bz_domain_t* dom,
-                           void (*fn)(void*, void*), void* task, void* state);
-
-// ---------------------------------------------------------------------------
-// bz_domain_t — serial execution unit (§30.13 / #618)
-// ---------------------------------------------------------------------------
-
-struct bz_domain_t {
-    struct Cont { void (*fn)(void*, void*); void* task; void* state; };
-
-    std::deque<Cont>  queue;          // ready-to-run continuations
-    std::mutex        mtx;            // guards queue and active
-    bool              active = false; // true while a pool worker is draining
-
-    // Enqueue a continuation.  If the domain is idle, mark it active and
-    // return true so the caller submits a drain to the pool.  If already
-    // active, just enqueue and return false — the active runner picks it up.
-    bool enqueue_and_claim(Cont c) {
-        std::lock_guard<std::mutex> lk(mtx);
-        queue.push_back(c);
-        if (!active) {
-            active = true;
-            return true;   // caller must submit domain_drain to pool
-        }
-        return false;      // active runner will pick up the new item
-    }
-};
-
-static bz_domain_t* g_main_domain = nullptr;
-
-// ---------------------------------------------------------------------------
-// bz_task_t
+// Task scheduler — pthread-based thread pool
 // ---------------------------------------------------------------------------
 
 struct bz_task_t {
@@ -1674,17 +1592,10 @@ struct bz_task_t {
     void* error_obj = nullptr;
     void* result = nullptr;
     int64_t result_size = 0;
-    // §30.13 (#618): owning execution domain (set at allocation; always
-    // g_main_domain for current single-domain programs).
-    bz_domain_t* domain = nullptr;
-    // Continuation chain (registered by bz_task_then before the task completes)
+    // Continuation chain
     struct Cont { void (*fn)(void*, void*); void* state; };
     std::vector<Cont> continuations;
 };
-
-// ---------------------------------------------------------------------------
-// BzScheduler — POSIX thread pool (workers serve domain drains)
-// ---------------------------------------------------------------------------
 
 struct BzScheduler {
     std::vector<std::thread> threads;
@@ -1718,60 +1629,7 @@ struct BzScheduler {
 
 static BzScheduler* g_scheduler = nullptr;
 
-// ---------------------------------------------------------------------------
-// domain_drain — drains one domain's queue on a pool worker (§30.13 / #618)
-// ---------------------------------------------------------------------------
-//
-// Run continuations one-at-a-time until the deque is empty, then release the
-// domain.  Re-acquires the mutex between continuations so late-arriving items
-// (from timer completions or concurrent completions) are picked up without
-// needing a new pool submission.
-static void domain_drain(bz_domain_t* dom) {
-    for (;;) {
-        bz_domain_t::Cont c;
-        {
-            std::lock_guard<std::mutex> lk(dom->mtx);
-            if (dom->queue.empty()) {
-                dom->active = false;
-                return;   // nothing left; release the domain
-            }
-            c = dom->queue.front();
-            dom->queue.pop_front();
-        }
-        // Run the continuation WITHOUT holding the domain mutex so other
-        // threads (timer completions, WhenAll/WhenAny callbacks) can enqueue
-        // to the domain while the continuation executes.  The lock is
-        // re-acquired at the top of the loop.
-        c.fn(c.task, c.state);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// domain_enqueue — single path through which all continuations are queued
-// ---------------------------------------------------------------------------
-static void domain_enqueue(bz_domain_t* dom,
-                           void (*fn)(void*, void*), void* task, void* state) {
-    if (!dom) {
-        // Fallback: no domain yet (guard against pre-init calls).
-        if (g_scheduler)
-            g_scheduler->submit([fn, task, state](){ fn(task, state); });
-        else
-            fn(task, state);
-        return;
-    }
-    bool need_submit = dom->enqueue_and_claim({fn, task, state});
-    if (need_submit && g_scheduler)
-        g_scheduler->submit([dom](){ domain_drain(dom); });
-    else if (need_submit)
-        domain_drain(dom);  // no pool: drain inline (single-threaded fallback)
-}
-
-// ---------------------------------------------------------------------------
-// Scheduler lifecycle
-// ---------------------------------------------------------------------------
-
 void bz_scheduler_init(int num_threads) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
     if (g_scheduler) return;
     g_scheduler = new BzScheduler();
     for (int i = 0; i < num_threads; i++)
@@ -1785,41 +1643,25 @@ void bz_scheduler_shutdown(void) {
     for (auto& t : g_scheduler->threads) t.join();
     delete g_scheduler;
     g_scheduler = nullptr;
-    // Reset the main domain for process re-use (e.g. repeated JIT test runs).
-    delete g_main_domain;
-    g_main_domain = nullptr;
 }
 
 void* bz_task_alloc(void) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
-    auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    return task;
+    return new bz_task_t();
 }
 
-// §30.13 (#618): schedule the initial entry-point continuation for a task (the
-// state-machine Resume that starts the async method body).  Route through the
-// task's domain so the initial run is also serialized within the domain.
 void bz_task_schedule(void* tp, void (*fn)(void* task, void* state), void* state) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
     if (!g_scheduler) bz_scheduler_init(4); // lazy init
     auto* task = (bz_task_t*)tp;
-    bz_domain_t* dom = task->domain ? task->domain : g_main_domain;
-    domain_enqueue(dom, fn, task, state);
+    g_scheduler->submit([task, fn, state]() { fn(task, state); });
 }
 
 // stdlib §6.7 / §30.10: Task.Delay(ms). Allocate a fresh (incomplete) task and
 // post a worker that sleeps `ms` then completes it with no value. The task is
 // genuinely incomplete at return, so an `await Task.Delay(...)` hits the suspend
-// path (bz_task_then) and resumes via the domain queue when the sleep elapses
-// (§30.13 / #618).  The Delay timer runs on a raw pool worker (outside any
-// domain), which calls bz_task_complete -> task_notify -> domain_enqueue to
-// re-queue the awaiting continuation back into its domain.
+// path (bz_task_then) and resumes on the pool when the sleep elapses (§30.13).
 void* bz_task_delay(int64_t milliseconds) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
     if (!g_scheduler) bz_scheduler_init(4);   // ensure a pool exists
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
     int64_t ms = milliseconds < 0 ? 0 : milliseconds;
     g_scheduler->submit([task, ms]() {
         if (ms > 0)
@@ -1830,35 +1672,47 @@ void* bz_task_delay(int64_t milliseconds) {
 }
 
 static void task_notify(bz_task_t* task) {
-    // §30.13 (#439 / #618): wake any sync-awaiter FIRST, then enqueue
-    // continuations to the task's DOMAIN queue (not directly to the pool).
+    // §30.13 (#439): wake any sync-awaiter FIRST, then dispatch continuations.
     //
     // Ordering is load-bearing for cross-thread safety. A continuation may FREE
     // the task (the await-resume that fired it frees an anonymous producer task —
     // e.g. `await Task.Delay(...)` — via bz_task_free). Once a continuation is
-    // enqueued to the domain, a worker can run it and free `task` at any moment,
-    // so task_notify must not touch `task` (its mutex / cv) AFTER the enqueue.
-    // We therefore: (1) snapshot the continuation list and domain pointer, and
-    // (2) notify the cv INSIDE the lock, then (3) enqueue the continuations (and
-    // never touch `task` or its fields again) after releasing the lock.
+    // submitted to the pool, another worker can run it and free `task` at any
+    // moment, so task_notify must not touch `task` (its mutex / cv) AFTER the
+    // submit. We therefore: (1) snapshot the continuation list and (2) notify the
+    // cv INSIDE the lock, then (3) submit the continuations (and never touch
+    // `task` or its fields again) after releasing the lock.
     //
     // notify_all() must be called while holding task->mtx (#445 / §30.5 race fix):
     // a sync-awaiter (bz_task_await_sync) may call bz_task_free immediately on
-    // waking, which destroys the condition_variable. Holding the mutex during
+    // waking, which destroys the condition_variable. POSIX pthread_cond_broadcast
+    // is not instantaneous — if the awaiter destroys the cond_t before broadcast
+    // finishes its internal bookkeeping, the result is undefined behaviour (TSan
+    // reports a data race on the cond_t internals). Holding the mutex during
     // notify_all ensures the awaiter cannot re-acquire the mutex and proceed to
-    // free the task until AFTER notify_all returns.
+    // free the task until AFTER notify_all returns, by which point this thread is
+    // done with the cv. The awaiter's cv.wait() releases the mutex atomically
+    // while it sleeps and re-acquires it upon waking before returning, so
+    // notify_all-under-lock does not deadlock. Submitting continuations is still
+    // done AFTER releasing the lock (scheduler->submit acquires the scheduler
+    // mutex; the lock ordering task->mtx then scheduler->mtx is consistent with
+    // the worker path which holds scheduler->mtx only while dequeuing and then
+    // releases it before running the work item, so no cycle).
     std::vector<bz_task_t::Cont> conts;
-    bz_domain_t* dom;
     {
         std::lock_guard<std::mutex> lk(task->mtx);
         conts = task->continuations;
-        dom   = task->domain;
         task->cv.notify_all();
     }
     // task may be freed by a woken sync-awaiter from this point on; do not
-    // touch task->mtx or task->cv again.
+    // touch task->mtx or task->cv again. The pointer `task` itself is still
+    // alive long enough to read conts (which we already snapshotted above) and
+    // to pass to the scheduler lambda (the lambda captures the pointer value,
+    // not a field of task; the continuation fn is responsible for task's
+    // lifetime on the continuation path).
     for (auto& c : conts)
-        domain_enqueue(dom, c.fn, task, c.state);
+        if (g_scheduler) g_scheduler->submit([c, task](){ c.fn(task, c.state); });
+        else c.fn(task, c.state);
 }
 
 void bz_task_complete(void* tp, const void* result, int64_t result_size) {
@@ -1899,7 +1753,7 @@ void bz_task_complete_error_obj(void* tp, void* error_obj) {
 }
 
 // §30.9: retrieve the original exception object (valid after bz_task_is_error).
-// Null when the fault carries only a message.
+// Null when the fault carried only a message.
 void* bz_task_error_obj(void* tp) {
     return ((bz_task_t*)tp)->error_obj;
 }
@@ -1916,20 +1770,6 @@ bool bz_task_is_error(void* tp) {
     return task->is_error;
 }
 
-// §30.13 / bz_task_await_sync: the main OS thread (emitted by the async-Main
-// wrapper in LlvmBackend_Async.cpp) blocks here until the top-level Task
-// completes.  This function is NOT a domain continuation: the main thread is
-// not a domain runner, holds no domain mutex while waiting, and just parks on
-// the task's condition variable.  Pool workers running domain drains eventually
-// complete the task (via bz_task_complete -> task_notify), which calls
-// notify_all on the task cv, waking this thread.  No deadlock is possible:
-//   - The main thread holds only task->mtx during cv.wait (released atomically
-//     by wait; re-acquired only for the predicate check, then released before
-//     returning).
-//   - Domain drains hold only dom->mtx while manipulating the deque, never
-//     while running continuations.
-//   - Lock ordering is always task->mtx then dom->mtx (in task_notify/
-//     domain_enqueue), never reversed.
 void* bz_task_await_sync(void* tp) {
     auto* task = (bz_task_t*)tp;
     std::unique_lock<std::mutex> lk(task->mtx);
@@ -1941,29 +1781,18 @@ const char* bz_task_error(void* tp) {
     return ((bz_task_t*)tp)->error_msg;
 }
 
-// §30.13 (#618): bz_task_then routes the continuation through the task's domain
-// queue regardless of the already-done fast path.
-//
-// When already_done is true the caller is executing as the domain's active
-// runner (it is itself a continuation that just ran and is chaining the next
-// step via bz_task_then).  Routing through domain_enqueue means: the current
-// continuation returns to the domain drain loop, which finds the newly-enqueued
-// item and runs it next — a domain-level tail call without stack growth.  This
-// is the correct run-to-completion implementation: other continuations that
-// arrived concurrently (e.g. from a parallel timer completion on a sub-task)
-// can be interleaved at the right points between the already-done items.
 void bz_task_then(void* tp, void (*cont)(void* task, void* state), void* state) {
     auto* task = (bz_task_t*)tp;
     bool already_done;
-    bz_domain_t* dom;
     {
         std::lock_guard<std::mutex> lk(task->mtx);
         already_done = task->done;
-        dom = task->domain;
         if (!already_done) task->continuations.push_back({cont, state});
     }
-    if (already_done)
-        domain_enqueue(dom, cont, task, state);
+    if (already_done) {
+        if (g_scheduler) g_scheduler->submit([cont, task, state](){ cont(task, state); });
+        else cont(task, state);
+    }
 }
 
 void bz_task_free(void* tp) {
@@ -1979,9 +1808,7 @@ void bz_task_free(void* tp) {
 // thread-pool submission). result == null / result_size == 0 produces an
 // already-completed no-value task (the primitive behind Task.CompletedTask).
 void* bz_task_from_result(const void* result, int64_t result_size) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
     if (result_size > 0 && result) {
         task->result = malloc((size_t)result_size);
         memcpy(task->result, result, (size_t)result_size);
@@ -2020,11 +1847,9 @@ struct BzWhenAllCtx {
 };
 
 void* bz_task_when_all(void* task_arr) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
-    aggregate->domain = g_main_domain;
     if (n == 0) {
         aggregate->done = true;
         return aggregate;
@@ -2099,11 +1924,9 @@ struct BzWhenAllResultsSlot {
 };
 
 void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
-    aggregate->domain = g_main_domain;
     if (n == 0) {
         // Empty array: complete immediately with an empty Array<T>.
         void* emptyArr = bz_array_alloc(elem_size, 0);
@@ -2199,11 +2022,9 @@ struct BzWhenAnyCtx {
 };
 
 void* bz_task_when_any(void* task_arr) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
-    aggregate->domain = g_main_domain;
     if (n == 0) {
         aggregate->done = true;
         return aggregate;
@@ -4541,10 +4362,8 @@ static void* bz_task_make_oce(void* oce_vtable) {
 // done here. oce_vtable is the vtable pointer for OperationCanceledException,
 // supplied by codegen so the runtime can construct the exception object.
 void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtable) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
     auto* s = (bz_cancel_state_t*)token;
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
     // Pre-check: if already cancelled, fault immediately.
     if (s && s->cancelled) {
         void* excObj = bz_task_make_oce(oce_vtable);
