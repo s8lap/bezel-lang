@@ -168,6 +168,7 @@ set(BEZEL_TEST_SOURCES
     sema/alias_transparency_578_test.cpp
     sema/console_write_arity_591_test.cpp
     sema/user_dispose_method_594_test.cpp
+    sema/new_expr_collection_literal_599_test.cpp
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
     flow/cfg_suspend_test.cpp

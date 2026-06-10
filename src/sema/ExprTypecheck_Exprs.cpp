@@ -575,6 +575,49 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         if (ne->type) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
                 ctx_.setExprType(&e, rt);
+                // per §15.4 / §22.7 (#599): a collection literal `[..]`
+                // in a `new` argument position is a compile error when the
+                // constructor parameter is not a collection type.  The
+                // stdlib builtin collection types (Array<T>, Stack<T>, etc.)
+                // are represented as Named TypeRefs with a null declaration
+                // and expose only `constructor()` / `constructor(capacity:
+                // int)` — neither accepts a collection literal (§15.4
+                // requires a collection-typed target context for `[..]`).
+                // Codegen silently ignores all `new Array<T>(...)` arguments
+                // and always emits an empty-capacity allocation, so the
+                // misuse produces a silently empty collection (#599).
+                // Detect and reject here before codegen sees the node.
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty()) {
+                    std::string_view colName = rt->astNode->name->parts[0];
+                    bool isBuiltinColl =
+                        colName == "Array"     || colName == "OwnedArray"  ||
+                        colName == "Stack"     || colName == "OwnedStack"  ||
+                        colName == "Queue"     || colName == "OwnedQueue"  ||
+                        colName == "Set"       || colName == "OwnedSet"    ||
+                        colName == "LinkedList"|| colName == "OwnedLinkedList" ||
+                        colName == "Dictionary"|| colName == "OwnedDictionary" ||
+                        colName == "StringBuilder";
+                    if (isBuiltinColl) {
+                        for (const auto& a : ne->args) {
+                            if (a.value && dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                               a.value.get())) {
+                                // Report on the literal's position.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, a.value->span.begin,
+                                    std::string("collection literal `[..]` cannot be "
+                                        "passed as an argument to `new ") +
+                                    std::string(colName) +
+                                    "<...>` — the constructor takes an optional "
+                                    "`int` capacity, not a collection literal; use a "
+                                    "typed-target declaration instead: "
+                                    "`var x: " + std::string(colName) +
+                                    "<T> := [...]` (\xC2\xA7""15.4, #599)");
+                            }
+                        }
+                    }
+                }
                 // Slice S11: forbid `new` on abstract or static
                 // class types. Interfaces and (purely declarative)
                 // static-only types are also non-instantiable.
