@@ -12,12 +12,12 @@ The language is paper-designed: there are no users yet, and the compiler does no
 
 Five documents in `docs/`. Their roles are distinct; consult the right one for the question at hand.
 
-- **`Bezel_Language_Spec_<version>.md`** — the normative reference. Every syntactic and semantic rule. If you need to know what the language *is*, this is the answer. Appendix A is the complete grammar; Appendix C lists compiler-enforced invariants.
-- **`Bezel_Standard_Library_<version>.md`** — every type, method, and constant the stdlib provides. **Do not invent stdlib APIs.** If you need a type or method that isn't in this document, either (a) it doesn't exist and you need to use the real one, or (b) the stdlib genuinely lacks it and that's worth flagging as an issue.
-- **`Bezel_Design_Rationale_<version>.md`** — explains *why* each decision was made and what alternatives were considered and declined. When the spec says "X is forbidden," the rationale typically says why and what was tried instead. Read this when you're tempted to wonder "why doesn't Bezel just do Y?" — the answer is usually there.
+- **`Bezel_Language_Spec.md`** — the normative reference. Every syntactic and semantic rule. If you need to know what the language *is*, this is the answer. Appendix A is the complete grammar; Appendix C lists compiler-enforced invariants.
+- **`Bezel_Standard_Library.md`** — every type, method, and constant the stdlib provides. **Do not invent stdlib APIs.** If you need a type or method that isn't in this document, either (a) it doesn't exist and you need to use the real one, or (b) the stdlib genuinely lacks it and that's worth flagging as an issue.
+- **`Bezel_Design_Rationale.md`** — explains *why* each decision was made and what alternatives were considered and declined. When the spec says "X is forbidden," the rationale typically says why and what was tried instead. Read this when you're tempted to wonder "why doesn't Bezel just do Y?" — the answer is usually there.
 - **`Bezel_Guide_01_Memory_and_Ownership.md`** and **`Bezel_Guide_02_Errors_and_Nullability.md`** — short example-first guides showing idiomatic Bezel. Useful for understanding what *good* Bezel code looks like, and for spec-derived test material.
 
-The version number in the filename indicates the current revision. When new revisions land, the documents are renamed (not edited in place above the per-revision marker), so the filename you cite in a PR is a stable reference to a specific revision.
+The filenames are stable across revisions (since v0.131; earlier revisions carried the version in the filename, e.g. `Bezel_Language_Spec_0_130.md` — such citations refer to that archived revision in git history). The current revision number lives in each document's header and in the rationale's per-revision changelog. When citing the spec in a PR, test, or issue, cite the section *and* the revision (e.g. "spec §28.2, v0.131") so the reference stays pinned as revisions land.
 
 ## The rules of engagement
 
@@ -33,7 +33,7 @@ When the spec appears to have an error: same — open an issue, describe the app
 
 ### 2. Do not invent stdlib APIs
 
-A recurring failure mode in earlier drafting was producing code that looks plausible but uses types or methods the stdlib does not define (`MemoryStream`, `File.Open(path)`, methods on abstract `Stream`). This is forbidden. Every type and method referenced in compiler code, tests, or examples must be verifiable in `Bezel_Standard_Library_<version>.md`.
+A recurring failure mode in earlier drafting was producing code that looks plausible but uses types or methods the stdlib does not define (`MemoryStream`, `File.Open(path)`, methods on abstract `Stream`). This is forbidden. Every type and method referenced in compiler code, tests, or examples must be verifiable in `Bezel_Standard_Library.md`.
 
 If you need an API that doesn't exist, the right move depends on context: in compiler code, use what does exist; in a test, choose a different test that exercises real APIs; in an example, either pick a different scenario or open an issue proposing the stdlib addition.
 
