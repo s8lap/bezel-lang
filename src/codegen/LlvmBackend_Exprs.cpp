@@ -1775,6 +1775,19 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     genericBackingType(tt, 0, /*isSet=*/true, nullptr) != nullptr;
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {
+                    // §28.2 v0.135 / issue #627: checked-disposal guard for
+                    // array-backed collection Count/Length property access.
+                    // Skip for Set<T> (dict-backed); they use bz_dict_count.
+                    if (checkedDisposal_ && !dictBacked) {
+                        llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                        auto* isFn = declareC("bz_array_is_disposed", i8Ty,
+                                              {ptrTy()});
+                        llvm::Value* flag =
+                            builder_.CreateCall(isFn, {obj}, "cd.arrdis");
+                        llvm::Value* disposed = builder_.CreateICmpNE(
+                            flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                        emitGuardThrow(disposed, "DisposedAccessException");
+                    }
                     auto* fn = dictBacked
                         ? declareC("bz_dict_count", i64(), {ptrTy()})
                         : declareC("bz_array_len", i64(), {ptrTy()});
@@ -1785,6 +1798,18 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             if (isDictTypeName(tt)) {
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {
+                    // §28.2 v0.135 / issue #627: checked-disposal guard for
+                    // dict Count property access.
+                    if (checkedDisposal_) {
+                        llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                        auto* isFn = declareC("bz_dict_is_disposed", i8Ty,
+                                              {ptrTy()});
+                        llvm::Value* flag =
+                            builder_.CreateCall(isFn, {obj}, "cd.ddis");
+                        llvm::Value* disposed = builder_.CreateICmpNE(
+                            flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                        emitGuardThrow(disposed, "DisposedAccessException");
+                    }
                     auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
                     llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
                     return builder_.CreateTrunc(cnt64, i32(), "dict.cnt");

@@ -330,6 +330,10 @@ struct bz_dict_t {
     int64_t*    order;       // malloc'd array of bucket indices
     int64_t     order_count; // used length (including -1 tombstones)
     int64_t     order_cap;   // allocated slots in order[]
+    // §28.2 v0.135 / issue #627: checked-disposal-mode quarantine flag.
+    // Set by bz_dict_mark_disposed (called instead of bz_dict_free in checked
+    // builds); tested by bz_dict_is_disposed for method guards.
+    int8_t      disposed;
 };
 
 static uint32_t fnv1a(const char* s, int64_t len) {
@@ -430,6 +434,10 @@ void* bz_dict_alloc(void) {
 void bz_dict_free(void* dp, void (*dispose_val)(void*)) {
     if (!dp) return;
     auto* d = (bz_dict_t*)dp;
+    // §28.2 v0.135 / issue #627: in checked-disposal builds, bz_dict_mark_disposed
+    // quarantines the header (disposed=1, buckets freed) without freeing the block.
+    // A subsequent scope-end bz_dict_free must be a no-op — skip if already disposed.
+    if (d->disposed) return;
     for (int64_t i = 0; i < d->capacity; i++) {
         bz_entry_t& e = d->buckets[i];
         if (e.key && !e.deleted) {
@@ -440,6 +448,40 @@ void bz_dict_free(void* dp, void (*dispose_val)(void*)) {
     free(d->buckets);
     free(d->order);  // issue #622: release the insertion-order tracking array
     free(d);
+}
+
+// §28.2 v0.135 / issue #627: checked-disposal-mode quarantine for bz_dict_t.
+// Mirrors bz_array_mark_disposed: disposes values, frees the bucket/order
+// arrays, marks disposed=1 on the header, but does NOT free the header block —
+// keeping it alive so subsequent method-entry guards can read the disposed flag.
+// Idempotent (safe to call twice). Deliberate memory leak in checked (debug)
+// builds, consistent with the class-instance and array quarantine patterns.
+void bz_dict_mark_disposed(void* dp, void (*dispose_val)(void*)) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    if (d->disposed) return;  // idempotent
+    for (int64_t i = 0; i < d->capacity; i++) {
+        bz_entry_t& e = d->buckets[i];
+        if (e.key && !e.deleted) {
+            free(e.key);
+            if (dispose_val && e.val) dispose_val(e.val);
+        }
+    }
+    free(d->buckets);
+    d->buckets = nullptr;
+    d->count = 0;
+    free(d->order);
+    d->order = nullptr;
+    d->order_count = 0;
+    d->disposed = 1;
+    // Do NOT free(d) — header stays alive for the disposed-flag guard.
+}
+
+// §28.2 v0.135 / issue #627: return non-zero if the dict has been disposed
+// via bz_dict_mark_disposed (checked mode only).
+int8_t bz_dict_is_disposed(void* dp) {
+    if (!dp) return 0;
+    return ((bz_dict_t*)dp)->disposed;
 }
 
 bool bz_dict_try_get_str(void* dp, const char* k, int64_t k_len, void** out) {
@@ -1712,6 +1754,12 @@ struct bz_shared_t {
     long   weak;
     void (*dispose_value)(void*);
     int    value_disposed;   // 1 after the value has been disposed (idempotent guard)
+    // §28.2 v0.135 / issue #627: checked-disposal-mode quarantine flag.
+    // Set by bz_shared_mark_disposed (called from checked-mode explicit Dispose()
+    // instead of bz_shared_release). bz_shared_release becomes a no-op when this
+    // is set so the control block remains alive (deliberate leak in checked
+    // builds) for the disposed-flag guard in bz_shared_is_disposed.
+    int8_t handle_disposed;
 };
 
 // Allocate a new control block.  strong=1, weak=0. per §28.13 constructor.
@@ -1740,6 +1788,37 @@ void* bz_shared_get(void* handle) {
     return cb->value;
 }
 
+// §28.2 v0.135 / issue #627: checked-disposal-mode quarantine for Shared<T>.
+// Called instead of bz_shared_release for the explicit handle.Dispose() in
+// checked builds. Disposes the owned value and marks handle_disposed=1, but
+// does NOT free the control block — keeping it alive (deliberate leak in
+// checked/debug builds) so bz_shared_is_disposed can read the flag afterward.
+// Idempotent (safe to call twice). The scope-end bz_shared_release becomes a
+// no-op when handle_disposed is set (see bz_shared_release below).
+void bz_shared_mark_disposed(void* handle) {
+    if (!handle) return;
+    bz_shared_t* cb = (bz_shared_t*)handle;
+    if (cb->handle_disposed) return;  // idempotent
+    cb->handle_disposed = 1;
+    if (cb->strong > 0) {
+        cb->strong--;
+        if (cb->strong == 0 && !cb->value_disposed) {
+            cb->value_disposed = 1;
+            if (cb->dispose_value && cb->value)
+                cb->dispose_value(cb->value);
+            cb->value = nullptr;
+        }
+    }
+    // Do NOT free(cb) — block stays alive for the disposed-flag guard.
+}
+
+// §28.2 v0.135 / issue #627: return non-zero if the Shared<T> handle has been
+// quarantined via bz_shared_mark_disposed (checked-disposal builds only).
+int8_t bz_shared_is_disposed(void* handle) {
+    if (!handle) return 0;
+    return ((bz_shared_t*)handle)->handle_disposed;
+}
+
 // Mint a Weak handle (same control block, weak count +1). §28.13 Downgrade.
 void* bz_shared_downgrade(void* handle) {
     bz_shared_t* cb = (bz_shared_t*)handle;
@@ -1763,9 +1842,14 @@ int bz_weak_try_upgrade(void* weak_handle, void** out_handle) {
 
 // Release one strong reference.  When the count hits 0, dispose the value;
 // when both counts hit 0 free the control block. §28.13 Dispose / Dispose().
+// §28.2 v0.135 / issue #627: in checked-disposal builds, bz_shared_mark_disposed
+// quarantines the handle (handle_disposed=1, block NOT freed). A subsequent
+// scope-end bz_shared_release call must be a no-op — skip if already quarantined.
 void bz_shared_release(void* handle) {
     bz_shared_t* cb = (bz_shared_t*)handle;
     if (!cb) return;
+    // Skip if already quarantined by bz_shared_mark_disposed (checked mode).
+    if (cb->handle_disposed) return;
     cb->strong--;
     if (cb->strong == 0 && !cb->value_disposed) {
         cb->value_disposed = 1;
@@ -1785,7 +1869,10 @@ void bz_weak_release(void* weak_handle) {
     cb->weak--;
     // The value was already disposed (strong == 0 got here first).
     // Free the block only when this was the last weak handle.
-    if (cb->strong == 0 && cb->weak == 0)
+    // §28.2 v0.135 / issue #627: do NOT free if handle_disposed is set —
+    // the block was quarantined by bz_shared_mark_disposed (checked builds)
+    // and must remain alive for the scope-end bz_shared_release no-op check.
+    if (cb->strong == 0 && cb->weak == 0 && !cb->handle_disposed)
         free(cb);
 }
 
