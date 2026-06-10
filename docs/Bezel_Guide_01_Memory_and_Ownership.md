@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification v0.131.*
+*A short, example-first guide. Companion to the Bezel Language Specification v0.132.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and refuses to compile a program that would leak or double-free. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 

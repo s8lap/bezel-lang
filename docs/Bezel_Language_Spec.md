@@ -1,14 +1,14 @@
 # Bezel Language Specification
 
-**Version 0.131 — June 2026**
+**Version 0.132 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
-This document is the normative reference for the language. It defines syntax, type system, ownership rules, and the semantics of every construct. It is intentionally dense — written to be precise rather than introductory — and is best read alongside its two companion documents: the design rationale, which explains *why* each decision was made and records the alternatives considered, and the standard library, which catalogs the types and methods the language ships with.
+This document is the normative reference for the language. It defines syntax, type system, ownership rules, and the semantics of every construct. The specification is partitioned into a Core level and a set of Extended features; Appendix D defines the levels and what a conformance claim at each means. It is intentionally dense — written to be precise rather than introductory — and is best read alongside its two companion documents: the design rationale, which explains *why* each decision was made and records the alternatives considered, and the standard library, which catalogs the types and methods the language ships with.
 
 If this is your first encounter with Bezel, the rationale's opening section is a gentler starting point: it sketches the goals of the language and the shape of its memory model before the spec's formal definitions begin. If you want concrete code first, the short companion guides (memory and ownership; errors and nullability) work from worked examples. Once you know what you are looking for, this document is the place to look it up.
 
-**Changes since v0.129** are summarized at the end of the design rationale; this file is the normative reference and does not narrate its own history.
+**Changes since v0.130** are summarized at the end of the design rationale; this file is the normative reference and does not narrate its own history.
 
 <a id="sec-contents"></a>
 ## Contents
@@ -50,6 +50,7 @@ If this is your first encounter with Bezel, the rationale's opening section is a
 35. [Appendix A: Grammar](#appendix-a-grammar)
 36. [Appendix B: Reserved Words](#appendix-b-reserved-words)
 37. [Appendix C: Compiler-Enforced Invariants](#appendix-c-compiler-enforced-invariants)
+38. [Appendix D: Conformance Levels](#appendix-d-conformance-levels)
 
 ---
 
@@ -263,6 +264,32 @@ By contrast, operators declared on user-defined record and class types are regul
 `string` straddles the two categories: it is a reference type (and not listed among the primitive value types in [§3.1](#sec-type-kinds)), but its comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`) are intrinsics, not declared overloads. Two reasons: classes — which `string` is — cannot overload `=` and `<>` per [§25.2](#sec-operator-overloading-restrictions) (they are reserved for reference equality on most classes; `string` overrides this with content equality through compiler intrinsics); and the ordering operators on `string` are defined uniformly as ordinal lexicographic comparison ([§4.6](#sec-string)), which the compiler implements directly rather than dispatching to a method. The asymmetry — `string`'s `+` is a declared overload while its `=` is intrinsic — reflects this rule about classes and equality, not a categorical statement that `string` is "primitive."
 
 This split — intrinsics for primitive numeric operators and class-typed equality, declared methods for user-defined and string-concatenation operators — keeps the std lib's primitive-wrapper declarations short (the wrappers exist mainly to host static methods like `Parse` and `MaxValue`, not to enumerate every operator) while preserving the regular operator-overload mechanism for user types.
+
+<a id="sec-derived-type-properties"></a>
+### 3.6 Derived type properties
+
+Several rules in this specification classify types by a predicate computed from the type's *structure* — its declaration and, for a generic type, its type arguments — rather than by anything the programmer declares. Such a predicate is a **derived type property**. This section defines the mechanism once; the individual properties are defined where their subject matter lives and obey the common rules below.
+
+The derived type properties of this revision:
+
+| Property | Defined in | Classifies |
+|---|---|---|
+| **trivial-dispose** | [§28](#sec-resource-management) intro, [§28.9](#sec-runtime-managed-types) | classes whose `Dispose()` does nothing: no destructor, no `owned` fields, no owning-inline-array fields, trivial-dispose base |
+| **borrow-bearing** | [§9.7](#sec-records-and-disposal) | records (and inline arrays, [§15.1](#sec-inline-arrays)) carrying at least one borrow of a non-runtime-managed reference type |
+| **auto-equality-bearing** | [§9.2](#sec-body-records) | records for which `=`, `GetHashCode`, and `ToString` are synthesized |
+| **serialization-eligible** | [§9.8](#sec-serialization-synthesis) | records and enums for which `Serialize`/`Deserialize` are synthesized |
+| **element category** | [§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans) | every type, as collection-element: value, runtime-managed reference, class/interface, or move-only value — the classification on which collection and buffer slot semantics dispatch |
+
+Common rules, normative for every derived type property:
+
+1. **Computed, never declared.** A derived type property cannot be asserted, opted into, or waived by annotation. It follows from structure; the only way to change it is to change the structure.
+2. **Per-instantiation evaluation for generics.** For a generic type or member, the property is evaluated at each instantiation, after substituting the type arguments. A generic body type-checks under the weakest assumption its constraints establish; an instantiation that violates a property-dependent requirement is rejected *at the instantiation site*, with a diagnostic naming the property, the offending type argument, and the structural reason ([§28.5](#sec-owned-fields)'s generic-owned-field check and the owning-collection element restriction of [§14.4](#sec-owned-as-a-generic-argument) follow this pattern).
+3. **Part of the public contract.** A declaration change that flips a derived type property of a public type — adding a destructor flips trivial-dispose; adding a computed property in the wrong form flips auto-equality-bearing — is a breaking change for clients relying on it, exactly as a signature change is. Library documentation should state the properties a type's clients are expected to rely on.
+4. **Named in diagnostics.** A diagnostic produced by a property-dependent rule names the property in the words of the table above, so the reader can find the defining section.
+
+Dispatch of *behavior* (not merely admissibility) on a derived type property — as the element category does for buffer and collection slot semantics ([§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) — is reserved to compiler-known standard-library types; it is not a user-available mechanism in this revision.
+
+New rules added to this specification that need a structural classification of types must define it as a derived type property under the rules of this section, rather than introducing a parallel mechanism.
 
 ---
 
@@ -840,7 +867,7 @@ A body-only record receives auto-generated `=`, `<>`, `GetHashCode`, and `ToStri
 - An overload of a non-equality operator.
 - A constructor.
 
-Such a record is said to be **auto-equality-bearing**. The generated `=` compares each auto-property by its declared type's `=`; the generated `GetHashCode` combines per-property hashes; the generated `ToString` produces `"TypeName(Prop1: value1, Prop2: value2)"` over the auto-properties in declaration order (matching the positional-record form in [§8.5](#sec-tostring)). Computed (expression-bodied) properties are not part of the equality comparison or the ToString output even when they are visible on the public surface — equality and the auto-formatted representation are always over storage, never over derived values.
+Such a record is said to be **auto-equality-bearing** — a derived type property ([§3.6](#sec-derived-type-properties)). The generated `=` compares each auto-property by its declared type's `=`; the generated `GetHashCode` combines per-property hashes; the generated `ToString` produces `"TypeName(Prop1: value1, Prop2: value2)"` over the auto-properties in declaration order (matching the positional-record form in [§8.5](#sec-tostring)). Computed (expression-bodied) properties are not part of the equality comparison or the ToString output even when they are visible on the public surface — equality and the auto-formatted representation are always over storage, never over derived values.
 
 A body record is **not** auto-equality-bearing — and `=` on it without an explicit overload is a compile error — when it contains:
 
@@ -936,7 +963,7 @@ Records are implicitly sealed. A record may not inherit from another record or f
 
 Records cannot have destructors, `owned` fields, or implement `IDisposable`. Records also cannot have inline-array fields whose slots carry the `owned` marker (`[N owned]T?` or `[N owned]T`); such fields are move-only value types ([§15.3](#sec-move-only-value-types)), and records support only copy semantics. Reference-typed fields in records are always borrows; the record does not own what they point to. See [§28](#sec-resource-management).
 
-A record type is a **borrow-bearing record** if it holds at least one *borrow-carrying* field of a non-runtime-managed type. A field is borrow-carrying when:
+A record type is a **borrow-bearing record** — a derived type property ([§3.6](#sec-derived-type-properties)) — if it holds at least one *borrow-carrying* field of a non-runtime-managed type. A field is borrow-carrying when:
 
 - Its type is a reference type (class or interface, nullable or not, including the `T?` forms).
 - Its type is an inline array whose element type is a reference type (`[N]C`, `[N]C?` for class-or-interface C).
@@ -961,7 +988,7 @@ A record or enum that declares conformance to `ISerializable` and/or `IDeseriali
 <a id="sec-synthesis-eligibility"></a>
 #### Synthesis-eligibility
 
-A type is **serialization-eligible** when it is a record or an enum and every serialized component is itself serializable:
+A type is **serialization-eligible** — a derived type property ([§3.6](#sec-derived-type-properties)) — when it is a record or an enum and every serialized component is itself serializable:
 
 - **Enums** are always serialization-eligible. The synthesized form writes the member *name* as a string (via `WriteString`) and reads it back by matching against the declared members; a value that is not a declared constant (a "raw" enum value, [§10](#sec-enums)) raises `SerializationException` on write and on read. Writing the name rather than the underlying integer makes the encoded form stable against reordering or renumbering of members and self-describing in text formats; programs that need the integer form serialize `int(e)` (or the underlying-typed cast) explicitly through a hand-written `Serialize`.
 - **Positional records** ([§9.1](#sec-positional-records)) are serialization-eligible when every positional field's type is serialization-eligible. The synthesized form is an object whose field names are the positional-field names in declaration order.
@@ -4714,7 +4741,7 @@ Bezel has no garbage collector. Class instances are heap-allocated by `new` and 
 
 A small set of types are **runtime-managed** and exempt from manual disposal: `string`, boxed value types, and lambda closures ([§28.9](#sec-runtime-managed-types)).
 
-For **trivial-dispose** class instances ([§28.9](#sec-runtime-managed-types)) — classes with no destructor, no owned fields, no fields of owning-inline-array type ([§15.1.1](#sec-owning-inline-arrays)), and a trivial-dispose base — abandoning a reference does not leak any user-defined cleanup, because there is no cleanup to leak. Memory for such instances is reclaimed by an implementation-defined mechanism (reference counting, region allocation, or another scheme) that runs no user code; the choice is invisible to programs because no destructor needs to run. This mechanism is *not* a garbage collector in the sense Bezel avoids: it does not scan the heap, does not pause threads, does not invoke user code, and does not affect timing of any operation a program can observe. It is the bookkeeping needed to satisfy the universal contract — every class instance with a non-trivial `Dispose()` reaches an owned location, becomes the operand of `using var`, or is explicitly disposed — without forcing programmers to write `using var _ := new MarkerObject();` for objects whose disposal does nothing.
+For **trivial-dispose** class instances ([§28.9](#sec-runtime-managed-types)) — classes with no destructor, no owned fields, no fields of owning-inline-array type ([§15.1.1](#sec-owning-inline-arrays)), and a trivial-dispose base; this is a derived type property ([§3.6](#sec-derived-type-properties)) — abandoning a reference does not leak any user-defined cleanup, because there is no cleanup to leak. Memory for such instances is reclaimed by an implementation-defined mechanism (reference counting, region allocation, or another scheme) that runs no user code; the choice is invisible to programs because no destructor needs to run. This mechanism is *not* a garbage collector in the sense Bezel avoids: it does not scan the heap, does not pause threads, does not invoke user code, and does not affect timing of any operation a program can observe. It is the bookkeeping needed to satisfy the universal contract — every class instance with a non-trivial `Dispose()` reaches an owned location, becomes the operand of `using var`, or is explicitly disposed — without forcing programmers to write `using var _ := new MarkerObject();` for objects whose disposal does nothing.
 
 The discard form `_ := expr;` ([§17.13](#sec-the-discard-_)) is restricted accordingly: it is rejected at compile time for class types whose `Dispose()` is non-trivial, including all `Task` types. For supervised fire-and-forget on tasks, use `Task.FireAndForget` ([§30.10](#sec-standard-library-task-helpers)).
 
@@ -5469,6 +5496,34 @@ Bezel has two families of collection types:
 - **Owning collections** (`OwnedArray<T>`, `OwnedLinkedList<T>`, `OwnedDictionary<K, V>`, `OwnedSet<T>`, `OwnedStack<T>`, `OwnedQueue<T>`) own their elements. The collection's `Dispose()` cascades through every element. `Add` takes ownership; the indexer setter disposes the previous slot value before installing the new one; `Remove`/`RemoveAt`/`Clear` dispose the affected elements. Owning collections require `where T: class` (and, for `OwnedDictionary<K, V>`, `where V: class`) — owning makes sense only for class-typed values.
 
 The two families are declared separately in the standard library ([§4](Bezel_Standard_Library.md#sec-system-collections-generic)). A program chooses the form that matches the intended ownership semantics. There is no implicit conversion between the two families; an `OwnedArray<Connection>` is not an `Array<Connection>` and vice versa.
+
+<a id="sec-element-slot-policy"></a>
+#### The element slot policy
+
+Every standard collection's element semantics follow from one classification, not from per-collection rules. A collection's slots are classified by the collection's family and the element type's *element category* — a derived type property ([§3.6](#sec-derived-type-properties)):
+
+| Element category | Borrowing family slots | Owning family slots |
+|---|---|---|
+| value type (non-move-only) | copies | *(rejected at instantiation)* |
+| runtime-managed reference (`string`, function types, boxed values; [§28.9](#sec-runtime-managed-types)) | shared references | *(rejected at instantiation)* |
+| class / interface type | borrows | owned |
+| move-only value type ([§15.3](#sec-move-only-value-types)) | *(rejected at instantiation)* | *(rejected at instantiation)* |
+
+(The owning family admits only class/interface element types; see the instantiation-site restriction in [§14.4](#sec-owned-as-a-generic-argument). Move-only element types are deferred for both families — see stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans) and the rationale.) For dictionaries the classification applies independently to the key slots and the value slots: an owning dictionary owns its *values*; its keys are value-like and classified per the borrowing column (stdlib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)).
+
+The slot kind alone determines what every element operation does:
+
+| Operation | copy slots | shared-reference slots | borrow slots | owned slots |
+|---|---|---|---|---|
+| store (`Add`, `Insert`, indexer-set) | copies the value in | stores the reference | stores the borrow; the element's source must outlive the collection's use of it | takes `owned`; indexer-set disposes the previous value first (skipped for a moved-from slot) |
+| `Remove` / `RemoveAt` | drops the copy | drops the reference | drops the borrow; the caller's ownership is unaffected | **disposes** the removed element |
+| `Clear()` | drops all | drops all | drops all | **disposes** every element |
+| `Dispose()` of the collection | frees storage | frees storage | frees storage; elements untouched | **disposes** every live element — reverse-insertion order for ordered collections, implementation-defined order for unordered — then frees storage |
+| indexer-get / default iteration | copy out | reference out | borrow out (source: the element's original owner; the collection is a transit point) | borrow out (source: the collection) |
+| ownership out | *(none — nothing owned)* | *(none)* | *(none)* | `move coll[i]`, the `Pop*` family, `Drain()` |
+| `DisposeElements()` | equivalent to `Clear()` | equivalent to `Clear()` | disposes every class-typed element, then empties | *(not declared — `Dispose()` already cascades)* |
+
+The per-collection clauses in the remainder of this section and in the standard library document ([§4](Bezel_Standard_Library.md#sec-system-collections-generic)) are presentations of this table for each concrete type; they do not introduce element semantics of their own, and a per-collection statement that diverges from the table is a defect in this specification. The storage embodiment of the owning column is `OwnedBuffer<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), the primitive over which the resizable owning collections compose; the borrowing family's storage remains a compiler intrinsic in this revision, because a user-expressible borrow-storing primitive needs its own borrow-lifetime rules (storing borrows in fields is otherwise rejected, [§28.3](#sec-local-variables-ownership-and-borrows)) — that design is deferred, recorded in the rationale.
 
 <a id="sec-borrowing-collections"></a>
 #### Borrowing collections
@@ -8099,3 +8154,44 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A class declares at most one qualifying `Main`; multiple qualifying overloads in the same class are rejected at compile time without flag-based override.
 - `Main` is `public static`. If `async`, its return type is `Task`, `Task<int>`, or one of the parameterized forms; otherwise it returns `()` or `int`.
 
+
+---
+
+<a id="appendix-d-conformance-levels"></a>
+## Appendix D: Conformance Levels
+
+This specification defines two conformance levels. The partition exists so that an implementation can be *complete and sound for a well-defined inner language* before the outer features are attempted, and so that the test-suite and teaching material can follow the same boundary.
+
+<a id="sec-the-levels"></a>
+### D.1 The levels
+
+- **Core conformance.** An implementation conforms at the Core level when it implements every normative rule of this specification *except* the Extended features listed in D.2, and *rejects* — with a diagnostic naming the construct and the feature — any program that uses an Extended feature it does not implement. Silent misbehavior on Extended input is non-conforming; clean rejection is the Core-conforming response.
+- **Full conformance.** An implementation conforms at the Full level when it implements the entire specification: Core plus every Extended feature.
+
+An implementation may also conform at "Core plus named features" (e.g., *Core + Events + FFI*), implementing some Extended features and rejecting the rest; a conformance claim of this form names the features implemented.
+
+<a id="sec-extended-features"></a>
+### D.2 The Extended features
+
+| Feature | Specification sections | Standard-library sections |
+|---|---|---|
+| **Events** | [§24](#sec-events) | `EventSource<T>`, `IEvent<T>`, `AsyncEventSource<T>`, `IAsyncEvent<T>`, `Subscription` (stdlib [§2.11](Bezel_Standard_Library.md#sec-subscription)) |
+| **Asynchronous programming** | [§30](#sec-asynchronous-programming) entire; [§28.12](#sec-asynchronous-disposal) (`await using`, `IAsyncDisposable`); the async-iterator forms of [§29](#sec-iteration-2) (`IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `OwnedAsyncEnumerable<T>`, `OwnedAsyncEnumerator<T>`) | `Task`, `Task<T>`, `OwnedTask<T>`, completion sources, `CancellationToken`/`CancellationTokenSource`, `Mutex`/`Semaphore`/`Atomic<T>`, the async forms of IO and sequence operations |
+| **Serialization synthesis** | [§9.8](#sec-serialization-synthesis) | stdlib §2.14–2.15 |
+| **Foreign Function Interface** | [§32](#sec-foreign-function-interface); the FFI clauses of [§15.1.3](#sec-inline-array-ffi) | — |
+| **Buffers and spans** | the buffer/span clauses of [§28.11](#sec-collection-element-ownership) (`move` on `OwnedBuffer`/`Span` slots) | stdlib §3.3–3.4, §4.14–4.16 |
+| **Sequence operations (LINQ-style)** | — | stdlib §5 entire |
+
+Everything not listed is **Core**: lexical structure through generics, records, enums, classes, interfaces, inheritance, nullability, patterns and `case`, expressions and statements, operators and overloading, properties and indexers, the entire ownership system of [§28](#sec-resource-management) (except §28.12), synchronous iteration ([§29](#sec-iteration-2)'s non-async forms, including iterator methods and `OwnedEnumerable<T>`), exceptions ([§31](#sec-exception-handling)), the entry point, and the corresponding standard-library sections.
+
+<a id="sec-feature-dependencies"></a>
+### D.3 Dependencies and closure
+
+- Extended features depend on Core; Core depends on no Extended feature. The Core sections' references *into* Extended sections (e.g., [§28.3](#sec-local-variables-ownership-and-borrows)'s notes on async lambdas, [§9.7](#sec-records-and-disposal)'s span examples) are normative only for implementations of the referenced feature.
+- The async-iterator forms belong to **Asynchronous programming** and additionally require synchronous iteration (Core). **Buffers and spans** and **Sequence operations** depend only on Core. **Events**' async event source requires **Asynchronous programming**; the synchronous `EventSource<T>` does not.
+- A Core implementation's standard library omits the types of unimplemented Extended features entirely (they are absent, not stubbed); programs referencing them fail name resolution with the feature-naming diagnostic of D.1.
+
+<a id="sec-conformance-and-the-runtime-model"></a>
+### D.4 Conformance and the runtime model
+
+The execution-domain guarantees of [§30.13](#sec-runtime-model) are stated within the Asynchronous-programming feature, but their soundness consequences for [§28](#sec-resource-management) hold trivially in a Core implementation: with no `async`/`await`, every program is a single continuation in a single domain. A Core implementation therefore satisfies the domain guarantees by construction.

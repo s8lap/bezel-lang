@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.131 — June 2026**
+**Companion to the Bezel Language Specification, v0.132 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1018,6 +1018,8 @@ ReportEach(myPool);            // OwnedArray<Connection> → IReadOnlyList<Conne
 The two hierarchies do *not* share mutating interfaces. `IList<T>` (borrowing) and `IOwnedList<T>` (owning) are unrelated types with no subtyping; code that abstracts over "any mutable list" must pick one. This is intentional — the semantic of `Add` differs between the two (borrow-taking vs. owned-taking), so there is no useful single abstraction over both.
 
 For draining iteration that transfers ownership, the owning collections expose `Drain()` returning `OwnedEnumerable<T>` (declared in [§4.13](#sec-owning-enumeration-interfaces)).
+
+Every collection's element semantics — what `Add`, `Remove`, `Clear`, the indexer, iteration, and `Dispose` do with the elements — derive from the element slot policy of language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy): the collection's family and the element type's category determine the slot kind, and the slot kind determines every element operation. The per-type sections below present that table for each concrete type; they introduce no element semantics of their own. The storage primitive embodying the owning column is `OwnedBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
 
 <a id="sec-arrayt"></a>
 ### 4.4 `Array<T>`

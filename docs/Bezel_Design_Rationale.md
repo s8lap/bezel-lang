@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.131 — June 2026**
+**Companion to the Bezel Language Specification, v0.132 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -615,6 +615,17 @@ The one real design question was that *tree-shape is not statically verifiable* 
 *Conclusion of the working-out.* The unobservability-under-constructor-side-effects proof **is dischargeable**, via a statically-checkable self-contained-constructor rule the existing escape analysis already has the machinery to enforce, and it discharges *without* weakening [§7.9](Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields). The cyclic case is therefore no longer "the single open problem"; it is a *specifiable* feature with a known eligibility restriction, gated now only on ordinary spec-design work: the wire mechanism for cycle-closing references (the identity/`$ref` table the DAG case already established, extended so a reference may target an object still under construction) and the `serialized` clause spelling. This subsection is the gate-clearing the project's discipline requires before that spec work — the next revision may specify cyclic synthesis for self-contained-constructor classes, exactly as v0.121 specified the DAG case after v0.120 cleared its gate. What is *not* claimed: this does not make every cyclic graph synthesizable; it discharges the proof for the statically-delimited eligible class and converts the remainder from "unresolved" to "explicitly excluded with reason" — the honest and complete form of the answer. *(v0.124: this discharge was made normative — language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis) specifies the `serialized cyclic` clause, the self-contained-constructor eligibility rule as a compile-time check, and the two-phase construction, exactly as worked out here and with [§7.9](Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields) preserved unmodified. The serialization stack is complete.)*
 
 **Why v0.114 ships only the vocabulary.** The format abstraction is the one piece that cannot be retrofitted: if the type-side interface ever names a format, or the format ever inspects type shape, the separation is lost and every later tier is built on sand. It also costs no language feature and the writing direction is usable by hand the day it ships. Shipping it now, alone, fixes the architectural keystone at zero language cost and lets the synthesis feature, the concrete formats, and the customization mechanism land later as independent, non-breaking additions — each forward-compatible because the vocabulary was designed, like `FromCollectionLiteral` before it, to be promotable rather than replaced. The disposition is the same one applied in [§5.17](#sec-why-no-class-deconstruction) and [§5.18](#sec-type-identity-not-reflection): ship what fits the language now, record the staged plan for what does not yet, keep every open question explicitly scoped.
+
+<a id="sec-one-element-policy"></a>
+### 5.20 One element policy, not twelve
+
+v0.132 adds the element slot policy (language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)): a single table — collection family × element category → slot kind, slot kind → the semantics of every element operation — from which all twelve standard collections derive their element behavior. The change is declarative, not behavioral: each collection's documented operations are unchanged; what changes is their *status*, from twelve independently-stated rule sets to twelve presentations of one rule.
+
+**Why.** The implementation experience made the cost of the per-collection statement concrete. The compiler hand-wired each collection's element handling separately, and the defect history clustered exactly there: a long series of bugs in which one collection's handling of one element category diverged from its siblings' — string elements compared by `memcmp` in one list operation but structurally in another, dictionary value decoding correct for one value category and garbage for the next, disposal order right in one container and wrong in its peer (#556, #558–#560, #562–#563, #565–#566, #570–#571, #598 among others). Every one of those bugs is, in the table's terms, a cell filled in inconsistently with its column. A normative table makes the column the authority: an implementation can implement the column once, and a divergence between a per-collection clause and the table is now *defined* to be a spec defect rather than a judgment call. This is the specification-side half of the direction recorded in #545 (implement the element policy once, type-keyed, instead of per collection); the spec now says the twelve behaviors *are* one behavior, so the implementation is licensed to build them that way.
+
+**What was already in place.** The owning column's storage embodiment, `OwnedBuffer<T>` (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans), [§5.15](#sec-owned-buffers-and-spans) above), existed since v0.99/v0.102, and its category-dispatched slot semantics were the prototype for the table; the owning family's rejection of runtime-managed element types was likewise already normative ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)). v0.132 did not have to invent the policy — it had to *name* it, state it once, and subordinate the per-collection prose to it.
+
+**The deferred half: a borrow-storing primitive.** The table's borrowing column has no user-expressible storage embodiment, and v0.132 deliberately does not add one. The blocker is principled: outside the compiler-known borrowing collections, storing a borrow in a field is rejected ([§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) — that rule is what makes borrow lifetimes statically trackable. A user-expressible `Buffer<T>`-of-borrows would need its own lifetime discipline (the collection-as-transit rules of [§28.11](Bezel_Language_Spec.md#sec-collection-element-ownership), generalized and made checkable for arbitrary user containers), which is real design work, not transcription. Until that work is done, borrowing collections remain compiler intrinsics specified by the table. **Declined** rather than attempted now: a quick dispensation ("classes marked somehow may store borrows") would re-open the soundness of the borrow tracker for a convenience the standard library does not itself need — the same shape of reasoning that declined `<owned T>` generic parameterization in v0.97 ([§5.11](#sec-owning-collections)).
 
 <a id="sec-nullability"></a>
 ## 6. Nullability
@@ -6414,6 +6425,67 @@ No conforming program changes meaning. A program could only observe the differen
 #### Editorial note
 
 The `linkify_refs.py` toolchain was not re-run for this revision. The substantive edits are localized (one §30.13 rewrite, five consequential rewordings, one new §28.2 subsection, one §31.4 tree entry plus a prose note, one new rationale §12.5, this changelog entry), and the inter-document filename references were updated mechanically with the version bump. The new cross-references were verified manually against existing anchors.
+
+---
+
+<a id="sec-v0-131-to-v0-132-changelog"></a>
+### v0.131 to v0.132 changelog
+
+v0.132 folds the three legs of the foundation amendment (#602). All three are *declarative* — they name, unify, and partition machinery the specification already had; none changes the meaning of any conforming program, and none adds a language construct. (This revision is also the first under stable document filenames: the version-in-filename convention was retired immediately after v0.131, with the revision number living in each document's header and in this changelog.)
+
+<a id="sec-v0-131-to-v0-132-changelog-summary"></a>
+#### Summary
+
+Three changes:
+
+1. **Derived type properties (#602, leg A).** New [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) defines once the mechanism the spec had been using four times over: a compiler-computed structural predicate on types, with uniform rules — computed never declared, evaluated per generic instantiation with instantiation-site diagnostics, part of the public contract, named in diagnostics. The existing four (trivial-dispose, borrow-bearing, auto-equality-bearing, serialization-eligible) plus the element category are tabulated as instances and their defining sections backlink to §3.6. New spec rules needing a structural classification must define it under §3.6 rather than inventing parallel machinery.
+
+2. **The element slot policy (#602, leg B).** New subsection in [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy): one table mapping collection family × element category to slot kind, and slot kind to the semantics of every element operation (store, remove, clear, dispose, get/iterate, ownership-out, `DisposeElements`). The per-collection clauses in spec §28.11 and stdlib §4 are demoted to presentations of the table; a divergence is now by definition a spec defect. The owning column's storage embodiment is the existing `OwnedBuffer<T>`; a user-expressible borrow-storing primitive is **deferred with reasons** (new rationale [§5.20](#sec-one-element-policy)).
+
+3. **Conformance levels (#602, leg C).** New [Appendix D](Bezel_Language_Spec.md#appendix-d-conformance-levels): a **Core** level (the language minus the listed Extended features, with mandatory clean rejection of unimplemented Extended constructs) and a **Full** level, plus "Core + named features" claims. Extended features: Events, Asynchronous programming (incl. §28.12 and the async-iterator forms), Serialization synthesis, FFI, Buffers and spans, Sequence operations. Dependencies and the Core-soundness note (§30.13's domain guarantees hold trivially in a sync-only Core) are stated in D.3/D.4.
+
+<a id="sec-v0-131-to-v0-132-changelog-602a"></a>
+#### The leg-A decision
+
+The spec had evolved the same mechanism four times — trivial-dispose (v-early), borrow-bearing (§9.7), auto-equality-bearing (§9.2), serialization-eligibility (§9.8) — and v0.102's buffer work had additionally introduced "type-parameter-category-dependent specialization" as a one-off compiler-known behavior ([§5.15](#sec-owned-buffers-and-spans)). Each was correct; each was specified from scratch; their generic-instantiation behavior and diagnostic conventions agreed only by imitation. Naming the mechanism makes the agreement normative, gives the next property (sendability, #600 phases 2–3, is the known next customer) a definition to cite instead of a pattern to imitate, and gives diagnostics a uniform vocabulary. One alternative was **declined**: user-declared marker traits (opt-in interfaces or attributes asserting a property). Declined because a declared property can lie — the entire value of trivial-dispose, borrow-bearing, and element-category dispatch is that they are *facts about structure* the compiler derives and cannot be miss-asserted; an assertion mechanism would convert structural soundness into programmer promises. Behavior-dispatch on these properties remains reserved to compiler-known standard-library types, unchanged from v0.102's scoping.
+
+<a id="sec-v0-131-to-v0-132-changelog-602b"></a>
+#### The leg-B decision
+
+Recorded in full as rationale [§5.20](#sec-one-element-policy): the implementation defect history (a dozen-plus bugs, each a single collection × element-category cell diverging from its column) motivated stating the policy once; `OwnedBuffer<T>` had already embodied the owning column since v0.99/v0.102, so the amendment names and subordinates rather than invents; the borrow-storing user primitive is deferred because it needs its own borrow-lifetime design (storing borrows in fields is otherwise rejected by [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)), and a quick dispensation was declined on v0.97-lesson grounds. The table also closes one small gap discovered during drafting: dictionary key slots are now explicitly classified per the borrowing column (owning dictionaries own values, never keys — consistent with stdlib §4.9's existing prose).
+
+<a id="sec-v0-131-to-v0-132-changelog-602c"></a>
+#### The leg-C decision
+
+The driver is the feature-interaction matrix: the language's subsystems are individually sound but their pairwise interactions are where both specification complexity and implementation defects concentrate. A defined inner language — Core — gives implementations, the test suite, and teaching a boundary that must be airtight before the outer ring composes with it. The partition criterion was *severability*: a feature is Extended if a program-rejecting implementation lacking it can still claim a coherent, useful language (events, async, serialization synthesis, FFI, buffers/spans, sequence operations all sever cleanly; nullability, ownership, generics, exceptions do not). Two alternatives were **declined**. *Fully à-la-carte feature flags* (every section independently optional): declined because most sections are not severable and the combinatorics of claims would be meaningless. *No levels* (the status quo): declined because the implementation already stages features de facto — the appendix makes the de-facto staging claimable and testable instead of informal. Mandatory clean rejection (not silent misbehavior) of unimplemented Extended constructs is the load-bearing clause; it is what makes a Core claim trustworthy.
+
+<a id="sec-v0-131-to-v0-132-changelog-language-spec-changes"></a>
+#### Language spec changes
+
+- **[§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)** — new section "Derived type properties": the mechanism, the table of the five current properties, the four common rules, the reservation of behavior-dispatch to compiler-known stdlib types.
+- **[§9.2](Bezel_Language_Spec.md#sec-body-records), [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal), [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis), [§28](Bezel_Language_Spec.md#sec-resource-management) intro** — one-line backlinks marking each defining site as a §3.6 instance.
+- **[§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)** — new subsection "The element slot policy": the family × category classification, the operation table, the derivation statement, the dictionary key/value clause, the deferred borrow-storing primitive note.
+- **[Appendix D](Bezel_Language_Spec.md#appendix-d-conformance-levels)** — new appendix "Conformance Levels" (D.1–D.4); Contents updated; one pointer sentence added to the document intro.
+
+<a id="sec-v0-131-to-v0-132-changelog-standard-library-changes"></a>
+#### Standard library changes
+
+- **[§4.3](Bezel_Standard_Library.md#sec-how-the-borrowing-and-owning-hierarchies-relate)** — one paragraph stating that the per-collection sections present, and do not define, element semantics (deriving from spec §28.11's slot policy), and naming `OwnedBuffer<T>` as the owning column's embodiment.
+
+<a id="sec-v0-131-to-v0-132-changelog-rationale-changes"></a>
+#### Rationale changes
+
+- New [§5.20](#sec-one-element-policy) "One element policy, not twelve", recording the leg-B reasoning, the defect-history evidence, and the deferred-with-reasons borrow-storing primitive.
+- This changelog entry.
+
+<a id="sec-v0-131-to-v0-132-changelog-migration"></a>
+#### Migration
+
+No conforming program changes meaning. Leg A and leg C are purely declarative. Leg B restates existing per-collection behavior as one rule; the only normative tightening is definitional (a future per-collection divergence is a spec defect, not an alternative reading). Implementations gain license, not obligations: the compiler may now implement element handling once, keyed by the slot table, and may stage features along the Appendix D partition — the current implementation's de-facto staging becomes claimable.
+
+#### Editorial note
+
+The `linkify_refs.py` toolchain was not re-run for this revision. The substantive edits are localized (one new §3.6, four one-line backlinks, one new §28.11 subsection, one new appendix plus Contents/intro pointers, one stdlib §4.3 paragraph, one new rationale §5.20, this changelog entry). No filename references changed (stable filenames as of this revision). The new cross-references were verified against existing anchors, including the §29 anchor disambiguation (`sec-iteration-2` for the chapter; `sec-iteration` is §16.5's range-iteration anchor).
 
 ---
 
