@@ -1813,6 +1813,35 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
             }
         }
     }
+    // §9 / §12 / §14 (issue #590, follow-on to #585): when `ms` is null AND the
+    // TARGET's static type is a bare GENERIC PARAMETER (`T` — a single-part Named
+    // TypeRef with no declaration), sema could not resolve the nested member: a
+    // field `_val: T` read as `_val.X` inside a generic method/ctor leaves `.X`
+    // unresolved because `T` has no members at the declaration site. Inside a
+    // MONOMORPHIZED body the active `genericSubstSemaTy_` binds `T` to its
+    // concrete type for this instantiation (e.g. `T → Pt`); resolve the member
+    // by name on that concrete type's declaration so `_val.X` GEPs the
+    // specialized record/class layout (without this the read fell through to
+    // `ret 0` — the standalone `Container<Pt>.GX()` and the inherited
+    // `Wrapper<Pt>` paths all read 0).
+    if (!ms && ma.target && !genericSubstSemaTy_.empty()) {
+        if (sema::TypeRef* tt = ctx_.exprType(*ma.target)) {
+            if (tt->kind == sema::TypeRef::Kind::Named && !tt->declaration &&
+                tt->astNode && tt->astNode->name &&
+                tt->astNode->name->parts.size() == 1) {
+                auto cit = genericSubstSemaTy_.find(tt->astNode->name->parts[0]);
+                if (cit != genericSubstSemaTy_.end() && cit->second &&
+                    cit->second->kind == sema::TypeRef::Kind::Named &&
+                    cit->second->declaration) {
+                    for (sema::Symbol* m : cit->second->declaration->members) {
+                        if (!m || m->name != ma.member) continue;
+                        ms = storageMemberOf(m);
+                        if (ms) break;
+                    }
+                }
+            }
+        }
+    }
     if (!ms || !ms->parent || !ma.target) return nullptr;
     auto idxIt = fieldIndex_.find(ms);
     // CG-generic: for generic class field access (e.g. bd.value where
