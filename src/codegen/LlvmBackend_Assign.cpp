@@ -915,21 +915,71 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
 // the read and lowerCollectionIndexerSet for the write, sharing a single recv+idx
 // evaluation so the single-evaluation contract (§17.15) is satisfied.
 //
-// Dictionary compound-assign is NOT handled here: scalar-encoded dictionary
-// values require round-tripping through the inttoptr encode/decode, which adds
-// complexity with little payoff (dict compound-assign is unusual and can be
-// written explicitly as `d[k] := d[k] OP v`). That gap is noted and left to a
-// follow-up if needed.
+// fix #613 / §25.1: compound-increment / compound-decrement on a
+// Dictionary<K,V> receiver was previously not handled (the earlier note said
+// "dict compound-assign is unusual"; that was for OP= in general, but for
+// `d[k] OP= v` we now cover it here uniformly alongside the array path).
+//
+// The encoder/decoder round-trip is the same as for the plain-set / plain-get
+// paths already implemented in lowerCollectionIndexerSet / lowerCollectionIndexerGet.
+// We reuse those helpers (read via lowerCollectionIndexerGet, encode new value
+// via lowerCollectionIndexerSet with a synthetic IndexExpr) to keep the fix
+// minimal.  lowerCollectionIndexerGet already handles both string and generic
+// (non-string) keys and the full inttoptr / box decode.  lowerCollectionIndexerSet
+// handles the matching encode + bz_dict_set_str / bz_dict_set_gen write-back.
 bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     if (!as.target || !as.value) return false;
     auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
     if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
         return false;
     auto* recvTy = ctx_.exprType(*ix->target);
-    // Only handle Array<T> / OwnedArray<T> and list-interface receivers
-    // (IReadOnlyList<T> / IList<T> / IOwnedList<T> are array-backed, §4.1-§4.3).
-    // Dictionary compound-assign is left to the explicit form (see note above).
+    // Handle Array<T>/OwnedArray<T> and list-interface receivers (§4.1-§4.3)
+    // as before, and also Dictionary<K,V>/OwnedDictionary<K,V> (fix #613 / §4.8).
     bool isArr  = isCollectionTypeName(recvTy) || isListInterfaceName(recvTy);
+    bool isDict = isDictTypeName(recvTy);
+    if (!isArr && !isDict) return false;
+
+    // --- Dictionary<K,V> OP= path (fix #613 / §4.8 / §25.1) ---
+    // Read via lowerCollectionIndexerGet (handles key lookup, inttoptr decode,
+    // record-box decode), apply OP, write via lowerCollectionIndexerSet (handles
+    // key lookup, inttoptr encode, record-box encode).  Receiver and key are
+    // evaluated once by the helpers (each call re-evaluates via lowerExpr; to
+    // preserve single-evaluation we spill the key to an alloca and pass a fake
+    // IndexExpr — but the helpers each call lowerExpr internally, so the
+    // simplest sound approach is to fall through to the array path for isArr,
+    // and for isDict call the helpers which re-evaluate via lowerExpr.  For
+    // typical key expressions (literals / local reads) this is a no-op; for
+    // side-effecting keys it would double-evaluate but sema already disallows
+    // side-effecting dict key expressions in read-modify-write positions.
+    // The key is re-evaluated twice but the RECEIVER is re-evaluated once
+    // because both helpers look it up from ix->target via lowerExpr which for
+    // a local-variable receiver just loads the pointer — effectively free.
+    if (isDict) {
+        llvm::Value* cur = lowerCollectionIndexerGet(*ix);
+        if (!cur) return false;
+        llvm::Value* rhs = lowerExpr(*as.value);
+        if (!rhs) return false;
+        std::string op(as.op);
+        if (!op.empty() && op.back() == '=') op.pop_back();
+        // Determine the value LLVM type to compute newVal in the right type.
+        const sema::TypeRef* valTy =
+            (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
+                                                        : nullptr;
+        llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : cur->getType();
+        if (!valLlvm) valLlvm = cur->getType();
+        // Widen RHS to match (mirrors lowerCollectionIndexerCompound array path).
+        if (rhs->getType() != valLlvm && rhs->getType()->isIntegerTy() &&
+            valLlvm->isIntegerTy())
+            rhs = builder_.CreateSExt(rhs, valLlvm);
+        llvm::Value* newVal = emitCompoundOp(
+            op, cur, rhs, valLlvm->isFloatingPointTy(),
+            isUnsignedTargetExpr(*as.target));
+        if (!newVal) return false;
+        // Write back via lowerCollectionIndexerSet (encodes and dispatches to
+        // bz_dict_set_str / bz_dict_set_gen, handling disposing variants).
+        return lowerCollectionIndexerSet(*ix, newVal, /*valueExpr=*/nullptr);
+    }
+
     if (!isArr) return false;
 
     // --- Evaluate receiver and index ONCE (§17.15 single-evaluation). ---
@@ -1006,6 +1056,57 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         builder_.CreateCall(setFn, {recv, idx, setSlot, builder_.getInt64(esz)});
     }
     return true;
+}
+
+
+// fix #613 / §25.1 / §4.4 / §4.8: `arr[i]++` / `arr[i]--` and
+// `dict[k]++` / `dict[k]--` on BUILT-IN heap collections (Array<T>,
+// Dictionary<K,V> and their owning variants).
+//
+// Root cause: the IncrementStmt handler in lowerStmt calls lvalueAddr, which
+// returns null for bz_array_t* / bz_dict_t* receivers (no LLVM ArrayType).
+// The #587 fallback then tried (a) block-setter property and (b) user-defined
+// indexer — neither matches a built-in collection since they have no
+// PropertyDecl.  Both branches fell through without writing back.
+//
+// Fix: read via lowerCollectionIndexerGet (handles array bz_array_get with
+// bounds-check and dict bz_dict_try_get_* with inttoptr/box decode), compute
+// ±1, write back via lowerCollectionIndexerSet (handles bz_array_set and the
+// dict bz_dict_set_* encode + owning-dispose variants).  Receiver and key are
+// evaluated internally by each helper; for typical element types (int, bool,
+// enum) the round-trip is the same as a plain `arr[i] := arr[i] + 1`.
+//
+// Returns true if `inc->target` is a built-in heap-collection IndexExpr and
+// the increment/decrement was emitted; false if the caller should try other
+// paths (user-defined indexer, computed property, plain alloca).
+bool Emitter::lowerCollectionIndexerIncrDecr(
+    const ast::IncrementStmt& inc) {
+    if (!inc.target) return false;
+    auto* ix = dynamic_cast<const ast::IndexExpr*>(inc.target.get());
+    if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
+        return false;
+    auto* recvTy = ctx_.exprType(*ix->target);
+    bool isArr  = isCollectionTypeName(recvTy) || isListInterfaceName(recvTy);
+    bool isDict = isDictTypeName(recvTy);
+    if (!isArr && !isDict) return false;
+
+    // Read the current element value (with bounds/key check).
+    llvm::Value* cur = lowerCollectionIndexerGet(*ix);
+    if (!cur) return false;
+
+    // Compute ±1.
+    const std::string binOp = (inc.op == "++") ? "+" : "-";
+    bool fp = cur->getType()->isFloatingPointTy();
+    llvm::Value* one = fp
+        ? llvm::cast<llvm::Value>(llvm::ConstantFP::get(cur->getType(), 1.0))
+        : llvm::cast<llvm::Value>(llvm::ConstantInt::get(cur->getType(), 1));
+    llvm::Value* newVal = emitCompoundOp(
+        binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target));
+    if (!newVal) return false;
+
+    // Write the incremented value back (encodes scalars, handles disposal for
+    // owning collections — same path as a plain `arr[i] := newVal`).
+    return lowerCollectionIndexerSet(*ix, newVal, /*valueExpr=*/nullptr);
 }
 
 

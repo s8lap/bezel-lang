@@ -418,13 +418,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             } else {
                 // fix #587 / §20.5: lvalueAddr returned null — the target is either
-                // a computed property with a block setter or a user-defined indexer.
-                // Both require a getter read + arithmetic + setter write-back.
+                // a built-in heap-collection indexer, a computed property with a
+                // block setter, or a user-defined indexer.  All require a getter
+                // read + arithmetic + setter write-back.
                 const std::string binOp = (inc->op == "++") ? "+" : "-";
+                // --- (c) Built-in heap-collection indexer: `arr[i]++` / `dict[k]++`
+                // fix #613 / §25.1 / §4.4 / §4.8: Array<T> and Dictionary<K,V>
+                // elements are accessed via bz_array_get/bz_dict_try_get_* (no
+                // PropertyDecl, so findIndexer returns null and branch (b) never
+                // fires).  Read via lowerCollectionIndexerGet, compute ±1, write
+                // back via lowerCollectionIndexerSet — same encode/decode round-trip
+                // as the plain `arr[i] := v` path.  Checked first so that (a)/(b)
+                // are only reached for non-collection IndexExpr targets.
+                if (lowerCollectionIndexerIncrDecr(*inc)) {
+                    // handled: write-back emitted by lowerCollectionIndexerIncrDecr
                 // --- (a) Block-setter computed property: `obj.P++` / `obj.P--` ---
                 // mirrors lowerPropertyCompound (§22.9): read via getter expression,
                 // compute new value, write via setter body.
-                if (computedSetterOf(*inc->target)) {
+                } else if (computedSetterOf(*inc->target)) {
                     llvm::Value* cur = lowerExpr(*inc->target);  // getter read
                     if (cur) {
                         bool fp = cur->getType()->isFloatingPointTy();
