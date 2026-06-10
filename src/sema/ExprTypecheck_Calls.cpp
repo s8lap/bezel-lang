@@ -3667,6 +3667,48 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // issue #605 / §14.1 / §8.1 / §8.5: a BARE TYPE-PARAMETER receiver
+        // (`val: T where T: value`) accessing a universal Object member
+        // (ToString, GetHashCode, Equals, GetType). The type-param's TypeRef
+        // has kind=Named, no declaration, so none of the intrinsic-type
+        // branches above fire for it.  Set the MemberAccessExpr type here so
+        // that the enclosing CallExpr typeCall() propagates it through the
+        // `!calleeSym` → `callee exprType` fallback. Without this the
+        // MemberAccess stays untyped, the CallExpr is untyped, and
+        // lowerLocalDecl (§15.2) cannot infer the inferred-var's LLVM slot
+        // type — it falls back to `i32`, so `var s := val.ToString()` gets
+        // an i32 slot and `return s` emits `ret i32` in a `ptr`-return
+        // function → IR verification failure. The fix aligns with the same
+        // handling applied to record/enum receivers (§9.1/§10) at line 3834
+        // above. Only fires when targetType is still null — i.e. the param
+        // was not found through any constraint-bound type (only value/class/
+        // new() shape constraints, not a named interface/class constraint).
+        if (ma.target) {
+            if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
+                if (recvTy->kind == TypeRef::Kind::Named &&
+                    !recvTy->declaration && recvTy->astNode &&
+                    recvTy->astNode->name &&
+                    recvTy->astNode->name->parts.size() == 1) {
+                    // Bare type-parameter receiver (T, TKey, TValue, …).
+                    const auto& mbr = ma.member;
+                    if (mbr == "ToString")
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                    else if (mbr == "GetHashCode")
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    else if (mbr == "Equals")
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    else if (mbr == "GetType") {
+                        auto* typeTy = ctx_.makeTypeRef();
+                        typeTy->kind = TypeRef::Kind::Named;
+                        typeTy->declaration = builtinClassSym("Type");
+                        ctx_.setExprType(&ma, typeTy);
+                    }
+                }
+            }
+        }
         // §26.5: a user extension on a PRIMITIVE/builtin receiver (e.g.
         // `extension int`). Consulted last — after every builtin/intrinsic
         // member above — so a real builtin member always wins (no shadow).

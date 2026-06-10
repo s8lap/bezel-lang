@@ -309,6 +309,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_mono_test.cpp
     codegen/generic_base_field_585_test.cpp
     codegen/generic_second_typeparam_597_test.cpp
+    codegen/generic_nullable_typeparam_604_605_test.cpp
     codegen/generic_record_field_590_test.cpp
     codegen/generic_return_inference_test.cpp
     codegen/generic_collection_return_test.cpp
