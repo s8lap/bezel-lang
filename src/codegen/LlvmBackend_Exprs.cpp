@@ -5214,6 +5214,26 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             genericSubst_ = std::move(newSubst);
             genericSubstSemaTy_ = std::move(newSema);
         }
+    } else if (!rt->genericArgs.empty() && !t->decl &&
+               t->genericParams.size() == rt->genericArgs.size()) {
+        // #428 / §14.1 / §2.5: IMPORTED generic type — no ast::TypeDecl is
+        // available (decl is null for imported TypeSymbols), but the generic
+        // parameter names are in t->genericParams (GenericParamSymbol* with
+        // .name, populated by ModuleLoader::convertGenericParams).  Build the
+        // same per-instantiation substitution so recordStruct (and classStruct)
+        // compute correct field layouts for non-int type arguments (the
+        // prior silent miscompile was due to this substitution being skipped
+        // entirely for imported types, leaving T's i32 placeholder in place).
+        std::unordered_map<std::string_view, llvm::Type*> newSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+        for (std::size_t gi = 0; gi < t->genericParams.size(); ++gi) {
+            llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
+            std::string_view pname = t->genericParams[gi]->name;
+            newSubst[pname] = concrTy;
+            newSema[pname] = rt->genericArgs[gi];
+        }
+        genericSubst_ = std::move(newSubst);
+        genericSubstSemaTy_ = std::move(newSema);
     }
 
     // §9 / §9.5 / issue #460: `new Record(args)` builds a value-type struct
