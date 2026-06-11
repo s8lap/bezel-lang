@@ -99,24 +99,29 @@ struct ClassComponent {
     std::string declName;    // declared identifier (matches ctor param name)
     const sema::TypeRef* ty; // resolved component type
     unsigned fieldIdx;       // index in classStruct (for GEP on serialize)
-    bool isSkip    = false;  // serialized skip
+    bool isSkip     = false; // serialized skip
     bool isOptional = false; // serialized optional
-    bool isOwned   = false;  // `owned` class-typed component (not a value field)
+    bool isOwned    = false; // `owned` class-typed component (not a value field)
+    bool isBackEdge = false; // §9.8 tier 3: non-owned class-typed back-edge (graph/cyclic)
 };
 
-// Collect the serialized components of a `serialized tree` class in declaration
-// order.  Per §9.8: owned and value-typed fields/auto-properties.  Back-edges
-// (non-owned class-typed fields) are tier 3 (serialized graph/cyclic) and are
-// excluded here.
+// Collect the serialized components of a class in declaration order.
+// Per §9.8: owned and value-typed fields/auto-properties, PLUS back-edge
+// (non-owned class-typed) fields when the class is `serialized graph/cyclic`.
+// The `isBackEdge` flag on each component distinguishes the two categories.
+// Under `serialized tree`, back-edges are excluded (they violate the tree assertion).
 //
 // `storage` must already be populated by collectInstanceStorage().
 // `fieldIndex_` must be current (call classStruct(ts) first).
+// `includeBackEdges`: include non-owned class-typed fields as back-edge
+// components (true for `serialized graph/cyclic`; false for `serialized tree`).
 static void collectClassComponents(
         const TypeSymbol* ts,
         const std::vector<const Symbol*>& storage,
         const std::unordered_map<const Symbol*, unsigned>& fieldIndex,
         sema::SemaContext& ctx,
-        std::vector<ClassComponent>& out) {
+        std::vector<ClassComponent>& out,
+        bool includeBackEdges = false) {
     if (!ts || !ts->decl) return;
     const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
     if (!td) return;
@@ -131,7 +136,7 @@ static void collectClassComponents(
         comp.declName = std::string(m->name);
         comp.ty       = nullptr;
 
-        // Determine ty, wireName, skip, optional from the symbol's decl.
+        // Determine ty, wireName, skip, optional, isOwned from the symbol's decl.
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
             // Check if owned modifier is set.
             bool isOwned = false;
@@ -139,6 +144,25 @@ static void collectClassComponents(
             comp.isOwned = isOwned;
             comp.wireName = comp.declName;
             comp.ty = ctx.resolvedType(*fd->type);
+
+            // §9.8 tier 3: identify back-edges (non-owned class-typed fields).
+            if (!isOwned && comp.ty) {
+                bool fieldIsClass =
+                    (comp.ty->kind == sema::TypeRef::Kind::Named &&
+                     comp.ty->declaration &&
+                     comp.ty->declaration->kind == ast::TypeDeclKind::Class);
+                bool fieldIsNullableClass = false;
+                if (!fieldIsClass && comp.ty->nullable) {
+                    fieldIsNullableClass =
+                        comp.ty->kind == sema::TypeRef::Kind::Named &&
+                        comp.ty->declaration &&
+                        comp.ty->declaration->kind == ast::TypeDeclKind::Class;
+                }
+                if (fieldIsClass || fieldIsNullableClass) {
+                    if (!includeBackEdges) continue;  // skip for tree mode
+                    comp.isBackEdge = true;
+                }
+            }
         } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl)) {
             if (pd->serialized) {
                 comp.isSkip     = pd->serialized->isSkip;
@@ -997,17 +1021,29 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
 }
 
 // ---------------------------------------------------------------------------
-// Emitter::emitClassSerialize  §9.8 tier 2
+// Emitter::emitClassSerialize  §9.8 tier 2 + tier 3
 //
-// Synthesized Serialize body for a `serialized tree` class.
+// Synthesized Serialize body for a `serialized tree`/`graph`/`cyclic` class.
 // `objPtr` is an opaque ptr to the class instance (ptr to classStruct).
 // Iterates the class's serialized components in declaration order, GEPs each
 // field, and calls emitSerializeField for its value.
+//
+// §9.8 tier 3 (graph/cyclic): for each owned class-typed component, writes a
+// BZ_SER_INLINE (0x01) + LE32 tag_id marker before the inline body using the
+// identity-tag table in the serializer.  For back-edge (non-owned class-typed)
+// components, writes BZ_SER_REF (0x02) + LE32 tag_id referencing the existing
+// tag of the borrowed object.
 // ---------------------------------------------------------------------------
 void Emitter::emitClassSerialize(const TypeSymbol* ts,
                                  llvm::Value* objPtr,
                                  llvm::Value* serPtr) {
     if (!ts || !ts->decl) return;
+
+    // Detect graph mode: true for `serialized graph` and `serialized cyclic`.
+    const auto* td0 = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+    bool isGraphMode = td0 && td0->serializedClass &&
+                       (td0->serializedClass->shape == "graph" ||
+                        td0->serializedClass->shape == "cyclic");
 
     // Ensure classStruct is built and fieldIndex_ is populated.
     llvm::StructType* st = classStruct(ts);
@@ -1016,7 +1052,7 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
     collectInstanceStorage(ts, storage);
 
     std::vector<ClassComponent> comps;
-    collectClassComponents(ts, storage, fieldIndex_, ctx_, comps);
+    collectClassComponents(ts, storage, fieldIndex_, ctx_, comps, isGraphMode);
 
     llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
 
@@ -1093,6 +1129,50 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
         llvm::Type* llvmFty = lowerTypeRef(fty);
         if (!llvmFty) continue;
 
+        // §9.8 tier 3: back-edge fields (non-owned class-typed) in graph/cyclic
+        // mode.  Write field-name + BZ_SER_REF marker + existing tag_id.
+        // The target object was already written as an owned component earlier
+        // (owner-before-borrower order guaranteed by declaration order per §9.8).
+        if (isGraphMode && comp.isBackEdge) {
+            // Load the back-edge ptr from the field.
+            llvm::Value* bePtr = builder_.CreateLoad(ptrTy(), fieldPtr, "cser.be");
+            // Write field name.
+            llvm::Value* nameStr = lowerStringLiteral(
+                "\"" + comp.wireName + "\"", false);
+            auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
+                                         {ptrTy(), ptrTy()});
+            builder_.CreateCall(writeNameFn, {serPtr, nameStr});
+            // §9.8 tier 3: nullable back-edge — if ptr is null, write null marker
+            // (0x00 via bz_binser_write_null); otherwise write BZ_SER_REF + tag_id.
+            llvm::Value* isNullBe = builder_.CreateICmpEQ(
+                bePtr, llvm::ConstantPointerNull::get(ptrTy()), "cser.be.isnull");
+            auto* beNullBB = llvm::BasicBlock::Create(llvm_, "cser.be.null", currentFn_);
+            auto* beRefBB  = llvm::BasicBlock::Create(llvm_, "cser.be.ref",  currentFn_);
+            auto* beEndBB  = llvm::BasicBlock::Create(llvm_, "cser.be.end",  currentFn_);
+            builder_.CreateCondBr(isNullBe, beNullBB, beRefBB);
+            // Null path: write 0x00 null marker (no tag_id follows).
+            builder_.SetInsertPoint(beNullBB);
+            {
+                auto* writeNullFn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
+                builder_.CreateCall(writeNullFn, {serPtr});
+            }
+            builder_.CreateBr(beEndBB);
+            // Non-null path: look up existing tag, write BZ_SER_REF + tag_id.
+            builder_.SetInsertPoint(beRefBB);
+            {
+                auto* getTagFn = declareC("bz_binser_graph_get_tag", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* existingTag = builder_.CreateCall(
+                    getTagFn, {serPtr, bePtr}, "cser.be.tag");
+                auto* writeRefFn = declareC("bz_binser_write_ref_tag", voidTy,
+                                            {ptrTy(), i32()});
+                builder_.CreateCall(writeRefFn, {serPtr, existingTag});
+            }
+            builder_.CreateBr(beEndBB);
+            builder_.SetInsertPoint(beEndBB);
+            continue;
+        }
+
         // Handle `serialized optional`: on write, omit null nullable fields.
         if (comp.isOptional && fty->nullable) {
             // The isNonNull flag was already computed; use it as the write-gate.
@@ -1125,6 +1205,55 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
         auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
                                      {ptrTy(), ptrTy()});
         builder_.CreateCall(writeNameFn, {serPtr, nameStr});
+
+        // §9.8 tier 3: in graph/cyclic mode, owned class-typed components get
+        // an identity-tag marker before their inline body.  This allows the
+        // deserializer to build a tag→object table for back-edge resolution.
+        if (isGraphMode && comp.isOwned &&
+            fty->kind == sema::TypeRef::Kind::Named &&
+            fty->declaration &&
+            fty->declaration->kind == ast::TypeDeclKind::Class) {
+            // fieldVal is the owned ptr.  Check if already tagged (shouldn't be
+            // for tree-structured owned edges, but handle it gracefully).
+            auto* getTagFn = declareC("bz_binser_graph_get_tag", i32(),
+                                      {ptrTy(), ptrTy()});
+            llvm::Value* existingTag = builder_.CreateCall(
+                getTagFn, {serPtr, fieldVal}, "cser.ot.chk");
+            llvm::Value* isNew = builder_.CreateICmpEQ(
+                existingTag, builder_.getInt32(0), "cser.ot.isnew");
+            auto* inlineBB = llvm::BasicBlock::Create(llvm_, "cser.ot.inline", currentFn_);
+            auto* refBB    = llvm::BasicBlock::Create(llvm_, "cser.ot.ref",    currentFn_);
+            auto* doneTagBB = llvm::BasicBlock::Create(llvm_, "cser.ot.done",  currentFn_);
+            builder_.CreateCondBr(isNew, inlineBB, refBB);
+
+            // First reach: assign tag, write inline marker, then write body.
+            builder_.SetInsertPoint(inlineBB);
+            {
+                auto* assignFn = declareC("bz_binser_graph_assign_tag", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* newTag = builder_.CreateCall(
+                    assignFn, {serPtr, fieldVal}, "cser.ot.tag");
+                auto* writeInlineFn = declareC("bz_binser_write_inline_tag", voidTy,
+                                               {ptrTy(), i32()});
+                builder_.CreateCall(writeInlineFn, {serPtr, newTag});
+                emitSerializeField(fieldVal, fty, serPtr);
+            }
+            builder_.CreateBr(doneTagBB);
+
+            // Already seen (aliased in tree path — should not happen for well-formed
+            // serialized graph, but handle defensively): write $ref.
+            builder_.SetInsertPoint(refBB);
+            {
+                auto* writeRefFn = declareC("bz_binser_write_ref_tag", voidTy,
+                                            {ptrTy(), i32()});
+                builder_.CreateCall(writeRefFn, {serPtr, existingTag});
+            }
+            builder_.CreateBr(doneTagBB);
+
+            builder_.SetInsertPoint(doneTagBB);
+            continue;
+        }
+
         emitSerializeField(fieldVal, fty, serPtr);
     }
 
@@ -1134,21 +1263,34 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
 }
 
 // ---------------------------------------------------------------------------
-// Emitter::emitClassDeserialize  §9.8 tier 2
+// Emitter::emitClassDeserialize  §9.8 tier 2 + tier 3
 //
-// Synthesized Deserialize body for a `serialized tree` class.
+// Synthesized Deserialize body for a `serialized tree`/`graph`/`cyclic` class.
 // Returns an owned ptr to the newly constructed class instance.
 //
-// Algorithm:
+// Algorithm (tree mode):
 //   1. Read all non-skip serialized components into local slots.
 //   2. Allocate the class via calloc + emitInstanceInit.
 //   3. Find the unique constructor matching serialized components by name.
 //   4. Call that constructor with the deserialized values.
 //   5. Return the owned ptr.
+//
+// §9.8 tier 3 additional (graph/cyclic mode):
+//   - For owned class-typed components: read BZ_SER_INLINE marker + tag_id,
+//     mark tag as in-progress, deserialize body, register tag.
+//   - For back-edge components: read BZ_SER_REF marker + tag_id,
+//     resolve tag from table (NULL = cycle → SerializationException),
+//     pass ptr to constructor.
 // ---------------------------------------------------------------------------
 llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                                            llvm::Value* derPtr) {
     if (!ts || !ts->decl) return llvm::ConstantPointerNull::get(ptrTy());
+
+    // Detect graph mode.
+    const auto* td0g = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+    bool isGraphMode = td0g && td0g->serializedClass &&
+                       (td0g->serializedClass->shape == "graph" ||
+                        td0g->serializedClass->shape == "cyclic");
 
     llvm::StructType* st = classStruct(ts);
     llvm::Type* voidTy   = llvm::Type::getVoidTy(llvm_);
@@ -1157,7 +1299,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     collectInstanceStorage(ts, storage);
 
     std::vector<ClassComponent> comps;
-    collectClassComponents(ts, storage, fieldIndex_, ctx_, comps);
+    collectClassComponents(ts, storage, fieldIndex_, ctx_, comps, isGraphMode);
 
     // Allocate local slots for each non-skip component.
     std::vector<llvm::AllocaInst*> slots(comps.size(), nullptr);
@@ -1307,10 +1449,95 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
 
         builder_.SetInsertPoint(readBB);
         {
-            llvm::Value* fv = emitDeserializeField(comp.ty, derPtr);
+            bool isClassComp = (comp.ty &&
+                                comp.ty->kind == sema::TypeRef::Kind::Named &&
+                                comp.ty->declaration &&
+                                comp.ty->declaration->kind == ast::TypeDeclKind::Class);
+
+            llvm::Value* fv = nullptr;
+
+            if (isGraphMode && comp.isBackEdge && isClassComp) {
+                // §9.8 tier 3: back-edge field.
+                // The wire format for a back-edge is one of:
+                //   0x00                       → nullable back-edge was null
+                //   BZ_SER_REF (0x02) + LE32   → non-null ref to already-built object
+                // First try to consume a null marker (0x00 byte).  bz_binder_try_read_null
+                // peeks: if the next byte is 0x00, it consumes it and returns 1 (int8).
+                // If not 0x00, it returns 0 without consuming anything.
+                auto* tryNullFn = declareC("bz_binder_try_read_null", i8(), {ptrTy()});
+                llvm::Value* wasNull = builder_.CreateCall(tryNullFn, {derPtr}, "cdeser.be.wasnull");
+                llvm::Value* wasNullBool = builder_.CreateICmpNE(
+                    wasNull, builder_.getInt8(0), "cdeser.be.isnull");
+                auto* beNullBB    = llvm::BasicBlock::Create(llvm_, "cdeser.be.null",     currentFn_);
+                auto* beRefBB     = llvm::BasicBlock::Create(llvm_, "cdeser.be.ref",      currentFn_);
+                auto* beResolvBB  = llvm::BasicBlock::Create(llvm_, "cdeser.be.resolv",   currentFn_);
+                auto* beMergeBB   = llvm::BasicBlock::Create(llvm_, "cdeser.be.merge",    currentFn_);
+                builder_.CreateCondBr(wasNullBool, beNullBB, beRefBB);
+                // Null path: back-edge was null on serialize → fv = null ptr.
+                builder_.SetInsertPoint(beNullBB);
+                builder_.CreateBr(beMergeBB);
+                // Ref path: read BZ_SER_REF (0x02) + LE32 tag_id, resolve.
+                builder_.SetInsertPoint(beRefBB);
+                llvm::AllocaInst* tagSlot = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt32(0), tagSlot);
+                auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
+                                              i32(), {ptrTy(), ptrTy()});
+                // (marker result not checked — trust wire format is REF here)
+                builder_.CreateCall(readMarkerFn, {derPtr, tagSlot});
+                llvm::Value* tagId = builder_.CreateLoad(i32(), tagSlot, "cdeser.be.tag");
+                auto* resolveFn = declareC("bz_binder_graph_resolve_tag",
+                                           ptrTy(), {ptrTy(), i32()});
+                llvm::Value* resolvedPtr = builder_.CreateCall(
+                    resolveFn, {derPtr, tagId}, "cdeser.be.ptr");
+                // Null resolve result means cycle (in-progress) or unknown tag → raise.
+                llvm::Value* isNullPtr = builder_.CreateICmpEQ(
+                    resolvedPtr, llvm::ConstantPointerNull::get(ptrTy()),
+                    "cdeser.be.resolnull");
+                auto* cycleBB    = llvm::BasicBlock::Create(llvm_, "cdeser.cycle",    currentFn_);
+                builder_.CreateCondBr(isNullPtr, cycleBB, beResolvBB);
+                builder_.SetInsertPoint(cycleBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(beResolvBB);
+                builder_.CreateBr(beMergeBB);
+                // Merge: fv = phi(null | resolvedPtr).
+                builder_.SetInsertPoint(beMergeBB);
+                llvm::PHINode* bePhi = builder_.CreatePHI(ptrTy(), 2, "cdeser.be.fv");
+                bePhi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), beNullBB);
+                bePhi->addIncoming(resolvedPtr, beResolvBB);
+                fv = bePhi;
+            } else if (isGraphMode && comp.isOwned && isClassComp) {
+                // §9.8 tier 3: owned class-typed component in graph mode.
+                // Read BZ_SER_INLINE marker + tag_id, mark in-progress, deserialize
+                // body (which builds the object), register tag.
+                llvm::AllocaInst* tagSlot = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt32(0), tagSlot);
+                auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
+                                              i32(), {ptrTy(), ptrTy()});
+                builder_.CreateCall(readMarkerFn, {derPtr, tagSlot});
+                llvm::Value* tagId = builder_.CreateLoad(i32(), tagSlot, "cdeser.ot.tag");
+                // Mark the tag as in-progress (cycle sentinel).
+                auto* markFn = declareC("bz_binder_graph_mark_in_progress",
+                                        voidTy, {ptrTy(), i32()});
+                builder_.CreateCall(markFn, {derPtr, tagId});
+                // Deserialize the inline object body.
+                llvm::Value* childPtr = emitClassDeserialize(comp.ty->declaration, derPtr);
+                // Register the constructed object with the tag.
+                auto* regFn = declareC("bz_binder_graph_register_tag",
+                                       voidTy, {ptrTy(), i32(), ptrTy()});
+                builder_.CreateCall(regFn, {derPtr, tagId, childPtr});
+                fv = childPtr;
+            } else {
+                // Tree mode (or value types, strings, records): existing path.
+                fv = emitDeserializeField(comp.ty, derPtr);
+            }
+
             if (fv && slots[ci]) {
                 llvm::Type* lt = lowerTypeRef(comp.ty);
-                if (fv->getType() == lt)
+                if (lt && fv->getType() == lt)
+                    builder_.CreateStore(fv, slots[ci]);
+                else if (fv->getType()->isPointerTy() && lt && lt->isPointerTy())
                     builder_.CreateStore(fv, slots[ci]);
             }
             auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});

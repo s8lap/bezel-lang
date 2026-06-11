@@ -7177,10 +7177,25 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
 
 // --- writer state -----------------------------------------------------------
 
+// §9.8 / tier-3 graph serialization: wire markers for the identity-tag protocol.
+// Written before each class-typed component in `serialized graph` mode:
+//   BZ_SER_INLINE (0x01) + LE32 tag_id  → first owning reach of this object
+//   BZ_SER_REF    (0x02) + LE32 tag_id  → back-edge / shared reference
+// Under `serialized tree` mode these markers are NOT emitted (legacy path).
+#define BZ_SER_INLINE 0x01
+#define BZ_SER_REF    0x02
+
 struct bz_binser_t {
     uint8_t* buf;
     int64_t  used;   // bytes written so far
     int64_t  cap;    // allocated capacity
+
+    // §9.8 tier-3: identity-tag table (pointer → tag_id) for `serialized graph`.
+    // tag_ptrs[i] = the object pointer for tag_id (i+1).  tag_id=0 means "not seen".
+    // The table is allocated on first use (null when no graph serialization active).
+    void**   tag_ptrs;
+    int32_t  tag_count;  // number of assigned tags (= tag_ptrs size in use)
+    int32_t  tag_cap;    // allocated capacity of tag_ptrs
 };
 
 static void bz_binser_ensure(bz_binser_t* s, int64_t need) {
@@ -7226,9 +7241,12 @@ extern "C" {
 
 void* bz_binser_alloc(void) {
     auto* s = static_cast<bz_binser_t*>(malloc(sizeof(bz_binser_t)));
-    s->buf  = nullptr;
-    s->used = 0;
-    s->cap  = 0;
+    s->buf       = nullptr;
+    s->used      = 0;
+    s->cap       = 0;
+    s->tag_ptrs  = nullptr;
+    s->tag_count = 0;
+    s->tag_cap   = 0;
     return s;
 }
 
@@ -7236,6 +7254,7 @@ void bz_binser_free(void* serp) {
     if (!serp) return;
     auto* s = static_cast<bz_binser_t*>(serp);
     free(s->buf);
+    free(s->tag_ptrs);
     free(s);
 }
 
@@ -7346,6 +7365,51 @@ void bz_binser_begin_array(void* serp, int32_t element_count) {
 
 void bz_binser_end_array(void* /*serp*/) { /* no trailer */ }
 
+// ---------------------------------------------------------------------------
+// §9.8 tier-3: identity-tag graph serialization helpers
+// ---------------------------------------------------------------------------
+
+// Return the tag_id already assigned to `ptr`, or 0 if not yet seen.
+// Per §9.8: a tag_id of 0 means "first reach through an owning edge" (must be
+// written inline); non-zero means "already written" (must be written as BZ_SER_REF).
+int32_t bz_binser_graph_get_tag(void* serp, void* ptr) {
+    if (!serp || !ptr) return 0;
+    auto* s = static_cast<bz_binser_t*>(serp);
+    for (int32_t i = 0; i < s->tag_count; ++i)
+        if (s->tag_ptrs[i] == ptr)
+            return i + 1;  // tag_id is 1-based
+    return 0;
+}
+
+// Assign a new tag_id to `ptr` and return it.
+// Called for the first owning reach of each object in a `serialized graph`.
+int32_t bz_binser_graph_assign_tag(void* serp, void* ptr) {
+    if (!serp || !ptr) return 0;
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->tag_count >= s->tag_cap) {
+        int32_t newcap = s->tag_cap == 0 ? 16 : s->tag_cap * 2;
+        s->tag_ptrs = static_cast<void**>(realloc(s->tag_ptrs,
+                                                   (size_t)newcap * sizeof(void*)));
+        s->tag_cap  = newcap;
+    }
+    s->tag_ptrs[s->tag_count++] = ptr;
+    return s->tag_count;  // 1-based tag_id
+}
+
+// Write BZ_SER_INLINE (0x01) + LE32 tag_id.  Precedes the inline object body.
+void bz_binser_write_inline_tag(void* serp, int32_t tag_id) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    bz_binser_write_byte_impl(s, BZ_SER_INLINE);
+    bz_binser_write_le32_impl(s, (uint32_t)tag_id);
+}
+
+// Write BZ_SER_REF (0x02) + LE32 tag_id.  Used for back-edge / aliased references.
+void bz_binser_write_ref_tag(void* serp, int32_t tag_id) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    bz_binser_write_byte_impl(s, BZ_SER_REF);
+    bz_binser_write_le32_impl(s, (uint32_t)tag_id);
+}
+
 } // extern "C" (writer half)
 
 // --- reader state -----------------------------------------------------------
@@ -7357,6 +7421,15 @@ struct bz_binder_t {
     int8_t         ignore_unknown;
     int32_t        fields_remaining;
     bool           in_object;
+
+    // §9.8 tier-3: identity-tag→object table for `serialized graph` deserialize.
+    // tag_ptrs[i]        = the constructed object pointer for tag_id (i+1).
+    //                      NULL while the object is still in-progress (cycle marker).
+    // tag_in_progress[i] = 1 while tag (i+1) is currently being constructed.
+    // The table is allocated on first use.
+    void**   tag_ptrs;
+    int8_t*  tag_in_progress;
+    int32_t  tag_count;  // slots allocated (capacity = tag_count; grows as needed)
 };
 
 static int bz_binder_read_byte_impl(bz_binder_t* d, uint8_t* out) {
@@ -7474,11 +7547,18 @@ void* bz_binder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
     d->ignore_unknown   = ignore_unknown;
     d->fields_remaining = 0;
     d->in_object        = false;
+    d->tag_ptrs         = nullptr;
+    d->tag_in_progress  = nullptr;
+    d->tag_count        = 0;
     return d;
 }
 
 void bz_binder_free(void* derp) {
-    free(derp);
+    if (!derp) return;
+    auto* d = static_cast<bz_binder_t*>(derp);
+    free(d->tag_ptrs);
+    free(d->tag_in_progress);
+    free(d);
 }
 
 int64_t bz_binder_read_int(void* derp) {
@@ -7601,6 +7681,86 @@ int8_t bz_binder_has_more_elements(void* /*derp*/) {
 }
 
 void bz_binder_end_array(void* /*derp*/) { /* no trailer */ }
+
+// ---------------------------------------------------------------------------
+// §9.8 tier-3: identity-tag graph deserialization helpers
+//
+// Wire format (per §9.8 / tier-3 design):
+//   Before each class-typed component in `serialized graph` mode, the wire
+//   carries one byte marker:
+//     BZ_SER_INLINE (0x01) + LE32 tag_id  → inline object follows; register tag
+//     BZ_SER_REF    (0x02) + LE32 tag_id  → back-edge; resolve from table
+//
+// The tag table (tag_ptrs, tag_in_progress) is embedded in bz_binder_t and
+// grows dynamically; tag_id is 1-based (slot index = tag_id - 1).
+// ---------------------------------------------------------------------------
+
+// Ensure the tag table has room for at least `tag_id` entries.
+static void bz_binder_graph_ensure_slot(bz_binder_t* d, int32_t tag_id) {
+    if (tag_id <= d->tag_count) return;
+    // Grow both parallel arrays to cover slots 0 .. tag_id-1.
+    void** new_ptrs = static_cast<void**>(
+        realloc(d->tag_ptrs, (size_t)tag_id * sizeof(void*)));
+    int8_t* new_ip = static_cast<int8_t*>(
+        realloc(d->tag_in_progress, (size_t)tag_id * sizeof(int8_t)));
+    // Zero-initialize the newly added slots.
+    for (int32_t i = d->tag_count; i < tag_id; ++i) {
+        new_ptrs[i] = nullptr;
+        new_ip[i]   = 0;
+    }
+    d->tag_ptrs        = new_ptrs;
+    d->tag_in_progress = new_ip;
+    d->tag_count       = tag_id;
+}
+
+// Read the graph marker byte + tag_id from the wire.
+// Returns:
+//   BZ_SER_INLINE (1) → inline object; *out_tag set to the tag_id
+//   BZ_SER_REF    (2) → back-edge ref; *out_tag set to the tag_id
+//   0             → truncated / unexpected input
+int32_t bz_binder_read_graph_marker(void* derp, int32_t* out_tag) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    uint8_t marker = 0;
+    if (!bz_binder_read_byte_impl(d, &marker)) { *out_tag = 0; return 0; }
+    uint32_t tag_id = 0;
+    if (!bz_binder_read_le32_impl(d, &tag_id)) { *out_tag = 0; return 0; }
+    *out_tag = (int32_t)tag_id;
+    return (int32_t)marker;
+}
+
+// Mark tag_id as "currently being constructed" (cycle-detection sentinel).
+// Called just before beginning to construct the object for this tag.
+void bz_binder_graph_mark_in_progress(void* derp, int32_t tag_id) {
+    if (!derp || tag_id <= 0) return;
+    auto* d = static_cast<bz_binder_t*>(derp);
+    bz_binder_graph_ensure_slot(d, tag_id);
+    d->tag_in_progress[tag_id - 1] = 1;
+    d->tag_ptrs[tag_id - 1]        = nullptr;
+}
+
+// Register the constructed object pointer for tag_id (construction complete).
+// Clears the in-progress flag.
+void bz_binder_graph_register_tag(void* derp, int32_t tag_id, void* ptr) {
+    if (!derp || tag_id <= 0) return;
+    auto* d = static_cast<bz_binder_t*>(derp);
+    bz_binder_graph_ensure_slot(d, tag_id);
+    d->tag_ptrs[tag_id - 1]        = ptr;
+    d->tag_in_progress[tag_id - 1] = 0;
+}
+
+// Resolve a tag_id to its object pointer.
+// Returns NULL if:
+//   - tag_id out of range (not yet registered) → indicates a cycle or bad input
+//   - tag_in_progress[tag_id-1] = 1 → cycle: object still being constructed
+// Per §9.8: a cycle raises SerializationException; the codegen checks for NULL
+// and throws.
+void* bz_binder_graph_resolve_tag(void* derp, int32_t tag_id) {
+    if (!derp || tag_id <= 0) return nullptr;
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (tag_id > d->tag_count)     return nullptr;  // not yet registered
+    if (d->tag_in_progress[tag_id - 1]) return nullptr;  // cycle
+    return d->tag_ptrs[tag_id - 1];
+}
 
 // bz_ser_throw: build a minimal SerializationException-like exception object
 // and store it in the global bz_exc slot.  `ser_exn_vtable` is the vtable*

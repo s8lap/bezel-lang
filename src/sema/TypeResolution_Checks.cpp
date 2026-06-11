@@ -2367,18 +2367,47 @@ void Resolver::checkSerializationEligibility() {
                             inner.declaration->kind == ast::TypeDeclKind::Class;
                     }
                     if ((fieldIsClass || fieldIsNullableClass) && !isOwned) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, t->declLoc,
-                            "class `" + std::string(t->name) + "` (`serialized "
-                            + std::string(scc.shape) +
-                            "`): field `" + std::string(fs->name) +
-                            "` is a non-owned (borrowing) class-typed field "
-                            "(a back-edge in the serialized graph), which is not "
-                            "yet implemented (issue #550 tier 3); mark the field "
-                            "`owned`, declare `serialized skip`, or hand-write "
-                            "`Serialize`/`Deserialize`");
-                        foundBackEdge = true;
-                        break;
+                        // §9.8 / tier 3: back-edge fields (non-owned class-typed
+                        // fields) are serialization-eligible under `serialized graph`
+                        // and `serialized cyclic` — they are written as tag references
+                        // and resolved from the tag→object table on deserialize.
+                        // Under `serialized tree`, aliasing is forbidden (back-edges
+                        // violate the tree assertion), so they remain an error there.
+                        if (scc.shape == "tree") {
+                            ctx_.diagnostics().report(
+                                Severity::Error, t->declLoc,
+                                "class `" + std::string(t->name) + "` (`serialized "
+                                "tree`): field `" + std::string(fs->name) +
+                                "` is a non-owned (borrowing) class-typed field "
+                                "(a back-edge); `serialized tree` forbids aliasing — "
+                                "mark the field `owned`, declare `serialized skip`, "
+                                "or change the clause to `serialized graph`");
+                            foundBackEdge = true;
+                            break;
+                        }
+                        // Under `serialized graph` / `serialized cyclic`:
+                        // back-edge is eligible (§9.8 tier 3 implemented).
+                        // Verify the target type has a graph-shape clause.
+                        const TypeSymbol* beDecl = tr->declaration;
+                        if (!beDecl && tr->nullable) beDecl = tr->declaration;
+                        if (beDecl) {
+                            auto* beTd = dynamic_cast<const ast::TypeDecl*>(beDecl->decl);
+                            if (!beTd || !beTd->serializedClass) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, t->declLoc,
+                                    "class `" + std::string(t->name) +
+                                    "` (`serialized " + std::string(scc.shape) +
+                                    "`): back-edge field `" + std::string(fs->name) +
+                                    "` has type `" + std::string(beDecl->name) +
+                                    "` which has no `serialized tree`/`graph`/`cyclic` "
+                                    "clause; the back-edge target must itself be "
+                                    "serialization-eligible (§9.8)");
+                                foundBackEdge = true;
+                                break;
+                            }
+                        }
+                        // Valid back-edge under graph/cyclic — continue.
+                        continue;
                     }
                     if (!isSerializationEligibleType(tr, visited)) {
                         reportIneligible(fs->name,
