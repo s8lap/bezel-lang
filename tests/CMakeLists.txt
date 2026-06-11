@@ -468,6 +468,11 @@ set(BEZEL_TEST_SOURCES
     codegen/serialization_synthesis_550_test.cpp
     codegen/main_args_633_test.cpp
     codegen/serialization_edges_635_637_638_test.cpp
+    # --- #550 tier-2 contract tests (class trees, §9.8) ---
+    # Spec-derived CONTRACT for #550 tier 2; 23/25 red until the implementation
+    # lands. Enable with the tier-2 implementation merge (pattern: #600 contract).
+    # codegen/serialization_tier2_classes_test.cpp
+    # --- end #550 tier-2 contract ---
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
