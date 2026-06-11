@@ -579,6 +579,14 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size);
 // The input array is BORROWED.
 void* bz_task_when_any(void* task_arr);
 
+// stdlib §6.7 / §30.10: Task.WhenAllOwned<T>(owned tasks: OwnedArray<OwnedTask<T>>):
+//   OwnedTask<OwnedArray<T>> where T: class.
+// Pattern B aggregator for class T. Caller transfers ownership of the
+// OwnedArray<OwnedTask<T>>; each OwnedTask<T> is awaited and its result
+// (a class pointer) collected into a new OwnedArray<T>. The input array and
+// all input tasks are freed. Returns an OwnedTask<OwnedArray<T>>.
+void* bz_task_when_all_owned(void* task_arr);
+
 // stdlib §6.7 / §30.10: Task.FireAndForget(owned task). Registers a
 // continuation on `task` that frees it when done (after discarding any
 // result or logging any error). Ownership of `task` transfers; the

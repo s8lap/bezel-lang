@@ -212,6 +212,91 @@ BEZEL_TEST(whenall_generic_results_451, faulted_caught) {
 }
 
 // ===========================================================================
+// (A2) Task.WhenAllOwned<T> — stdlib §6.7 lines 2942-2944
+//      OwnedTask<T> combinator variant (T: class)
+// ===========================================================================
+
+// §6.7 line 2942 / §30.10: WhenAllOwned with an empty OwnedArray produces an
+// immediately-complete OwnedTask<OwnedArray<T>>. Await result's Count == 0.
+BEZEL_TEST(when_all_owned_451, empty_array_produces_empty_result) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class Box "
+        "  public Value: int; "
+        "  public constructor(v: int) "
+        "    Value := v; "
+        "  end; "
+        "end Box; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    var tasks := new OwnedArray<OwnedTask<Box>>(); "
+        "    using var wa := Task.WhenAllOwned(move tasks); "
+        "    using var arr := await wa; "
+        "    return arr.Count; "
+        "  end Main; end C;"),
+        0);
+}
+
+// §6.7 line 2942 / §30.10: WhenAllOwned with two already-completed OwnedTask<Box>
+// (from Task.FromOwnedResult). Results collected; Value fields are 10 and 20.
+// Returns arr[0].Value + arr[1].Value = 30.
+// Derived from: stdlib §6.7 WhenAllOwned<T>(tasks: OwnedArray<OwnedTask<T>>):
+// OwnedTask<OwnedArray<T>>.
+BEZEL_TEST(when_all_owned_451, two_tasks_results_collected) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "class Box "
+        "  public Value: int; "
+        "  public constructor(v: int) "
+        "    Value := v; "
+        "  end; "
+        "end Box; "
+        "class C "
+        "  public static async method MakeBox(n: int): OwnedTask<Box> "
+        "    return new Box(n); "
+        "  end MakeBox; "
+        "  public static async method Main(): Task<int> "
+        "    var tasks := new OwnedArray<OwnedTask<Box>>(); "
+        "    tasks.Add(MakeBox(10)); "
+        "    tasks.Add(MakeBox(20)); "
+        "    using var wa := Task.WhenAllOwned(move tasks); "
+        "    using var arr := await wa; "
+        "    return arr[0].Value + arr[1].Value; "
+        "  end Main; end C;"),
+        30);
+}
+
+// §6.7 line 2942 / §30.10: WhenAllOwned cross-thread: each OwnedTask<Box>
+// awaits Task.Delay before returning a new Box. Tasks run concurrently (they
+// are started before WhenAllOwned is called). Collect 3 boxes; sum = 1+2+3=6.
+BEZEL_TEST(when_all_owned_451, async_producers_cross_thread) {
+    const std::string src =
+        "module M; "
+        "class Box "
+        "  public Value: int; "
+        "  public constructor(v: int) "
+        "    Value := v; "
+        "  end; "
+        "end Box; "
+        "class C "
+        "  public static async method MakeBox(n: int): OwnedTask<Box> "
+        "    await Task.Delay(5); "
+        "    return new Box(n); "
+        "  end MakeBox; "
+        "  public static async method Main(): Task<int> "
+        "    var tasks := new OwnedArray<OwnedTask<Box>>(); "
+        "    tasks.Add(MakeBox(1)); "
+        "    tasks.Add(MakeBox(2)); "
+        "    tasks.Add(MakeBox(3)); "
+        "    using var wa := Task.WhenAllOwned(move tasks); "
+        "    using var arr := await wa; "
+        "    return arr[0].Value + arr[1].Value + arr[2].Value; "
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 6);
+}
+
+// ===========================================================================
 // (B) Task.Delay(ms, token: CancellationToken) — stdlib §6.7 lines 2867-2870
 // ===========================================================================
 
@@ -402,12 +487,22 @@ BEZEL_TEST(cancellation_token_local_across_suspend_461, nullable_value_local_rou
 // (C) await inside a catch GUARD — confirmed clean diagnostic (#451)
 // ===========================================================================
 
-// §30.9 / #451: `catch E when await ...` produces a clear compile-time error
-// (not a crash or malformed IR). The compile MUST fail and report an error
-// (errorCount > 0). This confirms the diagnostic boundary — await in a catch
-// GUARD body is deferred with a safe error rather than silently miscompiling.
-// Per the existing async codegen: "not yet implemented: `await` inside a catch
-// GUARD (`catch ... when await ...`)".
+// §30.9 / §31.2.1 / #451: `catch E when await ...` produces a clear
+// compile-time error (not a crash or malformed IR). The compile MUST fail and
+// report an error (errorCount > 0).
+//
+// Spec §30.9 states "await has no syntactic restrictions on placement inside
+// try/catch/finally." However, implementing catch-guard suspension requires
+// re-entering the catch DISPATCH sequence at resume — the guard runs DURING
+// dispatch, BEFORE the arm scope / caught-exception state are set up, so the
+// async state machine would have to re-run and re-evaluate the guard expression
+// with a different suspended state. This is a genuine implementation gap, not
+// a spec restriction: the diagnostic is "not yet implemented" rather than a
+// hard spec prohibition, and this test confirms the boundary is clean (a safe
+// error, no crash, no malformed IR) while the implementation is deferred.
+//
+// When this is eventually implemented, update this test to expect success
+// and add happy-path tests for guard-true / guard-false / throws-in-guard.
 BEZEL_TEST(await_catch_guard_451, clean_diagnostic_not_crash) {
     BEZEL_EXPECT_TRUE(compileFails(
         "module M; class C "
