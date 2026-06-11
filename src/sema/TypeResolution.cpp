@@ -105,6 +105,8 @@ void Resolver::run(const ast::SourceFile& src) {
     checkTopLevelVisibility();
     // Slice S23: record restrictions (§9.7).
     checkRecordRestrictions();
+    // §9.8 (issue #550): ISerializable/IDeserializable conformance eligibility.
+    checkSerializationEligibility();
     // #594 (§28.2): user code may not declare Dispose() on a class/record.
     checkUserDeclaredDispose();
     // Slice S28: accessor visibility (§13.6).

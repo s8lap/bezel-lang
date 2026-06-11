@@ -4923,3 +4923,434 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
     });
     return task;
 }
+
+// ============================================================
+// BinarySerializer / BinaryDeserializer runtime  (§2.15 / §9.8)
+// ============================================================
+// All extern "C" function signatures match bezel_runtime.h exactly.
+// Internal types use the bz_array_t / bz_string_struct layouts defined
+// earlier in this file.
+
+// --- writer state -----------------------------------------------------------
+
+struct bz_binser_t {
+    uint8_t* buf;
+    int64_t  used;   // bytes written so far
+    int64_t  cap;    // allocated capacity
+};
+
+static void bz_binser_ensure(bz_binser_t* s, int64_t need) {
+    if (s->used + need <= s->cap) return;
+    int64_t newcap = s->cap == 0 ? 256 : s->cap;
+    while (newcap < s->used + need) newcap *= 2;
+    s->buf = static_cast<uint8_t*>(realloc(s->buf, (size_t)newcap));
+    s->cap = newcap;
+}
+
+static void bz_binser_write_byte_impl(bz_binser_t* s, uint8_t b) {
+    bz_binser_ensure(s, 1);
+    s->buf[s->used++] = b;
+}
+
+static void bz_binser_write_le32_impl(bz_binser_t* s, uint32_t v) {
+    bz_binser_ensure(s, 4);
+    s->buf[s->used+0] = (uint8_t)(v);
+    s->buf[s->used+1] = (uint8_t)(v >> 8);
+    s->buf[s->used+2] = (uint8_t)(v >> 16);
+    s->buf[s->used+3] = (uint8_t)(v >> 24);
+    s->used += 4;
+}
+
+static void bz_binser_write_le64_impl(bz_binser_t* s, uint64_t v) {
+    bz_binser_ensure(s, 8);
+    for (int i = 0; i < 8; ++i)
+        s->buf[s->used+i] = (uint8_t)(v >> (8*i));
+    s->used += 8;
+}
+
+// Write LE32 length + raw UTF-8 bytes (no NUL), per §2.15 wire format.
+static void bz_binser_write_utf8_bytes(bz_binser_t* s, const char* data, int64_t byte_len) {
+    bz_binser_write_le32_impl(s, (uint32_t)byte_len);
+    if (byte_len > 0) {
+        bz_binser_ensure(s, byte_len);
+        memcpy(s->buf + s->used, data, (size_t)byte_len);
+        s->used += byte_len;
+    }
+}
+
+extern "C" {
+
+void* bz_binser_alloc(void) {
+    auto* s = static_cast<bz_binser_t*>(malloc(sizeof(bz_binser_t)));
+    s->buf  = nullptr;
+    s->used = 0;
+    s->cap  = 0;
+    return s;
+}
+
+void bz_binser_free(void* serp) {
+    if (!serp) return;
+    auto* s = static_cast<bz_binser_t*>(serp);
+    free(s->buf);
+    free(s);
+}
+
+// Transfer accumulated bytes as a fresh OwnedBuffer<byte> (bz_array_t* with
+// elem_size=1).  The serializer's internal buffer is cleared after the copy
+// so further writes start fresh.  Caller owns the returned array.
+void* bz_binser_to_bytes(void* serp) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    int64_t len = s->used;
+    // Allocate a bz_array_t and bulk-copy the bytes directly.
+    void* arr = bz_array_alloc(1, len > 0 ? len : 1);
+    if (len > 0) {
+        auto* a = static_cast<bz_array_t*>(arr);
+        memcpy(a->data, s->buf, (size_t)len);
+        a->count = len;
+    }
+    // Clear internal buffer so the serializer can be reused.
+    s->used = 0;
+    return arr;
+}
+
+// ISerializer method implementations ----------------------------------------
+
+void bz_binser_write_int(void* serp, int64_t v) {
+    bz_binser_write_le64_impl(static_cast<bz_binser_t*>(serp), (uint64_t)v);
+}
+
+void bz_binser_write_uint(void* serp, uint64_t v) {
+    bz_binser_write_le64_impl(static_cast<bz_binser_t*>(serp), v);
+}
+
+void bz_binser_write_float(void* serp, double v) {
+    uint64_t bits;
+    memcpy(&bits, &v, 8);
+    bz_binser_write_le64_impl(static_cast<bz_binser_t*>(serp), bits);
+}
+
+// WriteDecimal: Bezel decimal wire rep is implementation-defined in §2.15;
+// we use 8-byte IEEE 754 LE (same as WriteFloat) for now.
+void bz_binser_write_decimal(void* serp, void* /*val*/) {
+    // val is a Bezel decimal value; we receive it as a double via LLVM ABI.
+    // Treat as 0.0 stub (decimal synthesis deferred).
+    double zero = 0.0;
+    bz_binser_write_float(serp, zero);
+}
+
+void bz_binser_write_bool(void* serp, int8_t v) {
+    bz_binser_write_byte_impl(static_cast<bz_binser_t*>(serp), v ? 1 : 0);
+}
+
+void bz_binser_write_string(void* serp, void* strp) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (!strp) {
+        bz_binser_write_le32_impl(s, 0);
+        return;
+    }
+    // bz_string_struct layout: {void* data, int64_t len, int8_t width}
+    // For width==1, data points to uint8_t byte array (UTF-8 / Latin-1).
+    // For width==2, data points to uint16_t (UTF-16 LE).
+    // We re-encode to UTF-8 bytes for the wire format.
+    // Simplification: for width==1 we can write data directly (it's already
+    // byte-width; Bezel strings with width==1 are latin-1 or ASCII subset;
+    // non-ASCII wide chars use width==2 or width==4 so the byte content is
+    // valid as-is for our LE32-length-prefixed raw-bytes encoding).
+    const auto* str = static_cast<const bz_string_struct*>(strp);
+    if (str->width == 1) {
+        bz_binser_write_utf8_bytes(s,
+            static_cast<const char*>(str->data), str->len);
+    } else {
+        // width==2 or width==4: use bz_string_to_utf8z to get a UTF-8 copy.
+        char* utf8 = bz_string_to_utf8z(strp);
+        int64_t n = utf8 ? (int64_t)strlen(utf8) : 0;
+        bz_binser_write_utf8_bytes(s, utf8 ? utf8 : "", n);
+        free(utf8);
+    }
+}
+
+void bz_binser_write_char(void* serp, int32_t codepoint) {
+    // Encode Unicode scalar as UTF-8, then write as LE32-length-prefixed bytes.
+    char buf[4];
+    int n = 0;
+    uint32_t cp = (uint32_t)codepoint;
+    if      (cp < 0x80)     { buf[n++] = (char)cp; }
+    else if (cp < 0x800)    { buf[n++] = (char)(0xC0|(cp>>6));  buf[n++] = (char)(0x80|(cp&0x3F)); }
+    else if (cp < 0x10000)  { buf[n++] = (char)(0xE0|(cp>>12)); buf[n++] = (char)(0x80|((cp>>6)&0x3F));  buf[n++] = (char)(0x80|(cp&0x3F)); }
+    else                    { buf[n++] = (char)(0xF0|(cp>>18)); buf[n++] = (char)(0x80|((cp>>12)&0x3F)); buf[n++] = (char)(0x80|((cp>>6)&0x3F)); buf[n++] = (char)(0x80|(cp&0x3F)); }
+    bz_binser_write_utf8_bytes(static_cast<bz_binser_t*>(serp), buf, n);
+}
+
+void bz_binser_write_null(void* serp) {
+    bz_binser_write_byte_impl(static_cast<bz_binser_t*>(serp), 0);
+}
+
+void bz_binser_begin_object(void* serp, int32_t field_count) {
+    bz_binser_write_le32_impl(static_cast<bz_binser_t*>(serp), (uint32_t)field_count);
+}
+
+// write_field_name: name is a bz_string* (void*)
+void bz_binser_write_field_name(void* serp, void* name) {
+    bz_binser_write_string(serp, name);
+}
+
+void bz_binser_end_object(void* /*serp*/) { /* no trailer in binary format */ }
+
+void bz_binser_begin_array(void* serp, int32_t element_count) {
+    bz_binser_write_le32_impl(static_cast<bz_binser_t*>(serp), (uint32_t)element_count);
+}
+
+void bz_binser_end_array(void* /*serp*/) { /* no trailer */ }
+
+} // extern "C" (writer half)
+
+// --- reader state -----------------------------------------------------------
+
+struct bz_binder_t {
+    const uint8_t* data;
+    int64_t        len;
+    int64_t        pos;
+    int8_t         ignore_unknown;
+    int32_t        fields_remaining;
+    bool           in_object;
+};
+
+static int bz_binder_read_byte_impl(bz_binder_t* d, uint8_t* out) {
+    if (d->pos >= d->len) return 0;
+    *out = d->data[d->pos++];
+    return 1;
+}
+
+static int bz_binder_read_le32_impl(bz_binder_t* d, uint32_t* out) {
+    if (d->pos + 4 > d->len) return 0;
+    *out = ((uint32_t)d->data[d->pos+0])
+         | ((uint32_t)d->data[d->pos+1] <<  8)
+         | ((uint32_t)d->data[d->pos+2] << 16)
+         | ((uint32_t)d->data[d->pos+3] << 24);
+    d->pos += 4;
+    return 1;
+}
+
+static int bz_binder_read_le64_impl(bz_binder_t* d, uint64_t* out) {
+    if (d->pos + 8 > d->len) return 0;
+    *out = 0;
+    for (int i = 0; i < 8; ++i)
+        *out |= ((uint64_t)d->data[d->pos+i]) << (8*i);
+    d->pos += 8;
+    return 1;
+}
+
+// Read a LE32-prefixed UTF-8 byte string and return a heap-allocated
+// bz_string_struct* (width=1, caller must free via bz_string_release or
+// direct free of both the struct and its data buffer).
+// Returns nullptr on truncated data.
+static void* bz_binder_read_bz_string(bz_binder_t* d) {
+    uint32_t byte_len = 0;
+    if (!bz_binder_read_le32_impl(d, &byte_len)) return nullptr;
+    if (d->pos + (int64_t)byte_len > d->len)     return nullptr;
+    // Allocate data buffer (NUL-terminate for bz_string_to_utf8z compat).
+    char* buf = static_cast<char*>(malloc((size_t)byte_len + 1));
+    memcpy(buf, d->data + d->pos, byte_len);
+    buf[byte_len] = '\0';
+    d->pos += byte_len;
+    // Allocate a full BZ_STRING_SIZEOF (32-byte) object with rc initialized so
+    // that bz_string_release works correctly (#550: deserialized field names are
+    // passed to bz_string_release by generated code; using a smaller struct
+    // would leave rc at offset 24 uninitialized, corrupting the heap).
+    uint8_t* strObj = static_cast<uint8_t*>(calloc(1, (size_t)BZ_STRING_SIZEOF));
+    int64_t str_len64 = (int64_t)byte_len;
+    memcpy(strObj,      &buf,        sizeof(void*));    // data
+    memcpy(strObj + 8,  &str_len64,  sizeof(int64_t)); // len
+    strObj[16] = 1;                                     // width = 1
+    bz_string_init_rc(strObj);  // #422: rc := 1 (producer's reference)
+    return strObj;
+}
+
+extern "C" {
+
+void* bz_binder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
+    auto* d = static_cast<bz_binder_t*>(malloc(sizeof(bz_binder_t)));
+    d->data             = data;
+    d->len              = len;
+    d->pos              = 0;
+    d->ignore_unknown   = ignore_unknown;
+    d->fields_remaining = 0;
+    d->in_object        = false;
+    return d;
+}
+
+void bz_binder_free(void* derp) {
+    free(derp);
+}
+
+int64_t bz_binder_read_int(void* derp) {
+    uint64_t v = 0;
+    bz_binder_read_le64_impl(static_cast<bz_binder_t*>(derp), &v);
+    return (int64_t)v;
+}
+
+uint64_t bz_binder_read_uint(void* derp) {
+    uint64_t v = 0;
+    bz_binder_read_le64_impl(static_cast<bz_binder_t*>(derp), &v);
+    return v;
+}
+
+double bz_binder_read_float(void* derp) {
+    uint64_t bits = 0;
+    bz_binder_read_le64_impl(static_cast<bz_binder_t*>(derp), &bits);
+    double v;
+    memcpy(&v, &bits, 8);
+    return v;
+}
+
+void* bz_binder_read_decimal(void* derp) {
+    // Stub: read 8 bytes (to advance position) and return nullptr.
+    uint64_t bits = 0;
+    bz_binder_read_le64_impl(static_cast<bz_binder_t*>(derp), &bits);
+    return nullptr;
+}
+
+int8_t bz_binder_read_bool(void* derp) {
+    uint8_t b = 0;
+    bz_binder_read_byte_impl(static_cast<bz_binder_t*>(derp), &b);
+    return b ? 1 : 0;
+}
+
+// Returns a newly-allocated bz_string_struct* (caller owns).
+void* bz_binder_read_string(void* derp) {
+    return bz_binder_read_bz_string(static_cast<bz_binder_t*>(derp));
+}
+
+int32_t bz_binder_read_char(void* derp) {
+    auto* str = static_cast<bz_string_struct*>(
+        bz_binder_read_bz_string(static_cast<bz_binder_t*>(derp)));
+    if (!str || str->len == 0) {
+        if (str) { free(str->data); free(str); }
+        return 0;
+    }
+    const uint8_t* u = static_cast<const uint8_t*>(str->data);
+    uint32_t cp;
+    if      (u[0] < 0x80) { cp = u[0]; }
+    else if (u[0] < 0xE0) { cp = ((u[0]&0x1F)<<6)  | (u[1]&0x3F); }
+    else if (u[0] < 0xF0) { cp = ((u[0]&0x0F)<<12) | ((u[1]&0x3F)<<6) | (u[2]&0x3F); }
+    else                  { cp = ((u[0]&0x07)<<18)  | ((u[1]&0x3F)<<12) | ((u[2]&0x3F)<<6) | (u[3]&0x3F); }
+    free(str->data);
+    free(str);
+    return (int32_t)cp;
+}
+
+int8_t bz_binder_try_read_null(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->pos >= d->len) return 0;
+    if (d->data[d->pos] == 0) { d->pos++; return 1; }
+    return 0;
+}
+
+int32_t bz_binder_begin_object(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    uint32_t cnt = 0;
+    if (!bz_binder_read_le32_impl(d, &cnt)) return -1;
+    // Note: fields_remaining is NOT set here.  The synthesized loop in
+    // emitRecordDeserialize uses the returned count directly; nested records
+    // call bz_binder_begin_object recursively which would clobber a flat
+    // fields_remaining field.  Reading is driven entirely by the loop counter
+    // held in LLVM IR, not by the binder state (§9.8 / issue #550).
+    d->in_object = true;
+    return (int32_t)cnt;
+}
+
+// Returns a newly-allocated bz_string* for the field name.
+// No fields_remaining guard: the synthesized deserialization loop in
+// emitRecordDeserialize calls this exactly fieldCount times, where fieldCount
+// is the value returned by bz_binder_begin_object for THIS object level.
+// Nesting works correctly because each emitRecordDeserialize invocation uses
+// its own fieldCount local (stored in an LLVM alloca), not shared state here.
+void* bz_binder_read_field_name(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    return bz_binder_read_bz_string(d);
+}
+
+// skip_value: advance past one value at current position.
+// The binary format has no type tags, so this is a best-effort skip:
+// we read a LE32 "length" and skip that many bytes (works for all
+// string-prefixed and object/array values; for int/float the caller
+// would need to know the type — synthesis never generates unknown fields).
+void bz_binder_skip_value(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->pos >= d->len) return;
+    uint32_t maybe_len = 0;
+    if (!bz_binder_read_le32_impl(d, &maybe_len)) return;
+    if (d->pos + (int64_t)maybe_len <= d->len)
+        d->pos += (int64_t)maybe_len;
+}
+
+void bz_binder_end_object(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    d->in_object = false;
+    d->fields_remaining = 0;
+}
+
+int32_t bz_binder_begin_array(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    uint32_t cnt = 0;
+    if (!bz_binder_read_le32_impl(d, &cnt)) return -1;
+    return (int32_t)cnt;
+}
+
+int8_t bz_binder_has_more_elements(void* /*derp*/) {
+    // Count-prefixed format: caller drives the loop; this is a placeholder.
+    return 0;
+}
+
+void bz_binder_end_array(void* /*derp*/) { /* no trailer */ }
+
+// bz_ser_throw: build a minimal SerializationException-like exception object
+// and store it in the global bz_exc slot.  `ser_exn_vtable` is the vtable*
+// emitted by the codegen for the SerializationException class (nullptr in tests
+// that don't use vtable-dispatch).  `msg` is a NUL-terminated C string.
+void bz_ser_throw(const char* msg, void* ser_exn_vtable) {
+    // Build a bz_string_struct for the message.
+    size_t msg_len = msg ? strlen(msg) : 0;
+    char* buf = static_cast<char*>(malloc(msg_len + 1));
+    if (msg_len > 0) memcpy(buf, msg, msg_len);
+    buf[msg_len] = '\0';
+    auto* str = static_cast<bz_string_struct*>(malloc(sizeof(bz_string_struct)));
+    str->data  = buf;
+    str->len   = (int64_t)msg_len;
+    str->width = 1;
+
+    // An exception object layout is {vtable*, message bz_string*}.
+    // Allocate a 2-pointer object: [vtable*, str*].
+    void** exc_obj = static_cast<void**>(malloc(2 * sizeof(void*)));
+    exc_obj[0] = ser_exn_vtable;
+    exc_obj[1] = str;
+    extern void* bz_exc;
+    bz_exc = exc_obj;
+}
+
+// OwnedBuffer<byte> helpers --------------------------------------------------
+
+// Allocate an OwnedBuffer<byte> containing a copy of `data[0..len)`.
+// Returns bz_array_t* (elem_size 1).  Caller owns the result.
+void* bz_owned_buffer_byte_alloc(const uint8_t* data, int64_t len) {
+    void* arr = bz_array_alloc(1, len > 0 ? len : 1);
+    if (data && len > 0) {
+        auto* a = static_cast<bz_array_t*>(arr);
+        memcpy(a->data, data, (size_t)len);
+        a->count = len;
+    }
+    return arr;
+}
+
+// Return a pointer+length pair from an OwnedBuffer<byte> (bz_array_t* with
+// elem_size 1).  The span borrows from the buffer; the buffer must outlive it.
+void bz_owned_buffer_get_span(void* bufp,
+                               const uint8_t** data_out,
+                               int64_t* len_out) {
+    if (!bufp) { *data_out = nullptr; *len_out = 0; return; }
+    auto* arr = static_cast<bz_array_t*>(bufp);
+    *data_out = static_cast<const uint8_t*>(arr->data);
+    *len_out  = arr->count;
+}
+
+} // extern "C" (binary serialization)

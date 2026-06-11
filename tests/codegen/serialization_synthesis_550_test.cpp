@@ -1,0 +1,304 @@
+// Codegen tests — §9.8 serialization synthesis (issue #550, tier 1).
+//
+// Tests BinarySerializer/BinaryDeserializer round-trips through the synthesized
+// Serialize/Deserialize on records and enums, per §9.8 + stdlib §2.14–2.15.
+//
+// BinarySerializer/BinaryDeserializer live in System.Serialization (§2.15) and
+// are NOT auto-imported; the tests include "import System.Serialization;".
+//
+// The JIT harness returns main's int exit code. We verify values by comparing
+// deserialized output to expected using = (equality), returning 1 (pass) or 0
+// (fail). All tests return 1 on success and 0 on failure.
+//
+// Scope: tier 1 only — records (primitives, string, enums, nullable T?,
+// nested records), enums, `serialized` field clauses. Classes without the
+// `serialized tree`/`graph`/`cyclic` clause are NOT synthesized; a call to
+// Serialize/Deserialize on such a class without a hand-written method is a
+// normal no-such-member error, not specially diagnosed here.
+//
+// The spec states (§2.14) that BinarySerializer/BinaryDeserializer require
+// `import System.Serialization`. JsonSerializer/JsonDeserializer are deferred
+// (not implemented in tier 1).
+//
+// Spec refs: §9.8, stdlib §2.14, §2.15.
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+
+int run(const std::string& src) {
+    auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+bool compileFails(const std::string& src) {
+    auto r = runJit(src);
+    return r.diagnostics.hasErrors() && !r.ran;
+}
+
+// Preamble for all BinarySerializer tests (§2.15: requires import).
+const char* kImport = "import System.Serialization; ";
+
+} // namespace
+
+// ===========================================================================
+// §9.8 / §2.15: enum round-trip via BinarySerializer/BinaryDeserializer
+// Enums serialize by member NAME (string), not underlying integer (§9.8:
+// "The synthesized form writes the member *name* as a string via WriteString").
+// ===========================================================================
+
+// §9.8: basic enum round-trip — name written and read back correctly.
+BEZEL_TEST(codegen_serialization_550, enum_roundtrip_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "enum Color: ISerializable, IDeserializable Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  using var s := new BinarySerializer(); "
+        "  Color.Green.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var v := Color.Deserialize(d); "
+        "  return (1 if v = Color.Green else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: enum round-trip — different constant (last).
+BEZEL_TEST(codegen_serialization_550, enum_roundtrip_last_member_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "enum Dir: ISerializable, IDeserializable North, South, East, West; end Dir; "
+        "class C public static method Main(): int "
+        "  using var s := new BinarySerializer(); "
+        "  Dir.West.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var v := Dir.Deserialize(d); "
+        "  return (1 if v = Dir.West else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: enum first constant round-trip.
+BEZEL_TEST(codegen_serialization_550, enum_roundtrip_first_member_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "enum Priority: ISerializable, IDeserializable Low, Medium, High; end Priority; "
+        "class C public static method Main(): int "
+        "  using var s := new BinarySerializer(); "
+        "  Priority.Low.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var v := Priority.Deserialize(d); "
+        "  return (1 if v = Priority.Low else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: enum serialized "name" clause — constant encoded under the alternative
+// name, not the declared identifier.
+BEZEL_TEST(codegen_serialization_550, enum_serialized_name_clause_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "enum State: ISerializable, IDeserializable "
+        "  On serialized \"on\", Off serialized \"off\"; "
+        "end State; "
+        "class C public static method Main(): int "
+        "  using var s := new BinarySerializer(); "
+        "  State.On.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var v := State.Deserialize(d); "
+        "  return (1 if v = State.On else 0); "
+        "end Main; end C;"), 1);
+}
+
+// ===========================================================================
+// §9.8 / §2.15: positional record round-trips with BinarySerializer
+// ===========================================================================
+
+// §9.8 example 1: a positional record with int fields round-trips.
+// This is the canonical §9.8 spec example: Point(X: int, Y: int).
+BEZEL_TEST(codegen_serialization_550, record_int_fields_roundtrip_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Point(X: int, Y: int): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var p := new Point(3, 7); "
+        "  using var s := new BinarySerializer(); "
+        "  p.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var p2 := Point.Deserialize(d); "
+        "  return (1 if p2.X = 3 and p2.Y = 7 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: a positional record with a string field round-trips.
+BEZEL_TEST(codegen_serialization_550, record_string_field_roundtrip_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Named(Name: string, Age: int): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var n := new Named(\"Alice\", 30); "
+        "  using var s := new BinarySerializer(); "
+        "  n.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var n2 := Named.Deserialize(d); "
+        "  return (1 if n2.Name = \"Alice\" and n2.Age = 30 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: a positional record with bool, int, double fields round-trips.
+BEZEL_TEST(codegen_serialization_550, record_bool_double_fields_roundtrip_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Flags(Active: bool, Value: double): "
+        "  ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var f := new Flags(true, 3.14); "
+        "  using var s := new BinarySerializer(); "
+        "  f.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var f2 := Flags.Deserialize(d); "
+        "  return (1 if f2.Active and f2.Value = 3.14 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: a positional record with an enum field round-trips.
+BEZEL_TEST(codegen_serialization_550, record_enum_field_roundtrip_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "enum Status: ISerializable, IDeserializable Active, Inactive; end Status; "
+        "record Item(Name: string, St: Status): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var it := new Item(\"thing\", Status.Active); "
+        "  using var s := new BinarySerializer(); "
+        "  it.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var it2 := Item.Deserialize(d); "
+        "  return (1 if it2.Name = \"thing\" and it2.St = Status.Active else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: nested record (tree shape) round-trips.
+BEZEL_TEST(codegen_serialization_550, record_nested_record_roundtrip_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record Point(X: int, Y: int): ISerializable, IDeserializable; "
+        "record Line(A: Point, B: Point): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var ln := new Line(new Point(1, 2), new Point(3, 4)); "
+        "  using var s := new BinarySerializer(); "
+        "  ln.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var ln2 := Line.Deserialize(d); "
+        "  return (1 if ln2.A.X = 1 and ln2.A.Y = 2 "
+        "             and ln2.B.X = 3 and ln2.B.Y = 4 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: `serialized "name"` clause — field encoded under the alternative name.
+// Per §9.8: field-name customization works in both directions.
+BEZEL_TEST(codegen_serialization_550, record_serialized_name_clause_roundtrip_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record User(Id: int, "
+        "  FirstName: string serialized \"first_name\"): "
+        "  ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var u := new User(42, \"Bob\"); "
+        "  using var s := new BinarySerializer(); "
+        "  u.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var u2 := User.Deserialize(d); "
+        "  return (1 if u2.Id = 42 and u2.FirstName = \"Bob\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8: `serialized skip` — skipped field not written/read; deserialized
+// from constructor with default value.
+// §9.8: `serialized skip` — skipped field not written/read; deserialized
+// from constructor with default value (default(int) = 0).
+BEZEL_TEST(codegen_serialization_550, record_serialized_skip_clause_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "class C2 end C2; "
+        "record R(X: int, Secret: int serialized skip): "
+        "  ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var r := new R(5, 99); "
+        "  using var s := new BinarySerializer(); "
+        "  r.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var r2 := R.Deserialize(d); "
+        "  return (1 if r2.X = 5 and r2.Secret = 0 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.8 / §2.15 field order independence: Deserialize must work regardless of
+// input field order (dispatch by name). We test by serializing normally and
+// reading back — the binary format writes declaration order, reads by name.
+BEZEL_TEST(codegen_serialization_550, record_deserialize_by_field_name_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "record R(A: int, B: int, C: int): ISerializable, IDeserializable; "
+        "class C public static method Main(): int "
+        "  var r := new R(10, 20, 30); "
+        "  using var s := new BinarySerializer(); "
+        "  r.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var r2 := R.Deserialize(d); "
+        "  return (1 if r2.A = 10 and r2.B = 20 and r2.C = 30 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// ===========================================================================
+// §9.8: a record NOT declaring ISerializable has no synthesized Serialize →
+// calling it is a normal no-member error (compile fails).
+// ===========================================================================
+
+// §9.8: calling Serialize on a record that does not declare ISerializable
+// is a compile error (no synthesis without the conformance declaration).
+BEZEL_TEST(codegen_serialization_550, no_conformance_no_synthesis_spec_9_8) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        std::string("module M; ") + kImport +
+        "record R(X: int); "
+        "class C public static method Main(): int "
+        "  var r := new R(1); "
+        "  using var s := new BinarySerializer(); "
+        "  r.Serialize(s); "   // no ISerializable declared → compile error
+        "  return 0; "
+        "end Main; end C;"));
+}
+
+// ===========================================================================
+// §9.8 / §2.15: classes without serialized-class clause cannot use synthesis
+// (a codegen-level "not yet implemented" error for class ISerializable).
+// ===========================================================================
+
+// §9.8: a class that declares ISerializable without a `serialized tree`/
+// `graph`/`cyclic` clause but has no hand-written Serialize is a compile error.
+// (The error is emitted at the conformance declaration — either sema or codegen
+// ERROR channel; must produce a hard error and no binary.)
+BEZEL_TEST(codegen_serialization_550, class_no_serialized_clause_hard_error_spec_9_8) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        std::string("module M; ") + kImport +
+        "class Box: ISerializable "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box(1); "
+        "  using var s := new BinarySerializer(); "
+        "  b.Serialize(s); "
+        "  return 0; "
+        "end Main; end C;"));
+}

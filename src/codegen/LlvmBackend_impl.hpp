@@ -512,6 +512,13 @@ private:
         // UAF) and it runs once per exit (no double-free). `slot` holds the box
         // pointer; the class/collection/dict fields are unused.
         bool boxRelease = false;
+        // §2.15 / issue #550: a `using var` bound to a BinarySerializer or
+        // BinaryDeserializer.  These are opaque heap handles with no user
+        // TypeSymbol and no vtable.  At scope end they are freed via
+        // bz_binser_free / bz_binder_free respectively.  Recognised by the
+        // local's declared/resolved type name or the NewExpr type name.
+        bool binarySerializer = false;
+        bool binaryDeserializer = false;
         // §6.1 / §30.8: a `using var` bound to a CancellationTokenSource.
         // The source has no user TypeSymbol, so classOfLocal returns null and the
         // class-disposal path misses it. At scope end it is freed via
@@ -885,6 +892,8 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         descArray_;
 
+    llvm::Type* i8() { return llvm::Type::getInt8Ty(llvm_); }
+    llvm::Type* i16() { return llvm::Type::getInt16Ty(llvm_); }
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
     llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
     llvm::Type* i64() { return llvm::Type::getInt64Ty(llvm_); }
@@ -1377,6 +1386,40 @@ private:
     // synthesizes, §8/§9/§10). Returns the lowered value, or null if not such
     // a call (caller falls through to ordinary method dispatch).
     llvm::Value* tryLowerValueSemanticsCall(const ast::CallExpr& call);
+
+    // §9.8 / §2.14–2.15 (issue #550): BinarySerializer/BinaryDeserializer
+    // construction, ToBytes, AsReadOnlySpan, and synthesized Serialize/
+    // Deserialize on records and enums.  Returns the lowered value, or
+    // nullptr if the call is not a serialization-related call (or is void).
+    // Use isSerializationCall() to distinguish "void result" from "not ours".
+    llvm::Value* tryLowerSerializationCall(const ast::CallExpr& call);
+    // Returns true iff the call should be handled by tryLowerSerializationCall.
+    bool isSerializationCall(const ast::CallExpr& call,
+                             const ast::MemberAccessExpr& ma);
+
+    // Helpers for synthesized Serialize / Deserialize bodies.
+    // Emit the Serialize body for a positional record value and a serializer ptr.
+    void emitRecordSerialize(const sema::TypeSymbol* ts,
+                             llvm::Value* recvVal,
+                             llvm::Value* serPtr);
+    // Emit a single field write (dispatches on type).
+    void emitSerializeField(llvm::Value* val,
+                            const sema::TypeRef* fieldTy,
+                            llvm::Value* serPtr);
+    // Emit the Serialize body for an enum value (writes member name string).
+    void emitEnumSerialize(const sema::TypeSymbol* ts,
+                           llvm::Value* enumVal,
+                           llvm::Value* serPtr);
+    // Emit the Deserialize body for a record: returns the constructed struct value.
+    llvm::Value* emitRecordDeserialize(const sema::TypeSymbol* ts,
+                                       llvm::Value* derPtr);
+    // Emit a single field read (dispatches on type).
+    llvm::Value* emitDeserializeField(const sema::TypeRef* fieldTy,
+                                      llvm::Value* derPtr);
+    // Emit the Deserialize body for an enum: returns i32 constant.
+    llvm::Value* emitEnumDeserialize(const sema::TypeSymbol* ts,
+                                     llvm::Value* derPtr);
+
     // The resolved sema TypeRef of a record field's declared type (positional
     // Param or body FieldDecl). Null if it cannot be determined.
     const sema::TypeRef* recordFieldType(const sema::FieldSymbol* fs);

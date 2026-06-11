@@ -5065,6 +5065,56 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 return builder_.getInt64(0);  // default: zero TimeSpan
             }
+
+            // §2.15 (issue #550): BinarySerializer / BinaryDeserializer.
+            // These require `import System.Serialization`; they are compiler-known
+            // builtin classes backed by bz_binser_t / bz_binder_t in the runtime.
+            // new BinarySerializer() → bz_binser_alloc()  (opaque ptr)
+            if (colName == "BinarySerializer" && ne.args.empty()) {
+                auto* fn = declareC("bz_binser_alloc", ptrTy(), {});
+                return builder_.CreateCall(fn, {}, "binser.new");
+            }
+            // new BinaryDeserializer(span: ReadOnlySpan<byte>)  or
+            // new BinaryDeserializer(span, ignoreUnknownFields: bool)
+            // The span arg is an { ptr, i32, i32 } struct value; we extract
+            // the backing data pointer and byte count.
+            if (colName == "BinaryDeserializer" && !ne.args.empty()) {
+                if (!ne.args[0].value) return nullptr;
+                llvm::Value* spanVal = lowerExpr(*ne.args[0].value);
+                if (!spanVal) return nullptr;
+                // Extract source ptr (field 0) and length i32 (field 2) from the span.
+                llvm::Value* dataPtr = spanSource(spanVal);  // ptr to raw bytes
+                llvm::Value* lenI32  = spanLength(spanVal);  // i32 element count
+                // The data ptr from the span points to the bz_array_t->data buffer;
+                // for byte spans (elem_size=1), that IS the raw byte data.
+                // However, the source field of a byte span IS the bz_array_t* header,
+                // not data directly. We need the actual byte data, so GEP into the
+                // array's data field. Use bz_owned_buffer_get_span to unpack.
+                // Actually: spanSource returns the bz_array_t* (the "source" ptr in
+                // the span struct). We need to get arr->data from it.
+                // bz_array_t layout: {void* data, i64 count, i64 capacity, i8 disposed}
+                // data is at offset 0.
+                llvm::Value* arrData = builder_.CreateLoad(ptrTy(), dataPtr,
+                    "bindeser.data");
+                // Apply the span start offset (usually 0, but can be non-zero).
+                llvm::Value* startI32 = spanStart(spanVal);
+                llvm::Value* startI64 = builder_.CreateZExt(startI32, i64(), "span.s64");
+                llvm::Value* lenI64   = builder_.CreateZExt(lenI32, i64(), "span.l64");
+                // Offset = start (in bytes, elem_size=1 for byte span)
+                llvm::Value* byteData = builder_.CreateGEP(
+                    llvm::Type::getInt8Ty(llvm_), arrData, startI64, "bindeser.bdata");
+                // ignoreUnknownFields: second arg if present (bool, default 0)
+                llvm::Value* ignoreFld = builder_.getInt8(0);
+                if (ne.args.size() >= 2 && ne.args[1].value) {
+                    llvm::Value* bv = lowerExpr(*ne.args[1].value);
+                    if (bv)
+                        ignoreFld = builder_.CreateZExt(bv, i8(), "deser.ign");
+                }
+                auto* fn = declareC("bz_binder_alloc", ptrTy(),
+                                    {ptrTy(), i64(), i8()});
+                return builder_.CreateCall(fn, {byteData, lenI64, ignoreFld},
+                                           "bindeser.new");
+            }
         }
         return nullptr;
     }

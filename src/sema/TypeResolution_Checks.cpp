@@ -2021,4 +2021,261 @@ void Resolver::checkVariancePositions() {
     }
 }
 
+// §9.8 (issue #550): serialization-eligibility check.
+//
+// A type that declares `: ISerializable` or `: IDeserializable` and is NOT
+// serialization-eligible (by §9.8 rules) is a compile error at the conformance
+// declaration.  A type that has a hand-written `Serialize` (resp. `Deserialize`)
+// method suppresses synthesis on that direction — it is always valid regardless
+// of eligibility, because the hand-written body is the contract (§9.8).
+//
+// Eligible component types (§9.8 — tier 1, trees only):
+//   - Primitive types (bool, char, the integer types, float, double, decimal)
+//   - string
+//   - An enum type
+//   - A positional record or auto-equality-bearing body record that itself
+//     declares ISerializable/IDeserializable (recursive eligibility)
+//   - A nullable T? whose T is an eligible component type
+// NOT eligible (in tier 1):
+//   - A class without a `serialized tree`/`graph`/`cyclic` clause
+//   - A record that does not itself declare ISerializable/IDeserializable
+//   - Any other Named type (interface, etc.)
+//   - Function, inline-array, unit types
+//
+// A field marked `serialized skip` is excluded from the component set and does
+// not disqualify the type (§9.8).
+
+// Check whether a TypeRef is a serialization-eligible COMPONENT type (§9.8).
+// `visited` prevents infinite recursion on mutually-referencing eligible records.
+static bool isSerializationEligibleType(
+        const TypeRef* tr,
+        std::unordered_set<const TypeSymbol*>& visited) {
+    if (!tr) return false;
+    using K = TypeRef::Kind;
+    // Nullable T?: eligible when T is eligible (§9.8).
+    if (tr->nullable) {
+        // Peel the nullable wrapper and check the inner type.
+        TypeRef inner = *tr;
+        inner.nullable = false;
+        return isSerializationEligibleType(&inner, visited);
+    }
+    if (tr->kind == K::Primitive) {
+        // All primitives except Object are eligible.
+        using P = PrimitiveType;
+        switch (tr->primitive) {
+            case P::Bool:
+            case P::Char:
+            case P::String:
+            case P::Byte: case P::SByte:
+            case P::Short: case P::UShort:
+            case P::Int: case P::UInt:
+            case P::Long: case P::ULong:
+            case P::Float: case P::Double:
+            case P::Decimal:
+                return true;
+            default:
+                return false;
+        }
+    }
+    if (tr->kind != K::Named) return false;
+    const TypeSymbol* ts = tr->declaration;
+    if (!ts) return false;
+
+    // Enum: always eligible (§9.8).
+    if (ts->kind == ast::TypeDeclKind::Enum) return true;
+
+    // Record: eligible when it itself declares ISerializable/IDeserializable
+    // (the same eligibility contract it must satisfy — the recursive component
+    // check). Guard against cycles.
+    if (ts->kind == ast::TypeDeclKind::Record) {
+        if (visited.count(ts)) return true;  // assume eligible (cycle = eligible set)
+        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+        if (!td) return false;
+        bool declaredISerializable = false;
+        bool declaredIDeserializable = false;
+        for (const auto& bt : td->baseTypes) {
+            if (!bt || !bt->name || bt->name->parts.empty()) continue;
+            auto n = bt->name->parts.back();
+            if (n == "ISerializable")   declaredISerializable = true;
+            if (n == "IDeserializable") declaredIDeserializable = true;
+        }
+        if (!declaredISerializable && !declaredIDeserializable) return false;
+        visited.insert(ts);
+        // Verify the component types of the nested record are themselves eligible.
+        // (This is the recursive eligibility: a nested record must be FULLY
+        // eligible, not just declared conformant.)
+        // For tier 1, trust the declaration — if it declared ISerializable then
+        // the compiler will check IT at its own conformance declaration.
+        // This avoids deep recursion and mirrors how auto-equality treats nested
+        // records (it trusts them, checks each at its own declaration site).
+        return true;
+    }
+
+    // Class: NOT eligible in tier 1 unless it has a serialized-class clause.
+    // A class without such a clause is not a "serialization-eligible synthesized
+    // class" per §9.8. (Tier 1 scope: tree shape is supported; graph/cyclic not.)
+    if (ts->kind == ast::TypeDeclKind::Class) {
+        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+        if (td && td->serializedClass) return true;  // has serialized-class clause
+        return false;
+    }
+
+    return false;
+}
+
+// §9.8: return true if the TypeSymbol `t` has a user-written method of the
+// given name.  This is the suppression check (§9.8): "Hand-writing `Serialize`
+// (respectively a recognized static `Deserialize`) suppresses synthesis."
+static bool typeHasHandWrittenMethod(const TypeSymbol* t, std::string_view name) {
+    for (const Symbol* m : t->members) {
+        const auto* ms = dynamic_cast<const MethodSymbol*>(m);
+        if (ms && ms->name == name) return true;
+    }
+    return false;
+}
+
+// §9.8: does the TypeDecl's base-type list mention the given interface name?
+// ISerializable/IDeserializable are auto-imported built-ins with no TypeSymbol;
+// we match by the last name part, identical to the IDisposable check above.
+static bool declaredConformance(const ast::TypeDecl& td,
+                                std::string_view ifaceName) {
+    for (const auto& bt : td.baseTypes) {
+        if (!bt || !bt->name || bt->name->parts.empty()) continue;
+        if (bt->name->parts.back() == ifaceName) return true;
+    }
+    return false;
+}
+
+// §9.8: the serialized name for a positional field — the `serialized "X"` clause
+// if present, else the declared identifier.  Returns the clause name if set and
+// non-empty, else the field name.  Also returns whether this field is skip.
+static bool positionalFieldIsSkip(const ast::Param& pf) {
+    return pf.serialized && pf.serialized->isSkip;
+}
+
+void Resolver::checkSerializationEligibility() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+
+        // §9.8 applies to records and enums that declare ISerializable/
+        // IDeserializable.  Classes are checked only when they carry an
+        // explicit serialized-class clause — tier 1 does not synthesize class
+        // serialization but we still emit the ineligibility error if declared.
+        bool isRecord = t->kind == ast::TypeDeclKind::Record;
+        bool isEnum   = t->kind == ast::TypeDeclKind::Enum;
+        bool isClass  = t->kind == ast::TypeDeclKind::Class;
+        if (!isRecord && !isEnum && !isClass) continue;
+
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (!td) continue;
+
+        bool wantsIS  = declaredConformance(*td, "ISerializable");
+        bool wantsID  = declaredConformance(*td, "IDeserializable");
+        if (!wantsIS && !wantsID) continue;
+
+        // Enums are always serialization-eligible (§9.8).
+        if (isEnum) continue;  // no further check needed
+
+        // Classes without a serialized-class clause cannot use synthesis
+        // (tier 1 scope — classes with the clause are deferred to later tiers).
+        if (isClass) {
+            if (!td->serializedClass) {
+                // A class declaring ISerializable/IDeserializable without a
+                // `serialized tree`/`graph`/`cyclic` clause AND without a
+                // hand-written Serialize/Deserialize is a tier-1 ineligibility
+                // error (emitted at codegen via the ERROR channel, not here).
+                // Sema does not diagnose class conformance in tier 1 — we skip.
+                // The codegen call will produce a "not yet implemented" hard error.
+                continue;
+            }
+            continue;  // serialized-class clause present: defer to tier 2+
+        }
+
+        // Record: check hand-written suppression and then eligibility.
+        // §9.8: "Hand-writing `Serialize` suppresses synthesis of that direction."
+        bool hasHandWrittenSerialize   = typeHasHandWrittenMethod(t, "Serialize");
+        bool hasHandWrittenDeserialize = typeHasHandWrittenMethod(t, "Deserialize");
+
+        // For ISerializable: need to check eligibility unless hand-written.
+        bool needsSerializeCheck   = wantsIS  && !hasHandWrittenSerialize;
+        bool needsDeserializeCheck = wantsID  && !hasHandWrittenDeserialize;
+        if (!needsSerializeCheck && !needsDeserializeCheck) continue;
+
+        // Collect the serialized components of this record (§9.8).
+        // For a positional record: the positional fields (minus skip-marked ones).
+        // For a body record: the auto-properties (minus skip-marked ones).
+        // A `serialized skip` field is excluded from the component set (§9.8).
+        std::unordered_set<const TypeSymbol*> visited;
+        visited.insert(t);  // guard self-reference
+
+        auto reportIneligible = [&](std::string_view memberName,
+                                    std::string_view reason) {
+            ctx_.diagnostics().report(
+                Severity::Error, t->declLoc,
+                std::string(isRecord ? "record" : "type") +
+                " `" + std::string(t->name) + "` declares `ISerializable`/"
+                "`IDeserializable` but is not serialization-eligible (§9.8): "
+                "field `" + std::string(memberName) + "` " +
+                std::string(reason) + "; remove the conformance declaration, "
+                "mark the field `serialized skip`, make the field type "
+                "serializable, or hand-write `Serialize`/`Deserialize`");
+        };
+
+        bool foundError = false;
+
+        // Positional record: check positional fields.
+        if (td->hasPositionalFields) {
+            for (const auto& pf : td->positionalFields) {
+                if (positionalFieldIsSkip(pf)) continue;  // skip → excluded
+                if (!pf.type) continue;
+                const TypeRef* tr = ctx_.resolvedType(*pf.type);
+                if (!tr) continue;
+                if (!isSerializationEligibleType(tr, visited)) {
+                    reportIneligible(pf.name,
+                        "has a type that is not serialization-eligible");
+                    foundError = true;
+                    break;  // report first offending member only (§9.8)
+                }
+            }
+        } else {
+            // Body record: check auto-properties.
+            for (const Symbol* m : t->members) {
+                if (!isAutoPropertySymbol(m)) continue;
+                auto* ps = dynamic_cast<const PropertySymbol*>(m);
+                if (!ps) continue;
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (!pd) continue;
+                // Check for serialized skip on the auto-property.
+                if (pd->serialized && pd->serialized->isSkip) continue;
+                if (!pd->type) continue;
+                const TypeRef* tr = ctx_.resolvedType(*pd->type);
+                if (!tr) continue;
+                if (!isSerializationEligibleType(tr, visited)) {
+                    reportIneligible(m->name,
+                        "has a type that is not serialization-eligible");
+                    foundError = true;
+                    break;
+                }
+            }
+            if (!foundError) {
+                // §9.8/§9.2: a body record must also be auto-equality-bearing
+                // for synthesis to apply (same membership conditions as §9.2).
+                // If it is not auto-equality-bearing AND doesn't have hand-written
+                // Serialize/Deserialize, the synthesis cannot proceed.
+                // (We don't require auto-equality-bearing for synthesis per the
+                // spec wording; we require the §9.8 body-record conditions which
+                // are the same as §9.2 "auto-equality-bearing" conditions. The
+                // spec says "under exactly the auto-equality membership conditions"
+                // so treat them identically.)
+                // Note: we only report this if there are actually auto-properties
+                // to serialize — an empty record body is still eligible (trivially).
+            }
+        }
+
+        (void)foundError;  // error was already reported if true
+    }
+}
+
 }  // namespace bezel::sema

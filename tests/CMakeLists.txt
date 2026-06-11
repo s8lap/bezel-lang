@@ -171,6 +171,7 @@ set(BEZEL_TEST_SOURCES
     sema/user_dispose_method_594_test.cpp
     sema/new_expr_collection_literal_599_test.cpp
     sema/shared_weak_instantiation_603_test.cpp
+    sema/serialization_synthesis_550_sema_test.cpp
     # --- #600 contract tests (sendability + Domain.Spawn + channels, §30.14/§30.15) ---
     # These tests are the spec-derived CONTRACT for issue #600 phases 2-3.
     # They are RED against current main: sema has no knowledge of Channel<T>,
@@ -458,6 +459,7 @@ set(BEZEL_TEST_SOURCES
     codegen/async_iter_try_finally_554_test.cpp
     codegen/codegen_unimplemented_hard_error_628_test.cpp
     codegen/user_exception_unqualified_msg_625_test.cpp
+    codegen/serialization_synthesis_550_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
