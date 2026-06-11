@@ -685,6 +685,15 @@ private:
     // currentEnumMethod_: when we're emitting an enum instance method, set to
     // the enum TypeSymbol so that `case this` knows the scrutinee's enum type.
     const sema::TypeSymbol* currentEnumMethod_ = nullptr;
+    // fix #628 / §9.5 / §14.2: when emitting a SPECIALIZED method body via
+    // buildSpecializedMethodFn, currentFn_ is set to the freshly-created specFn
+    // which is NOT registered in methodFns_.  lowerWith's §575 reverse-lookup
+    // (fn == currentFn_ in methodFns_) therefore fails — t stays null and
+    // `this with … end` returns the raw `this` pointer instead of a struct copy
+    // → ret-type mismatch (IR verification failure).  currentSpecMethodSymbol_
+    // carries the ORIGINAL MethodSymbol* being specialized so lowerWith can find
+    // the parent TypeSymbol without requiring specFn to be in methodFns_.
+    sema::MethodSymbol* currentSpecMethodSymbol_ = nullptr;
 
     // #383 / §28.8.1: true while emitting a class's compiler-generated Dispose
     // (a destructor body). A `using var u := move this._f;` inside a destructor

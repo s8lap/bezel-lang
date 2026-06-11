@@ -4750,6 +4750,11 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
         // indices. Without this, lowerWith returns the raw pointer and the
         // method emits `ret ptr` where `ret %record.T` is expected →
         // IR verification failure.
+        // fix #628 / §14.2: when emitting inside buildSpecializedMethodFn,
+        // currentFn_ is the freshly-created specFn which is NOT registered in
+        // methodFns_ (only the template function is).  Fall back to
+        // currentSpecMethodSymbol_ (the original MethodSymbol* being specialized)
+        // to recover the parent record TypeSymbol.
         if (src == currentThis_ && currentFn_) {
             for (const auto& [ms, fn] : methodFns_) {
                 if (fn == currentFn_ && ms->parent &&
@@ -4758,6 +4763,12 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
                     rt = nullptr;  // no concrete TypeRef; use method's own subst
                     break;
                 }
+            }
+            if (!t && currentSpecMethodSymbol_ &&
+                currentSpecMethodSymbol_->parent &&
+                currentSpecMethodSymbol_->parent->kind == ast::TypeDeclKind::Record) {
+                t = currentSpecMethodSymbol_->parent;
+                rt = nullptr;  // genericSubst_ already active from buildSpecializedMethodFn
             }
         }
         if (!t) return src;
