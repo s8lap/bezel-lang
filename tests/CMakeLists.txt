@@ -172,6 +172,7 @@ set(BEZEL_TEST_SOURCES
     sema/new_expr_collection_literal_599_test.cpp
     sema/shared_weak_instantiation_603_test.cpp
     sema/serialization_synthesis_550_sema_test.cpp
+    sema/serialization_import_gate_631_sema_test.cpp
     # --- #600 contract tests (sendability + Domain.Spawn + channels, §30.14/§30.15) ---
     # These tests are the spec-derived CONTRACT for issue #600 phases 2-3.
     # They are RED against current main: sema has no knowledge of Channel<T>,
