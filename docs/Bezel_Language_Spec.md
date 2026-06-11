@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.135 — June 2026**
+**Version 0.136 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -1006,13 +1006,17 @@ A class may opt into serialization synthesis by declaring a `serialized` graph-s
 - **`serialized tree`** asserts the class's serialized object graph is a **tree**: along the serialized edges, no two references alias the same object, and there are no cycles.
 - **`serialized graph`** asserts the serialized object graph is a **directed acyclic graph**: serialized edges *may* alias a shared object (the same object reachable by more than one path), but there are no cycles.
 
-A class with either clause is serialization-eligible when every serialized component is itself serialization-eligible by the rule above (which recursively admits other `serialized tree`/`serialized graph` classes and owned collections of them). The two clauses differ only in how aliasing is treated; cycles are rejected by both.
+A class with either clause is serialization-eligible when every serialized component is itself serialization-eligible by the rule above (which recursively admits other `serialized tree`/`serialized graph` classes and owned collections of them). The two clauses differ only in how aliasing is treated; cycles are rejected by both. (`sealed` is irrelevant to serialization: a sealed class follows the same eligibility rules and wire form as any other class, clarified in v0.136.)
+
+When a class-typed component appears in a **record**, it participates only as an *owning* edge: the record field must be `owned` and its class type must carry a graph-shape clause. A record cannot hold a *borrowing* class-typed component in its serialized set — a record declares no owning spanning tree against which a back-edge could resolve — and such a record is not serialization-eligible (a compile error at the conformance declaration, naming the borrowing field; clarified in v0.136).
 
 The serialized components of a class are its `owned` and value-typed fields and auto-properties together with its **borrowing** reference fields (non-owning class-typed fields whose target is owned elsewhere in the same serialized graph), in declaration order. The owning (`owned`) and value edges form the **owning spanning tree**; the borrowing fields are **back-edges** into that tree. This owning-tree/back-edge partition is read directly from the `owned`/borrow annotations the language already requires — it is not inferred and not guessed.
 
 **Synthesized `Serialize`.** The serializer assigns each owned object an identity tag the first time it is reached through an owning edge, and writes the object's components there. A borrowing field is *not* written inline; it is written as a reference to the tag of the object it borrows (which is necessarily present in the owning tree, because a borrow's lifetime is bounded by an owner that outlives it — the language already guarantees the owner exists within the graph). Under `serialized tree`, the serializer additionally asserts no tag is ever reached twice through owning edges and no reference targets an already-emitted-as-reference object; a violation is the programmer's contract breach, surfaced at read (below). Under `serialized graph`, a shared object is written once at its owning-tree position and referenced by tag elsewhere.
 
 **Synthesized `Deserialize`.** The synthesized factory has the class return shape of [§2.14](Bezel_Standard_Library.md#sec-serialization-vocabulary) — `Deserialize(d: IDeserializer): owned T` (a class instance is an owned heap value transferred to the caller, [§28.8](#sec-ownership-transfer)). It reconstructs the owning spanning tree first, in **owner-before-borrower order**: each owned object is constructed by an ordinary call to its constructor, exactly as in the tree case, and every borrowing field is supplied **as a constructor argument** — the reference is resolved against the tag→object table, which already contains the target because the owning tree is built in an order where every borrow target precedes every borrower. A directed acyclic graph always admits such an order; this is precisely the property `serialized graph` asserts. Because each borrowing field is bound *through the constructor*, before any constructor body runs, there is no program point at which a constructed object has an unbound non-nullable reference field: [§7.9](#sec-definite-assignment-for-non-nullable-fields) is satisfied unmodified, with no nullable-field relaxation and no observable intermediate state. The ownership contract for the owning edges lives at the constructor signature, a static program point, exactly as for records and tree-shaped classes; the borrowing arguments are ordinary borrows whose lifetime is established by the constructed owning tree.
+
+**Constructor selection (clarified in v0.136).** When the class declares more than one constructor, the synthesized `Deserialize` uses the *unique* constructor whose parameter list binds exactly the serialized components and borrowing fields, matched by name (order-insensitive; `serialized "<name>"` renames do not affect the parameter-name match, which uses the declared identifiers). If no constructor matches, or more than one does, the conformance declaration is a compile error naming the candidate constructors — the same compile-error discipline as the eligibility rule, reported where the opt-in is declared.
 
 Because graph shape is an *assertion the compiler cannot verify statically*, the synthesized deserializer **enforces it dynamically**:
 
@@ -6465,7 +6469,9 @@ By convention, async methods that should be cancellable accept a `CancellationTo
 - Awaiting a faulted task re-raises the exception with the original stack trace preserved.
 - `try`/`catch` inside an async method catches exceptions normally, including those raised by `await`.
 
-`await` has no syntactic restrictions on its placement inside `try`/`catch`/`finally`. The state machine handles suspension across exception-handling boundaries correctly.
+`await` has no syntactic restrictions on its placement inside `try`/`catch`/`finally` *bodies*. The state machine handles suspension across exception-handling boundaries correctly.
+
+Catch **guards** are the one exception: a `when` guard on a catch arm ([§19.4](#sec-guards)) is evaluated synchronously during exception dispatch and may not contain `await` (a compile error, in async and sync methods alike). Exception dispatch — deciding *which* arm handles a raised exception — runs to completion without suspension; permitting a suspension point inside dispatch would leave the exception neither caught nor propagating across the suspension. A guard that needs asynchronous information awaits it *before* the `try`, or catches unconditionally and re-raises (`throw;`, [§21.8](#sec-throw)) after an awaited check in the arm body.
 
 ```bezel
 public async method WithCleanupAsync(): Task

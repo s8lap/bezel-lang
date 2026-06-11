@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.135 — June 2026**
+**Companion to the Bezel Language Specification, v0.136 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6645,6 +6645,48 @@ None. Amendment 2 only widens acceptance: programs previously rejected by the ov
 #### Editorial note
 
 The `linkify_refs.py` toolchain was not re-run; the four edits are localized and the new cross-references were verified against existing anchors.
+
+---
+
+### v0.136 changelog (v0.135 → v0.136)
+
+Five amendments: two stdlib additions that unblock tracked implementation work (#553, #547), one async-dispatch clarification (#451's open question), and two §9.8 clarifications surfaced by the serialization tier-2 test derivation (#659).
+
+#### Amendment 1 — Encoding semantics for `Utf16`, `Utf32`, `Ascii` (stdlib §3.2; closes the spec side of #553)
+
+The four standard encodings were declared in §3.2 with no normative semantics. §3.2 now specifies, per encoding: byte order (UTF-16/32 are little-endian only), BOM policy (never emitted; one leading little-endian BOM consumed on decode), and the error model. **Decision: strict defined-fault error model** — `FormatException` on ill-formed input bytes (decode) and unrepresentable code points (encode, `Ascii` only); no replacement characters. *Declined: lenient decode-with-replacement (U+FFFD).* Silent substitution is data corruption by another name, and Bezel's design rule is that faults are defined and loud (cf. checked disposal, §28.2; serialization contract violations, §9.8). A program that wants replacement decoding writes it explicitly over the byte span. *Declined: big-endian variants* — no in-scope producer; byte-swapping is one explicit loop, and the singleton surface stays minimal.
+
+#### Amendment 2 — `SortedDictionary<K, V>` and `SortedSet<T>` (stdlib §4.17/§4.18, new; spec side of #547)
+
+Comparison-ordered associative collections with `K: IComparable<K>` constraints, O(log n) point operations, ascending in-order single-pass borrowing iteration (§4.8 form), `First`/`Last` accessors. **Decision: ordering comes from the key type's `CompareTo` only — no comparer parameter.** Keeping equality, ordering, and hashing on the type (one identity per type) avoids the comparer-mismatch class of bugs (a set built with one comparer queried under another); a different order is a wrapper record away. **Decision: no `OwnedSortedDictionary`/`OwnedSortedSet` in this revision** — owning sorted collections ride the self-hosted-collections direction (#545), where the element-slot policy (§28.11) already centralizes the finalization machinery they would need.
+
+#### Amendment 3 — Catch guards are synchronous (spec §30.9; settles #451's deferred question)
+
+§30.9 stated `await` has no placement restrictions in `try`/`catch`/`finally`; that sentence is now scoped to *bodies*, and a new paragraph states that a `when` guard on a catch arm may not contain `await` (compile error). Exception dispatch runs to completion without suspension. *Declined: asynchronous guards* — a suspension point inside dispatch leaves the exception neither caught nor propagating across the suspension; re-entering dispatch after resumption would require materializing dispatch state in the state machine for a construct whose use cases are served by awaiting before the `try` or re-raising from the arm body. The implementation has diagnosed this since #451; the spec now says so.
+
+#### Amendment 4 — §9.8 constructor selection clarified (#659 silence 3)
+
+The synthesized `Deserialize` text said "its constructor," silent on classes with several. Now: the unique constructor binding exactly the serialized components and borrowing fields by declared name; zero or several matches are a compile error at the conformance declaration naming the candidates. Compile-time decidable, consistent with the eligibility-error discipline.
+
+#### Amendment 5 — §9.8 records × class-typed components, and `sealed` (#659 silences 4 and 2)
+
+A class-typed component of a *record* participates only as an owning edge (`owned` field of a clause-carrying class); a borrowing class-typed component makes the record ineligible (compile error naming the field) — a record declares no owning spanning tree against which a back-edge could resolve. One parenthetical states `sealed` is irrelevant to serialization. (#659 silence 1 — polymorphic components — needed no amendment: §9.8 has specified the `polymorphic` registry and the no-registry compile error since v0.122.)
+
+#### Touched
+
+- **Spec §30.9** — bodies scoping + catch-guard paragraph (cross-refs §19.4, §21.8).
+- **Spec §9.8** — constructor-selection paragraph; record/owning-edge paragraph; `sealed` parenthetical.
+- **Stdlib §3.2** — encoding semantics block.
+- **Stdlib §4.17/§4.18** — new sections (anchors `sec-sorted-dictionary`, `sec-sorted-set`).
+- **Rationale** — this changelog entry.
+
+#### Migration
+
+None. Amendments 1–2 specify previously-unspecified surface; 3–5 codify the implementation's existing (or compile-error) behavior. No existing well-formed program changes meaning.
+
+#### Editorial note
+
+The `linkify_refs.py` toolchain was not re-run; edits are localized and all new cross-references were verified against existing anchors (`sec-guards`, `sec-throw`, `sec-dictionaryk-v`, `sec-sett-and-ownedsett`).
 
 ---
 

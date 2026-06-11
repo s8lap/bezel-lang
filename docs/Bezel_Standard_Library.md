@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.135 — June 2026**
+**Companion to the Bezel Language Specification, v0.136 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -841,6 +841,15 @@ end Encoding;
 The static properties (`Utf8`, `Utf16`, `Utf32`, `Ascii`) return singleton instances of implementation-provided concrete subclasses. The concrete subclass types are not part of the public API; callers access them through the `Encoding` base type. The singleton instances are program-lifetime objects with no resources to release; their `Dispose()` is a no-op. They are not marked `static owned` — they are exempt from the ownership-discharge requirement by the same reasoning as non-`owned` static class-typed fields ([§22.13](Bezel_Language_Spec.md#sec-static-initialization-order) of the language spec).
 
 `Encoding` is `abstract` to permit implementation-provided concrete subclasses. User code may subclass `Encoding` for custom encodings; user subclasses are subject to normal class disposal rules (they may have destructors and owned fields).
+
+**Semantics of the standard encodings (specified in v0.136).** All four standard encodings follow one error model: malformed or unrepresentable input is a **defined fault**, never a silent substitution. `GetString` raises `FormatException` when the input bytes are not a well-formed sequence in the encoding; `GetBytes` raises `FormatException` when the string contains a code point the encoding cannot represent (possible only for `Ascii`). No replacement characters are produced. (The lenient decode-with-replacement mode was considered and declined — rationale changelog, v0.136.)
+
+- **`Utf8`** (`Name` = `"utf-8"`): bytes are the UTF-8 form of the string's code points. `GetBytes` never emits a byte-order mark; `GetString` does not treat a leading `EF BB BF` specially (it decodes to U+FEFF). Ill-formed sequences — overlong forms, unpaired-surrogate encodings, truncated tails — raise `FormatException`.
+- **`Utf16`** (`Name` = `"utf-16le"`): little-endian, no BOM emitted. `GetString` requires an even byte count, consumes one leading little-endian BOM (`FF FE`) if present, and raises `FormatException` on an odd count, a big-endian BOM (`FE FF`), or an unpaired surrogate. Big-endian UTF-16 is not provided; a program that needs it byte-swaps explicitly.
+- **`Utf32`** (`Name` = `"utf-32le"`): little-endian, no BOM emitted. `GetString` requires a byte count divisible by four, consumes one leading little-endian BOM if present, and raises `FormatException` on any unit that is not a Unicode scalar value (greater than `U+10FFFF` or in the surrogate range).
+- **`Ascii`** (`Name` = `"us-ascii"`): strict seven-bit. `GetBytes` raises `FormatException` on any code point above `U+007F`; `GetString` raises `FormatException` on any byte above `0x7F`.
+
+The `index`/`count` overload of `GetString` applies the same rules to the selected byte range; a BOM is consumed only at the start of the range.
 
 <a id="sec-readonlystringspan"></a>
 ### 3.3 `ReadOnlyStringSpan`
@@ -2477,6 +2486,56 @@ Authors of performance-sensitive APIs typically provide the concrete-type signat
 **SequenceEqual and the interface.** `SequenceEqual` *is* on the interface, with parameter type `IReadOnlySpan<TElement>`. This admits cross-source equality through the interface — `byteSpan.SequenceEqual(asciiSpan)` where one is a `ReadOnlySpan<byte>` and the other is a `ReadOnlyAsciiByteSpan` compiles when both are passed via `IReadOnlySpan<byte>`. The cost is two virtual-dispatched indexer reads per element; the convenience is real for comparison code that doesn't care which source type the operands came from.
 
 **What about writable spans.** v0.108 does not introduce an `IMutableSpan` (or similar) writable interface. The writable side has substantive semantic differences across span families — `Span<T>`'s class-T setter takes `owned T?` and disposes previous slot contents; `ArraySpan<T>`'s setter takes a borrow with no disposal; value-T setters are plain copies. Unifying these under a single writable interface would either pick one model and exclude the others, or fork the contract by source kind, which defeats the unification. The read-only side is genuinely uniform: every span supports indexer-get returning the slot's element, and that's enough for one interface. The writable side may be revisited if a partial unification (e.g. covering only the non-owned-slot writable spans) proves valuable.
+
+<a id="sec-sorted-dictionary"></a>
+### 4.17 `SortedDictionary<K, V>` (added in v0.136)
+
+A comparison-ordered associative collection: iteration visits entries in ascending key order. The borrowing/non-owning counterpart of `Dictionary<K, V>` ([§4.8](#sec-dictionaryk-v)) with an ordering guarantee.
+
+```bezel
+public class SortedDictionary<K, V>: IDisposable where K: IComparable<K>
+  public constructor();
+
+  public readonly property Count: int;
+
+  public property [key: K]: V;                  // get: KeyNotFoundException if absent
+                                                // set: insert or replace
+  public method ContainsKey(key: K): bool;
+  public method TryGetValue(key: K, out value: V?): bool;
+  public method Remove(key: K): bool;           // false if absent
+  public method Clear();
+
+  public readonly property FirstKey: K;         // least key; InvalidOperationException if empty
+  public readonly property LastKey: K;          // greatest key; InvalidOperationException if empty
+end SortedDictionary;
+```
+
+Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type). Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
+
+Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. There is no owning `OwnedSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (rationale changelog, v0.136).
+
+<a id="sec-sorted-set"></a>
+### 4.18 `SortedSet<T>` (added in v0.136)
+
+A comparison-ordered set: membership by `CompareTo`-equality, iteration in ascending order.
+
+```bezel
+public class SortedSet<T>: IDisposable where T: IComparable<T>
+  public constructor();
+
+  public readonly property Count: int;
+
+  public method Add(item: T): bool;             // false if an equal item is present
+  public method Contains(item: T): bool;
+  public method Remove(item: T): bool;          // false if absent
+  public method Clear();
+
+  public readonly property First: T;            // least; InvalidOperationException if empty
+  public readonly property Last: T;             // greatest; InvalidOperationException if empty
+end SortedSet;
+```
+
+The same single-order rule, complexity guarantees (point ops O(log n), in-order iteration O(n)), iteration form, and value semantics as [§4.17](#sec-sorted-dictionary) apply. As with `Set<T>` ([§4.10](#sec-sett-and-ownedsett)), the element type supplies the identity; for `SortedSet<T>` that identity is `CompareTo`-equality, and an `Add` of an equal element returns `false` without modifying the set.
 
 ---
 
