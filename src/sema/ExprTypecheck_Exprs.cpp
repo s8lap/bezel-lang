@@ -887,29 +887,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     } else if (t->kind == ast::TypeDeclKind::Class) {
                         // Slice T7: constructor arity / arg types.
                         checkNewExprArgs(*ne, t);
-                    } else if (t->kind == ast::TypeDeclKind::Record &&
-                               ctx_.isImported(t) && !t->genericParams.empty()) {
-                        // §14.1 / §2.5 (#428): an IMPORTED GENERIC RECORD is NOT
-                        // routed through checkNewExprArgs (records have no
-                        // constructor-arity check here), so without this guard a
-                        // `new ImportedRecord<Args>(...)` slipped past every check
-                        // and codegen monomorphized it through the record path —
-                        // which has no per-instantiation struct specialization, so
-                        // a non-`int` type argument silently MISCOMPILED (the
-                        // field kept the i32 placeholder layout). Reject it with
-                        // the honest §14 diagnostic until cross-module generic-type
-                        // monomorphization is supported (deferred — #428; the
-                        // generic CLASS case is gated in checkImportedNewExprArgs).
-                        ctx_.diagnostics().report(
-                            Severity::Error, ne->span.begin,
-                            std::string("constructing an imported generic record "
-                                        "(`new ") +
-                                std::string(t->name) +
-                                "<...>`) is not yet supported: a generic record is "
-                                "monomorphized per-instantiation (\xC2\xA7""14) and "
-                                "its per-instantiation layout is not yet carried "
-                                "across a module boundary (\xC2\xA7""2.5)");
                     }
+                    // §14.1 / §2.5 (#428 phase B): imported generic RECORD
+                    // construction is now supported — codegen performs per-
+                    // instantiation specialization in the importing module using
+                    // the same local recordStruct path, with the substitution
+                    // built from TypeSymbol::genericParams (populated by the
+                    // ModuleLoader).  The prior §14 guard that rejected this
+                    // case is removed here; the residual gate for imported
+                    // generic CLASS is still in checkImportedNewExprArgs.
                 }
             }
         }

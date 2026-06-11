@@ -300,6 +300,19 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 if (sit != genericSubst_.end())
                     return sit->second;
             }
+            // #428 / §14.1 / §2.5: an imported generic-record field whose
+            // type is a type parameter carries NO astNode (there is no AST
+            // in the importer), but the parameter name is in importedName
+            // (set by ModuleLoader.cpp Loader::convert for the Named/no-decl
+            // case). A single-part name in importedName with no declaration
+            // and no astNode is a type-parameter reference — look it up in the
+            // active genericSubst_ exactly as the astNode path above does.
+            if (!rt->declaration && !genericSubst_.empty() &&
+                rt->astNode == nullptr && !rt->importedName.empty()) {
+                auto sit = genericSubst_.find(rt->importedName);
+                if (sit != genericSubst_.end())
+                    return sit->second;
+            }
             // §32.5 / §32.7 / stdlib §10: FFI-boundary types. IntPtr and
             // UIntPtr are pointer-sized integers — on the host target that is
             // 64-bit, so they lower to i64. CString/WString/RawBytes are
@@ -835,19 +848,39 @@ Emitter::RecordSubstGuard::RecordSubstGuard(Emitter* em, const sema::TypeRef* rt
         rt->genericArgs.empty())
         return;
     auto* rtd = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    if (!rtd || rtd->genericParams.size() != rt->genericArgs.size()) return;
-    savedSubst = e->genericSubst_;
-    savedSemaTy = e->genericSubstSemaTy_;
-    std::unordered_map<std::string_view, llvm::Type*> newSubst;
-    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-    for (std::size_t gi = 0; gi < rtd->genericParams.size(); ++gi) {
-        newSubst[rtd->genericParams[gi].name] =
-            e->lowerTypeRef(rt->genericArgs[gi]);
-        newSema[rtd->genericParams[gi].name] = rt->genericArgs[gi];
+    if (rtd && rtd->genericParams.size() == rt->genericArgs.size()) {
+        // Local generic record: generic param names come from the ast::TypeDecl.
+        savedSubst = e->genericSubst_;
+        savedSemaTy = e->genericSubstSemaTy_;
+        std::unordered_map<std::string_view, llvm::Type*> newSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+        for (std::size_t gi = 0; gi < rtd->genericParams.size(); ++gi) {
+            newSubst[rtd->genericParams[gi].name] =
+                e->lowerTypeRef(rt->genericArgs[gi]);
+            newSema[rtd->genericParams[gi].name] = rt->genericArgs[gi];
+        }
+        e->genericSubst_ = std::move(newSubst);
+        e->genericSubstSemaTy_ = std::move(newSema);
+        active = true;
+    } else if (!rtd &&
+               rt->declaration->genericParams.size() == rt->genericArgs.size()) {
+        // #428 / §14.1 / §2.5: IMPORTED generic record — no ast::TypeDecl, but
+        // generic param names are in TypeSymbol::genericParams (populated by
+        // ModuleLoader::convertGenericParams). Build the substitution the same
+        // way so field accesses on an imported Box<string> get the ptr layout.
+        savedSubst = e->genericSubst_;
+        savedSemaTy = e->genericSubstSemaTy_;
+        std::unordered_map<std::string_view, llvm::Type*> newSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+        for (std::size_t gi = 0; gi < rt->declaration->genericParams.size(); ++gi) {
+            std::string_view pname = rt->declaration->genericParams[gi]->name;
+            newSubst[pname] = e->lowerTypeRef(rt->genericArgs[gi]);
+            newSema[pname] = rt->genericArgs[gi];
+        }
+        e->genericSubst_ = std::move(newSubst);
+        e->genericSubstSemaTy_ = std::move(newSema);
+        active = true;
     }
-    e->genericSubst_ = std::move(newSubst);
-    e->genericSubstSemaTy_ = std::move(newSema);
-    active = true;
 }
 
 Emitter::RecordSubstGuard::~RecordSubstGuard() {
@@ -865,16 +898,34 @@ Emitter::RecordSubstGuard::~RecordSubstGuard() {
 // same param-name lookup ownedTypeParamConcreteType / lowerNew's `new T()` path
 // use, applied to the synthesized value-semantics members so a generic record's
 // `T`-typed field compares / formats / hashes by its CONCRETE type's contract.
+//
+// #428 / §14.1 / §2.5: for IMPORTED generic record fields, recordMemberType
+// returns null (no posParam, no FieldDecl AST), but the field type lives in the
+// imported-member-type side table (ctx_.importedMemberType).  Fall back to that
+// table so the substitution lookup below can still resolve T → the concrete type.
 const sema::TypeRef* Emitter::recordMemberTypeResolved(const sema::Symbol* m) {
     const sema::TypeRef* declared = recordMemberType(m);
+    // #428: imported field fallback — importedMemberType carries the TypeRef for
+    // members whose declaration is null (all imported symbols).
+    if (!declared) {
+        if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
+            if (ms->decl == nullptr)
+                declared = ctx_.importedMemberType(ms);
+    }
     if (!declared || genericSubstSemaTy_.empty()) return declared;
     if (declared->kind != sema::TypeRef::Kind::Named || declared->declaration)
         return declared;
-    if (!declared->astNode || !declared->astNode->name ||
-        declared->astNode->name->parts.size() != 1)
-        return declared;
-    auto it = genericSubstSemaTy_.find(declared->astNode->name->parts[0]);
-    if (it != genericSubstSemaTy_.end() && it->second) return it->second;
+    // Local generic record: type-param name is in astNode.
+    if (declared->astNode && declared->astNode->name &&
+        declared->astNode->name->parts.size() == 1) {
+        auto it = genericSubstSemaTy_.find(declared->astNode->name->parts[0]);
+        if (it != genericSubstSemaTy_.end() && it->second) return it->second;
+    }
+    // #428: imported generic record — type-param name is in importedName.
+    if (!declared->importedName.empty()) {
+        auto it = genericSubstSemaTy_.find(declared->importedName);
+        if (it != genericSubstSemaTy_.end() && it->second) return it->second;
+    }
     return declared;
 }
 
@@ -1987,6 +2038,20 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                         if (lit != localGenericSubst_.end())
                             newSubst = lit->second;
                     }
+                }
+                genericSubst_ = std::move(newSubst);
+            } else if (!td &&
+                       ms->parent->genericParams.size() ==
+                       targetTy->genericArgs.size()) {
+                // #428 / §14.1 / §2.5: IMPORTED generic type — no ast::TypeDecl,
+                // but TypeSymbol::genericParams has the param names.  Build the
+                // same layout substitution so recordStruct (and classStruct)
+                // produce the correct specialized struct for field-index mapping.
+                std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                for (std::size_t gi = 0;
+                     gi < ms->parent->genericParams.size(); ++gi) {
+                    newSubst[ms->parent->genericParams[gi]->name] =
+                        lowerTypeRef(targetTy->genericArgs[gi]);
                 }
                 genericSubst_ = std::move(newSubst);
             }

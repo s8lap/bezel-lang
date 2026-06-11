@@ -3191,6 +3191,27 @@ TypeRef* ExprTC::substituteReturnType(
         }
         return declared;
     }
+    // #428 phase B: an imported generic-record field's type parameter has NO
+    // astNode (there is no AST for imported types); its name rides importedName
+    // instead (set by ModuleLoader::convert for MetaType::Named when
+    // declaration==nullptr).  The local-AST branch above misses this case.
+    // Look up importedName directly in `solved` — same substitution semantics.
+    // per §14.1 / §9 (imported positional-record field type substitution).
+    if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
+        !declared->astNode && !declared->importedName.empty() &&
+        declared->genericArgs.empty()) {
+        auto it = solved.find(declared->importedName);
+        if (it != solved.end() && it->second) {
+            TypeRef* sub = it->second;
+            if (declared->nullable && !sub->nullable) {
+                TypeRef* nn = ctx_.makeTypeRef(*sub);
+                nn->nullable = true;
+                return nn;
+            }
+            return sub;
+        }
+        return declared;
+    }
     // Constructed generic → substitute each generic argument in place.
     // This covers both user-defined generic types (declaration != nullptr, e.g.
     // `Box<T>`) and null-declaration stdlib built-ins (e.g. `Array<T>`,
