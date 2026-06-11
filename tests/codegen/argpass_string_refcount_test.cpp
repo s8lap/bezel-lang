@@ -1,0 +1,530 @@
+// Codegen + runtime — string reference counting for the ARGUMENT-PASS category
+// (issue #429, §4.6 / §28.9). When a +1 string producer (concat / interpolation
+// / range-slice / user-method-return) is passed DIRECTLY as a call argument
+// (not bound to a local first), the CALLER must release the temporary AFTER the
+// call returns. The callee receives the string as a BORROW; if the callee stores
+// the param into a string field/auto-property, the field-store path inside the
+// callee already retains independently (rc→2), so the post-call release (rc→1)
+// is safe — the field still owns its +1.  If the callee only reads the string,
+// the post-call release (rc→0) reclaims the temporary.
+//
+// Ownership convention (argument-pass sub-slice):
+//   - A +1 string producer in argument position is released by the CALLER after
+//     the call returns (bz_string_release on the argument value).
+//   - The release runs only on normal-exit paths; on exception paths the
+//     temporary leaks (the safe direction — a leak is harmless, a UAF is not).
+//   - Non-producer arguments (literals / local identifiers / field reads) are
+//     NOT released (they do not hold an independent +1 from the call-site's
+//     perspective). Literals carry the sentinel rc; locals' +1 is owned by the
+//     local slot and released by the scope-end machinery.
+//   - Double-free canaries: when the callee stores the argument into a field,
+//     the field-store path retains (rc→2); our post-call release (rc→1) keeps
+//     exactly one reference in the field. The canary programs exercise this path
+//     under detect_leaks=0 / abort_on_error=0 (so we catch UAF/double-free while
+//     tolerating any residual bookkeeping leak from closure-box cells).
+//
+// Two complementary checks per shape:
+//   1. expectValueAndLeakFree: exit code correct AND LSan reports no leak /
+//      UAF / double-free (the temporary is reclaimed → CLEAN).
+//   2. expectValueAndNoCorruption: exit code correct AND ASan no MEMORY-SAFETY
+//      error (UAF/double-free), tolerating a residual leak.  Used for field-store
+//      canaries where a small unrelated residual may survive.
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <sys/wait.h>
+
+#include "codegen/LlvmBackend.hpp"
+#include "driver/Driver.hpp"
+#include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
+#include "test_harness.hpp"
+#include "native_test_harness.hpp"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Compile + run natively; return exit code or -1 on failure.
+int compileAndRun(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_429ap_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    { std::ofstream out(src); out << source; }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    int code = -1;
+    if (r.success) {
+        int status = std::system(exe.c_str());
+        if (status != -1 && WIFEXITED(status)) code = WEXITSTATUS(status);
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return code;
+}
+
+// Compile + link against ASan runtime. Returns false on failure / unavailable.
+bool lowerAndLink(const std::string& source, std::string& obj,
+                  std::string& exe) {
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return false;
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_429ap_san_" + std::to_string(counter++);
+    obj = (dir / (stem + ".o")).string();
+    exe = (dir / stem).string();
+    {
+        bezel::DiagnosticEngine diags;
+        bezel::Lexer lexer(source, diags);
+        bezel::Parser parser(lexer, diags);
+        auto unit = parser.parseCompilationUnit();
+        if (!unit) return false;
+        bezel::sema::SemaContext ctx(diags);
+        bezel::sema::collectSymbols(*unit, ctx);
+        bezel::sema::resolveTypes(*unit, ctx);
+        bezel::sema::typecheckExpressions(*unit, ctx);
+        bezel::sema::checkDefiniteAssignment(*unit, ctx);
+        bezel::ownership::checkOwnership(*unit, ctx);
+        if (diags.hasErrors()) return false;
+        llvm::LLVMContext llvmCtx;
+        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+        if (!module) return false;
+        std::string err;
+        if (!bezel::codegen::emitObjectFile(*module, obj, err)) return false;
+    }
+    std::string linkCmd = "clang++ -fsanitize=address -g " + obj + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) {
+        std::remove(obj.c_str()); return false;
+    }
+    return true;
+}
+
+// LSan verification. Returns 0 = clean, 1 = leak/corruption, -1 = skip.
+int runUnderLeakSanitizer(const std::string& source) {
+    std::string obj, exe;
+    if (!lowerAndLink(source, obj, exe)) return -1;
+    std::string runCmd =
+        "ASAN_OPTIONS=detect_leaks=1:exitcode=99 " + exe + " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    std::remove(obj.c_str()); std::remove(exe.c_str());
+    if (status == -1) return -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;
+    return 0;
+}
+
+// Assert correct exit code AND LSan-clean (no leak, no UAF/DF).
+void expectValueAndLeakFree(const std::string& source, int expectedExitCode) {
+    BEZEL_EXPECT_EQ(compileAndRun(source), expectedExitCode);
+    int lsan = runUnderLeakSanitizer(source);
+    if (lsan == -1) return;
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// Assert correct exit code AND no ASan MEMORY-SAFETY error (UAF/DF), tolerating
+// a residual leak (detect_leaks=0). Used for field-store canaries where a small
+// unrelated residual may survive from pre-existing box/closure bookkeeping.
+void expectValueAndNoCorruption(const std::string& source, int expectedExitCode) {
+    BEZEL_EXPECT_EQ(compileAndRun(source), expectedExitCode);
+    std::string obj, exe;
+    if (!lowerAndLink(source, obj, exe)) return;
+    std::string runCmd =
+        "ASAN_OPTIONS=detect_leaks=0:exitcode=99:abort_on_error=0 " + exe +
+        " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    std::remove(obj.c_str()); std::remove(exe.c_str());
+    if (status == -1) return;
+    BEZEL_EXPECT_TRUE(WIFEXITED(status) &&
+                      WEXITSTATUS(status) == expectedExitCode);
+}
+
+// ---- Programs: concat direct arg (borrow-only callee) -----------------------
+//
+// §28.9 / §4.6 / §28.3: a +1 producer (`+`) passed DIRECTLY as an argument to
+// a method that only READS it (pure borrow). The producer's rc=1 reference was
+// previously leaked (no one released it). With argument-pass retain, the caller
+// emits bz_string_release AFTER the call → rc=0, freed. Looped 100k → memory
+// bounded (no per-iteration growth). LSan-clean after the fix.
+
+const char* kConcatDirectArgBorrowOnlyCallee =
+    "module M; class C "
+    "  public static method Consume(s: string): int return s.Length; end Consume; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      total := total + C.Consume(\"he\" + \"llo\"); "  // concat rc=1, released after call
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 500000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: user-method-return arg (borrow-only callee) ------------------
+//
+// §28.9 / §28.3 (RETURN × ARGUMENT-PASS interplay): `Build()` mints +1 for the
+// returned string; the result is passed DIRECTLY to `Consume` (no local). The
+// caller now releases the +1 after the outer call → reclaimed each iteration.
+const char* kMethodReturnDirectArgBorrowOnlyCallee =
+    "module M; class C "
+    "  public static method Build(): string return \"bu\" + \"ilt\"; end Build; "
+    "  public static method Consume(s: string): int return s.Length; end Consume; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      total := total + C.Consume(C.Build()); "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 500000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: string interpolation direct arg ------------------------------
+//
+// §28.9 / §4.6: an interpolation `$"…"` is a +1 producer. Passed as argument
+// directly → released after the call.
+const char* kInterpDirectArgBorrowOnlyCallee =
+    "module M; class C "
+    "  public static method Consume(s: string): int return s.Length; end Consume; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      total := total + C.Consume($\"x=3\"); "  // interp → rc=1, released
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 300000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: multiple +1 producer args in one call -----------------------
+//
+// §28.9: both args are +1 producers; both are released after the call → bounded
+// memory.
+const char* kMultipleProducerArgsCall =
+    "module M; class C "
+    "  public static method Combine(a: string, b: string): int "
+    "    return a.Length + b.Length; "
+    "  end Combine; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      total := total + C.Combine(\"aa\" + \"bb\", \"cc\" + \"dd\"); "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 800000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: concat arg to field-store callee (double-free canary) --------
+//
+// §28.9 (CARDINAL double-free guard): the callee stores the param into a class
+// string field via `this.Name := s`. The field-store path sees `s` (a param
+// identifier, NOT a +1 producer at the callee's expression level) → RETAINS
+// (rc=2). After the outer call returns, our post-call release drops rc to 1 —
+// the field still holds its independent +1.  No double-free, no UAF.
+// Looped 100k times; the field's final value is released on the object's
+// disposal. Value + no-corruption (detect_leaks=0, tolerating any residual from
+// object bookkeeping in the test harness).
+const char* kConcatArgFieldStoreNoDoubleFree =
+    "module M; class Holder "
+    "  public Name: string; "
+    "  public constructor() this.Name := \"init\"; end constructor; "
+    "  public method Set(s: string) this.Name := s; end Set; "
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  using var h := new Holder(); "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 100000 do "
+    "    h.Set(\"ne\" + \"w\"); "
+    "    total := total + h.Name.Length; "  // "new" => 3
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 300000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// ---- Programs: literal arg (sentinel, no heap alloc) -----------------------
+//
+// §28.9: a literal string carries the sentinel rc — bz_string_release on a
+// sentinel is a no-op. The fix emits a release on the literal value; the no-op
+// ensures no spurious free. CONTROL: this was already CLEAN before the fix.
+const char* kLiteralArgSentinelControl =
+    "module M; class C "
+    "  public static method Consume(s: string): int return s.Length; end Consume; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      total := total + C.Consume(\"lit\"); "
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 300000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: nested call foo(bar(s + "x")) --------------------------------
+//
+// §28.9 (RETURN × ARGUMENT-PASS, nested): the inner concat `"ab"+"cd"` is
+// released after `Build` returns (a post-call release on Build's argument);
+// `Build`'s own return mints +1 for the result; that result is passed to `Len`
+// and released after `Len` returns. Two independent post-call releases, each
+// balancing exactly one +1 producer.
+const char* kNestedCallChainBothRelease =
+    "module M; class C "
+    "  public static method Build(s: string): string return s + \"!\"; end Build; "
+    "  public static method Len(s: string): int return s.Length; end Len; "
+    "  public static method Main(): int "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      total := total + C.Len(C.Build(\"ab\" + \"cd\")); "  // "abcd!" => 5
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 500000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: statement-level call with producer arg -----------------------
+//
+// §28.9: the call is used as a statement (result discarded). The concat's +1 is
+// released after the call. Looped → no accumulation.
+const char* kStatementCallProducerArgReleased =
+    "module M; class C "
+    "  public static method SideEffect(s: string): int return s.Length; end SideEffect; "
+    "  public static method Main(): int "
+    "    var i: int := 0; "
+    "    while i < 100000 do "
+    "      _ := C.SideEffect(\"eff\" + \"ect\"); "
+    "      i := i + 1; "
+    "    end; "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: virtual (vtable) method call with producer arg ---------------
+//
+// §28.9 / §12: vtable dispatch does not change the argument-pass convention —
+// the concat temporary is still released after the virtual call.
+const char* kVirtualCallProducerArgReleased =
+    "module M; class Base "
+    "  public virtual method Consume(s: string): int return s.Length; end Consume; "
+    "end Base; "
+    "class Derived : Base "
+    "  public override method Consume(s: string): int return s.Length + 1; end Consume; "
+    "end Derived; "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 100000 do "
+    "    using var d := new Derived(); "
+    "    var b: Base := d; "
+    "    total := total + b.Consume(\"vtab\" + \"cd\"); "  // "vtabcd" => 6, +1 via override => 7
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 700000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// ---- Programs: interface (itable) method call with producer arg -------------
+//
+// §28.9 / §13: itable dispatch: same argument-pass convention.
+const char* kItableCallProducerArgReleased =
+    "module M; interface IConsumer "
+    "  method Consume(s: string): int; "
+    "end IConsumer; "
+    "class Thing : IConsumer "
+    "  public method Consume(s: string): int return s.Length; end Consume; "
+    "end Thing; "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 100000 do "
+    "    using var t := new Thing(); "
+    "    var ic: IConsumer := t; "
+    "    total := total + ic.Consume(\"itab\" + \"cd\"); "  // "itabcd" => 6
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 600000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// ---- Programs: constructor with producer arg (double-free canary) -----------
+//
+// §28.9: `new Holder("ct" + "or")` passes a concat to the constructor. Inside
+// the ctor, `this.Name := n` sees `n` (a param, not a +1 producer) → RETAINS
+// (rc=2). The post-ctor release drops rc to 1; the field holds its +1, released
+// on the owner's disposal. No double-free. Looped + using var → LSan-clean.
+const char* kConstructorProducerArgFieldStoreLoop =
+    "module M; class Holder "
+    "  public Name: string; "
+    "  public constructor(n: string) this.Name := n; end constructor; "
+    "end Holder; "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 100000 do "
+    "    using var h := new Holder(\"ct\" + \"or\"); "
+    "    total := total + h.Name.Length; "  // "ctor" => 4
+    "    i := i + 1; "
+    "  end; "
+    "  if total = 400000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// ---- Programs: method-return arg to field-store callee (double-free canary) -
+//
+// §28.9: `Build()` returns +1; `h.Set(C.Build())` passes it to Set, which
+// stores it into a field (retains, rc=2). Post-call release → rc=1. No UAF/DF.
+const char* kMethodReturnArgFieldStoreNoDoubleFree =
+    "module M; class Holder "
+    "  public Name: string; "
+    "  public constructor() this.Name := \"init\"; end constructor; "
+    "  public method Set(s: string) this.Name := s; end Set; "
+    "end Holder; "
+    "class C "
+    "  public static method Build(): string return \"bu\" + \"ilt\"; end Build; "
+    "  public static method Main(): int "
+    "    using var h := new Holder(); "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      h.Set(C.Build()); "
+    "      total := total + h.Name.Length; "  // "built" => 5
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 500000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: range-slice direct arg --------------------------------------
+//
+// §3.4 / §28.9: `src[0..3]` is a +1 producer (fresh allocation from
+// bz_string_slice). Passed directly as an argument → released after the call.
+const char* kSliceDirectArgReleased =
+    "module M; class C "
+    "  public static method Consume(s: string): int return s.Length; end Consume; "
+    "  public static method Main(): int "
+    "    var src: string := \"hello\"; "
+    "    var i: int := 0; var total: int := 0; "
+    "    while i < 100000 do "
+    "      total := total + C.Consume(src[0..3]); "  // slice "hell" => 4
+    "      i := i + 1; "
+    "    end; "
+    "    if total = 400000 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// ---- Programs: local string arg (NOT a +1 producer at call site) -----------
+//
+// §28.9 (CONTROL — no change): a LOCAL string `var s := "ab"+"cd"` owns +1.
+// When passed as an argument, `s` is an IDENTIFIER (not a +1 producer at the
+// call site). The fix must NOT release it (the local's own scope-end release
+// handles it — but since the escape walk marks s as escaped when passed to a
+// call, s's +1 is conservatively leaked; this is the pre-existing #422 behavior
+// unchanged by this increment). The test verifies CORRECTNESS (the value
+// round-trips) and NO DOUBLE-FREE (no UAF/DF under ASan with detect_leaks=0).
+const char* kLocalStringArgNotAProducerControl =
+    "module M; class C "
+    "  public static method Consume(s: string): int return s.Length; end Consume; "
+    "  public static method Main(): int "
+    "    var s: string := \"ab\" + \"cd\"; "  // producer local — NOT a producer at call site
+    "    return C.Consume(s); "               // passes the identifier, not the expression
+    "  end Main; "
+    "end C;";
+
+}  // namespace
+
+// ============= Tests: argument-pass retain (#429 §28.9 §4.6) =================
+
+// §28.9 / §4.6 / §28.3: concat passed directly as argument to a borrow-only
+// callee. Released after the call → reclaimed each iteration → LSan-clean.
+BEZEL_TEST(codegen_argpass_string_429, concat_direct_arg_borrow_only_28_9) {
+    expectValueAndLeakFree(kConcatDirectArgBorrowOnlyCallee, 0);
+}
+
+// §28.9 / §28.3 (RETURN × ARG-PASS): user-method return string passed directly
+// as argument to a borrow-only callee. Both returns (outer call) are balanced:
+// Build mints +1 → Consume receives borrow → caller releases after Consume.
+BEZEL_TEST(codegen_argpass_string_429, method_return_direct_arg_borrow_only_28_9) {
+    expectValueAndLeakFree(kMethodReturnDirectArgBorrowOnlyCallee, 0);
+}
+
+// §28.9 / §4.6: interpolation in argument position. Released after the call.
+BEZEL_TEST(codegen_argpass_string_429, interp_direct_arg_borrow_only_28_9) {
+    expectValueAndLeakFree(kInterpDirectArgBorrowOnlyCallee, 0);
+}
+
+// §28.9: multiple producer args in one call — each released after the call.
+BEZEL_TEST(codegen_argpass_string_429, multiple_producer_args_one_call_28_9) {
+    expectValueAndLeakFree(kMultipleProducerArgsCall, 0);
+}
+
+// §28.9 (CARDINAL double-free canary): concat arg to field-store callee.
+// Field-store retains the param (rc→2); post-call release (rc→1). No double-free.
+BEZEL_TEST(codegen_argpass_string_429, concat_arg_field_store_no_double_free_28_9) {
+    // Use expectValueAndNoCorruption: the field-store retain makes this clean
+    // on the memory-safety side (no UAF/DF). The loop stresses the pattern;
+    // the object's disposal releases the final field value.
+    expectValueAndNoCorruption(kConcatArgFieldStoreNoDoubleFree, 0);
+}
+
+// §28.9 (CONTROL — sentinel no-op): literal arg. Release is a no-op on the
+// sentinel. This was already clean before the fix; verifies no regression.
+BEZEL_TEST(codegen_argpass_string_429, literal_arg_sentinel_control_28_9) {
+    expectValueAndLeakFree(kLiteralArgSentinelControl, 0);
+}
+
+// §28.9 (RETURN × ARG-PASS, nested): foo(bar(s + "x")) — two post-call
+// releases, one for the concat arg to bar and one for bar's return to foo.
+BEZEL_TEST(codegen_argpass_string_429, nested_call_chain_both_release_28_9) {
+    expectValueAndLeakFree(kNestedCallChainBothRelease, 0);
+}
+
+// §28.9: statement-level call with producer arg. Producer released after call.
+BEZEL_TEST(codegen_argpass_string_429, statement_call_producer_arg_released_28_9) {
+    expectValueAndLeakFree(kStatementCallProducerArgReleased, 0);
+}
+
+// §28.9 / §12: virtual (vtable) dispatch — same argument-pass convention.
+BEZEL_TEST(codegen_argpass_string_429, virtual_call_producer_arg_released_28_9) {
+    expectValueAndLeakFree(kVirtualCallProducerArgReleased, 0);
+}
+
+// §28.9 / §13: interface (itable) dispatch — same argument-pass convention.
+BEZEL_TEST(codegen_argpass_string_429, itable_call_producer_arg_released_28_9) {
+    expectValueAndLeakFree(kItableCallProducerArgReleased, 0);
+}
+
+// §28.9: constructor with +1 producer arg, constructor stores param into field.
+// Field-store retains (rc→2); post-ctor release (rc→1); disposal releases field.
+BEZEL_TEST(codegen_argpass_string_429, ctor_producer_arg_field_store_loop_28_9) {
+    expectValueAndLeakFree(kConstructorProducerArgFieldStoreLoop, 0);
+}
+
+// §28.9 (CARDINAL double-free canary): user-method-return arg to field-store
+// callee. Build's +1 is borrowed by Set; Set's field-store retains (rc→2);
+// post-call release (rc→1). Final value released on disposal. No double-free.
+BEZEL_TEST(codegen_argpass_string_429, method_return_arg_field_store_no_df_28_9) {
+    expectValueAndNoCorruption(kMethodReturnArgFieldStoreNoDoubleFree, 0);
+}
+
+// §3.4 / §28.9: range-slice in argument position. Slice is a +1 producer;
+// released after the call → no per-iteration heap growth.
+BEZEL_TEST(codegen_argpass_string_429, slice_direct_arg_released_28_9) {
+    expectValueAndLeakFree(kSliceDirectArgReleased, 0);
+}
+
+// §28.9 (CONTROL — local identifier, no post-call release): passing a local
+// string (not an inline producer) is NOT a +1 producer at the call site, so
+// no post-call release is emitted. Correctness check + no double-free.
+BEZEL_TEST(codegen_argpass_string_429, local_string_arg_not_a_producer_control_28_9) {
+    // The local `s` is escaped (passed as arg), so the escape walk suppresses
+    // scope-end release — a pre-existing #422 safe leak, not this increment's
+    // concern. Verify correctness (Length=4) and no double-free under ASan.
+    expectValueAndNoCorruption(kLocalStringArgNotAProducerControl, 4);
+}

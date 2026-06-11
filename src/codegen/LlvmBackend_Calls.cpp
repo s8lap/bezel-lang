@@ -8077,6 +8077,33 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         lastCallGenericSubst_ = genericSubst_;
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSemaTy);
+
+    // #429 (ARGUMENT-PASS category) / §4.6 / §28.9: a +1 string producer
+    // (concat / interpolation / range-slice / user-method-return) that appears
+    // DIRECTLY as a call argument (not bound to a local first) holds an
+    // independent rc=1 reference.  The callee receives the string as a BORROW
+    // (Bezel parameters are borrows by default); if the callee stores the param
+    // into a string field/auto-property the field-store path inside the callee
+    // already retains it independently (rc→2), so our release here (rc→1) is
+    // safe — the field still owns its +1.  If the callee only reads the string
+    // and discards it, our release (rc→0) reclaims the temporary.
+    //
+    // Release is emitted ONLY when the call was actually lowered (!diverged_):
+    // on an exception path the temporary leaks, which is the pre-existing safe
+    // direction (a leak is harmless; a double-free / UAF is not).
+    //
+    // Identification: argExprs (populated by buildOrderedArgs) is parallel to
+    // args.  For instance methods args[0] = receiver (argExprs[0] = nullptr);
+    // for static methods the args start at index 0.  We scan from argOffset
+    // to args.size() and release any argument whose expression is a +1 producer.
+    if (!diverged_ && !args.empty()) {
+        std::size_t argOffset = isStaticMethod(ms) ? 0 : 1;
+        for (std::size_t ai = argOffset; ai < args.size() && ai < argExprs.size(); ++ai) {
+            if (argExprs[ai] && isPlusOneStringProducer(argExprs[ai]))
+                emitStringRelease(args[ai]);
+        }
+    }
+
     return result;
 }
 
