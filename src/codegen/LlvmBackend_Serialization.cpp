@@ -580,6 +580,7 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         std::string declName;   // declared identifier
         const sema::TypeRef* ty;
         bool isSkip = false;
+        bool isOptional = false; // `serialized optional`: missing → default(T)
         unsigned storageIdx;    // index into the struct (ExtractValue / InsertValue)
     };
     std::vector<Component> components;
@@ -590,11 +591,12 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     if (td->hasPositionalFields) {
         for (const auto& pf : td->positionalFields) {
             Component comp;
-            comp.storageIdx = si;
-            comp.declName   = std::string(pf.name);
-            comp.isSkip     = positionalFieldIsSkip(pf);
-            comp.wireName   = comp.isSkip ? "" : std::string(positionalFieldWireName(pf));
-            comp.ty         = si < storage.size()
+            comp.storageIdx  = si;
+            comp.declName    = std::string(pf.name);
+            comp.isSkip      = positionalFieldIsSkip(pf);
+            comp.isOptional  = pf.serialized && pf.serialized->isOptional;
+            comp.wireName    = comp.isSkip ? "" : std::string(positionalFieldWireName(pf));
+            comp.ty          = si < storage.size()
                 ? recordMemberTypeResolved(storage[si]) : nullptr;
             components.push_back(std::move(comp));
             ++si;
@@ -605,11 +607,13 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
             comp.storageIdx = si;
             comp.declName   = std::string(sym->name);
             comp.isSkip     = false;
+            comp.isOptional = false;
             const ast::PropertyDecl* pd =
                 dynamic_cast<const ast::PropertyDecl*>(sym->decl);
             if (pd && pd->serialized) {
-                comp.isSkip  = pd->serialized->isSkip;
-                comp.wireName = pd->serialized->name.empty()
+                comp.isSkip     = pd->serialized->isSkip;
+                comp.isOptional = pd->serialized->isOptional;
+                comp.wireName   = pd->serialized->name.empty()
                     ? comp.declName : std::string(pd->serialized->name);
             } else {
                 comp.wireName = comp.declName;
@@ -635,6 +639,23 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         llvm::AllocaInst* slot = entryAlloca(et);
         builder_.CreateStore(llvm::Constant::getNullValue(et), slot);
         slots[i] = slot;
+    }
+
+    // fix #668: §9.8 / §2.15: allocate seen-flags for required components.
+    // Required = non-skip AND non-optional. `serialized optional` exempts a
+    // component; naked nullable T? (no optional clause) is still required.
+    struct RecordSeenEntry {
+        unsigned compIdx;
+        std::string declName;
+        llvm::AllocaInst* seenSlot;  // i8: 0=unseen, 1=seen
+    };
+    std::vector<RecordSeenEntry> recSeenFlags;
+    for (unsigned i = 0; i < components.size(); ++i) {
+        if (components[i].isSkip) continue;
+        if (components[i].isOptional) continue;
+        llvm::AllocaInst* sf = entryAlloca(i8());
+        builder_.CreateStore(builder_.getInt8(0), sf);
+        recSeenFlags.push_back({i, components[i].declName, sf});
     }
 
     // BeginObject → read field count.
@@ -717,6 +738,13 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
             if (fieldVal->getType() == et)
                 builder_.CreateStore(fieldVal, slots[ci]);
         }
+        // fix #668: mark this required component as seen.
+        for (const auto& rse : recSeenFlags) {
+            if (rse.compIdx == ci) {
+                builder_.CreateStore(builder_.getInt8(1), rse.seenSlot);
+                break;
+            }
+        }
         // Release namePtr (bz_string_release).
         auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
         builder_.CreateCall(relFn, {namePtr});
@@ -747,6 +775,27 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // EndObject.
     auto* endFn = declareC("bz_binder_end_object", voidTy, {ptrTy()});
     builder_.CreateCall(endFn, {derPtr});
+
+    // fix #668: §9.8 / §2.15: check all required components were seen.
+    // Records have no owned class fields so there is nothing to dispose on this
+    // path — any already-read value-type slots (int, string, etc.) are held in
+    // allocas that will simply be ignored if we throw.  String slots may hold a
+    // bz_string* that needs release if it was already populated; for simplicity
+    // we accept the minor leak on this rare structural-error path (matching the
+    // behaviour of the truncated-input path for records which also does not
+    // release string slots before emitThrowBuiltin).
+    for (const auto& rse : recSeenFlags) {
+        llvm::Value* seen = builder_.CreateLoad(i8(), rse.seenSlot, "rdeser.seen");
+        llvm::Value* notSeen = builder_.CreateICmpEQ(seen, builder_.getInt8(0), "rdeser.nseen");
+        auto* missBB = llvm::BasicBlock::Create(llvm_, "rdeser.miss", currentFn_);
+        auto* okBB   = llvm::BasicBlock::Create(llvm_, "rdeser.ok",   currentFn_);
+        builder_.CreateCondBr(notSeen, missBB, okBB);
+        builder_.SetInsertPoint(missBB);
+        emitThrowBuiltin("SerializationException");
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateUnreachable();
+        builder_.SetInsertPoint(okBB);
+    }
 
     // Build result struct: insert all non-skip fields from their slots.
     llvm::Value* result = builder_.CreateLoad(st, resultSlot, "deser.rec");
@@ -1302,14 +1351,49 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     collectClassComponents(ts, storage, fieldIndex_, ctx_, comps, isGraphMode);
 
     // Allocate local slots for each non-skip component.
+    // fix #669: null-init stores must be in the entry block, not the current
+    // insert point (which may be liveBB of an outer nullable deserialization).
     std::vector<llvm::AllocaInst*> slots(comps.size(), nullptr);
     for (unsigned i = 0; i < comps.size(); ++i) {
         if (comps[i].isSkip || !comps[i].ty) continue;
         llvm::Type* lt = lowerTypeRef(comps[i].ty);
         if (!lt) continue;
         llvm::AllocaInst* slot = entryAlloca(lt);
-        builder_.CreateStore(llvm::Constant::getNullValue(lt), slot);
+        {
+            llvm::BasicBlock& eb = currentFn_->getEntryBlock();
+            llvm::IRBuilder<> eb_b(&eb, std::next(slot->getIterator()));
+            eb_b.CreateStore(llvm::Constant::getNullValue(lt), slot);
+        }
         slots[i] = slot;
+    }
+
+    // fix #668: §9.8 / §2.15: "missing required fields remain unconditional
+    // errors."  For each non-skip, non-optional component allocate an i8 seen-
+    // flag alloca (entry-block init to 0); the flag is set to 1 when the field
+    // is matched in the loop.  After EndObject, any flag still 0 means a
+    // required component was absent → raise SerializationException.
+    //
+    // Nullable T? fields without `serialized optional` are REQUIRED: nullability
+    // does not confer optionality.  Only the `serialized optional` clause exempts
+    // a field from the missing-field check (§9.8: "serialized optional is the
+    // per-field missing-field tolerant-mode opt-in").
+    struct SeenEntry {
+        std::size_t compIdx;      // index into comps[]
+        std::string declName;     // for the error message
+        llvm::AllocaInst* slot;   // i8 flag: 0=unseen, 1=seen
+    };
+    std::vector<SeenEntry> seenFlags;
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        if (comps[i].isSkip) continue;      // skip excluded from wire
+        if (comps[i].isOptional) continue;  // optional: missing is fine
+        // Required component: allocate a seen-flag, zero in entry block.
+        llvm::AllocaInst* sf = entryAlloca(i8());
+        {
+            llvm::BasicBlock& eb = currentFn_->getEntryBlock();
+            llvm::IRBuilder<> eb_b(&eb, std::next(sf->getIterator()));
+            eb_b.CreateStore(builder_.getInt8(0), sf);
+        }
+        seenFlags.push_back({i, comps[i].declName, sf});
     }
 
     // §9.8 / #550 leak-safety: the per-iteration field-name string returned by
@@ -1321,8 +1405,25 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // emitUnwindDisposals automatically calls bz_string_release on it.  On the
     // normal match/skip path, after the explicit bz_string_release(namePtr), we
     // null the slot to prevent the disposal from double-releasing.
+    //
+    // fix #669: null-init MUST be emitted in the function entry block, not at
+    // the current insert point.  emitClassDeserialize can be called from inside
+    // a conditional branch (e.g. the live-path of emitDeserializeField for a
+    // nullable class T? component).  entryAlloca() places the alloca in the entry
+    // block (always runs), but if the null-init store is emitted at the current
+    // insert point — which is liveBB — it never runs on the null path.  The
+    // alloca then holds uninitialised stack bytes, and the disposeStack_
+    // stringRelease mechanism later calls bz_string_release on garbage → SIGSEGV
+    // in AOT mode (JIT's zeroed heap happens to mask it).  By emitting the store
+    // directly into the entry block, the slot is always null before any live-path
+    // code runs.  Per §9.8/§28.
     llvm::AllocaInst* namePtrSlot = entryAlloca(ptrTy());
-    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
+    {
+        // Insert the null-init store into the entry block right after the alloca.
+        llvm::BasicBlock& eb = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> eb_b(&eb, std::next(namePtrSlot->getIterator()));
+        eb_b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
+    }
     if (!disposeStack_.empty()) {
         Disposal nd{namePtrSlot, nullptr};
         nd.stringRelease = true;
@@ -1540,6 +1641,13 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 else if (fv->getType()->isPointerTy() && lt && lt->isPointerTy())
                     builder_.CreateStore(fv, slots[ci]);
             }
+            // fix #668: mark this required component as seen.
+            for (const auto& se : seenFlags) {
+                if (se.compIdx == ci) {
+                    builder_.CreateStore(builder_.getInt8(1), se.slot);
+                    break;
+                }
+            }
             auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
             builder_.CreateCall(relFn, {namePtr});
             // Null the slot so the stringRelease disposal doesn't double-release.
@@ -1575,6 +1683,44 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // EndObject.
     auto* endFn = declareC("bz_binder_end_object", voidTy, {ptrTy()});
     builder_.CreateCall(endFn, {derPtr});
+
+    // fix #668: §9.8 / §2.15: check that all required (non-skip, non-optional)
+    // components were present in the wire data.  Any component whose seen-flag
+    // is still 0 means the field was absent → SerializationException.
+    // Checked after EndObject so the deserializer has consumed the full object
+    // token, but before calloc so no allocation cleanup is needed on this path.
+    for (const auto& se : seenFlags) {
+        llvm::Value* seen = builder_.CreateLoad(i8(), se.slot, "cdeser.seen");
+        llvm::Value* notSeen = builder_.CreateICmpEQ(seen, builder_.getInt8(0), "cdeser.nseen");
+        auto* missBB = llvm::BasicBlock::Create(llvm_, "cdeser.miss", currentFn_);
+        auto* okBB   = llvm::BasicBlock::Create(llvm_, "cdeser.ok",   currentFn_);
+        builder_.CreateCondBr(notSeen, missBB, okBB);
+        builder_.SetInsertPoint(missBB);
+        // Dispose already-read owned-class slots to avoid leaks (§28.3/§28.5).
+        for (std::size_t ci2 = 0; ci2 < comps.size(); ++ci2) {
+            if (comps[ci2].isSkip || !slots[ci2]) continue;
+            if (!comps[ci2].ty) continue;
+            bool isClassSlot =
+                comps[ci2].ty->kind == sema::TypeRef::Kind::Named &&
+                comps[ci2].ty->declaration &&
+                comps[ci2].ty->declaration->kind == ast::TypeDeclKind::Class;
+            if (!isClassSlot) continue;
+            llvm::Value* p = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.mslot");
+            llvm::Value* nonNull = builder_.CreateICmpNE(
+                p, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.mnn");
+            auto* dispBB2 = llvm::BasicBlock::Create(llvm_, "cdeser.mdisp", currentFn_);
+            auto* skipBB3 = llvm::BasicBlock::Create(llvm_, "cdeser.mskip", currentFn_);
+            builder_.CreateCondBr(nonNull, dispBB2, skipBB3);
+            builder_.SetInsertPoint(dispBB2);
+            emitDisposeAndReclaim(p);
+            builder_.CreateBr(skipBB3);
+            builder_.SetInsertPoint(skipBB3);
+        }
+        emitThrowBuiltin("SerializationException");
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateUnreachable();
+        builder_.SetInsertPoint(okBB);
+    }
 
     // Allocate the class instance.
     llvm::Value* sizeofSt = builder_.CreatePtrToInt(
