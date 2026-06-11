@@ -5744,7 +5744,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             auto ctorArgSemaTy = genericSubstSemaTy_;
             genericSubst_ = savedSubst;
             genericSubstSemaTy_ = savedSemaTy;
-            bool builtArgs = buildOrderedArgs(cd->params, ne.args, args);
+            // #429 (ARGUMENT-PASS category): collect per-param arg expressions
+            // so we can release any +1 string producer after the ctor runs.
+            std::vector<const ast::Expr*> ctorArgExprs;
+            bool builtArgs = buildOrderedArgs(cd->params, ne.args, args,
+                                              &ctorArgExprs);
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
             if (builtArgs &&
@@ -5805,6 +5809,19 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     currentThis_ = savedThis;
                     locals_ = std::move(savedLocals);
                     paramSlots_ = std::move(savedParams);
+                }
+                // #429 (ARGUMENT-PASS category) / §4.6 / §28.9: release any
+                // +1 string producer constructor arguments after the ctor body
+                // runs. Constructor params are borrows; field-store of a param
+                // retains independently (rc→2) so our release (rc→1) is safe.
+                // args[0]=obj; args[1..n]=ctor params; ctorArgExprs is parallel.
+                if (!diverged_) {
+                    for (std::size_t ai = 1;
+                         ai < args.size() && ai < ctorArgExprs.size() + 1; ++ai) {
+                        if (ctorArgExprs[ai - 1] &&
+                            isPlusOneStringProducer(ctorArgExprs[ai - 1]))
+                            emitStringRelease(args[ai]);
+                    }
                 }
             }
         }

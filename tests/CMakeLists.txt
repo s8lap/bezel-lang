@@ -217,6 +217,8 @@ set(BEZEL_TEST_SOURCES
     codegen/string_refcount_test.cpp
     codegen/escaping_string_refcount_test.cpp
     codegen/escaping_closure_refcount_test.cpp
+    codegen/argpass_string_probe_test.cpp
+    codegen/argpass_string_refcount_test.cpp
     codegen/encoding_test.cpp
     codegen/closure_refcount_test.cpp
     codegen/linq_refcount_test.cpp
