@@ -2037,6 +2037,72 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)});
             return llvm::ConstantInt::get(i32(), 0);  // unit/void result
         }
+        // fix #654-tail B / stdlib §4.10: OwnedSet<T>.TryAdd(owned item): bool
+        // for class-typed T (array-backed path — class elements are ineligible
+        // for the dict-backed set path since genericBackingType returns null for
+        // class types).  Equality for class T is reference identity (§8.3).
+        // Semantics: scan the array for an element with the same pointer; if not
+        // found, append and return true; if found, dispose the passed item
+        // (caller transferred ownership; §4.10 "on false, the item is disposed")
+        // and return false.
+        if (m == "TryAdd" && call.args.size() == 1 && call.args[0].value &&
+            arrElemIsClass && arrIsOwning) {
+            llvm::Value* item = lowerExpr(*call.args[0].value);
+            if (!item) return nullptr;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* arrLen = builder_.CreateCall(lenFn, {recv}, "ta.len");
+            // Create all BBs upfront to avoid CFG wiring errors.
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "ta.c",    currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "ta.b",    currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "ta.next", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "ta.dup",  currentFn_);
+            auto* newBB   = llvm::BasicBlock::Create(llvm_, "ta.new",  currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "ta.end",  currentFn_);
+            // idxSlot: loop counter.
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            builder_.CreateBr(condBB);
+            // condBB: exit when idx >= len (not found).
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* curIdx = builder_.CreateLoad(i64(), idxSlot, "ta.i");
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(curIdx, arrLen), bodyBB, newBB);
+            // bodyBB: compare element pointer at curIdx with item.
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(
+                ptrFn, {recv, curIdx, builder_.getInt64(esz)}, "ta.ep");
+            llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "ta.ex");
+            builder_.CreateCondBr(
+                builder_.CreateICmpEQ(existing, item, "ta.same"), foundBB, nextBB);
+            // nextBB: advance index, loop back.
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(curIdx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            // foundBB: duplicate — dispose the passed item and return false.
+            builder_.SetInsertPoint(foundBB);
+            if (arrElemPol.disposerThunk)
+                builder_.CreateCall(arrElemPol.disposerThunk, {item});
+            builder_.CreateBr(endBB);
+            // newBB: not present — append and return true.
+            builder_.SetInsertPoint(newBB);
+            {
+                llvm::AllocaInst* slot = entryAlloca(item->getType());
+                builder_.CreateStore(item, slot);
+                auto* addFn = declareC("bz_array_add",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+                builder_.CreateCall(addFn, {recv, slot, builder_.getInt64(esz)});
+            }
+            builder_.CreateBr(endBB);
+            // endBB: PHI for bool result.
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "ta.r");
+            phi->addIncoming(builder_.getFalse(), foundBB);
+            phi->addIncoming(builder_.getTrue(), newBB);
+            return phi;
+        }
         // per §4.5: .Insert(index, item) — insert at index, shifting up. For an
         // OwnedArray<T> the item is `owned` (already moved in by the caller);
         // there is no element to dispose (a fresh slot is created, not a
@@ -2076,8 +2142,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 llvm::Value* isEmpty = builder_.CreateICmpEQ(
                     len, builder_.getInt64(0), "peek.empty");
                 emitGuardThrow(isEmpty, "InvalidOperationException");
-                // Peek: last element (Stack) or first (Queue)
-                idx = builder_.CreateSub(len, builder_.getInt64(1));
+                // fix #654-tail A / stdlib §4.11: Peek() FIFO semantics for
+                // Queue/OwnedQueue — front element (index 0); Stack/OwnedStack
+                // peek the top element (last inserted, index len-1).
+                bool isQueuePeek = recvTy && recvTy->astNode &&
+                    recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    (recvTy->astNode->name->parts[0] == "Queue" ||
+                     recvTy->astNode->name->parts[0] == "OwnedQueue");
+                if (isQueuePeek)
+                    idx = builder_.getInt64(0);
+                else
+                    idx = builder_.CreateSub(len, builder_.getInt64(1));
             } else {
                 idx = builder_.CreateSExt(idx, i64());
             }
@@ -2247,6 +2323,45 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                    {ptrTy(), i64(), i64()});
             builder_.CreateCall(remFn, {recv, idx, builder_.getInt64(esz)});
             return builder_.CreateLoad(retTy, out, "arr.pop");
+        }
+        // fix #642 / stdlib §4.5: .PopAt(index): owned T / .PopLast(): owned T /
+        // .PopFirst(): owned T  — remove and return the element at the given slot,
+        // transferring ownership to the caller.  Unlike Pop/Dequeue (Stack/Queue),
+        // these are defined on OwnedArray<T> and its alias forms.
+        // Ownership rule (§4.5 / §28.11 v0.135): the slot is removed WITHOUT
+        // disposal — bz_array_pop_at copies the element bytes BEFORE shifting so
+        // the pointer is captured before the shift, then the slot is removed.
+        // The caller receives the owned T and is responsible for disposing it.
+        if ((m == "PopAt" && call.args.size() == 1 && call.args[0].value) ||
+            ((m == "PopLast" || m == "PopFirst") && call.args.empty())) {
+            // Determine return type from generic arg.
+            llvm::Type* retTy = i32();
+            if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                retTy = lowerTypeRef(recvTy->genericArgs[0]);
+            // Determine index.
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "popatl.len");
+            llvm::Value* isEmpty = builder_.CreateICmpEQ(
+                len, builder_.getInt64(0), "popat.empty");
+            emitGuardThrow(isEmpty, "InvalidOperationException");
+            llvm::Value* idx = nullptr;
+            if (m == "PopAt") {
+                llvm::Value* rawIdx = lowerExpr(*call.args[0].value);
+                if (!rawIdx) return nullptr;
+                idx = builder_.CreateSExt(rawIdx, i64(), "popat.idx");
+            } else if (m == "PopLast") {
+                idx = builder_.CreateSub(len, builder_.getInt64(1), "popl.idx");
+            } else {  // PopFirst
+                idx = builder_.getInt64(0);
+            }
+            llvm::AllocaInst* out = entryAlloca(retTy);
+            // bz_array_pop_at: copy element at idx into *out, then remove the
+            // slot WITHOUT disposal — ownership transfers to the caller.
+            auto* popFn = declareC("bz_array_pop_at",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(popFn,
+                {recv, idx, out, builder_.getInt64(esz)});
+            return builder_.CreateLoad(retTy, out, "popat.val");
         }
         // .Clear()
         if (m == "Clear" && call.args.empty()) {
@@ -2692,6 +2807,53 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             auto* fn = declareC("bz_dict_remove_str", i1(), {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {recv, kd, kl}, "dict.remove");
+        }
+        // fix #643 / stdlib §4.9: .PopValue(k): owned V — retrieve the owned
+        // value for key k, remove the entry WITHOUT disposing the value
+        // (ownership transfers to the caller), raise if absent.
+        // Unlike Remove(k) which disposes, PopValue transfers the owned V out.
+        // Only meaningful on OwnedDictionary<K,V>; the borrowing Dictionary does
+        // not expose a PopValue method.
+        if (m == "PopValue" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            if (!k) return nullptr;
+            // Determine value LLVM type.
+            llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : ptrTy();
+            if (!valLlvm) valLlvm = ptrTy();
+            auto* tmpSlot = entryAlloca(ptrTy());
+            llvm::Value* found;
+            if (keyTy) {
+                // #643: bz_dict_pop_value_gen — get-then-remove without disposal.
+                auto* fn = declareC("bz_dict_pop_value_gen", i1(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
+                                            "pv.found");
+            } else {
+                auto [kd2, kl2] = strDataLen(k);
+                auto* fn = declareC("bz_dict_pop_value_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd2, kl2, tmpSlot},
+                                            "pv.found");
+            }
+            // Raise InvalidOperationException when key is not found.
+            llvm::Value* notFound = builder_.CreateNot(found, "pv.notfound");
+            emitGuardThrow(notFound, "InvalidOperationException");
+            // Decode the stored void* into the value LLVM type (same as TryGetValue).
+            llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot, "pv.vptr");
+            if ((valRec || valNullableVal) && valLlvm->isStructTy()) {
+                return builder_.CreateLoad(valLlvm, valPtr, "pv.rec");
+            } else if (!valLlvm->isPointerTy()) {
+                llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
+                if (valLlvm->isDoubleTy())
+                    return builder_.CreateBitCast(asI64, valLlvm);
+                if (valLlvm->isFloatTy()) {
+                    llvm::Value* trunc = builder_.CreateTrunc(asI64, i32());
+                    return builder_.CreateBitCast(trunc, valLlvm);
+                }
+                if (valLlvm->isIntegerTy(64)) return asI64;
+                return builder_.CreateTrunc(asI64, valLlvm);
+            }
+            return valPtr;  // pointer value (class/string)
         }
         // .TryGetValue(k, out v): bool
         // (Note: the out-var slot is pre-created by ensureOutVarSlots)
@@ -9455,6 +9617,30 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
         return builder_.CreateCall(fn,
             {recv, node, slot, builder_.getInt64(esz)}, "ll.addAfter");
+    }
+    // --- PopFirst(): owned T / PopLast(): owned T (OwnedLinkedList only) ---
+    // fix #642 / stdlib §4.7: transfer ownership of the first/last element to the
+    // caller; remove WITHOUT disposal.  Only valid on OwnedLinkedList<T> (the
+    // borrowing LinkedList<T> has no owned-return variants).
+    if ((m == "PopFirst" || m == "PopLast") && call.args.empty()) {
+        // Guard: raise InvalidOperationException when empty.
+        auto* cntFn = declareC("bz_llist_count", i64(), {ptrTy()});
+        llvm::Value* cnt = builder_.CreateCall(cntFn, {recv}, "llpop.cnt");
+        llvm::Value* isEmpty = builder_.CreateICmpEQ(
+            cnt, builder_.getInt64(0), "llpop.empty");
+        emitGuardThrow(isEmpty, "InvalidOperationException");
+        // Output slot for the copied element.
+        llvm::AllocaInst* out = entryAlloca(elemLLTy);
+        if (m == "PopFirst") {
+            auto* fn = declareC("bz_llist_pop_first",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, out, builder_.getInt64(esz)});
+        } else {
+            auto* fn = declareC("bz_llist_pop_last",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            builder_.CreateCall(fn, {recv, out, builder_.getInt64(esz)});
+        }
+        return builder_.CreateLoad(elemLLTy, out, "llpop.val");
     }
     // --- RemoveFirst() ---
     if (m == "RemoveFirst" && call.args.empty()) {

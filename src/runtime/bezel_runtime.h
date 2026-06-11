@@ -50,6 +50,10 @@ void bz_array_set_disposing(void* arr, int64_t idx, const void* elem,
 // Remove the element at `idx`, shifting subsequent elements down.
 void bz_array_remove_at(void* arr, int64_t idx, int64_t elem_size);
 
+// fix #642 / stdlib §4.5: PopAt(i) — copy element at idx into *out (transferring
+// ownership to the caller) then remove the slot WITHOUT disposal.
+void bz_array_pop_at(void* arr, int64_t idx, void* out, int64_t elem_size);
+
 // stdlib §4.5: insert one element (elem_size bytes) at `idx`, shifting the
 // existing element at `idx` and all subsequent elements up by one. Grows
 // capacity as needed. `idx` is clamped to [0, count] (idx == count appends).
@@ -161,6 +165,11 @@ void bz_llist_remove_first(void* list, void (*dispose_elem)(void*));
 // Remove and free the last node. If dispose_elem is non-null, calls it on the element first.
 void bz_llist_remove_last(void* list, void (*dispose_elem)(void*));
 
+// fix #642 / stdlib §4.7: copy first/last element into *out, then unlink WITHOUT
+// disposal (ownership transfers to the caller).
+void bz_llist_pop_first(void* list, void* out, int64_t elem_size);
+void bz_llist_pop_last(void* list, void* out, int64_t elem_size);
+
 // Remove and free a specific node (unlinks from list). Calls dispose_elem if non-null.
 void bz_llist_remove_node(void* list, void* node, void (*dispose_elem)(void*));
 
@@ -244,6 +253,12 @@ bool  bz_dict_remove_gen(void* d, const void* key);
 bool  bz_dict_remove_gen_disposing(void* d, const void* key,
                                    void (*dispose_val)(void*));
 bool  bz_dict_contains_gen(void* d, const void* key);
+
+// fix #643 / stdlib §4.9: PopValue(key) — retrieve the stored value pointer
+// (written into *out) then remove the entry WITHOUT disposing the value
+// (ownership transfers to the caller).  Returns false when key is absent.
+bool  bz_dict_pop_value_str(void* d, const char* k, int64_t k_len, void** out);
+bool  bz_dict_pop_value_gen(void* d, const void* key, void** out);
 
 // stdlib §4.10 / §4.8: empty a hash table in place (keeps it allocated). Frees
 // each key copy and, if `dispose_val` is non-null, disposes each value; zeroes

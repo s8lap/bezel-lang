@@ -1076,8 +1076,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "IsEmpty")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
-                        else if (m == "Get" || m == "Peek" || m == "Pop" || m == "Dequeue") {
+                        else if (m == "Get" || m == "Peek" || m == "Pop" || m == "Dequeue" ||
+                                 m == "PopLast" || m == "PopFirst") {
                             // Return type = element type (first generic arg)
+                            // fix #642 / stdlib §4.5/§4.7: PopLast/PopFirst return owned T.
+                            if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                                ctx_.setExprType(&ce, recvTy->genericArgs[0]);
+                        }
+                        // fix #642 / stdlib §4.5: PopAt(index: int): owned T
+                        else if (m == "PopAt" && !ce.args.empty()) {
                             if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                 ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         }
@@ -1365,8 +1372,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "Dictionary" || colName == "OwnedDictionary") {
                         if (m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
-                        else if (m == "ContainsKey" || m == "Remove" || m == "TryGetValue")
+                        else if (m == "ContainsKey" || m == "Remove" || m == "TryGetValue" ||
+                                 m == "TryPopValue")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // fix #643 / stdlib §4.9: PopValue(key): owned V — removes
+                        // and returns the owned value; raises if absent.
+                        else if (m == "PopValue" && recvTy &&
+                                 recvTy->genericArgs.size() > 1 &&
+                                 recvTy->genericArgs[1]) {
+                            ctx_.setExprType(&ce, recvTy->genericArgs[1]);
+                        }
                         // stdlib §4.8 / §4.9: GetOrAdd(key, factory): V — the
                         // result is the value type V (the second generic arg). For
                         // OwnedDictionary the result is a BORROW of the stored value
