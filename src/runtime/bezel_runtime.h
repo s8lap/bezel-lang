@@ -123,6 +123,12 @@ void* bz_array_ptr_at(void* arr, int64_t idx, int64_t elem_size);
 // Ensure capacity for at least `cap` elements without changing the length.
 void bz_array_reserve(void* arr, int64_t elem_size, int64_t cap);
 
+// §33.4: build an Array<string> (bz_array_t* of bz_string*) from the process
+// argv, excluding argv[0] (the executable name).  Called by the C-entry shim
+// for Main(args: Array<string>) forms.  Dispose with
+//   bz_array_free(result, bz_string_release).
+void* bz_args_array(int32_t argc, char** argv);
+
 // ---------------------------------------------------------------------------
 // bz_llist_t — doubly-linked list used by LinkedList<T> and OwnedLinkedList<T>.
 // stdlib §4.6 / §4.7.  Node layout: { prev*, next*, value[elem_size] }.

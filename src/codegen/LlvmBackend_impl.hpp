@@ -605,6 +605,12 @@ private:
     // ROOT scope (the first scope it pushes) so they are auto-disposed on an
     // exception unwind out of the whole method. Cleared once registered.
     std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>> pendingOwnedParams_;
+    // fix #633 / §33.4: when Main(args: Array<string>) is emitted, the args
+    // array is built in the function prolog (before any scope opens) and must be
+    // disposed at the function-body root scope exit.  This optional Disposal is
+    // set by emitMethodBody and consumed by the first lowerScopedBlock call
+    // (which opens the root scope), mirroring the pendingOwnedParams_ pattern.
+    std::optional<Disposal> pendingArgsDisposal_;
     // CG13: the compiler-generated Dispose function for each class.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerFns_;
     // §2.5 / §22.8 (issue #328 item 2+3): the `bz$<Type>$init(ptr)` function for

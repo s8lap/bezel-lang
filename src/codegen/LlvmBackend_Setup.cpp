@@ -602,10 +602,22 @@ void Emitter::declareFunctions() {
                 paramTys.push_back(isEnumMethod ? i32() : ptrTy());
             }
         }
-        for (const auto& p : *ci.params) {
-            paramTys.push_back(isByRefMod(p.modifier)
-                                   ? ptrTy()  // CG50: ref/out by reference
-                                   : lowerType(p.type.get()));
+        // fix #633 / §33.4: Main(args: Array<string>) must match the C ABI
+        // entry-point signature `int main(int argc, char** argv)`, NOT the
+        // Bezel-typed `int main(ptr args)`.  The OS/C runtime passes `argc`
+        // as an i32 and `argv` as a ptr; any other signature silently receives
+        // the integer `argc` where the ptr is expected → immediate SIGSEGV.
+        // The args Array<string> is constructed from (argc, argv) in the
+        // function prolog (see emitMethodBody below) via bz_args_array.
+        if (isMain(ms) && !ci.params->empty()) {
+            paramTys.push_back(i32());  // argc
+            paramTys.push_back(ptrTy());  // argv (char**)
+        } else {
+            for (const auto& p : *ci.params) {
+                paramTys.push_back(isByRefMod(p.modifier)
+                                       ? ptrTy()  // CG50: ref/out by reference
+                                       : lowerType(p.type.get()));
+            }
         }
         auto* fnType = llvm::FunctionType::get(retTy, paramTys,
                                                /*isVarArg=*/false);
@@ -2742,6 +2754,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     disposeStack_.clear();
     loopStack_.clear(); finallyStack_.clear();
     propagateBB_ = nullptr;
+    pendingArgsDisposal_.reset();
     unwindTarget_ = nullptr;
     currentCaughtExc_ = nullptr;
     currentCaughtName_ = {};
@@ -2775,7 +2788,41 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectBoxReleaseEligible(*ci.stmts);
     }
 
-    bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
+    // fix #633 / §33.4: Main(args: Array<string>) has C ABI signature
+    // `i32(i32 argc, ptr argv)` — NOT `i32(ptr args)` (the Bezel type).
+    // The OS passes argc as an i32 in the first integer register and argv as
+    // a ptr in the second; if the function is declared `i32(ptr)`, the CPU
+    // puts argc (e.g. 1) in the pointer register and args dereferences it →
+    // SIGSEGV.  The fix: declare main with (i32, ptr) and convert to
+    // Array<string> in the prolog via bz_args_array (runtime helper).
+    // §33.4 rule: "The program's own executable path is not included;
+    // args[0] is the first user-supplied argument."  bz_args_array skips
+    // argv[0] to enforce exactly that.
+    if (isMain(ms) && !ms->params.empty()) {
+        // The LLVM function has exactly two args: i32 argc, ptr argv.
+        auto argIt = fn->args().begin();
+        llvm::Value* argc = &*argIt++;   // i32
+        llvm::Value* argv = &*argIt;     // ptr (char**)
+        // Call bz_args_array(int32_t argc, char** argv) → void* (bz_array_t*).
+        auto* bz_args_fn = declareC("bz_args_array", ptrTy(), {i32(), ptrTy()});
+        llvm::AllocaInst* argsSlot = entryAlloca(ptrTy());
+        llvm::Value* argsArr = builder_.CreateCall(bz_args_fn, {argc, argv},
+                                                    "main.args");
+        builder_.CreateStore(argsArr, argsSlot);
+        // Wire the param symbol → slot so body reads (IdentifierExpr of args)
+        // resolve correctly via paramSlots_.
+        paramSlots_[ms->params[0]] = argsSlot;
+        // Register the array for collection disposal at scope end (both normal
+        // exit and unwind).  No scope is open yet — defer to lowerScopedBlock
+        // via pendingArgsDisposal_, mirroring pendingOwnedParams_.
+        // bz_array_free(arr, bz_string_release) disposes each string element
+        // (rc-decremented to 0 → freed) and then frees the array header.
+        pendingArgsDisposal_ = Disposal{argsSlot, nullptr};
+        pendingArgsDisposal_->collection = true;
+        pendingArgsDisposal_->collectionElemDisposer = stringElementReleaseThunk();
+    } else {
+        bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
+    }
 
     // §28.2 v0.134 / issue #601: checked disposal mode guard.
     // For every instance method of a class (not static, not the entry point,
@@ -7279,6 +7326,14 @@ bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& bo
         pendingOwnedParams_.clear();
         for (auto& [psym, slot] : pending)
             registerUnwindOwnedParam(psym, slot);
+    }
+    // fix #633 / §33.4: Main(args: Array<string>) prolog built the args array
+    // before any scope opened.  Consume the pending Disposal here (ROOT scope
+    // only) so emitDisposals runs bz_array_free(arr, bz_string_release) on both
+    // the normal-exit and unwind-exit paths, exactly once per program run.
+    if (disposeStack_.size() == 1 && pendingArgsDisposal_) {
+        disposeStack_.back().push_back(std::move(*pendingArgsDisposal_));
+        pendingArgsDisposal_.reset();
     }
     bool terminated = false;
     for (std::size_t i = startIdx; i < body.size(); ++i) {

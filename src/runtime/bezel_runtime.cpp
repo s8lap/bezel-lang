@@ -1610,6 +1610,31 @@ static inline void bz_string_init_rc(void* s) {
     memcpy((uint8_t*)s + BZ_STRING_RC_OFFSET, &one, sizeof(int64_t));
 }
 
+// §33.4: build an Array<string> (bz_array_t* of bz_string*) from the process
+// argv, excluding argv[0] (the executable name).  The returned array is
+// freshly owned; each element's rc is initialised to 1.  Disposal:
+//   bz_array_free(result, bz_string_release)
+// argv[0] is excluded per §33.4: "The program's own executable path is not
+// included; args[0] is the first user-supplied argument."
+void* bz_args_array(int32_t argc, char** argv) {
+    int32_t n = (argc > 1) ? (argc - 1) : 0;
+    void* arr = bz_array_alloc(8, n);   // elem_size = sizeof(void*) = 8
+    for (int32_t i = 0; i < n; ++i) {
+        const char* src = argv[i + 1];  // skip argv[0]
+        int64_t len = (int64_t)strlen(src);
+        char* data = (char*)malloc((size_t)(len + 1));
+        memcpy(data, src, (size_t)len);
+        data[len] = '\0';
+        uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+        memcpy(s, &data, sizeof(void*));           // data ptr
+        memcpy(s + 8, &len, sizeof(int64_t));      // len field
+        s[16] = 1;                                  // width = 1 (UTF-8 bytes)
+        bz_string_init_rc(s);                       // producer's reference, rc := 1
+        bz_array_add(arr, &s, 8);                  // append the bz_string* pointer
+    }
+    return arr;
+}
+
 void* bz_file_read_all_lines(const char* path) {
     uint8_t* buf; int64_t len;
     if (bz_file_read_all_bytes(path, &buf, &len) != 0)
