@@ -1858,6 +1858,41 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // fix #667 / §30.15 / stdlib §6.9: Channel<T>.IsClosed and Channel<T>.Count
+    // as property reads (MemberAccessExpr without parens). These are "readonly
+    // property" in the stdlib, so the parser generates a MemberAccessExpr (not
+    // a CallExpr), bypassing tryLowerChannelAndDomainCall.  Handle them here so
+    // the MemberAccess path correctly calls bz_channel_is_closed /
+    // bz_channel_count.  The null-guards in those runtime functions (fix #667)
+    // ensure that null (post-Dispose slot) returns the expected sentinel values.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target &&
+            (ma->member == "IsClosed" || ma->member == "Count")) {
+            auto* tt = ctx_.exprType(*ma->target);
+            bool isChProp = (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                             !tt->declaration && tt->astNode &&
+                             tt->astNode->name &&
+                             !tt->astNode->name->parts.empty() &&
+                             tt->astNode->name->parts[0] == "Channel");
+            if (isChProp) {
+                llvm::Value* ch = lowerExpr(*ma->target);
+                if (ch) {
+                    if (ma->member == "IsClosed") {
+                        auto* fn = declareC("bz_channel_is_closed",
+                                           i32(), {ptrTy()});
+                        llvm::Value* r = builder_.CreateCall(
+                            fn, {ch}, "ch.isclosed");
+                        return builder_.CreateICmpNE(r, builder_.getInt32(0));
+                    } else {
+                        auto* fn = declareC("bz_channel_count",
+                                           i64(), {ptrTy()});
+                        llvm::Value* c = builder_.CreateCall(fn, {ch});
+                        return builder_.CreateTrunc(c, i32(), "ch.count.i");
+                    }
+                }
+            }
+        }
+    }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
     // StringBuilder.Length — sum of part lengths (total chars).
     // Dictionary<K,V>.Count — runtime bz_dict_count.

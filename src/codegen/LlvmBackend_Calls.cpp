@@ -11384,6 +11384,14 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
 
             // TryReceive(out owned item: T?) → bool.
             // The out-var slot was pre-created by ensureOutVarSlots.
+            // fix #667 / §30.15 / stdlib §6.9: value-type payload decode.
+            // The runtime stores value-typed items as inttoptr(zext(val,i64)).
+            // The out-slot for T? is {i8 hasValue; T value} (nullable struct)
+            // for primitive/enum T, or a pointer for class/string T.
+            // We must decode rawItem correctly:
+            //   - struct outEty (nullable value type): ptrtoint → trunc/bitcast
+            //     to inner type, then build {i8=1, innerVal} and store.
+            //   - pointer outEty (class/string): store rawItem directly.
             if (mname == "TryReceive" && call.args.size() == 1 &&
                 call.args[0].value) {
                 // The out argument's address.
@@ -11401,7 +11409,7 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                                     {ptrTy(), ptrTy()});
                 llvm::Value* ok = builder_.CreateCall(fn, {ch, rawSlot},
                                                       "ch.tryrecv");
-                // If ok: copy rawSlot into outSlot (the caller's out-var).
+                // If ok: decode and copy rawItem into outSlot (the caller's out-var).
                 auto* okBB   = llvm::BasicBlock::Create(llvm_, "tryrecv.ok",
                                                          currentFn_);
                 auto* contBB = llvm::BasicBlock::Create(llvm_, "tryrecv.cont",
@@ -11410,9 +11418,54 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 builder_.CreateCondBr(isOk, okBB, contBB);
                 builder_.SetInsertPoint(okBB);
                 llvm::Value* rawItem = builder_.CreateLoad(ptrTy(), rawSlot);
-                // Decode item: for value types, ptrtoint + trunc; for ptr types
-                // store as-is. The element type decides the decoding.
-                builder_.CreateStore(rawItem, outSlot);
+                // fix #667 / §30.15: decode the stored void* into the out-slot type.
+                // For nullable value types (outEty is a struct) the item was encoded
+                // as inttoptr(zext(T_value, i64)) by the Send lowering above; decode
+                // by ptrtoint + trunc/bitcast to the inner field type, then wrap in
+                // the nullable struct {i8=1, innerVal}.
+                // For pointer types (class, string) the item IS the raw pointer; store
+                // directly (the slot holds a nullable pointer: non-null = has value).
+                if (outEty && outEty->isStructTy()) {
+                    // Nullable value type path.
+                    auto* stTy = llvm::cast<llvm::StructType>(outEty);
+                    llvm::Type* innerTy = stTy->getNumElements() > 1
+                                         ? stTy->getElementType(1)
+                                         : i32();
+                    llvm::Value* asI64 = builder_.CreatePtrToInt(
+                        rawItem, i64(), "tr.i64");
+                    llvm::Value* decoded;
+                    if (innerTy->isDoubleTy()) {
+                        decoded = builder_.CreateBitCast(asI64, innerTy, "tr.dbl");
+                    } else if (innerTy->isFloatTy()) {
+                        llvm::Value* t32 = builder_.CreateTrunc(asI64, i32(), "tr.f32b");
+                        decoded = builder_.CreateBitCast(t32, innerTy, "tr.flt");
+                    } else if (innerTy->isIntegerTy(64)) {
+                        decoded = asI64;
+                    } else if (innerTy->isIntegerTy()) {
+                        decoded = builder_.CreateTrunc(asI64, innerTy, "tr.int");
+                    } else {
+                        // Fallback for unexpected inner types (e.g. record struct):
+                        // store as i64 and let the struct initialiser zero the rest.
+                        decoded = asI64;
+                    }
+                    // Build the nullable struct {i8=1, decoded}.
+                    llvm::Value* nv = llvm::UndefValue::get(stTy);
+                    nv = builder_.CreateInsertValue(
+                        nv,
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u},
+                        "tr.hv");
+                    // Coerce decoded to the exact inner slot type (handles the rare
+                    // case where the truncation produced a slightly wrong width).
+                    if (decoded->getType() != stTy->getElementType(1))
+                        decoded = builder_.CreateIntCast(
+                            decoded, stTy->getElementType(1),
+                            /*isSigned=*/false, "tr.coerce");
+                    nv = builder_.CreateInsertValue(nv, decoded, {1u}, "tr.nv");
+                    builder_.CreateStore(nv, outSlot);
+                } else {
+                    // Pointer type (class, string): rawItem is the object pointer.
+                    builder_.CreateStore(rawItem, outSlot);
+                }
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
                 return builder_.CreateICmpNE(ok, builder_.getInt32(0), "ch.try.r");
