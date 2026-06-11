@@ -2006,6 +2006,26 @@ static void domain_enqueue(bz_domain_t* dom,
 // ---------------------------------------------------------------------------
 // bz_domain_t — serial execution unit (§30.13 / #618)
 // ---------------------------------------------------------------------------
+//
+// Lifetime via reference counting (fix #632 — UAF in domain_drain):
+//
+//   Every C++ holder that can dereference a bz_domain_t* acquires +1 on
+//   the refcount and releases -1 when done; the last release (refs → 0)
+//   deletes the domain.
+//
+//   Holders and their acquire / release sites (per fix #632):
+//     - drain active: domain_drain acquires +1 at entry, releases -1 after
+//       clearing active=false and returning — so the domain is live for the
+//       entire drain loop even if a continuation calls bz_domain_spawn and
+//       the child (or its SpawnCtx) completes instantly.
+//     - SpawnCtx: bz_domain_spawn acquires +1 for the SpawnCtx; entry_cont
+//       releases -1 after completing the join task (before deleting SpawnCtx).
+//     - task->domain: each bz_task_t that stores a domain pointer holds one
+//       ref (acquired when task->domain is written, released in bz_task_free).
+//
+//   g_main_domain is exempt from deletion: it receives a permanent +1 at
+//   creation so its count never reaches 0 in normal operation.
+//   bz_scheduler_shutdown deletes it directly after the pool is torn down.
 
 struct bz_domain_t {
     struct Cont { void (*fn)(void*, void*); void* task; void* state; };
@@ -2013,6 +2033,9 @@ struct bz_domain_t {
     std::deque<Cont>  queue;          // ready-to-run continuations
     std::mutex        mtx;            // guards queue and active
     bool              active = false; // true while a pool worker is draining
+    // per fix #632: refcount — every holder acquires +1 and releases -1;
+    // last release (refs==1→0) deletes.  Starts at 0; callers add their refs.
+    std::atomic<int>  refs{0};
 
     // Enqueue a continuation.  If the domain is idle, mark it active and
     // return true so the caller submits a drain to the pool.  If already
@@ -2029,6 +2052,37 @@ struct bz_domain_t {
 };
 
 static bz_domain_t* g_main_domain = nullptr;
+
+// ---------------------------------------------------------------------------
+// domain_ref / domain_release — refcount helpers (fix #632)
+// ---------------------------------------------------------------------------
+
+// Acquire a reference to a domain.  per fix #632.
+static void domain_ref(bz_domain_t* dom) {
+    dom->refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Release a reference.  per fix #632.
+// When the count reaches 0, delete the domain.
+// g_main_domain's permanent +1 (from bz_main_domain_get) is released by
+// bz_scheduler_shutdown via this same path; the domain is deleted when the
+// last outstanding ref (usually the outerTask freed after shutdown) drops to 0.
+static void domain_release(bz_domain_t* dom) {
+    if (dom->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete dom;
+}
+
+// bz_main_domain_get — lazy-init g_main_domain with its permanent +1 ref.
+// per fix #632: all lazy-init sites call this instead of bare new bz_domain_t().
+// The permanent ref is released by bz_scheduler_shutdown (via domain_release),
+// ensuring g_main_domain stays alive until all task refs are also released.
+static bz_domain_t* bz_main_domain_get() {
+    if (!g_main_domain) {
+        g_main_domain = new bz_domain_t();
+        domain_ref(g_main_domain);  // per fix #632: permanent ref; released at shutdown
+    }
+    return g_main_domain;
+}
 
 // ---------------------------------------------------------------------------
 // bz_task_t
@@ -2116,7 +2170,12 @@ static BzScheduler* g_scheduler = nullptr;
 // on the same domain.  The mutex provides a sequentially-consistent
 // happens-before edge, so a new drain on a different pool worker always sees
 // all memory writes from the previous drain's continuations.
+//
+// Lifetime: domain_drain acquires a refcount on entry and releases on exit,
+// per fix #632 (UAF: entry_cont deleted the child_domain then domain_drain
+// looped back and re-locked dom->mtx on freed memory).
 static void domain_drain(bz_domain_t* dom) {
+    domain_ref(dom);  // per fix #632: drain holds a ref for its entire run
     for (;;) {
         bz_domain_t::Cont c;
         {
@@ -2127,6 +2186,7 @@ static void domain_drain(bz_domain_t* dom) {
                 // see active=false, will set active=true, and will submit a
                 // new drain — so no items are lost.
                 dom->active = false;
+                domain_release(dom);  // per fix #632: release drain ref on exit
                 return;
             }
             c = dom->queue.front();
@@ -2196,7 +2256,7 @@ static void domain_enqueue(bz_domain_t* dom,
 // ---------------------------------------------------------------------------
 
 void bz_scheduler_init(int num_threads) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     if (g_scheduler) return;
     g_scheduler = new BzScheduler();
     for (int i = 0; i < num_threads; i++)
@@ -2210,15 +2270,22 @@ void bz_scheduler_shutdown(void) {
     for (auto& t : g_scheduler->threads) t.join();
     delete g_scheduler;
     g_scheduler = nullptr;
-    // Reset the main domain for process re-use (e.g. repeated JIT test runs).
-    delete g_main_domain;
+    // per fix #632: release the permanent ref on g_main_domain via domain_release
+    // so the domain is deleted when ALL outstanding task refs (+ this permanent ref)
+    // are gone.  The generated main calls bz_task_free(outerTask) AFTER shutdown,
+    // which releases the outerTask's domain ref — that final release triggers the
+    // delete.  Nulling g_main_domain first lets bz_main_domain_get re-init cleanly
+    // on the next bz_scheduler_init (process-reuse in JIT test harness).
+    bz_domain_t* main_dom = g_main_domain;
     g_main_domain = nullptr;
+    if (main_dom) domain_release(main_dom);  // releases permanent ref; may delete
 }
 
 void* bz_task_alloc(void) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
     task->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
     return task;
 }
 
@@ -2226,7 +2293,7 @@ void* bz_task_alloc(void) {
 // state-machine Resume that starts the async method body).  Route through the
 // task's domain so the initial run is also serialized within the domain.
 void bz_task_schedule(void* tp, void (*fn)(void* task, void* state), void* state) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     if (!g_scheduler) bz_scheduler_init(4); // lazy init
     auto* task = (bz_task_t*)tp;
     bz_domain_t* dom = task->domain ? task->domain : g_main_domain;
@@ -2241,10 +2308,11 @@ void bz_task_schedule(void* tp, void (*fn)(void* task, void* state), void* state
 // domain), which calls bz_task_complete -> task_notify -> domain_enqueue to
 // re-queue the awaiting continuation back into its domain.
 void* bz_task_delay(int64_t milliseconds) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     if (!g_scheduler) bz_scheduler_init(4);   // ensure a pool exists
     auto* task = new bz_task_t();
     task->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
     int64_t ms = milliseconds < 0 ? 0 : milliseconds;
     g_scheduler->submit([task, ms]() {
         if (ms > 0)
@@ -2395,7 +2463,9 @@ void bz_task_free(void* tp) {
     auto* task = (bz_task_t*)tp;
     free(task->result);
     free(task->error_msg);
+    bz_domain_t* dom = task->domain;
     delete task;
+    if (dom) domain_release(dom);  // per fix #632: release task's domain ref
 }
 
 // stdlib §6.7 / §30.10: Task.FromResult<T>(value). Allocate a fresh task and
@@ -2404,9 +2474,10 @@ void bz_task_free(void* tp) {
 // thread-pool submission). result == null / result_size == 0 produces an
 // already-completed no-value task (the primitive behind Task.CompletedTask).
 void* bz_task_from_result(const void* result, int64_t result_size) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
     task->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
     if (result_size > 0 && result) {
         task->result = malloc((size_t)result_size);
         memcpy(task->result, result, (size_t)result_size);
@@ -2445,11 +2516,12 @@ struct BzWhenAllCtx {
 };
 
 void* bz_task_when_all(void* task_arr) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
     aggregate->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
     if (n == 0) {
         aggregate->done = true;
         return aggregate;
@@ -2524,11 +2596,12 @@ struct BzWhenAllResultsSlot {
 };
 
 void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
     aggregate->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
     if (n == 0) {
         // Empty array: complete immediately with an empty Array<T>.
         void* emptyArr = bz_array_alloc(elem_size, 0);
@@ -2624,11 +2697,12 @@ struct BzWhenAnyCtx {
 };
 
 void* bz_task_when_any(void* task_arr) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
     aggregate->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
     if (n == 0) {
         aggregate->done = true;
         return aggregate;
@@ -4966,10 +5040,11 @@ static void* bz_task_make_oce(void* oce_vtable) {
 // done here. oce_vtable is the vtable pointer for OperationCanceledException,
 // supplied by codegen so the runtime can construct the exception object.
 void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtable) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* s = (bz_cancel_state_t*)token;
     auto* task = new bz_task_t();
     task->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
     // Pre-check: if already cancelled, fault immediately.
     if (s && s->cancelled) {
         void* excObj = bz_task_make_oce(oce_vtable);
@@ -5066,7 +5141,7 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
 
 extern "C"
 void* bz_channel_new(void (*dispose_elem)(void*)) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* ch = new bz_channel_t();
     ch->dispose_elem   = dispose_elem;
     ch->sender_count   = 0;
@@ -5139,9 +5214,10 @@ void bz_channel_sender_send(void* txp, void* item) {
 extern "C"
 void* bz_channel_receive(void* chp, void* cce_vtable) {
     auto* ch = (bz_channel_t*)chp;
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
     task->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
 
     void* item = nullptr;
     bool  have_item = false;
@@ -5293,15 +5369,17 @@ void bz_channel_dispose(void* chp, void* cce_vtable) {
 extern "C"
 void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
                       void* dfe_vtable) {
-    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     if (!g_scheduler) bz_scheduler_init(4);
 
     // Allocate the join task -- the caller awaits this.
     auto* join_task = new bz_task_t();
     // The join task belongs to the CALLER's domain (main or current domain).
     join_task->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: join_task holds a ref on its domain
 
     // Allocate a FRESH domain for the spawned entry (§30.13 isolation).
+    // per fix #632: start with refs=0; domain_drain and SpawnCtx each add their own.
     auto* child_domain = new bz_domain_t();
 
     struct SpawnCtx {
@@ -5312,6 +5390,7 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
         void*          dfe_vtable;
     };
     auto* ctx = new SpawnCtx{child_domain, join_task, entry_fn, arg_ptr, dfe_vtable};
+    domain_ref(child_domain);  // per fix #632: SpawnCtx holds a ref on child_domain
 
     // Schedule the entry as a continuation on the child domain.
     auto entry_cont = [](void* /*task_unused*/, void* state) {
@@ -5358,13 +5437,12 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
             bz_task_complete(sc->join_task, &result, sizeof(void*));
         }
 
-        // The child domain is no longer needed; delete it here (safe: the
-        // domain drain loop exits after this continuation returns, and
-        // domain_drain accesses only dom->mtx/queue/active -- the structs
-        // remain valid until this call returns to domain_drain).
+        // per fix #632: release the SpawnCtx's ref on the child domain.
+        // domain_drain still holds its own drain-ref (acquired at domain_drain
+        // entry), so the domain remains live until the drain loop exits.
         bz_domain_t* dom = sc->child_domain;
         delete sc;
-        delete dom;
+        domain_release(dom);  // per fix #632: release SpawnCtx ref
     };
 
     domain_enqueue(child_domain, entry_cont, nullptr, ctx);
