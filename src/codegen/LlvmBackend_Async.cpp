@@ -1211,11 +1211,10 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         ctx_.diagnostics().report(
             Severity::Error,
             ms->decl ? ms->decl->span.begin : SourceLocation{},
-            "not implemented: `yield` in a try/catch arm body, `yield` in a "
-            "finally block, or `await` in a catch guard inside an async iterator "
-            "— forbidden by §29.6 / §30.7 (`yield` in a try body with only a "
-            "finally is allowed; `await` in try/catch/finally bodies is allowed "
-            "per §30.9)");
+            "forbidden by §29.6: `yield` inside a try body with catch arms, "
+            "`yield` inside a catch arm body, or `yield` inside a finally block "
+            "in an async iterator (`yield` in a try body with only a finally is "
+            "allowed; `await` in try/catch/finally bodies is allowed per §30.9)");
         emitAsyncStub(ms, fn, ci);
         return;
     }
