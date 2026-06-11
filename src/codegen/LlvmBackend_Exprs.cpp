@@ -1608,7 +1608,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     return llvm::ConstantAggregateZero::get(guidStructType());
                 }
                 // stdlib §9.3 / fix #521: Decimal static constants.
-                if (id2->name == "Decimal") {
+                if (id2->name == "Decimal" || id2->name == "decimal") {  // §5: both spellings (spec L243)
                     llvm::StructType* dst = decimalStructType();
                     const auto& mbr = ma->member;
                     if (mbr == "Zero")

@@ -278,7 +278,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    id->name == "Guid" ||
                    // stdlib §9.3: Decimal is auto-imported (a builtin value type).
                    // fix #521: needed for Decimal.Parse, Decimal.Zero, etc.
-                   id->name == "Decimal" ||
+                   id->name == "Decimal" || id->name == "decimal" ||
                    // §7 System.IO:
                    id->name == "File" || id->name == "Directory" ||
                    id->name == "Path" ||

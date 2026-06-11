@@ -4566,7 +4566,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
             // stdlib §9.3 / fix #521: Decimal static member types.
             // Reached when the receiver is the `Decimal` class identifier.
-            if (cls == "Decimal") {
+            if (cls == "Decimal" || cls == "decimal") {  // §5: both spellings (spec L243)
                 // Zero, One, MinValue, MaxValue → decimal.
                 if (m == "Zero" || m == "One" || m == "MinValue" || m == "MaxValue" ||
                     m == "Parse") {

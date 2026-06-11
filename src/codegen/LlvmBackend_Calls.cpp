@@ -4602,7 +4602,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // Decimal is a 128-bit value type stored as { i32 lo32, i32 mid32, i32 hi32, i32 flags }.
     // All runtime functions take a pointer to the struct.
     // ---------------------------------------------------------------------------
-    if (cls == "Decimal") {
+    if (cls == "Decimal" || cls == "decimal") {  // §5: both spellings (spec L243)
         llvm::StructType* dst = decimalStructType();
 
         // Helper: allocate a decimal-sized alloca slot.

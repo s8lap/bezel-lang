@@ -599,3 +599,24 @@ BEZEL_TEST(codegen_521_overflow, aot_max_plus_one_catches_and_returns_42_spec_6_
         "end Main; end C;"),
         42);
 }
+
+// Spec §5 (L243): "Static members of the standard library type are accessible
+// through either form: int.Parse, int.MaxValue ..." — the keyword receiver
+// (`decimal.MaxValue`) and the class receiver (`Decimal.MaxValue`) must agree.
+// Regression for the silent-garbage keyword form found 2026-06-12.
+BEZEL_TEST(codegen_521_overflow, keyword_receiver_statics_agree_spec_5) {
+    BEZEL_EXPECT_EQ(compileAndRun521(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var a := Decimal.MaxValue; "
+        "  var b := decimal.MaxValue; "
+        "  if a = b and decimal.One = Decimal.One and decimal.Zero = 0.0m then "
+        "    try "
+        "      var _ := decimal.MaxValue + decimal.One; "
+        "      return 2; "
+        "    catch OverflowException => return 42; "
+        "    end; "
+        "  end; "
+        "  return 3; "
+        "end Main; end C;"), 42);
+}
