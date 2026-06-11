@@ -189,6 +189,70 @@ void Emitter::emitSerializeField(llvm::Value* val,
         return;
     }
 
+    // §9.8 / #638 / #637: nullable check MUST come before Primitive/Named dispatch.
+    // TypeRef represents T? with the same kind as T but nullable=true.  If we
+    // checked K::Primitive first, an int?/{i8,i32} struct value would reach the
+    // integer SExt path → LLVM verifier failure.  A string? nullptr would be
+    // passed to bz_binser_write_string which writes a zero-length string (not a
+    // null marker) → Deserialize reads "" instead of null (#637).
+    if (fieldTy->nullable) {
+        if (val->getType()->isPointerTy()) {
+            // Nullable reference type (string?, class?): ptr is null → write null.
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                val, llvm::ConstantPointerNull::get(ptrTy()), "ser.isnull");
+            auto* nullBB = llvm::BasicBlock::Create(llvm_, "ser.null", currentFn_);
+            auto* liveBB = llvm::BasicBlock::Create(llvm_, "ser.live", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ser.nend", currentFn_);
+            builder_.CreateCondBr(isNull, nullBB, liveBB);
+            builder_.SetInsertPoint(nullBB);
+            {
+                auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
+                builder_.CreateCall(fn, {serPtr});
+            }
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(liveBB);
+            {
+                // Write the non-null value: strip nullable flag and recurse.
+                sema::TypeRef nonNullTy = *fieldTy;
+                nonNullTy.nullable = false;
+                emitSerializeField(val, &nonNullTy, serPtr);
+            }
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            return;
+        }
+        // Nullable value type: {i8 hasValue; T value} struct layout.
+        if (val->getType()->isStructTy()) {
+            llvm::Value* hasVal = builder_.CreateExtractValue(val, {0u}, "ser.hasv");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                hasVal, builder_.getInt8(0), "ser.isnull");
+            auto* nullBB = llvm::BasicBlock::Create(llvm_, "ser.null", currentFn_);
+            auto* liveBB = llvm::BasicBlock::Create(llvm_, "ser.live", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ser.nend", currentFn_);
+            builder_.CreateCondBr(isNull, nullBB, liveBB);
+            builder_.SetInsertPoint(nullBB);
+            {
+                auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
+                builder_.CreateCall(fn, {serPtr});
+            }
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(liveBB);
+            {
+                llvm::Value* inner = builder_.CreateExtractValue(val, {1u}, "ser.inner");
+                sema::TypeRef nonNullTy = *fieldTy;
+                nonNullTy.nullable = false;
+                emitSerializeField(inner, &nonNullTy, serPtr);
+            }
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            return;
+        }
+        // Fallback: write null marker.
+        auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
+        builder_.CreateCall(fn, {serPtr});
+        return;
+    }
+
     if (fieldTy->kind == K::Primitive) {
         switch (fieldTy->primitive) {
         case sema::PrimitiveType::Bool: {
@@ -284,68 +348,6 @@ void Emitter::emitSerializeField(llvm::Value* val,
             emitRecordSerialize(fieldTs, recVal, serPtr);
             return;
         }
-    }
-
-    // Nullable T? — §9.8: write WriteNull (null marker) or the value.
-    // TypeRef does not have a separate Nullable kind: nullable is expressed
-    // via the `nullable` bool flag on a Primitive or Named TypeRef.
-    if (fieldTy->nullable) {
-        if (val->getType()->isPointerTy()) {
-            // Nullable reference type (string?, class?): ptr is null → write null.
-            llvm::Value* isNull = builder_.CreateICmpEQ(
-                val, llvm::ConstantPointerNull::get(ptrTy()), "ser.isnull");
-            auto* nullBB = llvm::BasicBlock::Create(llvm_, "ser.null", currentFn_);
-            auto* liveBB = llvm::BasicBlock::Create(llvm_, "ser.live", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ser.nend", currentFn_);
-            builder_.CreateCondBr(isNull, nullBB, liveBB);
-            builder_.SetInsertPoint(nullBB);
-            {
-                auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
-                builder_.CreateCall(fn, {serPtr});
-            }
-            builder_.CreateBr(endBB);
-            builder_.SetInsertPoint(liveBB);
-            {
-                // Write the non-null value: strip nullable flag and recurse.
-                // Make a shallow copy of the TypeRef with nullable = false.
-                sema::TypeRef nonNullTy = *fieldTy;
-                nonNullTy.nullable = false;
-                emitSerializeField(val, &nonNullTy, serPtr);
-            }
-            builder_.CreateBr(endBB);
-            builder_.SetInsertPoint(endBB);
-            return;
-        }
-        // Nullable value type: {i8 hasValue; T value} struct layout.
-        if (val->getType()->isStructTy()) {
-            llvm::Value* hasVal = builder_.CreateExtractValue(val, {0u}, "ser.hasv");
-            llvm::Value* isNull = builder_.CreateICmpEQ(
-                hasVal, builder_.getInt8(0), "ser.isnull");
-            auto* nullBB = llvm::BasicBlock::Create(llvm_, "ser.null", currentFn_);
-            auto* liveBB = llvm::BasicBlock::Create(llvm_, "ser.live", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ser.nend", currentFn_);
-            builder_.CreateCondBr(isNull, nullBB, liveBB);
-            builder_.SetInsertPoint(nullBB);
-            {
-                auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
-                builder_.CreateCall(fn, {serPtr});
-            }
-            builder_.CreateBr(endBB);
-            builder_.SetInsertPoint(liveBB);
-            {
-                llvm::Value* inner = builder_.CreateExtractValue(val, {1u}, "ser.inner");
-                sema::TypeRef nonNullTy = *fieldTy;
-                nonNullTy.nullable = false;
-                emitSerializeField(inner, &nonNullTy, serPtr);
-            }
-            builder_.CreateBr(endBB);
-            builder_.SetInsertPoint(endBB);
-            return;
-        }
-        // Fallback: write null marker.
-        auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
-        builder_.CreateCall(fn, {serPtr});
-        return;
     }
 
     // Fallback: unknown / unsupported type — emit null marker (silent skip).
@@ -646,6 +648,62 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
 
     if (!fieldTy) return nullptr;
 
+    // §9.8 / #638 / #637: nullable check MUST come before Primitive/Named dispatch.
+    // For int?/bool? the kind is Primitive but the wire starts with a null marker;
+    // for string? the kind is also Primitive — reaching the Primitive branch without
+    // the null check means bz_binder_read_string is called unconditionally, returning
+    // "" when the marker indicates null (#637).  Non-nullable value types return an
+    // inner TypeRef with nullable=false which then re-dispatches correctly.
+    if (fieldTy->nullable) {
+        // Read null marker or inner value.
+        auto* tryNullFn = declareC("bz_binder_try_read_null", i8(), {ptrTy()});
+        llvm::Value* wasNull = builder_.CreateCall(tryNullFn, {derPtr}, "deser.wnull");
+        llvm::Value* isNull  = builder_.CreateICmpNE(
+            wasNull, builder_.getInt8(0), "deser.isnull");
+
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "deser.nullfld", currentFn_);
+        auto* liveBB = llvm::BasicBlock::Create(llvm_, "deser.livefld", currentFn_);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "deser.nend",    currentFn_);
+        builder_.CreateCondBr(isNull, nullBB, liveBB);
+
+        // null path: return a null/zero value for the nullable type.
+        builder_.SetInsertPoint(nullBB);
+        llvm::Value* nullVal = nullptr;
+        if (fieldTy->kind == K::Primitive &&
+            fieldTy->primitive == sema::PrimitiveType::String) {
+            nullVal = llvm::ConstantPointerNull::get(ptrTy());
+        } else {
+            // nullable value: return the full nullable-value struct zeroed.
+            llvm::Type* thisLlvmTy = lowerTypeRef(fieldTy);
+            nullVal = thisLlvmTy ? llvm::Constant::getNullValue(thisLlvmTy) : nullptr;
+        }
+        builder_.CreateBr(endBB);
+        auto* nullEndBB = builder_.GetInsertBlock();
+
+        // live path: read the inner (non-nullable) value.
+        builder_.SetInsertPoint(liveBB);
+        sema::TypeRef nonNullTy = *fieldTy;
+        nonNullTy.nullable = false;
+        llvm::Value* innerVal = emitDeserializeField(&nonNullTy, derPtr);
+        // For nullable VALUE types ({i8 hasValue, T value}), the raw inner read
+        // returns the inner T.  Wrap it back into the tagged struct so the PHI
+        // and the record slot both see {i8=1, T=value}.  Reference-nullable
+        // (string?, class?) stays as a plain ptr — no wrap needed (#638).
+        if (innerVal && isNullableValueTy(fieldTy))
+            innerVal = wrapNullableValue(fieldTy, innerVal);
+        builder_.CreateBr(endBB);
+        auto* liveEndBB = builder_.GetInsertBlock();
+
+        builder_.SetInsertPoint(endBB);
+        if (nullVal && innerVal && nullVal->getType() == innerVal->getType()) {
+            llvm::PHINode* phi = builder_.CreatePHI(nullVal->getType(), 2, "deser.nval");
+            phi->addIncoming(nullVal, nullEndBB);
+            phi->addIncoming(innerVal, liveEndBB);
+            return phi;
+        }
+        return innerVal ? innerVal : nullVal;
+    }
+
     if (fieldTy->kind == K::Primitive) {
         switch (fieldTy->primitive) {
         case sema::PrimitiveType::Bool: {
@@ -728,51 +786,6 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
 
         if (fieldTs->kind == ast::TypeDeclKind::Record)
             return emitRecordDeserialize(fieldTs, derPtr);
-    }
-
-    // Nullable T? — TypeRef.nullable flag; no separate Nullable kind.
-    if (fieldTy->nullable) {
-        // Read null marker or inner value.
-        auto* tryNullFn = declareC("bz_binder_try_read_null", i8(), {ptrTy()});
-        llvm::Value* wasNull = builder_.CreateCall(tryNullFn, {derPtr}, "deser.wnull");
-        llvm::Value* isNull  = builder_.CreateICmpNE(
-            wasNull, builder_.getInt8(0), "deser.isnull");
-
-        auto* nullBB = llvm::BasicBlock::Create(llvm_, "deser.nullfld", currentFn_);
-        auto* liveBB = llvm::BasicBlock::Create(llvm_, "deser.livefld", currentFn_);
-        auto* endBB  = llvm::BasicBlock::Create(llvm_, "deser.nend",    currentFn_);
-        builder_.CreateCondBr(isNull, nullBB, liveBB);
-
-        // null path: return a null/zero value for the nullable type.
-        builder_.SetInsertPoint(nullBB);
-        llvm::Value* nullVal = nullptr;
-        if (fieldTy->kind == K::Primitive &&
-            fieldTy->primitive == sema::PrimitiveType::String) {
-            nullVal = llvm::ConstantPointerNull::get(ptrTy());
-        } else {
-            // nullable value: return the full nullable-value struct zeroed.
-            llvm::Type* thisLlvmTy = lowerTypeRef(fieldTy);
-            nullVal = thisLlvmTy ? llvm::Constant::getNullValue(thisLlvmTy) : nullptr;
-        }
-        builder_.CreateBr(endBB);
-        auto* nullEndBB = builder_.GetInsertBlock();
-
-        // live path: read the inner (non-nullable) value.
-        builder_.SetInsertPoint(liveBB);
-        sema::TypeRef nonNullTy = *fieldTy;
-        nonNullTy.nullable = false;
-        llvm::Value* innerVal = emitDeserializeField(&nonNullTy, derPtr);
-        builder_.CreateBr(endBB);
-        auto* liveEndBB = builder_.GetInsertBlock();
-
-        builder_.SetInsertPoint(endBB);
-        if (nullVal && innerVal && nullVal->getType() == innerVal->getType()) {
-            llvm::PHINode* phi = builder_.CreatePHI(nullVal->getType(), 2, "deser.nval");
-            phi->addIncoming(nullVal, nullEndBB);
-            phi->addIncoming(innerVal, liveEndBB);
-            return phi;
-        }
-        return innerVal ? innerVal : nullVal;
     }
 
     return nullptr;

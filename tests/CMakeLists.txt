@@ -466,6 +466,7 @@ set(BEZEL_TEST_SOURCES
     codegen/user_exception_unqualified_msg_625_test.cpp
     codegen/serialization_synthesis_550_test.cpp
     codegen/main_args_633_test.cpp
+    codegen/serialization_edges_635_637_638_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
