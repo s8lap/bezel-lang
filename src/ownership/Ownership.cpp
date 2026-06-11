@@ -772,6 +772,25 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // `using var` is always Owned and implicitly discharged.
         lo.state = OwnershipState::Owned;
         lo.implicitDischarge = true;
+        // §28.3 / §28.10 adoption (Guide 1 §7 Pattern B; spec §30.15 example):
+        // `using var x := <owned local or owned param>;` is an owned-consuming
+        // binding — the using var IS an owned location, so the source's
+        // obligation transfers (a move). Without this the source stays Owned
+        // and is falsely reported dropped at method exit. Only an Owned
+        // source transfers; a borrow RHS keeps §28.10's pin-without-obligation
+        // behavior unchanged.
+        if (ld.initializer) {
+            if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ld.initializer.get())) {
+                for (auto& [s, st] : states_) {
+                    if (s->name == aid->name &&
+                        st.state == OwnershipState::Owned) {
+                        markMovedByName(aid->name, aid->span.begin);
+                        break;
+                    }
+                }
+            }
+        }
     } else if (ld.initializer) {
         lo.state = producerState(*ld.initializer);
     } else {

@@ -1823,6 +1823,15 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
                                           std::size_t argPos) {
     const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
     if (!ma || !ma->target) return false;
+    // per §30.14/§30.15 (#600): Domain.Spawn's trailing argument is moved into
+    // the spawned domain — an owned-consuming position (stdlib §6.8: Spawn(entry,
+    // owned arg)). `Domain` is a static builtin whose identifier may carry no
+    // exprType, so match it syntactically before the typed path below.
+    if (const auto* tid =
+            dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+        if (tid->name == "Domain" && ma->member == "Spawn")
+            return argPos == 1;
+    }
     const sema::TypeRef* tt = ctx_.exprType(*ma->target);
     // Built-in collections resolve to a Named TypeRef with a null declaration
     // and carry the class name on the AST node. A user type (non-null
@@ -1833,6 +1842,11 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
         tt->astNode->name->parts.empty())
         return false;
     const std::string_view cn = tt->astNode->name->parts[0];
+    // per §30.15 (#600): ChannelSender<T>.Send(owned item) transfers ownership
+    // into the channel (stdlib §6.9). For value/string element types the slot
+    // is a copy and the sink classification is a harmless no-op.
+    if (cn == "ChannelSender" && ma->member == "Send")
+        return argPos == 0;
     const bool isOwning =
         cn == "OwnedArray" || cn == "OwnedDictionary" ||
         cn == "OwnedSet" || cn == "OwnedStack" || cn == "OwnedQueue" ||

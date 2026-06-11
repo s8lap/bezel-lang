@@ -975,6 +975,63 @@ void bz_shared_mark_disposed(void* handle);
 // quarantined via bz_shared_mark_disposed (checked-disposal builds only).
 int8_t bz_shared_is_disposed(void* handle);
 
+// ---------------------------------------------------------------------------
+// Channel<T> and Domain.Spawn runtime (§30.14/§30.15, #600 phase c)
+//
+// Channel<T> is backed by a bz_channel_t (opaque to Bezel code, stored as ptr).
+// ChannelSender<T> is backed by a bz_channel_sender_t (also opaque, ptr).
+//
+// Element encoding: class items → void* (ownership transferred); value/string
+// items → void* (uint64 bit-cast inline; no deep disposal via dispose_elem).
+// dispose_elem is null for value/string channels; non-null for class channels
+// (vtable Dispose + free, same as OwnedArray<T> element policy).
+// ---------------------------------------------------------------------------
+
+// Allocate a new empty Channel<T>. `dispose_elem` is the per-element
+// disposer (null for value/string elements; non-null for class elements).
+void* bz_channel_new(void (*dispose_elem)(void*));
+
+// Mint a new ChannelSender<T> handle. Increments the channel's sender count.
+// Caller owns the returned sender (must release via bz_channel_sender_release).
+void* bz_channel_new_sender(void* ch);
+
+// Send one item (via the channel pointer directly). Item ownership transfers.
+void bz_channel_send(void* ch, void* item);
+
+// Send one item via a ChannelSender handle.
+void bz_channel_sender_send(void* tx, void* item);
+
+// Receive one item asynchronously. Returns a bz_task_t* (already-done if
+// an item is buffered; pending if empty+open; faulted with ChannelClosedException
+// if empty+closed). cce_vtable is the ChannelClosedException vtable global.
+void* bz_channel_receive(void* ch, void* cce_vtable);
+
+// Non-blocking receive: stores item in *out_item and returns 1 if available;
+// returns 0 if empty. Thread-safe.
+int32_t bz_channel_try_receive(void* ch, void** out_item);
+
+// Number of buffered (not-yet-received) items.
+int64_t bz_channel_count(void* ch);
+
+// True (non-zero) if the channel is closed (all senders released).
+int32_t bz_channel_is_closed(void* ch);
+
+// Release one ChannelSender handle. If this was the last sender, closes the
+// channel and faults any pending receivers with ChannelClosedException.
+// cce_vtable is the ChannelClosedException vtable global.
+void bz_channel_sender_release(void* tx, void* cce_vtable);
+
+// Dispose the Channel<T>: close it, fault pending receivers, dispose any
+// undelivered items in REVERSE insertion order (§28.11), and free the struct.
+void bz_channel_dispose(void* ch, void* cce_vtable);
+
+// Domain.Spawn: spawn a fresh domain that runs entry_fn(arg_ptr).
+// Returns an OwnedTask bz_task_t* that completes (with the result pointer)
+// when the spawned domain finishes, or faults with DomainFaultedException.
+// dfe_vtable is the DomainFaultedException vtable global.
+void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
+                      void* dfe_vtable);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

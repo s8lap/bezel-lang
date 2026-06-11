@@ -97,13 +97,13 @@ BEZEL_TEST(send_600_runtime,
         "    using var a := await ch.Receive(); "   // drains item 1
         "    using var b := await ch.Receive(); "   // drains item 2
         // Channel is now drained+closed; next Receive must raise
-        // ChannelClosedException.
+        // ChannelClosedException.  Per §31.2 / §A.6 Bezel catch syntax:
+        //   `catch TypeName => statement;`  (no parentheses).
         "    try "
         "      using var c := await ch.Receive(); "
         "      return -1; "   // must not reach
-        "    catch (ChannelClosedException) "
-        "      return a.Val + b.Val; "   // 1 + 2 = 3
-        "    end try; "
+        "    catch ChannelClosedException => return a.Val + b.Val; "   // 1 + 2 = 3
+        "    end; "
         "  end Main; "
         "end Program;");
     // §30.15 drain semantics: items received in order; closed raises exception.
@@ -167,10 +167,12 @@ BEZEL_TEST(send_600_runtime,
         "    try "
         "      await t; "
         "      return -1; "   // must not reach
-        "    catch (DomainFaultedException e) "
+        // §31.2 Bezel catch-with-binding: `catch var e: Type => statement;`
+        // §A.7 Bezel conditional: `value if cond else other` (not C `cond ? a : b`).
+        "    catch var e: DomainFaultedException => "
         // Verify Message is non-empty (a copy of the original text).
-        "      return e.Message.Length > 0 ? 1 : -2; "
-        "    end try; "
+        "      return 1 if e.Message.Length > 0 else -2; "
+        "    end; "
         "  end Main; "
         "end Program;");
     // §30.14: DomainFaultedException caught with non-empty Message.

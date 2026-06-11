@@ -3436,6 +3436,49 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     }
     if (!targetType) {
+        // §31 / #600 phase c: `e.Message` where `e` is typed as a PURE built-in
+        // exception (declaration==nullptr, no user TypeSymbol — e.g. a caught
+        // `DomainFaultedException e` or `ChannelClosedException e`).  The user-
+        // class branch further below handles `Message` on user classes that
+        // INHERIT from a built-in exception, but that branch needs targetType!=null.
+        // Here targetType IS null (pure built-in), so we match by ast node name
+        // against the known built-in exception set and type the access as `string`.
+        // Codegen reads the message-ptr at byte offset 8 (LlvmBackend_Exprs.cpp
+        // CG22+ handler) — same slot for ALL built-in exception objects.
+        if (ma.target && ma.member == "Message") {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                        tt->astNode && tt->astNode->name &&
+                        !tt->astNode->name->parts.empty()) {
+                    auto beName = [](std::string_view n) -> bool {
+                        return n == "Exception"                 ||
+                               n == "ArgumentException"         ||
+                               n == "ArgumentNullException"     ||
+                               n == "ArithmeticException"       ||
+                               n == "OverflowException"         ||
+                               n == "DivideByZeroException"     ||
+                               n == "InvalidOperationException" ||
+                               n == "DisposedAccessException"   ||
+                               n == "NotImplementedException"   ||
+                               n == "NullReferenceException"    ||
+                               n == "IndexOutOfRangeException"  ||
+                               n == "KeyNotFoundException"      ||
+                               n == "MatchFailureException"     ||
+                               n == "OperationCanceledException"||
+                               n == "TypeInitializationException" ||
+                               n == "FormatException"           ||
+                               n == "StackOverflowException"    ||
+                               n == "ChannelClosedException"    ||  // §30.15 #600c
+                               n == "DomainFaultedException";       // §30.14 #600c
+                    };
+                    if (beName(tt->astNode->name->parts.back())) {
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                        return;
+                    }
+                }
+            }
+        }
         // issue #494 / §29.2 / §29.3: `e.Current` property access where `e` is
         // typed as the builtin IEnumerator<T> or OwnedEnumerator<T> (no sema
         // TypeDecl). Current returns T (the first generic arg). Typing this lets
