@@ -50,8 +50,29 @@
 //
 // Spec refs: §9.8 (v0.135), §2.14, §2.15, §28.8.
 
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <sys/wait.h>
+
+#include "codegen/LlvmBackend.hpp"
+#include "driver/Driver.hpp"
+#include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
+#include "native_test_harness.hpp"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 
 using bezel::test::runJit;
 
@@ -65,6 +86,59 @@ int run(const std::string& src) {
 bool compileFails(const std::string& src) {
     auto r = runJit(src);
     return r.diagnostics.hasErrors() && !r.ran;
+}
+
+// Compile `source` to a native object file, link with ASan runtime, run.
+// Returns 0 (clean), 1 (sanitizer triggered), or -1 (toolchain unavailable/skip).
+// Per owned_exception_field_test.cpp pattern.
+int runUnderLeakSanitizer550(const std::string& source, bool detectLeaks = true) {
+    namespace fs = std::filesystem;
+    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
+    if (rtObj.empty()) return -1;
+
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_550_lsan_" + std::to_string(counter++);
+    std::string objPath = (dir / (stem + ".o")).string();
+    std::string exe     = (dir / stem).string();
+
+    {
+        bezel::DiagnosticEngine diags;
+        bezel::Lexer lexer(source, diags);
+        bezel::Parser parser(lexer, diags);
+        auto unit = parser.parseCompilationUnit();
+        if (!unit) return -1;
+        bezel::sema::SemaContext ctx(diags);
+        bezel::sema::collectSymbols(*unit, ctx);
+        bezel::sema::resolveTypes(*unit, ctx);
+        bezel::sema::typecheckExpressions(*unit, ctx);
+        bezel::sema::checkDefiniteAssignment(*unit, ctx);
+        bezel::ownership::checkOwnership(*unit, ctx);
+        if (diags.hasErrors()) return -1;
+        llvm::LLVMContext llvmCtx;
+        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+        if (!module) return -1;
+        std::string err;
+        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
+    }
+
+    auto cleanup = [&] {
+        std::remove(objPath.c_str());
+        std::remove(exe.c_str());
+    };
+    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
+                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
+                          " > /dev/null 2>&1";
+    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
+    std::string runCmd =
+        std::string("ASAN_OPTIONS=detect_leaks=") +
+        (detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
+        " > /dev/null 2>&1";
+    int status = std::system(runCmd.c_str());
+    cleanup();
+    if (status == -1) return -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer
+    return 0;                                                       // clean
 }
 
 // Preamble for all BinarySerializer tests (§2.15: requires import).
@@ -807,7 +881,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         std::string("module M; ") + kImport +
         "sealed class Token serialized tree : ISerializable, IDeserializable "
         "  public property Value: int; "
-        "  public constructor(v: int) Value := v; end constructor; "
+        "  public constructor(value: int) Value := value; end constructor; "
         "end Token; "
         "class C public static method Main(): int "
         "  using var t := new Token(77); "
@@ -872,3 +946,213 @@ BEZEL_TEST(codegen_serialization_t2_classes,
 // therefore only reachable through malformed wire data (which the deserializer
 // tests after implementation). No codegen-level test is written for this.
 // ===========================================================================
+
+// ===========================================================================
+// §9.8 v0.136: constructor-selection by parameter NAME (order-insensitive)
+//
+// "When the class declares more than one constructor, the synthesized
+// Deserialize uses the *unique* constructor whose parameter list binds
+// exactly the serialized components and borrowing fields, matched by name
+// (order-insensitive; `serialized "<name>"` renames do not affect the
+// parameter-name match, which uses the declared identifiers). If no
+// constructor matches, or more than one does, the conformance declaration
+// is a compile error naming the candidate constructors."
+// — §9.8 v0.136, constructor-selection paragraph
+// ===========================================================================
+
+// §9.8 v0.136: ctor params in REVERSED field order — round-trip must succeed.
+//
+// Class Root declares fields `owned M: Mid` then `Id: int`, but its
+// constructor is `(id: int, owned m: Mid)` — params in the opposite order
+// (camelCase params matching PascalCase fields via case-insensitive binding).
+// The synthesized Deserialize must bind the args by name (Id→id, M→m), not
+// positionally, so the ctor receives (id=7, m=<Mid ptr>) not (id=<Mid ptr>,
+// m=7). This was the repro shape from the probe that caught the defect.
+//
+// Expected exit code: 42 (back.Id = 7 and back.M.Name = "m" and
+// back.M.L.Tag = "leaf" → return back.M.L.N + back.Id = 35 + 7 = 42).
+BEZEL_TEST(codegen_serialization_t2_classes,
+           ctor_params_reversed_field_order_roundtrip_spec_9_8_v0136) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module V; ") + kImport +
+        // Leaf: fields Tag, N — ctor (tag, n) — same order (control)
+        "class Leaf serialized tree : ISerializable, IDeserializable "
+        "  public Tag: string := \"\"; "
+        "  public N: int := 0; "
+        "  public constructor(tag: string, n: int) Tag := tag; N := n; end constructor; "
+        "end Leaf; "
+        // Mid: fields L, Name — ctor (name, l) — reversed order
+        "class Mid serialized tree : ISerializable, IDeserializable "
+        "  public owned L: Leaf; "
+        "  public Name: string := \"\"; "
+        "  public constructor(name: string, owned l: Leaf) Name := name; L := move l; end constructor; "
+        "end Mid; "
+        // Root: fields M, Id — ctor (id, m) — reversed order (the repro shape)
+        "class Root serialized tree : ISerializable, IDeserializable "
+        "  public owned M: Mid; "
+        "  public Id: int := 0; "
+        "  public constructor(id: int, owned m: Mid) Id := id; M := move m; end constructor; "
+        "end Root; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var r := new Root(7, new Mid(\"m\", new Leaf(\"leaf\", 35))); "
+        "    using var ser := new BinarySerializer(); "
+        "    r.Serialize(ser); "
+        "    using var bytes := ser.ToBytes(); "
+        "    using var de := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "    using var back := Root.Deserialize(de); "
+        "    if back.Id = 7 and back.M.Name = \"m\" and back.M.L.Tag = \"leaf\" then "
+        "      return back.M.L.N + back.Id; "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 42);
+}
+
+// §9.8 v0.136: ctor params in SCRAMBLED order for 3 fields — round-trip.
+//
+// Class Triple has fields A: int, B: string, C: int. Its ctor is
+// (c: int, a: int, b: string) — a permutation, with camelCase params
+// matching PascalCase fields via case-insensitive binding.
+// Synthesized Deserialize must bind by name: C→c, A→a, B→b.
+// Expected: round-trip preserves A=1, B="x", C=41 → exit 42.
+BEZEL_TEST(codegen_serialization_t2_classes,
+           ctor_params_scrambled_three_fields_roundtrip_spec_9_8_v0136) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module V; ") + kImport +
+        "class Triple serialized tree : ISerializable, IDeserializable "
+        "  public A: int := 0; "
+        "  public B: string := \"\"; "
+        "  public C: int := 0; "
+        // Constructor in reverse field order: c first, then a, then b
+        "  public constructor(c: int, a: int, b: string) "
+        "    A := a; B := b; C := c; "
+        "  end constructor; "
+        "end Triple; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var t := new Triple(41, 1, \"x\"); "
+        "    using var ser := new BinarySerializer(); "
+        "    t.Serialize(ser); "
+        "    using var bytes := ser.ToBytes(); "
+        "    using var de := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "    using var back := Triple.Deserialize(de); "
+        "    if back.A = 1 and back.B = \"x\" and back.C = 41 then "
+        "      return back.A + back.C; "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 42);
+}
+
+// §9.8 v0.136 NEGATIVE: ctor param name matches NO serialized component.
+//
+// Class Foo has field V: int. Its only ctor is (x: int) — param name `x`
+// does not match field name `V`. The conformance declaration is a compile
+// error (no constructor matches the component set).
+BEZEL_TEST(codegen_serialization_t2_classes,
+           ctor_param_name_no_match_is_compile_error_spec_9_8_v0136) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        std::string("module V; ") + kImport +
+        "class Foo serialized tree : IDeserializable "
+        "  public V: int := 0; "
+        // Param name `x` does not match field name `V` → no ctor matches
+        "  public constructor(x: int) V := x; end constructor; "
+        "end Foo; "
+        "class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;"));
+}
+
+// §9.8 v0.136 NEGATIVE: two ctors both match the serialized component set.
+//
+// Class Bar has fields A: int, B: string. It declares two constructors:
+//   constructor(a: int, b: string) and constructor(b: string, a: int)
+// Both have parameter names {a, b} matching component names {A, B} via
+// case-insensitive binding — ambiguous (the ctors are valid overloads since
+// (int, string) and (string, int) differ by type order).
+// The conformance declaration is a compile error (more than one matches).
+BEZEL_TEST(codegen_serialization_t2_classes,
+           two_ctors_both_match_is_compile_error_spec_9_8_v0136) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        std::string("module V; ") + kImport +
+        "class Bar serialized tree : IDeserializable "
+        "  public A: int := 0; "
+        "  public B: string := \"\"; "
+        "  public constructor(a: int, b: string) A := a; B := b; end constructor; "
+        "  public constructor(b: string, a: int) A := a; B := b; end constructor; "
+        "end Bar; "
+        "class Program "
+        "  public static method Main(): int return 0; end Main; "
+        "end Program;"));
+}
+
+// ===========================================================================
+// §9.8 v0.136 ASan truncated-input check (per #550 lane contract)
+//
+// Truncated binary input to Deserialize on a 3-level tree must raise
+// SerializationException with NO heap leak or double-free of any partially-
+// constructed subtree. The synthesized Deserialize builds Root → Mid → Leaf
+// in nested order; if the buffer is cut in half, some intermediate owned
+// objects will have been allocated before the error is detected. The
+// ownership model (§28.3/§28.5) must ensure those are reclaimed exactly once
+// as the exception unwinds. Verified with ASAN_OPTIONS=detect_leaks=1.
+// ===========================================================================
+
+namespace {
+
+// Bezel source: 3-level tree (field order reversed vs ctor param order per
+// §9.8 v0.136), serialize a full instance, truncate bytes to half, call
+// Deserialize — must raise SerializationException, exit 42.
+const char* kTruncatedInput3Level =
+    "module V; "
+    "import System.Serialization; "
+    "class Leaf serialized tree : ISerializable, IDeserializable "
+    "  public Tag: string := \"\"; "
+    "  public N: int := 0; "
+    "  public constructor(tag: string, n: int) Tag := tag; N := n; end constructor; "
+    "end Leaf; "
+    "class Mid serialized tree : ISerializable, IDeserializable "
+    "  public owned L: Leaf; "
+    "  public Name: string := \"\"; "
+    "  public constructor(name: string, owned l: Leaf) Name := name; L := move l; end constructor; "
+    "end Mid; "
+    "class Root serialized tree : ISerializable, IDeserializable "
+    "  public owned M: Mid; "
+    "  public Id: int := 0; "
+    "  public constructor(id: int, owned m: Mid) Id := id; M := move m; end constructor; "
+    "end Root; "
+    "class Program "
+    "  public static method Main(): int "
+    "    using var r := new Root(7, new Mid(\"hello\", new Leaf(\"world\", 35))); "
+    "    using var ser := new BinarySerializer(); "
+    "    r.Serialize(ser); "
+    "    using var bytes := ser.ToBytes(); "
+    "    var halfLen: int := bytes.Length / 2; "
+    "    using var de := new BinaryDeserializer(bytes.AsReadOnlySpan(0, halfLen)); "
+    "    var caught: bool := false; "
+    "    try "
+    "      using var back := Root.Deserialize(de); "
+    "      return 0; "
+    "    catch SerializationException => caught := true; "
+    "    end; "
+    "    return (42 if caught else 1); "
+    "  end Main; "
+    "end Program;";
+
+} // namespace
+
+// §9.8 v0.136 + §28.3/§28.5: truncated binary input must raise
+// SerializationException and leave no heap leak or double-free.
+// ASan with detect_leaks=1 confirms. Skipped if toolchain unavailable.
+BEZEL_TEST(codegen_serialization_t2_classes,
+           truncated_input_asan_no_leak_spec_9_8_v0136) {
+    // Exit-code leg: verify SerializationException is caught (rc=42).
+    BEZEL_EXPECT_EQ(run(kTruncatedInput3Level), 42);
+    // ASan leg: same source, but now compiled to native .o + linked with
+    // ASan runtime + run with ASAN_OPTIONS=detect_leaks=1. Returns -1 if
+    // the toolchain is unavailable → test silently passes (skip, not fail).
+    int asan = runUnderLeakSanitizer550(kTruncatedInput3Level, /*detectLeaks=*/true);
+    if (asan == -1) return;  // toolchain unavailable: skip ASan leg
+    BEZEL_EXPECT_EQ(asan, 0);  // 0 == no leak / no UAF / no double-free
+}

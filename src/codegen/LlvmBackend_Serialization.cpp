@@ -32,6 +32,17 @@ using namespace bezel::ast;
 // Local helpers
 // ---------------------------------------------------------------------------
 
+// Case-fold a string to lowercase (ASCII only) for constructor-parameter
+// name matching per §9.8 v0.136.  The idiomatic Bezel convention uses
+// PascalCase for field/property declared identifiers and camelCase for
+// constructor parameters; the synthesized-Deserialize constructor-selection
+// match treats these as equivalent by comparing lowercased forms.
+static std::string toLowerAscii(std::string_view sv) {
+    std::string r(sv);
+    for (char& c : r) c = (char)std::tolower((unsigned char)c);
+    return r;
+}
+
 // Test whether a TypeSymbol's base-type list mentions the given name.
 static bool declaresConformance(const TypeSymbol* ts, std::string_view name) {
     if (!ts || !ts->decl) return false;
@@ -1159,6 +1170,23 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         slots[i] = slot;
     }
 
+    // §9.8 / #550 leak-safety: the per-iteration field-name string returned by
+    // bz_binder_read_field_name must be released even when a nested
+    // emitClassDeserialize throws (its emitThrowBuiltin calls emitUnwindDisposals
+    // which sweeps ALL disposeStack_ entries, including this one).
+    // Strategy: keep one `namePtrSlot` alloca (null-initialized) that holds the
+    // current iteration's namePtr.  Register it as a stringRelease disposal so
+    // emitUnwindDisposals automatically calls bz_string_release on it.  On the
+    // normal match/skip path, after the explicit bz_string_release(namePtr), we
+    // null the slot to prevent the disposal from double-releasing.
+    llvm::AllocaInst* namePtrSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
+    if (!disposeStack_.empty()) {
+        Disposal nd{namePtrSlot, nullptr};
+        nd.stringRelease = true;
+        disposeStack_.back().push_back(nd);
+    }
+
     // BeginObject → read field count.
     auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
     llvm::Value* fieldCount = builder_.CreateCall(beginFn, {derPtr}, "cdeser.cnt");
@@ -1181,6 +1209,69 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
 
     auto* readNameFn = declareC("bz_binder_read_field_name", ptrTy(), {ptrTy()});
     llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "cdeser.fname");
+
+    // §9.8 / #550: truncated input — bz_binder_read_field_name returns null.
+    // Dispose any already-allocated owned-class slots, raise SerializationException.
+    {
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            namePtr, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.nfname");
+        auto* errBB  = llvm::BasicBlock::Create(llvm_, "cdeser.trunc", currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "cdeser.cont",  currentFn_);
+        builder_.CreateCondBr(isNull, errBB, contBB);
+
+        builder_.SetInsertPoint(errBB);
+        // Dispose already-filled slots (prevent leaks on truncated-input path).
+        // §28.3/§28.5: owned class ptrs must be disposed; §4.6 string ptrs must
+        // be released (bz_string_release); other value types need no cleanup.
+        auto* voidTy2 = llvm::Type::getVoidTy(llvm_);
+        for (std::size_t ci2 = 0; ci2 < comps.size(); ++ci2) {
+            if (comps[ci2].isSkip || !slots[ci2]) continue;
+            if (!comps[ci2].ty) continue;
+            const auto* ty2 = comps[ci2].ty;
+            // Owned class: Dispose + free.
+            if (ty2->kind == sema::TypeRef::Kind::Named) {
+                const TypeSymbol* cTs = ty2->declaration;
+                if (!cTs || cTs->kind != ast::TypeDeclKind::Class) continue;
+                llvm::Value* p = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.pslot");
+                llvm::Value* nonNull = builder_.CreateICmpNE(
+                    p, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.pnn");
+                auto* dispBB    = llvm::BasicBlock::Create(llvm_, "cdeser.disp",  currentFn_);
+                auto* skipBB2   = llvm::BasicBlock::Create(llvm_, "cdeser.skipt", currentFn_);
+                builder_.CreateCondBr(nonNull, dispBB, skipBB2);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(p);
+                builder_.CreateBr(skipBB2);
+                builder_.SetInsertPoint(skipBB2);
+                continue;
+            }
+            // String: bz_string_release (null-safe per runtime implementation).
+            if (ty2->kind == sema::TypeRef::Kind::Primitive &&
+                ty2->primitive == sema::PrimitiveType::String) {
+                llvm::Value* sp = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.sslot");
+                llvm::Value* nonNull = builder_.CreateICmpNE(
+                    sp, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.snn");
+                auto* relBB  = llvm::BasicBlock::Create(llvm_, "cdeser.srel",  currentFn_);
+                auto* skipBB2 = llvm::BasicBlock::Create(llvm_, "cdeser.sskip", currentFn_);
+                builder_.CreateCondBr(nonNull, relBB, skipBB2);
+                builder_.SetInsertPoint(relBB);
+                auto* relFn2 = declareC("bz_string_release", voidTy2, {ptrTy()});
+                builder_.CreateCall(relFn2, {sp});
+                builder_.CreateBr(skipBB2);
+                builder_.SetInsertPoint(skipBB2);
+                continue;
+            }
+        }
+        // Raise SerializationException (sets bz_exc, unwinds, branches to unwindBB).
+        emitThrowBuiltin("SerializationException");
+        // emitThrowBuiltin branches to unwindBB; add unreachable as fallback.
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateUnreachable();
+
+        builder_.SetInsertPoint(contBB);
+        // Record the live namePtr so emitUnwindDisposals can release it if a
+        // nested deserialization throws before the normal match/skip branch.
+        builder_.CreateStore(namePtr, namePtrSlot);
+    }
 
     auto* cmpFn = declareC("bz_string_compare", i32(),
                            {ptrTy(), i64(), ptrTy(), i64(), i32()});
@@ -1224,6 +1315,8 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
             }
             auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
             builder_.CreateCall(relFn, {namePtr});
+            // Null the slot so the stringRelease disposal doesn't double-release.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
         }
         builder_.CreateBr(afterBB);
 
@@ -1238,6 +1331,8 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         builder_.CreateCall(skipFn, {derPtr});
         auto* relFn  = declareC("bz_string_release", voidTy, {ptrTy()});
         builder_.CreateCall(relFn, {namePtr});
+        // Null the slot so the stringRelease disposal doesn't double-release.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
     }
     builder_.CreateBr(afterBB);
 
@@ -1269,24 +1364,42 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         currentThis_ = savedThis;
     }
 
-    // §9.8 v0.136: find the unique constructor whose parameter count matches
-    // the number of ALL serialized components (skip + non-skip).  Arguments
-    // are passed in component declaration order (positional):
-    //   - non-skip component: the deserialized value from its slot
-    //   - skip component:     default(T) (zero/null — §9.8 "supply default(T)")
+    // §9.8 v0.136: find the unique constructor whose parameter names match
+    // exactly the set of serialized component declared identifiers
+    // (bijection, order-insensitive).  `serialized "<name>"` renames do not
+    // affect the match — which uses declared identifiers only (§9.8 v0.136).
+    // Once found, arguments are passed IN CONSTRUCTOR PARAMETER ORDER, with
+    // each parameter value looked up by its name in the component map.
     //
-    // This positional approach handles the typical Bezel idiom where the ctor
-    // param is a camelCase abbreviation of the PascalCase property (e.g. `v`
-    // for property `Value`, or `x` for property `X`) — no name correspondence
-    // is assumed; only the COUNT and ORDER are used.
+    // Build a map from lowercased component declName → component index.
+    // §9.8 v0.136: the match is case-insensitive: the Bezel convention uses
+    // PascalCase for field/property declared identifiers and camelCase for
+    // constructor parameters.  The spec says "matched by name" using declared
+    // identifiers, and the idiomatic convention means `id` binds `Id`, `m`
+    // binds `M`, etc.  We normalise to lowercase for the map key so that
+    // `tag` and `Tag` resolve to the same component.
+    std::unordered_map<std::string, std::size_t> compByNameLower;
+    for (std::size_t ci = 0; ci < comps.size(); ++ci)
+        compByNameLower[toLowerAscii(comps[ci].declName)] = ci;
+
     sema::ConstructorSymbol* matchedCtor = nullptr;
     for (Symbol* m : ts->members) {
         auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
         if (!cs || cs->isStatic) continue;
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) continue;
-        // Match: param count must equal total component count.
-        if (cd->params.size() == comps.size()) {
+        // Match: param count == component count AND every param name (lowered)
+        // maps to a distinct component (bijection).
+        if (cd->params.size() != comps.size()) continue;
+        bool allMatch = true;
+        for (const auto& p : cd->params) {
+            if (compByNameLower.find(toLowerAscii(p.name)) ==
+                    compByNameLower.end()) {
+                allMatch = false;
+                break;
+            }
+        }
+        if (allMatch) {
             matchedCtor = cs;
             break;
         }
@@ -1296,16 +1409,22 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(matchedCtor->decl);
         auto it  = ctorFns_.find(matchedCtor);
         if (it != ctorFns_.end() && cd) {
-            // Build the argument list in component declaration order (= ctor param
-            // order under the positional convention).
-            // Non-skip components: supply the deserialized value from the slot.
-            // Skip components: supply default(T) (zero/null).
+            // Build the argument list IN CONSTRUCTOR PARAMETER ORDER.
+            // For each ctor param, look up the corresponding component by
+            // lowercased param name (case-insensitive match to component
+            // declName).  Non-skip component → deserialized value from slot.
+            // Skip component → default(T) (zero/null).
             std::vector<llvm::Value*> args;
             args.push_back(obj);  // `this`
 
             auto* fnTy = it->second->getFunctionType();
             bool  ok   = true;
-            for (std::size_t ci = 0; ci < comps.size(); ++ci) {
+            for (std::size_t pi = 0; pi < cd->params.size(); ++pi) {
+                // Find the component for this parameter by lowercased name.
+                auto cit = compByNameLower.find(
+                    toLowerAscii(cd->params[pi].name));
+                if (cit == compByNameLower.end()) { ok = false; break; }
+                std::size_t ci = cit->second;
                 if (!comps[ci].ty) { ok = false; break; }
                 llvm::Type* lt = lowerTypeRef(comps[ci].ty);
                 if (!lt) { ok = false; break; }
@@ -1316,9 +1435,9 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 } else {
                     fv = builder_.CreateLoad(lt, slots[ci], "cdeser.arg");
                 }
-                // Coerce to ctor param type if needed.
-                if (ci + 1 < fnTy->getNumParams())
-                    fv = coerceNumericToType(fv, fnTy->getParamType(ci + 1), false);
+                // Coerce to ctor param LLVM type if needed.
+                if (pi + 1 < fnTy->getNumParams())
+                    fv = coerceNumericToType(fv, fnTy->getParamType(pi + 1), false);
                 args.push_back(fv);
             }
             if (ok && args.size() == it->second->arg_size()) {
@@ -1354,9 +1473,10 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
         // Serialize/Deserialize bodies; the concrete object is always a
         // BinarySerializer* / BinaryDeserializer* at runtime).
         if (rcn == "ISerializer" || rcn == "IDeserializer") return true;
-        // OwnedBuffer<byte>.AsReadOnlySpan() / AsSpan() / .Count.
+        // OwnedBuffer<byte>.AsReadOnlySpan() / AsSpan() (all overloads) / .Count.
         if ((rcn == "OwnedBuffer" || rcn == "Array") &&
-            (mn == "AsReadOnlySpan" || mn == "AsSpan" || mn == "Count")) {
+            (mn == "AsReadOnlySpan" || mn == "AsSpan" || mn == "Count" ||
+             mn == "Length")) {
             bool isByte = !recvTy->genericArgs.empty() &&
                 recvTy->genericArgs[0] &&
                 recvTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
@@ -1574,33 +1694,54 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
             return nullptr;
         }
 
-        // OwnedBuffer<byte>.AsReadOnlySpan() → span {ptr, 0, count}
+        // OwnedBuffer<byte>.AsReadOnlySpan/AsSpan (0/1/2-arg) and .Length / .Count
         if (rcn == "OwnedBuffer" || rcn == "Array") {
-            bool isOwnedBuffer = (rcn == "OwnedBuffer");
-            // Only intercept .AsReadOnlySpan() and .AsSpan() on byte buffers.
+            // Only intercept AsReadOnlySpan/AsSpan/Length/Count on byte buffers.
             bool isByteBuffer = !recvTy->genericArgs.empty() &&
                 recvTy->genericArgs[0] &&
                 recvTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
                 recvTy->genericArgs[0]->primitive == sema::PrimitiveType::Byte;
-            if (isByteBuffer && call.args.empty()) {
-                if (methodName == "AsReadOnlySpan" || methodName == "AsSpan") {
-                    llvm::Value* arr = lowerExpr(*ma->target);
-                    if (!arr) return nullptr;
-                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-                    llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
-                    llvm::Value* count   = builder_.CreateTrunc(count64, i32(), "ob.cnt32");
+            if (isByteBuffer &&
+                (methodName == "AsReadOnlySpan" || methodName == "AsSpan")) {
+                llvm::Value* arr = lowerExpr(*ma->target);
+                if (!arr) return nullptr;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
+                llvm::Value* count   = builder_.CreateTrunc(count64, i32(), "ob.cnt32");
+                // 0-arg: full buffer [0, count)
+                if (call.args.empty()) {
                     return buildArraySpan(arr, builder_.getInt32(0), count);
                 }
-                if (methodName == "Count") {
-                    // OwnedBuffer<byte>.Count → bz_array_len → i32
-                    llvm::Value* arr = lowerExpr(*ma->target);
-                    if (!arr) return nullptr;
-                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-                    llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
-                    return builder_.CreateTrunc(count64, i32(), "ob.cnt32");
+                // (start): [start, count)
+                if (call.args.size() == 1 && call.args[0].value) {
+                    llvm::Value* start = lowerExpr(*call.args[0].value);
+                    if (!start) return nullptr;
+                    if (!start->getType()->isIntegerTy(32))
+                        start = builder_.CreateSExtOrTrunc(start, i32());
+                    llvm::Value* len = builder_.CreateSub(count, start, "ob.slen");
+                    return buildArraySpan(arr, start, len);
+                }
+                // (start, length): [start, start+length)
+                if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+                    llvm::Value* start = lowerExpr(*call.args[0].value);
+                    llvm::Value* len   = lowerExpr(*call.args[1].value);
+                    if (!start || !len) return nullptr;
+                    if (!start->getType()->isIntegerTy(32))
+                        start = builder_.CreateSExtOrTrunc(start, i32());
+                    if (!len->getType()->isIntegerTy(32))
+                        len = builder_.CreateSExtOrTrunc(len, i32());
+                    return buildArraySpan(arr, start, len);
                 }
             }
-            (void)isOwnedBuffer;
+            if (isByteBuffer &&
+                (methodName == "Count" || methodName == "Length")) {
+                // OwnedBuffer<byte>.Count / .Length → bz_array_len → i32
+                llvm::Value* arr = lowerExpr(*ma->target);
+                if (!arr) return nullptr;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
+                return builder_.CreateTrunc(count64, i32(), "ob.cnt32");
+            }
         }
     }
 

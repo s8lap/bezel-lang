@@ -2,6 +2,8 @@
 
 #include "sema/TypeResolution.hpp"
 
+#include <cctype>
+
 namespace bezel::sema {
 
 // Free-function wrapper exposing the resolver's structural type equality
@@ -2427,6 +2429,135 @@ void Resolver::checkSerializationEligibility() {
                             "fields from constructor parameters and own value "
                             "fields (§9.8, rule 2)");
                         break;
+                    }
+                }
+            }
+
+            // §9.8 v0.136 constructor-selection check (applies when synthesis of
+            // Deserialize is needed — i.e. !hwD2).
+            // Rule: there must be exactly one non-static constructor whose
+            // parameter names match exactly the set of serialized component
+            // declared identifiers (bijection, order-insensitive, case-
+            // insensitive).  `serialized "<name>"` renames do NOT affect the
+            // match — which uses declared identifiers only (§9.8 v0.136).
+            // Case-insensitivity: Bezel convention is PascalCase fields and
+            // camelCase parameters; `id` and `Id` are treated as the same
+            // component name in the synthesized-Deserialize match.
+            if (!hwD2) {
+                // Helper: fold to lowercase (ASCII).
+                auto toLower = [](std::string_view sv) {
+                    std::string r(sv);
+                    for (char& c : r)
+                        c = (char)std::tolower((unsigned char)c);
+                    return r;
+                };
+
+                // Collect the lowercased declared identifiers of ALL serialized
+                // components — including `serialized skip` ones.  Skip
+                // components are still passed to the constructor as default(T),
+                // so they count toward the parameter-name match.  What `skip`
+                // means is only that the value is not read/written on the wire;
+                // the param name must still appear in the ctor (§9.8 v0.136).
+                // For field members: FieldDecl.name (non-static).
+                // For auto-property members: the member name (all, skip or not).
+                std::unordered_set<std::string> compNamesLower;
+                std::vector<std::string> compNamesOrig;  // for error message
+                for (const Symbol* m : t->members) {
+                    auto* fs = dynamic_cast<const FieldSymbol*>(m);
+                    if (fs) {
+                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                        if (!fd) continue;
+                        bool isStat = false;
+                        for (auto mod : fd->modifiers)
+                            if (mod == "static") { isStat = true; break; }
+                        if (isStat) continue;
+                        compNamesLower.insert(toLower(fd->name));
+                        compNamesOrig.push_back(std::string(fd->name));
+                        continue;
+                    }
+                    if (!isAutoPropertySymbol(m)) continue;
+                    auto* ps = dynamic_cast<const PropertySymbol*>(m);
+                    if (!ps) continue;
+                    // Include skip-marked auto-properties: skip means "don't
+                    // serialize" but the component still appears in the ctor.
+                    compNamesLower.insert(toLower(m->name));
+                    compNamesOrig.push_back(std::string(m->name));
+                }
+
+                // Collect non-static constructors and check which ones match.
+                std::vector<std::string> matchingCtors;  // for error message
+                std::vector<std::string> allCtors;
+                for (const Symbol* m : t->members) {
+                    auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic) continue;
+                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                    if (!cd) continue;
+
+                    // Build a string representation for the error message.
+                    std::string ctorDesc = "constructor(";
+                    for (unsigned pi = 0; pi < cd->params.size(); ++pi) {
+                        if (pi) ctorDesc += ", ";
+                        ctorDesc += std::string(cd->params[pi].name);
+                    }
+                    ctorDesc += ")";
+                    allCtors.push_back(ctorDesc);
+
+                    // Match: param count == component count AND every param
+                    // name (lowercased) appears in compNamesLower (bijection).
+                    if (cd->params.size() != compNamesLower.size()) continue;
+                    bool allMatch = true;
+                    for (const auto& p : cd->params) {
+                        if (compNamesLower.find(toLower(p.name)) ==
+                                compNamesLower.end()) {
+                            allMatch = false;
+                            break;
+                        }
+                    }
+                    if (allMatch) matchingCtors.push_back(ctorDesc);
+                }
+
+                if (matchingCtors.size() != 1) {
+                    // Build candidate list for the error message.
+                    std::string candidates;
+                    const auto& list = allCtors.empty() ? matchingCtors : allCtors;
+                    for (const auto& c : list) {
+                        if (!candidates.empty()) candidates += ", ";
+                        candidates += c;
+                    }
+                    if (candidates.empty()) candidates = "(none)";
+                    // Build component-set string for the error message.
+                    std::string compSet;
+                    for (const auto& n : compNamesOrig) {
+                        if (!compSet.empty()) compSet += ", ";
+                        compSet += n;
+                    }
+                    if (matchingCtors.size() == 0) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` declares "
+                            "`IDeserializable` (`serialized " +
+                            std::string(scc.shape) +
+                            "`): no constructor has parameter names matching "
+                            "the serialized component set {" + compSet +
+                            "} — candidates: " + candidates +
+                            " (§9.8 v0.136: constructor selection is by name, "
+                            "case-insensitive, order-insensitive)");
+                    } else {
+                        // >1 match
+                        std::string matchList;
+                        for (const auto& c : matchingCtors) {
+                            if (!matchList.empty()) matchList += ", ";
+                            matchList += c;
+                        }
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` declares "
+                            "`IDeserializable` (`serialized " +
+                            std::string(scc.shape) +
+                            "`): more than one constructor matches the serialized "
+                            "component set — ambiguous: " + matchList +
+                            " (§9.8 v0.136: the unique matching constructor is "
+                            "required)");
                     }
                 }
             }
