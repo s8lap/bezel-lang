@@ -10586,6 +10586,9 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             }
 
             // Send(owned item): transfer ownership of item into the channel.
+            // per fix #634 / §30.15: bz_channel_send now takes cce_vtable and
+            // stores a ChannelClosedException in bz_exc when the channel is
+            // closed; emitPendingCheck() unwinds on that path.
             if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
@@ -10607,9 +10610,10 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 }
                 auto* fn = declareC("bz_channel_send",
                                     llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {ch, itemArg});
-                return nullptr;  // void
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ch, itemArg, getCCEVtable()});
+                emitPendingCheck();  // per fix #634: bz_channel_send sets bz_exc on closed channel
+                return nullptr;  // void — handled; fallthrough is benign (no symbol match)
             }
 
             // Receive(): returns a Task<T> or OwnedTask<T>.
@@ -10701,6 +10705,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             if (!tx) return nullptr;
 
             // Send(owned item): transfer ownership into the channel.
+            // per fix #634 / §30.15: bz_channel_sender_send now takes cce_vtable
+            // and signals ChannelClosedException via bz_exc when closed.
             if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
@@ -10717,8 +10723,9 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 }
                 auto* fn = declareC("bz_channel_sender_send",
                                     llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {tx, itemArg});
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {tx, itemArg, getCCEVtable()});
+                emitPendingCheck();  // per fix #634: signals ChannelClosedException via bz_exc
                 return nullptr;
             }
 

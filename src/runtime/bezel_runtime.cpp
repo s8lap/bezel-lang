@@ -5647,6 +5647,21 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
 
 // ---------------------------------------------------------------------------
 // bz_channel_t -- MPSC channel (§30.15)
+//
+// Lifetime via reference counting (fix #634 — UAF in bz_channel_dispose):
+//
+//   Every C++ holder that can dereference a bz_channel_t* acquires +1 on
+//   core_refs and releases -1 when done; the last release (core_refs → 0)
+//   deletes the channel core.
+//
+//   Holders and their acquire / release sites (per fix #634):
+//     - Channel object: bz_channel_new acquires +1 (starts at 1);
+//       bz_channel_dispose releases -1 after closing+draining items.
+//     - ChannelSender handle: bz_channel_new_sender acquires +1;
+//       bz_channel_sender_release releases -1 after closing/draining.
+//
+//   This prevents bz_channel_dispose from deleting the core while live
+//   sender handles still hold a bz_channel_t* (the UAF root cause).
 // ---------------------------------------------------------------------------
 
 struct bz_pending_receiver_t {
@@ -5662,11 +5677,30 @@ struct bz_channel_t {
     int64_t  sender_count;
     bool     closed;
     bool     disposed;
+    // per fix #634: refcount — Channel object holds +1, each sender holds +1;
+    // last release (core_refs == 1 → 0) deletes.
+    std::atomic<int> core_refs{1};
 };
 
 // Forward declaration
 static void channel_close_and_drain_pending(bz_channel_t* ch,
                                             void* cce_vtable);
+
+// ---------------------------------------------------------------------------
+// channel_core_ref / channel_core_release — refcount helpers (fix #634)
+// ---------------------------------------------------------------------------
+
+// Acquire a reference to a channel core.  per fix #634.
+static void channel_core_ref(bz_channel_t* ch) {
+    ch->core_refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Release a reference.  per fix #634.
+// When the count reaches 0, delete the channel core.
+static void channel_core_release(bz_channel_t* ch) {
+    if (ch->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete ch;
+}
 
 extern "C"
 void* bz_channel_new(void (*dispose_elem)(void*)) {
@@ -5676,6 +5710,7 @@ void* bz_channel_new(void (*dispose_elem)(void*)) {
     ch->sender_count   = 0;
     ch->closed         = false;
     ch->disposed       = false;
+    // core_refs starts at 1 (the Channel object's ref); per fix #634.
     return ch;
 }
 
@@ -5692,6 +5727,7 @@ void* bz_channel_new_sender(void* chp) {
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         ch->sender_count++;
     }
+    channel_core_ref(ch);  // per fix #634: sender holds a core ref
     auto* tx = new bz_channel_sender_t{ch};
     return tx;
 }
@@ -5699,16 +5735,32 @@ void* bz_channel_new_sender(void* chp) {
 // bz_channel_send: append item to channel; if a pending receiver exists,
 // complete it immediately with the item (via the receiver's domain queue).
 // Per §30.15: Send transfers ownership of the item.
+// Per fix #634 / §30.15: if the channel is closed or disposed, dispose the
+// item, build a ChannelClosedException object into bz_exc, and return.
+// The codegen caller must call emitPendingCheck() after every Send call.
 extern "C"
-void bz_channel_send(void* chp, void* item) {
+void bz_channel_send(void* chp, void* item, void* cce_vtable) {
     auto* ch = (bz_channel_t*)chp;
     bz_pending_receiver_t recv{nullptr, nullptr};
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         if (ch->closed || ch->disposed) {
-            // Should not happen in a correct program (sema enforces no send
-            // after close). Safe fallback: dispose the item and return.
+            // §30.15 / fix #634: send after close raises ChannelClosedException.
+            // Dispose the item first (ownership was transferred to us).
             if (item && ch->dispose_elem)
                 ch->dispose_elem(item);
+            else if (item && !ch->dispose_elem) {
+                // Value/string item: string refs need releasing; value scalars
+                // are stored as inttoptr and must not be freed via free().
+                // The dispose_elem==null policy means no deep disposal needed
+                // (mirrors bz_channel_dispose item drain for value types).
+            }
+            // Build a ChannelClosedException object and store in bz_exc.
+            if (cce_vtable) {
+                void* excObj = calloc(1, 16);
+                memcpy(excObj, &cce_vtable, sizeof(void*));
+                extern void* bz_exc;
+                bz_exc = excObj;
+            }
             return;
         }
         if (!ch->pending.empty()) {
@@ -5728,10 +5780,13 @@ void bz_channel_send(void* chp, void* item) {
 }
 
 // bz_channel_sender_send: convenience wrapper used by codegen for ChannelSender.Send.
+// per fix #634: passes cce_vtable through to bz_channel_send so closed-channel
+// sends raise ChannelClosedException (stored in bz_exc; codegen checks via
+// emitPendingCheck after the call).
 extern "C"
-void bz_channel_sender_send(void* txp, void* item) {
+void bz_channel_sender_send(void* txp, void* item, void* cce_vtable) {
     auto* tx = (bz_channel_sender_t*)txp;
-    bz_channel_send(tx->ch, item);
+    bz_channel_send(tx->ch, item, cce_vtable);
 }
 
 // bz_channel_receive: return a task that will complete with the next item.
@@ -5831,6 +5886,8 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
 
 // bz_channel_sender_release: release one sender handle. If this was the last
 // sender, close the channel. cce_vtable is the ChannelClosedException vtable.
+// per fix #634: also drops the sender's core_refs reference so the channel
+// core can be freed when Channel.Dispose has already run.
 extern "C"
 void bz_channel_sender_release(void* txp, void* cce_vtable) {
     if (!txp) return;
@@ -5846,12 +5903,18 @@ void bz_channel_sender_release(void* txp, void* cce_vtable) {
     }
     if (last_sender)
         channel_close_and_drain_pending(ch, cce_vtable);
+    // per fix #634: release sender's core ref; frees core when Channel.Dispose
+    // already dropped its ref and this was the last outstanding sender.
+    channel_core_release(ch);
 }
 
 // bz_channel_dispose: §30.15 §28.11 dispose -- close the channel and dispose
 // any buffered (undelivered) items in REVERSE insertion order (§28.11 owned
-// column; per §28.11 v0.135 ordered-disposal-of-owned row). Then free the
-// channel object. cce_vtable is passed to close pending receivers.
+// column; per §28.11 v0.135 ordered-disposal-of-owned row). Then drop the
+// Channel object's core ref (fix #634: does NOT directly delete — the core
+// is freed by channel_core_release when the last ref drops, which may be
+// here or when the last ChannelSender releases).
+// cce_vtable is passed to close pending receivers.
 extern "C"
 void bz_channel_dispose(void* chp, void* cce_vtable) {
     if (!chp) return;
@@ -5871,7 +5934,10 @@ void bz_channel_dispose(void* chp, void* cce_vtable) {
             ch->items.clear();
         }
     }
-    delete ch;
+    // per fix #634: drop the Channel object's core ref; if no senders are
+    // alive this is the last ref and the core is freed here.  If senders are
+    // still alive their refs keep the core alive until they release.
+    channel_core_release(ch);
 }
 
 // ---------------------------------------------------------------------------

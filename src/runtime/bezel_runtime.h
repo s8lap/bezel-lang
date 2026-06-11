@@ -1058,10 +1058,15 @@ void* bz_channel_new(void (*dispose_elem)(void*));
 void* bz_channel_new_sender(void* ch);
 
 // Send one item (via the channel pointer directly). Item ownership transfers.
-void bz_channel_send(void* ch, void* item);
+// Per fix #634 / §30.15: if the channel is already closed or disposed, disposes
+// the item and stores a ChannelClosedException in bz_exc (cce_vtable supplies
+// the vtable; may be null for best-effort). Codegen emits emitPendingCheck()
+// after every Call to this function.
+void bz_channel_send(void* ch, void* item, void* cce_vtable);
 
 // Send one item via a ChannelSender handle.
-void bz_channel_sender_send(void* tx, void* item);
+// Per fix #634: also signals ChannelClosedException via bz_exc when closed.
+void bz_channel_sender_send(void* tx, void* item, void* cce_vtable);
 
 // Receive one item asynchronously. Returns a bz_task_t* (already-done if
 // an item is buffered; pending if empty+open; faulted with ChannelClosedException
