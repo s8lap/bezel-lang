@@ -403,7 +403,10 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §30.14/§30.15 (#600 phase c): Channel<T> and ChannelSender<T>
                     // are compiler-known heap-pointer builtins (bz_channel_t* and
                     // bz_channel_sender_t* respectively). Both lower to ptrTy().
-                    n == "Channel" || n == "ChannelSender") {
+                    n == "Channel" || n == "ChannelSender" ||
+                    // stdlib §5 (#651): IGrouping<TKey, T> is a compiler-known
+                    // pointer (bz_grouping_t*) produced by GroupBy(...).ToArray().
+                    n == "IGrouping") {
                     return ptrTy();
                 }
             }
@@ -467,7 +470,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // astNode path above).
                     n == "Shared" || n == "Weak" ||
                     // §30.14/§30.15 (#600 phase c): imported Channel<T>/ChannelSender<T>.
-                    n == "Channel" || n == "ChannelSender") {
+                    n == "Channel" || n == "ChannelSender" ||
+                    // stdlib §5 (#651): imported IGrouping<TKey, T>.
+                    n == "IGrouping") {
                     return ptrTy();
                 }
             }

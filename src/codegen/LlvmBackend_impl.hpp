@@ -625,6 +625,8 @@ private:
     // callbacks for OwnedArray<Shared<T>> / OwnedArray<Weak<T>>.
     llvm::Function* sharedReleaseThunk_ = nullptr;
     llvm::Function* weakReleaseThunk_ = nullptr;
+    // stdlib §5 (#651): bz_grouping_free thunk for Array<IGrouping> disposal.
+    llvm::Function* groupingFreeThunk_ = nullptr;
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
     // lazily) for a borrowing Array<string>'s co-owned string elements.
     llvm::Function* stringElementReleaseThunk_ = nullptr;
@@ -2585,6 +2587,7 @@ private:
     llvm::Function* elementDisposerThunk();
     llvm::Function* sharedReleaseThunk();
     llvm::Function* weakReleaseThunk();
+    llvm::Function* groupingFreeThunk(); // stdlib §5 (#651): IGrouping disposal
 
     // #429 / §4.6 / §28.9: a module-level `void(void*)` thunk that calls
     // bz_string_release on the element (the slot holds a bz_string*). Used as the
@@ -4374,6 +4377,9 @@ private:
             // are compiler-known pointer-typed builtins backed by bz_channel_t
             // and bz_channel_sender_t respectively.
             "Channel", "ChannelSender",
+            // stdlib §5 (#651): IGrouping<TKey, T> is a compiler-known pointer
+            // (bz_grouping_t*) produced by GroupBy.
+            "IGrouping",
         };
         if (kBuiltins.count(name)) return true;
         // §31.4: a built-in exception type (Exception / a subtype).

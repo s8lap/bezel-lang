@@ -3558,6 +3558,113 @@ extern "C" void* bz_lazy_from_llist(void* llist, int64_t esz) {
     return e;
 }
 
+// ---------------------------------------------------------------------------
+// §5 (#651): GroupBy — bz_grouping_t wraps one group's key + element array.
+// bz_groupby_to_array(lazy, val_esz, key_esz, key_fn, closure) materializes
+// the source pipeline and groups elements by key, using memcmp for key equality
+// (value-type keys of known byte size).  Returns a bz_array_t* of
+// bz_grouping_t* pointers (each pointer is one group's heap object).
+//
+// The key function has the same `bz_sel_fn` signature as Select's selector:
+//   void key_fn(void* closure, const void* elem, void* key_out)
+// It writes `key_esz` bytes of the computed key into `key_out`.
+//
+// bz_grouping_count(g): number of elements in group g.
+// bz_grouping_key(g, out): copies the key bytes into `out`.
+// bz_grouping_elements(g): returns the bz_array_t* for indexed access.
+// bz_grouping_free(g): disposes the element array and frees the group object.
+// ---------------------------------------------------------------------------
+struct bz_grouping_t {
+    void*    elements;  // bz_array_t*
+    int64_t  key_esz;
+    void*    key_data;  // malloc'd key_esz bytes
+};
+
+static bz_grouping_t* bz_grouping_alloc(int64_t val_esz, int64_t key_esz,
+                                         const void* key) {
+    auto* g = (bz_grouping_t*)calloc(1, sizeof(bz_grouping_t));
+    g->elements = bz_array_alloc(val_esz, 4);
+    g->key_esz  = key_esz;
+    g->key_data = malloc((size_t)key_esz);
+    memcpy(g->key_data, key, (size_t)key_esz);
+    return g;
+}
+
+extern "C" int64_t bz_grouping_count(void* grp) {
+    if (!grp) return 0;
+    return bz_array_len(((bz_grouping_t*)grp)->elements);
+}
+
+// Copy the key bytes into `out` (caller allocates `key_esz` bytes).
+extern "C" void bz_grouping_key(void* grp, void* out) {
+    if (!grp || !out) return;
+    auto* g = (bz_grouping_t*)grp;
+    memcpy(out, g->key_data, (size_t)g->key_esz);
+}
+
+// Returns the bz_array_t* of elements so the caller can index into it.
+extern "C" void* bz_grouping_elements(void* grp) {
+    return grp ? ((bz_grouping_t*)grp)->elements : nullptr;
+}
+
+extern "C" void bz_grouping_free(void* grp) {
+    if (!grp) return;
+    auto* g = (bz_grouping_t*)grp;
+    bz_array_free(g->elements, nullptr);
+    free(g->key_data);
+    free(g);
+}
+
+// bz_groupby_to_array: materialize a lazy source, group by key, return an
+// Array<bz_grouping_t*>.  Caller owns the returned array and each grouping
+// inside it; call bz_groupby_free_groups to release all groupings, then
+// bz_array_free for the outer array.
+extern "C" void* bz_groupby_to_array(void* lazy, int64_t val_esz,
+                                      int64_t key_esz,
+                                      void* closure, void* key_fn_ptr) {
+    typedef void (*key_fn_t)(void*, const void*, void*);
+    auto  key_fn = (key_fn_t)key_fn_ptr;
+    auto* e = (bz_lazy_t*)lazy;
+    // Outer array holds bz_grouping_t* pointers.
+    void* groups = bz_array_alloc(sizeof(void*), 4);
+    void* key_buf = malloc((size_t)key_esz);
+    // Closure over the groups array to find/create a group by key.
+    auto find_or_create = [&](const void* key) -> bz_grouping_t* {
+        auto* garr = (bz_array_t*)groups;
+        for (int64_t i = 0; i < garr->count; ++i) {
+            void** slot = (void**)((char*)garr->data + i * sizeof(void*));
+            auto* g = (bz_grouping_t*)(*slot);
+            if (memcmp(g->key_data, key, (size_t)key_esz) == 0) return g;
+        }
+        auto* g = bz_grouping_alloc(val_esz, key_esz, key);
+        bz_array_add(groups, &g, sizeof(void*));
+        return g;
+    };
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    while (((mn_t)vt[2])(e)) {
+        const void* elem = ((cur_t)vt[3])(e);
+        key_fn(closure, elem, key_buf);
+        bz_grouping_t* g = find_or_create(key_buf);
+        bz_array_add(g->elements, elem, val_esz);
+    }
+    bz_lazy_dispose(e);
+    free(key_buf);
+    return groups;
+}
+
+// Release all groupings inside a groups array (produced by bz_groupby_to_array).
+// After this call, the outer array itself must be freed with bz_array_free(...,null).
+extern "C" void bz_groupby_free_groups(void* groups_arr) {
+    auto* garr = (bz_array_t*)groups_arr;
+    if (!garr) return;
+    for (int64_t i = 0; i < garr->count; ++i) {
+        void** slot = (void**)((char*)garr->data + i * sizeof(void*));
+        bz_grouping_free(*slot);
+    }
+}
+
 extern "C" void* bz_lazy_where(void* up, void* closure, void* pred) {
     auto* u = (bz_lazy_t*)up;
     auto* e = bz_lazy_new(BZ_LAZY_WHERE, u->esz);

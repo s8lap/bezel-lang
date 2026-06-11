@@ -90,6 +90,27 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         auto n = t->astNode->name->parts[0];
         return n == "Shared" || n == "Weak";
     };
+    // stdlib §5 (#651): IGrouping<TKey, T> elements are bz_grouping_t* pointers
+    // owned by the Array<IGrouping> produced by GroupBy(...).ToArray(). They need
+    // a disposer thunk that calls bz_grouping_free(ptr) to release the element
+    // array and key data. Always treated as owned (GroupBy produces fresh groups).
+    auto isIGroupingElem = [](const sema::TypeRef* t) {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+        if (t->declaration) return false;
+        if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+            return false;
+        return t->astNode->name->parts[0] == "IGrouping";
+    };
+    if (isIGroupingElem(elemTy)) {
+        // Use the cached groupingFreeThunk() (built once per module,
+        // null-checked, same pattern as sharedReleaseThunk).
+        return ElementPolicy{
+            ElementPolicy::Category::ClassOwned,
+            ptrTy(),
+            groupingFreeThunk(),
+            /*retainRelease=*/false
+        };
+    }
     bool isSharedWeakElem = isSharedOrWeak(elemTy);
     // Distinguish Shared vs Weak for per-element release thunk selection.
     auto isWeakElem = [](const sema::TypeRef* t) {
