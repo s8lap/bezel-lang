@@ -117,22 +117,24 @@ end C;
 }
 
 // ===========================================================================
-// (2) §29.6: yield inside try-with-only-finally with consumer break.
-//     The consumer reads only the first yielded value then breaks.
-//     The iterator must compile and produce the correct first value.
-//     (Early-disposal finally execution is a future increment per §29.7;
-//      this test only verifies the produced value, not finallyRan.)
-//     Expected exit code: 1.
+// (2) §29.6 / §29.7: yield inside try-with-only-finally with consumer break.
+//     The consumer reads only the first yielded value then breaks. Per §29.7
+//     the iterator's Dispose runs all finally clauses active at the suspension
+//     point before freeing the frame. The finally must execute exactly once.
+//     Expected exit code: 1 (got=1 and finallyRan==1).
 // ===========================================================================
 BEZEL_TEST(async_iter_try_finally_554, yield_in_try_finally_early_break) {
     BEZEL_EXPECT_EQ(compileAndRun(R"(
 module M;
 class C
+  public static finallyRan: int := 0;
+
   public async static method Gen(): IAsyncEnumerable<int>
     try
       yield return 1;
       yield return 2;
     finally
+      C.finallyRan := C.finallyRan + 1;
     end;
   end Gen;
 
@@ -142,6 +144,7 @@ class C
       got := x;
       break;
     end;
+    if C.finallyRan <> 1 then return 99; end;
     return got;
   end Main;
 end C;
@@ -360,4 +363,196 @@ class C
   end Main;
 end C;
 )"), true);
+}
+
+// ===========================================================================
+// (10) §30.7 / §30.9: await in try body, exception from awaited task caught by
+//      the iterator's own catch arm (no yield inside the try/catch — §29.6).
+//      MayFail(true) throws InvalidOperationException; the catch arm sets x=5
+//      and the iterator yields 5 outside the try/catch block.
+//      Expected exit code: 5 (sum=5, caught==1).
+// ===========================================================================
+BEZEL_TEST(async_iter_try_finally_554, await_in_try_with_catch_exception_caught) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static caught: int := 0;
+
+  public static async method MayFail(shouldFail: bool): Task<int>
+    if shouldFail then
+      throw new InvalidOperationException("fail");
+    end;
+    return 42;
+  end MayFail;
+
+  public async static method Gen(): IAsyncEnumerable<int>
+    var x: int := 0;
+    try
+      x := await MayFail(true);
+    catch
+      var ex: InvalidOperationException => do
+        C.caught := C.caught + 1;
+        x := 5;
+      end
+    end;
+    yield return x;
+  end Gen;
+
+  public static async method Main(): Task<int>
+    var sum := 0;
+    await for var v in Gen() do
+      sum := sum + v;
+    end;
+    if C.caught <> 1 then return 99; end;
+    return sum;
+  end Main;
+end C;
+)"), 5);
+}
+
+// ===========================================================================
+// (11) §29.7: throw before first yield — finally runs, exception propagates.
+//      The iterator throws before yielding anything; the consuming `await for`
+//      sees the exception; the outer catch in Main captures it; finallyRan==1.
+//      Expected exit code: 9 (sum=0 + 9 sentinel from exception catch).
+// ===========================================================================
+BEZEL_TEST(async_iter_try_finally_554, throw_before_first_yield_finally_runs) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static finallyRan: int := 0;
+
+  public async static method Gen(): IAsyncEnumerable<int>
+    try
+      throw new Exception("before yield");
+      yield return 1;
+    finally
+      C.finallyRan := C.finallyRan + 1;
+    end;
+  end Gen;
+
+  public static async method Main(): Task<int>
+    var sum := 0;
+    try
+      await for var x in Gen() do
+        sum := sum + x;
+      end;
+    catch
+      var ex: Exception => sum := sum + 9;
+    end;
+    if C.finallyRan <> 1 then return 99; end;
+    return sum;
+  end Main;
+end C;
+)"), 9);
+}
+
+// ===========================================================================
+// (12) §29.6 / §29.7: multiple sequential try/finally blocks in an async
+//      iterator — each finally runs exactly once on normal completion.
+//      Gen yields 1 (try1) then 2 (try2); cleanups: 1 (try1 finally) + 10
+//      (try2 finally) = 11.  Expected exit code: 3 (1+2) with cleanups==11.
+// ===========================================================================
+BEZEL_TEST(async_iter_try_finally_554, multiple_sequential_try_finally_blocks) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static cleanups: int := 0;
+
+  public async static method Gen(): IAsyncEnumerable<int>
+    try
+      yield return 1;
+    finally
+      C.cleanups := C.cleanups + 1;
+    end;
+    try
+      yield return 2;
+    finally
+      C.cleanups := C.cleanups + 10;
+    end;
+  end Gen;
+
+  public static async method Main(): Task<int>
+    var sum := 0;
+    await for var x in Gen() do
+      sum := sum + x;
+    end;
+    if C.cleanups <> 11 then return 99; end;
+    return sum;
+  end Main;
+end C;
+)"), 3);
+}
+
+// ===========================================================================
+// (13) §29.6 / §29.7: nested try inside try in an async iterator — both
+//      finally blocks run in innermost-first order on normal completion.
+//      Gen yields 1 (inner try), then 2 (outer try after inner); cleanups:
+//      inner(1) + outer(10) = 11.  Expected exit code: 3 (1+2) cleanups==11.
+// ===========================================================================
+BEZEL_TEST(async_iter_try_finally_554, nested_try_inside_try_both_finally_run) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static cleanups: int := 0;
+
+  public async static method Gen(): IAsyncEnumerable<int>
+    try
+      try
+        yield return 1;
+      finally
+        C.cleanups := C.cleanups + 1;
+      end;
+      yield return 2;
+    finally
+      C.cleanups := C.cleanups + 10;
+    end;
+  end Gen;
+
+  public static async method Main(): Task<int>
+    var sum := 0;
+    await for var x in Gen() do
+      sum := sum + x;
+    end;
+    if C.cleanups <> 11 then return 99; end;
+    return sum;
+  end Main;
+end C;
+)"), 3);
+}
+
+// ===========================================================================
+// (14) §29.6 / §29.7: nested try, consumer breaks early — dispose runs
+//      innermost-first: inner finally runs before outer finally.
+//      After a break at the first yield, order should be inner(1) then
+//      outer(2) → order field == 12.  Expected exit code: 12.
+// ===========================================================================
+BEZEL_TEST(async_iter_try_finally_554, nested_try_early_break_innermost_first) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static order: int := 0;
+
+  public async static method Gen(): IAsyncEnumerable<int>
+    try
+      try
+        yield return 1;
+        yield return 2;
+      finally
+        C.order := C.order * 10 + 1;
+      end;
+    finally
+      C.order := C.order * 10 + 2;
+    end;
+  end Gen;
+
+  public static async method Main(): Task<int>
+    await for var x in Gen() do
+      break;
+    end;
+    if C.order <> 12 then return 99; end;
+    return C.order;
+  end Main;
+end C;
+)"), 12);
 }
