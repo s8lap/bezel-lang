@@ -1843,6 +1843,32 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // §9.4 (#624): DictionaryEntry<K,V>.Key and .Value are positional
+            // read-only fields — any assignment through the entry loop variable
+            // (e.Key := …, e.Value := …, e.Value += …, etc.) must be rejected.
+            // The synthetic DictionaryEntry TypeRef has importedName="DictionaryEntry"
+            // and no user TypeSymbol (declaration == nullptr); detect by that tag.
+            if (as->target) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        as->target.get())) {
+                    if (ma->member == "Key" || ma->member == "Value") {
+                        if (ma->target) {
+                            if (auto* tt = ctx_.exprType(*ma->target)) {
+                                if (tt->kind == TypeRef::Kind::Named &&
+                                        !tt->declaration &&
+                                        tt->importedName == "DictionaryEntry") {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, as->span.begin,
+                                        std::string("cannot assign to `") +
+                                        std::string(ma->member) +
+                                        "` — DictionaryEntry<K,V> fields are "
+                                        "read-only positional fields (§9.4)");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Slice S7: readonly field assignment outside a ctor.
             checkReadonlyAssignment(*as);
             // Slice T2: plain `:=` assignment must be primitive-

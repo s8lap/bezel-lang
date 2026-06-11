@@ -2543,6 +2543,30 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         if (llvm::Value* addr = implicitFieldAddr(e, elemTy)) {
             return builder_.CreateLoad(elemTy, addr);
         }
+        // #625 / §12 / §31: bare `Message` inside a user class that inherits
+        // a built-in exception — sema resolved it as the inherited Exception
+        // property (no FieldSymbol, type=string).  Emit the same GEP-at-byte-8
+        // read as `this.Message` in the qualified MemberAccessExpr path above
+        // (CG22+): the message pointer lives at byte offset 8 in the exception
+        // object layout regardless of whether the receiver is the builtin class
+        // itself or a user-derived class (§31 / classStruct layout rule).
+        if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            if (id2->name == "Message" &&
+                    !ctx_.exprSymbol(e) &&
+                    currentThis_) {
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* msgSlot = builder_.CreateGEP(
+                    i8Ty, currentThis_, builder_.getInt64(8), "msg.slot");
+                llvm::Value* msgPtr =
+                    builder_.CreateLoad(ptrTy(), msgSlot, "msg.ptr");
+                auto* isNull = builder_.CreateICmpEQ(
+                    msgPtr,
+                    llvm::ConstantPointerNull::get(ptrTy()), "msg.isnull");
+                llvm::Value* emptyStr = lowerStringLiteral("\"\"", false);
+                return builder_.CreateSelect(
+                    isNull, emptyStr, msgPtr, "msg.val");
+            }
+        }
         // CG50: a ref/out parameter — load through the incoming pointer.
         llvm::Type* refElem = nullptr;
         if (llvm::Value* a = refParamAddr(e, refElem)) {
