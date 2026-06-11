@@ -4372,6 +4372,42 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
             return lowerExpr(*call.args[0].value);
         }
+        // per §2.5 / #648: DateTime.Parse(s: string): DateTime
+        // Calls bz_datetime_parse(str_p) → i64 ticks.  The codegen emits a
+        // guard that traps (unreachable) on parse failure — same pattern as
+        // Guid.Parse.  bz_datetime_try_parse returns 1 on success, 0 on failure.
+        if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            // Call bz_datetime_try_parse(str_p, &out_ticks) to validate+get ticks.
+            auto* ticksSlot = entryAlloca(i64());
+            auto* tryFn = declareC("bz_datetime_try_parse", i32(),
+                                   {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot},
+                                                  "dt.parse.ok");
+            llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+            auto* okBB  = llvm::BasicBlock::Create(llvm_, "dt.parse.ok", currentFn_);
+            auto* badBB = llvm::BasicBlock::Create(llvm_, "dt.parse.bad", currentFn_);
+            builder_.CreateCondBr(isOk, okBB, badBB);
+            builder_.SetInsertPoint(badBB);
+            builder_.CreateUnreachable();
+            builder_.SetInsertPoint(okBB);
+            return builder_.CreateLoad(i64(), ticksSlot, "dt.parsed");
+        }
+        // per §2.5 / #648: DateTime.TryParse(s: string, out result: DateTime): bool
+        if (m == "TryParse" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Type* et = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+            if (!outAddr) return nullptr;
+            auto* tryFn = declareC("bz_datetime_try_parse", i32(),
+                                   {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, outAddr},
+                                                  "dt.tryp.ok");
+            return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dt.tryp.bool");
+        }
     }
     // ---------------------------------------------------------------------------
     // §2.5 TimeSpan — static factories and Zero constant.
@@ -4868,6 +4904,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     // Deferred: full timezone conversion needs platform TZ APIs.
                     if (mname == "ToUtc" || mname == "ToLocal")
                         return ticks;
+                    // per §2.5 / #648: ToString(format: string): string —
+                    // expand format specifiers via bz_datetime_to_string_fmt.
+                    if (mname == "ToString" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Value* fmtStr = lowerExpr(*call.args[0].value);
+                        if (!fmtStr) return nullptr;
+                        auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
+                                            {i64(), ptrTy()});
+                        return builder_.CreateCall(fn, {ticks, fmtStr},
+                                                   "dt.tostr.fmt");
+                    }
                 }
             }
         }
@@ -6779,6 +6826,29 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
             if (ma->member == "Dispose" && ma->target) {
+                // per §6.8 / #652: Domain instance Dispose() — release the
+                // bz_domain_t ref acquired by bz_domain_alloc. Calls
+                // bz_domain_dispose(dom) which calls domain_release().
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && builtinTypeName(recvTy) == "Domain") {
+                        llvm::Value* dom = lowerExpr(*ma->target);
+                        if (dom && dom->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_domain_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {dom});
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
                 // §30.15 (#600 phase c): Channel<T>.Dispose() — close the channel,
                 // fault pending receivers with ChannelClosedException, dispose
                 // undelivered items in reverse order, and free the struct.

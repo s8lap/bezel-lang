@@ -1510,6 +1510,13 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     return builder_.CreateCall(fn, {cts}, "cts.token.prop");
                 }
             }
+            // per §6.8 / #652: Domain instance property reads.
+            if (cn == "Domain" && ma->member == "Name") {
+                llvm::Value* dom = lowerExpr(*ma->target);
+                if (!dom) return nullptr;
+                auto* fn = declareC("bz_domain_get_name", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {dom}, "dom.name");
+            }
             // CancellationToken.None (static property, target is type-name identifier).
             if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
                 if (id2->name == "CancellationToken" && ma->member == "None") {
@@ -5078,6 +5085,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if (colName == "CancellationTokenSource") {
                 auto* allocFn = declareC("bz_cts_alloc", ptrTy(), {});
                 return builder_.CreateCall(allocFn, {}, "cts.alloc");
+            }
+            // per §6.8 / #652: new Domain(name: string) — allocate a named
+            // domain instance backed by a bz_domain_t with a stored name field.
+            // bz_domain_alloc(name_str_p) → bz_domain_t* (refs=1 for `using var`).
+            if (colName == "Domain") {
+                llvm::Value* nameArg = llvm::ConstantPointerNull::get(ptrTy());
+                if (!ne.args.empty() && ne.args[0].value) {
+                    llvm::Value* v = lowerExpr(*ne.args[0].value);
+                    if (v) nameArg = v;
+                }
+                auto* allocFn = declareC("bz_domain_alloc", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(allocFn, {nameArg}, "dom.alloc");
             }
             // §2.5: new DateTime(year, month, day) or
             //        new DateTime(year, month, day, hour, minute, second) or

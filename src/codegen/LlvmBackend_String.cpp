@@ -1099,6 +1099,21 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 return result;
             }
         }
+        // §9.6 / #649: IndexOf(sub: string, start: int) — 2-arg overload.
+        // `start` is a code-point index (§4.6 adaptive-width strings); the
+        // runtime bz_str_indexof_from honours the width-aware code-point model.
+        if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            llvm::Value* sub = lowerExpr(*call.args[0].value);
+            if (!sub) return nullptr;
+            llvm::Value* startVal = lowerExpr(*call.args[1].value);
+            if (!startVal) return nullptr;
+            // Normalize start to i64 for the runtime.
+            if (!startVal->getType()->isIntegerTy(64))
+                startVal = builder_.CreateSExt(startVal, i64(), "iof2.s64");
+            auto* fn = declareC("bz_str_indexof_from", i32(),
+                                {ptrTy(), ptrTy(), i64()});
+            return builder_.CreateCall(fn, {self, sub, startVal}, "iof2.result");
+        }
         // §9.6 / #535: IndexOf(sub: string) — code-point index via runtime.
         llvm::Value* sub = getStrArg(0);
         if (!sub) return nullptr;

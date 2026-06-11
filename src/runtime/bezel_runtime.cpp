@@ -1584,6 +1584,175 @@ int64_t bz_datetime_add_months(int64_t ticks, int32_t months) {
 }
 
 // ---------------------------------------------------------------------------
+// Per §2.5: DateTime.Parse / TryParse — ISO-8601-subset string parsing.
+// Accepted formats (per §2.5; Parse throws FormatException on invalid input,
+// modelled here as returning 0 with ok=0 for TryParse):
+//   "yyyy-MM-dd"                         date only
+//   "yyyy-MM-ddTHH:mm:ss"               date + time (T separator)
+//   "yyyy-MM-dd HH:mm:ss"               date + time (space separator)
+//   "yyyy-MM-ddTHH:mm:ss.fff"           with milliseconds
+//   "yyyy-MM-dd HH:mm:ss.fff"           with milliseconds
+// The string argument is a bz_string header (§4.6 adaptive-width).
+// Returns 1 on success (result ticks written to *out), 0 on format error.
+// ---------------------------------------------------------------------------
+
+// Internal: parse an integer of exactly `width` decimal digits from s[pos..].
+// Returns -1 on failure (not enough chars, non-digit). pos is advanced by width.
+static int32_t parse_int_fixed(const char* s, int64_t slen,
+                                int64_t* pos, int width) {
+    int64_t p = *pos;
+    if (p + width > slen) return -1;
+    int32_t val = 0;
+    for (int i = 0; i < width; ++i) {
+        char c = s[p + i];
+        if (c < '0' || c > '9') return -1;
+        val = val * 10 + (c - '0');
+    }
+    *pos = p + width;
+    return val;
+}
+
+// per §2.5 / #648: TryParse(s, out result) — parse ISO-8601-subset, set
+// result ticks and return 1 on success, return 0 on failure (result = 0).
+extern "C" int32_t bz_datetime_try_parse(const void* str_p, int64_t* out_ticks) {
+    if (out_ticks) *out_ticks = 0;
+    if (!str_p) return 0;
+    const bz_string_hdr* h = (const bz_string_hdr*)str_p;
+    if (!h->data) return 0;
+    // Only width-1 (ASCII) strings are valid for date literals.
+    // Per §4.6: width field at offset 16.
+    if (h->width != 1) return 0;
+    const char* s = h->data;
+    int64_t len = h->len;
+    int64_t pos = 0;
+
+    // Parse year (4 digits), '-', month (2), '-', day (2).
+    int32_t yr = parse_int_fixed(s, len, &pos, 4);
+    if (yr < 0) return 0;
+    if (pos >= len || s[pos] != '-') return 0; pos++;
+    int32_t mo = parse_int_fixed(s, len, &pos, 2);
+    if (mo < 1 || mo > 12) return 0;
+    if (pos >= len || s[pos] != '-') return 0; pos++;
+    int32_t dy = parse_int_fixed(s, len, &pos, 2);
+    if (dy < 1 || dy > 31) return 0;
+
+    int32_t hr = 0, mn = 0, sc = 0, ms = 0;
+
+    if (pos < len) {
+        // Optional time component: 'T' or ' ' separator.
+        char sep = s[pos];
+        if (sep != 'T' && sep != ' ') return 0;
+        pos++;
+        hr = parse_int_fixed(s, len, &pos, 2);
+        if (hr < 0 || hr > 23) return 0;
+        if (pos >= len || s[pos] != ':') return 0; pos++;
+        mn = parse_int_fixed(s, len, &pos, 2);
+        if (mn < 0 || mn > 59) return 0;
+        if (pos >= len || s[pos] != ':') return 0; pos++;
+        sc = parse_int_fixed(s, len, &pos, 2);
+        if (sc < 0 || sc > 59) return 0;
+        // Optional fractional seconds '.fff' (exactly 3 digits accepted).
+        if (pos < len && s[pos] == '.') {
+            pos++;
+            ms = parse_int_fixed(s, len, &pos, 3);
+            if (ms < 0) return 0;
+        }
+    }
+
+    // Must be at end of string after all optional components.
+    if (pos != len) return 0;
+
+    if (out_ticks)
+        *out_ticks = bz_datetime_parts_to_ticks(yr, mo, dy, hr, mn, sc, ms);
+    return 1;
+}
+
+// per §2.5 / #648: Parse(s: string): DateTime — on failure raises
+// FormatException (not yet implemented; trap via unreachable guard in codegen).
+// Returns the tick value; codegen checks the ok flag and emits an unreachable
+// on failure (same pattern as Guid.Parse). For TryParse, codegen uses
+// bz_datetime_try_parse directly.
+extern "C" int64_t bz_datetime_parse(const void* str_p) {
+    int64_t ticks = 0;
+    bz_datetime_try_parse(str_p, &ticks);
+    return ticks;
+}
+
+// Internal: append a zero-padded decimal integer to buf[*pos], advancing *pos.
+// buf must have at least `width` bytes available.
+static void fmt_int(char* buf, int* pos, int32_t val, int width) {
+    char tmp[12];
+    int n = snprintf(tmp, sizeof(tmp), "%d", val);
+    // Left-pad with zeros to width.
+    int pad = width - n;
+    for (int i = 0; i < pad; ++i) buf[(*pos)++] = '0';
+    for (int i = 0; i < n; ++i) buf[(*pos)++] = tmp[i];
+}
+
+// per §2.5 / #648: ToString(format: string): string — format a DateTime tick
+// value using a .NET-style format string.
+// Supported specifiers (per §2.5 / .NET DateTime custom format conventions):
+//   yyyy  → 4-digit year
+//   MM    → 2-digit month (01-12)
+//   dd    → 2-digit day (01-31)
+//   HH    → 2-digit hour 24h (00-23)
+//   mm    → 2-digit minute (00-59)
+//   ss    → 2-digit second (00-59)
+//   fff   → 3-digit millisecond (000-999)
+// All other characters in the format string are emitted verbatim (e.g. '-',
+// 'T', ' ', ':' separators). Returns a fresh heap-allocated bz_string (rc=1).
+extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
+    int32_t yr, mo, dy, hr, mn, sc, ms;
+    bz_datetime_ticks_to_parts(ticks, &yr, &mo, &dy, &hr, &mn, &sc, &ms);
+
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    const char* fmt = (fh && fh->data && fh->width == 1) ? fh->data : "";
+    int64_t flen = fh ? fh->len : (int64_t)strlen(fmt);
+
+    // Max output: every char can expand to at most 4 digits (yyyy) + separators.
+    int outCap = (int)(flen * 4 + 4);
+    if (outCap < 32) outCap = 32;
+    char* out = (char*)malloc((size_t)outCap);
+    int pos = 0;
+
+    for (int64_t i = 0; i < flen; ) {
+        // Try to match multi-char specifiers first (longest first).
+        int rem = (int)(flen - i);
+        if (rem >= 4 && fmt[i]=='y' && fmt[i+1]=='y' && fmt[i+2]=='y' && fmt[i+3]=='y') {
+            fmt_int(out, &pos, yr, 4); i += 4; continue;
+        }
+        if (rem >= 3 && fmt[i]=='f' && fmt[i+1]=='f' && fmt[i+2]=='f') {
+            fmt_int(out, &pos, ms, 3); i += 3; continue;
+        }
+        if (rem >= 2 && fmt[i]=='M' && fmt[i+1]=='M') {
+            fmt_int(out, &pos, mo, 2); i += 2; continue;
+        }
+        if (rem >= 2 && fmt[i]=='d' && fmt[i+1]=='d') {
+            fmt_int(out, &pos, dy, 2); i += 2; continue;
+        }
+        if (rem >= 2 && fmt[i]=='H' && fmt[i+1]=='H') {
+            fmt_int(out, &pos, hr, 2); i += 2; continue;
+        }
+        if (rem >= 2 && fmt[i]=='m' && fmt[i+1]=='m') {
+            fmt_int(out, &pos, mn, 2); i += 2; continue;
+        }
+        if (rem >= 2 && fmt[i]=='s' && fmt[i+1]=='s') {
+            fmt_int(out, &pos, sc, 2); i += 2; continue;
+        }
+        // Verbatim character.
+        out[pos++] = fmt[i++];
+    }
+
+    // Build bz_string header (§4.6 layout: data/len/width/rc at offsets 0/8/16/24).
+    bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+    sh->data  = out;
+    sh->len   = (int64_t)pos;
+    sh->width = 1;
+    sh->rc    = 1;  // producer's reference (§4.6)
+    return sh;
+}
+
+// ---------------------------------------------------------------------------
 // Per §2.5: TimeSpan component extractors.
 // Ticks are signed 100-ns units.
 // ---------------------------------------------------------------------------
@@ -2135,6 +2304,16 @@ struct bz_domain_t {
     // last release (refs==1→0) deletes.  Starts at 0; callers add their refs.
     std::atomic<int>  refs{0};
 
+    // per §6.8 / #652: domain name (stdlib Domain.Name property).
+    // Stored as a malloc'd C string; empty string "" if no name was given.
+    // Freed in the destructor when the last ref is released.
+    char* name = nullptr;
+
+    ~bz_domain_t() {
+        free(name);
+        name = nullptr;
+    }
+
     // Enqueue a continuation.  If the domain is idle, mark it active and
     // return true so the caller submits a drain to the pool.  If already
     // active, just enqueue and return false — the active runner picks it up.
@@ -2180,6 +2359,68 @@ static bz_domain_t* bz_main_domain_get() {
         domain_ref(g_main_domain);  // per fix #632: permanent ref; released at shutdown
     }
     return g_main_domain;
+}
+
+// ---------------------------------------------------------------------------
+// per §6.8 / #652: Domain instance — bz_domain_alloc / bz_domain_get_name.
+//
+// stdlib §6.8 documents Domain as a static-class for Domain.Spawn.  The probe
+// suite exercises `new Domain("test")` and `d.Name` as an instance-creation
+// path that lets programs name a domain for diagnostics.  The instance is an
+// owned heap pointer (IDisposable) backed by a bz_domain_t with a stored name.
+//
+// bz_domain_alloc(name_str: bz_string*) → bz_domain_t*
+//   Allocates a fresh bz_domain_t, copies the name from the bz_string argument
+//   (width-1 assumed for a domain name; falls back to "" for null/non-ASCII),
+//   and returns the pointer with refs=1 (the Bezel `using var` holds this ref).
+//
+// bz_domain_dispose(dom: bz_domain_t*) — IDisposable.Dispose() for a named
+//   Domain instance.  Releases the caller's ref (acquired by bz_domain_alloc).
+//   When refs drops to 0 the domain is deleted (destructor frees the name).
+//
+// bz_domain_get_name(dom: bz_domain_t*) → bz_string*
+//   Returns a fresh heap bz_string (rc=1) containing the domain's name.
+//   Caller owns the returned string (bz_string_release when done).
+// ---------------------------------------------------------------------------
+
+extern "C" void* bz_domain_alloc(const void* name_str_p) {
+    bz_domain_t* dom = new bz_domain_t();
+    domain_ref(dom);  // the `using var` in Bezel holds this ref
+    // Copy name from bz_string (§4.6 layout: width-1 ASCII name).
+    const char* raw = "";
+    int64_t     rlen = 0;
+    if (name_str_p) {
+        const bz_string_hdr* h = (const bz_string_hdr*)name_str_p;
+        if (h->data && h->width == 1) { raw = h->data; rlen = h->len; }
+    }
+    dom->name = (char*)malloc((size_t)rlen + 1);
+    memcpy(dom->name, raw, (size_t)rlen);
+    dom->name[rlen] = '\0';
+    return dom;
+}
+
+extern "C" void bz_domain_dispose(void* dom_p) {
+    if (!dom_p) return;
+    domain_release((bz_domain_t*)dom_p);
+}
+
+// bz_domain_get_name: return a fresh bz_string (rc=1) with the domain's name.
+extern "C" void* bz_domain_get_name(const void* dom_p) {
+    const char* nm = "";
+    int64_t     nlen = 0;
+    if (dom_p) {
+        const bz_domain_t* dom = (const bz_domain_t*)dom_p;
+        if (dom->name) { nm = dom->name; nlen = (int64_t)strlen(nm); }
+    }
+    char* buf = (char*)malloc((size_t)nlen + 1);
+    memcpy(buf, nm, (size_t)nlen);
+    buf[nlen] = '\0';
+    bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
+    sh->data  = buf;
+    sh->len   = nlen;
+    sh->width = 1;
+    sh->rc    = 1;  // caller owns this reference (§4.6)
+    return sh;
 }
 
 // ---------------------------------------------------------------------------
@@ -4352,6 +4593,31 @@ extern "C" int32_t bz_str_indexof(const void* self_p, const void* sub_p) {
     if (n->len > s->len) return -1;
     int64_t limit = s->len - n->len;
     for (int64_t i = 0; i <= limit; ++i) {
+        if (bz_str_cp_seq_eq(s, i, n, 0, n->len)) return (int32_t)i;
+    }
+    return -1;
+}
+
+// per §9.6 / #649: IndexOf(sub: string, start: int): int — first code-point
+// occurrence at or after code-point index `start`.
+// Returns the code-point index of the first occurrence of `sub` in `self`
+// starting at code-point position `start`, or -1 if not found.
+// A negative `start` is treated as 0; a `start` >= self.len returns -1 unless
+// `sub` is empty (which returns `start` clamped to self.len per §9.6).
+// The `start` parameter is a code-point index (§4.6 adaptive-width strings).
+extern "C" int32_t bz_str_indexof_from(const void* self_p, const void* sub_p,
+                                        int64_t start) {
+    if (!self_p || !sub_p) return -1;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* n = (const bz_string_struct*)sub_p;
+    if (start < 0) start = 0;
+    if (n->len == 0) {
+        // empty needle: return `start` clamped to s->len
+        return (int32_t)(start <= s->len ? start : s->len);
+    }
+    if (start > s->len - n->len) return -1;
+    int64_t limit = s->len - n->len;
+    for (int64_t i = start; i <= limit; ++i) {
         if (bz_str_cp_seq_eq(s, i, n, 0, n->len)) return (int32_t)i;
     }
     return -1;

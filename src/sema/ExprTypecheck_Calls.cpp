@@ -1523,8 +1523,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     };
                     if (colName == "DateTime") {
                         if (m == "Now" || m == "UtcNow" || m == "Today" ||
-                            m == "MinValue" || m == "MaxValue" || m == "FromTicks")
+                            m == "MinValue" || m == "MaxValue" || m == "FromTicks" ||
+                            m == "Parse")  // per §2.5 / #648: Parse(s) → DateTime
                             ctx_.setExprType(&ce, makeDTType());
+                        // per §2.5 / #648: TryParse(s, out result) → bool.
+                        if (m == "TryParse")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     }
                     // §2.5: TimeSpan static factories → TimeSpan type.
                     if (colName == "TimeSpan") {
@@ -1791,6 +1795,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             ctx_.setExprType(&ce, argIsTS ? dtTy : tsTy);
                         }
+                        // per §2.5 / #648: ToString(format: string) → string.
+                        else if (m == "ToString" && !ce.args.empty())
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                     }
                     // TimeSpan arithmetic methods return TimeSpan (fallback if
                     // the operator desugaring lands here rather than BinaryExpr).
@@ -4006,6 +4013,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 // Cancel() / CancelAfter() / Dispose() → unit (leave untyped).
+            }
+            // per §6.8 / #652: Domain instance member access types.
+            if (cn == "Domain") {
+                // Name: string readonly property (§6.8).
+                if (ma.member == "Name") {
+                    ctx_.setExprType(&ma,
+                        ctx_.primitiveTypeRef(PrimitiveType::String));
+                    return;
+                }
+                // Dispose() → unit (leave untyped; codegen handles it).
             }
             // §30.8: CancellationToken.None — static readonly property on the
             // CancellationToken builtin type name used as an identifier expression.
