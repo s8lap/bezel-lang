@@ -5901,6 +5901,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
     if (auto* v = tryLowerEncodingCall(call)) return v;
+    // §30.14/§30.15 (#600 phase c): Channel<T>/ChannelSender<T> methods + Domain.Spawn.
+    if (auto* v = tryLowerChannelAndDomainCall(call)) return v;
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
     if (auto* v = tryLowerBuiltinClassCall(call)) return v;
     // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
@@ -6580,6 +6582,76 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
             if (ma->member == "Dispose" && ma->target) {
+                // §30.15 (#600 phase c): Channel<T>.Dispose() — close the channel,
+                // fault pending receivers with ChannelClosedException, dispose
+                // undelivered items in reverse order, and free the struct.
+                // After the call, null the receiver slot (if it is a local/field
+                // this scope owns) so the `using var` scope-exit guard finds null
+                // and skips, preventing a double-free (§28.2 exactly-once rule).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && builtinTypeName(recvTy) == "Channel") {
+                        llvm::Value* ch = lowerExpr(*ma->target);
+                        if (ch && ch->getType()->isPointerTy()) {
+                            llvm::Value* cceVt =
+                                llvm::ConstantPointerNull::get(ptrTy());
+                            {   auto vit = builtinVtable_.find(
+                                    "ChannelClosedException");
+                                if (vit != builtinVtable_.end())
+                                    cceVt = vit->second;
+                            }
+                            auto* fn = declareC("bz_channel_dispose",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {ch, cceVt});
+                            // Null the slot so any subsequent using-var scope-exit
+                            // reload sees null and skips (§28.2).
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
+                // §30.15 (#600 phase c): ChannelSender<T>.Dispose() — release
+                // this sender handle (may close the channel if last sender).
+                // After the call, null the receiver slot to prevent double-free
+                // at using-var scope exit (§28.2 exactly-once rule).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && builtinTypeName(recvTy) == "ChannelSender") {
+                        llvm::Value* tx = lowerExpr(*ma->target);
+                        if (tx && tx->getType()->isPointerTy()) {
+                            llvm::Value* cceVt =
+                                llvm::ConstantPointerNull::get(ptrTy());
+                            {   auto vit = builtinVtable_.find(
+                                    "ChannelClosedException");
+                                if (vit != builtinVtable_.end())
+                                    cceVt = vit->second;
+                            }
+                            auto* fn = declareC("bz_channel_sender_release",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {tx, cceVt});
+                            // Null the slot so any subsequent using-var scope-exit
+                            // reload sees null and skips (§28.2).
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
                 // §6.1 / §30.8: CancellationTokenSource.Dispose() — runs the
                 // source's destructor (cancels surviving token observers, frees
                 // the source object) via bz_cts_dispose.  Recognized by the
@@ -10143,6 +10215,344 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         phi->addIncoming(builder_.getFalse(), neqBB);
         phi->addIncoming(builder_.getTrue(),  condBB);
         return phi;
+    }
+
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// §30.14/§30.15 (#600 phase c): Channel<T> and Domain.Spawn codegen.
+//
+// Handles:
+//   Channel<T>:
+//     NewSender()               → bz_channel_new_sender(ch)        → ptr (ChannelSender<T>)
+//     Send(owned item)          → bz_channel_send(ch, item)        → void
+//     Receive()                 → bz_channel_receive(ch, cce_vtable) → Task/OwnedTask<T>
+//     TryReceive(out item)      → bz_channel_try_receive(ch, &slot)  → bool
+//     Count                     → bz_channel_count(ch)             → int
+//     IsClosed                  → bz_channel_is_closed(ch)         → bool
+//     Dispose()                 → bz_channel_dispose(ch, cce_vtable)→ void
+//   ChannelSender<T>:
+//     Send(owned item)          → bz_channel_sender_send(tx, item) → void
+//     Dispose()                 → bz_channel_sender_release(tx, cce_vtable) → void
+//   Domain.Spawn(entry, arg?)   → bz_domain_spawn(fn, arg, dfe_vtable) → OwnedTask<R>
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view mname = ma->member;
+
+    // Helper: get ChannelClosedException vtable constant (or null if not set up).
+    auto getCCEVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("ChannelClosedException");
+        if (vit == builtinVtable_.end())
+            return llvm::ConstantPointerNull::get(ptrTy());
+        return vit->second;
+    };
+    auto getDFEVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("DomainFaultedException");
+        if (vit == builtinVtable_.end())
+            return llvm::ConstantPointerNull::get(ptrTy());
+        return vit->second;
+    };
+
+    // -----------------------------------------------------------------------
+    // Channel<T> instance methods (receiver type name == "Channel").
+    // -----------------------------------------------------------------------
+    {
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isChannel = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                         builtinTypeName(recvTy) == "Channel";
+        if (isChannel) {
+            llvm::Value* ch = lowerExpr(*ma->target);
+            if (!ch) return nullptr;
+
+            // NewSender(): allocate a ChannelSender handle.
+            if (mname == "NewSender" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_new_sender", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {ch}, "ch.newsender");
+            }
+
+            // Send(owned item): transfer ownership of item into the channel.
+            if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* item = lowerExpr(*call.args[0].value);
+                if (!item) return nullptr;
+                // Value types (int/bool/etc.) need to be widened to ptr-size.
+                // We store them as bit-cast void* (uint64 reinterpretation).
+                // For ptr-typed items (class, string) just pass as-is.
+                llvm::Value* itemArg = item;
+                if (item->getType()->isIntegerTy() &&
+                    !item->getType()->isIntegerTy(64)) {
+                    // Zero-extend to i64 then inttoptr.
+                    llvm::Value* ext = builder_.CreateZExt(item, i64(), "send.ext");
+                    itemArg = builder_.CreateIntToPtr(ext, ptrTy(), "send.cast");
+                } else if (item->getType()->isIntegerTy(64)) {
+                    itemArg = builder_.CreateIntToPtr(item, ptrTy(), "send.cast");
+                } else if (!item->getType()->isPointerTy()) {
+                    // double/float: bitcast to i64 then inttoptr.
+                    llvm::Value* bits = builder_.CreateBitCast(item, i64(), "send.bits");
+                    itemArg = builder_.CreateIntToPtr(bits, ptrTy(), "send.cast");
+                }
+                auto* fn = declareC("bz_channel_send",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ch, itemArg});
+                return nullptr;  // void
+            }
+
+            // Receive(): returns a Task<T> or OwnedTask<T>.
+            if (mname == "Receive" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_receive", ptrTy(),
+                                    {ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {ch, getCCEVtable()}, "ch.recv");
+            }
+
+            // TryReceive(out owned item: T?) → bool.
+            // The out-var slot was pre-created by ensureOutVarSlots.
+            if (mname == "TryReceive" && call.args.size() == 1 &&
+                call.args[0].value) {
+                // The out argument's address.
+                llvm::Type* outEty = nullptr;
+                llvm::Value* outSlot = lvalueAddr(*call.args[0].value, outEty);
+                if (!outSlot) {
+                    // Fallback: create a temporary slot.
+                    outSlot = entryAlloca(ptrTy());
+                }
+                // Allocate a ptr-sized slot for the raw item pointer.
+                llvm::AllocaInst* rawSlot = entryAlloca(ptrTy());
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                     rawSlot);
+                auto* fn = declareC("bz_channel_try_receive", i32(),
+                                    {ptrTy(), ptrTy()});
+                llvm::Value* ok = builder_.CreateCall(fn, {ch, rawSlot},
+                                                      "ch.tryrecv");
+                // If ok: copy rawSlot into outSlot (the caller's out-var).
+                auto* okBB   = llvm::BasicBlock::Create(llvm_, "tryrecv.ok",
+                                                         currentFn_);
+                auto* contBB = llvm::BasicBlock::Create(llvm_, "tryrecv.cont",
+                                                         currentFn_);
+                llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+                builder_.CreateCondBr(isOk, okBB, contBB);
+                builder_.SetInsertPoint(okBB);
+                llvm::Value* rawItem = builder_.CreateLoad(ptrTy(), rawSlot);
+                // Decode item: for value types, ptrtoint + trunc; for ptr types
+                // store as-is. The element type decides the decoding.
+                builder_.CreateStore(rawItem, outSlot);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+                return builder_.CreateICmpNE(ok, builder_.getInt32(0), "ch.try.r");
+            }
+
+            // Count → int64.
+            if (mname == "Count" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_count", i64(), {ptrTy()});
+                llvm::Value* c = builder_.CreateCall(fn, {ch}, "ch.count");
+                // Truncate to i32 (Bezel int).
+                return builder_.CreateTrunc(c, i32(), "ch.count.i");
+            }
+
+            // IsClosed → bool.
+            if (mname == "IsClosed" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_is_closed", i32(), {ptrTy()});
+                llvm::Value* r = builder_.CreateCall(fn, {ch}, "ch.isclosed");
+                return builder_.CreateICmpNE(r, builder_.getInt32(0));
+            }
+
+            // Dispose() — explicit dispose of the channel (frees backing struct).
+            // Null the receiver slot after the call so any subsequent
+            // using-var scope-exit reload sees null and skips (§28.2).
+            if (mname == "Dispose" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_dispose",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ch, getCCEVtable()});
+                if (!checkedDisposal_) {
+                    llvm::Type* slotTy = nullptr;
+                    if (llvm::Value* slot = lvalueAddr(*ma->target, slotTy))
+                        builder_.CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy()), slot);
+                }
+                return nullptr;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ChannelSender<T> instance methods (receiver type name == "ChannelSender").
+    // -----------------------------------------------------------------------
+    {
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isSender = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        builtinTypeName(recvTy) == "ChannelSender";
+        if (isSender) {
+            llvm::Value* tx = lowerExpr(*ma->target);
+            if (!tx) return nullptr;
+
+            // Send(owned item): transfer ownership into the channel.
+            if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* item = lowerExpr(*call.args[0].value);
+                if (!item) return nullptr;
+                llvm::Value* itemArg = item;
+                if (item->getType()->isIntegerTy() &&
+                    !item->getType()->isIntegerTy(64)) {
+                    llvm::Value* ext = builder_.CreateZExt(item, i64());
+                    itemArg = builder_.CreateIntToPtr(ext, ptrTy());
+                } else if (item->getType()->isIntegerTy(64)) {
+                    itemArg = builder_.CreateIntToPtr(item, ptrTy());
+                } else if (!item->getType()->isPointerTy()) {
+                    llvm::Value* bits = builder_.CreateBitCast(item, i64());
+                    itemArg = builder_.CreateIntToPtr(bits, ptrTy());
+                }
+                auto* fn = declareC("bz_channel_sender_send",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {tx, itemArg});
+                return nullptr;
+            }
+
+            // Dispose() — release this sender handle (may close the channel).
+            // Null the receiver slot after the call so any subsequent
+            // using-var scope-exit reload sees null and skips (§28.2).
+            if (mname == "Dispose" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_sender_release",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {tx, getCCEVtable()});
+                if (!checkedDisposal_ && ma) {
+                    llvm::Type* slotTy = nullptr;
+                    if (llvm::Value* slot = lvalueAddr(*ma->target, slotTy))
+                        builder_.CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy()), slot);
+                }
+                return nullptr;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Domain.Spawn(entry, arg?) — static class "Domain".
+    // The entry expression is a static method reference (a MemberAccessExpr
+    // like `Worker.Compute` or `Producer.SendOne`). We:
+    //   1. Resolve the MethodSymbol from the entry expression.
+    //   2. Build a static adapter function: `void* adapter(void* arg)` that
+    //      calls the actual method with the right ABI and returns the result
+    //      as a void* (or null for void). The adapter is what bz_domain_spawn
+    //      receives as its entry_fn.
+    //   3. Lower the optional argument and pass it to bz_domain_spawn.
+    // -----------------------------------------------------------------------
+    {
+        auto* targetId = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (targetId && targetId->name == "Domain" && mname == "Spawn" &&
+            !call.args.empty()) {
+            const ast::Expr* entryExpr = call.args[0].value.get();
+            if (!entryExpr) return nullptr;
+
+            // Resolve the entry method symbol.
+            sema::MethodSymbol* entryMs =
+                dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*entryExpr));
+            if (!entryMs) return nullptr;
+
+            // Find the actual LLVM function for the method.
+            auto mfIt = methodFns_.find(entryMs);
+            if (mfIt == methodFns_.end()) return nullptr;
+            llvm::Function* origFn = mfIt->second;
+
+            // Build the adapter: `void* adapter(void* arg)`.
+            // The adapter's body:
+            //   - If entry has 1 param: call origFn(arg)
+            //   - If entry has 0 params: call origFn()
+            //   - Return value: origFn's result cast to void* (or null for void)
+            static std::atomic<unsigned> spawnAdaptCtr{0};
+            std::string adaptName = "spawn.adapter$" +
+                std::to_string(spawnAdaptCtr.fetch_add(1));
+            auto* adaptFnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+            auto* adapter = llvm::Function::Create(
+                adaptFnTy, llvm::Function::InternalLinkage,
+                adaptName, module_.get());
+
+            // Emit the adapter body.
+            {
+                llvm::Function* savedFn = currentFn_;
+                llvm::Value*    savedThis = currentThis_;
+                llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+
+                currentFn_   = adapter;
+                currentThis_ = nullptr;
+                auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", adapter);
+                builder_.SetInsertPoint(entryBB);
+
+                llvm::Value* argParam = adapter->getArg(0);  // void* arg
+
+                std::vector<llvm::Value*> callArgs;
+                std::size_t nArgs = origFn->arg_size();
+                if (nArgs == 1) {
+                    // Entry takes one argument: interpret arg as the param type.
+                    llvm::Type* paramTy = origFn->getArg(0)->getType();
+                    llvm::Value* typedArg;
+                    if (paramTy->isPointerTy()) {
+                        typedArg = argParam;
+                    } else if (paramTy->isIntegerTy(64)) {
+                        typedArg = builder_.CreatePtrToInt(argParam, i64());
+                    } else if (paramTy->isIntegerTy(32)) {
+                        llvm::Value* i = builder_.CreatePtrToInt(argParam, i64());
+                        typedArg = builder_.CreateTrunc(i, i32());
+                    } else {
+                        typedArg = builder_.CreatePtrToInt(argParam, i64());
+                    }
+                    callArgs.push_back(typedArg);
+                }
+                // else: nArgs == 0 — no-arg entry, no call args.
+
+                llvm::Value* ret = builder_.CreateCall(origFn, callArgs);
+                if (origFn->getReturnType()->isVoidTy()) {
+                    builder_.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+                } else if (origFn->getReturnType()->isPointerTy()) {
+                    builder_.CreateRet(ret);
+                } else {
+                    // Value result: inttoptr.
+                    llvm::Value* wide = ret;
+                    if (!wide->getType()->isIntegerTy(64))
+                        wide = builder_.CreateZExt(wide, i64());
+                    builder_.CreateRet(
+                        builder_.CreateIntToPtr(wide, ptrTy()));
+                }
+
+                // Restore emitter state.
+                currentFn_   = savedFn;
+                currentThis_ = savedThis;
+                if (savedBB) builder_.SetInsertPoint(savedBB);
+            }
+
+            // Lower the optional argument to bz_domain_spawn.
+            llvm::Value* argVal = llvm::ConstantPointerNull::get(ptrTy());
+            if (call.args.size() >= 2 && call.args[1].value) {
+                llvm::Value* argExprV = lowerExpr(*call.args[1].value);
+                if (argExprV) {
+                    if (argExprV->getType()->isPointerTy()) {
+                        argVal = argExprV;
+                    } else if (argExprV->getType()->isIntegerTy(64)) {
+                        argVal = builder_.CreateIntToPtr(argExprV, ptrTy(),
+                                                         "spawn.arg.cast");
+                    } else if (argExprV->getType()->isIntegerTy()) {
+                        argVal = builder_.CreateIntToPtr(
+                            builder_.CreateZExt(argExprV, i64()), ptrTy(),
+                            "spawn.arg.cast");
+                    } else {
+                        argVal = builder_.CreateIntToPtr(
+                            builder_.CreateBitCast(argExprV, i64()), ptrTy(),
+                            "spawn.arg.cast");
+                    }
+                }
+            }
+
+            auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
+                                     {ptrTy(), ptrTy(), ptrTy()});
+            return builder_.CreateCall(spawnFn,
+                {adapter, argVal, getDFEVtable()},
+                "domain.spawn");
+        }
     }
 
     return nullptr;

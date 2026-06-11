@@ -5022,6 +5022,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 auto* newFn = declareC("bz_shared_new", ptrTy(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(newFn, {val, dispFn}, "shared.new");
             }
+            // §30.15 (#600 phase c): new Channel<T>() — allocate a bz_channel_t.
+            // The dispose_elem callback is:
+            //   - null for value/string element types (no deep disposal needed),
+            //   - elementDisposerThunk() for class element types (vtable Dispose + free).
+            // This mirrors the OwnedArray<T> element policy (§28.11 v0.135).
+            if (colName == "Channel") {
+                llvm::Function* disposerArg = nullptr;
+                if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
+                    const sema::TypeRef* elemTy = rt->genericArgs[0];
+                    // Only class elements get a disposer (OwnedArray<T> model).
+                    if (elemTy->kind == sema::TypeRef::Kind::Named &&
+                        elemTy->declaration &&
+                        elemTy->declaration->kind == ast::TypeDeclKind::Class) {
+                        disposerArg = elementDisposerThunk();
+                    }
+                }
+                llvm::Value* dispArg = disposerArg
+                    ? llvm::cast<llvm::Value>(disposerArg)
+                    : llvm::ConstantPointerNull::get(ptrTy());
+                auto* allocFn = declareC("bz_channel_new", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(allocFn, {dispArg}, "ch.new");
+            }
             // §6.1 / §30.8: new CancellationTokenSource() — allocate via
             // bz_cts_alloc (stdlib §6.1 default constructor).
             if (colName == "CancellationTokenSource") {

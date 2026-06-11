@@ -4923,3 +4923,378 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
     });
     return task;
 }
+
+// ---------------------------------------------------------------------------
+// §30.14/§30.15 (#600 phase c): Domain.Spawn and Channel<T> runtime.
+//
+// Design decisions (recorded per CLAUDE.md):
+//   D-c1: bz_domain_spawn allocates a FRESH bz_domain_t for the spawned
+//         domain (serial run-to-completion inside the child; independent of
+//         the caller's domain — §30.13 isolation). The entry function and
+//         argument are passed as type-erased void* and transferred (owned);
+//         the result (if any) is a void*-sized heap pointer for class results
+//         or a value-in-malloc for value/string results. This mirrors the
+//         bz_task_complete convention already used for Task<T>.
+//   D-c2: bz_channel_t is a mutex-protected deque of void*-sized items plus
+//         a FIFO of pending-receiver tasks (at most one outstanding per §30.15
+//         MPSC contract — a second concurrent Receive simply enqueues another
+//         pending receiver task). No condvars: receivers are async.
+//   D-c3: bz_channel_sender_t is a trivial ref-count wrapper around the shared
+//         channel so multiple senders (via NewSender()) see the same channel.
+//         Last sender release closes the channel and drains pending receivers
+//         with ChannelClosedException.
+//   D-c4: DomainFaultedException and ChannelClosedException are raised as
+//         16-byte built-in exception objects (same layout as all builtin
+//         exceptions: [vtable*, message_string*]). Their vtables are injected
+//         at codegen setup time via builtinExceptionHierarchy; the runtime
+//         allocates them exactly like OperationCanceledException in
+//         bz_ctoken_throw_if_cancelled.
+//   D-c5: For bz_domain_spawn, the entry and its args are plain void* values;
+//         codegen lowers the static-function reference as a function pointer
+//         and moves the argument into a heap allocation (or passes it as a
+//         pointer-sized value inline). The spawned domain calls the entry via
+//         the trampoline protocol: entry_fn(arg_ptr) -> result_ptr.
+//         For a void entry (no return), the join OwnedTask is completed with
+//         no result; for an owned-result entry the result pointer IS the result.
+//   D-c6: Element encoding in channel items: class types pass void* (object
+//         pointer, ownership transferred); value types (int/long/double/bool)
+//         are bit-cast to uint64_t and stored inline; string items are stored
+//         as void* with a +1 reference counted (bz_string_retain on send,
+//         bz_string_release on Dispose drain -- same as Array<string> per
+//         §28.11 / §28.9). The dispose_elem callback resolves the strategy:
+//         null = value/string-ref (no deep disposal), non-null = class
+//         (vtable Dispose + free) -- mirrors OwnedArray<T> element policy.
+//   D-c7: The spawned domain uses the same BzScheduler thread pool as the main
+//         domain. The pool must be started (bz_scheduler_init) before spawn;
+//         bz_domain_spawn lazy-inits the pool if needed (same as bz_task_delay).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// bz_channel_t -- MPSC channel (§30.15)
+// ---------------------------------------------------------------------------
+
+struct bz_pending_receiver_t {
+    bz_task_t*     task;   // the Task that will receive the item
+    bz_domain_t*   domain; // the domain to route the completion through
+};
+
+struct bz_channel_t {
+    std::mutex                        mtx;
+    std::deque<void*>                 items;   // buffered items (void*-sized)
+    std::deque<bz_pending_receiver_t> pending; // pending receivers (FIFO)
+    void (*dispose_elem)(void*); // null for value/string; non-null for class
+    int64_t  sender_count;
+    bool     closed;
+    bool     disposed;
+};
+
+// Forward declaration
+static void channel_close_and_drain_pending(bz_channel_t* ch,
+                                            void* cce_vtable);
+
+extern "C"
+void* bz_channel_new(void (*dispose_elem)(void*)) {
+    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    auto* ch = new bz_channel_t();
+    ch->dispose_elem   = dispose_elem;
+    ch->sender_count   = 0;
+    ch->closed         = false;
+    ch->disposed       = false;
+    return ch;
+}
+
+// bz_channel_sender_t -- a minted sender handle (§30.15 NewSender).
+// Each handle increments the channel's sender_count; releasing the last one
+// closes the channel.
+struct bz_channel_sender_t {
+    bz_channel_t* ch;
+};
+
+extern "C"
+void* bz_channel_new_sender(void* chp) {
+    auto* ch = (bz_channel_t*)chp;
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        ch->sender_count++;
+    }
+    auto* tx = new bz_channel_sender_t{ch};
+    return tx;
+}
+
+// bz_channel_send: append item to channel; if a pending receiver exists,
+// complete it immediately with the item (via the receiver's domain queue).
+// Per §30.15: Send transfers ownership of the item.
+extern "C"
+void bz_channel_send(void* chp, void* item) {
+    auto* ch = (bz_channel_t*)chp;
+    bz_pending_receiver_t recv{nullptr, nullptr};
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        if (ch->closed || ch->disposed) {
+            // Should not happen in a correct program (sema enforces no send
+            // after close). Safe fallback: dispose the item and return.
+            if (item && ch->dispose_elem)
+                ch->dispose_elem(item);
+            return;
+        }
+        if (!ch->pending.empty()) {
+            recv = ch->pending.front();
+            ch->pending.pop_front();
+            // Don't push item to items -- deliver directly via the task below.
+        } else {
+            ch->items.push_back(item);
+        }
+    }
+    if (recv.task) {
+        // Complete the pending-receiver task with the item (ptr-sized result).
+        // Route through the receiver's domain so the continuation is serialized.
+        // bz_task_complete stores result_size bytes; for a void* item we store 8.
+        bz_task_complete(recv.task, &item, sizeof(void*));
+    }
+}
+
+// bz_channel_sender_send: convenience wrapper used by codegen for ChannelSender.Send.
+extern "C"
+void bz_channel_sender_send(void* txp, void* item) {
+    auto* tx = (bz_channel_sender_t*)txp;
+    bz_channel_send(tx->ch, item);
+}
+
+// bz_channel_receive: return a task that will complete with the next item.
+// If items are available, the task is already-done (fast path). If the channel
+// is empty + closed, the task faults with ChannelClosedException.
+// If empty + open, the task is parked in the pending-receiver FIFO.
+//
+// The codegen-supplied cce_vtable is the ChannelClosedException vtable global.
+extern "C"
+void* bz_channel_receive(void* chp, void* cce_vtable) {
+    auto* ch = (bz_channel_t*)chp;
+    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    auto* task = new bz_task_t();
+    task->domain = g_main_domain;
+
+    void* item = nullptr;
+    bool  have_item = false;
+    bool  is_closed_empty = false;
+
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        if (!ch->items.empty()) {
+            item = ch->items.front();
+            ch->items.pop_front();
+            have_item = true;
+        } else if (ch->closed || ch->disposed) {
+            is_closed_empty = true;
+        } else {
+            // Park in pending-receiver FIFO.
+            ch->pending.push_back({task, task->domain});
+        }
+    }
+
+    if (have_item) {
+        // Fast path: already-done (item available).
+        bz_task_complete(task, &item, sizeof(void*));
+    } else if (is_closed_empty) {
+        // Fault: ChannelClosedException.
+        void* excObj = nullptr;
+        if (cce_vtable) {
+            excObj = calloc(1, 16);
+            memcpy(excObj, &cce_vtable, sizeof(void*));
+        }
+        bz_task_complete_error_obj(task, excObj);
+    }
+    // else: task is parked; bz_channel_send or sender_release will complete it.
+    return task;
+}
+
+// bz_channel_try_receive: non-blocking receive. If an item is available,
+// stores it in *out_item and returns 1. Otherwise returns 0.
+extern "C"
+int32_t bz_channel_try_receive(void* chp, void** out_item) {
+    auto* ch = (bz_channel_t*)chp;
+    std::lock_guard<std::mutex> lk(ch->mtx);
+    if (ch->items.empty()) return 0;
+    *out_item = ch->items.front();
+    ch->items.pop_front();
+    return 1;
+}
+
+// bz_channel_count: number of buffered (not-yet-received) items.
+extern "C"
+int64_t bz_channel_count(void* chp) {
+    auto* ch = (bz_channel_t*)chp;
+    std::lock_guard<std::mutex> lk(ch->mtx);
+    return (int64_t)ch->items.size();
+}
+
+// bz_channel_is_closed: true after the last sender has released.
+extern "C"
+int32_t bz_channel_is_closed(void* chp) {
+    auto* ch = (bz_channel_t*)chp;
+    std::lock_guard<std::mutex> lk(ch->mtx);
+    return ch->closed ? 1 : 0;
+}
+
+// Close the channel and fault any pending receivers with ChannelClosedException.
+// Called under external locking (the sender_count reaches 0).
+// cce_vtable may be null (best-effort, no exception object).
+static void channel_close_and_drain_pending(bz_channel_t* ch,
+                                            void* cce_vtable) {
+    std::deque<bz_pending_receiver_t> pending;
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        ch->closed = true;
+        pending.swap(ch->pending);
+    }
+    for (auto& r : pending) {
+        void* excObj = nullptr;
+        if (cce_vtable) {
+            excObj = calloc(1, 16);
+            memcpy(excObj, &cce_vtable, sizeof(void*));
+        }
+        bz_task_complete_error_obj(r.task, excObj);
+    }
+}
+
+// bz_channel_sender_release: release one sender handle. If this was the last
+// sender, close the channel. cce_vtable is the ChannelClosedException vtable.
+extern "C"
+void bz_channel_sender_release(void* txp, void* cce_vtable) {
+    if (!txp) return;
+    auto* tx = (bz_channel_sender_t*)txp;
+    bz_channel_t* ch = tx->ch;
+    delete tx;
+
+    bool last_sender = false;
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        ch->sender_count--;
+        if (ch->sender_count <= 0)
+            last_sender = true;
+    }
+    if (last_sender)
+        channel_close_and_drain_pending(ch, cce_vtable);
+}
+
+// bz_channel_dispose: §30.15 §28.11 dispose -- close the channel and dispose
+// any buffered (undelivered) items in REVERSE insertion order (§28.11 owned
+// column; per §28.11 v0.135 ordered-disposal-of-owned row). Then free the
+// channel object. cce_vtable is passed to close pending receivers.
+extern "C"
+void bz_channel_dispose(void* chp, void* cce_vtable) {
+    if (!chp) return;
+    auto* ch = (bz_channel_t*)chp;
+    // Drain pending receivers with closed error.
+    channel_close_and_drain_pending(ch, cce_vtable);
+    // Dispose undelivered items in REVERSE insertion order (§28.11).
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        ch->disposed = true;
+        if (ch->dispose_elem) {
+            // Reverse the deque items for disposal.
+            std::vector<void*> rev(ch->items.rbegin(), ch->items.rend());
+            ch->items.clear();
+            for (void* item : rev)
+                if (item) ch->dispose_elem(item);
+        } else {
+            ch->items.clear();
+        }
+    }
+    delete ch;
+}
+
+// ---------------------------------------------------------------------------
+// §30.14 (#600 phase c): Domain.Spawn
+//
+// bz_domain_spawn(entry_fn, arg_ptr, dfe_vtable) -- spawn a new domain that
+// runs entry_fn(arg_ptr) and returns an already-allocated join task.
+//
+// entry_fn signature: void* (*)(void*) -- takes the arg pointer, returns
+//   the result pointer (or null for void entry).  The codegen wraps the
+//   actual Bezel entry method in a static trampoline that matches this ABI.
+//
+// arg_ptr: pointer to the (owned) argument value (pointer for class types;
+//   address of a stack/heap copy for value types; null for no-arg entry).
+//   Ownership is transferred to the spawned domain.
+//
+// dfe_vtable: DomainFaultedException vtable (injected by codegen; null if
+//   the exception vtable is not available).
+//
+// Returns: a bz_task_t* join task (OwnedTask<R> or OwnedTask) that completes
+//   when the spawned domain finishes (or faults).
+// ---------------------------------------------------------------------------
+
+extern "C"
+void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
+                      void* dfe_vtable) {
+    if (!g_main_domain) g_main_domain = new bz_domain_t();
+    if (!g_scheduler) bz_scheduler_init(4);
+
+    // Allocate the join task -- the caller awaits this.
+    auto* join_task = new bz_task_t();
+    // The join task belongs to the CALLER's domain (main or current domain).
+    join_task->domain = g_main_domain;
+
+    // Allocate a FRESH domain for the spawned entry (§30.13 isolation).
+    auto* child_domain = new bz_domain_t();
+
+    struct SpawnCtx {
+        bz_domain_t*   child_domain;
+        bz_task_t*     join_task;
+        void* (*entry_fn)(void*);
+        void*          arg_ptr;
+        void*          dfe_vtable;
+    };
+    auto* ctx = new SpawnCtx{child_domain, join_task, entry_fn, arg_ptr, dfe_vtable};
+
+    // Schedule the entry as a continuation on the child domain.
+    auto entry_cont = [](void* /*task_unused*/, void* state) {
+        auto* sc = (SpawnCtx*)state;
+
+        // Per D-c5: call entry; detect fault via bz_exc.
+        // Save and clear bz_exc so a fault in the caller domain doesn't
+        // confuse the fault check.
+        extern void* bz_exc;
+        void* prev_exc = bz_exc;
+        bz_exc = nullptr;
+        void* result = sc->entry_fn(sc->arg_ptr);
+        void* fault_exc = bz_exc;
+        bz_exc = prev_exc;
+
+        if (fault_exc) {
+            // The entry faulted. Per §30.14: wrap in DomainFaultedException.
+            // Copy message from the original exception (offset 8 = message string*).
+            void* dfe_obj = nullptr;
+            if (sc->dfe_vtable) {
+                void* msg_ptr = nullptr;
+                if (fault_exc) {
+                    // Read message string pointer from the exception's slot 8.
+                    memcpy(&msg_ptr, (char*)fault_exc + 8, sizeof(void*));
+                    if (msg_ptr) bz_string_retain(msg_ptr);
+                }
+                dfe_obj = calloc(1, 16);
+                memcpy(dfe_obj, &sc->dfe_vtable, sizeof(void*));
+                if (msg_ptr) memcpy((char*)dfe_obj + 8, &msg_ptr, sizeof(void*));
+                // Dispose the original fault exception. Dynamic dispatch via
+                // vtable slot 2 (Dispose), then free.
+                void** fault_vtbl = nullptr;
+                memcpy(&fault_vtbl, fault_exc, sizeof(void*));
+                if (fault_vtbl && fault_vtbl[2]) {
+                    typedef void (*DispFn)(void*);
+                    ((DispFn)fault_vtbl[2])(fault_exc);
+                }
+                free(fault_exc);
+            }
+            bz_task_complete_error_obj(sc->join_task, dfe_obj);
+        } else {
+            // Normal completion. result is the ptr-sized result (class ptr or
+            // null for void entry).
+            bz_task_complete(sc->join_task, &result, sizeof(void*));
+        }
+
+        // The child domain is no longer needed; delete it here (safe: the
+        // domain drain loop exits after this continuation returns, and
+        // domain_drain accesses only dom->mtx/queue/active -- the structs
+        // remain valid until this call returns to domain_drain).
+        bz_domain_t* dom = sc->child_domain;
+        delete sc;
+        delete dom;
+    };
+
+    domain_enqueue(child_domain, entry_cont, nullptr, ctx);
+    return join_task;
+}

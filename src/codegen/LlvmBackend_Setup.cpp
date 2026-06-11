@@ -1533,6 +1533,13 @@ Emitter::builtinExceptionHierarchy() {
         {"TypeInitializationException", "Exception"},
         {"FormatException", "Exception"},
         {"StackOverflowException", "Exception"},
+        // §30.15 (#600 phase c): ChannelClosedException — raised when Receive()
+        // is called on a drained+closed Channel<T>.
+        {"ChannelClosedException", "Exception"},
+        // §30.14 (#600 phase c): DomainFaultedException — raised at the join
+        // of a spawned domain that threw an exception. Message carries a copy
+        // of the original exception's message text.
+        {"DomainFaultedException", "Exception"},
     };
     return h;
 }
@@ -4173,6 +4180,61 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (isCTS) {
             Disposal d{it->second, nullptr};
             d.cancellationTokenSource = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+    // §30.15 (#600 phase c): a `using var` bound to a Channel<T>.
+    // No user TypeSymbol; recognised by type name "Channel". At scope end,
+    // bz_channel_dispose is called (closes channel, faults pending receivers with
+    // ChannelClosedException, disposes undelivered items in reverse insertion
+    // order per §28.11).
+    // Detection: NewExpr type name OR inferred exprType name "Channel".
+    {
+        bool isCh = false;
+        auto isChannelTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "Channel";
+        };
+        if (ld->type)
+            isCh = isChannelTypeName(ctx_.resolvedType(*ld->type));
+        if (!isCh && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isCh = ne->type && ne->type->name &&
+                       !ne->type->name->parts.empty() &&
+                       ne->type->name->parts[0] == "Channel";
+        }
+        if (!isCh && ld->initializer)
+            isCh = isChannelTypeName(ctx_.exprType(*ld->initializer));
+        if (isCh) {
+            Disposal d{it->second, nullptr};
+            d.channel = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+    // §30.15 (#600 phase c): a `using var` bound to a ChannelSender<T>.
+    // No user TypeSymbol; recognised by type name "ChannelSender". At scope end,
+    // bz_channel_sender_release is called (decrements sender count; may close
+    // the channel if this was the last sender).
+    {
+        bool isTx = false;
+        auto isSenderTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "ChannelSender";
+        };
+        if (ld->type)
+            isTx = isSenderTypeName(ctx_.resolvedType(*ld->type));
+        if (!isTx && ld->initializer)
+            isTx = isSenderTypeName(ctx_.exprType(*ld->initializer));
+        if (isTx) {
+            Disposal d{it->second, nullptr};
+            d.channelSender = true;
             disposeStack_.back().push_back(d);
             return;
         }
@@ -7426,6 +7488,59 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_task_fire_and_forget",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {t});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §30.15 (#600 phase c): a `using var` Channel<T>. Dispose via
+        // bz_channel_dispose (closes, faults pending receivers with
+        // ChannelClosedException, disposes undelivered items in reverse order
+        // per §28.11, frees the struct). The ChannelClosedException vtable is
+        // retrieved from builtinVtable_ (set up by setupBuiltinExceptions).
+        if (it->channel) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* ch = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                ch, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB  = llvm::BasicBlock::Create(llvm_, "ch.dispose",  currentFn_);
+            auto* contBB  = llvm::BasicBlock::Create(llvm_, "ch.cont",     currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            // Get ChannelClosedException vtable (may be null before setup).
+            llvm::Value* cceVt = llvm::ConstantPointerNull::get(ptrTy());
+            {   auto vit = builtinVtable_.find("ChannelClosedException");
+                if (vit != builtinVtable_.end()) cceVt = vit->second;
+            }
+            auto* fn = declareC("bz_channel_dispose",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {ch, cceVt});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §30.15 (#600 phase c): a `using var` ChannelSender<T>. Release via
+        // bz_channel_sender_release (decrements sender count; may close the
+        // channel if this was the last sender).
+        if (it->channelSender) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* tx = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                tx, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* relBB  = llvm::BasicBlock::Create(llvm_, "tx.release",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "tx.cont",     currentFn_);
+            builder_.CreateCondBr(isNull, contBB, relBB);
+            builder_.SetInsertPoint(relBB);
+            llvm::Value* cceVt = llvm::ConstantPointerNull::get(ptrTy());
+            {   auto vit = builtinVtable_.find("ChannelClosedException");
+                if (vit != builtinVtable_.end()) cceVt = vit->second;
+            }
+            auto* fn = declareC("bz_channel_sender_release",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {tx, cceVt});
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

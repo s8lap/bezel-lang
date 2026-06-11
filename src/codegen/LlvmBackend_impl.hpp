@@ -552,6 +552,20 @@ private:
         // fallback" (class not statically known, or DisposeAsync not found).
         bool asyncDispose = false;
         llvm::Function* disposeAsyncFn = nullptr;
+        // §30.15 (#600 phase c): a `using var` bound to a Channel<T>. At scope
+        // end it is freed via bz_channel_dispose (closes the channel, faults any
+        // pending receivers with ChannelClosedException, disposes undelivered
+        // items in reverse insertion order per §28.11). No user TypeSymbol;
+        // recognised by the builtin type name "Channel". The element disposer
+        // (for class-typed T) is embedded in the channel struct itself (set at
+        // construction time), so the Disposal struct needs no extra field.
+        bool channel = false;
+        // §30.15 (#600 phase c): a `using var` bound to a ChannelSender<T>. At
+        // scope end it is released via bz_channel_sender_release (decrements
+        // sender count; if last sender, closes the channel and faults pending
+        // receivers with ChannelClosedException). No user TypeSymbol; recognised
+        // by the builtin type name "ChannelSender".
+        bool channelSender = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -4226,6 +4240,10 @@ private:
             // lowered it to {i8,i32} instead of ptr → LLVM GEP type assertion
             // crash on `Shared<T>? := null` / null-compare / `?.` / `!`.
             "Shared", "Weak",
+            // §30.14/§30.15 (#600 phase c): Channel<T> and ChannelSender<T>
+            // are compiler-known pointer-typed builtins backed by bz_channel_t
+            // and bz_channel_sender_t respectively.
+            "Channel", "ChannelSender",
         };
         if (kBuiltins.count(name)) return true;
         // §31.4: a built-in exception type (Exception / a subtype).
@@ -4420,6 +4438,10 @@ private:
     // Detect Convert.ToInt32(s) / Convert.ToInt64(s) / Math.Abs(n) etc.
     // as intrinsic static class method calls. Returns a lowered value or null.
     llvm::Value* tryLowerBuiltinClassCall(const ast::CallExpr& call);
+
+    // §30.14/§30.15 (#600 phase c): Channel<T>/ChannelSender<T> instance methods
+    // and Domain.Spawn(entry, arg?) lowering. Returns null when not matched.
+    llvm::Value* tryLowerChannelAndDomainCall(const ast::CallExpr& call);
 
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
     // The callee is a member access whose target is itself `Encoding.<singleton>`.

@@ -399,7 +399,11 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // instead of ptr (IR verification failure); Shared<T>? fell
                     // into the bare type-param nullable branch (returns {i8,i32}
                     // instead of ptr) → checkGEPType LLVM-assert crash.
-                    n == "Shared" || n == "Weak") {
+                    n == "Shared" || n == "Weak" ||
+                    // §30.14/§30.15 (#600 phase c): Channel<T> and ChannelSender<T>
+                    // are compiler-known heap-pointer builtins (bz_channel_t* and
+                    // bz_channel_sender_t* respectively). Both lower to ptrTy().
+                    n == "Channel" || n == "ChannelSender") {
                     return ptrTy();
                 }
             }
@@ -461,7 +465,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §28.13 / stdlib §2.16 (#620): imported Shared<T>/Weak<T>
                     // (type name carried in importedName — same fix as the
                     // astNode path above).
-                    n == "Shared" || n == "Weak") {
+                    n == "Shared" || n == "Weak" ||
+                    // §30.14/§30.15 (#600 phase c): imported Channel<T>/ChannelSender<T>.
+                    n == "Channel" || n == "ChannelSender") {
                     return ptrTy();
                 }
             }
