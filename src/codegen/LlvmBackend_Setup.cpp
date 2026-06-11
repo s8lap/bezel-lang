@@ -7352,6 +7352,19 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
             }
         }
     }
+    // #639 / §28.11: `using var u := item` where `item` is a drain-loop
+    // variable of user class type (an IdentifierExpr with no explicit
+    // type annotation). The ownership checker confirms the transfer; here
+    // we just need to recover the concrete class from the identifier's
+    // sema-resolved exprType so that registerUsingDisposal can push a
+    // static disposal entry (destructor runs at scope end).
+    if (!ld->type &&
+        dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+        if (auto* rt = ctx_.exprType(*ld->initializer)) {
+            if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration)
+                return rt->declaration;
+        }
+    }
     return nullptr;
 }
 

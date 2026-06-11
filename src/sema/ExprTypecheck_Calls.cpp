@@ -1463,6 +1463,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, oenTy);
                         }
                     }
+                    // #639 / stdlib §4.5/§4.7/§4.11 v0.135:
+                    // OwnedArray<T>.Drain(), OwnedLinkedList<T>.Drain(),
+                    // OwnedStack<T>.Drain(), OwnedQueue<T>.Drain() all
+                    // return OwnedEnumerable<T>.
+                    // T is the first (and only) generic argument of the receiver.
+                    // codegen's lowerOwnedSeqDrainFor handles all four;
+                    // it detects the collection kind from the receiver type name.
+                    if ((colName == "OwnedArray" ||
+                         colName == "OwnedLinkedList" ||
+                         colName == "OwnedStack" ||
+                         colName == "OwnedQueue") &&
+                        m == "Drain" && ce.args.empty() &&
+                        recvTy &&
+                        !recvTy->genericArgs.empty() &&
+                        recvTy->genericArgs[0]) {
+                        // Shared static astNode for OwnedEnumerable<T>.
+                        static const ast::Type* kOwnedEnumSeqNode =
+                            []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("OwnedEnumerable");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* oenTy = ctx_.makeTypeRef();
+                        oenTy->kind = TypeRef::Kind::Named;
+                        oenTy->declaration = nullptr;
+                        oenTy->astNode = kOwnedEnumSeqNode;
+                        oenTy->genericArgs.push_back(recvTy->genericArgs[0]); // T
+                        ctx_.setExprType(&ce, oenTy);
+                    }
                     // StringBuilder methods
                     if (colName == "StringBuilder") {
                         if (m == "ToString")

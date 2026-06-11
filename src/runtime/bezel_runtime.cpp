@@ -953,6 +953,40 @@ bool bz_dict_drain_next_gen(void* dp, int64_t* cursor,
     return false;
 }
 
+// issue #639 / stdlib §4.5/§4.7/§4.11 v0.135: OwnedArray<T> / OwnedLinkedList<T>
+// / OwnedStack<T> / OwnedQueue<T> .Drain() per-element pop.
+//
+// bz_array_drain_next — pops index 0 (front-to-back).
+// Used by OwnedArray<T>.Drain() (front-to-back per §28.11 "iteration order")
+// and OwnedQueue<T>.Drain() (FIFO, also front-to-back).
+// Returns true if an element was popped into *val_out; false when the array is
+// empty (drain complete). The caller takes ownership of the popped pointer.
+// The element slot is closed by bz_array_remove_at so count shrinks by 1.
+bool bz_array_drain_next(void* arrp, void** val_out) {
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr || arr->count == 0) return false;
+    // Read the pointer-sized element at index 0 (class-typed element).
+    void* elem = ((void**)arr->data)[0];
+    if (val_out) *val_out = elem;
+    // Remove the slot without disposal — ownership transferred to caller.
+    bz_array_remove_at(arrp, 0, (int64_t)sizeof(void*));
+    return true;
+}
+
+// bz_array_drain_next_lifo — pops the last element (LIFO / back-to-front).
+// Used by OwnedStack<T>.Drain() which pops in top-first order (the stack's
+// Pop order), matching "iteration order" per §28.11.
+bool bz_array_drain_next_lifo(void* arrp, void** val_out) {
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr || arr->count == 0) return false;
+    int64_t last = arr->count - 1;
+    void* elem = ((void**)arr->data)[last];
+    if (val_out) *val_out = elem;
+    // Shrink count by 1 (the last element's slot needs no shift).
+    arr->count = last;
+    return true;
+}
+
 // issue #389 / stdlib §4.10: fold a snapshot of `other`'s elements into/against
 // a dict-backed Set `self`. See the header for the `op` codes and the snapshot
 // contract. Frees the snapshot before returning. UnionWith/ExceptWith iterate
@@ -1284,6 +1318,24 @@ void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
         n = prv;
     }
     free(l);
+}
+
+// #639 / stdlib §4.7 v0.135: OwnedLinkedList<T>.Drain() per-element pop.
+// Pops the head node (front-to-back / head-to-tail per §28.11 "iteration order").
+// Returns the pointer stored inline in the head node into *val_out, then
+// unlinks and frees the node WITHOUT disposal (ownership transferred to caller).
+// Returns true if a node was popped; false if the list is empty.
+bool bz_llist_drain_next(void* listp, void** val_out) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->head) return false;
+    bz_llist_node_t* node = l->head;
+    // Element bytes stored inline after the node header; for class-typed T this
+    // is a single void* (the owned class pointer).
+    void* elem = *(void**)((char*)node + sizeof(bz_llist_node_t));
+    if (val_out) *val_out = elem;
+    // Unlink without disposal — ownership transferred to caller.
+    llist_unlink(l, node, /*dispose_elem=*/nullptr);
+    return true;
 }
 
 // ---------------------------------------------------------------------------

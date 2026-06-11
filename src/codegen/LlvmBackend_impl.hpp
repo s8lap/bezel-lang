@@ -4050,6 +4050,11 @@ private:
     // Returns false if the iterable is not a bare Dictionary<K,V> local.
     bool lowerDictEntryFor(const ast::ForStmt& fs);
 
+    // #639 / stdlib §4.5/§4.7/§4.11 v0.135: `for var x in coll.Drain()`
+    // ownership-transferring drain over OwnedArray<T>, OwnedLinkedList<T>,
+    // OwnedStack<T>, OwnedQueue<T>.
+    bool lowerOwnedSeqDrainFor(const ast::ForStmt& fs);
+
     // #628 / stdlib §4.9 v0.135: `for var entry in ownedDict.Drain()`
     // ownership-transferring drain iteration over OwnedDictionary<K,V>.
     bool lowerDictDrainFor(const ast::ForStmt& fs);
