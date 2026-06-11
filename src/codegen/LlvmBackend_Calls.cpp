@@ -7874,6 +7874,12 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // not the outer caller's. Save and restore around the body.
     const ast::Type* savedRetNode = currentReturnTypeNode_;
     currentReturnTypeNode_ = ci.returnType;
+    // fix #628 / §9.5 / §14.2: specFn is NOT registered in methodFns_, so
+    // lowerWith's reverse-lookup (fn == currentFn_ in methodFns_) cannot find
+    // the parent record TypeSymbol.  Store `ms` in currentSpecMethodSymbol_ for
+    // the duration of the body so lowerWith can use it as a fallback.
+    sema::MethodSymbol* savedSpecMs = currentSpecMethodSymbol_;
+    currentSpecMethodSymbol_ = ms;
 
     currentFn_ = specFn;
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", specFn);
@@ -7947,6 +7953,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     loopStack_ = std::move(savedLoop);
     disposeStack_ = std::move(savedDispose);
     currentReturnTypeNode_ = savedRetNode;
+    currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
 
     return specFn;
 }
@@ -8171,6 +8178,16 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     llvm::Value* savedCaught = currentCaughtExc_;
     std::size_t savedUnwindDepth = unwindScopeDepth_;
     bool savedDiverged = diverged_;
+    // fix #628 (phase a) / §9.5 / §14.2: for EXPRESSION-body generic record
+    // instance methods (`this with … end`), lowerWith's §575 reverse-lookup
+    // uses `currentFn_` to find the parent record TypeSymbol.  But
+    // emitInlineGenericMethod does NOT change currentFn_ (the inlining happens
+    // inside the CALLER's function), so the lookup finds the caller's function
+    // instead of Box.WithValue's registered template — and fails.  Store `ms`
+    // in currentSpecMethodSymbol_ as a fallback, exactly as buildSpecializedMethodFn
+    // does for block bodies.
+    sema::MethodSymbol* savedSpecMs = currentSpecMethodSymbol_;
+    currentSpecMethodSymbol_ = ms;
 
     // Bind this and params.
     currentThis_ = (!args.empty() && !isStaticMethod(ms))
@@ -8211,6 +8228,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     currentCaughtExc_ = savedCaught;
     unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;
+    currentSpecMethodSymbol_ = savedSpecMs;  // fix #628 (phase a)
 
     return result;
 }

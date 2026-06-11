@@ -509,6 +509,38 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     rt->declaration->decl);
                 if (!rt->genericArgs.empty() && rtd &&
                     rtd->genericParams.size() == rt->genericArgs.size()) {
+                    // fix #428 phase a / §14.2 / §9.4: a GENERIC RECORD's type
+                    // annotation (`Box<T>` as a method return or param type) should
+                    // lower to the SAME struct the body will use.  When all type
+                    // args are UNRESOLVED type-parameters (no declaration, single-
+                    // part name, not bound in the outer genericSubst_), lowering
+                    // each arg with the current (possibly empty) substitution
+                    // produces the i32 placeholder — identical in value to the
+                    // concrete `int` arg but a different LLVM named struct type
+                    // (e.g. %record.Box$spec0 vs %record.Box).  The template body
+                    // uses the UNSPECIALIZED %record.Box (classStruct with no
+                    // active subst), so the two differ and LLVM rejects the `ret`
+                    // instruction.  Skip specialization when every arg is still an
+                    // unbound placeholder; the caller (declareFunctions, template
+                    // body) is building the unspecialized template and must use the
+                    // same base struct as the template body.
+                    bool allUnbound = true;
+                    for (const auto& arg : rt->genericArgs) {
+                        if (!arg) { allUnbound = false; break; }
+                        // An unbound type param: Named kind, no declaration,
+                        // single-part name, NOT bound in the current outer subst.
+                        if (arg->kind != sema::TypeRef::Kind::Named ||
+                            arg->declaration ||
+                            !arg->astNode || !arg->astNode->name ||
+                            arg->astNode->name->parts.size() != 1 ||
+                            genericSubst_.count(arg->astNode->name->parts[0])) {
+                            allUnbound = false;
+                            break;
+                        }
+                    }
+                    if (allUnbound)
+                        return recordStruct(rt->declaration);  // unspecialized
+
                     auto savedSubst = genericSubst_;
                     auto savedSemaTy = genericSubstSemaTy_;
                     std::unordered_map<std::string_view, llvm::Type*> newSubst;
