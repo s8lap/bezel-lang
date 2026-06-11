@@ -5355,6 +5355,290 @@ extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
 }
 
 // ---------------------------------------------------------------------------
+// Encoding: Utf16 / Utf32 / Ascii (stdlib §3.2, v0.136).
+//
+// All three follow the strict error model: malformed or unrepresentable input
+// is a defined fault — FormatException — not a silent substitution.  The
+// codegen callers (tryLowerEncodingCall) check the return value for NULL and
+// emit emitGuardThrow(null_check, "FormatException").
+//
+// Return convention:
+//   GetBytes: returns a fresh owned bz_array_t* on success, NULL on error.
+//   GetString: returns a fresh +1 managed bz.string* on success, NULL on error.
+//
+// Utf16 = UTF-16LE (stdlib §3.2 v0.136):
+//   GetBytes:  never fails (every Unicode scalar value is representable; BMP
+//              chars → 2 bytes LE, supplementary → 4 bytes LE surrogate pair).
+//   GetString: requires even byte count, consumes one leading LE BOM (FF FE)
+//              if present, raises FormatException on odd count, a big-endian
+//              BOM (FE FF), or an unpaired surrogate.
+//
+// Utf32 = UTF-32LE (stdlib §3.2 v0.136):
+//   GetBytes:  never fails.
+//   GetString: requires byte count divisible by 4, consumes one leading LE BOM
+//              if present, raises FormatException on non-scalar-value code
+//              points (> U+10FFFF or in the surrogate range U+D800..U+DFFF).
+//
+// Ascii = strict 7-bit (stdlib §3.2 v0.136):
+//   GetBytes:  raises FormatException on any code point above U+007F.
+//   GetString: raises FormatException on any byte above 0x7F.
+
+extern "C" void* bz_encoding_utf16_get_bytes(const void* strp) {
+    // Utf16 GetBytes: encode each code point as UTF-16LE.  Bezel strings carry
+    // native Unicode code points; emit BMP chars as 2-byte LE, supplementary
+    // chars as 4-byte LE surrogate pair.  No BOM emitted (stdlib §3.2 v0.136).
+    // Returns a fresh owned Array<byte> (elem_size 1).  Never fails.
+    void* arr = bz_array_alloc(1, 0);
+    if (!strp) return arr;
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len;
+    if (n < 0) n = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp;
+        if (s->width == 1)      cp = ((const uint8_t*)s->data)[i];
+        else if (s->width == 2) cp = ((const uint16_t*)s->data)[i];
+        else                    cp = ((const uint32_t*)s->data)[i];
+        if (cp <= 0xFFFF) {
+            // BMP: emit as 2-byte LE unit.
+            uint8_t b[2] = { (uint8_t)(cp & 0xFF), (uint8_t)(cp >> 8) };
+            bz_array_add(arr, &b[0], 1);
+            bz_array_add(arr, &b[1], 1);
+        } else {
+            // Supplementary: encode as surrogate pair.
+            cp -= 0x10000;
+            uint16_t hi = (uint16_t)(0xD800 | (cp >> 10));
+            uint16_t lo = (uint16_t)(0xDC00 | (cp & 0x3FF));
+            uint8_t b[4] = { (uint8_t)(hi & 0xFF), (uint8_t)(hi >> 8),
+                             (uint8_t)(lo & 0xFF), (uint8_t)(lo >> 8) };
+            bz_array_add(arr, &b[0], 1); bz_array_add(arr, &b[1], 1);
+            bz_array_add(arr, &b[2], 1); bz_array_add(arr, &b[3], 1);
+        }
+    }
+    return arr;
+}
+
+// Utf16 GetString(bytes, index, count): decode `count` UTF-16LE bytes starting
+// at `index` of the byte array.  Consumes one leading LE BOM if present.
+// Returns NULL (→ FormatException) on odd count, big-endian BOM, or unpaired
+// surrogate.  On success returns a fresh +1 managed bz.string*.
+extern "C" void* bz_encoding_utf16_get_string(void* arrp, int64_t index,
+                                               int64_t count) {
+    auto* arr = (bz_array_t*)arrp;
+    const uint8_t* data = arr ? (const uint8_t*)arr->data : nullptr;
+    int64_t total = arr ? arr->count : 0;
+    if (index < 0) index = 0;
+    if (count < 0) count = 0;
+    if (index > total) index = total;
+    if (index + count > total) count = total - index;
+    // Odd byte count → FormatException.
+    if (count % 2 != 0) return nullptr;
+    const uint8_t* p = data + index;
+    int64_t nBytes = count;
+    int64_t pos = 0;
+
+    // Check for and consume leading BOM (FF FE = LE, allowed; FE FF = BE, error).
+    if (nBytes >= 2) {
+        if (p[0] == 0xFF && p[1] == 0xFE) {
+            pos = 2;  // consume LE BOM
+        } else if (p[0] == 0xFE && p[1] == 0xFF) {
+            return nullptr;  // big-endian BOM → FormatException
+        }
+    }
+
+    // Decode UTF-16LE units into a temporary code-point buffer.
+    // Maximum code points = nBytes/2 (surrogates pair into one cp, so actual ≤ nBytes/2).
+    int64_t maxCp = (nBytes - pos) / 2;
+    uint32_t* cps = (uint32_t*)malloc((size_t)(maxCp > 0 ? maxCp : 1) * 4);
+    int64_t ncp = 0;
+    uint32_t maxVal = 0;
+
+    while (pos + 2 <= nBytes) {
+        uint16_t unit = (uint16_t)(p[pos] | (p[pos + 1] << 8));
+        pos += 2;
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            // High surrogate: must be followed by a low surrogate.
+            if (pos + 2 > nBytes) { free(cps); return nullptr; }
+            uint16_t lo = (uint16_t)(p[pos] | (p[pos + 1] << 8));
+            pos += 2;
+            if (lo < 0xDC00 || lo > 0xDFFF) { free(cps); return nullptr; }
+            uint32_t cp = 0x10000 + (((uint32_t)(unit & 0x3FF)) << 10) +
+                          (uint32_t)(lo & 0x3FF);
+            cps[ncp++] = cp;
+            if (cp > maxVal) maxVal = cp;
+        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            // Unpaired low surrogate → FormatException.
+            free(cps); return nullptr;
+        } else {
+            cps[ncp++] = (uint32_t)unit;
+            if ((uint32_t)unit > maxVal) maxVal = (uint32_t)unit;
+        }
+    }
+
+    // Pack into adaptive-width string (§4.6).
+    int8_t width = (maxVal <= 0xFF) ? 1 : (maxVal <= 0xFFFF ? 2 : 4);
+    void* sdata = malloc((size_t)(ncp > 0 ? ncp : 1) * (size_t)width);
+    if (width == 1) {
+        uint8_t* d = (uint8_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = (uint8_t)cps[k];
+    } else if (width == 2) {
+        uint16_t* d = (uint16_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = (uint16_t)cps[k];
+    } else {
+        uint32_t* d = (uint32_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = cps[k];
+    }
+    free(cps);
+
+    uint8_t* str = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(str, &sdata, sizeof(void*));
+    memcpy(str + 8, &ncp, sizeof(int64_t));
+    str[16] = (uint8_t)width;
+    bz_string_init_rc(str);
+    return str;
+}
+
+// Utf32 GetBytes: encode each code point as 4-byte LE.  No BOM emitted.
+// Never fails (all Bezel code points are valid Unicode scalar values).
+extern "C" void* bz_encoding_utf32_get_bytes(const void* strp) {
+    void* arr = bz_array_alloc(1, 0);
+    if (!strp) return arr;
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len;
+    if (n < 0) n = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp;
+        if (s->width == 1)      cp = ((const uint8_t*)s->data)[i];
+        else if (s->width == 2) cp = ((const uint16_t*)s->data)[i];
+        else                    cp = ((const uint32_t*)s->data)[i];
+        uint8_t b[4] = { (uint8_t)(cp & 0xFF), (uint8_t)((cp >> 8) & 0xFF),
+                         (uint8_t)((cp >> 16) & 0xFF), (uint8_t)((cp >> 24) & 0xFF) };
+        bz_array_add(arr, &b[0], 1); bz_array_add(arr, &b[1], 1);
+        bz_array_add(arr, &b[2], 1); bz_array_add(arr, &b[3], 1);
+    }
+    return arr;
+}
+
+// Utf32 GetString(bytes, index, count): decode `count` UTF-32LE bytes.
+// Requires byte count divisible by 4; consumes one leading LE BOM (00 00 FE FF
+// in LE byte order = bytes 0xFF,0xFE,0x00,0x00).  Returns NULL on non-divisible
+// count or any code unit that is not a Unicode scalar value (> U+10FFFF or in
+// the surrogate range U+D800..U+DFFF).
+extern "C" void* bz_encoding_utf32_get_string(void* arrp, int64_t index,
+                                               int64_t count) {
+    auto* arr = (bz_array_t*)arrp;
+    const uint8_t* data = arr ? (const uint8_t*)arr->data : nullptr;
+    int64_t total = arr ? arr->count : 0;
+    if (index < 0) index = 0;
+    if (count < 0) count = 0;
+    if (index > total) index = total;
+    if (index + count > total) count = total - index;
+    // Count must be divisible by 4.
+    if (count % 4 != 0) return nullptr;
+    const uint8_t* p = data + index;
+    int64_t nBytes = count;
+    int64_t pos = 0;
+
+    // Check for and consume leading LE BOM (0xFF 0xFE 0x00 0x00 = U+FEFF in LE).
+    if (nBytes >= 4 &&
+        p[0] == 0xFF && p[1] == 0xFE && p[2] == 0x00 && p[3] == 0x00) {
+        pos = 4;  // consume LE BOM
+    }
+
+    int64_t nUnits = (nBytes - pos) / 4;
+    uint32_t* cps = (uint32_t*)malloc((size_t)(nUnits > 0 ? nUnits : 1) * 4);
+    int64_t ncp = 0;
+    uint32_t maxVal = 0;
+
+    while (pos + 4 <= nBytes) {
+        uint32_t cp = (uint32_t)(p[pos]) | ((uint32_t)(p[pos+1]) << 8) |
+                      ((uint32_t)(p[pos+2]) << 16) | ((uint32_t)(p[pos+3]) << 24);
+        pos += 4;
+        // Validate: must be a Unicode scalar value.
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            free(cps); return nullptr;
+        }
+        cps[ncp++] = cp;
+        if (cp > maxVal) maxVal = cp;
+    }
+
+    int8_t width = (maxVal <= 0xFF) ? 1 : (maxVal <= 0xFFFF ? 2 : 4);
+    void* sdata = malloc((size_t)(ncp > 0 ? ncp : 1) * (size_t)width);
+    if (width == 1) {
+        uint8_t* d = (uint8_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = (uint8_t)cps[k];
+    } else if (width == 2) {
+        uint16_t* d = (uint16_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = (uint16_t)cps[k];
+    } else {
+        uint32_t* d = (uint32_t*)sdata;
+        for (int64_t k = 0; k < ncp; ++k) d[k] = cps[k];
+    }
+    free(cps);
+
+    uint8_t* str = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(str, &sdata, sizeof(void*));
+    memcpy(str + 8, &ncp, sizeof(int64_t));
+    str[16] = (uint8_t)width;
+    bz_string_init_rc(str);
+    return str;
+}
+
+// Ascii GetBytes: strict 7-bit.  Returns NULL (→ FormatException) if any code
+// point is above U+007F.  Otherwise returns a fresh owned Array<byte>.
+extern "C" void* bz_encoding_ascii_get_bytes(const void* strp) {
+    if (!strp) return bz_array_alloc(1, 0);
+    const auto* s = (const bz_string_struct*)strp;
+    int64_t n = s->len;
+    if (n < 0) n = 0;
+    // Pre-check: any non-ASCII code point → fail.
+    for (int64_t i = 0; i < n; ++i) {
+        uint32_t cp;
+        if (s->width == 1)      cp = ((const uint8_t*)s->data)[i];
+        else if (s->width == 2) cp = ((const uint16_t*)s->data)[i];
+        else                    cp = ((const uint32_t*)s->data)[i];
+        if (cp > 0x7F) return nullptr;  // → FormatException
+    }
+    void* arr = bz_array_alloc(1, (int)n);
+    for (int64_t i = 0; i < n; ++i) {
+        uint8_t b;
+        if (s->width == 1) b = ((const uint8_t*)s->data)[i];
+        else if (s->width == 2) b = (uint8_t)((const uint16_t*)s->data)[i];
+        else b = (uint8_t)((const uint32_t*)s->data)[i];
+        bz_array_add(arr, &b, 1);
+    }
+    return arr;
+}
+
+// Ascii GetString(bytes, index, count): strict 7-bit decode.  Returns NULL
+// (→ FormatException) if any byte is above 0x7F.  Otherwise returns a fresh
+// +1 managed bz.string* with width=1.
+extern "C" void* bz_encoding_ascii_get_string(void* arrp, int64_t index,
+                                               int64_t count) {
+    auto* arr = (bz_array_t*)arrp;
+    const uint8_t* data = arr ? (const uint8_t*)arr->data : nullptr;
+    int64_t total = arr ? arr->count : 0;
+    if (index < 0) index = 0;
+    if (count < 0) count = 0;
+    if (index > total) index = total;
+    if (index + count > total) count = total - index;
+    const uint8_t* p = data + index;
+    // Pre-check: any byte above 0x7F → FormatException.
+    for (int64_t i = 0; i < count; ++i) {
+        if (p[i] > 0x7F) return nullptr;
+    }
+    // All bytes are valid ASCII (== code points 0–127, width 1).
+    void* sdata = malloc((size_t)(count > 0 ? count : 1));
+    memcpy(sdata, p, (size_t)count);
+    int64_t ncp = count;
+    uint8_t* str = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(str, &sdata, sizeof(void*));
+    memcpy(str + 8, &ncp, sizeof(int64_t));
+    str[16] = 1;  // width = 1 (ASCII fits in one byte)
+    bz_string_init_rc(str);
+    return str;
+}
+
+// ---------------------------------------------------------------------------
 // String reference counting (§4.6 / §28.9, issue #422 strings increment).
 //
 // `string` is runtime-managed: "its memory is reclaimed automatically" (§4.6).

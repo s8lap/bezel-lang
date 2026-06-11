@@ -957,8 +957,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         return true;
                     }
-                    // stdlib §5 (#650): FirstOrNull(pred) on lazy receiver → T?.
-                    if (m == "FirstOrNull" && ce.args.size() == 1) {
+                    // stdlib §5 (#650/#661): FirstOrNull(pred)/SingleOrNull(pred)
+                    // on lazy receiver → T?.
+                    if ((m == "FirstOrNull" || m == "SingleOrNull") &&
+                        ce.args.size() == 1) {
                         if (srcElem) {
                             auto* nullTy = ctx_.makeTypeRef();
                             *nullTy = *srcElem;
@@ -1312,9 +1314,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             nullTy->nullable = true;
                             ctx_.setExprType(&ce, nullTy);
                         }
-                        // stdlib §5 (#650): FirstOrNull(predicate) — returns T?
-                        // for the predicate form (the no-predicate form is above).
-                        else if (m == "FirstOrNull" && ce.args.size() == 1 &&
+                        // stdlib §5 (#650/#661): FirstOrNull(predicate) /
+                        // SingleOrNull(predicate) — returns T? for the predicate
+                        // form (the no-predicate form is above).
+                        else if ((m == "FirstOrNull" || m == "SingleOrNull") &&
+                                 ce.args.size() == 1 &&
                                  !recvTy->genericArgs.empty() &&
                                  recvTy->genericArgs[0]) {
                             auto* nullTy = ctx_.makeTypeRef();
@@ -3626,21 +3630,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (auto* eid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
             if (eid->name == "Encoding") {
                 const auto& sg = ma.member;
-                if (sg == "Utf8") {
+                if (sg == "Utf8" || sg == "Utf16" || sg == "Utf32" ||
+                    sg == "Ascii") {
+                    // stdlib §3.2 v0.136: all four singletons now implemented.
                     auto* encTy = ctx_.makeTypeRef();
                     encTy->kind = TypeRef::Kind::Named;
                     encTy->declaration = builtinClassSym("Encoding");
                     ctx_.setExprType(&ma, encTy);
-                    return;
-                }
-                if (sg == "Utf16" || sg == "Utf32" || sg == "Ascii") {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        "`Encoding." + std::string(sg) +
-                        "` is not yet implemented; only `Encoding.Utf8` is "
-                        "available (stdlib §3.2). The Utf16/Utf32/Ascii "
-                        "GetBytes/GetString semantics are not specified, so "
-                        "they are deferred rather than guessed");
                     return;
                 }
             }
