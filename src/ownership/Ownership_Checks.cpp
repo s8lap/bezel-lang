@@ -283,7 +283,39 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-        if (call->callee) checkRead(*call->callee, /*selfTarget=*/true);
+        // §28.2: a further Dispose() call on an already-disposed instance is
+        // handled by markDisposedByName (further below), which emits the
+        // "already disposed" error.  We must NOT also fire the §28.2
+        // use-after-dispose WARNING for `x.Dispose()` when x is already
+        // Disposed — that would be a noisy second diagnostic for the same
+        // site.  However, for other ownership states (Uninitialized,
+        // MovedFrom) the callee read-check MUST fire so that reading an
+        // uninitialized or moved-from local via `.Dispose()` is diagnosed.
+        // Strategy: if this is `x.Dispose()` and x is currently Disposed,
+        // skip checkRead (markDisposedByName will diagnose); otherwise call
+        // checkRead normally. // per §28.2
+        bool skipCalleeReadForDispose = false;
+        if (call->callee) {
+            if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call->callee.get())) {
+                if (cma->member == "Dispose") {
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            cma->target.get())) {
+                        // Only skip read-check if the local is already Disposed
+                        // (the double-dispose case that markDisposedByName handles).
+                        for (auto& [s, lo] : states_) {
+                            if (s->name == tid->name) {
+                                skipCalleeReadForDispose =
+                                    (lo.state == OwnershipState::Disposed);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (call->callee && !skipCalleeReadForDispose)
+            checkRead(*call->callee, /*selfTarget=*/true);
         // Slice O14 + §28.8: argument-mode handling.
         std::size_t pos = 0;
         for (const auto& a : call->args) {
@@ -542,10 +574,26 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 "` was already moved out at this point (§28.3)");
             st->state = OwnershipState::Poisoned;
         } else if (st->state == OwnershipState::Disposed) {
+            // §28.2 v0.131: emit a compile-time warning (not an error) when a
+            // local is used after an explicit Dispose() that dominates the use
+            // site on every path — the statically-decidable subset of
+            // use-after-dispose.  "Should" in the spec maps to Warning severity
+            // (the runtime checked mode, §28.2 checked mode, handles the error
+            // path).  If we have the dispose-site location, emit a Note pointing
+            // at it so the programmer can see both sites in a single diagnostic
+            // sequence.
             report(
-                Severity::Error, id->span.begin,
-                std::string("read of disposed local `") +
-                std::string(id->name) + "` (§28.3)");
+                Severity::Warning, id->span.begin,
+                std::string("use of `") + std::string(id->name) +
+                "` after a dominating explicit Dispose() call — "
+                "use-after-dispose is undefined behaviour in unchecked mode "
+                "and raises DisposedAccessException in checked mode (§28.2)");
+            if (st->explicitlyDisposed && st->explicitDisposeLoc.line != 0) {
+                report(
+                    Severity::Note, st->explicitDisposeLoc,
+                    std::string("explicit Dispose() of `") +
+                    std::string(id->name) + "` was here");
+            }
             st->state = OwnershipState::Poisoned;
         } else if (st->state == OwnershipState::Uninitialized &&
                    isOwnedRelevantLocal(sym)) {
@@ -1750,6 +1798,8 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
         return;
     }
     st->state = OwnershipState::Disposed;
+    st->explicitlyDisposed = true;
+    st->explicitDisposeLoc = loc;
 }
 
 void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc) {

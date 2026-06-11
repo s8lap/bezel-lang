@@ -52,6 +52,19 @@ struct LocalOwnership {
     const ast::Node* obligationOrigin = nullptr;
     // True for `using var` — discharge is implicit at scope exit.
     bool implicitDischarge = false;
+    // §28.2 v0.131: location of an explicit `.Dispose()` call that put this
+    // local into the Disposed state. Populated by markDisposedByName; used
+    // to attach a Note pointing at the dispose site on the use-after-dispose
+    // warning.  Zero-initialised (invalid) when the local was never explicitly
+    // disposed (state transitions from Owned → Disposed only through an
+    // explicit call, so the field is always valid when state == Disposed from
+    // an explicit call; the only other path to Disposed is markDisposedByName).
+    SourceLocation explicitDisposeLoc;
+    // True when the Disposed state was set by an explicit x.Dispose() call (as
+    // opposed to the using-var implicit scope-end disposal, where we never call
+    // markDisposedByName from the checker because the implicit dispose doesn't
+    // pass through the ownership-checker code path that reads the state).
+    bool explicitlyDisposed = false;
 
     // Async-readiness 3c: SuspendLocal annotation (§30.5 / §30.9). True when
     // this owned local's live range crosses at least one `await` suspend
