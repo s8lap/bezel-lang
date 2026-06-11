@@ -533,6 +533,24 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         if (t.name->parts.size() == 1) {
             int arity = builtinTypeArity(first);
             if (arity != kNotBuiltin) {
+                // §2.15 / issue #631: BinarySerializer / BinaryDeserializer
+                // live in System.Serialization and require an explicit
+                // `import System.Serialization;` (stdlib §2.15). The
+                // compiler previously resolved them unconditionally (like the
+                // always-available builtins), which caused silent codegen on
+                // no-import code and a segfault at runtime. Emit a compile
+                // error when the required import is absent. The TypeRef is
+                // still populated so the pass does not cascade further errors.
+                if ((first == "BinarySerializer" ||
+                     first == "BinaryDeserializer") &&
+                    !sourceImports_.count("System.Serialization")) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("`") + std::string(first) +
+                        "` is declared in `System.Serialization` and "
+                        "requires `import System.Serialization;` "
+                        "(\xC2\xA7""2.15, #631)");
+                }
                 ref.kind = TypeRef::Kind::Named;
                 ref.declaration = nullptr;
                 int n = static_cast<int>(t.genericArgs.size());

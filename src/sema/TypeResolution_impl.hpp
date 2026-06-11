@@ -53,6 +53,12 @@ private:
 
     SemaContext& ctx_;
 
+    // §2.15 / issue #631: the set of dotted namespace names declared with
+    // `import` in the current source file. Populated in run() from
+    // src.imports and consulted in resolveNamed to gate builtin types that
+    // require an explicit import (BinarySerializer / BinaryDeserializer).
+    std::unordered_set<std::string> sourceImports_;
+
     // Slice S38 (§13.7 / Appendix C.2): a class's base class and
     // implemented interfaces must be at least as visible as the class.
     // Effective top-level visibility defaults to `internal`. Restricted

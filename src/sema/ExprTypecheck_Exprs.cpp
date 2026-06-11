@@ -824,6 +824,34 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         }
                     }
                 }
+                // §2.15 / issue #631: `new BinaryDeserializer(arg)` requires
+                // `arg` to be a `ReadOnlySpan<byte>` (the result of calling
+                // `.AsReadOnlySpan()` on an `OwnedBuffer<byte>`). Passing the
+                // owned buffer directly (`new BinaryDeserializer(bytes)` where
+                // `bytes: OwnedBuffer<byte>`) is a type error — the constructor
+                // signature is `BinaryDeserializer(input: ReadOnlySpan<byte>)`
+                // (stdlib §2.15). Without this check the wrong-arg form compiled
+                // silently and segfaulted at runtime.
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->astNode->name->parts[0] == "BinaryDeserializer" &&
+                    !ne->args.empty() && ne->args[0].value) {
+                    const TypeRef* arg0 = ctx_.exprType(*ne->args[0].value);
+                    if (arg0 && arg0->kind == TypeRef::Kind::Named &&
+                        !arg0->declaration && arg0->astNode &&
+                        arg0->astNode->name &&
+                        !arg0->astNode->name->parts.empty() &&
+                        arg0->astNode->name->parts[0] == "OwnedBuffer") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ne->args[0].value->span.begin,
+                            "`new BinaryDeserializer(...)` expects "
+                            "`ReadOnlySpan<byte>` as its first argument "
+                            "(stdlib \xC2\xA7""2.15); got `OwnedBuffer<byte>` — "
+                            "call `.AsReadOnlySpan()` first "
+                            "(\xC2\xA7""2.15, #631)");
+                    }
+                }
                 // Slice S11: forbid `new` on abstract or static
                 // class types. Interfaces and (purely declarative)
                 // static-only types are also non-instantiable.

@@ -36,6 +36,19 @@ PrimitiveType primitiveFromName(std::string_view name) {
 }
 
 void Resolver::run(const ast::SourceFile& src) {
+    // §2.15 / issue #631: build the set of imported namespace names so that
+    // import-gated builtin types (BinarySerializer / BinaryDeserializer) can be
+    // checked in resolveNamed. Every `import X;` contributes its dotted name.
+    sourceImports_.clear();
+    for (const auto& imp : src.imports) {
+        if (!imp || !imp->name) continue;
+        std::string dotted;
+        for (std::size_t i = 0; i < imp->name->parts.size(); ++i) {
+            if (i != 0) dotted += '.';
+            dotted += std::string(imp->name->parts[i]);
+        }
+        sourceImports_.insert(std::move(dotted));
+    }
     Scope moduleScope;
     // Populate module-scope: every top-level type / alias by name.
     if (ctx_.module()) {
