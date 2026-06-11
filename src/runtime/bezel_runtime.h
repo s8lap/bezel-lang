@@ -376,6 +376,84 @@ double  bz_random_next_double(void* r);
 void    bz_random_next_bytes(void* r, uint8_t* buf, int64_t len);
 
 // ---------------------------------------------------------------------------
+// decimal (§4.4 / stdlib §9.3) — 128-bit high-precision decimal type.
+//
+// Layout: .NET-compatible four-word struct (16 bytes, same as System.Decimal):
+//   { uint32_t lo32, uint32_t mid32, uint32_t hi32, uint32_t flags }
+// where lo32/mid32/hi32 are the low/middle/high 32 bits of the 96-bit
+// unsigned integer mantissa, and flags encodes:
+//   bit 31        = sign (1 = negative)
+//   bits 16..23   = scale (0..28, decimal point position from the right)
+//   all other bits = 0
+//
+// All functions take a pointer to bz_decimal_t for ABI clarity (16-byte
+// struct passing is architecture-specific; pointer avoids the ambiguity).
+// Return values are written via an out-pointer too.  The caller allocates
+// stack storage (entry alloca) and passes its address.
+//
+// Errors (per fix #521 / §6.4):
+//   bz_decimal_div and bz_decimal_mod: divisor-zero precondition is checked
+//     INLINE by the codegen (DivideByZeroException via emitGuardThrow).
+//   bz_decimal_add/sub/mul/div/mod: accept ove_vtable (OverflowException vtable);
+//     on overflow store the exception object in bz_exc and return.
+//     Callers call emitPendingCheck() after each call.
+//   bz_decimal_from_double: same — ove_vtable for out-of-range.
+//   bz_decimal_parse / bz_decimal_parse_cstr: ove_vtable for out-of-range,
+//     fe_vtable (FormatException vtable) for malformed input.
+// ---------------------------------------------------------------------------
+
+typedef struct { uint32_t lo32; uint32_t mid32; uint32_t hi32; uint32_t flags; }
+    bz_decimal_t;
+
+// Arithmetic — result written to *out.
+// per fix #521 / §6.4: ove_vtable is the OverflowException vtable (may be
+// null at compile-time; emitPendingCheck() is called by codegen after each op).
+void bz_decimal_add(const bz_decimal_t* a, const bz_decimal_t* b,
+                    bz_decimal_t* out, void* ove_vtable);
+void bz_decimal_sub(const bz_decimal_t* a, const bz_decimal_t* b,
+                    bz_decimal_t* out, void* ove_vtable);
+void bz_decimal_mul(const bz_decimal_t* a, const bz_decimal_t* b,
+                    bz_decimal_t* out, void* ove_vtable);
+void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
+                    bz_decimal_t* out, void* ove_vtable);
+void bz_decimal_mod(const bz_decimal_t* a, const bz_decimal_t* b,
+                    bz_decimal_t* out, void* ove_vtable);
+void bz_decimal_neg(const bz_decimal_t* a, bz_decimal_t* out);
+
+// Comparison — returns negative/zero/positive like memcmp.
+int32_t bz_decimal_cmp(const bz_decimal_t* a, const bz_decimal_t* b);
+
+// Conversions — from integer (per §5.1 implicit widening table).
+void bz_decimal_from_int64(int64_t v, bz_decimal_t* out);
+void bz_decimal_from_int32(int32_t v, bz_decimal_t* out);
+
+// Conversions — from/to double (explicit only, per §5.2).
+// per fix #521: ove_vtable for out-of-range values.
+void   bz_decimal_from_double(double v, bz_decimal_t* out, void* ove_vtable);
+double bz_decimal_to_double(const bz_decimal_t* a);
+
+// Parse from string (stdlib §9.3 Decimal.Parse / TryParse).
+// per fix #521: bz_decimal_parse raises FormatException (fe_vtable) for
+// malformed input and OverflowException (ove_vtable) for out-of-range.
+// bz_decimal_try_parse returns 0/1 with no exception.
+void    bz_decimal_parse(const void* str, bz_decimal_t* out,
+                         void* ove_vtable, void* fe_vtable);
+int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out);
+
+// ToString (stdlib §9.3 Decimal.ToString()) — returns a new bz_string* (rc=1).
+void* bz_decimal_to_string(const bz_decimal_t* a);
+
+// Round(digits: int) — result written to *out.
+void bz_decimal_round(const bz_decimal_t* a, int32_t digits, bz_decimal_t* out);
+
+// Literal parse at compile-time (called by runtime init for MinValue/MaxValue).
+// Same as bz_decimal_parse but takes a null-terminated C string.
+// per fix #521: ove_vtable/fe_vtable may be nullptr for compile-time use
+// (literals are lexer-validated; overflow cannot occur for known constants).
+void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
+                            void* ove_vtable, void* fe_vtable);
+
+// ---------------------------------------------------------------------------
 // Guid (stdlib §2.6) — 128-bit globally unique identifier.
 // Layout: two uint64_t fields (lo, hi) — a 16-byte value type. All functions
 // take pointers to bz_guid_t so the value can be passed without LLVM ABI

@@ -14,6 +14,9 @@ llvm::Type* Emitter::lowerPrimitive(sema::PrimitiveType p) {
         case P::Long: case P::ULong:   return i64();
         case P::Int: case P::UInt: case P::Char:
                                        return i32();
+        // §4.4 fix #521: decimal is a 128-bit value type { i32 lo, i32 mid, i32 hi, i32 flags }.
+        // Layout is .NET-compatible: 96-bit mantissa (lo/mid/hi) + scale + sign in flags.
+        case P::Decimal:               return decimalStructType();
         // CG27a (§4.6): string is a reference type — pointer to bz_string.
         case P::String:                return ptrTy();
         // §8.1: Object is the universal reference root — every reference type

@@ -1403,6 +1403,677 @@ void bz_random_next_bytes(void* rp, uint8_t* buf, int64_t len) {
 }
 
 // ---------------------------------------------------------------------------
+// decimal (§4.4 / stdlib §9.3) — 128-bit high-precision decimal type.
+//
+// Representation: bz_decimal_t = { uint32_t lo32, mid32, hi32, flags }
+//   flags bit 31  = sign (1 = negative)
+//   flags bits 16..23 = scale s (0..28): value = mantissa / 10^s
+//   mantissa = (hi32 << 64) | (mid32 << 32) | lo32  (96-bit unsigned integer)
+//
+// All arithmetic follows .NET Decimal semantics (28–29 significant decimal
+// digits).  OverflowException if the result cannot be represented (> MaxValue
+// or needs scale > 28).  DivideByZeroException if the divisor is zero (§6.4).
+//
+// Implementation strategy: we carry the mantissa as __uint128_t internally.
+// This is supported by clang++ on x86_64 (the only compiler used here per
+// CLAUDE.md).  All internal arithmetic normalises the scale to the minimum
+// possible (trailing zeros removed) before storing back.
+// ---------------------------------------------------------------------------
+
+// Note on exceptions:
+// - DivideByZeroException: checked INLINE by the codegen before calling
+//   bz_decimal_div / bz_decimal_mod (matching the integer division pattern).
+//   The codegen inspects the three mantissa i32 fields and throws if all zero.
+//   The runtime functions assume the divisor is non-zero.
+// - OverflowException: raised via bz_set_exc(ove_vtable) into the bz_exc slot.
+//   Each arithmetic function receives the OverflowException vtable as a
+//   parameter (ove_vtable) and stores a minimal exception object in bz_exc.
+//   The codegen caller calls emitPendingCheck() after every arithmetic call.
+//   Pattern mirrors fix #634 / bz_channel_send / bz_ser_throw (§6.4).
+// - FormatException: same mechanism, separate vtable (fe_vtable), used by
+//   bz_decimal_parse_cstr for malformed input.
+
+// Helper: allocate a minimal 16-byte exception object {vtable*, null} and
+// store it in bz_exc (the global pending-exception slot).
+static void bz_set_exc(void* vtable) {
+    if (!vtable) return;
+    void** obj = static_cast<void**>(calloc(1, 16));
+    memcpy(obj, &vtable, sizeof(void*));
+    extern void* bz_exc;
+    bz_exc = obj;
+}
+
+// Helper: extract the unsigned 96-bit mantissa as __uint128_t.
+static inline __uint128_t dec_mantissa(const bz_decimal_t* d) {
+    return ((__uint128_t)d->hi32 << 64) |
+           ((__uint128_t)d->mid32 << 32) |
+           (__uint128_t)d->lo32;
+}
+
+// Helper: get scale (0..28) from flags.
+static inline uint32_t dec_scale(const bz_decimal_t* d) {
+    return (d->flags >> 16) & 0xFF;
+}
+
+// Helper: get sign bit.
+static inline int dec_sign(const bz_decimal_t* d) {
+    return (d->flags >> 31) & 1;
+}
+
+// Powers of ten as __uint128_t (indices 0..28).
+static const __uint128_t kPow10[29] = {
+    ((__uint128_t)1),                                    // 10^0
+    ((__uint128_t)10),                                   // 10^1
+    ((__uint128_t)100),                                  // 10^2
+    ((__uint128_t)1000),                                 // 10^3
+    ((__uint128_t)10000),                                // 10^4
+    ((__uint128_t)100000),                               // 10^5
+    ((__uint128_t)1000000),                              // 10^6
+    ((__uint128_t)10000000),                             // 10^7
+    ((__uint128_t)100000000),                            // 10^8
+    ((__uint128_t)1000000000),                           // 10^9
+    ((__uint128_t)10000000000ULL),                       // 10^10
+    ((__uint128_t)100000000000ULL),                      // 10^11
+    ((__uint128_t)1000000000000ULL),                     // 10^12
+    ((__uint128_t)10000000000000ULL),                    // 10^13
+    ((__uint128_t)100000000000000ULL),                   // 10^14
+    ((__uint128_t)1000000000000000ULL),                  // 10^15
+    ((__uint128_t)10000000000000000ULL),                 // 10^16
+    ((__uint128_t)100000000000000000ULL),                // 10^17
+    ((__uint128_t)1000000000000000000ULL),               // 10^18
+    ((__uint128_t)10000000000000000000ULL),              // 10^19
+    ((__uint128_t)10000000000000000000ULL) * 10,         // 10^20
+    ((__uint128_t)10000000000000000000ULL) * 100,        // 10^21
+    ((__uint128_t)10000000000000000000ULL) * 1000,       // 10^22
+    ((__uint128_t)10000000000000000000ULL) * 10000,      // 10^23
+    ((__uint128_t)10000000000000000000ULL) * 100000,     // 10^24
+    ((__uint128_t)10000000000000000000ULL) * 1000000,    // 10^25
+    ((__uint128_t)10000000000000000000ULL) * 10000000,   // 10^26
+    ((__uint128_t)10000000000000000000ULL) * 100000000,  // 10^27
+    ((__uint128_t)10000000000000000000ULL) * 1000000000, // 10^28
+};
+
+// Maximum mantissa for a 96-bit unsigned integer (2^96 - 1).
+static const __uint128_t kMax96 =
+    (((__uint128_t)0xFFFFFFFFULL << 64) |
+     ((__uint128_t)0xFFFFFFFFULL << 32) |
+      (__uint128_t)0xFFFFFFFFULL);
+
+// MaxValue mantissa: 79228162514264337593543950335 = 10^29 - 1 rounded to 96 bits.
+// Actually .NET MaxValue = 79228162514264337593543950335 with scale 0.
+// In binary: 0xFFFFFFFF FFFFFFFF FFFFFFFF (all 96 bits set).
+// This is the largest 96-bit number = 2^96 - 1.
+
+// Helper: store mantissa + scale + sign back into a bz_decimal_t.
+// Returns true on success; on OverflowException (§6.4) stores the exception
+// object via bz_set_exc(ove_vtable) and returns false.
+// per fix #521 / §6.4: overflow raises OverflowException, not abort().
+static bool dec_store(bz_decimal_t* out, __uint128_t m, uint32_t s, int neg,
+                      void* ove_vtable) {
+    // Remove trailing decimal zeros to minimise scale.
+    while (s > 0 && m % 10 == 0) { m /= 10; --s; }
+    // If mantissa still overflows 96 bits, try to reduce by increasing the
+    // scale (divides the value by 10, dropping trailing digits, rounding half-up).
+    while (m > kMax96) {
+        if (s == 0) {
+            // §6.4: OverflowException — pathological case (value > MaxValue).
+            bz_set_exc(ove_vtable);
+            return false;
+        }
+        __uint128_t rem = m % 10;
+        m = m / 10;
+        if (rem >= 5) m += 1;  // round half-up
+        --s;
+        // Remove new trailing zeros.
+        while (s > 0 && m % 10 == 0) { m /= 10; --s; }
+    }
+    if (m > kMax96) {
+        // should not reach here — defensive overflow guard (§6.4).
+        bz_set_exc(ove_vtable);
+        return false;
+    }
+    if (m == 0) neg = 0;  // no negative zero per .NET
+    out->lo32  = (uint32_t)(m & 0xFFFFFFFF);
+    out->mid32 = (uint32_t)((m >> 32) & 0xFFFFFFFF);
+    out->hi32  = (uint32_t)((m >> 64) & 0xFFFFFFFF);
+    out->flags = ((uint32_t)neg << 31) | ((s & 0xFF) << 16);
+    return true;
+}
+
+// Helper: align two decimals to the same scale, returning false if impossible.
+// Sets *ma, *mb, *s to the aligned mantissas and common scale.
+// If rescaling would overflow 96 bits for the larger one, we truncate the
+// smaller scale's mantissa (losing trailing zeros is lossless; upscaling the
+// larger is avoided).
+static bool dec_align(__uint128_t ma, uint32_t sa,
+                      __uint128_t mb, uint32_t sb,
+                      __uint128_t* oA, __uint128_t* oB, uint32_t* os) {
+    while (sa < sb) {
+        // Need to multiply ma by 10 to match sb.
+        if (ma > kMax96 / 10) {
+            // ma would overflow: try dividing mb instead.
+            __uint128_t rem = mb % 10;
+            mb /= 10;
+            if (rem >= 5) mb += 1;
+            --sb;
+            continue;
+        }
+        ma *= 10; ++sa;
+    }
+    while (sb < sa) {
+        if (mb > kMax96 / 10) {
+            __uint128_t rem = ma % 10;
+            ma /= 10;
+            if (rem >= 5) ma += 1;
+            --sa;
+            continue;
+        }
+        mb *= 10; ++sb;
+    }
+    *oA = ma; *oB = mb; *os = sa;
+    return true;
+}
+
+// §4.4 / §6.4: decimal + decimal
+// per fix #521 / §6.4: ove_vtable is the OverflowException vtable; stored in
+// bz_exc on overflow so codegen's emitPendingCheck() unwinds.
+extern "C" void bz_decimal_add(const bz_decimal_t* a, const bz_decimal_t* b,
+                                bz_decimal_t* out, void* ove_vtable) {
+    __uint128_t ma = dec_mantissa(a), mb = dec_mantissa(b);
+    uint32_t sa = dec_scale(a), sb = dec_scale(b);
+    int signa = dec_sign(a), signb = dec_sign(b);
+    __uint128_t ra, rb; uint32_t rs;
+    dec_align(ma, sa, mb, sb, &ra, &rb, &rs);
+    int rsign;
+    __uint128_t rm;
+    if (signa == signb) {
+        rm = ra + rb; rsign = signa;
+        // carry: may overflow 96 bits, dec_store will reduce scale.
+    } else {
+        if (ra >= rb) { rm = ra - rb; rsign = signa; }
+        else          { rm = rb - ra; rsign = signb; }
+    }
+    dec_store(out, rm, rs, rsign, ove_vtable);
+}
+
+// §4.4 / §6.4: decimal - decimal
+// per fix #521 / §6.4: ove_vtable flows through to bz_decimal_add/dec_store.
+extern "C" void bz_decimal_sub(const bz_decimal_t* a, const bz_decimal_t* b,
+                                bz_decimal_t* out, void* ove_vtable) {
+    // a - b = a + (-b)
+    bz_decimal_t nb = *b;
+    nb.flags ^= (1u << 31);  // flip sign
+    if (dec_mantissa(&nb) == 0) nb.flags &= ~(1u << 31);  // no -0
+    bz_decimal_add(a, &nb, out, ove_vtable);
+}
+
+// §4.4 / §6.4: decimal * decimal
+// per fix #521 / §6.4: ove_vtable flows to dec_store for overflow signalling.
+extern "C" void bz_decimal_mul(const bz_decimal_t* a, const bz_decimal_t* b,
+                                bz_decimal_t* out, void* ove_vtable) {
+    __uint128_t ma = dec_mantissa(a), mb = dec_mantissa(b);
+    uint32_t sa = dec_scale(a) + dec_scale(b);
+    int rsign = dec_sign(a) ^ dec_sign(b);
+    // Product may be up to 192 bits; use 256-bit arithmetic via splitting.
+    // Split mb = mb_hi * 2^64 + mb_lo; a * b = a*mb_hi*2^64 + a*mb_lo.
+    __uint128_t mb_lo = (uint64_t)mb;
+    __uint128_t mb_hi = (uint64_t)(mb >> 64);
+    // Use unsigned __int128 arithmetic. The product of two 96-bit numbers
+    // is at most 192 bits.  We compute it as: product = ma * mb,
+    // working in 256 bits by splitting.
+    // For simplicity: split ma into 32-bit limbs.
+    uint64_t a0 = (uint32_t)(ma),          a1 = (uint32_t)(ma >> 32),
+             a2 = (uint32_t)(ma >> 64);
+    uint64_t b0 = (uint32_t)(mb),          b1 = (uint32_t)(mb >> 32),
+             b2 = (uint32_t)(mb >> 64);
+    // 6x6 32-bit partial products, sum into 5 64-bit accumulators.
+    uint64_t c[6] = {0, 0, 0, 0, 0, 0};
+    // Each partial: a_i * b_j -> add at position i+j.
+    auto add64 = [&](int pos, uint64_t v) {
+        while (v && pos < 6) {
+            uint64_t old = c[pos];
+            c[pos] += v;
+            v = (c[pos] < old) ? 1 : 0;
+            ++pos;
+        }
+    };
+    add64(0, a0 * b0);
+    add64(1, a0 * b1); add64(1, a1 * b0);
+    add64(2, a0 * b2); add64(2, a1 * b1); add64(2, a2 * b0);
+    add64(3, a1 * b2); add64(3, a2 * b1);
+    add64(4, a2 * b2);
+
+    // Reassemble into __uint128_t pairs: lo128 (c[0..3]) and hi128 (c[4..5]).
+    __uint128_t lo128 = ((__uint128_t)c[1] << 32) | c[0];
+    lo128 |= ((__uint128_t)(c[2] & 0xFFFFFFFF) << 64);
+    lo128 |= ((__uint128_t)(c[2] >> 32) << 96);
+    // Actually, let's recompute more carefully with 32-bit limbs.
+    // We have 6 limbs of 32 bits (indices 0..5 × 32 = 192 bits total).
+    // Reconstruct the 192-bit value.
+    // Limb i holds bits [i*32 .. i*32+63] worth (up to 64-bit partial sums,
+    // but we need to propagate carries properly).
+    // Propagate carries:
+    for (int i = 0; i < 5; ++i) {
+        c[i+1] += c[i] >> 32;
+        c[i] &= 0xFFFFFFFF;
+    }
+    // Now c[0..5] are each 32-bit values representing the 192-bit product.
+    // Reconstruct as __uint128_t lo + hi.
+    __uint128_t product_lo = (((__uint128_t)c[3] << 96) |
+                               ((__uint128_t)c[2] << 64) |
+                               ((__uint128_t)c[1] << 32) |
+                                (__uint128_t)c[0]);
+    uint64_t product_hi_words = ((uint64_t)c[5] << 32) | c[4];
+    // product = product_hi_words * 2^128 + product_lo
+    // We need to reduce this into a 96-bit mantissa by dividing by powers
+    // of 10 (adjusting scale down). If product_hi_words != 0, we must
+    // scale down until the result fits in 96 bits.
+
+    // Reconstruct as a scaled value: try to reduce scale while trimming
+    // the product to 96 bits.
+    // Simple approach: divide by 10^k until it fits, reducing sa by k.
+    // Use 192-bit division by 10 iteratively.
+    // product / 10: (hi * 2^128 + lo) / 10
+    while (product_hi_words != 0 || product_lo > kMax96) {
+        // Divide 192-bit value by 10.
+        // hi_words / 10 = q_hi, remainder r_hi
+        uint64_t q_hi = product_hi_words / 10;
+        uint64_t r_hi = product_hi_words % 10;
+        // (r_hi * 2^128 + lo) / 10 = lo / 10 + r_hi * (2^128 / 10)
+        // 2^128 / 10 = 34028236692093846346337460743176821145 + rem
+        // This is complex; use a simpler iterative approach.
+        // Divide the 192-bit number by 10:
+        // Let N = hi * 2^128 + lo.
+        // q = N / 10, r = N mod 10.
+        // We compute r first, then divide.
+        // r = (product_hi_words * (2^128 mod 10) + product_lo mod 10) mod 10
+        // 2^128 mod 10 = 6 (since 2^4=16≡6 and cycles with period 4; 128/4=32, rem=0 → 2^128≡6 mod 10)
+        // Actually: 2^1=2, 2^2=4, 2^3=8, 2^4=6(mod10), 2^5=2... period 4.
+        // 128 mod 4 = 0 → 2^128 ≡ 2^4 ≡ 6 (mod 10).
+        // remainder = (product_hi_words * 6 + (product_lo % 10)) % 10
+        // This only gives us the last digit, but we need to do the full division.
+        // Use 64-bit chunks:
+        // Treat as 6 × 32-bit limbs and do long division.
+        uint64_t limbs[6];
+        for (int i = 0; i < 4; ++i) limbs[i] = (product_lo >> (32*i)) & 0xFFFFFFFF;
+        limbs[4] = product_hi_words & 0xFFFFFFFF;
+        limbs[5] = product_hi_words >> 32;
+        uint64_t rem = 0;
+        for (int i = 5; i >= 0; --i) {
+            uint64_t cur = (rem << 32) | limbs[i];
+            limbs[i] = cur / 10;
+            rem = cur % 10;
+        }
+        // Reconstruct.
+        product_hi_words = ((uint64_t)limbs[5] << 32) | limbs[4];
+        product_lo = (((__uint128_t)limbs[3] << 96) |
+                      ((__uint128_t)limbs[2] << 64) |
+                      ((__uint128_t)limbs[1] << 32) |
+                       (__uint128_t)limbs[0]);
+        // If sa > 0, reduce scale (divides by 10, legal rounding).
+        // If sa == 0, the product genuinely exceeds MaxValue — OverflowException.
+        if (sa > 0) { --sa; }
+        else {
+            // §6.4: OverflowException — product > MaxValue with no remaining
+            // scale to reduce.  Cannot represent the result.
+            bz_set_exc(ove_vtable);
+            return;
+        }
+        if (rem >= 5) {
+            // Round: add 1 to the truncated result.
+            __uint128_t old = product_lo;
+            if (product_hi_words == 0) {
+                product_lo += 1;
+            } else {
+                product_lo += 1;
+                if (product_lo < old) product_hi_words += 1;
+            }
+        }
+    }
+    dec_store(out, product_lo, sa, rsign, ove_vtable);
+}
+
+// §4.4 / §6.4: decimal / decimal.
+// PRE: divisor is non-zero (codegen checks via emitGuardThrow before calling).
+// per fix #521 / §6.4: ove_vtable flows to dec_store for overflow signalling.
+extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
+                                bz_decimal_t* out, void* ove_vtable) {
+    __uint128_t mb = dec_mantissa(b);
+    if (mb == 0) { abort(); return; }  // precondition violated — codegen guards this
+    __uint128_t ma = dec_mantissa(a);
+    uint32_t sa = dec_scale(a), sb = dec_scale(b);
+    int rsign = dec_sign(a) ^ dec_sign(b);
+    // Compute quotient: (ma / 10^sa) / (mb / 10^sb) = (ma / mb) * 10^(sb-sa)
+    // We want: result_mantissa = ma * 10^extra / mb, result_scale = sa - sb + extra
+    // Choose extra to get as many significant digits as possible (up to 28).
+    // Strategy: scale up ma by 10^k (up to k=28) before dividing, to get
+    // good precision. Use the largest k such that ma * 10^k fits in 128 bits.
+    uint32_t extra = 0;
+    // We can scale up ma as long as ma * 10 <= MaxUint128 (but we use 96-bit
+    // precision; scale up to kMax96).
+    while (extra + sa < 29 && ma <= kMax96 / 10) {
+        ma *= 10; ++extra;
+    }
+    __uint128_t q = ma / mb;
+    // Scale: sa + extra (from ma) - sb (denominator's scale) → net scale.
+    int32_t rs_signed = (int32_t)(sa + extra) - (int32_t)sb;
+    if (rs_signed < 0) {
+        // Result scale is negative: multiply q by 10^|rs| to compensate.
+        while (rs_signed < 0 && q <= kMax96 / 10) { q *= 10; ++rs_signed; }
+        if (rs_signed < 0) { dec_store(out, q, 0, rsign, ove_vtable); return; }
+    }
+    uint32_t rs = (uint32_t)rs_signed;
+    dec_store(out, q, rs, rsign, ove_vtable);
+}
+
+// §4.4 / §6.4: decimal mod decimal.
+// PRE: divisor is non-zero (codegen checks via emitGuardThrow before calling).
+// per fix #521 / §6.4: ove_vtable flows to dec_store for overflow signalling.
+extern "C" void bz_decimal_mod(const bz_decimal_t* a, const bz_decimal_t* b,
+                                bz_decimal_t* out, void* ove_vtable) {
+    __uint128_t mb = dec_mantissa(b);
+    if (mb == 0) { abort(); return; }  // precondition violated — codegen guards this
+    __uint128_t ma = dec_mantissa(a);
+    uint32_t sa = dec_scale(a), sb = dec_scale(b);
+    int signa = dec_sign(a);
+    // §6.1 dividend-sign rule: result has the sign of the dividend.
+    // Align to common scale.
+    __uint128_t ra, rb; uint32_t rs;
+    dec_align(ma, sa, mb, sb, &ra, &rb, &rs);
+    if (rb == 0) { abort(); return; }  // shouldn't happen given non-zero divisor
+    __uint128_t q = ra / rb;
+    __uint128_t rem = ra - q * rb;
+    dec_store(out, rem, rs, signa, ove_vtable);
+}
+
+// Negation.
+extern "C" void bz_decimal_neg(const bz_decimal_t* a, bz_decimal_t* out) {
+    *out = *a;
+    if (dec_mantissa(a) != 0)
+        out->flags ^= (1u << 31);
+}
+
+// §8.3: comparison — returns negative/zero/positive.
+extern "C" int32_t bz_decimal_cmp(const bz_decimal_t* a, const bz_decimal_t* b) {
+    int signa = dec_sign(a), signb = dec_sign(b);
+    __uint128_t ma = dec_mantissa(a), mb = dec_mantissa(b);
+    // Both zero → equal.
+    if (ma == 0 && mb == 0) return 0;
+    // Different signs → sign determines order.
+    if (signa != signb) return signa ? -1 : 1;
+    // Same sign — align and compare mantissas.
+    __uint128_t ra, rb; uint32_t rs;
+    dec_align(ma, dec_scale(a), mb, dec_scale(b), &ra, &rb, &rs);
+    int32_t cmp = (ra < rb) ? -1 : (ra > rb) ? 1 : 0;
+    return signa ? -cmp : cmp;  // negative numbers: larger mantissa = smaller value
+}
+
+// Conversion from int64/int32 (implicit per §5.1).
+extern "C" void bz_decimal_from_int64(int64_t v, bz_decimal_t* out) {
+    int neg = (v < 0);
+    __uint128_t m = neg ? (v == INT64_MIN ? ((__uint128_t)1 << 63) : (__uint128_t)(-v))
+                        : (__uint128_t)v;
+    // int64 mantissa always fits in 96 bits (int64_max < 2^63 < 2^96); no overflow.
+    dec_store(out, m, 0, neg, nullptr);
+}
+
+extern "C" void bz_decimal_from_int32(int32_t v, bz_decimal_t* out) {
+    bz_decimal_from_int64((int64_t)v, out);
+}
+
+// Conversion from double (explicit per §5.2).
+// per fix #521 / §6.4: ove_vtable is stored in bz_exc on overflow; callers
+// call emitPendingCheck() after this function.
+extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
+                                        void* ove_vtable) {
+    // Use snprintf to get the decimal representation.
+    if (v != v || v > 1e29 || v < -1e29) {
+        // §6.4: OverflowException — value out of decimal range.
+        bz_set_exc(ove_vtable);
+        return;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.15g", v);
+    // ove_vtable also covers the (very unlikely) case where the string
+    // produced by snprintf overflows (e.g. 1e29 edge case).
+    bz_decimal_parse_cstr(buf, out, ove_vtable, nullptr);
+}
+
+// Conversion to double (explicit per §5.2).
+extern "C" double bz_decimal_to_double(const bz_decimal_t* a) {
+    __uint128_t m = dec_mantissa(a);
+    uint32_t s = dec_scale(a);
+    double result = 0.0;
+    // Convert mantissa to double then divide by 10^scale.
+    // Split m into hi64 and lo64 to avoid precision loss.
+    uint64_t m_hi = (uint64_t)(m >> 64);
+    uint64_t m_lo = (uint64_t)(m);
+    result = (double)m_hi * 18446744073709551616.0 + (double)m_lo;
+    if (s > 0) {
+        static const double pow10d[29] = {
+            1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
+            1000000000, 10000000000.0, 100000000000.0, 1000000000000.0,
+            10000000000000.0, 100000000000000.0, 1000000000000000.0,
+            10000000000000000.0, 100000000000000000.0, 1000000000000000000.0,
+            10000000000000000000.0, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28
+        };
+        result /= pow10d[s];
+    }
+    return dec_sign(a) ? -result : result;
+}
+
+// Parse from C string (null-terminated).
+// per fix #521 / §6.4: FormatException (malformed) stored via fe_vtable;
+// OverflowException (out-of-range) stored via ove_vtable.  Either may be
+// nullptr (used during compile-time initialisation where no vtable exists).
+// On failure bz_exc is set and the function returns without writing *out.
+extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
+                                       void* ove_vtable, void* fe_vtable) {
+    if (!s) { bz_set_exc(fe_vtable); return; }  // FormatException — null input
+    // Skip optional sign.
+    int neg = 0;
+    if (*s == '-') { neg = 1; ++s; }
+    else if (*s == '+') { ++s; }
+    // Collect digits, find decimal point.
+    __uint128_t m = 0;
+    uint32_t sc = 0;
+    bool in_frac = false;
+    bool any_digit = false;
+    for (; *s; ++s) {
+        if (*s == '.') { in_frac = true; continue; }
+        if (*s == 'e' || *s == 'E') {
+            // Scientific notation: parse exponent.
+            ++s;
+            int exp_neg = 0;
+            if (*s == '-') { exp_neg = 1; ++s; }
+            else if (*s == '+') ++s;
+            int exp = 0;
+            for (; *s >= '0' && *s <= '9'; ++s) exp = exp * 10 + (*s - '0');
+            if (exp_neg) sc += (uint32_t)exp;
+            else {
+                if ((int)sc - exp < 0) {
+                    // Multiply by 10^(exp-sc): shift mantissa left.
+                    int shift = exp - (int)sc;
+                    for (int i = 0; i < shift && i < 29; ++i) {
+                        if (m > kMax96 / 10) {
+                            // §6.4: OverflowException — mantissa too large for decimal range.
+                            bz_set_exc(ove_vtable);
+                            return;
+                        }
+                        m *= 10;
+                    }
+                    sc = 0;
+                } else {
+                    sc -= (uint32_t)exp;
+                }
+            }
+            break;
+        }
+        if (*s < '0' || *s > '9') {
+            // FormatException — unexpected character in decimal string.
+            bz_set_exc(fe_vtable);
+            return;
+        }
+        any_digit = true;
+        if (in_frac) ++sc;
+        if (m <= kMax96 / 10) {
+            m = m * 10 + (uint32_t)(*s - '0');
+        }
+        // If mantissa would overflow, just track scale (lose trailing digits
+        // beyond 29).
+    }
+    if (!any_digit) {
+        // FormatException — no digits found.
+        bz_set_exc(fe_vtable);
+        return;
+    }
+    dec_store(out, m, sc, neg, ove_vtable);
+}
+
+// Parse from bz_string* (stdlib §9.3 Decimal.Parse).
+// per fix #521: raises FormatException (malformed) or OverflowException
+// (out-of-range) via bz_exc; codegen calls emitPendingCheck() after this call.
+extern "C" void bz_decimal_parse(const void* str, bz_decimal_t* out,
+                                  void* ove_vtable, void* fe_vtable) {
+    if (!str) {
+        // Null string argument — raise FormatException per §9.3.
+        bz_set_exc(fe_vtable);
+        return;
+    }
+    // bz_string layout: { char* data, int64_t len, uint8_t width, int64_t rc }
+    struct BzStr { char* data; int64_t len; uint8_t width; int64_t rc; };
+    const auto* bs = (const BzStr*)str;
+    // Copy to null-terminated buffer.
+    char buf[64];
+    int64_t n = bs->len < 63 ? bs->len : 63;
+    for (int64_t i = 0; i < n; ++i) buf[i] = bs->data[i];
+    buf[n] = '\0';
+    bz_decimal_parse_cstr(buf, out, ove_vtable, fe_vtable);
+}
+
+// TryParse — returns 0 on failure (no throw), 1 on success.
+// per fix #521: uses bz_decimal_parse_cstr with null vtables so no exception
+// is stored; on failure bz_exc is not set and the return value signals failure.
+// Overflow also returns 0 (mirrors .NET Decimal.TryParse behaviour).
+extern "C" int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out) {
+    // We need a way to catch failures. Use setjmp/longjmp? That's complex.
+    // Instead, validate the string manually before parsing.
+    if (!str) return 0;
+    struct BzStr { char* data; int64_t len; uint8_t width; int64_t rc; };
+    const auto* bs = (const BzStr*)str;
+    char buf[64];
+    int64_t n = bs->len < 63 ? bs->len : 63;
+    for (int64_t i = 0; i < n; ++i) buf[i] = bs->data[i];
+    buf[n] = '\0';
+    const char* s = buf;
+    if (*s == '-' || *s == '+') ++s;
+    if (!*s) return 0;
+    bool has_digit = false, has_dot = false;
+    for (; *s; ++s) {
+        if (*s == '.') { if (has_dot) return 0; has_dot = true; continue; }
+        if (*s == 'e' || *s == 'E') {
+            ++s;
+            if (*s == '-' || *s == '+') ++s;
+            if (!*s) return 0;
+            for (; *s; ++s) if (*s < '0' || *s > '9') return 0;
+            break;
+        }
+        if (*s < '0' || *s > '9') return 0;
+        has_digit = true;
+    }
+    if (!has_digit) return 0;
+    // Pass null vtables: on overflow bz_exc is NOT set (TryParse returns false).
+    extern void* bz_exc;
+    void* prev_exc = bz_exc;
+    bz_exc = nullptr;
+    bz_decimal_parse_cstr(buf, out, nullptr, nullptr);
+    if (bz_exc) {
+        // Overflow or other error during parse — return 0 (no exception raised).
+        // Discard the internally set exc and restore caller's exception state.
+        free(bz_exc);
+        bz_exc = prev_exc;
+        return 0;
+    }
+    bz_exc = prev_exc;
+    return 1;
+}
+
+// ToString (stdlib §9.3 Decimal.ToString()) — returns new bz_string* (rc=1).
+// Layout mirrors bz_string_hdr defined in the Guid section below.
+extern "C" void* bz_decimal_to_string(const bz_decimal_t* a) {
+    __uint128_t m = dec_mantissa(a);
+    uint32_t s = dec_scale(a);
+    int neg = dec_sign(a);
+    // Convert mantissa to decimal string via repeated division.
+    char digits[32]; // 96-bit number has at most 29 decimal digits.
+    int nd = 0;
+    if (m == 0) { digits[0] = '0'; nd = 1; }
+    else {
+        while (m > 0) {
+            digits[nd++] = (char)('0' + (int)(m % 10));
+            m /= 10;
+        }
+    }
+    // digits is in reverse order; reverse it.
+    for (int i = 0; i < nd / 2; ++i) {
+        char tmp = digits[i]; digits[i] = digits[nd-1-i]; digits[nd-1-i] = tmp;
+    }
+    // Build output string.
+    char buf[64];
+    int pos = 0;
+    if (neg) buf[pos++] = '-';
+    if (s == 0) {
+        // Integer value.
+        for (int i = 0; i < nd; ++i) buf[pos++] = digits[i];
+    } else {
+        // Insert decimal point s digits from the right.
+        int int_digits = nd - (int)s;
+        if (int_digits <= 0) {
+            buf[pos++] = '0';
+            buf[pos++] = '.';
+            for (int i = 0; i < -(int_digits); ++i) buf[pos++] = '0';
+            for (int i = 0; i < nd; ++i) buf[pos++] = digits[i];
+        } else {
+            for (int i = 0; i < int_digits; ++i) buf[pos++] = digits[i];
+            buf[pos++] = '.';
+            for (int i = int_digits; i < nd; ++i) buf[pos++] = digits[i];
+        }
+    }
+    buf[pos] = '\0';
+    // Allocate a bz_string header + data heap block (rc=1, width=1/ASCII).
+    // This mirrors the layout used by bz_guid_to_string and bz_string_hdr below.
+    int64_t len = (int64_t)pos;
+    char* data = (char*)malloc((size_t)len + 1);
+    memcpy(data, buf, (size_t)len + 1);
+    // bz_string_hdr: { char* data, int64_t len, uint8_t width, int64_t rc }
+    struct { char* data; int64_t len; uint8_t width; int64_t rc; }* hdr =
+        (decltype(hdr))calloc(1, sizeof(*hdr));
+    hdr->data  = data;
+    hdr->len   = len;
+    hdr->width = 1;
+    hdr->rc    = 1;  // producer's reference
+    return hdr;
+}
+
+// Round(digits) — rounds to `digits` decimal places (banker's rounding not
+// required; we use half-up as .NET's Decimal.Round default).
+extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
+                                  bz_decimal_t* out) {
+    if (digits < 0) digits = 0;
+    uint32_t s = dec_scale(a);
+    if ((uint32_t)digits >= s) { *out = *a; return; }
+    __uint128_t m = dec_mantissa(a);
+    uint32_t remove = s - (uint32_t)digits;
+    for (uint32_t i = 0; i < remove; ++i) {
+        __uint128_t rem = m % 10;
+        m /= 10;
+        if (i == 0 && rem >= 5) m += 1;
+    }
+    // Rounding only reduces mantissa magnitude; result always fits in 96 bits.
+    dec_store(out, m, (uint32_t)digits, dec_sign(a), nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // Guid (stdlib §2.6) — 128-bit globally unique identifier.
 // Representation: { uint64_t lo, uint64_t hi } (matches LLVM { i64, i64 }).
 // NewGuid fills bytes from /dev/urandom and stamps RFC 4122 v4 version/variant

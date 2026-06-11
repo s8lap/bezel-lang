@@ -1,5 +1,9 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+// §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
+                                       void* ove_vtable, void* fe_vtable);
+
 namespace bezel::codegen {
 
 llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
@@ -3447,6 +3451,56 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (!ma || !ma->target) return nullptr;
 
     // ---------------------------------------------------------------------------
+    // stdlib §9.3 / §4.4 fix #521: Decimal instance methods.
+    // ---------------------------------------------------------------------------
+    {
+        using P = sema::PrimitiveType;
+        auto* recvTy = ctx_.exprType(*ma->target);
+        bool isDec = recvTy &&
+            recvTy->kind == sema::TypeRef::Kind::Primitive &&
+            recvTy->primitive == P::Decimal;
+        if (isDec) {
+            llvm::StructType* dst = decimalStructType();
+            const auto& mname = ma->member;
+
+            llvm::Value* recvVal = lowerExpr(*ma->target);
+            if (!recvVal) return nullptr;
+            // Store receiver into an alloca for pass-by-ptr calls.
+            llvm::AllocaInst* slot = entryAlloca(dst);
+            builder_.CreateStore(recvVal, slot);
+
+            // Decimal.ToString(): string — §9.3.
+            if (mname == "ToString" && call.args.empty()) {
+                auto* fn = declareC("bz_decimal_to_string", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {slot}, "dec.tostr");
+            }
+            // Decimal.ToString(format: string) — not implemented; fall through to plain ToString.
+            if (mname == "ToString" && call.args.size() == 1) {
+                auto* fn = declareC("bz_decimal_to_string", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {slot}, "dec.tostr");
+            }
+            // Decimal.CompareTo(other: decimal): int — §9.3.
+            if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* other = lowerExpr(*call.args[0].value);
+                if (!other) return nullptr;
+                llvm::AllocaInst* oSlot = entryAlloca(dst);
+                builder_.CreateStore(other, oSlot);
+                auto* fn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+                return builder_.CreateCall(fn, {slot, oSlot}, "dec.cmp");
+            }
+            // Decimal.Round(digits: int): decimal — §9.3.
+            if (mname == "Round" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* digits = lowerExpr(*call.args[0].value);
+                if (!digits) return nullptr;
+                llvm::AllocaInst* oSlot = entryAlloca(dst);
+                auto* fn = declareC("bz_decimal_round", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), i32(), ptrTy()});
+                builder_.CreateCall(fn, {slot, digits, oSlot});
+                return builder_.CreateLoad(dst, oSlot, "dec.round");
+            }
+        }
+    }
+
     // stdlib §2.6: Guid instance methods — handled before the IdentifierExpr
     // guard below because the receiver may be a chained expression (e.g.
     // Guid.Empty.ToString()) whose target is not a bare identifier.
@@ -4540,6 +4594,91 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 seed = builder_.CreateTrunc(seed, i32());
             builder_.CreateCall(srandFn, {seed});
             return nullptr;  // unit
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // stdlib §9.3 / §4.4 fix #521: Decimal — static members and methods.
+    // Decimal is a 128-bit value type stored as { i32 lo32, i32 mid32, i32 hi32, i32 flags }.
+    // All runtime functions take a pointer to the struct.
+    // ---------------------------------------------------------------------------
+    if (cls == "Decimal") {
+        llvm::StructType* dst = decimalStructType();
+
+        // Helper: allocate a decimal-sized alloca slot.
+        auto makeDecSlot = [&]() -> llvm::AllocaInst* {
+            return entryAlloca(dst);
+        };
+
+        // Helper: build a decimal struct from compile-time parse of a cstr.
+        auto decConstant = [&](const char* s) -> llvm::Value* {
+            uint32_t dec[4] = {0, 0, 0, 0};
+            bz_decimal_parse_cstr(s, dec, nullptr, nullptr);
+            return llvm::ConstantStruct::get(dst, {
+                llvm::ConstantInt::get(i32(), dec[0]),
+                llvm::ConstantInt::get(i32(), dec[1]),
+                llvm::ConstantInt::get(i32(), dec[2]),
+                llvm::ConstantInt::get(i32(), dec[3])
+            });
+        };
+
+        // Decimal.MinValue — .NET = -79228162514264337593543950335 (max 96-bit, negative).
+        if (m == "MinValue" && call.args.empty())
+            return decConstant("-79228162514264337593543950335");
+        // Decimal.MaxValue — .NET = 79228162514264337593543950335.
+        if (m == "MaxValue" && call.args.empty())
+            return decConstant("79228162514264337593543950335");
+        // Decimal.Zero — 0.
+        if (m == "Zero" && call.args.empty())
+            return llvm::ConstantAggregateZero::get(dst);
+        // Decimal.One — 1.
+        if (m == "One" && call.args.empty())
+            return decConstant("1");
+
+        // Decimal.Parse(s: string): decimal — throws FormatException for malformed
+        // input or OverflowException for out-of-range values (per fix #521 / §6.4).
+        if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::AllocaInst* slot = makeDecSlot();
+            // per fix #521: pass OverflowException and FormatException vtables
+            // so the runtime stores the correct exception in bz_exc on failure.
+            auto getOVEVtable = [&]() -> llvm::Value* {
+                auto vit = builtinVtable_.find("OverflowException");
+                if (vit == builtinVtable_.end())
+                    return llvm::ConstantPointerNull::get(ptrTy());
+                return vit->second;
+            };
+            auto getFEVtable = [&]() -> llvm::Value* {
+                auto vit = builtinVtable_.find("FormatException");
+                if (vit == builtinVtable_.end())
+                    return llvm::ConstantPointerNull::get(ptrTy());
+                return vit->second;
+            };
+            auto* fn = declareC("bz_decimal_parse", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {strVal, slot, getOVEVtable(), getFEVtable()});
+            emitPendingCheck();  // per fix #521: runtime sets bz_exc on parse failure
+            return builder_.CreateLoad(dst, slot, "dec.parsed");
+        }
+
+        // Decimal.TryParse(s: string, out result: decimal): bool
+        if (m == "TryParse" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::AllocaInst* slot = makeDecSlot();
+            auto* fn = declareC("bz_decimal_try_parse", i32(),
+                                {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "dec.tryp.ok");
+            // Write the result into the out parameter.
+            llvm::Type* et = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+            if (outAddr) {
+                llvm::Value* result = builder_.CreateLoad(dst, slot, "dec.tryp.val");
+                builder_.CreateStore(result, outAddr);
+            }
+            return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dec.tryp.bool");
         }
     }
 

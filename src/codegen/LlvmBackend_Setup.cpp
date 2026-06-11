@@ -1,5 +1,8 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+// §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out);
+
 namespace bezel::codegen {
 
 // #383 / §28: forward declaration — defined later in this file. A reference
@@ -392,18 +395,28 @@ llvm::Constant* Emitter::constInitFor(const ast::FieldDecl* fd, llvm::Type* ty) 
         if (auto* b = dynamic_cast<const ast::BoolLiteralExpr*>(e)) {
             return llvm::ConstantInt::get(ty, b->value ? 1 : 0);
         }
-        // CG24: float/double literal initializer for static float fields.
+        // CG24: float/double/decimal literal initializer for static float fields.
         if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(e)) {
-            // #521 / §4.4: a decimal literal (m/M suffix) must not reach
-            // here — sema diagnoses it before codegen runs. As a belt-and-
-            // suspenders guard, skip the ConstantFP emission for m-literals
-            // so that a double ConstantFP is never inserted into an i32
-            // global (which would crash the IR verifier). Fall through to
-            // the null-value zero-init below.
+            // §4.4 fix #521: a decimal literal (m/M suffix) → parse into the
+            // .NET-compatible bz_decimal_t struct constant.
             if (!fl->text.empty()) {
                 char last = fl->text.back();
-                if (last == 'm' || last == 'M')
-                    return llvm::Constant::getNullValue(ty);
+                if (last == 'm' || last == 'M') {
+                    std::string digits;
+                    for (char c : fl->text) {
+                        if (c == '_' || c == 'm' || c == 'M') continue;
+                        digits.push_back(c);
+                    }
+                    uint32_t dec[4] = {0, 0, 0, 0};
+                    bz_decimal_parse_cstr(digits.c_str(), dec);
+                    llvm::StructType* dst = decimalStructType();
+                    return llvm::ConstantStruct::get(dst, {
+                        llvm::ConstantInt::get(i32(), dec[0]),
+                        llvm::ConstantInt::get(i32(), dec[1]),
+                        llvm::ConstantInt::get(i32(), dec[2]),
+                        llvm::ConstantInt::get(i32(), dec[3])
+                    });
+                }
             }
             std::string digits;
             for (char c : fl->text) {
