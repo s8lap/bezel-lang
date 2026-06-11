@@ -73,6 +73,55 @@ const char* primitiveSpelling(PrimitiveType p) {
     return "<unknown>";
 }
 
+// #625 / §12 / §31: true when `name` is a built-in exception type identifier.
+// Mirrors the isBuiltinExName lambda in ExprTypecheck_Calls.cpp (kept in sync).
+static bool isBuiltinExceptionTypeName(std::string_view n) {
+    return n == "Exception"              ||
+           n == "ArgumentException"      ||
+           n == "ArgumentNullException"  ||
+           n == "ArithmeticException"    ||
+           n == "OverflowException"      ||
+           n == "DivideByZeroException"  ||
+           n == "InvalidOperationException" ||
+           n == "NotImplementedException"   ||
+           n == "NullReferenceException"    ||
+           n == "IndexOutOfRangeException"  ||
+           n == "KeyNotFoundException"      ||
+           n == "MatchFailureException"     ||
+           n == "OperationCanceledException"||
+           n == "TypeInitializationException" ||
+           n == "FormatException"           ||
+           n == "StackOverflowException";
+}
+
+// #625 / §12 / §31: true when `ts` (a user class TypeSymbol) or any user-class
+// ancestor has a direct AST-declared base that is a built-in exception.
+// Used by the unqualified identifier resolver to allow bare `Message` in the
+// body of an exception-derived class without "unresolved identifier".
+static bool inheritsBuiltinException(const TypeSymbol* ts) {
+    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
+    for (const TypeSymbol* cur = ts; cur;) {
+        auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);
+        if (td) {
+            for (const auto& bt : td->baseTypes) {
+                if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                if (isBuiltinExceptionTypeName(bt->name->parts.back()))
+                    return true;
+            }
+        }
+        // Walk to the next user-class base.
+        const TypeSymbol* next = nullptr;
+        for (const TypeSymbol* b : cur->baseTypes) {
+            if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
+                next = b;
+                break;
+            }
+        }
+        cur = next;
+    }
+    return false;
+}
+
 }  // namespace
 
 void ExprTC::visitExpr(const ast::Expr& e) {
@@ -254,6 +303,23 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // as intrinsics.
             auto* ts = builtinClassSym(id->name);
             ctx_.setExprSymbol(&e, ts);
+        } else if (id->name == "Message" && currentType_ &&
+                   !inStaticMember_ &&
+                   inheritsBuiltinException(currentType_)) {
+            // #625 / §12 / §31: unqualified `Message` inside an INSTANCE method
+            // body of a class that inherits (directly or via a user-class chain)
+            // from a built-in exception type resolves as the inherited stdlib
+            // Exception.Message property (a string read of the slot at byte
+            // offset 8 in the exception layout).  No user TypeSymbol or
+            // FieldSymbol exists for it; the codegen's GEP-at-byte-8 path
+            // handles the read (same as `this.Message` — see the
+            // MemberAccessExpr case in LlvmBackend_Exprs.cpp CG22+).
+            // Static methods are excluded: there is no `this` in a static
+            // context so Message would have no meaningful receiver.
+            // Do NOT set a symbol — there is none; just set the type to string
+            // so downstream (type-assignability, .Length, etc.) can use it.
+            ctx_.setExprType(&e,
+                ctx_.primitiveTypeRef(PrimitiveType::String));
         } else if (currentScope_) {
             ctx_.diagnostics().report(
                 Severity::Error, id->span.begin,

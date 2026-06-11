@@ -161,6 +161,7 @@ set(BEZEL_TEST_SOURCES
     sema/typeof_gettype_487_test.cpp
     sema/gettype_chain_511_test.cpp
     sema/dict_iteration_diag_530_test.cpp
+    sema/dict_entry_write_reject_624_test.cpp
     sema/lifted_operators_486_sema_test.cpp
     sema/decimal_diagnostics_521_test.cpp
     sema/getoradd_argcheck_542_test.cpp
@@ -456,6 +457,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_insertion_order_622_test.cpp
     codegen/async_iter_try_finally_554_test.cpp
     codegen/codegen_unimplemented_hard_error_628_test.cpp
+    codegen/user_exception_unqualified_msg_625_test.cpp
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
