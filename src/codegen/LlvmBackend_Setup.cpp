@@ -5074,6 +5074,40 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                    tt->primitive == sema::PrimitiveType::String;
         }
     }
+    // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: a CALL to the inline
+    // CG27c ToString() path on a NUMERIC or CHAR primitive (emitPrimitiveToString
+    // allocates a fresh heap string with rc := 1). Recognised by a CallExpr with
+    // an empty argument list, member == "ToString", and a numeric/char/decimal
+    // receiver type. Bool.ToString() is EXCLUDED (returns a "True"/"False"
+    // sentinel with the immortal rc — not heap-allocated); String.ToString() is
+    // EXCLUDED (identity, no allocation); Object.ToString() is EXCLUDED (goes
+    // through lowerObjectToString which may or may not allocate — excluded for
+    // safety). This recognition makes releaseConcatIntermediate release the
+    // emitPrimitiveToString result when it feeds directly into a `+` operand,
+    // comparison, or other consumer — fixing the `"ab" + i.ToString()` shape.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
+                        using P = sema::PrimitiveType;
+                        switch (tt->primitive) {
+                            case P::Int: case P::Long: case P::Short:
+                            case P::Byte: case P::SByte: case P::UInt:
+                            case P::ULong: case P::UShort:
+                            case P::Float: case P::Double: case P::Decimal:
+                            case P::Char:
+                                return true;  // emitPrimitiveToString → rc=1 heap string
+                            default:
+                                break;  // Bool → sentinel; String → identity; Object → excluded
+                        }
+                    }
+                }
+            }
+        }
+    }
     // #429 (RETURN-escape category) / §4.6 / §28.9: a CALL to a user-defined,
     // locally-compiled method whose declared return type is `string` hands the
     // caller EXACTLY +1 (the callee's ReturnStmt lowering mints it). So such a

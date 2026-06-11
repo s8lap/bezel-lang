@@ -510,8 +510,46 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
                         if (tt->primitive == sema::PrimitiveType::String) {
                             // CG27f: stdlib §9.6 string methods.
-                            if (auto* v = tryLowerStringMethod(*call, *ma))
+                            // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9:
+                            // pre-lower the receiver so we can release it after
+                            // the method call when it is a +1 string producer
+                            // (concat / interpolation / primitive-ToString /
+                            // user-method-return / range-slice). The receiver is
+                            // consumed by the method (only read; it is a borrow
+                            // inside tryLowerStringMethod), and has no named-local
+                            // owner — nothing else releases it.  Only pre-lower when
+                            // the target IS a +1 producer, so non-producer receivers
+                            // still flow through the existing path inside
+                            // tryLowerStringMethod without any change.
+                            bool selfIsProducer =
+                                ma->target &&
+                                isPlusOneStringProducer(ma->target.get());
+                            llvm::Value* selfV =
+                                selfIsProducer ? lowerExpr(*ma->target) : nullptr;
+                            if (auto* v = tryLowerStringMethod(*call, *ma, selfV)) {
+                                // Release the +1 producer receiver AFTER the
+                                // method has been lowered (result is in hand;
+                                // string still live for the method's reads).
+                                if (selfIsProducer && selfV)
+                                    emitStringRelease(selfV);
                                 return v;
+                            }
+                            // tryLowerStringMethod returned nullptr (method not
+                            // recognised by the structurally-matched §9.6 paths).
+                            // If we pre-lowered the receiver, it is harmless to
+                            // proceed: tryLowerStringMethod re-lowers when selfV
+                            // is null, but since we passed selfV it skipped the
+                            // lowerExpr call — so it just returned nullptr without
+                            // side-effects. The fall-through paths below do NOT
+                            // lower ma->target again for a string receiver type
+                            // (they only apply to non-string primitives).
+                            // Releasing selfV on the nullptr path is SAFE: nothing
+                            // else will use the lowered value since we are about
+                            // to return nullptr anyway. This avoids a leak if the
+                            // receiver was a producer and tryLowerStringMethod
+                            // happened to not recognise the method.
+                            if (selfIsProducer && selfV)
+                                emitStringRelease(selfV);
                         }
                         // CG27c: ToString() on any primitive (no arg). §8.5/§8.6
                         // (#417): an OBJECT-typed receiver is NOT a value
@@ -1479,6 +1517,15 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 if (ma->member == "Length") {
                     // stdlib §9.6: Length: int — number of char code points.
                     llvm::Value* len64 = loadStringLen(strPtr);
+                    // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: if the
+                    // receiver is a +1 string producer (concat, interpolation,
+                    // primitive-ToString, user-method-return, range-slice), it has
+                    // no named-local owner and no scope-end release — release it
+                    // here, AFTER loading the length, so the string lives long
+                    // enough for the length-field read.  bz_string_release on a
+                    // sentinel is a no-op (safe for literal receivers).
+                    if (isPlusOneStringProducer(ma->target.get()))
+                        emitStringRelease(strPtr);
                     return builder_.CreateTrunc(len64, i32(), "str.len.i32");
                 }
                 // Other string members deferred — sema would have flagged
@@ -3922,8 +3969,20 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         // from a generic context where the sema type is unresolved T=string).
         bool useStrEq = (lIsStr || rIsStr) && lIsPtr && rIsPtr && !eitherNull;
         if (useStrEq && (op == "=" || op == "<>")) {
-            if (op == "=") return emitStringEq(l, r);
-            return builder_.CreateNot(emitStringEq(l, r));
+            llvm::Value* cmpResult;
+            if (op == "=") cmpResult = emitStringEq(l, r);
+            else           cmpResult = builder_.CreateNot(emitStringEq(l, r));
+            // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: a +1 string
+            // producer (concat / interpolation / range-slice / primitive-ToString /
+            // user-method-return) fed as a COMPARISON OPERAND is consumed by the
+            // comparison (= / <>) but not by any concat chain — nothing else holds
+            // its reference.  Release it after emitStringEq has produced the
+            // boolean result.  Both sides may be producers independently.
+            if (bin.left  && isPlusOneStringProducer(bin.left.get()))
+                emitStringRelease(l);
+            if (bin.right && isPlusOneStringProducer(bin.right.get()))
+                emitStringRelease(r);
+            return cmpResult;
         }
         // FINDING [2] / §4.6 / §28.9: release a concat OPERAND that is itself a
         // fresh +1 string intermediate this codegen produced — i.e. a nested
@@ -3993,10 +4052,19 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (op == "<" || op == ">" || op == "<=" || op == ">=") {
                 llvm::Value* cmp = emitStringOrdCmp(l, r);
                 llvm::Value* zero = llvm::ConstantInt::get(i32(), 0);
-                if (op == "<") return builder_.CreateICmpSLT(cmp, zero);
-                if (op == ">") return builder_.CreateICmpSGT(cmp, zero);
-                if (op == "<=") return builder_.CreateICmpSLE(cmp, zero);
-                /* >= */ return builder_.CreateICmpSGE(cmp, zero);
+                llvm::Value* ordResult;
+                if (op == "<")       ordResult = builder_.CreateICmpSLT(cmp, zero);
+                else if (op == ">")  ordResult = builder_.CreateICmpSGT(cmp, zero);
+                else if (op == "<=") ordResult = builder_.CreateICmpSLE(cmp, zero);
+                else                 ordResult = builder_.CreateICmpSGE(cmp, zero);
+                // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: release +1
+                // string producer operands after the ordinal comparison, mirroring
+                // the equality-operator release above.
+                if (bin.left  && isPlusOneStringProducer(bin.left.get()))
+                    emitStringRelease(l);
+                if (bin.right && isPlusOneStringProducer(bin.right.get()))
+                    emitStringRelease(r);
+                return ordResult;
             }
         }
         // §4.6: primitive + string — convert lhs to string first.

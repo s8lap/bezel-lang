@@ -1529,7 +1529,8 @@ private:
     // CG27f (stdlib §9.6): intercept stdlib string method calls.
     // Returns the lowered value, or null if the method is not recognised.
     llvm::Value* tryLowerStringMethod(const ast::CallExpr& call,
-                                       const ast::MemberAccessExpr& ma);
+                                       const ast::MemberAccessExpr& ma,
+                                       llvm::Value* self = nullptr);
 
     // CG25: is a Bezel primitive an unsigned integer type? (Drives
     // zext/udiv/lshr/unsigned-comparison choices.)
