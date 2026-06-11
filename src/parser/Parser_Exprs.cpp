@@ -832,6 +832,13 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
     // Primitive-type-led TypePattern. Other types (named) fall through to
     // the Identifier branch as NamedPattern — sema disambiguates Constant
     // vs Type by name resolution per the §A.7 note.
+    //
+    // Per §5.2 / §A.7: `int(expr)` is an explicit conversion call (a
+    // PrimaryExpr), NOT a TypePattern. Only a bare primitive keyword NOT
+    // followed by `(` is a TypePattern here; when `(` follows, fall through
+    // to the catch-all expression path so `int(this) < int(other)` and
+    // similar conversion expressions in scrutinee-less case arms parse as
+    // ConstantPattern over a BinaryExpr. Issue #657 / spec_0026.
     if (isKeyword("int")     || isKeyword("long")  ||
         isKeyword("short")   || isKeyword("byte")  ||
         isKeyword("sbyte")   || isKeyword("ushort")||
@@ -839,9 +846,18 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
         isKeyword("float")   || isKeyword("double")||
         isKeyword("decimal") || isKeyword("bool")  ||
         isKeyword("char")    || isKeyword("string")) {
-        auto tp = std::make_unique<ast::TypePattern>();
-        tp->type = parseType();
-        return std::unique_ptr<ast::Pattern>(tp.release());
+        // current_ is the keyword; peekAt(1) is the next token.
+        // If the next token is `(`, this is a conversion call expression,
+        // not a type-test pattern — fall through to the catch-all.
+        const bool nextIsParen =
+            peekAt(1).kind == TokenKind::Punctuator &&
+            peekAt(1).text == "(";
+        if (!nextIsParen) {
+            auto tp = std::make_unique<ast::TypePattern>();
+            tp->type = parseType();
+            return std::unique_ptr<ast::Pattern>(tp.release());
+        }
+        // Fall through to catch-all: parse int(expr) as expression.
     }
     // Identifier → QualifiedName. `(` after means DestructuringPattern.
     // A `,` followed by another Constant means a multi-Constant alternatives
@@ -926,9 +942,26 @@ ast::PositionalPattern Parser::parsePositionalPattern() {
     return pp;
 }
 
-ast::CaseArm Parser::parseCaseArm() {
+ast::CaseArm Parser::parseCaseArm(bool scrutineeLess) {
     ast::CaseArm arm;
-    arm.pattern = parsePattern();
+    if (scrutineeLess) {
+        // §19.1 scrutinee-less form: each arm's "pattern" is a full boolean
+        // expression (e.g. `int(this) < int(other)`, `score >= 90`, `_ `).
+        // The `_` discard is the only conventional pattern that remains as-is.
+        if (current_.kind == TokenKind::Identifier && current_.text == "_") {
+            advance();
+            arm.pattern = std::make_unique<ast::DiscardPattern>();
+        } else {
+            // Parse a full expression as the boolean pattern. Wrap it as a
+            // ConstantPattern so the rest of the arm pipeline is uniform.
+            auto boolExpr = parseExpression();
+            auto cp = std::make_unique<ast::ConstantPattern>();
+            cp->constants.push_back(std::move(boolExpr));
+            arm.pattern = std::move(cp);
+        }
+    } else {
+        arm.pattern = parsePattern();
+    }
     if (consumeKeyword("when")) {
         arm.guard = parseExpression();
     }
@@ -944,27 +977,68 @@ ast::CaseArm Parser::parseCaseArm() {
     return arm;
 }
 
+// §19.1 / §A.7 `Expression?`: detect the scrutinee-less bare-`case` form.
+// Returns true when either:
+//   (a) the first arm's first token is on a different (later) source line
+//       than the `case` keyword — the canonical written style for bare case;
+//   (b) a bounded forward scan to the first `=>` at depth 0 finds an
+//       operator that cannot appear in a Pattern (equality `=`/`<>`, logical
+//       `or`/`and`) — an unambiguous signal that the arms are full boolean
+//       expressions rather than patterns.
+// Called immediately after advance() past `case`; `caseKeyLine` is the
+// source line of the consumed `case` token.
+bool Parser::isScruntineeLessCase(uint32_t caseKeyLine) const {
+    // Heuristic (a): `case` keyword on a different line than first arm token.
+    if (current_.location.line != caseKeyLine) return true;
+    // Heuristic (b): scan for non-pattern operators before first `=>`.
+    // Track nesting depth for `(`, `)`, `[`, `]`; bail at `end`/EOF.
+    int depth = 0;
+    for (std::size_t i = 0; ; ++i) {
+        const Token& t = const_cast<Parser*>(this)->peekAt(i);
+        if (t.kind == TokenKind::EndOfFile) break;
+        if (t.kind == TokenKind::Punctuator) {
+            if (t.text == "(" || t.text == "[") { depth++; continue; }
+            if (t.text == ")" || t.text == "]") { depth--; continue; }
+            if (depth == 0) {
+                if (t.text == "=>") break;  // end of first arm's pattern region
+            }
+        }
+        if (t.kind == TokenKind::Keyword && depth == 0) {
+            if (t.text == "end") break;  // empty or malformed case
+            // `or` / `and` — logical operators, not in Pattern
+            if (t.text == "or" || t.text == "and") return true;
+        }
+    }
+    return false;
+}
+
 std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
+    const uint32_t caseKeyLine = current_.location.line;
     advance(); // past `case`
     auto ce = std::make_unique<ast::CaseExpr>();
-    // Slice 38 requires the scrutinee form. The bare-`case` form
-    // (`case CaseArm* end`, no scrutinee) is deferred.
+
+    // §19.1 / §A.7 `Expression?`: detect scrutinee-less form. In the bare
+    // form (no scrutinee), each arm's pattern is a full boolean expression
+    // and no scrutinee value exists.
     //
-    // §19: the scrutinee is limited to operators above the relational level
-    // (precedence ≥ 8) so that relop patterns (`>=90`, `<0`, etc.) are
-    // recognised as arm patterns rather than consumed as part of a boolean
-    // scrutinee. Users needing a full boolean expression as scrutinee can
-    // wrap it in parentheses.
-    {
+    // §19: in scrutinee form, the scrutinee is limited to operators above
+    // the relational level (precedence ≥ 8) so that relop patterns
+    // (`>=90`, `<0`, etc.) are recognised as arm patterns rather than
+    // consumed as part of a boolean scrutinee. Users needing a full boolean
+    // expression as scrutinee can wrap it in parentheses.
+    const bool bareForm = isScruntineeLessCase(caseKeyLine);
+    if (!bareForm) {
         SourceLocation start = current_.location;
         ce->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
     }
-    ce->arms.push_back(parseCaseArm());
+    // ce->scrutinee remains null for bare form (grammar: Expression?).
+
+    ce->arms.push_back(parseCaseArm(bareForm));
     while (consumePunctuator(",")) {
         // Trailing `","?` per the grammar — `,` followed immediately by
         // `end` terminates the list.
         if (isKeyword("end")) break;
-        ce->arms.push_back(parseCaseArm());
+        ce->arms.push_back(parseCaseArm(bareForm));
     }
     if (!consumeKeyword("end")) {
         diagnostics_.report(Severity::Error, current_.location,

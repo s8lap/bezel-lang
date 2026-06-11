@@ -109,7 +109,20 @@ private:
     // inPositional=true suppresses the ConstantPattern `,` alternatives loop
     // to avoid consuming the sub-pattern separator in DestructuringPatterns.
     std::unique_ptr<ast::Pattern> parsePattern(bool inPositional = false);
-    ast::CaseArm parseCaseArm();
+    // parseCaseArm: when `scrutineeLess` is true the arm "pattern" is a
+    // full boolean expression (§19.1 scrutinee-less form); the Pattern
+    // grammar is bypassed and parseExpression() is used directly, wrapping
+    // the result in a ConstantPattern so the arm's pattern field is always
+    // non-null. Issue #657 / spec_0026, spec_0020, spec_0100.
+    ast::CaseArm parseCaseArm(bool scrutineeLess = false);
+    // Scrutinee-less `case` form detection (§19.1 / §A.7 `Expression?`):
+    // returns true when `case` is on a different source line than the first
+    // arm's first token (the common written style for bare-case), OR when a
+    // bounded forward scan to the first `=>` at depth 0 finds an operator
+    // that cannot appear in a Pattern (`=`, `<>`, `or`, `and`).
+    // Called after advance() past `case`; `caseKeyLine` is the line of the
+    // consumed `case` keyword.
+    bool isScruntineeLessCase(uint32_t caseKeyLine) const;
     std::unique_ptr<ast::Expr> parseCaseExpr();
     // The positional sub-pattern of `Name(p1, p2)` destructuring. Mostly
     // delegates to parsePattern, but also admits naked-binding Identifier
@@ -126,9 +139,9 @@ private:
     std::unique_ptr<ast::Expr> qualifiedNameToExpr(
         std::unique_ptr<ast::QualifiedName> qn);
     // Slice 39: statement-position `case` (A.6). Sibling of parseCaseExpr;
-    // arms have Statement-form or `do … end` bodies.
+    // arms have Expression-form, Statement-form, or `do … end` bodies.
     std::unique_ptr<ast::Stmt> parseCaseStmt();
-    ast::CaseArm parseCaseStmtArm();
+    ast::CaseArm parseCaseStmtArm(bool scrutineeLess = false);
     // Slice 41: parse `serialized ( "skip" | StringLiteral? "optional"? )`
     // (A.4 SerializedClause). The caller checks `isSerializedClauseStart()`
     // first — `serialized` is contextual so we identify by text.

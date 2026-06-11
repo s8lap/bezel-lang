@@ -52,6 +52,7 @@ set(BEZEL_TEST_SOURCES
     parser/property_accessor_blocks_test.cpp
     parser/case_and_patterns_test.cpp
     parser/case_stmt_test.cpp
+    parser/case_scrutineeless_test.cpp
     parser/nested_types_test.cpp
     parser/serialized_clause_test.cpp
     parser/serialized_class_clause_test.cpp
