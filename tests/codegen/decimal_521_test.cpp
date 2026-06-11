@@ -19,6 +19,13 @@
 //   521_stdlib      — Decimal.Parse, TryParse, ToString, CompareTo, Round (§9.3)
 //   521_consts      — Decimal.Zero, One, MinValue, MaxValue (§9.3)
 
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <sys/wait.h>
+
+#include "driver/Driver.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -439,4 +446,156 @@ BEZEL_TEST(codegen_521_consts, min_less_than_max_spec_9_3) {
         "var hi := Decimal.MaxValue; "
         "if lo < hi then return 1; end; "
         "return 0; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_overflow: §6.4 — decimal arithmetic overflow raises OverflowException.
+// Before fix #521 (this commit), these paths called abort() and killed the
+// process.  After the fix, OverflowException propagates through try/catch.
+// ---------------------------------------------------------------------------
+
+// §6.4: MaxValue + One raises OverflowException (add path via dec_store).
+BEZEL_TEST(codegen_521_overflow, max_plus_one_raises_overflow_spec_6_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var r := 0; "
+        "try "
+        "  var big := Decimal.MaxValue; "
+        "  var one := Decimal.One; "
+        "  var _ := big + one; "
+        "catch OverflowException => r := 1; "
+        "end; "
+        "return r; ")), 1);
+}
+
+// §6.4: MaxValue * 2m raises OverflowException (mul path via dec_store).
+BEZEL_TEST(codegen_521_overflow, max_times_two_raises_overflow_spec_6_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var r := 0; "
+        "try "
+        "  var big := Decimal.MaxValue; "
+        "  var two := 2m; "
+        "  var _ := big * two; "
+        "catch OverflowException => r := 1; "
+        "end; "
+        "return r; ")), 1);
+}
+
+// §6.4: MinValue - One raises OverflowException (sub path via add).
+// MinValue is already the most negative representable decimal; subtracting
+// one more pushes the mantissa past MaxValue.
+BEZEL_TEST(codegen_521_overflow, min_minus_one_raises_overflow_spec_6_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var r := 0; "
+        "try "
+        "  var small := Decimal.MinValue; "
+        "  var one := Decimal.One; "
+        "  var _ := small - one; "
+        "catch OverflowException => r := 1; "
+        "end; "
+        "return r; ")), 1);
+}
+
+// §6.4 / §9.3: Decimal.Parse on an out-of-range string raises OverflowException.
+// The value "1e29" (10^29) exceeds MaxValue (≈7.9e28), so Parse must raise
+// OverflowException rather than FormatException (the string is well-formed).
+BEZEL_TEST(codegen_521_overflow, parse_out_of_range_raises_overflow_spec_6_4_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var r := 0; "
+        "try "
+        "  var _ := Decimal.Parse(\"1e29\"); "
+        "catch OverflowException => r := 1; "
+        "end; "
+        "return r; ")), 1);
+}
+
+// §9.3: Decimal.Parse on a malformed string raises FormatException.
+// "abc" is not a valid decimal string.
+BEZEL_TEST(codegen_521_overflow, parse_malformed_raises_format_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var r := 0; "
+        "try "
+        "  var _ := Decimal.Parse(\"abc\"); "
+        "catch FormatException => r := 1; "
+        "end; "
+        "return r; ")), 1);
+}
+
+// §6.4: overflow exception is catchable — execution continues after the catch.
+// This test proves the exception is a proper exception (not abort) by checking
+// that code after the try/catch runs.
+BEZEL_TEST(codegen_521_overflow, overflow_catchable_execution_continues_spec_6_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var caught := 0; "
+        "try "
+        "  var big := Decimal.MaxValue; "
+        "  var _ := big + big; "
+        "catch OverflowException => caught := 1; "
+        "end; "
+        "if caught = 1 then return 42; end; "
+        "return 0; ")), 42);
+}
+
+// §6.4 regression: normal arithmetic is still exact after the overflow fix.
+// 0.1m + 0.2m = 0.3m must still hold — the fix must not affect non-overflow paths.
+BEZEL_TEST(codegen_521_overflow, normal_add_still_exact_regression_spec_6_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 0.1m; "
+        "var b := 0.2m; "
+        "var c := a + b; "
+        "if c = 0.3m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_overflow_aot: AOT (native executable) probe — §6.4 overflow exception
+// propagates correctly through the native code path (not just JIT).
+// Uses the Driver compile+link+exec pipeline, same as uncaught_exit_test.cpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Compile `source` to a temp native executable and run it; returns the
+// process exit code, or -1 if compilation/link/run failed.
+// per §33.3: Main's return value is the process exit code.
+int compileAndRun521(const std::string& source) {
+    static int counter = 0;
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_521_aot_" + std::to_string(counter++);
+    std::string src  = (dir / (stem + ".bzl")).string();
+    std::string exe  = (dir / stem).string();
+    {
+        std::ofstream out(src);
+        out << source;
+    }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    int code = -1;
+    if (r.success) {
+        int status = std::system(exe.c_str());
+        if (status != -1 && WIFEXITED(status)) code = WEXITSTATUS(status);
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return code;
+}
+
+} // namespace
+
+// §6.4 AOT probe: Decimal.MaxValue + Decimal.One raises OverflowException;
+// the catch runs and Main returns 42 → process exits with code 42.
+// This verifies the exception propagates correctly in native (non-JIT) mode.
+BEZEL_TEST(codegen_521_overflow, aot_max_plus_one_catches_and_returns_42_spec_6_4) {
+    BEZEL_EXPECT_EQ(compileAndRun521(
+        "module M; "
+        "class C public static method Main(): int "
+        "  try "
+        "    var big := Decimal.MaxValue; "
+        "    var one := Decimal.One; "
+        "    var _ := big + one; "
+        "    return 1; "
+        "  catch OverflowException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"),
+        42);
 }

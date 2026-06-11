@@ -1,7 +1,8 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
 // §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
-extern "C" void bz_decimal_parse_cstr(const char* s, void* out);
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
+                                       void* ove_vtable, void* fe_vtable);
 
 namespace bezel::codegen {
 
@@ -4505,7 +4506,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // Helper: build a decimal struct from compile-time parse of a cstr.
         auto decConstant = [&](const char* s) -> llvm::Value* {
             uint32_t dec[4] = {0, 0, 0, 0};
-            bz_decimal_parse_cstr(s, dec);
+            bz_decimal_parse_cstr(s, dec, nullptr, nullptr);
             return llvm::ConstantStruct::get(dst, {
                 llvm::ConstantInt::get(i32(), dec[0]),
                 llvm::ConstantInt::get(i32(), dec[1]),
@@ -4527,14 +4528,30 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "One" && call.args.empty())
             return decConstant("1");
 
-        // Decimal.Parse(s: string): decimal — throws FormatException on failure.
+        // Decimal.Parse(s: string): decimal — throws FormatException for malformed
+        // input or OverflowException for out-of-range values (per fix #521 / §6.4).
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::AllocaInst* slot = makeDecSlot();
+            // per fix #521: pass OverflowException and FormatException vtables
+            // so the runtime stores the correct exception in bz_exc on failure.
+            auto getOVEVtable = [&]() -> llvm::Value* {
+                auto vit = builtinVtable_.find("OverflowException");
+                if (vit == builtinVtable_.end())
+                    return llvm::ConstantPointerNull::get(ptrTy());
+                return vit->second;
+            };
+            auto getFEVtable = [&]() -> llvm::Value* {
+                auto vit = builtinVtable_.find("FormatException");
+                if (vit == builtinVtable_.end())
+                    return llvm::ConstantPointerNull::get(ptrTy());
+                return vit->second;
+            };
             auto* fn = declareC("bz_decimal_parse", llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy()});
-            builder_.CreateCall(fn, {strVal, slot});
+                                {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {strVal, slot, getOVEVtable(), getFEVtable()});
+            emitPendingCheck();  // per fix #521: runtime sets bz_exc on parse failure
             return builder_.CreateLoad(dst, slot, "dec.parsed");
         }
 

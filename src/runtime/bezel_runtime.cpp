@@ -1412,12 +1412,23 @@ void bz_random_next_bytes(void* rp, uint8_t* buf, int64_t len) {
 //   bz_decimal_div / bz_decimal_mod (matching the integer division pattern).
 //   The codegen inspects the three mantissa i32 fields and throws if all zero.
 //   The runtime functions assume the divisor is non-zero.
-// - OverflowException: raised via abort() for the pathological overflow case
-//   (mantissa > 2^96 − 1 after all scale reduction).  In practice this can
-//   only happen for products/quotients of extremely large values; the 96-bit
-//   limit accommodates 28–29 significant decimal digits.  A future revision
-//   can wire in the full vtable-based exception mechanism (see bz_ser_throw).
-#include <cstdlib>  // abort()
+// - OverflowException: raised via bz_set_exc(ove_vtable) into the bz_exc slot.
+//   Each arithmetic function receives the OverflowException vtable as a
+//   parameter (ove_vtable) and stores a minimal exception object in bz_exc.
+//   The codegen caller calls emitPendingCheck() after every arithmetic call.
+//   Pattern mirrors fix #634 / bz_channel_send / bz_ser_throw (§6.4).
+// - FormatException: same mechanism, separate vtable (fe_vtable), used by
+//   bz_decimal_parse_cstr for malformed input.
+
+// Helper: allocate a minimal 16-byte exception object {vtable*, null} and
+// store it in bz_exc (the global pending-exception slot).
+static void bz_set_exc(void* vtable) {
+    if (!vtable) return;
+    void** obj = static_cast<void**>(calloc(1, 16));
+    memcpy(obj, &vtable, sizeof(void*));
+    extern void* bz_exc;
+    bz_exc = obj;
+}
 
 // Helper: extract the unsigned 96-bit mantissa as __uint128_t.
 static inline __uint128_t dec_mantissa(const bz_decimal_t* d) {
@@ -1481,8 +1492,11 @@ static const __uint128_t kMax96 =
 // This is the largest 96-bit number = 2^96 - 1.
 
 // Helper: store mantissa + scale + sign back into a bz_decimal_t.
-// Aborts on OverflowException (§6.4) — see note above on exception strategy.
-static void dec_store(bz_decimal_t* out, __uint128_t m, uint32_t s, int neg) {
+// Returns true on success; on OverflowException (§6.4) stores the exception
+// object via bz_set_exc(ove_vtable) and returns false.
+// per fix #521 / §6.4: overflow raises OverflowException, not abort().
+static bool dec_store(bz_decimal_t* out, __uint128_t m, uint32_t s, int neg,
+                      void* ove_vtable) {
     // Remove trailing decimal zeros to minimise scale.
     while (s > 0 && m % 10 == 0) { m /= 10; --s; }
     // If mantissa still overflows 96 bits, try to reduce by increasing the
@@ -1490,7 +1504,8 @@ static void dec_store(bz_decimal_t* out, __uint128_t m, uint32_t s, int neg) {
     while (m > kMax96) {
         if (s == 0) {
             // §6.4: OverflowException — pathological case (value > MaxValue).
-            abort();
+            bz_set_exc(ove_vtable);
+            return false;
         }
         __uint128_t rem = m % 10;
         m = m / 10;
@@ -1499,12 +1514,17 @@ static void dec_store(bz_decimal_t* out, __uint128_t m, uint32_t s, int neg) {
         // Remove new trailing zeros.
         while (s > 0 && m % 10 == 0) { m /= 10; --s; }
     }
-    if (m > kMax96) { abort(); }  // should not reach here
+    if (m > kMax96) {
+        // should not reach here — defensive overflow guard (§6.4).
+        bz_set_exc(ove_vtable);
+        return false;
+    }
     if (m == 0) neg = 0;  // no negative zero per .NET
     out->lo32  = (uint32_t)(m & 0xFFFFFFFF);
     out->mid32 = (uint32_t)((m >> 32) & 0xFFFFFFFF);
     out->hi32  = (uint32_t)((m >> 64) & 0xFFFFFFFF);
     out->flags = ((uint32_t)neg << 31) | ((s & 0xFF) << 16);
+    return true;
 }
 
 // Helper: align two decimals to the same scale, returning false if impossible.
@@ -1542,8 +1562,10 @@ static bool dec_align(__uint128_t ma, uint32_t sa,
 }
 
 // §4.4 / §6.4: decimal + decimal
+// per fix #521 / §6.4: ove_vtable is the OverflowException vtable; stored in
+// bz_exc on overflow so codegen's emitPendingCheck() unwinds.
 extern "C" void bz_decimal_add(const bz_decimal_t* a, const bz_decimal_t* b,
-                                bz_decimal_t* out) {
+                                bz_decimal_t* out, void* ove_vtable) {
     __uint128_t ma = dec_mantissa(a), mb = dec_mantissa(b);
     uint32_t sa = dec_scale(a), sb = dec_scale(b);
     int signa = dec_sign(a), signb = dec_sign(b);
@@ -1558,22 +1580,24 @@ extern "C" void bz_decimal_add(const bz_decimal_t* a, const bz_decimal_t* b,
         if (ra >= rb) { rm = ra - rb; rsign = signa; }
         else          { rm = rb - ra; rsign = signb; }
     }
-    dec_store(out, rm, rs, rsign);
+    dec_store(out, rm, rs, rsign, ove_vtable);
 }
 
 // §4.4 / §6.4: decimal - decimal
+// per fix #521 / §6.4: ove_vtable flows through to bz_decimal_add/dec_store.
 extern "C" void bz_decimal_sub(const bz_decimal_t* a, const bz_decimal_t* b,
-                                bz_decimal_t* out) {
+                                bz_decimal_t* out, void* ove_vtable) {
     // a - b = a + (-b)
     bz_decimal_t nb = *b;
     nb.flags ^= (1u << 31);  // flip sign
     if (dec_mantissa(&nb) == 0) nb.flags &= ~(1u << 31);  // no -0
-    bz_decimal_add(a, &nb, out);
+    bz_decimal_add(a, &nb, out, ove_vtable);
 }
 
 // §4.4 / §6.4: decimal * decimal
+// per fix #521 / §6.4: ove_vtable flows to dec_store for overflow signalling.
 extern "C" void bz_decimal_mul(const bz_decimal_t* a, const bz_decimal_t* b,
-                                bz_decimal_t* out) {
+                                bz_decimal_t* out, void* ove_vtable) {
     __uint128_t ma = dec_mantissa(a), mb = dec_mantissa(b);
     uint32_t sa = dec_scale(a) + dec_scale(b);
     int rsign = dec_sign(a) ^ dec_sign(b);
@@ -1673,13 +1697,14 @@ extern "C" void bz_decimal_mul(const bz_decimal_t* a, const bz_decimal_t* b,
                       ((__uint128_t)limbs[2] << 64) |
                       ((__uint128_t)limbs[1] << 32) |
                        (__uint128_t)limbs[0]);
-        // If sa > 0, reduce scale. Otherwise we've lost digits (round).
+        // If sa > 0, reduce scale (divides by 10, legal rounding).
+        // If sa == 0, the product genuinely exceeds MaxValue — OverflowException.
         if (sa > 0) { --sa; }
         else {
-            // We've exhausted the scale but the product still exceeds MaxValue.
-            // Round and store — if it still overflows after normalisation, throw.
-            if (rem >= 5 && product_lo < kMax96) product_lo += 1;
-            break;
+            // §6.4: OverflowException — product > MaxValue with no remaining
+            // scale to reduce.  Cannot represent the result.
+            bz_set_exc(ove_vtable);
+            return;
         }
         if (rem >= 5) {
             // Round: add 1 to the truncated result.
@@ -1692,15 +1717,16 @@ extern "C" void bz_decimal_mul(const bz_decimal_t* a, const bz_decimal_t* b,
             }
         }
     }
-    dec_store(out, product_lo, sa, rsign);
+    dec_store(out, product_lo, sa, rsign, ove_vtable);
 }
 
 // §4.4 / §6.4: decimal / decimal.
 // PRE: divisor is non-zero (codegen checks via emitGuardThrow before calling).
+// per fix #521 / §6.4: ove_vtable flows to dec_store for overflow signalling.
 extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
-                                bz_decimal_t* out) {
+                                bz_decimal_t* out, void* ove_vtable) {
     __uint128_t mb = dec_mantissa(b);
-    if (mb == 0) { abort(); return; }  // precondition violated
+    if (mb == 0) { abort(); return; }  // precondition violated — codegen guards this
     __uint128_t ma = dec_mantissa(a);
     uint32_t sa = dec_scale(a), sb = dec_scale(b);
     int rsign = dec_sign(a) ^ dec_sign(b);
@@ -1721,18 +1747,19 @@ extern "C" void bz_decimal_div(const bz_decimal_t* a, const bz_decimal_t* b,
     if (rs_signed < 0) {
         // Result scale is negative: multiply q by 10^|rs| to compensate.
         while (rs_signed < 0 && q <= kMax96 / 10) { q *= 10; ++rs_signed; }
-        if (rs_signed < 0) { dec_store(out, q, 0, rsign); return; }
+        if (rs_signed < 0) { dec_store(out, q, 0, rsign, ove_vtable); return; }
     }
     uint32_t rs = (uint32_t)rs_signed;
-    dec_store(out, q, rs, rsign);
+    dec_store(out, q, rs, rsign, ove_vtable);
 }
 
 // §4.4 / §6.4: decimal mod decimal.
 // PRE: divisor is non-zero (codegen checks via emitGuardThrow before calling).
+// per fix #521 / §6.4: ove_vtable flows to dec_store for overflow signalling.
 extern "C" void bz_decimal_mod(const bz_decimal_t* a, const bz_decimal_t* b,
-                                bz_decimal_t* out) {
+                                bz_decimal_t* out, void* ove_vtable) {
     __uint128_t mb = dec_mantissa(b);
-    if (mb == 0) { abort(); return; }  // precondition violated
+    if (mb == 0) { abort(); return; }  // precondition violated — codegen guards this
     __uint128_t ma = dec_mantissa(a);
     uint32_t sa = dec_scale(a), sb = dec_scale(b);
     int signa = dec_sign(a);
@@ -1743,7 +1770,7 @@ extern "C" void bz_decimal_mod(const bz_decimal_t* a, const bz_decimal_t* b,
     if (rb == 0) { abort(); return; }  // shouldn't happen given non-zero divisor
     __uint128_t q = ra / rb;
     __uint128_t rem = ra - q * rb;
-    dec_store(out, rem, rs, signa);
+    dec_store(out, rem, rs, signa, ove_vtable);
 }
 
 // Negation.
@@ -1773,7 +1800,8 @@ extern "C" void bz_decimal_from_int64(int64_t v, bz_decimal_t* out) {
     int neg = (v < 0);
     __uint128_t m = neg ? (v == INT64_MIN ? ((__uint128_t)1 << 63) : (__uint128_t)(-v))
                         : (__uint128_t)v;
-    dec_store(out, m, 0, neg);
+    // int64 mantissa always fits in 96 bits (int64_max < 2^63 < 2^96); no overflow.
+    dec_store(out, m, 0, neg, nullptr);
 }
 
 extern "C" void bz_decimal_from_int32(int32_t v, bz_decimal_t* out) {
@@ -1781,12 +1809,21 @@ extern "C" void bz_decimal_from_int32(int32_t v, bz_decimal_t* out) {
 }
 
 // Conversion from double (explicit per §5.2).
-extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out) {
+// per fix #521 / §6.4: ove_vtable is stored in bz_exc on overflow; callers
+// call emitPendingCheck() after this function.
+extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
+                                        void* ove_vtable) {
     // Use snprintf to get the decimal representation.
-    if (v != v || v > 1e29 || v < -1e29) { abort(); return; }  // OverflowException
+    if (v != v || v > 1e29 || v < -1e29) {
+        // §6.4: OverflowException — value out of decimal range.
+        bz_set_exc(ove_vtable);
+        return;
+    }
     char buf[64];
     snprintf(buf, sizeof(buf), "%.15g", v);
-    bz_decimal_parse_cstr(buf, out);
+    // ove_vtable also covers the (very unlikely) case where the string
+    // produced by snprintf overflows (e.g. 1e29 edge case).
+    bz_decimal_parse_cstr(buf, out, ove_vtable, nullptr);
 }
 
 // Conversion to double (explicit per §5.2).
@@ -1813,8 +1850,13 @@ extern "C" double bz_decimal_to_double(const bz_decimal_t* a) {
 }
 
 // Parse from C string (null-terminated).
-extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out) {
-    if (!s) { abort(); return; }  // FormatException — null input
+// per fix #521 / §6.4: FormatException (malformed) stored via fe_vtable;
+// OverflowException (out-of-range) stored via ove_vtable.  Either may be
+// nullptr (used during compile-time initialisation where no vtable exists).
+// On failure bz_exc is set and the function returns without writing *out.
+extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
+                                       void* ove_vtable, void* fe_vtable) {
+    if (!s) { bz_set_exc(fe_vtable); return; }  // FormatException — null input
     // Skip optional sign.
     int neg = 0;
     if (*s == '-') { neg = 1; ++s; }
@@ -1840,7 +1882,11 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out) {
                     // Multiply by 10^(exp-sc): shift mantissa left.
                     int shift = exp - (int)sc;
                     for (int i = 0; i < shift && i < 29; ++i) {
-                        if (m > kMax96 / 10) { abort(); return; }  // OverflowException
+                        if (m > kMax96 / 10) {
+                            // §6.4: OverflowException — mantissa too large for decimal range.
+                            bz_set_exc(ove_vtable);
+                            return;
+                        }
                         m *= 10;
                     }
                     sc = 0;
@@ -1850,7 +1896,11 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out) {
             }
             break;
         }
-        if (*s < '0' || *s > '9') { abort(); return; }  // FormatException
+        if (*s < '0' || *s > '9') {
+            // FormatException — unexpected character in decimal string.
+            bz_set_exc(fe_vtable);
+            return;
+        }
         any_digit = true;
         if (in_frac) ++sc;
         if (m <= kMax96 / 10) {
@@ -1859,14 +1909,24 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out) {
         // If mantissa would overflow, just track scale (lose trailing digits
         // beyond 29).
     }
-    if (!any_digit) { abort(); return; }  // FormatException
-    dec_store(out, m, sc, neg);
+    if (!any_digit) {
+        // FormatException — no digits found.
+        bz_set_exc(fe_vtable);
+        return;
+    }
+    dec_store(out, m, sc, neg, ove_vtable);
 }
 
 // Parse from bz_string* (stdlib §9.3 Decimal.Parse).
-// Throws on failure.
-extern "C" void bz_decimal_parse(const void* str, bz_decimal_t* out) {
-    if (!str) { abort(); return; }  // ArgumentNullException
+// per fix #521: raises FormatException (malformed) or OverflowException
+// (out-of-range) via bz_exc; codegen calls emitPendingCheck() after this call.
+extern "C" void bz_decimal_parse(const void* str, bz_decimal_t* out,
+                                  void* ove_vtable, void* fe_vtable) {
+    if (!str) {
+        // Null string argument — raise FormatException per §9.3.
+        bz_set_exc(fe_vtable);
+        return;
+    }
     // bz_string layout: { char* data, int64_t len, uint8_t width, int64_t rc }
     struct BzStr { char* data; int64_t len; uint8_t width; int64_t rc; };
     const auto* bs = (const BzStr*)str;
@@ -1875,10 +1935,13 @@ extern "C" void bz_decimal_parse(const void* str, bz_decimal_t* out) {
     int64_t n = bs->len < 63 ? bs->len : 63;
     for (int64_t i = 0; i < n; ++i) buf[i] = bs->data[i];
     buf[n] = '\0';
-    bz_decimal_parse_cstr(buf, out);
+    bz_decimal_parse_cstr(buf, out, ove_vtable, fe_vtable);
 }
 
 // TryParse — returns 0 on failure (no throw), 1 on success.
+// per fix #521: uses bz_decimal_parse_cstr with null vtables so no exception
+// is stored; on failure bz_exc is not set and the return value signals failure.
+// Overflow also returns 0 (mirrors .NET Decimal.TryParse behaviour).
 extern "C" int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out) {
     // We need a way to catch failures. Use setjmp/longjmp? That's complex.
     // Instead, validate the string manually before parsing.
@@ -1906,7 +1969,19 @@ extern "C" int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out) {
         has_digit = true;
     }
     if (!has_digit) return 0;
-    bz_decimal_parse_cstr(buf, out);
+    // Pass null vtables: on overflow bz_exc is NOT set (TryParse returns false).
+    extern void* bz_exc;
+    void* prev_exc = bz_exc;
+    bz_exc = nullptr;
+    bz_decimal_parse_cstr(buf, out, nullptr, nullptr);
+    if (bz_exc) {
+        // Overflow or other error during parse — return 0 (no exception raised).
+        // Discard the internally set exc and restore caller's exception state.
+        free(bz_exc);
+        bz_exc = prev_exc;
+        return 0;
+    }
+    bz_exc = prev_exc;
     return 1;
 }
 
@@ -1981,7 +2056,8 @@ extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
         m /= 10;
         if (i == 0 && rem >= 5) m += 1;
     }
-    dec_store(out, m, (uint32_t)digits, dec_sign(a));
+    // Rounding only reduces mantissa magnitude; result always fits in 96 bits.
+    dec_store(out, m, (uint32_t)digits, dec_sign(a), nullptr);
 }
 
 // ---------------------------------------------------------------------------

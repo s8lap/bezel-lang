@@ -4,7 +4,10 @@
 // bz_decimal_parse_cstr is compiled into the same process (the runtime is linked
 // into bezel_tests and also available in the driver binary).  Calling it from the
 // compiler during code generation is safe for both AOT and JIT modes.
-extern "C" void bz_decimal_parse_cstr(const char* s, void* out);
+// per fix #521: ove_vtable/fe_vtable are nullptr here because literals are
+// already validated by the lexer; the cstr call cannot fail at compile time.
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
+                                       void* ove_vtable, void* fe_vtable);
 
 namespace bezel::codegen {
 
@@ -54,7 +57,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
             // Call the runtime parse function directly (declared at top of file).
             uint32_t dec[4] = {0, 0, 0, 0};
-            bz_decimal_parse_cstr(digits.c_str(), dec);
+            bz_decimal_parse_cstr(digits.c_str(), dec, nullptr, nullptr);
             llvm::StructType* dst = decimalStructType();
             return llvm::ConstantStruct::get(dst, {
                 llvm::ConstantInt::get(i32(), dec[0]),
@@ -1585,7 +1588,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         return llvm::ConstantAggregateZero::get(dst);
                     if (mbr == "One") {
                         uint32_t dec[4] = {0, 0, 0, 0};
-                        bz_decimal_parse_cstr("1", dec);
+                        bz_decimal_parse_cstr("1", dec, nullptr, nullptr);
                         return llvm::ConstantStruct::get(dst, {
                             llvm::ConstantInt::get(i32(), dec[0]),
                             llvm::ConstantInt::get(i32(), dec[1]),
@@ -1595,7 +1598,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                     if (mbr == "MinValue") {
                         uint32_t dec[4] = {0, 0, 0, 0};
-                        bz_decimal_parse_cstr("-79228162514264337593543950335", dec);
+                        bz_decimal_parse_cstr("-79228162514264337593543950335", dec, nullptr, nullptr);
                         return llvm::ConstantStruct::get(dst, {
                             llvm::ConstantInt::get(i32(), dec[0]),
                             llvm::ConstantInt::get(i32(), dec[1]),
@@ -1605,7 +1608,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                     if (mbr == "MaxValue") {
                         uint32_t dec[4] = {0, 0, 0, 0};
-                        bz_decimal_parse_cstr("79228162514264337593543950335", dec);
+                        bz_decimal_parse_cstr("79228162514264337593543950335", dec, nullptr, nullptr);
                         return llvm::ConstantStruct::get(dst, {
                             llvm::ConstantInt::get(i32(), dec[0]),
                             llvm::ConstantInt::get(i32(), dec[1]),
@@ -3638,9 +3641,18 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     op == "*"   ? "bz_decimal_mul" :
                     op == "/"   ? "bz_decimal_div" :
                     /* mod */     "bz_decimal_mod";
+                // per fix #521 / §6.4: pass OverflowException vtable so the
+                // runtime can set bz_exc on overflow; emitPendingCheck() unwinds.
+                auto getOVEVtable = [&]() -> llvm::Value* {
+                    auto vit = builtinVtable_.find("OverflowException");
+                    if (vit == builtinVtable_.end())
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                    return vit->second;
+                };
                 auto* fn = declareC(fn_name, llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {aSlot, bSlot, oSlot});
+                                    {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {aSlot, bSlot, oSlot, getOVEVtable()});
+                emitPendingCheck();  // per fix #521 / §6.4: runtime sets bz_exc on overflow
                 return builder_.CreateLoad(dst, oSlot, "dec.res");
             }
             // Negation (unary - on decimal is handled separately via lowerUnary,
