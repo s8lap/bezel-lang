@@ -21,9 +21,23 @@ NodePtr stampSpan(NodePtr node, const SourceLocation& start,
 } // namespace
 
 
-ast::CaseArm Parser::parseCaseStmtArm() {
+ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
     ast::CaseArm arm;
-    arm.pattern = parsePattern();
+    if (scrutineeLess) {
+        // §19.1 scrutinee-less: arm pattern is a full boolean expression.
+        // `_` is the discard pattern and remains special.
+        if (current_.kind == TokenKind::Identifier && current_.text == "_") {
+            advance();
+            arm.pattern = std::make_unique<ast::DiscardPattern>();
+        } else {
+            auto boolExpr = parseExpression();
+            auto cp = std::make_unique<ast::ConstantPattern>();
+            cp->constants.push_back(std::move(boolExpr));
+            arm.pattern = std::move(cp);
+        }
+    } else {
+        arm.pattern = parsePattern();
+    }
     if (consumeKeyword("when")) {
         arm.guard = parseExpression();
     }
@@ -31,10 +45,21 @@ ast::CaseArm Parser::parseCaseStmtArm() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected '=>' after case-arm pattern");
     }
-    // ArmBody in statement position: `do … end` block OR a single Statement
-    // (whose terminating `;` ends the arm body per the §A.7 ArmBody note).
+    // ArmBody in statement position: §A.7 allows three forms:
+    //   (1) `do … end` block of statements
+    //   (2) A single Statement whose terminating `;` ends the arm body
+    //   (3) An Expression (value discarded; per §19.7 spec examples,
+    //       no `;` is required when the expression fills the arm body
+    //       and `,` or `end` follows directly)
+    //
+    // Disambiguation:
+    //   `do` keyword → form (1).
+    //   Keywords that start statements only (`return`, `var`, …) → form (2).
+    //   Everything else → parse as expression (form 3); if `;` follows,
+    //   consume it (compatible with explicit-`;` statement style from §19.2).
     arm.bodyKind = ast::CaseArmBodyKind::Block;
     if (consumeKeyword("do")) {
+        // Block form.
         while (!isKeyword("end") &&
                current_.kind != TokenKind::EndOfFile) {
             auto s = parseStatement();
@@ -49,28 +74,53 @@ ast::CaseArm Parser::parseCaseStmtArm() {
                 Severity::Error, current_.location,
                 "expected 'end' to close 'do' arm body");
         }
-    } else {
-        // Single Statement. The Statement consumes its own `;`. After
-        // returning, the outer loop expects `,` or `end`.
+    } else if (current_.kind == TokenKind::Keyword &&
+               (current_.text == "return"  || current_.text == "var"     ||
+                current_.text == "using"   || current_.text == "for"     ||
+                current_.text == "while"   || current_.text == "if"      ||
+                current_.text == "break"   || current_.text == "continue"||
+                current_.text == "try"     || current_.text == "yield"   ||
+                current_.text == "await")) {
+        // Statement-only keywords → parse as statement (form 2). The
+        // statement consumes its own `;`, leaving `,` or `end` for the
+        // outer case-arm loop.
         auto s = parseStatement();
         if (s) arm.stmts.push_back(std::move(s));
+    } else {
+        // Expression body (form 3). Parse the expression, then optionally
+        // consume `;` for compatibility with the explicit-semicolon style.
+        // Wrap in ExpressionStmt and store in stmts so the arm is uniformly
+        // represented as a Block with one statement.
+        SourceLocation start = current_.location;
+        auto expr = parseExpression();
+        // Consume optional `;` (explicit statement-form style from §19.2).
+        consumePunctuator(";");
+        if (expr) {
+            auto es = std::make_unique<ast::ExpressionStmt>();
+            es->expr = std::move(expr);
+            es->span.begin = start;
+            arm.stmts.push_back(std::move(es));
+        }
     }
     return arm;
 }
 
 std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
+    const uint32_t caseKeyLine = current_.location.line;
     advance(); // past `case`
     auto cs = std::make_unique<ast::CaseStmt>();
-    // Same scrutinee restriction as parseCaseExpr (stop before relational
-    // operators so relop patterns like `>=90` can appear in arm position).
-    {
+    // §19.1 / §A.7 `Expression?`: detect scrutinee-less form.
+    const bool bareForm = isScruntineeLessCase(caseKeyLine);
+    if (!bareForm) {
+        // Scrutinee form: same restriction as parseCaseExpr (precedence ≥ 8
+        // stops before relational ops so relop patterns are parsed as arms).
         SourceLocation start = current_.location;
         cs->scrutinee = stampSpan(parseBinaryExpression(8), start, current_.location);
     }
-    cs->arms.push_back(parseCaseStmtArm());
+    cs->arms.push_back(parseCaseStmtArm(bareForm));
     while (consumePunctuator(",")) {
         if (isKeyword("end")) break;
-        cs->arms.push_back(parseCaseStmtArm());
+        cs->arms.push_back(parseCaseStmtArm(bareForm));
     }
     if (!consumeKeyword("end")) {
         diagnostics_.report(Severity::Error, current_.location,

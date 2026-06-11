@@ -103,6 +103,12 @@ void ExprTC::checkNotInstanceMember(const ast::IdentifierExpr& id, Symbol* sym) 
     if (!mem) return;
     // ConstMemberSymbol is implicitly static (a class const).
     if (dynamic_cast<ConstMemberSymbol*>(sym)) return;
+    // EnumConstantSymbol: enum constants are implicitly static compile-time
+    // values — they are not instance members. A static readonly field
+    // initializer on an enum may freely reference the enum's declared
+    // constants (§10 / §22.13 "enum constants are compile-time values and
+    // are available before any static readonly initializer runs").
+    if (dynamic_cast<EnumConstantSymbol*>(sym)) return;
     bool isStatic = false;
     for (auto mod : mem->modifiers) {
         if (mod == "static") { isStatic = true; break; }
