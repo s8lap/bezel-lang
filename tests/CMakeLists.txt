@@ -483,6 +483,9 @@ set(BEZEL_TEST_SOURCES
     # lands. Enable with the tier-2 implementation merge (pattern: #600 contract).
     codegen/serialization_tier2_classes_test.cpp
     # --- end #550 tier-2 contract ---
+    # --- #550 tier-3 contract tests (serialized-graph back-edges, §9.8) ---
+    codegen/serialization_tier3_graph_test.cpp
+    # --- end #550 tier-3 contract ---
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

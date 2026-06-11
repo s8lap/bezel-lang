@@ -649,37 +649,61 @@ BEZEL_TEST(codegen_serialization_t2_classes,
 // "Synthesized Deserialize … each borrowing field is supplied as a constructor
 // argument — the reference is resolved against the tag→object table."
 //
-// TIER BOUNDARY (tier 3): back-edge (non-owned class-typed field) serialization
-// is not yet implemented (issue #550 tier 3 — requires a tag→object table in the
-// synthesized Serialize/Deserialize bodies). A `serialized graph` class with a
-// non-owned class-typed field currently produces a compile error at the
-// conformance declaration (§9.8) rather than generating working round-trip code.
-// When tier 3 is implemented, this test should be changed to verify the actual
-// round-trip with back-edge resolution.
+// §9.8 tier 3 (implemented): a `serialized graph` class with a non-owned
+// class-typed back-edge field synthesizes Serialize/Deserialize using the
+// identity-tag/BZ_SER_REF protocol.  The back-edge is written as a $ref to
+// the owned object's tag and resolved from the tag→object table on deserialize.
+// Wire: BZ_SER_INLINE(0x01)+LE32 tag before inline body; BZ_SER_REF(0x02)+LE32
+// tag for back-edges.  Owner-before-borrower order guaranteed by declaration order.
+//
+// Construction note: Bezel's ownership rules forbid borrowing a variable after
+// moving it, so the nullable-back-edge pattern is used: Hub.Alias (Slot?) starts
+// null and is set to borrow Hub.Target after the Hub is constructed.  During
+// serialization, Alias is written as a $ref to Target's tag_id.  On deserialize,
+// Alias is resolved from the tag table and passed as a constructor argument.
 BEZEL_TEST(codegen_serialization_t2_classes,
            graph_class_with_back_edge_field_compiles_and_round_trips_spec_9_8) {
-    // §9.8 tier-boundary: back-edge fields in `serialized graph` are not yet
-    // supported (issue #550 tier 3). The compiler emits a clean diagnostic.
-    BEZEL_EXPECT_TRUE(compileFails(
+    // §9.8 tier 3: a `serialized graph` class with a nullable back-edge field
+    // (Slot?) rounds trips correctly.  Hub owns Target and has Alias: Slot?
+    // (nullable back-edge) pointing to Target.  After deserialization, Alias
+    // resolves to the same object as Target (identity preserved per §9.8).
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
+        // Slot: a simple graph-serializable class.
         "class Slot serialized graph : ISerializable, IDeserializable "
         "  public property Name: string; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
-        // BorrowHolder has two owned Slot instances plus a back-edge Primary
-        // (non-owned, non-`owned` annotated class-typed field) — a back-edge
-        // in the serialized graph that borrows from one of the owned Slots.
-        "class BorrowHolder serialized graph : ISerializable, IDeserializable "
-        "  public owned SlotA: Slot; "
-        "  public owned SlotB: Slot; "
-        // Primary is the borrowing back-edge: non-owning, borrow lifetime
-        // bounded by the containing BorrowHolder that owns the target.
-        "  public Primary: Slot; "
-        "  public constructor(owned a: Slot, owned b: Slot, primary: Slot) "
-        "    SlotA := move a; SlotB := move b; Primary := primary; "
+        // Hub: owns Target, has a nullable back-edge Alias pointing to Target.
+        // Constructor params (target, alias) match field names (Target, Alias)
+        // case-insensitively per §9.8 v0.136.
+        "class Hub serialized graph : ISerializable, IDeserializable "
+        "  public owned Target: Slot; "
+        "  public Alias: Slot?; "  // nullable back-edge
+        "  public constructor(owned target: Slot, alias: Slot?) "
+        "    Target := move target; Alias := alias; "
         "  end constructor; "
-        "end BorrowHolder; "
-        "class C public static method Main(): int return 0; end Main; end C;"));
+        "end Hub; "
+        "class C public static method Main(): int "
+        // Create Hub with Alias = null initially.
+        // Inline new-Slot avoids the `using var t` + `move t` pattern that
+        // the ownership checker rejects (§28.3 `using var` is scope-bound).
+        "  using var hub := new Hub(new Slot(\"alpha\"), null); "
+        // Set back-edge: hub.Alias borrows hub.Target.
+        "  hub.Alias := hub.Target; "
+        // Serialize.
+        "  using var s := new BinarySerializer(); "
+        "  hub.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        // Deserialize.
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var hub2 := Hub.Deserialize(d); "
+        // Verify: Target round-tripped, Alias resolved to same Name as Target.
+        "  if hub2.Target.Name <> \"alpha\" then return 91; end; "
+        "  if hub2.Alias = null then return 92; end; "
+        "  if hub2.Alias?.Name <> \"alpha\" then return 93; end; "
+        "  return 42; "
+        "end Main; end C;"), 42);
 }
 
 // ===========================================================================

@@ -1241,6 +1241,17 @@ void bz_binser_end_object(void* ser);
 void bz_binser_begin_array(void* ser, int32_t element_count);
 void bz_binser_end_array(void* ser);
 
+// §9.8 tier-3: identity-tag graph serialization helpers.
+// Wire markers: BZ_SER_INLINE (0x01) = first owning reach; BZ_SER_REF (0x02) = back-edge.
+// bz_binser_graph_get_tag    — return existing tag_id for ptr, or 0 if not yet seen.
+// bz_binser_graph_assign_tag — assign next tag_id to ptr and return it.
+// bz_binser_write_inline_tag — write BZ_SER_INLINE + LE32 tag_id before inline object.
+// bz_binser_write_ref_tag    — write BZ_SER_REF + LE32 tag_id for a back-edge.
+int32_t bz_binser_graph_get_tag(void* ser, void* ptr);
+int32_t bz_binser_graph_assign_tag(void* ser, void* ptr);
+void    bz_binser_write_inline_tag(void* ser, int32_t tag_id);
+void    bz_binser_write_ref_tag(void* ser, int32_t tag_id);
+
 // --- Deserializer (reader) ---
 // Allocate a BinaryDeserializer reading from a byte span.
 // `data` is borrowed for the lifetime of the deserializer; `len` is byte count.
@@ -1265,6 +1276,16 @@ void    bz_binder_end_object(void* der);
 int32_t bz_binder_begin_array(void* der);   // returns element count
 int8_t  bz_binder_has_more_elements(void* der);
 void    bz_binder_end_array(void* der);
+
+// §9.8 tier-3: identity-tag graph deserialization helpers.
+// bz_binder_read_graph_marker   — read 1-byte marker + LE32 tag_id; returns BZ_SER_INLINE/REF/0.
+// bz_binder_graph_mark_in_progress — mark tag as being constructed (cycle sentinel).
+// bz_binder_graph_register_tag  — store constructed ptr for tag_id; clears in-progress.
+// bz_binder_graph_resolve_tag   — resolve tag_id to ptr (NULL if in-progress = cycle).
+int32_t bz_binder_read_graph_marker(void* der, int32_t* out_tag);
+void    bz_binder_graph_mark_in_progress(void* der, int32_t tag_id);
+void    bz_binder_graph_register_tag(void* der, int32_t tag_id, void* ptr);
+void*   bz_binder_graph_resolve_tag(void* der, int32_t tag_id);
 
 // SerializationException throw helper — called by synthesized code on bad input.
 // `msg` is a NUL-terminated C string describing the fault (for diagnostics).
