@@ -1532,6 +1532,26 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 llvm::Value* flag = builder_.CreateCall(fn, {tok}, "ct.iscancelled");
                 return builder_.CreateICmpNE(flag, builder_.getInt32(0), "ct.icr.b");
             }
+            // §8.1 / issue #646: Stopwatch instance property reads.
+            // Receiver is a bz_stopwatch_t* (heap pointer).
+            if (cn == "Stopwatch") {
+                llvm::Value* sw = lowerExpr(*ma->target);
+                if (!sw) return nullptr;
+                if (ma->member == "IsRunning") {
+                    auto* fn = declareC("bz_stopwatch_is_running", i32(), {ptrTy()});
+                    llvm::Value* flag = builder_.CreateCall(fn, {sw}, "sw.running");
+                    return builder_.CreateICmpNE(flag, builder_.getInt32(0), "sw.running.b");
+                }
+                if (ma->member == "ElapsedMilliseconds") {
+                    auto* fn = declareC("bz_stopwatch_elapsed_ms", i64(), {ptrTy()});
+                    return builder_.CreateCall(fn, {sw}, "sw.elms");
+                }
+                if (ma->member == "Elapsed") {
+                    // Returns TimeSpan (i64, 100-ns ticks).
+                    auto* fn = declareC("bz_stopwatch_elapsed_ticks", i64(), {ptrTy()});
+                    return builder_.CreateCall(fn, {sw}, "sw.el");
+                }
+            }
             // CancellationTokenSource property reads.
             if (cn == "CancellationTokenSource") {
                 llvm::Value* cts = lowerExpr(*ma->target);
@@ -5367,6 +5387,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if (colName == "CancellationTokenSource") {
                 auto* allocFn = declareC("bz_cts_alloc", ptrTy(), {});
                 return builder_.CreateCall(allocFn, {}, "cts.alloc");
+            }
+            // §8.1 / issue #646: new Stopwatch() — allocate via bz_stopwatch_alloc.
+            // Stopwatch is a heap-allocated class with a bz_stopwatch_t layout
+            // (start_ts: timespec, elapsed_ns: i64, running: i32).
+            if (colName == "Stopwatch") {
+                auto* allocFn = declareC("bz_stopwatch_alloc", ptrTy(), {});
+                return builder_.CreateCall(allocFn, {}, "sw.alloc");
             }
             // per §6.8 / #652: new Domain(name: string) — allocate a named
             // domain instance backed by a bz_domain_t with a stored name field.

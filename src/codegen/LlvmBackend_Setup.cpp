@@ -4246,6 +4246,33 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // §8.1 / issue #646: a `using var` bound to a Stopwatch — a builtin
+    // heap-allocated class (bz_stopwatch_t*) with no user TypeSymbol, freed
+    // via bz_stopwatch_free. Recognised by two patterns:
+    //   1. NewExpr type name is "Stopwatch" (`new Stopwatch()`).
+    //   2. Initializer exprType is the builtin "Stopwatch" class
+    //      (Stopwatch.StartNew() whose return-type sema sets to a Named TypeRef
+    //      with builtinClassSym("Stopwatch")).
+    {
+        bool isSW = false;
+        if (!isSW && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isSW = ne->type && ne->type->name &&
+                       !ne->type->name->parts.empty() &&
+                       ne->type->name->parts[0] == "Stopwatch";
+        }
+        if (!isSW && ld->initializer) {
+            if (auto* rt = ctx_.exprType(*ld->initializer))
+                isSW = builtinTypeName(rt) == "Stopwatch";
+        }
+        if (isSW) {
+            Disposal d{it->second, nullptr};
+            d.stopwatch = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // §6.1 / §30.8: a `using var` bound to a CancellationTokenSource — a
     // builtin owned class with no user TypeSymbol, disposed via bz_cts_dispose
     // (idempotent: cancels surviving token observers, then frees the source).
@@ -7649,6 +7676,26 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_binder_free",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {h});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §8.1 / issue #646: a `using var` Stopwatch. Free the timing struct
+        // via bz_stopwatch_free. Null-guarded for consistency with other
+        // builtin disposal sites.
+        if (it->stopwatch) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* sw = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                sw, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "sw.free",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "sw.cont",  currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_stopwatch_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {sw});
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

@@ -1713,6 +1713,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         }
                     }
+                    // §8.1 / issue #646: Stopwatch static factory.
+                    // StartNew() → owned Stopwatch (same TypeRef shape as
+                    // new Stopwatch(), so using-var disposal and builtinTypeName
+                    // checks all see an identical type).
+                    if (colName == "Stopwatch") {
+                        if (m == "StartNew") {
+                            auto* swTy = ctx_.makeTypeRef();
+                            swTy->kind = TypeRef::Kind::Named;
+                            swTy->declaration = builtinClassSym("Stopwatch");
+                            ctx_.setExprType(&ce, swTy);
+                        }
+                        // Instance methods Start/Stop/Reset/Restart return unit.
+                        // Debug.Assert/WriteLine return unit. Both are untyped (void).
+                    }
+                    // §8.2 / issue #646: Debug static methods return unit (void).
+                    // No type annotation needed; untyped is correct for void calls.
+                    // (Debug.Assert and Debug.WriteLine both return unit.)
+
                     // §6.1 / §30.8: CancellationToken instance method return types.
                     // ThrowIfCancellationRequested() → unit (void); Register(cb) →
                     // owned Subscription (leave untyped — Register is deferred).
@@ -4151,6 +4169,31 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
             }
+            // §8.1 / issue #646: Stopwatch instance property reads.
+            // Stopwatch is a builtin class (heap pointer); the ordinary member-
+            // lookup path never finds its properties.
+            if (dtcn == "Stopwatch") {
+                const auto& mbr = ma.member;
+                // IsRunning → bool.
+                if (mbr == "IsRunning") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
+                // ElapsedMilliseconds → long (i64).
+                if (mbr == "ElapsedMilliseconds") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
+                    return;
+                }
+                // Elapsed → TimeSpan (i64, 100-ns ticks; same representation as
+                // TimeSpan returned by DateTime.Subtract etc.).
+                if (mbr == "Elapsed") {
+                    auto* tsTy = ctx_.makeTypeRef();
+                    tsTy->kind = TypeRef::Kind::Named;
+                    tsTy->declaration = builtinClassSym("TimeSpan");
+                    ctx_.setExprType(&ma, tsTy);
+                    return;
+                }
+            }
             // §2.5: DateTime static properties accessed as DateTime.Now, etc.
             // These appear as MemberAccess on the "DateTime" identifier.
             if (auto* did = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
@@ -4577,6 +4620,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
                 // ToString → string, CompareTo → int, Round → decimal (instance methods).
             }
+            // §8.1 / issue #646: Stopwatch instance method and static factory
+            // return types.  Start/Stop/Reset/Restart → unit (leave untyped).
+            // StartNew() is also handled in the static-call path above; the
+            // duplicate here handles the `sw.StartNew()` misuse gracefully
+            // (won't crash, just leaves untyped — the static path is the real one).
+            if (cls == "Stopwatch") {
+                if (m == "StartNew") {
+                    auto* swTy = ctx_.makeTypeRef();
+                    swTy->kind = TypeRef::Kind::Named;
+                    swTy->declaration = builtinClassSym("Stopwatch");
+                    ctx_.setExprType(&ma, swTy);
+                }
+                // IsRunning, ElapsedMilliseconds, Elapsed: property reads, not
+                // call expressions — handled in resolveMemberAccess above.
+                // Start / Stop / Reset / Restart → unit (leave untyped).
+            }
+            // §8.2 / issue #646: Debug static methods — all return unit.
+            // Assert / WriteLine: leave untyped (void).
+            // No return-type annotation needed.
+
             // §6.1 / §30.8: CancellationToken instance property reads.
             // Reached when tok was bound via `cts.Token` (builtinClassSym decl).
             if (cls == "CancellationToken") {

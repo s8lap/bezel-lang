@@ -525,6 +525,11 @@ private:
         // bz_cts_dispose (idempotent — signals surviving tokens and frees the
         // source). Recognised by the local's declared/resolved type name.
         bool cancellationTokenSource = false;
+        // §8.1 / issue #646: a `using var` bound to a Stopwatch. Stopwatch is
+        // a heap-allocated timing object (bz_stopwatch_t*) with no user
+        // TypeSymbol, so classOfLocal returns null and the class-disposal path
+        // misses it. At scope end it is freed via bz_stopwatch_free.
+        bool stopwatch = false;
         // §28.13 / stdlib §2.16 (#603): a `using var` bound to a Shared<T>
         // handle. At scope end it is released via bz_shared_release (decrements
         // strong count; at 0 disposes the value then frees the control block if
