@@ -4481,6 +4481,42 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         disposeStack_.back().push_back(d);
         return;
     }
+    // #628 / stdlib §4.9 v0.135: a `using var` bound to a DrainedEntry<K,V>
+    // obtained from `for var entry in d.Drain() do … end`. The entry struct
+    // holds {K key; V* value}; ownership of the V instance must be discharged
+    // at scope end. Additionally, if K is string the bz_string_t* at field[0]
+    // must be released (the drain runtime transferred its ownership to the
+    // loop variable). Recognition: initializer's exprType has importedName
+    // "DrainedEntry" (synthetic TypeRef set by sema for OwnedDictionary.Drain
+    // in ExprTypecheck_Calls.cpp).
+    {
+        const sema::TypeRef* iniTy = ld->initializer
+            ? ctx_.exprType(*ld->initializer) : nullptr;
+        bool isDrainedEntry =
+            iniTy && iniTy->kind == sema::TypeRef::Kind::Named &&
+            !iniTy->declaration && iniTy->importedName == "DrainedEntry" &&
+            iniTy->genericArgs.size() >= 2 &&
+            iniTy->genericArgs[0] && iniTy->genericArgs[1];
+        if (isDrainedEntry) {
+            const sema::TypeRef* kTy = iniTy->genericArgs[0];
+            const sema::TypeRef* vTy = iniTy->genericArgs[1];
+            Disposal d{it->second, nullptr};
+            d.drainedEntry = true;
+            d.drainedEntryKeyIsString =
+                kTy->kind == sema::TypeRef::Kind::Primitive &&
+                kTy->primitive == sema::PrimitiveType::String;
+            // Build LLVM types for field GEPs (K and V*).
+            d.drainedEntryKeyType = lowerTypeRef(kTy);
+            d.drainedEntryValType = lowerTypeRef(vTy);  // ptr for class
+            // Value disposer thunk (for owning class V). elementPolicyFor
+            // returns the vtable-based thunk when V is a user class; null
+            // for builtins (use emitDisposeAndReclaim directly in emitDisposals).
+            d.drainedEntryValDisposer =
+                elementPolicyFor(vTy, /*owning=*/true).disposerThunk;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
 
     const sema::TypeSymbol* cls = classOfLocal(ld);
     if (cls && disposerFns_.find(cls) != disposerFns_.end()) {
@@ -7518,6 +7554,63 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.CreateCall(fn, {ch, cceVt});
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // #628 / stdlib §4.9 v0.135: a `using var` DrainedEntry<K,V> — the
+        // loop variable from `for var entry in d.Drain() do … end`. The entry
+        // struct is {K key; V* value} allocated on the stack. At scope end:
+        //   1. Load V* from field[1] and dispose+reclaim the owned class value.
+        //   2. If K is string: load the bz_string_t* from field[0] and release
+        //      it (bz_string_release) — the drain runtime transferred ownership
+        //      of the heap-allocated key string to the loop entry struct.
+        // The slot is a struct AllocaInst, not a pointer-to-heap-object; no
+        // boxedStorage detour — load fields directly via GEP.
+        if (it->drainedEntry) {
+            // drainedEntryKeyType / drainedEntryValType carry the LLVM types for
+            // fields 0 and 1 of the entry struct (same layout as the alloca in
+            // lowerDictDrainFor: { keyLlvm, valLlvm }). They may be null if
+            // lowerTypeRef failed at registration time; skip the whole disposal
+            // in that case (should not happen in well-formed code).
+            llvm::Type* kTy = it->drainedEntryKeyType;
+            llvm::Type* vTy = it->drainedEntryValType;
+            if (kTy && vTy) {
+                llvm::StructType* entStTy =
+                    llvm::StructType::get(llvm_, {kTy, vTy});
+                // Step 1: dispose the owned V class value (field[1]).
+                // Guard: V must be a pointer type (class). OwnedDictionary<K,V>
+                // requires V: class per §4.9, so in well-formed code this always
+                // holds; the guard prevents codegen crashes on ill-formed programs.
+                if (vTy->isPointerTy()) {
+                    llvm::Value* valFldPtr =
+                        builder_.CreateStructGEP(entStTy, it->slot, 1, "de.val.ptr");
+                    llvm::Value* valPtr =
+                        builder_.CreateLoad(ptrTy(), valFldPtr, "de.val");
+                    llvm::Value* isNullVal = builder_.CreateICmpEQ(
+                        valPtr, llvm::ConstantPointerNull::get(ptrTy()));
+                    auto* dispBB = llvm::BasicBlock::Create(
+                        llvm_, "de.dispose", currentFn_);
+                    auto* afterValBB = llvm::BasicBlock::Create(
+                        llvm_, "de.after_val", currentFn_);
+                    builder_.CreateCondBr(isNullVal, afterValBB, dispBB);
+                    builder_.SetInsertPoint(dispBB);
+                    // Dispose via dynamic dispatch (emitDisposeAndReclaim handles
+                    // the vtable call + bz_free; dynamic dispatch is correct for
+                    // both user and builtin V class types).
+                    emitDisposeAndReclaim(valPtr);
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), valFldPtr);
+                    builder_.CreateBr(afterValBB);
+                    builder_.SetInsertPoint(afterValBB);
+                }
+                // Step 2: if K is string, release the owned key string.
+                if (it->drainedEntryKeyIsString) {
+                    llvm::Value* keyFldPtr =
+                        builder_.CreateStructGEP(entStTy, it->slot, 0, "de.key.ptr");
+                    llvm::Value* keyPtr =
+                        builder_.CreateLoad(ptrTy(), keyFldPtr, "de.key");
+                    emitStringRelease(keyPtr);
+                }
+            }
             continue;
         }
         // §30.15 (#600 phase c): a `using var` ChannelSender<T>. Release via

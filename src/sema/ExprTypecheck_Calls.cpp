@@ -1404,6 +1404,49 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             ctx_.setExprType(&ce, recvTy->genericArgs[1]);
                         }
+                        // #628 / stdlib §4.9 v0.135: OwnedDictionary<K,V>.Drain()
+                        // returns OwnedEnumerable<DrainedEntry<K,V>>.
+                        // DrainedEntry<K,V> is a synthetic Named TypeRef with
+                        // importedName="DrainedEntry" and genericArgs=[K,V]; it is
+                        // wrapped in OwnedEnumerable<> so the for-loop sema sets
+                        // the loop variable's type to DrainedEntry<K,V> (via the
+                        // first generic arg of OwnedEnumerable<T>).
+                        // codegen's lowerDictDrainFor detects this iterable shape.
+                        else if (colName == "OwnedDictionary" &&
+                                 m == "Drain" && ce.args.empty() &&
+                                 recvTy &&
+                                 recvTy->genericArgs.size() >= 2 &&
+                                 recvTy->genericArgs[0] &&
+                                 recvTy->genericArgs[1]) {
+                            // Build the DrainedEntry<K,V> TypeRef (importedName tag).
+                            static const char kDrainedEntryName[] = "DrainedEntry";
+                            auto* entryTy = ctx_.makeTypeRef();
+                            entryTy->kind = TypeRef::Kind::Named;
+                            entryTy->declaration = nullptr;
+                            entryTy->astNode = nullptr;
+                            entryTy->importedName = kDrainedEntryName;
+                            entryTy->genericArgs.push_back(recvTy->genericArgs[0]); // K
+                            entryTy->genericArgs.push_back(recvTy->genericArgs[1]); // V
+                            // Wrap in OwnedEnumerable<DrainedEntry<K,V>>.
+                            // Use a static astNode so lowerIEnumerableBuiltinFor can
+                            // see the name "OwnedEnumerable" and route to the drain
+                            // handler (lowerDictDrainFor checks for DrainedEntry in
+                            // the first generic arg BEFORE the builtin path fires).
+                            static const ast::Type* kOwnedEnumNode = []() -> ast::Type* {
+                                auto* qn = new ast::QualifiedName;
+                                qn->parts.push_back("OwnedEnumerable");
+                                auto* t = new ast::Type;
+                                t->kind = ast::TypeKind::Named;
+                                t->name.reset(qn);
+                                return t;
+                            }();
+                            auto* oenTy = ctx_.makeTypeRef();
+                            oenTy->kind = TypeRef::Kind::Named;
+                            oenTy->declaration = nullptr;
+                            oenTy->astNode = kOwnedEnumNode;
+                            oenTy->genericArgs.push_back(entryTy);
+                            ctx_.setExprType(&ce, oenTy);
+                        }
                     }
                     // StringBuilder methods
                     if (colName == "StringBuilder") {
@@ -3511,6 +3554,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     tt->importedName == "DictionaryEntry" &&
                     tt->genericArgs.size() >= 2;
                 if (isDictEntry) {
+                    std::size_t gi = ma.member == "Key" ? 0 : 1;
+                    if (tt->genericArgs[gi])
+                        ctx_.setExprType(&ma, tt->genericArgs[gi]);
+                    return;
+                }
+                // #628 / stdlib §4.9 v0.135: `DrainedEntry<K,V>.Key` is K
+                // and `.Value` is V. Mirrors DictionaryEntry handling above.
+                // DrainedEntry has no user TypeSymbol; detect by importedName tag.
+                bool isDrainedEntry =
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->importedName == "DrainedEntry" &&
+                    tt->genericArgs.size() >= 2;
+                if (isDrainedEntry) {
                     std::size_t gi = ma.member == "Key" ? 0 : 1;
                     if (tt->genericArgs[gi])
                         ctx_.setExprType(&ma, tt->genericArgs[gi]);

@@ -267,6 +267,24 @@ void bz_dict_values_str(void* d, void*** vals_out, int64_t* n_out);
 // bz_dict_values_gen — for generic-key dictionaries (key_size > 0). Returns
 // the same shape: a malloc'd void** array of `n` slot values.
 void bz_dict_values_gen(void* d, void*** vals_out, int64_t* n_out);
+//
+// #628 / stdlib §4.9 v0.135: ownership-transferring drain iteration.
+//
+// bz_dict_drain_next_str — string-keyed dict (key_size == 0).
+// Pops the next live entry from the dict in insertion order. Returns true if
+// an entry was popped; false when the dict is empty (drain complete). The
+// caller owns the popped value (val_out) and the malloc'd key copy (key_out);
+// it must free(key_out) or adopt the bytes, and dispose the value.
+// `cursor` is a caller-supplied int64_t scan position (start at 0).
+bool bz_dict_drain_next_str(void* d, int64_t* cursor,
+                             char** key_out, int64_t* key_len_out,
+                             void** val_out);
+//
+// bz_dict_drain_next_gen — generic-keyed dict (key_size > 0).
+// Same as bz_dict_drain_next_str but the key is returned as a malloc'd copy
+// of the raw key bytes (size = dict->key_size). The caller must free(key_out).
+bool bz_dict_drain_next_gen(void* d, int64_t* cursor,
+                             void** key_out, void** val_out);
 
 // issue #389 / stdlib §4.10: fold a key snapshot of `other` into/against a
 // dict-backed Set `self` (generic-key table). `keys` is a malloc'd array of `n`

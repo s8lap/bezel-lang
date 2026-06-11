@@ -566,6 +566,23 @@ private:
         // receivers with ChannelClosedException). No user TypeSymbol; recognised
         // by the builtin type name "ChannelSender".
         bool channelSender = false;
+        // #628 / stdlib §4.9 v0.135: a `using var` bound to a DrainedEntry<K,V>
+        // obtained from `for var entry in d.Drain() do … end`. The loop variable
+        // `entry` is a struct {K key; V* value}; `using var e := entry` transfers
+        // ownership of the entry to `e`. At scope end we must:
+        //   1. Dispose + reclaim the owned V class value (field 1).
+        //   2. Release the key if K is string (field 0 holds a bz_string_t*).
+        // `drainedEntryKeyIsString` flags whether field[0] is a string pointer.
+        // `drainedEntryValDisposer` is the owning-class disposer thunk for V
+        // (null when V has no user TypeSymbol — then we use dynamic dispatch via
+        // emitDisposeAndReclaim directly on the loaded pointer).
+        // `drainedEntryKeyType` / `drainedEntryValType` are the LLVM types for
+        // the GEP so we can load the fields correctly.
+        bool drainedEntry = false;
+        bool drainedEntryKeyIsString = false;
+        llvm::Value* drainedEntryValDisposer = nullptr;
+        llvm::Type* drainedEntryKeyType  = nullptr;
+        llvm::Type* drainedEntryValType  = nullptr;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -3937,6 +3954,10 @@ private:
     // struct (field 0 = K, field 1 = V). Value is a borrow (not retained).
     // Returns false if the iterable is not a bare Dictionary<K,V> local.
     bool lowerDictEntryFor(const ast::ForStmt& fs);
+
+    // #628 / stdlib §4.9 v0.135: `for var entry in ownedDict.Drain()`
+    // ownership-transferring drain iteration over OwnedDictionary<K,V>.
+    bool lowerDictDrainFor(const ast::ForStmt& fs);
 
     // issue #370: emit a counted loop over a snapshot of generic-table keys
     // (from bz_dict_keys_gen). `tableObj` is the bz_dict_t*; `elemTyRef` is the

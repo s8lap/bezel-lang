@@ -855,6 +855,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // stdlib §5: `for var x in <lazy LINQ pipeline>` — iterate the deferred
         // enumerator without materializing it.
         if (lowerLazyLinqFor(*fors)) return false;
+        // #628 / stdlib §4.9 v0.135: `for var entry in ownedDict.Drain()`
+        // ownership-transferring drain over OwnedDictionary<K,V>.
+        // Must run BEFORE lowerIEnumerableBuiltinFor (which also handles
+        // OwnedEnumerable<T> but via vtable dispatch — incorrect for the
+        // dict drain case, which uses the bz_dict_drain_next_* runtime).
+        if (lowerDictDrainFor(*fors)) return false;
         // §29.2 (B1): `for var x in items` where items is IEnumerable<T>
         // typed as a builtin interface — treat runtime value as bz_array_t*.
         if (lowerIEnumerableBuiltinFor(*fors)) return false;
@@ -2417,6 +2423,210 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     builder_.SetInsertPoint(incBB);
     llvm::Value* idxInc = builder_.CreateLoad(i64(), idxSlot);
     builder_.CreateStore(builder_.CreateAdd(idxInc, builder_.getInt64(1)), idxSlot);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    return true;
+}
+
+
+// #628 / stdlib §4.9 v0.135: `for var entry in ownedDict.Drain()` —
+// ownership-transferring drain iteration over OwnedDictionary<K,V>.
+//
+// Detection: the iterable expression has type OwnedEnumerable<DrainedEntry<K,V>>
+// (set by sema for OwnedDictionary<K,V>.Drain()). The first generic arg of
+// OwnedEnumerable<T> is T = DrainedEntry<K,V> with importedName=="DrainedEntry".
+//
+// Loop variable layout: a 2-field struct alloca {K key; V* value} — mirroring
+// the DictionaryEntry layout used by lowerDictEntryFor. Field 0 = Key, field 1 =
+// Value. lowerExpr intercepts e.Key/e.Value GEPs on these (the DrainedEntry
+// handler mirrors the DictionaryEntry handler in LlvmBackend_Exprs.cpp).
+//
+// Ownership: the loop var's Value field IS the owned class pointer, transferred
+// out of the dict on each iteration. The key is a fresh copy (string: malloc'd
+// bz_string_t; generic: raw bytes). Both are the loop body's responsibility.
+// The for-loop owns the entry alloca; using var e := entry discharges the entry
+// (and its Value) at the end of the iteration body.
+//
+// Partial drain: break exits the loop leaving remaining entries in the dict.
+// The dict's Dispose() (scope-end) will dispose them via bz_dict_free.
+//
+// Per §4.9: OwnedDictionary makes no insertion-order guarantee; iteration walks
+// the order[] array in the natural (insertion-recorded) order as a convenience —
+// the spec does not prohibit this, and the runtime note says the order depends
+// on insertion-and-mutation history (not a strict contract). For correctness,
+// what matters is: every live entry is yielded exactly once.
+bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
+    if (!fs.iterable) return false;
+    auto* iterTy = ctx_.exprType(*fs.iterable);
+    if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
+    // Must be OwnedEnumerable<DrainedEntry<K,V>>.
+    // Check the type name is OwnedEnumerable.
+    std::string_view iterName;
+    if (iterTy->astNode && iterTy->astNode->name &&
+        !iterTy->astNode->name->parts.empty())
+        iterName = iterTy->astNode->name->parts[0];
+    else if (!iterTy->importedName.empty())
+        iterName = iterTy->importedName;
+    if (iterName != "OwnedEnumerable") return false;
+    // Must have one generic arg = DrainedEntry<K,V>.
+    if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
+    const sema::TypeRef* entryTy = iterTy->genericArgs[0];
+    if (entryTy->kind != sema::TypeRef::Kind::Named ||
+        entryTy->importedName != "DrainedEntry" ||
+        entryTy->genericArgs.size() < 2 ||
+        !entryTy->genericArgs[0] || !entryTy->genericArgs[1])
+        return false;
+
+    const sema::TypeRef* keyTy = entryTy->genericArgs[0];
+    const sema::TypeRef* valTy = entryTy->genericArgs[1];
+
+    // The iterable must be a Drain() call on an OwnedDictionary.
+    // Recover the dictionary object pointer by re-evaluating the target of
+    // the Drain() CallExpr.
+    const ast::Expr* dictExpr = nullptr;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(fs.iterable.get())) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get())) {
+            if (ma->member == "Drain" && ma->target)
+                dictExpr = ma->target.get();
+        }
+    }
+    if (!dictExpr) return false;
+
+    // Confirm the target has type OwnedDictionary<K,V>.
+    const sema::TypeRef* dictTy = ctx_.exprType(*dictExpr);
+    if (!isDictTypeName(dictTy)) return false;
+
+    // Evaluate the dictionary object.
+    llvm::Value* dictObj = lowerExpr(*dictExpr);
+    if (!dictObj) return false;
+
+    llvm::Type* keyLlvm = lowerTypeRef(keyTy);
+    llvm::Type* valLlvm = lowerTypeRef(valTy);  // V* (pointer to owned class)
+    if (!keyLlvm || !valLlvm) return false;
+
+    // Determine key mode: string (key_size == 0) vs generic.
+    bool useGen = genericBackingType(dictTy, 0, /*isSet=*/false, nullptr) != nullptr;
+
+    // Alloca for the drain cursor (i64, starts at 0).
+    auto* cursorSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), cursorSlot);
+
+    // Loop variable alloca: {K key; V* value} struct (same layout as
+    // DictionaryEntry<K,V> in lowerDictEntryFor).
+    llvm::StructType* entryStTy = llvm::StructType::get(llvm_, {keyLlvm, valLlvm});
+    auto* varSlot = entryAlloca(entryStTy);
+    locals_[&fs] = varSlot;
+
+    // Alloca for temp key/val outputs from the runtime pop function.
+    auto* keyOutSlot = entryAlloca(ptrTy());   // char** (str) or void** (gen)
+    auto* keyLenSlot = entryAlloca(i64());     // int64_t (str key_len only)
+    auto* valOutSlot = entryAlloca(ptrTy());   // void** for value
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "dd.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "dd.body", currentFn_);
+    auto* incBB  = llvm::BasicBlock::Create(llvm_, "dd.inc",  currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "dd.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    // cond: call bz_dict_drain_next_str / bz_dict_drain_next_gen.
+    // Returns bool (i1): true = entry popped, false = drain complete.
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* cursor = builder_.CreateLoad(i64(), cursorSlot);
+    // We pass &cursor as a pointer (already in cursorSlot).
+    llvm::Value* popped;
+    if (!useGen) {
+        // bz_dict_drain_next_str(dict, int64_t* cursor,
+        //                        char** key_out, int64_t* key_len_out,
+        //                        void** val_out) → bool
+        auto* drainFn = declareC("bz_dict_drain_next_str", i1(),
+                                 {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        popped = builder_.CreateCall(drainFn,
+            {dictObj, cursorSlot, keyOutSlot, keyLenSlot, valOutSlot},
+            "dd.popped");
+    } else {
+        // bz_dict_drain_next_gen(dict, int64_t* cursor,
+        //                        void** key_out, void** val_out) → bool
+        auto* drainFn = declareC("bz_dict_drain_next_gen", i1(),
+                                 {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        popped = builder_.CreateCall(drainFn,
+            {dictObj, cursorSlot, keyOutSlot, valOutSlot},
+            "dd.popped");
+    }
+    builder_.CreateCondBr(popped, bodyBB, endBB);
+
+    // body: decode key+val into the entry struct slot.
+    builder_.SetInsertPoint(bodyBB);
+    {
+        llvm::Value* rawKeyPtr = builder_.CreateLoad(ptrTy(), keyOutSlot);
+        llvm::Value* rawValPtr = builder_.CreateLoad(ptrTy(), valOutSlot);
+
+        // Decode key.
+        llvm::Value* keyDecoded;
+        using K = sema::TypeRef::Kind;
+        bool isStringKey = keyTy->kind == K::Primitive &&
+                           keyTy->primitive == sema::PrimitiveType::String;
+        if (isStringKey) {
+            // rawKeyPtr is a malloc'd char* (the key bytes; null-terminated).
+            // Build a bz_string_t object from it — same pattern as
+            // lowerDictEntryFor's string-key decode.
+            auto* mallocFn  = declareC("malloc", ptrTy(), {i64()});
+            auto* callocFn  = declareC("calloc", ptrTy(), {i64(), i64()});
+            auto* i8Ty      = llvm::Type::getInt8Ty(llvm_);
+            uint64_t strSz  = module_->getDataLayout().getTypeAllocSize(stringType());
+            // rawKeyPtr is char*; key_len_out holds the byte length.
+            llvm::Value* kl = builder_.CreateLoad(i64(), keyLenSlot);
+            // Allocate and null-terminate the data buffer.
+            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
+            // The char* from bz_dict_drain_next_str is already a malloc'd copy;
+            // use it directly as the string data buffer (no extra malloc+memcpy).
+            // Null-terminate: write '\0' at offset kl.
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, rawKeyPtr, kl);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            // Allocate the bz_string_t header.
+            llvm::Value* strObj = builder_.CreateCall(callocFn,
+                {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
+            builder_.CreateStore(rawKeyPtr,
+                builder_.CreateStructGEP(stringType(), strObj, 0));
+            builder_.CreateStore(kl,
+                builder_.CreateStructGEP(stringType(), strObj, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                builder_.CreateStructGEP(stringType(), strObj, 2));
+            initStringRc(strObj);
+            keyDecoded = strObj;
+            (void)dataSz;
+        } else if (useGen) {
+            // Generic key: rawKeyPtr is a malloc'd copy of the key bytes.
+            // Load the key value out of the raw bytes.
+            keyDecoded = builder_.CreateLoad(keyLlvm, rawKeyPtr, "dd.kgen");
+            // Free the raw bytes copy immediately (the value is loaded).
+            auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(freeFn, {rawKeyPtr});
+        } else {
+            // Non-string, non-generic key — should not happen.
+            keyDecoded = llvm::Constant::getNullValue(keyLlvm);
+        }
+
+        // Value: rawValPtr IS the owned class pointer (void* stored directly).
+        // V is always a class (OwnedDictionary<K,V> requires V: class), so
+        // valLlvm == ptrTy(). No further decoding needed.
+        llvm::Value* valDecoded = rawValPtr;
+
+        // Store key+val into the loop variable struct.
+        builder_.CreateStore(keyDecoded,
+            builder_.CreateStructGEP(entryStTy, varSlot, 0));
+        builder_.CreateStore(valDecoded,
+            builder_.CreateStructGEP(entryStTy, varSlot, 1));
+    }
+
+    loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+    bool term = lowerScopedBlock(fs.body);
+    loopStack_.pop_back();
+    if (!term) builder_.CreateBr(incBB);
+
+    // inc: just jump back to cond (cursor is already advanced inside the
+    // drain runtime function).
+    builder_.SetInsertPoint(incBB);
     builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(endBB);
