@@ -957,6 +957,58 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         return true;
                     }
+                    // stdlib §5 (#650): FirstOrNull(pred) on lazy receiver → T?.
+                    if (m == "FirstOrNull" && ce.args.size() == 1) {
+                        if (srcElem) {
+                            auto* nullTy = ctx_.makeTypeRef();
+                            *nullTy = *srcElem;
+                            nullTy->nullable = true;
+                            ctx_.setExprType(&ce, nullTy);
+                        }
+                        return true;
+                    }
+                    // stdlib §5 (#651): OfType<U>() on lazy receiver → lazy IEnum<U>.
+                    if (m == "OfType" && ce.args.empty()) {
+                        TypeRef* outElem = srcElem;
+                        if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                                ce.callee.get())) {
+                            if (!callMa->typeArgs.empty() && callMa->typeArgs[0]) {
+                                if (TypeRef* u =
+                                        ctx_.resolvedType(*callMa->typeArgs[0]))
+                                    outElem = u;
+                            }
+                        }
+                        ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
+                        return true;
+                    }
+                    // stdlib §5 (#651): GroupBy<TKey>(key) on lazy receiver.
+                    if (m == "GroupBy" && ce.args.size() == 1) {
+                        TypeRef* keyTy = srcElem;
+                        if (!ce.args.empty() && ce.args[0].value) {
+                            if (auto* lamTy = ctx_.exprType(*ce.args[0].value)) {
+                                if (lamTy->kind == TypeRef::Kind::Function &&
+                                    lamTy->funcReturn)
+                                    keyTy = lamTy->funcReturn;
+                            }
+                        }
+                        static const ast::Type* kIGroupingNode2 =
+                            []() -> ast::Type* {
+                                auto* qn = new ast::QualifiedName;
+                                qn->parts.push_back("IGrouping");
+                                auto* t = new ast::Type;
+                                t->kind = ast::TypeKind::Named;
+                                t->name.reset(qn);
+                                return t;
+                            }();
+                        auto* grpTy = ctx_.makeTypeRef();
+                        grpTy->kind = TypeRef::Kind::Named;
+                        grpTy->declaration = nullptr;
+                        grpTy->astNode = kIGroupingNode2;
+                        if (keyTy)  grpTy->genericArgs.push_back(keyTy);
+                        if (srcElem) grpTy->genericArgs.push_back(srcElem);
+                        ctx_.setExprType(&ce, makeLazyEnumerable(grpTy));
+                        return true;
+                    }
                     return false;
                 };
                 // stdlib §5: chained LINQ on a lazy IEnumerable<T> receiver.
@@ -1259,6 +1311,73 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             *nullTy = *recvTy->genericArgs[0];
                             nullTy->nullable = true;
                             ctx_.setExprType(&ce, nullTy);
+                        }
+                        // stdlib §5 (#650): FirstOrNull(predicate) — returns T?
+                        // for the predicate form (the no-predicate form is above).
+                        else if (m == "FirstOrNull" && ce.args.size() == 1 &&
+                                 !recvTy->genericArgs.empty() &&
+                                 recvTy->genericArgs[0]) {
+                            auto* nullTy = ctx_.makeTypeRef();
+                            *nullTy = *recvTy->genericArgs[0];
+                            nullTy->nullable = true;
+                            ctx_.setExprType(&ce, nullTy);
+                        }
+                        // stdlib §5 (#651): OfType<U>() — lazy IEnumerable<U>.
+                        // U comes from the explicit type arg on the callee
+                        // MemberAccessExpr. When U == T (same source element type),
+                        // codegen produces a Where-all identity; when U != T for
+                        // value types, produces an empty enumerator.
+                        else if (m == "OfType" && ce.args.empty()) {
+                            TypeRef* outElem = recvTy->genericArgs.empty()
+                                ? nullptr : recvTy->genericArgs[0];
+                            // Extract explicit type arg <U> from the callee MA.
+                            if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                                    ce.callee.get())) {
+                                if (!callMa->typeArgs.empty() &&
+                                    callMa->typeArgs[0]) {
+                                    if (TypeRef* u =
+                                            ctx_.resolvedType(*callMa->typeArgs[0]))
+                                        outElem = u;
+                                }
+                            }
+                            ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
+                        }
+                        // stdlib §5 (#651): GroupBy<TKey>(key: (T)->TKey) —
+                        // returns IEnumerable<IGrouping<TKey, T>>.
+                        // Model IGrouping<TKey, T> as a synthetic lazy element
+                        // TypeRef. The key type (TKey) comes from the key lambda's
+                        // return type. Codegen identifies "IGrouping" by the
+                        // synthetic astNode name and materialization method.
+                        else if (m == "GroupBy" && ce.args.size() == 1 &&
+                                 !recvTy->genericArgs.empty()) {
+                            TypeRef* srcElem = recvTy->genericArgs[0];
+                            TypeRef* keyTy   = srcElem; // default: identity key
+                            if (!ce.args.empty() && ce.args[0].value) {
+                                if (auto* lamTy =
+                                        ctx_.exprType(*ce.args[0].value)) {
+                                    if (lamTy->kind == TypeRef::Kind::Function &&
+                                        lamTy->funcReturn)
+                                        keyTy = lamTy->funcReturn;
+                                }
+                            }
+                            // Build IGrouping<TKey, T> TypeRef using a synthetic
+                            // astNode so codegen can identify it.
+                            static const ast::Type* kIGroupingNode =
+                                []() -> ast::Type* {
+                                    auto* qn = new ast::QualifiedName;
+                                    qn->parts.push_back("IGrouping");
+                                    auto* t = new ast::Type;
+                                    t->kind = ast::TypeKind::Named;
+                                    t->name.reset(qn);
+                                    return t;
+                                }();
+                            auto* grpTy = ctx_.makeTypeRef();
+                            grpTy->kind = TypeRef::Kind::Named;
+                            grpTy->declaration = nullptr;
+                            grpTy->astNode = kIGroupingNode;
+                            if (keyTy)  grpTy->genericArgs.push_back(keyTy);
+                            if (srcElem) grpTy->genericArgs.push_back(srcElem);
+                            ctx_.setExprType(&ce, makeLazyEnumerable(grpTy));
                         }
                         // per §5 LINQ: Where/Select/Skip/Take/Distinct/OrderBy
                         // are LAZY — they return a deferred IEnumerable<T>, not
@@ -1926,6 +2045,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (rcn == "Weak") {
                         if (m == "TryUpgrade") {
                             // TryUpgrade(out owned s: Shared<T>?): bool.
+                            // spec §22.4 / #653: the parameter is "out owned" —
+                            // the only accepted call-site forms are
+                            // "out using var x" and "out owned var x".
+                            // Plain "out x" (pre-declared variable) is ill-formed
+                            // because it doesn't communicate an owned-discharge
+                            // obligation to the compiler. Emit a clear diagnostic.
+                            if (!ce.args.empty()) {
+                                const auto& arg0 = ce.args[0];
+                                bool isOutUsingVar =
+                                    arg0.modifier == "out using var";
+                                bool isOutOwnedVar =
+                                    arg0.modifier == "out owned var";
+                                bool isDiscard = arg0.isDiscard;
+                                if (!arg0.modifier.empty() &&
+                                    !isOutUsingVar && !isOutOwnedVar &&
+                                    !isDiscard) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "TryUpgrade parameter is 'out owned': "
+                                        "accepted call-site forms are "
+                                        "'out using var x' or 'out owned var x' "
+                                        "(spec §22.4). "
+                                        "Plain 'out x' is not valid for an "
+                                        "'out owned' parameter — use "
+                                        "'out using var x' instead.");
+                                }
+                            }
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         }
                         // Dispose(): unit; no return type set.
@@ -2022,6 +2168,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // locals (`using var bytes := s.ToBytes()`) pick up the element
                     // type and downstream `bytes.AsReadOnlySpan()` can be intercepted
                     // by isSerializationCall / tryLowerSerializationCall.
+                    // stdlib §5 (#651): IGrouping<TKey, T> instance methods.
+                    // IGrouping<TKey, T>: Key (TKey property), Count() (int),
+                    // and enumeration (bz_grouping_elements).
+                    // rcn == "IGrouping" for the synthetic TypeRef built by GroupBy.
+                    if (rcn == "IGrouping" && recvTy) {
+                        if (m == "Count" && ce.args.empty()) {
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        }
+                        // .Key property: TKey is genericArgs[0].
+                        // (Property accesses for IGrouping.Key are handled in
+                        //  ExprTypecheck_Exprs visitMemberAccess, not here, but
+                        //  we guard the method form just in case.)
+                    }
                     if (rcn == "BinarySerializer" && m == "ToBytes") {
                         static const ast::Type* kOwnedBufNode2 = []() -> ast::Type* {
                             auto* qn = new ast::QualifiedName;
@@ -3488,6 +3647,21 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     }
     if (!targetType && ma.target) {
         auto* tt = ctx_.exprType(*ma.target);
+        // stdlib §5 (#651): IGrouping<TKey, T> property accesses.
+        // IGrouping TypeRefs are synthetic (no declaration); detect by astNode name.
+        if (tt && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+            tt->astNode && tt->astNode->name &&
+            !tt->astNode->name->parts.empty() &&
+            tt->astNode->name->parts[0] == "IGrouping") {
+            // Key: TKey (genericArgs[0]).
+            if (ma.member == "Key" && !tt->genericArgs.empty() &&
+                tt->genericArgs[0]) {
+                ctx_.setExprType(&ma, tt->genericArgs[0]);
+                return;
+            }
+            // Further IGrouping properties (if needed) go here.
+            return;
+        }
         if (tt && tt->kind == TypeRef::Kind::Named) {
             targetType = tt->declaration;
             // issue #484 / §14.2: when the receiver's TypeRef is a bare type

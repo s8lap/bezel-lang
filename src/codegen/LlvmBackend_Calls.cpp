@@ -1520,6 +1520,85 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             return resultV;
         }
+        // stdlib §5 (#650): FirstOrNull(predicate: (T)->bool): T? — find the
+        // first element satisfying the predicate, or null if none does.
+        // Analogous to First(pred) but returns T? instead of throwing.
+        // For value-type T: returns {i8 hasValue; T value}; for class/string T:
+        // returns a nullable pointer (null on no match).
+        if (m == "FirstOrNull" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            auto* resultSlot = entryAlloca(elemTy);
+            auto* foundSlot   = entryAlloca(i1());
+            builder_.CreateStore(builder_.getFalse(), foundSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "fon.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "fon.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "fon.f", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "fon.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "fon.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn,
+                {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, foundBB, nextBB);
+            builder_.SetInsertPoint(foundBB);
+            builder_.CreateStore(el, resultSlot);
+            builder_.CreateStore(builder_.getTrue(), foundSlot);
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(closure);
+
+            // Build T? result — same logic as the no-predicate *OrNull path.
+            sema::TypeRef* elemRefNN = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            sema::TypeRef nullRT;
+            if (elemRefNN) { nullRT = *elemRefNN; nullRT.nullable = true; }
+            bool isValTy = elemRefNN && isNullableValueTy(&nullRT);
+
+            llvm::Value* found = builder_.CreateLoad(i1(), foundSlot);
+            llvm::Value* notFound = builder_.CreateNot(found);
+            llvm::Value* loadedV  = builder_.CreateLoad(elemTy, resultSlot, "fon.v");
+            llvm::Value* resultV  = nullptr;
+            if (isValTy) {
+                auto* nst = nullableValueStructTy(&nullRT);
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst),
+                    builder_.CreateSelect(notFound,
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1)),
+                    {0u});
+                resultV = builder_.CreateInsertValue(
+                    res,
+                    builder_.CreateSelect(notFound,
+                        llvm::Constant::getNullValue(elemTy), loadedV),
+                    {1u});
+            } else {
+                // Pointer / class / string: null pointer when not found.
+                resultV = builder_.CreateSelect(notFound,
+                    llvm::Constant::getNullValue(elemTy), loadedV,
+                    "fon.ptr");
+            }
+            freeLazyTemp();
+            return resultV;
+        }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
 
         // per §3: .Sort() — in-place ascending sort for int arrays.
@@ -3300,6 +3379,87 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 auto* fn = declareC("bz_guid_equals", i32(), {ptrTy(), ptrTy()});
                 llvm::Value* r = builder_.CreateCall(fn, {slot, otherSlot}, "guid.eq.r");
                 return builder_.CreateICmpNE(r, builder_.getInt32(0), "guid.eq");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // stdlib §5 (#651): IGrouping<TKey, T> instance methods — Count() and Key.
+    // IGrouping objects are bz_grouping_t* pointers produced by GroupBy.
+    // count method and Key property are both accessed here via builtinTypeName.
+    // ---------------------------------------------------------------------------
+    {
+        auto* igrpRecvTy = ctx_.exprType(*ma->target);
+        if (igrpRecvTy && igrpRecvTy->kind == sema::TypeRef::Kind::Named &&
+            !igrpRecvTy->declaration &&
+            igrpRecvTy->astNode && igrpRecvTy->astNode->name &&
+            !igrpRecvTy->astNode->name->parts.empty() &&
+            igrpRecvTy->astNode->name->parts[0] == "IGrouping") {
+            llvm::Value* grp = lowerExpr(*ma->target);
+            if (!grp) return nullptr;
+            const auto& mname = ma->member;
+            // Count(): int — number of elements in this group.
+            if (mname == "Count" && call.args.empty()) {
+                auto* fn = declareC("bz_grouping_count", i64(), {ptrTy()});
+                llvm::Value* cnt64 = builder_.CreateCall(fn, {grp}, "grp.cnt");
+                return builder_.CreateTrunc(cnt64, i32(), "grp.cnt.i32");
+            }
+        }
+    }
+    // ---------------------------------------------------------------------------
+    // §28.13 / stdlib §2.16 (#603 / #653): Shared<T> and Weak<T> instance
+    // methods.  Placed BEFORE the IdentifierExpr guard below because the
+    // receiver may be any expression (e.g. nullable!.Clone() where the target
+    // is PostfixBangExpr, not a bare identifier).  Uses the same receiver-type
+    // check pattern as the Guid block above.
+    // ---------------------------------------------------------------------------
+    {
+        auto* recvTy653 = ctx_.exprType(*ma->target);
+        std::string_view btn653 = builtinTypeName(recvTy653);
+        if (btn653 == "Shared" || btn653 == "Weak") {
+            llvm::Value* handle = lowerExpr(*ma->target);
+            if (!handle) return nullptr;
+            const auto& mname = ma->member;
+            if (btn653 == "Shared") {
+                // §28.2 v0.135 / issue #627: checked-disposal guard.
+                if (checkedDisposal_ &&
+                    (mname == "Clone" || mname == "Get" || mname == "Downgrade")) {
+                    llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                    auto* isFn = declareC("bz_shared_is_disposed", i8Ty, {ptrTy()});
+                    llvm::Value* flag =
+                        builder_.CreateCall(isFn, {handle}, "cd.shrdis");
+                    llvm::Value* disposed = builder_.CreateICmpNE(
+                        flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                    emitGuardThrow(disposed, "DisposedAccessException");
+                }
+                if (mname == "Clone" && call.args.empty()) {
+                    auto* fn = declareC("bz_shared_clone", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {handle}, "shared.clone");
+                }
+                if (mname == "Get" && call.args.empty()) {
+                    auto* fn = declareC("bz_shared_get", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {handle}, "shared.get");
+                }
+                if (mname == "Downgrade" && call.args.empty()) {
+                    auto* fn = declareC("bz_shared_downgrade", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {handle}, "shared.downgrade");
+                }
+                // Dispose() is handled in the explicit-Dispose block; fall through.
+            }
+            if (btn653 == "Weak") {
+                if (mname == "TryUpgrade" && call.args.size() == 1 &&
+                    call.args[0].value) {
+                    llvm::Type* slotTy = nullptr;
+                    llvm::Value* outAddr = lvalueAddr(*call.args[0].value, slotTy);
+                    if (!outAddr) return builder_.getFalse();
+                    auto* fn = declareC("bz_weak_try_upgrade", i32(),
+                                        {ptrTy(), ptrTy()});
+                    llvm::Value* r = builder_.CreateCall(fn, {handle, outAddr},
+                                                         "weak.tryupgrade");
+                    return builder_.CreateICmpNE(r, builder_.getInt32(0),
+                                                 "weak.upgraded");
+                }
+                // Dispose() is handled in the explicit-Dispose block; fall through.
             }
         }
     }
@@ -9230,6 +9390,92 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
 
     // ----- ToArray: materialize the (lazy) pipeline into an owned Array<T> ---
     if (m == "ToArray" && call.args.empty()) {
+        // stdlib §5 (#651): GroupBy(...).ToArray() — intercept before the
+        // generic lazy-materialization path.  The GroupBy source is itself a
+        // call expression; detect by checking if it's a CallExpr whose callee
+        // is a MemberAccessExpr with member "GroupBy".
+        if (auto* srcCall = dynamic_cast<const ast::CallExpr*>(ma->target.get())) {
+            if (srcCall->callee) {
+                if (auto* srcMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                        srcCall->callee.get())) {
+                    if (srcMa->member == "GroupBy" && srcMa->target &&
+                        srcCall->args.size() == 1 && srcCall->args[0].value) {
+                        // srcMa->target is the source collection/lazy.
+                        auto* srcRecvTy = ctx_.exprType(*srcMa->target);
+                        sema::TypeRef* valElemRef =
+                            (srcRecvTy && !srcRecvTy->genericArgs.empty())
+                            ? srcRecvTy->genericArgs[0] : nullptr;
+                        llvm::Type* valElemTy = valElemRef
+                            ? lowerTypeRef(valElemRef) : i32();
+                        int64_t val_esz = lazyElemSize(valElemTy,
+                            module_->getDataLayout());
+                        // Determine key element type from the key lambda's return.
+                        sema::TypeRef* keyElemRef = valElemRef; // default: identity
+                        auto* callTy = ctx_.exprType(*srcCall);
+                        // callTy = IEnumerable<IGrouping<TKey,T>>;
+                        // IGrouping genericArgs[0]=TKey.
+                        if (callTy && !callTy->genericArgs.empty() &&
+                            callTy->genericArgs[0] &&
+                            callTy->genericArgs[0]->astNode &&
+                            callTy->genericArgs[0]->astNode->name &&
+                            !callTy->genericArgs[0]->astNode->name->parts.empty() &&
+                            callTy->genericArgs[0]->astNode->name->parts[0] == "IGrouping" &&
+                            callTy->genericArgs[0]->genericArgs.size() >= 1) {
+                            keyElemRef = callTy->genericArgs[0]->genericArgs[0];
+                        }
+                        llvm::Type* keyElemTy = keyElemRef
+                            ? lowerTypeRef(keyElemRef) : i32();
+                        int64_t key_esz = lazyElemSize(keyElemTy,
+                            module_->getDataLayout());
+                        // Lower the source to a lazy enumerator.
+                        sema::TypeRef* dummyElem = nullptr;
+                        llvm::Value* srcLazy = lowerToLazyEnumerator(
+                            *srcMa->target, dummyElem);
+                        if (!srcLazy) return nullptr;
+                        // Lower the key lambda to a closure.
+                        // Use selector trampoline (kind 1): void(cl, elem, out)
+                        // so the key is written as bytes into the output slot.
+                        const bool relCl =
+                            srcCall->args[0].value &&
+                            dynamic_cast<const ast::LambdaExpr*>(
+                                srcCall->args[0].value.get()) != nullptr;
+                        // lowerLinqLambda is defined AFTER the ToArray block;
+                        // inline its logic: set expectedFunctionType_ to a
+                        // function (valElemRef)->keyElemRef and lowerExpr.
+                        llvm::Value* closure = nullptr;
+                        {
+                            auto* funcRef = ctx_.makeTypeRef();
+                            funcRef->kind = sema::TypeRef::Kind::Function;
+                            funcRef->funcReturn = keyElemRef;
+                            if (valElemRef) {
+                                sema::TypeRef::FuncParam fp;
+                                fp.type = valElemRef;
+                                funcRef->funcParams.push_back(std::move(fp));
+                            }
+                            const sema::TypeRef* saved = expectedFunctionType_;
+                            expectedFunctionType_ = funcRef;
+                            closure = lowerExpr(*srcCall->args[0].value);
+                            expectedFunctionType_ = saved;
+                        }
+                        if (!closure) return nullptr;
+                        llvm::Function* keyTramp = buildLinqTrampoline(
+                            1, valElemTy, keyElemTy);
+                        auto* gbFn = declareC("bz_groupby_to_array", ptrTy(),
+                            {ptrTy(), i64(), i64(), ptrTy(), ptrTy()});
+                        llvm::Value* groups = builder_.CreateCall(gbFn,
+                            {srcLazy,
+                             builder_.getInt64(val_esz),
+                             builder_.getInt64(key_esz),
+                             closure,
+                             keyTramp},
+                            "linq.groupby");
+                        if (relCl && closure) emitClosureRelease(closure);
+                        return groups;
+                    }
+                }
+            }
+        }
+
         sema::TypeRef* elemRef = nullptr;
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
         if (!lazy) return nullptr;
@@ -9338,7 +9584,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                  // stdlib §5 Ordering secondary key:
                  m == "ThenBy" || m == "ThenByDescending" ||
                  // stdlib §5 lazy Reverse — only on a lazy receiver (not Array):
-                 (m == "Reverse" && lazyRecv));
+                 (m == "Reverse" && lazyRecv) ||
+                 // stdlib §5 (#651): OfType<U>() — lazy identity/type-filter.
+                 m == "OfType");
     if (!isOp) return nullptr;
 
     sema::TypeRef* elemRef = nullptr;
@@ -9596,6 +9844,33 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     if (m == "Reverse" && call.args.empty()) {
         auto* revFn = declareC("bz_lazy_reverse", ptrTy(), {ptrTy()});
         return builder_.CreateCall(revFn, {src}, "linq.reverse");
+    }
+    // stdlib §5 (#651): OfType<U>() — type-filter lazy operator.
+    // For value-type sources (monomorphic): U must equal T (statically enforced
+    // by sema since Bezel has no runtime type tags for value types), so OfType
+    // is an identity — wrap source as a Where-all (predicate always true).
+    // The element size is unchanged (U == T).
+    if (m == "OfType" && call.args.empty()) {
+        // Build a Where with an always-true predicate trampoline.
+        // kind-0 trampoline: i32(ptr closure, ptr elem) returns 1 always.
+        llvm::FunctionType* fty = llvm::FunctionType::get(i32(),
+            {ptrTy(), ptrTy()}, false);
+        auto* alwaysTrueFn = llvm::Function::Create(fty,
+            llvm::Function::InternalLinkage, "bz$oftype$tramp", module_.get());
+        auto savedIP = builder_.saveIP();
+        llvm::Function* savedFn = currentFn_;
+        currentFn_ = alwaysTrueFn;
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", alwaysTrueFn);
+        builder_.SetInsertPoint(entry);
+        builder_.CreateRet(builder_.getInt32(1));
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        // bz_lazy_where with nullptr closure and alwaysTrueFn → pass-through.
+        auto* whereFn = declareC("bz_lazy_where", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(whereFn,
+            {src, llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_, 0)),
+             alwaysTrueFn},
+            "linq.oftype");
     }
     return nullptr;
 }

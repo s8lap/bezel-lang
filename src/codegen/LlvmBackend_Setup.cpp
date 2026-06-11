@@ -2567,6 +2567,34 @@ llvm::Function* Emitter::weakReleaseThunk() {
     return fn;
 }
 
+// stdlib §5 (#651): void(void*) thunk that calls bz_grouping_free(ptr),
+// used as the per-element disposal callback for an Array<IGrouping<TKey,T>>.
+// Null-checks the pointer first (same pattern as sharedReleaseThunk).
+llvm::Function* Emitter::groupingFreeThunk() {
+    if (groupingFreeThunk_) return groupingFreeThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$groupingFree", module_.get());
+    llvm::Argument* h = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* freeBB = llvm::BasicBlock::Create(llvm_, "g.free", fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "g.ret",  fn);
+    llvm::IRBuilder<> b(entry);
+    b.CreateCondBr(
+        b.CreateICmpEQ(h, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, freeBB);
+    b.SetInsertPoint(freeBB);
+    auto* freeFn = declareC("bz_grouping_free",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    b.CreateCall(freeFn, {h});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    groupingFreeThunk_ = fn;
+    return fn;
+}
+
 bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
     // fix #619 / §28.11 v0.135 / §14.4: the §28.11 table's owned/borrow column
     // applies to "class / interface type" — both class AND interface elements are

@@ -1517,6 +1517,24 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 auto* fn = declareC("bz_domain_get_name", ptrTy(), {ptrTy()});
                 return builder_.CreateCall(fn, {dom}, "dom.name");
             }
+            // stdlib §5 (#651): IGrouping<TKey, T>.Key property read.
+            // IGrouping objects are bz_grouping_t* pointers; the key is
+            // stored as key_esz bytes at group->key_data. bz_grouping_key
+            // copies the key bytes into a caller-allocated slot.
+            // The key type (TKey) determines the LLVM type for the slot.
+            if (cn == "IGrouping" && ma->member == "Key" && tt &&
+                !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                llvm::Value* grp = lowerExpr(*ma->target);
+                if (!grp) return nullptr;
+                sema::TypeRef* keyRef = tt->genericArgs[0];
+                llvm::Type* keyTy = lowerTypeRef(keyRef);
+                if (!keyTy) keyTy = i32();
+                llvm::AllocaInst* keySlot = entryAlloca(keyTy);
+                auto* fn = declareC("bz_grouping_key", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {grp, keySlot});
+                return builder_.CreateLoad(keyTy, keySlot, "grp.key");
+            }
             // CancellationToken.None (static property, target is type-name identifier).
             if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
                 if (id2->name == "CancellationToken" && ma->member == "None") {
