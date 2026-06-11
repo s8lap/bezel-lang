@@ -161,6 +161,12 @@ bool ExprTC::stmtsContainYield(
         }
         if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get()))
             if (stmtsContainYield(db->body)) return true;
+        // §29.6 / §29.7 (#623): yield inside a try body (not catch or finally,
+        // which §29.6 forbids) makes the enclosing method an iterator; recurse
+        // into the try body so the DR1 "missing return on every path" check
+        // doesn't misfire on iterator methods whose yield is wrapped in try.
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(s.get()))
+            if (stmtsContainYield(trys->body)) return true;
     }
     return false;
 }

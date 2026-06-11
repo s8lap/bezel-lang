@@ -566,6 +566,13 @@ private:
         // receivers with ChannelClosedException). No user TypeSymbol; recognised
         // by the builtin type name "ChannelSender".
         bool channelSender = false;
+        // §29.7 (#623): an iterator enumerator (IEnumerable<T> state machine)
+        // whose Dispose is at vtable slot 1 (iterator vtable format:
+        // [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current) — NOT slot 2 (class
+        // vtable format).  At scope end (break / return / exception) we call
+        // vtable[1](self) then free the frame.  Distinct from `dynamicDispose`
+        // which dispatches through slot 2 of the class vtable.
+        bool iterEnumDispose = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -608,6 +615,20 @@ private:
         llvm::BasicBlock* contBB;       // outer loop continue target at try-entry time
     };
     std::vector<FinallyFrame> finallyStack_;
+    // §29.7 (#623): parallel to finallyStack_ — holds the finallyBody AST
+    // pointer for each active try/finally, so yield points can snapshot the
+    // chain for the Dispose function.  Always the same depth as finallyStack_;
+    // pushed/popped in lowerTry alongside finallyStack_.
+    std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>
+        finallyBodyStack_;
+
+    // §29.7 (#623): per-yield-state → snapshot of the finallyBodyStack_ at
+    // the moment of that yield (outermost first).  Populated at each
+    // `yield return` inside an iterator body; consumed by emitIteratorMethod
+    // to build the real Dispose function.
+    std::unordered_map<unsigned,
+        std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>>
+        smIterFinallyAtState_;
 
     // CG20: exception handling (explicit-unwinding model). A module-level
     // global holds the in-flight exception (null when none). A `throw` and

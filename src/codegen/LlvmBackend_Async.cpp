@@ -1265,28 +1265,12 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         module_.get());
     asyncResumeFn_ = resumeFn;
 
-    // --- Dispose(ptr self) -> void: free the spill area + the frame ---
-    // §30.7: `await for` disposes the enumerator at loop exit. Our generated
-    // enumerator has no async cleanup work, so Dispose is a synchronous free of
-    // the heap frame (and any cross-suspend spill area). (Awaiting DisposeAsync —
-    // genuine async cleanup across a suspend — is deferred; a synchronous free is
-    // sound here because the frame is plain heap memory.)
+    // --- Dispose(ptr self) -> void ---
+    // §29.7 (#623): Declare now so the vtable can reference it; real body is
+    // emitted after Resume emission (once smIterFinallyAtState_ is populated).
     auto* disposeFn = llvm::Function::Create(
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
-    {
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", disposeFn);
-        llvm::IRBuilder<> db(bb);
-        llvm::Value* self = &*disposeFn->arg_begin();
-        // Free the spill area (null when there was no cross-suspend temporary).
-        llvm::Value* spillField =
-            db.CreateStructGEP(stateStructTy, self, SPILL_PTR_FIELD);
-        llvm::Value* spillPtr = db.CreateLoad(ptrTy(), spillField);
-        auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
-        db.CreateCall(freeFn, {spillPtr});
-        db.CreateCall(freeFn, {self});
-        db.CreateRetVoid();
-    }
 
     // --- Vtable: [0]=self, [1]=Dispose, [2]=MoveNextAsync, [3]=Current ---
     const unsigned VT_SIZE = 4;
@@ -1361,6 +1345,9 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         currentThis_ = nullptr;
         locals_.clear(); paramSlots_.clear(); refParams_.clear();
         disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+        // §29.7 (#623): clear the finally-chain tracking for this async iterator.
+        finallyBodyStack_.clear();
+        smIterFinallyAtState_.clear();
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
@@ -1462,6 +1449,92 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         smAllocaToField_.clear();
         asyncResumeFn_ = nullptr;
         asyncResultTy_ = nullptr;
+    }
+
+    // --- Dispose(ptr self) -> void (real body, §29.7 #623) ---
+    // Emitted after Resume so smIterFinallyAtState_ is populated.
+    // §29.7: runs finally clauses active at the suspension point, then frees
+    // the spill area and the frame.  Finally bodies are run synchronously
+    // (await-in-finally-on-Dispose is not yet supported; §29.7 allows the
+    // sync-finally subset — an await-in-Dispose corner is reported separately).
+    {
+        currentFn_ = disposeFn;
+        currentThis_ = nullptr;
+        locals_.clear(); paramSlots_.clear(); refParams_.clear();
+        disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+        finallyBodyStack_.clear();
+        propagateBB_ = nullptr; unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", disposeFn);
+        builder_.SetInsertPoint(entry);
+
+        llvm::Value* self = &*disposeFn->arg_begin();
+
+        // Restore captures so finally bodies can access `this` / params.
+        emitFrameCaptureRestores(frame, self);
+
+        // Restore suspend-locals from the frame so finally bodies that
+        // reference iterator-body locals round-trip correctly.
+        for (auto& [node, fieldIdx] : frame.localFields) {
+            llvm::Type* lty =
+                frame.bodyLocals[fieldIdx - frame.localStart].second;
+            llvm::Value* fptr = builder_.CreateStructGEP(
+                stateStructTy, self, fieldIdx);
+            llvm::Value* val = builder_.CreateLoad(lty, fptr);
+            auto* slot = entryAlloca(lty);
+            builder_.CreateStore(val, slot);
+            locals_[node] = slot;
+        }
+
+        auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+
+        auto emitFreeAndReturn = [&]() {
+            // Free the spill area first (null-safe: free(null) is a no-op).
+            llvm::Value* spillField2 =
+                builder_.CreateStructGEP(stateStructTy, self, SPILL_PTR_FIELD);
+            llvm::Value* spillPtr2 = builder_.CreateLoad(ptrTy(), spillField2);
+            builder_.CreateCall(freeFn2, {spillPtr2});
+            builder_.CreateCall(freeFn2, {self});
+            builder_.CreateRetVoid();
+        };
+
+        if (smIterFinallyAtState_.empty()) {
+            // No yields inside try/finally — just mark done and free.
+            llvm::Value* stateGEP2 =
+                builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
+            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            emitFreeAndReturn();
+        } else {
+            auto* doneBB = llvm::BasicBlock::Create(llvm_, "dsp.done", disposeFn);
+            llvm::Value* stateGEP2 =
+                builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
+            llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
+            // Mark done immediately so re-entrant Dispose is a no-op.
+            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            auto* sw = builder_.CreateSwitch(curState, doneBB,
+                (unsigned)smIterFinallyAtState_.size());
+
+            for (auto& [stateIdx, chain] : smIterFinallyAtState_) {
+                auto* chainBB = llvm::BasicBlock::Create(
+                    llvm_, "dsp.s" + std::to_string(stateIdx), disposeFn);
+                sw->addCase(builder_.getInt32((int)stateIdx), chainBB);
+                builder_.SetInsertPoint(chainBB);
+                // Run finally bodies innermost-first (chain is outermost-first).
+                for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                    disposeStack_.emplace_back();
+                    lowerBody(**it);
+                    disposeStack_.pop_back();
+                }
+                builder_.CreateBr(doneBB);
+            }
+
+            builder_.SetInsertPoint(doneBB);
+            emitFreeAndReturn();
+        }
+
+        smIterFinallyAtState_.clear();
+        finallyBodyStack_.clear();
     }
 }
 

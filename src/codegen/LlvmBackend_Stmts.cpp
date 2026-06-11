@@ -975,6 +975,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             }
             unsigned nextState = ++smNextSuspendState_;
+            // §29.7 (#623): snapshot the active finally-body chain so the
+            // Dispose function can re-run finally clauses when the iterator
+            // is disposed while suspended at this yield point.  The state
+            // index stored in the frame when the consumer resumes from this
+            // yield is `nextState`; Dispose switches on that value.
+            if (!finallyBodyStack_.empty()) {
+                smIterFinallyAtState_[nextState] =
+                    std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>(
+                        finallyBodyStack_.begin(), finallyBodyStack_.end());
+            }
             builder_.CreateStore(builder_.getInt32((int)nextState), smStateGEP_);
             if (isAsyncYield) {
                 emitAsyncIterComplete(/*hasValue=*/true);
@@ -1059,6 +1069,9 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         finallyStack_.push_back({finNormalBB, exitModSlot, retValSlot,
                                  retTy, afterBB,
                                  loopBreakBB, loopContBB});
+        // §29.7 (#623): track the AST finally-body alongside the frame so
+        // a yield inside this try can snapshot the chain for Dispose.
+        finallyBodyStack_.push_back(&trys.finallyBody);
         // §30.9 / §31.2 (#438): an in-finally await re-enters the finally
         // mid-body; the exit-mode and return-value slots were set BEFORE the
         // finally (in the normal-exit path) and are read AFTER the suspend (the
@@ -1198,6 +1211,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     if (hasFin) {
         // Pop the frame — outer frames (if any) are now at back().
         finallyStack_.pop_back();
+        if (!finallyBodyStack_.empty()) finallyBodyStack_.pop_back();
         FinallyFrame* outerFr = finallyStack_.empty()
             ? nullptr : &finallyStack_.back();
 
@@ -1260,6 +1274,18 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
 
         // finUnwindBB: exception exit — run finally, then re-propagate.
         builder_.SetInsertPoint(finUnwindBB);
+        // §29.7 (#623): if we are inside an iterator state machine, mark the
+        // iterator as done (state=-1) BEFORE running the finally body.  The
+        // finally will run via this unwinding path; when the consumer's for-loop
+        // cleanup subsequently calls Dispose, Dispose must see state=-1 and be a
+        // no-op — otherwise the finally would run a second time.  We set -1
+        // before the finally (not after) so that any finally-body code that
+        // calls MoveNext/Dispose on the same iterator also sees it as done.
+        // smStateGEP_ is non-null exactly when we are emitting inside a
+        // sync/async iterator MoveNext / Resume function.
+        if (smStateGEP_) {
+            builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
+        }
         if (finallyAwaits) {
             // §30.9 / §31.2 (#438): an `await` in the finally on the EXCEPTION
             // path suspends with an exception in flight. `bz$exc` is a single
@@ -2564,6 +2590,19 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     auto* enumSlot = entryAlloca(ptrTy());
     builder_.CreateStore(enumObj, enumSlot);
 
+    // §29.7 (#623): register the enumerator for disposal on all exit paths
+    // (break / return / exception / normal exhaustion).  Use a dedicated scope
+    // around the loop so emitLoopDisposals(outerDepth) on `break` disposes it.
+    // The iterator vtable has Dispose at slot 1 (not slot 2 like class vtables),
+    // so we use iterEnumDispose rather than dynamicDispose.
+    std::size_t outerDepth = disposeStack_.size();
+    disposeStack_.emplace_back();
+    {
+        Disposal d{enumSlot, nullptr};
+        d.iterEnumDispose = true;
+        disposeStack_.back().push_back(d);
+    }
+
     // Use vtable-based MoveNext (slot 2) and Current (slot 3).
     // Layout: [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current
     auto* moveNextTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
@@ -2595,12 +2634,20 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     llvm::Value* curVal = builder_.CreateCall(currentTy, curFnPtr, {obj2}, "ib.cur");
     builder_.CreateStore(curVal, varSlot);
 
-    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+    // §29.7 (#623): loopScopeDepth = outerDepth (BEFORE enumerator scope push)
+    // so that emitLoopDisposals on `break` disposes both the body scope AND
+    // the enumerator scope (calls Dispose on the iterator frame).
+    loopStack_.push_back({condBB, endBB, outerDepth});
     lowerScopedBlock(fs.body);
     loopStack_.pop_back();
     if (!builder_.GetInsertBlock()->getTerminator())
         builder_.CreateBr(condBB);
+
+    // Normal exhaustion: endBB. Dispose the enumerator (Dispose runs the
+    // pending finally blocks and frees the frame), then pop the scope.
     builder_.SetInsertPoint(endBB);
+    emitDisposals(disposeStack_.back());
+    disposeStack_.pop_back();
     return true;
 }
 

@@ -7572,6 +7572,35 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.SetInsertPoint(contBB);
             continue;
         }
+        // §29.7 (#623): an iterator enumerator whose Dispose is at vtable slot 1
+        // (iterator format: [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current).
+        // Call Dispose(self) via slot 1 (which runs pending finally blocks inside
+        // the state machine and sets state=-1) then free the heap frame.
+        if (it->iterEnumDispose) {
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), it->slot);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "iter.dispose",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "iter.cont",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            // Dispatch vtable slot 1 (Dispose).
+            llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+            llvm::Value* dispSlot =
+                builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(1)});
+            llvm::Value* dispFnPtr = builder_.CreateLoad(ptrTy(), dispSlot);
+            auto* dispTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+            builder_.CreateCall(dispTy, dispFnPtr, {obj});
+            // Dispose now freed the frame — null the slot.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 it->slot);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         // #383 / §28: a `using var` owning a class/interface object whose
         // concrete class is not statically known here (interface-typed slot,
         // call returning `owned T`, or `move x.f`). Dispose dynamically through

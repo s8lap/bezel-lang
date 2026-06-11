@@ -335,14 +335,13 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         prefix + "Current", module_.get());
 
     // --- Dispose(ptr self) -> void ---
+    // §29.7 (#623): the real Dispose is emitted AFTER MoveNext so we know
+    // which yield states have active finally chains (smIterFinallyAtState_).
+    // Declare the function now so the vtable can reference it; fill the body
+    // below after MoveNext emission.
     auto* disposeFn = llvm::Function::Create(
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
-    {
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", disposeFn);
-        llvm::IRBuilder<> db(bb);
-        db.CreateRetVoid();
-    }
 
     // --- Vtable global for this iterator's IEnumerator<T> impl ---
     // Layout: [ptr vtable (self-ptr for td), ptr Dispose, ptr MoveNext, ptr get$Current]
@@ -412,6 +411,9 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         currentThis_ = nullptr;
         locals_.clear(); paramSlots_.clear(); refParams_.clear();
         disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+        // §29.7 (#623): clear the finally-chain tracking for this iterator.
+        finallyBodyStack_.clear();
+        smIterFinallyAtState_.clear();
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
@@ -459,6 +461,90 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smSelf_ = nullptr;
         smLocalFields_.clear();
         smAllocaToField_.clear();
+    }
+
+    // --- Dispose(ptr self) -> void (real body, §29.7 #623) ---
+    // Emitted after MoveNext so smIterFinallyAtState_ is populated.
+    // If the iterator was suspended inside a try/finally, run the finally
+    // chains (innermost first) before freeing the frame.  A second Dispose
+    // (state == -1) is a no-op per §29.7.
+    {
+        currentFn_ = disposeFn;
+        currentThis_ = nullptr;
+        locals_.clear(); paramSlots_.clear(); refParams_.clear();
+        disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+        finallyBodyStack_.clear();
+        propagateBB_ = nullptr; unwindTarget_ = nullptr;
+        currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", disposeFn);
+        builder_.SetInsertPoint(entry);
+
+        llvm::Value* self = &*disposeFn->arg_begin();
+
+        // Restore captures so finally bodies can access `this` / params.
+        emitFrameCaptureRestores(frame, self);
+
+        // Restore suspend-locals from the frame so finally bodies that
+        // reference iterator-body locals round-trip correctly.
+        for (auto& [node, fieldIdx] : frame.localFields) {
+            llvm::Type* lty =
+                frame.bodyLocals[fieldIdx - frame.localStart].second;
+            llvm::Value* fptr = builder_.CreateStructGEP(
+                stateStructTy, self, fieldIdx);
+            llvm::Value* val = builder_.CreateLoad(lty, fptr);
+            auto* slot = entryAlloca(lty);
+            builder_.CreateStore(val, slot);
+            locals_[node] = slot;
+        }
+
+        auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+
+        // If no yield was ever inside a try/finally, emit a simple free + return.
+        if (smIterFinallyAtState_.empty()) {
+            // Mark done so a second Dispose is a no-op (not strictly necessary
+            // when there are no finally chains, but keeps the contract clean).
+            llvm::Value* stateGEP2 =
+                builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
+            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            builder_.CreateCall(freeFn, {self});
+            builder_.CreateRetVoid();
+        } else {
+            // Build a switch on the current state.  State == -1 or 0: already
+            // done or never suspended inside a try — just free.  State N: run
+            // the finally chain recorded for that state, then free.
+            auto* doneBB = llvm::BasicBlock::Create(llvm_, "dsp.done", disposeFn);
+            llvm::Value* stateGEP2 =
+                builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
+            llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
+            // Mark done immediately so re-entrant Dispose is a no-op.
+            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            auto* sw = builder_.CreateSwitch(curState, doneBB,
+                (unsigned)smIterFinallyAtState_.size());
+
+            for (auto& [stateIdx, chain] : smIterFinallyAtState_) {
+                auto* chainBB = llvm::BasicBlock::Create(
+                    llvm_, "dsp.s" + std::to_string(stateIdx), disposeFn);
+                sw->addCase(builder_.getInt32((int)stateIdx), chainBB);
+                builder_.SetInsertPoint(chainBB);
+                // Run finally bodies innermost-first (chain is outermost-first,
+                // so iterate in reverse per §29.7 / §28.11).
+                for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                    disposeStack_.emplace_back();
+                    lowerBody(**it);
+                    disposeStack_.pop_back();
+                }
+                builder_.CreateBr(doneBB);
+            }
+
+            builder_.SetInsertPoint(doneBB);
+            builder_.CreateCall(freeFn, {self});
+            builder_.CreateRetVoid();
+        }
+
+        // Clear the per-iterator finally tracking.
+        smIterFinallyAtState_.clear();
+        finallyBodyStack_.clear();
     }
 }
 
