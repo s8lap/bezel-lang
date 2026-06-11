@@ -6963,8 +6963,14 @@ void* bz_channel_receive(void* chp, void* cce_vtable) {
 
 // bz_channel_try_receive: non-blocking receive. If an item is available,
 // stores it in *out_item and returns 1. Otherwise returns 0.
+// fix #667 / §30.15 / stdlib §6.9: null-guard for the disposed case.
+// After Channel.Dispose() the codegen nulls the ch slot; calling methods on
+// the null represents "fully disposed and cleared" = empty+closed.  Return 0
+// (no item) rather than crashing — per stdlib §6.9 "TryReceive → false when
+// the channel is empty or closed".
 extern "C"
 int32_t bz_channel_try_receive(void* chp, void** out_item) {
+    if (!chp) { *out_item = nullptr; return 0; }  // fix #667: null = disposed = empty
     auto* ch = (bz_channel_t*)chp;
     std::lock_guard<std::mutex> lk(ch->mtx);
     if (ch->items.empty()) return 0;
@@ -6981,9 +6987,15 @@ int64_t bz_channel_count(void* chp) {
     return (int64_t)ch->items.size();
 }
 
-// bz_channel_is_closed: true after the last sender has released.
+// bz_channel_is_closed: true after the last sender has released OR after
+// Channel.Dispose().
+// fix #667 / §30.15 / stdlib §6.9: null-guard for the disposed case.
+// After Channel.Dispose() the codegen nulls the ch slot; a null channel
+// represents "fully disposed and cleared" = closed.  Return 1 (true) per
+// §30.15 "Disposing the Channel<T> itself closes it immediately."
 extern "C"
 int32_t bz_channel_is_closed(void* chp) {
+    if (!chp) return 1;  // fix #667: null = disposed = closed
     auto* ch = (bz_channel_t*)chp;
     std::lock_guard<std::mutex> lk(ch->mtx);
     return ch->closed ? 1 : 0;

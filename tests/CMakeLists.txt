@@ -187,6 +187,7 @@ set(BEZEL_TEST_SOURCES
     sema/send_600_channel_rules_test.cpp
     sema/send_600_runtime_semantics_test.cpp   # #600c (runtime phase) — enabled
     sema/channel_634_uaf_test.cpp              # fix #634: channel core refcounting + send-after-close CCE
+    sema/channel_667_valuetype_test.cpp        # fix #667: value-typed payloads, TryReceive/IsClosed after dispose
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
