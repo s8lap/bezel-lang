@@ -2833,6 +2833,13 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     llvm::Value* mnSlotPtr = builder_.CreateGEP(ptrTy(), vtable, {builder_.getInt32(2)});
     llvm::Value* mnFnPtr = builder_.CreateLoad(ptrTy(), mnSlotPtr);
     llvm::Value* moved = builder_.CreateCall(moveNextTy, mnFnPtr, {obj}, "ib.moved");
+    // §29.2/§31 (#630): MoveNext runs the iterator body; an exception thrown
+    // there sets bz$exc and returns false (propagateBB in MoveNext).  Without
+    // this pending-check the consumer never sees the exception and the for-loop
+    // silently ends.  emitPendingCheck is the standard CG20 post-call gate:
+    // if bz$exc is non-null, unwind (disposing the enumerator via the scope
+    // on the disposeStack_) and propagate to the enclosing handler.
+    emitPendingCheck();
     builder_.CreateCondBr(moved, bodyBB, endBB);
 
     // body: call vtable slot 3 (Current)
