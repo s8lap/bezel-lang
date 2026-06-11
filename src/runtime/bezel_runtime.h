@@ -1049,6 +1049,93 @@ void bz_channel_dispose(void* ch, void* cce_vtable);
 // dfe_vtable is the DomainFaultedException vtable global.
 void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
                       void* dfe_vtable);
+// §2.15 (issue #550): BinarySerializer / BinaryDeserializer — compact binary
+// format for ISerializer / IDeserializer.
+//
+// Wire format (little-endian, not a stable interchange format per §2.15):
+//   - Integers: variable-length zigzag encoding (signed) or varint (unsigned).
+//   - float:  IEEE 754 single stored as 4 bytes (little-endian i32 bits).
+//   - double: IEEE 754 double stored as 8 bytes (little-endian i64 bits).
+//   - decimal: 16 bytes little-endian (unused in tier 1, reserved).
+//   - bool: 1 byte (0 or 1).
+//   - char: varint of the Unicode scalar value.
+//   - string: varint byte-length prefix, then UTF-8 bytes (no NUL).
+//   - null: marker byte 0x00 written before the value.
+//   - BeginObject(n): varint field count.
+//   - WriteFieldName(s): string (as above).
+//   - EndObject: no bytes (count was written at BeginObject).
+//   - BeginArray(n): varint element count.
+//   - EndArray: no bytes.
+//
+// All bz_binser_* / bz_binder_* functions are extern "C" and safe to call
+// from JIT-compiled Bezel code via DynamicLibrarySearchGenerator.
+
+// --- Serializer (writer) ---
+// Allocate a new BinarySerializer state. Returns an opaque handle.
+void* bz_binser_alloc(void);
+// Free the serializer (without transferring the buffer).
+void  bz_binser_free(void* ser);
+// Transfer the accumulated bytes as an owned OwnedBuffer<byte>. The caller
+// owns the result. The serializer continues to be valid after this call
+// (it retains the buffer for further writes — the semantics here: a fresh
+// OwnedBuffer copy is returned, the internal buffer is cleared).
+void* bz_binser_to_bytes(void* ser);
+
+// ISerializer interface methods on the BinarySerializer.
+void bz_binser_write_int(void* ser, int64_t value);
+void bz_binser_write_uint(void* ser, uint64_t value);
+void bz_binser_write_float(void* ser, double value);   // WriteFloat(double)
+void bz_binser_write_decimal(void* ser, void* val);    // WriteDecimal (stub)
+void bz_binser_write_bool(void* ser, int8_t value);
+void bz_binser_write_string(void* ser, void* str);     // bz_string*
+void bz_binser_write_char(void* ser, int32_t value);   // Unicode scalar
+void bz_binser_write_null(void* ser);
+void bz_binser_begin_object(void* ser, int32_t field_count);
+void bz_binser_write_field_name(void* ser, void* name); // bz_string*
+void bz_binser_end_object(void* ser);
+void bz_binser_begin_array(void* ser, int32_t element_count);
+void bz_binser_end_array(void* ser);
+
+// --- Deserializer (reader) ---
+// Allocate a BinaryDeserializer reading from a byte span.
+// `data` is borrowed for the lifetime of the deserializer; `len` is byte count.
+// `ignore_unknown` mirrors the IDeserializer strict/lenient policy.
+void* bz_binder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown);
+// Free the deserializer.
+void  bz_binder_free(void* der);
+
+// IDeserializer interface methods on the BinaryDeserializer.
+int64_t bz_binder_read_int(void* der);
+uint64_t bz_binder_read_uint(void* der);
+double  bz_binder_read_float(void* der);    // ReadFloat() → double
+void*   bz_binder_read_decimal(void* der);  // stub
+int8_t  bz_binder_read_bool(void* der);
+void*   bz_binder_read_string(void* der);   // returns bz_string* (rc=1)
+int32_t bz_binder_read_char(void* der);     // Unicode scalar
+int8_t  bz_binder_try_read_null(void* der);
+int32_t bz_binder_begin_object(void* der);  // returns field count
+void*   bz_binder_read_field_name(void* der); // returns bz_string* (rc=1)
+void    bz_binder_skip_value(void* der);
+void    bz_binder_end_object(void* der);
+int32_t bz_binder_begin_array(void* der);   // returns element count
+int8_t  bz_binder_has_more_elements(void* der);
+void    bz_binder_end_array(void* der);
+
+// SerializationException throw helper — called by synthesized code on bad input.
+// `msg` is a NUL-terminated C string describing the fault (for diagnostics).
+// Stores a built-in SerializationException in the global exception slot (bz_exc)
+// and returns (codegen emits the unwind branch after the call).
+void bz_ser_throw(const char* msg, void* ser_exn_vtable);
+
+// OwnedBuffer<byte> helpers used by BinarySerializer/BinaryDeserializer.
+// bz_owned_buffer_alloc: allocate an OwnedBuffer<byte> with the given bytes,
+// returning the opaque handle (an owned bz_array_t* wrapper). Caller owns it.
+void* bz_owned_buffer_byte_alloc(const uint8_t* data, int64_t len);
+// bz_owned_buffer_as_rospan: return a ReadOnlySpan<byte> struct {ptr, len} as
+// a pair of {i64 ptr, i64 len} words (matches the codegen layout for spans).
+// Actually returns a bz_array_t* with read semantics (span borrows from it).
+// The span borrows the buffer; the buffer must outlive the deserializer.
+void bz_owned_buffer_get_span(void* buf, const uint8_t** data_out, int64_t* len_out);
 
 #ifdef __cplusplus
 } // extern "C"

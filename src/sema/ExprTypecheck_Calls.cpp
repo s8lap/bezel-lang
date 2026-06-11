@@ -1912,6 +1912,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
+                    // §9.8 / §2.15 / issue #550: BinarySerializer.ToBytes() →
+                    // OwnedBuffer<byte>.  Set on the CallExpr so that inferred-type
+                    // locals (`using var bytes := s.ToBytes()`) pick up the element
+                    // type and downstream `bytes.AsReadOnlySpan()` can be intercepted
+                    // by isSerializationCall / tryLowerSerializationCall.
+                    if (rcn == "BinarySerializer" && m == "ToBytes") {
+                        static const ast::Type* kOwnedBufNode2 = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("OwnedBuffer");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* byTy2 = ctx_.primitiveTypeRef(PrimitiveType::Byte);
+                        auto* obTy2 = ctx_.makeTypeRef();
+                        obTy2->kind  = TypeRef::Kind::Named;
+                        obTy2->astNode = kOwnedBufNode2;
+                        obTy2->genericArgs.push_back(byTy2);
+                        ctx_.setExprType(&ce, obTy2);
+                    }
                 }
 
                 // §30.14 (#600): Domain.Spawn — static class, colName == "Domain".
@@ -4239,6 +4260,42 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
                 // Cancel / CancelAfter / Dispose → unit (leave untyped).
             }
+            // §9.8 / §2.15 / issue #550: BinarySerializer and BinaryDeserializer
+            // are compiler-known builtin classes (null `decl`, non-null astNode).
+            // Type their return-producing methods so downstream code can infer
+            // chain types (e.g. `using var bytes := s.ToBytes()` must know `bytes`
+            // is OwnedBuffer<byte> so `bytes.AsReadOnlySpan()` can be intercepted).
+            if (cls == "BinarySerializer") {
+                if (m == "ToBytes") {
+                    // Returns OwnedBuffer<byte> (stdlib §2.15).
+                    // Set on the CallExpr so that inferred-type locals
+                    // (`using var bytes := s.ToBytes()`) pick up the type
+                    // at line 1692 (`lsym->declType = ctx_.exprType(*ld->initializer)`).
+                    // Also set on the MemberAccessExpr callee so that the
+                    // fallback callee-type propagation below picks up OwnedBuffer<byte>
+                    // when `m == "ToBytes"` reaches the callee-type propagation block.
+                    static const ast::Type* kOwnedBufferAstNode = []() -> ast::Type* {
+                        auto* qn = new ast::QualifiedName;
+                        qn->parts.push_back("OwnedBuffer");
+                        auto* t = new ast::Type;
+                        t->kind = ast::TypeKind::Named;
+                        t->name.reset(qn);
+                        return t;
+                    }();
+                    auto* byTy  = ctx_.primitiveTypeRef(PrimitiveType::Byte);
+                    auto* obTy  = ctx_.makeTypeRef();
+                    obTy->kind  = TypeRef::Kind::Named;
+                    obTy->astNode = kOwnedBufferAstNode;
+                    obTy->genericArgs.push_back(byTy);
+                    ctx_.setExprType(&ma, obTy);
+                    // NOTE: the CallExpr type is set separately in typeCall
+                    // where `ce` is in scope (see the rcn == "BinarySerializer" block).
+                }
+                // Serialize(ISerializer) / Dispose → unit (leave untyped).
+            }
+            if (cls == "BinaryDeserializer") {
+                // All BinaryDeserializer methods are void; leave untyped.
+            }
         } else if (targetType->kind == ast::TypeDeclKind::Record ||
                    targetType->kind == ast::TypeDeclKind::Enum) {
             // §8 / §9 / §10: the value-semantics members the compiler
@@ -4290,6 +4347,43 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 typeTy->kind = TypeRef::Kind::Named;
                 typeTy->declaration = builtinClassSym("Type");
                 ctx_.setExprType(&ma, typeTy);
+            } else if (m == "Serialize" || m == "Deserialize") {
+                // §9.8 / issue #550: Serialize(s: ISerializer) and Deserialize
+                // are synthesized by codegen for records/enums that declare
+                // ISerializable / IDeserializable conformance. No MemberSymbol
+                // exists; sema must not reject the call.  We check the AST
+                // TypeDecl::baseTypes because TypeSymbol::baseTypes skips the
+                // builtin interface bases (ISerializable / IDeserializable have
+                // no user TypeDecl, so they never appear in TypeSymbol::baseTypes).
+                auto* td = dynamic_cast<const ast::TypeDecl*>(targetType->decl);
+                bool declaresSer = false, declaresDeser = false;
+                if (td) {
+                    for (const auto& bt : td->baseTypes) {
+                        if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                        const auto& n = bt->name->parts.back();
+                        if (n == "ISerializable")   declaresSer  = true;
+                        if (n == "IDeserializable") declaresDeser = true;
+                    }
+                }
+                if ((m == "Serialize" && declaresSer) ||
+                    (m == "Deserialize" && declaresDeser)) {
+                    // §9.8 / issue #550: Synthesis suppresses "no member".
+                    // For Deserialize the static synthesized method returns the
+                    // record/enum type itself (Point.Deserialize(d): Point).
+                    // Set that return type on the MemberAccessExpr so that
+                    // typeCall's !calleeSym fallback propagates it to the
+                    // CallExpr and `var p2 := T.Deserialize(d)` infers T for p2.
+                    if (m == "Deserialize" && declaresDeser && targetType) {
+                        auto* retTy = ctx_.makeTypeRef();
+                        retTy->kind = TypeRef::Kind::Named;
+                        retTy->declaration = targetType;
+                        ctx_.setExprType(&ma, retTy);
+                    }
+                    // Serialize returns unit (void); leave the MemberAccessExpr
+                    // untyped — codegen intercepts via tryLowerSerializationCall.
+                }
+                // If no conformance was declared the "no member" error will
+                // fire normally below via knownCompleteUserType.
             }
         }
         // issue #414 (§8.1, §11.3, §12.1): diagnose a genuinely-unknown member.
@@ -4332,6 +4426,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         bool isUniversalObjectMember =
             mm == "ToString" || mm == "Equals" || mm == "GetHashCode" ||
             mm == "GetType" || mm == "ReferenceEquals" || mm == "Dispose";
+        // §9.8 / issue #550: Serialize and Deserialize are synthesized for
+        // records/enums that declare ISerializable/IDeserializable. They have
+        // no MemberSymbol, so we must not fire "no member" on them.  We check
+        // the AST TypeDecl::baseTypes (TypeSymbol::baseTypes skips builtin
+        // interface bases like ISerializable because they carry no user TypeDecl).
+        bool isSerializationSynthesizedMember = false;
+        if ((mm == "Serialize" || mm == "Deserialize") && knownCompleteUserType &&
+                (targetType->kind == ast::TypeDeclKind::Record ||
+                 targetType->kind == ast::TypeDeclKind::Enum)) {
+            auto* tdSer = dynamic_cast<const ast::TypeDecl*>(targetType->decl);
+            if (tdSer) {
+                for (const auto& bt : tdSer->baseTypes) {
+                    if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                    const auto& bn = bt->name->parts.back();
+                    if (mm == "Serialize"   && bn == "ISerializable")   { isSerializationSynthesizedMember = true; break; }
+                    if (mm == "Deserialize" && bn == "IDeserializable") { isSerializationSynthesizedMember = true; break; }
+                }
+            }
+        }
         // #595 / §12 / §31: `Message` is an inherited member on any user class
         // that derives (directly or via a user-class chain) from a built-in
         // exception type (Exception, ArgumentException, …).  Built-in exception
@@ -4389,7 +4502,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
         if (knownCompleteUserType && !isUniversalObjectMember &&
-                !isBuiltinExInheritedMember) {
+                !isBuiltinExInheritedMember &&
+                !isSerializationSynthesizedMember) {
             ctx_.diagnostics().report(
                 Severity::Error, ma.span.begin,
                 std::string("no member `") + std::string(ma.member) +

@@ -9,7 +9,16 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // per the spec, but the compiler does not yet enforce import-gating for
         // System.Threading (same stance as KeyNotFoundException / System.Collections.
         // Generic — see the comment near the KeyNotFoundException entry below).
-        n == "CancellationTokenSource") {
+        n == "CancellationTokenSource" ||
+        // §9.8 / issue #550: ISerializable / IDeserializable (stdlib §2.14).
+        // Zero-arity interfaces; auto-imported with System (no explicit import
+        // required). Resolved here so that `: ISerializable` / `: IDeserializable`
+        // in record/enum base-type lists compile without "unresolved type" errors.
+        n == "ISerializable" || n == "IDeserializable" ||
+        // §2.14 / issue #550: ISerializer / IDeserializer — parameter types in
+        // the synthesised / hand-written Serialize(s: ISerializer) /
+        // Deserialize(d: IDeserializer) signatures (stdlib §2.14).
+        n == "ISerializer" || n == "IDeserializer") {
         return 0;
     }
     // Slice S25 (§31.4): language-built-in exception types, all
@@ -36,7 +45,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "MatchFailureException" ||
         n == "OperationCanceledException" ||
         n == "TypeInitializationException" ||
-        n == "FormatException" || n == "StackOverflowException") {
+        n == "FormatException" || n == "StackOverflowException" ||
+        // §9.8 / issue #550: thrown by synthesised Serialize/Deserialize on
+        // malformed binary input.
+        n == "SerializationException") {
         return 0;
     }
     if (n == "Task") return kBuiltinTaskLike;
@@ -63,7 +75,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §4.6: LinkedListNode<T> is the node handle returned by Add*/Find; it
         // carries a single generic element-type parameter and is resolved
         // without a user TypeDecl (same pattern as the collection types above).
-        n == "LinkedListNode") {
+        n == "LinkedListNode" ||
+        // §4.14 / issue #550: OwnedBuffer<T> (e.g. OwnedBuffer<byte> returned
+        // by BinarySerializer.ToBytes() per stdlib §2.15).
+        n == "OwnedBuffer") {
         return 1;
     }
     // §3 stdlib two-parameter collection types (arity 2):
@@ -78,7 +93,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
     if (n == "StringBuilder" || n == "Random" ||
         n == "DateTime" || n == "TimeSpan" ||
         n == "File" || n == "Directory" || n == "Path" ||
-        n == "Encoding" || n == "Linq") return 0;
+        n == "Encoding" || n == "Linq" ||
+        // §2.15 / issue #550: BinarySerializer / BinaryDeserializer (opaque
+        // runtime handles; require `import System.Serialization` per spec, but
+        // like CancellationTokenSource we do not yet enforce import-gating here).
+        n == "BinarySerializer" || n == "BinaryDeserializer") return 0;
     // §32.5 / stdlib §10: FFI-boundary types. IntPtr/UIntPtr are
     // compiler-intrinsic value types (pointer-sized integers); CString,
     // WString, RawBytes are FFI-boundary classes. They have no user

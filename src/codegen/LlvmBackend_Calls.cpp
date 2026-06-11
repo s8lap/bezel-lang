@@ -5843,6 +5843,21 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // ordinary dispatch so a record with no user ToString gets the §9.1 form
     // rather than falling through to the no-method path.
     if (auto* v = tryLowerValueSemanticsCall(call)) return v;
+    // §9.8 / §2.14–2.15 (issue #550): BinarySerializer/Deserializer construction,
+    // ToBytes, AsReadOnlySpan, and synthesized Serialize/Deserialize on record/enum
+    // receivers.  tryLowerSerializationCall returns a Value* for value-returning
+    // calls (Deserialize, ToBytes, AsReadOnlySpan) and nullptr for void calls
+    // (Serialize, Dispose) and for unrecognised calls. We use isSerializationCall()
+    // to distinguish "handled void" from "not handled".
+    if (call.callee) {
+        if (auto* sma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (isSerializationCall(call, *sma)) {
+                llvm::Value* sv = tryLowerSerializationCall(call);
+                return sv;  // nullptr for void or unrecognised (both are fine here)
+            }
+        }
+    }
     // §8.2 (#487): `v.GetType()` — universal Object member returning the `Type`
     // runtime class (stdlib §2.13). Sema types the CallExpr as Named Type, so
     // the expression is well-typed. Codegen defers the implementation (the

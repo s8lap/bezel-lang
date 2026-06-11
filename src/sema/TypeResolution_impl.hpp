@@ -147,6 +147,13 @@ private:
     // only and never own a resource.
     void checkRecordRestrictions();
 
+    // §9.8 (issue #550): records and enums that declare `: ISerializable` or
+    // `: IDeserializable` must satisfy the synthesis-eligibility rule.  Types
+    // that declare the conformance but are ineligible (ineligible component
+    // type, no hand-written Serialize/Deserialize) are a compile error at the
+    // conformance declaration.
+    void checkSerializationEligibility();
+
     // Slice S22 (§13.2): a top-level type may be `public` or `internal`
     // (the latter is also the default when no visibility keyword is
     // written). `protected` and `private` are rejected — there is no

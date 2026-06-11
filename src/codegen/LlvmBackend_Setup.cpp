@@ -1540,6 +1540,9 @@ Emitter::builtinExceptionHierarchy() {
         // of a spawned domain that threw an exception. Message carries a copy
         // of the original exception's message text.
         {"DomainFaultedException", "Exception"},
+        // §9.8 / issue #550: thrown by synthesised Serialize/Deserialize when
+        // the binary stream is malformed (unknown fields, truncated data, etc.).
+        {"SerializationException", "Exception"},
     };
     return h;
 }
@@ -4142,6 +4145,47 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (isSub) {
         disposeStack_.back().push_back({it->second, nullptr, /*subscription=*/true});
         return;
+    }
+    // §2.15 / issue #550: a `using var` bound to BinarySerializer or
+    // BinaryDeserializer — opaque runtime handles with no user TypeSymbol and
+    // no vtable.  At scope end they are freed via bz_binser_free /
+    // bz_binder_free.  Recognised by declared type name or NewExpr type name.
+    {
+        auto isBinName = [](const sema::TypeRef* rt, std::string_view nm) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == nm;
+        };
+        bool isBinSer = false, isBinDer = false;
+        if (ld->type) {
+            auto* rt = ctx_.resolvedType(*ld->type);
+            isBinSer = isBinName(rt, "BinarySerializer");
+            isBinDer = isBinName(rt, "BinaryDeserializer");
+        }
+        if (!isBinSer && !isBinDer && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+                isBinSer = ne->type && ne->type->name &&
+                           !ne->type->name->parts.empty() &&
+                           ne->type->name->parts[0] == "BinarySerializer";
+                isBinDer = ne->type && ne->type->name &&
+                           !ne->type->name->parts.empty() &&
+                           ne->type->name->parts[0] == "BinaryDeserializer";
+            }
+        }
+        if (isBinSer) {
+            Disposal d{it->second, nullptr};
+            d.binarySerializer = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+        if (isBinDer) {
+            Disposal d{it->second, nullptr};
+            d.binaryDeserializer = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
     }
     // §6.1 / §30.8: a `using var` bound to a CancellationTokenSource — a
     // builtin owned class with no user TypeSymbol, disposed via bz_cts_dispose
@@ -7443,6 +7487,44 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {list, disp});
+            continue;
+        }
+        // §2.15 / issue #550: a `using var` BinarySerializer — free the
+        // serializer buffer + state via bz_binser_free.
+        if (it->binarySerializer) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                h, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "binser.free",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "binser.cont",  currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_binser_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {h});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §2.15 / issue #550: a `using var` BinaryDeserializer — free the
+        // deserializer cursor state via bz_binder_free.
+        if (it->binaryDeserializer) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                h, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "binder.free",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "binder.cont",  currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_binder_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {h});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // §6.1 / §30.8: a `using var` CancellationTokenSource. Dispose via

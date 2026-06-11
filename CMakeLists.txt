@@ -138,6 +138,7 @@ add_library(bezel_core STATIC
     src/codegen/LlvmBackend_Stmts.cpp
     src/codegen/LlvmBackend_Exprs.cpp
     src/codegen/LlvmBackend_Calls.cpp
+    src/codegen/LlvmBackend_Serialization.cpp
     src/module/ModuleMetadata.cpp
     src/module/ModuleMetadataBuilder.cpp
     src/module/ModuleLoader.cpp
