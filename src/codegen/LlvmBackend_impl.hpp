@@ -2557,6 +2557,20 @@ private:
     ElementPolicy elementPolicyFor(const sema::TypeRef* elemTy,
                                    bool owningFamily);
 
+    // #602 batch 4 / §28.11 v0.135: convenience wrapper that returns the
+    // dispose_elem `llvm::Value*` argument for any runtime function that takes
+    // a `void(*)(void*)` element-finalizer:
+    //   - ClassOwned  → cast of elementPolicyFor().disposerThunk to ptr
+    //   - anything else → null pointer
+    // Use this at EVERY site that passes a disposer to the runtime so the
+    // null-vs-thunk decision lives in exactly one place (the #545 hook).
+    llvm::Value* elementDisposerArg(const sema::TypeRef* elemTy,
+                                    bool owningFamily) {
+        llvm::Function* thunk = elementPolicyFor(elemTy, owningFamily).disposerThunk;
+        return thunk ? llvm::cast<llvm::Value>(thunk)
+                     : llvm::ConstantPointerNull::get(ptrTy());
+    }
+
     // #362 / stdlib §4.5: a module-level `void(void*)` thunk that runs an
     // owning collection element's destructor via dynamic dispatch (vtable
     // slot 1), null-checking the element first. Suitable as the `dispose_elem`
@@ -2574,20 +2588,31 @@ private:
     // literal or null. Built once per module and cached.
     llvm::Function* stringElementReleaseThunk();
 
-    // #429 / §4.6 / §28.9: is `collTy` an array-backed collection whose element
-    // type is a non-nullable `string`? Used by emitArrayRetainStringsIfStringArray.
-    // All disposal / indexer-set sites derive this from elementPolicyFor directly
-    // (#602 batch 3); this predicate remains only for the bulk-retain path below.
-    bool isStringElementArray(const sema::TypeRef* collTy);
-
-    // #429 / §4.6 / §28.9: when `collTy` is a borrowing Array<string> (etc.),
-    // emit a bz_array_retain_strings(arr) over the freshly produced array `arr`
-    // (a copy / materialize) so it independently co-owns a +1 per element,
-    // matching the per-element release its later free/dispose will issue. A no-op
-    // for any other element type. `arr` must already hold its final elements.
+    // #429 / §4.6 / §28.9 / #602 batch 4: when `collTy` is a borrowing
+    // Array<string> (or Stack/Queue<string>), emit bz_array_retain_strings(arr)
+    // over the freshly produced array `arr` (a copy/materialize) so it
+    // independently co-owns a +1 per element, matching the per-element release
+    // its later free/dispose will issue. A no-op for any other element type.
+    // `arr` must already hold its final elements.
+    //
+    // #602 batch 4 / §28.11 v0.135: the RuntimeManaged-category decision is
+    // derived from elementPolicyFor (the #545 hook) — this is the only place
+    // that decides when a bulk bz_array_retain_strings is needed. isStringElementArray
+    // was deleted (batch 4) since its only use was this helper.
     void emitArrayRetainStringsIfStringArray(const sema::TypeRef* collTy,
                                              llvm::Value* arr) {
-        if (!arr || !isStringElementArray(collTy)) return;
+        if (!arr || !collTy || !collTy->astNode || !collTy->astNode->name ||
+            collTy->astNode->name->parts.empty()) return;
+        std::string_view cn = collTy->astNode->name->parts[0];
+        if (cn != "Array" && cn != "Stack" && cn != "Queue") return;
+        if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return;
+        const sema::TypeRef* el = collTy->genericArgs[0];
+        if (el->nullable) return;
+        // per §28.11 v0.135: RuntimeManaged AND specifically `string` (not fn type).
+        ElementPolicy pol = elementPolicyFor(el, /*owningFamily=*/false);
+        if (pol.cat != ElementPolicy::Category::RuntimeManaged) return;
+        if (el->kind != sema::TypeRef::Kind::Primitive ||
+            el->primitive != sema::PrimitiveType::String) return;
         auto* fn = declareC("bz_array_retain_strings",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {arr});

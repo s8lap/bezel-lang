@@ -2,6 +2,7 @@
 
 // #602 / §28.11 v0.134 — element-policy unification, batch 1.
 // fix #619 / §28.11 v0.135 — widen class/interface row to include Interface.
+// #602 batch 4 — uniform runtime finalization from the policy (the #545 hook).
 //
 // This translation unit owns the single source of truth for collection-element
 // slot behavior: the `ElementPolicy` struct and its factory
@@ -10,14 +11,20 @@
 // table, and the factory's switch mirrors the table row-for-row with a
 // per-row `// per §28.11 v0.135` citation.
 //
-// In batch 1 the factory is wired into the EXISTING helpers in
-// LlvmBackend_Setup.cpp as thin delegates; no call sites change yet.
-// Batch 2/3 will route all 82 call sites through the policy directly.
+// Batch 1: factory wired into the EXISTING helpers in LlvmBackend_Setup.cpp as
+// thin delegates; no call sites change.
+// Batches 2/3: all 82 call sites routed through the policy directly; old helpers
+// (owningCollectionElemDisposer, owningDictValueDisposer, isStringElementSet,
+// isStringValueDict, stringElementReleaseDisposer) deleted.
 // fix #619: the batch-1 delegates had Class-only pre-checks that blocked
 // interface element types from reaching the factory.  Those pre-checks are
-// removed in the delegates (owningCollectionElemDisposer,
-// owningDictValueDisposer, collectionElemIsClass); the factory itself already
-// handled Interface correctly.
+// removed; collectionElemIsClass widened to Class|Interface.
+// Batch 4 (#545 hook): elementDisposerArg() added (LlvmBackend_impl.hpp) —
+// the single site that maps (elemTy, owningFamily) → llvm::Value* for every
+// runtime dispose_elem parameter. bz_channel_new migrated onto it; Assign.cpp
+// OwnedDictionary move-out gate migrated from collectionElemIsClass to
+// elementPolicyFor; isStringElementArray deleted (inlined into
+// emitArrayRetainStringsIfStringArray which now calls elementPolicyFor directly).
 
 namespace bezel::codegen {
 
@@ -150,8 +157,9 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
             // element type — spec says "rejected at instantiation"; if we reach
             // here the sema gate did not fire (possible in imported/generic
             // contexts not yet fully checked).  Return Value (no-op) rather than
-            // crashing; this preserves prior behavior (owningCollectionElemDisposer
-            // returns null for non-class elements) and keeps batch 1 green.
+            // crashing; this preserves prior behavior (a null disposer for
+            // non-class elements, as in all prior helper implementations) and
+            // keeps the suite green.
             return ElementPolicy{
                 ElementPolicy::Category::Value,
                 ptrTy(),

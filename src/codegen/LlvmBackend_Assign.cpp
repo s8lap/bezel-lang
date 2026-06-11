@@ -255,20 +255,28 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     // Only an owning dictionary's value carries ownership; a borrowing
     // Dictionary<K,V> value is a borrow and `move dict[key]` is rejected by
     // sema. The owned thing is the VALUE (genericArgs[1]).
+    // #602 batch 4 / §28.11 v0.135: gate on elementPolicyFor (ClassOwned) rather
+    // than collectionElemIsClass, so Shared<T>/Weak<T> values are included.
+    // collectionElemIsClass checked Class|Interface only; elementPolicyFor covers
+    // the full ClassOwned row (class, interface, Shared, Weak).
+    const sema::TypeRef* dictMoveValTy =
+        (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
+                                                    : nullptr;
     bool owningDict =
         recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
         recvTy->astNode->name->parts[0] == "OwnedDictionary" &&
-        collectionElemIsClass(recvTy, 1);
+        elementPolicyFor(dictMoveValTy, /*owningFamily=*/true).cat ==
+            ElementPolicy::Category::ClassOwned;
     if (!owningDict) return nullptr;
     llvm::Value* recv = lowerExpr(*ix.target);
     if (!recv) return nullptr;
     const sema::TypeRef* keyTy =
         genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
     bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
-    // An owning dictionary owns class-typed VALUES, so the stored void* is the
-    // owned object pointer; no scalar/record decode is needed (collectionElemIsClass
-    // on the value already gated this path).
+    // An owning dictionary owns class-typed VALUES (per §28.11 ClassOwned row),
+    // so the stored void* is the owned object pointer; no scalar/record decode
+    // is needed — the ClassOwned gate above ensures a pointer-sized slot.
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);     // evaluate once
     if (!k) return nullptr;
@@ -471,11 +479,11 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         // concrete OwnedArray<T> or through an IOwnedList<T> view (#401) —
         // disposes the displaced class element before storing the new owner; a
         // borrowing Array<T> / IList<T> set just overwrites (no slot ownership).
-        // owningCollectionElemDisposer keys on the concrete "Owned…" name, so it
-        // misses IOwnedList<T>; supply the shared class-element disposer for the
-        // owning-interface case (T: class is guaranteed by §4.2's constraint).
         // #602 / §28.11 v0.135: element disposer from elementPolicyFor (covers
-        // Interface elements too).
+        // class, interface, Shared<T>, and Weak<T> elements; IOwnedList<T> case
+        // falls back to elementDisposerThunk() since the interface receiver's
+        // concrete element type is not in its TypeRef — T: class is guaranteed
+        // by §4.2's constraint, so the shared vtable thunk is correct).
         {
             const sema::TypeRef* arrEl =
                 (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
@@ -576,15 +584,14 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
 
     llvm::Value* k = lowerExpr(*ix.indices[0].value);
     if (!k) return false;
-    // §4.9: an OWNING dictionary (OwnedDictionary<K,V> where V: class) disposes
-    // the displaced value before storing the new owner. Unlike owning ARRAYS
-    // (whose owned element is genericArgs[0]), an owning dictionary's owned thing
-    // is its VALUE = genericArgs[1]; owningCollectionElemDisposer keys on idx 0,
-    // so compute the value-disposer here. The shared elementDisposerThunk
-    // disposes+frees any class object via its own vtable, so it applies as-is.
+    // §4.9: an OWNING dictionary (OwnedDictionary<K,V> where V: class/interface)
+    // disposes the displaced value before storing the new owner. Unlike owning
+    // ARRAYS (whose owned element is genericArgs[0]), an owning dictionary's
+    // owned thing is its VALUE = genericArgs[1].
     // #602 / §28.11 v0.135: derive value disposer for the dict indexer-set
     // overwrite path directly from elementPolicyFor (covers class AND interface
-    // value types; previously collectionElemIsClass was Class-only here).
+    // value types, as well as Shared<T>/Weak<T> handles — batch 3 wired this
+    // path; batch 4 removes the last stale reference to deleted helpers).
     bool dictIsOwning2 =
         recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&

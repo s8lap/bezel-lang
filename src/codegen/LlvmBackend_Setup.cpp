@@ -2580,8 +2580,10 @@ bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
 // #602 batch 3: isStringValueDict deleted — all call sites now use
 // elementPolicyFor(val, false) + string primitive check directly.
 // #602 batch 3: stringElementReleaseDisposer deleted — all disposal call sites
-// now use elementPolicyFor directly; isStringElementArray remains for
-// emitArrayRetainStringsIfStringArray (bulk-retain path).
+// now use elementPolicyFor directly.
+// #602 batch 4: isStringElementArray deleted — its only use was inside
+// emitArrayRetainStringsIfStringArray; that helper now calls elementPolicyFor
+// directly (the logic is inlined in LlvmBackend_impl.hpp).
 
 llvm::Function* Emitter::stringElementReleaseThunk() {
     // #429 / §4.6 / §28.9: a standalone `void(void*)` thunk that releases one
@@ -2605,37 +2607,6 @@ llvm::Function* Emitter::stringElementReleaseThunk() {
     return fn;
 }
 
-
-bool Emitter::isStringElementArray(const sema::TypeRef* collTy) {
-    // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: thin delegate to
-    // elementPolicyFor.  Array/Stack/Queue are the array-backed BORROWING
-    // collections (§28.11); Set is hash-backed (excluded); OwnedX never carry
-    // string elements (§15.2 class-only restriction).  Nullable string? is
-    // excluded for now (retain/release are null-safe but the nullable surface
-    // is deferred — same decision as before).
-    //
-    // Policy check: the element must fall in the RuntimeManaged row of the
-    // §28.11 table AND must specifically be a `string` primitive (not a
-    // function type — both are RuntimeManaged, but function elements use a
-    // different release path that is not yet implemented here).  Nullable
-    // string? is excluded (intentional deferral — same as before).
-    if (!collTy || !collTy->astNode || !collTy->astNode->name ||
-        collTy->astNode->name->parts.empty())
-        return false;
-    std::string_view n = collTy->astNode->name->parts[0];
-    if (n != "Array" && n != "Stack" && n != "Queue") return false;
-    if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return false;
-    const sema::TypeRef* el = collTy->genericArgs[0];
-    if (el->nullable) return false;
-    ElementPolicy pol = elementPolicyFor(el, /*owningFamily=*/false);
-    // Require RuntimeManaged AND confirm the element is specifically `string`
-    // (not a function type, which also has retainRelease=true but a different
-    // release path — per §28.11 v0.134 both are in the "runtime-managed ref"
-    // row, but the string-release thunk is string-specific).
-    return pol.cat == ElementPolicy::Category::RuntimeManaged &&
-           el->kind == sema::TypeRef::Kind::Primitive &&
-           el->primitive == sema::PrimitiveType::String;
-}
 
 
 llvm::Function* Emitter::valueBoxFreeThunk() {
@@ -7473,9 +7444,12 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         }
         // per §4.6/§4.7: a `using var` LinkedList<T> / OwnedLinkedList<T>.
         // Free the node chain via bz_llist_free; for an OwnedLinkedList<T> of
-        // class elements the element-disposer thunk cascades disposal into each
-        // (non-null) element exactly once (same owningCollectionElemDisposer
-        // pattern as OwnedArray — but on the node value pointer, not an array slot).
+        // class/interface elements the element-disposer thunk cascades disposal
+        // into each (non-null) element exactly once (same policy as OwnedArray —
+        // but on the node value pointer, not an array slot).
+        // #602 batch 3/4: owningCollectionElemDisposer deleted; d.collectionElemDisposer
+        // was set from elementPolicyFor at registerLocal time (covers class, interface,
+        // Shared<T>, Weak<T> elements per §28.11 v0.135).
         if (it->linkedList) {
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);

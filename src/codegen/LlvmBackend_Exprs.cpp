@@ -5046,32 +5046,30 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* val = lowerExpr(*ne.args[0].value);
                 if (!val) return nullptr;
                 // Get the element disposer thunk for T (the inner class type).
-                // elementDisposerThunk() returns the shared void(void*) shim that
-                // calls vtable slot 2 (Dispose) then free — same thunk used for
-                // OwnedArray<T> element disposal.
+                // #602 batch 4 / §28.11 v0.135 / §28.13: Shared<T>'s inner T is
+                // always a class type (sema-enforced); ClassOwned row → vtable-
+                // dispatch disposer thunk. elementDisposerThunk() is the shared
+                // void(void*) shim (vtable slot 2 Dispose + free); it is also
+                // what elementPolicyFor returns for ClassOwned, so using it here
+                // is policy-consistent (same thunk used for OwnedArray<T> disposal).
                 llvm::Function* dispFn = elementDisposerThunk();
                 auto* newFn = declareC("bz_shared_new", ptrTy(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(newFn, {val, dispFn}, "shared.new");
             }
             // §30.15 (#600 phase c): new Channel<T>() — allocate a bz_channel_t.
-            // The dispose_elem callback is:
-            //   - null for value/string element types (no deep disposal needed),
-            //   - elementDisposerThunk() for class element types (vtable Dispose + free).
-            // This mirrors the OwnedArray<T> element policy (§28.11 v0.135).
+            // The dispose_elem callback is derived from elementPolicyFor:
+            //   - ClassOwned → elementPolicyFor().disposerThunk (covers class,
+            //     interface, Shared<T>, Weak<T> — per §28.11 v0.135)
+            //   - value/string/RuntimeManaged → null (no deep disposal needed)
+            // #602 batch 4: routed through elementDisposerArg (the #545 hook) so
+            // the null-vs-thunk decision is consistent with every other site.
             if (colName == "Channel") {
-                llvm::Function* disposerArg = nullptr;
-                if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
-                    const sema::TypeRef* elemTy = rt->genericArgs[0];
-                    // Only class elements get a disposer (OwnedArray<T> model).
-                    if (elemTy->kind == sema::TypeRef::Kind::Named &&
-                        elemTy->declaration &&
-                        elemTy->declaration->kind == ast::TypeDeclKind::Class) {
-                        disposerArg = elementDisposerThunk();
-                    }
-                }
-                llvm::Value* dispArg = disposerArg
-                    ? llvm::cast<llvm::Value>(disposerArg)
-                    : llvm::ConstantPointerNull::get(ptrTy());
+                const sema::TypeRef* chElemTy =
+                    (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
+                // Channel<T> behaves like an owning collection for class elements
+                // (per §30.15 / §28.11 v0.135: class elements are owned, the
+                // runtime disposes them when the channel is closed/drained).
+                llvm::Value* dispArg = elementDisposerArg(chElemTy, /*owningFamily=*/true);
                 auto* allocFn = declareC("bz_channel_new", ptrTy(), {ptrTy()});
                 return builder_.CreateCall(allocFn, {dispArg}, "ch.new");
             }

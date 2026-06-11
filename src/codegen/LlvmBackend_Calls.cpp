@@ -756,14 +756,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // element-slot policy to decide whether this Set<T> co-owns a +1
                 // per element (Set is the dict-backed BORROWING collection; its
                 // element type must be in the RuntimeManaged row AND be specifically
-                // a non-nullable string primitive — same exclusions as batch-1's
-                // isStringElementSet delegate).
+                // a non-nullable string primitive).
+                // #602 batch 3: isStringElementSet was deleted; all Set<T> sites
+                // now use elementPolicyFor directly (batch 4: stale reference removed).
                 const ElementPolicy setElemPol =
                     elementPolicyFor(elemTy, /*owningFamily=*/false);
                 // isStrSet: RuntimeManaged AND specifically a `string` primitive
                 // (not a function type, which shares the RuntimeManaged row but uses
-                // a different release path — per §28.11 v0.134; same exclusion as
-                // the isStringElementSet delegate in LlvmBackend_Setup.cpp).
+                // a different release path — per §28.11 v0.134).
                 bool isStrSet =
                     setElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
                     elemTy->kind == sema::TypeRef::Kind::Primitive &&
@@ -1891,9 +1891,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // delegate calls; behavior preserved exactly):
         //
         //   arrIsStringElem: RuntimeManaged + non-nullable string primitive
-        //     (mirrors isStringElementArray — same collection-name guard already
-        //     enforced above: the Set/OwnedSet branch returned, so we are in an
-        //     array-backed collection; Owned* is excluded at instantiation, §15.2).
+        //     (same guard as emitArrayRetainStringsIfStringArray; the collection-
+        //     name guard is already enforced above: the Set/OwnedSet branch
+        //     returned, so we are in an array-backed collection; Owned* is
+        //     excluded at instantiation, §15.2).
+        //     #602 batch 4: isStringElementArray was deleted; the RuntimeManaged
+        //     check here directly mirrors the policy.
         //
         // per §28.11 v0.135 / fix #619: arrElemPol is derived from
         // elementPolicyFor which now correctly covers both Class and Interface
@@ -2018,10 +2021,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             v = ensureNullableElem(v);
             // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: a borrowing Array<string>
             // co-owns a +1 per element. Take an INDEPENDENT +1 at insert, released
-            // per element on free (stringElementReleaseDisposer). Mirror the
-            // field-store rule: a fresh +1 producer is TRANSFERRED (its single
-            // reference becomes the array's — no retain); anything else is RETAINED.
-            // retain is null-safe and a no-op on a sentinel/literal.
+            // per element on free (via stringElementReleaseThunk — RuntimeManaged row).
+            // Mirror the field-store rule: a fresh +1 producer is TRANSFERRED (its
+            // single reference becomes the array's — no retain); anything else is
+            // RETAINED. retain is null-safe and a no-op on a sentinel/literal.
             // arrIsStringElem is derived from arrElemPol (hoisted above).
             if (arrIsStringElem &&
                 !isPlusOneStringProducer(call.args[0].value.get()))
@@ -8988,7 +8991,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: a materialized Array<string>
         // co-owns a +1 per element so it can be released symmetrically. Keyed on
         // the produced element type being in the RuntimeManaged row AND specifically
-        // a non-nullable string primitive (same exclusions as isStringElementArray).
+        // a non-nullable string primitive (same logic as emitArrayRetainStringsIfStringArray;
+        // #602 batch 4: isStringElementArray was deleted, RuntimeManaged check is direct).
         {
             const ElementPolicy toArrPol =
                 elementPolicyFor(elemRef, /*owningFamily=*/false);
