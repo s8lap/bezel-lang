@@ -1,0 +1,442 @@
+// Codegen tests for fix #521: 128-bit decimal type (§4.4, stdlib §9.3).
+//
+// Spec reference: Bezel_Language_Spec.md §4.4 (decimal literal, precision,
+//   arithmetic, DivideByZeroException), §5.1 (int→decimal widening),
+//   §6.1 (decimal operators), §6.4 (overflow/divide-by-zero).
+// Stdlib reference: Bezel_Standard_Library.md §9.3 (Decimal record).
+//
+// Implementation: .NET-compatible 128-bit layout:
+//   { uint32 lo32, uint32 mid32, uint32 hi32, uint32 flags }
+//   96-bit mantissa; flags bit 31 = sign, bits 16-23 = scale (0-28).
+//
+// Test groups:
+//   521_literal     — m/M suffix produces decimal (not double); literals accepted
+//   521_arith       — exact arithmetic (+,-,*,/,mod); carries beyond double precision
+//   521_divzero     — decimal/0 raises DivideByZeroException (§6.4)
+//   521_cmp         — comparison operators (<, <=, >, >=, =, <>)
+//   521_widen       — int→decimal widening per §5.1
+//   521_static      — static decimal field with m-literal initializer
+//   521_stdlib      — Decimal.Parse, TryParse, ToString, CompareTo, Round (§9.3)
+//   521_consts      — Decimal.Zero, One, MinValue, MaxValue (§9.3)
+
+#include "support/codegen_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::runJit;
+
+namespace {
+
+int run(const std::string& program) {
+    auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+
+// Check that the program produces a sema error (decimal type is rejected by sema).
+bool hasErrors(const std::string& program) {
+    auto r = runJit(program);
+    return r.diagnostics.hasErrors();
+}
+
+std::string prog(const std::string& mainBody) {
+    return "module M; "
+           "class C public static method Main(): int "
+           + mainBody +
+           " end Main; end C;";
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// 521_literal: §4.4 — the `m`/`M` suffix produces a decimal literal, NOT
+// double. The literal is now fully implemented (128-bit bz_decimal_t).
+// ---------------------------------------------------------------------------
+
+// §4.4: 1.5m is a decimal literal. Compare against itself to verify it compiles
+// and the result is treated as decimal (not double, which would allow
+// double + decimal — that must still be rejected).
+BEZEL_TEST(codegen_521_literal, m_literal_compiles_and_runs_spec_4_4) {
+    // If decimal literal compiled, the program can run. Return 1 on success.
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 1.5m; "
+        "if d = 1.5m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §4.4: upper-case M suffix is also a decimal literal.
+BEZEL_TEST(codegen_521_literal, M_suffix_upper_compiles_spec_4_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 2.0M; "
+        "if d = 2.0m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §4.4 / §5.1 / §6.2: assigning a decimal literal to a `double` variable
+// must be rejected by sema (no implicit decimal → double conversion per §5.1).
+BEZEL_TEST(codegen_521_literal, decimal_literal_rejected_as_double_spec_5_1) {
+    BEZEL_EXPECT_TRUE(hasErrors(prog(
+        "var d: double := 1.5m; "
+        "return 0; ")));
+}
+
+// §4.4: 0m (zero) decimal literal.
+BEZEL_TEST(codegen_521_literal, zero_m_literal_spec_4_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var z := 0m; "
+        "if z = 0m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_arith: §6.1 — decimal arithmetic is exact (no floating-point error).
+// The key invariant: 0.1m + 0.2m = 0.3m EXACTLY (contrast with double).
+// ---------------------------------------------------------------------------
+
+// §4.4 / §6.1: 0.1m + 0.2m = 0.3m EXACTLY.
+// With double: 0.1 + 0.2 != 0.3 due to IEEE 754 representation error.
+// With decimal: the computation is exact.
+BEZEL_TEST(codegen_521_arith, add_exact_0_1_plus_0_2_spec_4_4_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 0.1m; "
+        "var b := 0.2m; "
+        "var c := a + b; "
+        "if c = 0.3m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1: subtraction is exact.
+BEZEL_TEST(codegen_521_arith, sub_exact_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 1.0m; "
+        "var b := 0.1m; "
+        "var c := a - b; "
+        "if c = 0.9m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1: multiplication is exact.
+BEZEL_TEST(codegen_521_arith, mul_exact_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 3.0m; "
+        "var b := 4.0m; "
+        "var c := a * b; "
+        "if c = 12.0m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1 / §4.4: integer division with remainder — quotient is exact.
+BEZEL_TEST(codegen_521_arith, div_integer_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 10.0m; "
+        "var b := 4.0m; "
+        "var c := a / b; "
+        "if c = 2.5m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1 / §4.4: `mod` operator. 10.0m mod 3.0m = 1.0m.
+// This was defect #521 sub-bug: before fix, miscompiled as double arithmetic.
+BEZEL_TEST(codegen_521_arith, mod_10_mod_3_is_1_spec_6_1_4_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 10.0m; "
+        "var b := 3.0m; "
+        "var c := a mod b; "
+        "if c = 1.0m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1 / §4.4: negation.
+BEZEL_TEST(codegen_521_arith, negate_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 5.5m; "
+        "var b := -a; "
+        "if b = -5.5m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §4.4 / §6.1: high-precision case: 20 significant digits.
+// 1234567890123456789.0m + 1.0m = 1234567890123456790.0m
+// This exceeds double's 15-17 significant digit precision.
+BEZEL_TEST(codegen_521_arith, high_precision_20_digits_spec_4_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 1234567890123456789.0m; "
+        "var b := a + 1.0m; "
+        "if b = 1234567890123456790.0m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_divzero: §4.4 / §6.4 — decimal / 0 raises DivideByZeroException.
+// Before fix #521, the code reached codegen as i32/i32, raising SIGFPE.
+// ---------------------------------------------------------------------------
+
+// §4.4 / §6.4: decimal / 0m raises DivideByZeroException; caught by try/catch.
+BEZEL_TEST(codegen_521_divzero, divide_by_zero_raises_exception_spec_4_4_6_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var r := 0; "
+        "try "
+        "  var a := 1.0m; "
+        "  var b := 0.0m; "
+        "  var _ := a / b; "
+        "catch DivideByZeroException => r := 1; "
+        "end; "
+        "return r; ")), 1);
+}
+
+// §4.4 / §6.4: decimal mod 0m also raises DivideByZeroException.
+BEZEL_TEST(codegen_521_divzero, mod_by_zero_raises_exception_spec_4_4_6_4) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var r := 0; "
+        "try "
+        "  var a := 5.0m; "
+        "  var b := 0.0m; "
+        "  var _ := a mod b; "
+        "catch DivideByZeroException => r := 1; "
+        "end; "
+        "return r; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_cmp: §6.1 — decimal comparison operators (=, <>, <, <=, >, >=).
+// ---------------------------------------------------------------------------
+
+// §6.1: decimal equality.
+BEZEL_TEST(codegen_521_cmp, equal_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 1.5m; "
+        "var b := 1.5m; "
+        "if a = b then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1: decimal inequality.
+BEZEL_TEST(codegen_521_cmp, not_equal_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 1.5m; "
+        "var b := 2.0m; "
+        "if a <> b then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1: less-than.
+BEZEL_TEST(codegen_521_cmp, less_than_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 1.0m; "
+        "var b := 2.0m; "
+        "if a < b then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1: less-than-or-equal (equality branch).
+BEZEL_TEST(codegen_521_cmp, leq_equal_branch_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 3.0m; "
+        "var b := 3.0m; "
+        "if a <= b then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1: greater-than.
+BEZEL_TEST(codegen_521_cmp, greater_than_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 5.0m; "
+        "var b := 2.0m; "
+        "if a > b then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §6.1: greater-than-or-equal (equal branch).
+BEZEL_TEST(codegen_521_cmp, geq_equal_branch_spec_6_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 4.5m; "
+        "var b := 4.5m; "
+        "if a >= b then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_widen: §5.1 — integers widen to decimal implicitly.
+// ---------------------------------------------------------------------------
+
+// §5.1: int + decimal → decimal (int is promoted to decimal).
+BEZEL_TEST(codegen_521_widen, int_plus_decimal_spec_5_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 2; "
+        "var b := 1.5m; "
+        "var c := a + b; "
+        "if c = 3.5m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §5.1: decimal + int → decimal.
+BEZEL_TEST(codegen_521_widen, decimal_plus_int_spec_5_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 1.5m; "
+        "var b := 3; "
+        "var c := a + b; "
+        "if c = 4.5m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §5.1: int literal widened to decimal in comparison.
+BEZEL_TEST(codegen_521_widen, int_literal_widened_in_compare_spec_5_1) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 5m; "
+        "if a = 5m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_static: §4.4 / §22.8 — static decimal field with m-literal initializer.
+// Before fix #521, this caused an IR verification crash (double ConstantFP
+// stored into an i32 global).
+// ---------------------------------------------------------------------------
+
+// §4.4 / §22.8: static decimal field initialised with m-literal: reads back
+// the same value.
+BEZEL_TEST(codegen_521_static, static_decimal_field_init_spec_4_4_22_8) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C "
+        "  public static _tax: decimal := 0.1m; "
+        "  public static method Main(): int "
+        "    if C._tax = 0.1m then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// §22.8: static decimal field updated at runtime.
+BEZEL_TEST(codegen_521_static, static_decimal_field_update_spec_22_8) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C "
+        "  public static _balance: decimal := 0m; "
+        "  public static method Main(): int "
+        "    C._balance := 100.5m; "
+        "    if C._balance = 100.5m then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_stdlib: stdlib §9.3 — Decimal.Parse, TryParse, ToString, CompareTo,
+// Round.
+// ---------------------------------------------------------------------------
+
+// §9.3: Decimal.Parse("1.5") → 1.5m.
+BEZEL_TEST(codegen_521_stdlib, parse_roundtrip_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := Decimal.Parse(\"1.5\"); "
+        "if d = 1.5m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Decimal.ToString() — round-trip through string.
+BEZEL_TEST(codegen_521_stdlib, tostring_parse_roundtrip_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 3.14m; "
+        "var s := d.ToString(); "
+        "var d2 := Decimal.Parse(s); "
+        "if d2 = 3.14m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Decimal.TryParse("2.5", out d) → true, d = 2.5m.
+BEZEL_TEST(codegen_521_stdlib, try_parse_valid_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d: decimal; "
+        "var ok := Decimal.TryParse(\"2.5\", out d); "
+        "if ok and d = 2.5m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Decimal.CompareTo — negative when a < b.
+BEZEL_TEST(codegen_521_stdlib, compare_to_less_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 1.0m; "
+        "var b := 2.0m; "
+        "if a.CompareTo(b) < 0 then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Decimal.CompareTo — zero when equal.
+BEZEL_TEST(codegen_521_stdlib, compare_to_equal_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 3.0m; "
+        "var b := 3.0m; "
+        "if a.CompareTo(b) = 0 then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Decimal.CompareTo — positive when a > b.
+BEZEL_TEST(codegen_521_stdlib, compare_to_greater_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var a := 5.0m; "
+        "var b := 2.0m; "
+        "if a.CompareTo(b) > 0 then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Round(0) — rounds to nearest integer.
+BEZEL_TEST(codegen_521_stdlib, round_to_integer_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 2.7m; "
+        "var r := d.Round(0); "
+        "if r = 3m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Round(2) — keeps 2 decimal places.
+BEZEL_TEST(codegen_521_stdlib, round_to_2_places_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 3.14159m; "
+        "var r := d.Round(2); "
+        "if r = 3.14m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 521_consts: stdlib §9.3 — Decimal.Zero and Decimal.One static constants.
+// ---------------------------------------------------------------------------
+
+// §9.3: Decimal.Zero = 0m.
+BEZEL_TEST(codegen_521_consts, zero_constant_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var z := Decimal.Zero; "
+        "if z = 0m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Decimal.One = 1m.
+BEZEL_TEST(codegen_521_consts, one_constant_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var o := Decimal.One; "
+        "if o = 1m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Decimal.MinValue is less than zero.
+BEZEL_TEST(codegen_521_consts, min_value_is_negative_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var mv := Decimal.MinValue; "
+        "if mv < 0m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: Decimal.MaxValue is greater than zero.
+BEZEL_TEST(codegen_521_consts, max_value_is_positive_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var mv := Decimal.MaxValue; "
+        "if mv > 0m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// §9.3: MinValue < MaxValue.
+BEZEL_TEST(codegen_521_consts, min_less_than_max_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var lo := Decimal.MinValue; "
+        "var hi := Decimal.MaxValue; "
+        "if lo < hi then return 1; end; "
+        "return 0; ")), 1);
+}

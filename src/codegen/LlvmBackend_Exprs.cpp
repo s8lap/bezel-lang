@@ -1,5 +1,11 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+// §4.4 fix #521: decimal literal compile-time parse.
+// bz_decimal_parse_cstr is compiled into the same process (the runtime is linked
+// into bezel_tests and also available in the driver binary).  Calling it from the
+// compiler during code generation is safe for both AOT and JIT modes.
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out);
+
 namespace bezel::codegen {
 
 llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
@@ -29,7 +35,34 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     }
     // CG24: float/double literal — value parsed from the lexeme, type
     // (f32/f64) from the expr's resolved type (default double).
+    // §4.4 fix #521: decimal literal (m/M suffix) → parse at compile time
+    // into a { i32 lo32, i32 mid32, i32 hi32, i32 flags } constant aggregate.
     if (auto* fl = dynamic_cast<const ast::FloatLiteralExpr*>(&e)) {
+        bool isDecimal = false;
+        if (auto* rt = ctx_.exprType(e))
+            if (rt->kind == sema::TypeRef::Kind::Primitive &&
+                rt->primitive == sema::PrimitiveType::Decimal)
+                isDecimal = true;
+        if (isDecimal) {
+            // Parse the decimal literal at compile time via the runtime's
+            // bz_decimal_parse_cstr, which is available as a plain C function.
+            // Strip the trailing m/M suffix before passing to the parser.
+            std::string digits;
+            for (char c : fl->text) {
+                if (c == '_' || c == 'm' || c == 'M') continue;
+                digits.push_back(c);
+            }
+            // Call the runtime parse function directly (declared at top of file).
+            uint32_t dec[4] = {0, 0, 0, 0};
+            bz_decimal_parse_cstr(digits.c_str(), dec);
+            llvm::StructType* dst = decimalStructType();
+            return llvm::ConstantStruct::get(dst, {
+                llvm::ConstantInt::get(i32(), dec[0]),
+                llvm::ConstantInt::get(i32(), dec[1]),
+                llvm::ConstantInt::get(i32(), dec[2]),
+                llvm::ConstantInt::get(i32(), dec[3])
+            });
+        }
         llvm::Type* ty = llvm::Type::getDoubleTy(llvm_);
         if (auto* rt = ctx_.exprType(e))
             if (rt->kind == sema::TypeRef::Kind::Primitive)
@@ -1543,6 +1576,43 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // stdlib §2.6: Guid.Empty — the all-zero Guid (static readonly property).
                 if (id2->name == "Guid" && ma->member == "Empty") {
                     return llvm::ConstantAggregateZero::get(guidStructType());
+                }
+                // stdlib §9.3 / fix #521: Decimal static constants.
+                if (id2->name == "Decimal") {
+                    llvm::StructType* dst = decimalStructType();
+                    const auto& mbr = ma->member;
+                    if (mbr == "Zero")
+                        return llvm::ConstantAggregateZero::get(dst);
+                    if (mbr == "One") {
+                        uint32_t dec[4] = {0, 0, 0, 0};
+                        bz_decimal_parse_cstr("1", dec);
+                        return llvm::ConstantStruct::get(dst, {
+                            llvm::ConstantInt::get(i32(), dec[0]),
+                            llvm::ConstantInt::get(i32(), dec[1]),
+                            llvm::ConstantInt::get(i32(), dec[2]),
+                            llvm::ConstantInt::get(i32(), dec[3])
+                        });
+                    }
+                    if (mbr == "MinValue") {
+                        uint32_t dec[4] = {0, 0, 0, 0};
+                        bz_decimal_parse_cstr("-79228162514264337593543950335", dec);
+                        return llvm::ConstantStruct::get(dst, {
+                            llvm::ConstantInt::get(i32(), dec[0]),
+                            llvm::ConstantInt::get(i32(), dec[1]),
+                            llvm::ConstantInt::get(i32(), dec[2]),
+                            llvm::ConstantInt::get(i32(), dec[3])
+                        });
+                    }
+                    if (mbr == "MaxValue") {
+                        uint32_t dec[4] = {0, 0, 0, 0};
+                        bz_decimal_parse_cstr("79228162514264337593543950335", dec);
+                        return llvm::ConstantStruct::get(dst, {
+                            llvm::ConstantInt::get(i32(), dec[0]),
+                            llvm::ConstantInt::get(i32(), dec[1]),
+                            llvm::ConstantInt::get(i32(), dec[2]),
+                            llvm::ConstantInt::get(i32(), dec[3])
+                        });
+                    }
                 }
             }
         }
@@ -3488,6 +3558,114 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             return res;
         }
     }
+    // §4.4 / §6.4 fix #521: decimal arithmetic — route via bz_decimal_* runtime.
+    // Decimal values are { i32 lo32, i32 mid32, i32 hi32, i32 flags } structs.
+    // All runtime functions take pointers, so we alloca the operands, store,
+    // pass their addresses, then load the result.
+    {
+        using P = sema::PrimitiveType;
+        const sema::TypeRef* lTy = bin.left  ? ctx_.exprType(*bin.left)  : nullptr;
+        const sema::TypeRef* rTy = bin.right ? ctx_.exprType(*bin.right) : nullptr;
+        bool lDec = lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
+                    lTy->primitive == P::Decimal;
+        bool rDec = rTy && rTy->kind == sema::TypeRef::Kind::Primitive &&
+                    rTy->primitive == P::Decimal;
+        // §5.1: integers implicitly widen to decimal — promote an integer operand.
+        // We detect this by: result type is decimal, and one operand is integer.
+        const sema::TypeRef* resTy = ctx_.exprType(bin);
+        bool resDec = resTy && resTy->kind == sema::TypeRef::Kind::Primitive &&
+                      resTy->primitive == P::Decimal;
+        if (lDec || rDec || resDec) {
+            llvm::StructType* dst = decimalStructType();
+            // Helper: promote value to decimal struct (alloca + runtime call).
+            auto toDecSlot = [&](llvm::Value* v,
+                                 const sema::TypeRef* ty) -> llvm::Value* {
+                if (ty && ty->kind == sema::TypeRef::Kind::Primitive &&
+                    ty->primitive == P::Decimal)
+                    return v;  // already decimal struct
+                // Integer widening to decimal (§5.1).
+                llvm::AllocaInst* slot = entryAlloca(dst);
+                if (ty && ty->kind == sema::TypeRef::Kind::Primitive) {
+                    P p = ty->primitive;
+                    llvm::Value* i64v = v;
+                    if (v->getType()->isIntegerTy(64)) {
+                        auto* fn = declareC("bz_decimal_from_int64",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {i64(), ptrTy()});
+                        builder_.CreateCall(fn, {i64v, slot});
+                    } else {
+                        // Widen to i32 then call from_int32.
+                        if (!v->getType()->isIntegerTy(32))
+                            i64v = (p == P::Byte || p == P::UShort || p == P::UInt ||
+                                    p == P::Char)
+                                       ? builder_.CreateZExt(v, i32())
+                                       : builder_.CreateSExt(v, i32());
+                        auto* fn = declareC("bz_decimal_from_int32",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {i32(), ptrTy()});
+                        builder_.CreateCall(fn, {i64v, slot});
+                    }
+                }
+                return builder_.CreateLoad(dst, slot, "dec.promoted");
+            };
+            llvm::Value* lv = toDecSlot(l, lTy);
+            llvm::Value* rv = toDecSlot(r, rTy);
+
+            // Arithmetic ops: store operands into alloca slots, call runtime,
+            // load result.  §6.4: div/mod are guarded against zero divisor.
+            if (op == "+" || op == "-" || op == "*" ||
+                op == "/" || op == "mod") {
+                // §6.4: check divisor for div/mod.
+                if (op == "/" || op == "mod") {
+                    // Zero check: mantissa = lo32 | mid32 | hi32.
+                    llvm::Value* lo  = builder_.CreateExtractValue(rv, {0u});
+                    llvm::Value* mid = builder_.CreateExtractValue(rv, {1u});
+                    llvm::Value* hi  = builder_.CreateExtractValue(rv, {2u});
+                    llvm::Value* orv = builder_.CreateOr(
+                        builder_.CreateOr(lo, mid), hi);
+                    llvm::Value* isZero = builder_.CreateICmpEQ(
+                        orv, llvm::ConstantInt::get(i32(), 0));
+                    emitGuardThrow(isZero, "DivideByZeroException");
+                }
+                llvm::AllocaInst* aSlot = entryAlloca(dst);
+                llvm::AllocaInst* bSlot = entryAlloca(dst);
+                llvm::AllocaInst* oSlot = entryAlloca(dst);
+                builder_.CreateStore(lv, aSlot);
+                builder_.CreateStore(rv, bSlot);
+                const char* fn_name =
+                    op == "+"   ? "bz_decimal_add" :
+                    op == "-"   ? "bz_decimal_sub" :
+                    op == "*"   ? "bz_decimal_mul" :
+                    op == "/"   ? "bz_decimal_div" :
+                    /* mod */     "bz_decimal_mod";
+                auto* fn = declareC(fn_name, llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {aSlot, bSlot, oSlot});
+                return builder_.CreateLoad(dst, oSlot, "dec.res");
+            }
+            // Negation (unary - on decimal is handled separately via lowerUnary,
+            // but mixed decimal comparisons are the binary ops below).
+            // Comparisons: call bz_decimal_cmp, compare result with 0.
+            if (op == "=" || op == "<>" ||
+                op == "<" || op == "<=" || op == ">" || op == ">=") {
+                llvm::AllocaInst* aSlot = entryAlloca(dst);
+                llvm::AllocaInst* bSlot = entryAlloca(dst);
+                builder_.CreateStore(lv, aSlot);
+                builder_.CreateStore(rv, bSlot);
+                auto* cmpFn = declareC("bz_decimal_cmp", i32(),
+                                       {ptrTy(), ptrTy()});
+                llvm::Value* cmp = builder_.CreateCall(cmpFn, {aSlot, bSlot},
+                                                       "dec.cmp");
+                llvm::Value* zero = llvm::ConstantInt::get(i32(), 0);
+                if (op == "=")  return builder_.CreateICmpEQ(cmp, zero);
+                if (op == "<>") return builder_.CreateICmpNE(cmp, zero);
+                if (op == "<")  return builder_.CreateICmpSLT(cmp, zero);
+                if (op == "<=") return builder_.CreateICmpSLE(cmp, zero);
+                if (op == ">")  return builder_.CreateICmpSGT(cmp, zero);
+                /* >= */        return builder_.CreateICmpSGE(cmp, zero);
+            }
+        }
+    }
     // CG24 (§6.3): floating-point arithmetic and comparisons (IEEE 754,
     // no overflow/div0 checks). If one operand is FP and the other an
     // integer, promote the integer (§6.2 mixed-type promotion).
@@ -4133,6 +4311,18 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     }
 
     if (op == "-") {
+        // §4.4 fix #521: decimal negation — flip bit 31 of flags (sign bit).
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(v->getType())) {
+            if (st == decimalStructType()) {
+                llvm::AllocaInst* slot = entryAlloca(st);
+                llvm::AllocaInst* out  = entryAlloca(st);
+                builder_.CreateStore(v, slot);
+                auto* fn = declareC("bz_decimal_neg", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {slot, out});
+                return builder_.CreateLoad(st, out, "dec.neg");
+            }
+        }
         if (v->getType()->isFloatingPointTy())  // CG24: §6.3 IEEE negate
             return builder_.CreateFNeg(v);
         // §6.1: unary negation overflows only at INT_MIN.

@@ -701,6 +701,15 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
         return lowerStringLiteral("\"Object\"", false);
     }
 
+    // §4.4 / fix #521: decimal.ToString() → call bz_decimal_to_string.
+    if (prim == P::Decimal) {
+        llvm::StructType* dst = decimalStructType();
+        llvm::AllocaInst* slot = entryAlloca(dst);
+        builder_.CreateStore(val, slot);
+        auto* fn = declareC("bz_decimal_to_string", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {slot}, "dec.tostr");
+    }
+
     // Special case: bool → "True" or "False"
     // per stdlib bool.ToString() → "True" or "False" (capital first letter).
     if (prim == P::Bool) {

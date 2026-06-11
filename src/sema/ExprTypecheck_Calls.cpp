@@ -4378,6 +4378,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                         return;
                     }
+                } else if (ma.member == "Round" &&
+                           tt->primitive == PrimitiveType::Decimal) {
+                    // stdlib §9.3 / fix #521: decimal.Round(digits: int) → decimal.
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::Decimal));
+                    return;
                 }
             }
         }
@@ -4528,6 +4534,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 } else if (m == "Equals") {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                 }
+            }
+            // stdlib §9.3 / fix #521: Decimal static member types.
+            // Reached when the receiver is the `Decimal` class identifier.
+            if (cls == "Decimal") {
+                // Zero, One, MinValue, MaxValue → decimal.
+                if (m == "Zero" || m == "One" || m == "MinValue" || m == "MaxValue" ||
+                    m == "Parse") {
+                    ctx_.setExprType(&ma,
+                        ctx_.primitiveTypeRef(PrimitiveType::Decimal));
+                } else if (m == "TryParse") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                }
+                // ToString → string, CompareTo → int, Round → decimal (instance methods).
             }
             // §6.1 / §30.8: CancellationToken instance property reads.
             // Reached when tok was bound via `cts.Token` (builtinClassSym decl).

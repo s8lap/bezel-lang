@@ -792,6 +792,8 @@ private:
     // Literals are materialized as private global constants; concatenation
     // allocates via malloc/memcpy. All string variables are ptr-typed (§4.6).
     llvm::StructType* stringStructTy_ = nullptr;
+    // §4.4 (fix #521): decimal value struct { i32 lo32, i32 mid32, i32 hi32, i32 flags }.
+    llvm::StructType* decimalStructTy_ = nullptr;
     // per stdlib §2.6: Guid value-type struct { i64 lo, i64 hi }.
     llvm::StructType* guidStructTy_ = nullptr;
     // fix #499 / §9.8: Range<T> value struct { i64 start, i64 end, i64 step, i8 flags }.
@@ -1112,6 +1114,16 @@ private:
 
     // per stdlib §2.6: Guid is a 128-bit value type represented as { i64 lo, i64 hi }.
     // Passed by pointer to runtime functions (bz_guid_t*); in LLVM IR a Guid-typed
+    // §4.4 (fix #521): decimal value struct { i32 lo32, i32 mid32, i32 hi32, i32 flags }.
+    // .NET-compatible layout: 96-bit mantissa (lo/mid/hi) + scale (bits 16..23 of flags)
+    // + sign (bit 31 of flags).  16 bytes total.  All runtime functions receive a ptr.
+    llvm::StructType* decimalStructType() {
+        if (!decimalStructTy_)
+            decimalStructTy_ = llvm::StructType::create(
+                llvm_, {i32(), i32(), i32(), i32()}, "bz.decimal");
+        return decimalStructTy_;
+    }
+
     // local is stored in an alloca of guidStructType(), and the address is passed to
     // the runtime call.
     llvm::StructType* guidStructType() {
