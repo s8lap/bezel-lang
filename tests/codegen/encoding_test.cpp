@@ -283,35 +283,282 @@ BEZEL_TEST(codegen_encoding, utf8_getstring_empty_spec_3_2) {
 
 // === Deferred singletons rejected (§3.2 / CLAUDE.md §4) =================
 
-// §3.2: Encoding.Ascii is not yet implemented — the program must fail to compile
-// (decline-with-reasons rather than guess unspecified semantics).
-BEZEL_TEST(codegen_encoding, ascii_singleton_rejected_spec_3_2) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// ===========================================================================
+// #553 — Encoding.Utf16 / Encoding.Utf32 / Encoding.Ascii (stdlib §3.2 v0.136)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Utf16 (UTF-16LE, no BOM emitted, stdlib §3.2 v0.136)
+// ---------------------------------------------------------------------------
+
+// §3.2 v0.136: Utf16.GetBytes("AB") — 'A' is U+0041, 'B' is U+0042.
+// UTF-16LE encodes BMP chars as 2 bytes LE: 'A' → 0x41,0x00 ; 'B' → 0x42,0x00.
+// Total: 4 bytes; first byte of 'A' is 0x41 (65).
+BEZEL_TEST(codegen_encoding, utf16_getbytes_ascii_length_spec_3_2) {
+    expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
-        "  var s := \"Hi\"; "
-        "  using var b: Array<byte> := Encoding.Ascii.GetBytes(s); "
+        "  using var b: Array<byte> := Encoding.Utf16.GetBytes(\"AB\"); "
         "  return b.Length; "
-        "end Main; end C;"));
+        "end Main; end C;", 4);
 }
 
-// §3.2: Encoding.Utf16 is not yet implemented — must fail to compile.
-BEZEL_TEST(codegen_encoding, utf16_singleton_rejected_spec_3_2) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// §3.2 v0.136: Utf16.GetBytes("A") → byte[0]=0x41 (first byte of LE unit 0x0041).
+BEZEL_TEST(codegen_encoding, utf16_getbytes_first_byte_spec_3_2) {
+    expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
-        "  var s := \"Hi\"; "
-        "  using var b: Array<byte> := Encoding.Utf16.GetBytes(s); "
-        "  return b.Length; "
-        "end Main; end C;"));
+        "  using var b: Array<byte> := Encoding.Utf16.GetBytes(\"A\"); "
+        "  return int(b.Get(0)); "
+        "end Main; end C;", 65);
 }
 
-// §3.2: Encoding.Utf32 is not yet implemented — must fail to compile.
-BEZEL_TEST(codegen_encoding, utf32_singleton_rejected_spec_3_2) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// §3.2 v0.136: Utf16.GetBytes("A") → byte[1]=0x00 (high byte of LE unit 0x0041).
+BEZEL_TEST(codegen_encoding, utf16_getbytes_second_byte_zero_spec_3_2) {
+    expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
-        "  var s := \"Hi\"; "
-        "  using var b: Array<byte> := Encoding.Utf32.GetBytes(s); "
+        "  using var b: Array<byte> := Encoding.Utf16.GetBytes(\"A\"); "
+        "  return int(b.Get(1)); "
+        "end Main; end C;", 0);
+}
+
+// §3.2 v0.136: Utf16.GetString round-trip for an ASCII string (no BOM).
+BEZEL_TEST(codegen_encoding, utf16_roundtrip_ascii_spec_3_2) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Utf16.GetBytes(\"Hello\"); "
+        "  using var back: string := Encoding.Utf16.GetString(b); "
+        "  return (1 if back = \"Hello\" else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Utf16.GetBytes does NOT emit a BOM — byte[0] for 'H' is 0x48, not 0xFF.
+BEZEL_TEST(codegen_encoding, utf16_getbytes_no_bom_spec_3_2) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Utf16.GetBytes(\"H\"); "
+        "  return (1 if int(b.Get(0)) = 72 and b.Length = 2 else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Utf16.GetString consumes one leading LE BOM (FF FE) when present.
+// The output string should NOT contain U+FEFF; round-trip is "Hi" not "﻿Hi".
+BEZEL_TEST(codegen_encoding, utf16_getstring_consume_bom_spec_3_2) {
+    // Manually build bytes: FF FE 48 00 69 00 (BOM + "Hi" in UTF-16LE).
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(255)); b.Add(byte(254)); "  // FF FE = LE BOM
+        "  b.Add(byte(72)); b.Add(byte(0)); "     // 'H'
+        "  b.Add(byte(105)); b.Add(byte(0)); "    // 'i'
+        "  using var s: string := Encoding.Utf16.GetString(b); "
+        "  return (1 if s = \"Hi\" and s.Length = 2 else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Utf16.GetString raises FormatException on odd byte count.
+BEZEL_TEST(codegen_encoding, utf16_getstring_odd_byte_count_raises_format_spec_3_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(65)); "  // 1 byte — odd count
+        "  try "
+        "    using var s: string := Encoding.Utf16.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 v0.136: Utf16.GetString raises FormatException on a big-endian BOM (FE FF).
+BEZEL_TEST(codegen_encoding, utf16_getstring_big_endian_bom_raises_format_spec_3_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(254)); b.Add(byte(255)); "  // FE FF = BE BOM
+        "  b.Add(byte(72)); b.Add(byte(0)); "
+        "  try "
+        "    using var s: string := Encoding.Utf16.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 v0.136: Utf16.GetString raises FormatException on an unpaired surrogate.
+BEZEL_TEST(codegen_encoding, utf16_getstring_unpaired_surrogate_raises_format_spec_3_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0x00)); b.Add(byte(0xD8)); "  // 0xD800 = lone high surrogate
+        "  try "
+        "    using var s: string := Encoding.Utf16.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 v0.136: Utf16.Name == "utf-16le".
+BEZEL_TEST(codegen_encoding, utf16_name_spec_3_2) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  var n: string := Encoding.Utf16.Name; "
+        "  return (1 if n = \"utf-16le\" else 0); "
+        "end Main; end C;", 1);
+}
+
+// ---------------------------------------------------------------------------
+// Utf32 (UTF-32LE, no BOM emitted, stdlib §3.2 v0.136)
+// ---------------------------------------------------------------------------
+
+// §3.2 v0.136: Utf32.GetBytes("A") — 'A' (U+0041) → 4 bytes LE: 0x41 0x00 0x00 0x00.
+BEZEL_TEST(codegen_encoding, utf32_getbytes_ascii_length_spec_3_2) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Utf32.GetBytes(\"A\"); "
         "  return b.Length; "
-        "end Main; end C;"));
+        "end Main; end C;", 4);
+}
+
+// §3.2 v0.136: Utf32.GetBytes("A") → byte[0]=0x41, byte[3]=0x00.
+BEZEL_TEST(codegen_encoding, utf32_getbytes_first_byte_spec_3_2) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Utf32.GetBytes(\"A\"); "
+        "  var ok := int(b.Get(0)) = 65 and int(b.Get(1)) = 0 and "
+        "             int(b.Get(2)) = 0 and int(b.Get(3)) = 0; "
+        "  return (1 if ok else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Utf32 round-trip for an ASCII string.
+BEZEL_TEST(codegen_encoding, utf32_roundtrip_ascii_spec_3_2) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Utf32.GetBytes(\"Hello\"); "
+        "  using var back: string := Encoding.Utf32.GetString(b); "
+        "  return (1 if back = \"Hello\" else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Utf32.GetBytes does NOT emit a BOM.
+BEZEL_TEST(codegen_encoding, utf32_getbytes_no_bom_spec_3_2) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Utf32.GetBytes(\"A\"); "
+        "  return (1 if int(b.Get(0)) = 65 and b.Length = 4 else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Utf32.GetString raises FormatException on non-divisible-by-4 count.
+BEZEL_TEST(codegen_encoding, utf32_getstring_non_div4_raises_format_spec_3_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(65)); b.Add(byte(0)); b.Add(byte(0)); "  // 3 bytes
+        "  try "
+        "    using var s: string := Encoding.Utf32.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 v0.136: Utf32.GetString raises FormatException on a surrogate code unit.
+BEZEL_TEST(codegen_encoding, utf32_getstring_surrogate_raises_format_spec_3_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(0x00)); b.Add(byte(0xD8)); b.Add(byte(0)); b.Add(byte(0)); "
+        "  try "
+        "    using var s: string := Encoding.Utf32.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 v0.136: Utf32.Name == "utf-32le".
+BEZEL_TEST(codegen_encoding, utf32_name_spec_3_2) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  var n: string := Encoding.Utf32.Name; "
+        "  return (1 if n = \"utf-32le\" else 0); "
+        "end Main; end C;", 1);
+}
+
+// ---------------------------------------------------------------------------
+// Ascii (strict 7-bit, stdlib §3.2 v0.136)
+// ---------------------------------------------------------------------------
+
+// §3.2 v0.136: Ascii.GetBytes("Hi") → 2 bytes: 0x48 ('H') and 0x69 ('i').
+BEZEL_TEST(codegen_encoding, ascii_getbytes_ascii_string_spec_3_2) {
+    expectValueAndLeakFree(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Ascii.GetBytes(\"Hi\"); "
+        "  var ok := b.Length = 2 and int(b.Get(0)) = 72 and int(b.Get(1)) = 105; "
+        "  return (1 if ok else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Ascii round-trip.
+BEZEL_TEST(codegen_encoding, ascii_roundtrip_ascii_spec_3_2) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := Encoding.Ascii.GetBytes(\"Hello\"); "
+        "  using var back: string := Encoding.Ascii.GetString(b); "
+        "  return (1 if back = \"Hello\" else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Ascii.GetBytes raises FormatException on any code point > U+007F.
+BEZEL_TEST(codegen_encoding, ascii_getbytes_non_ascii_raises_format_spec_3_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  try "
+        "    using var b: Array<byte> := Encoding.Ascii.GetBytes(\"caf\\u00e9\"); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 v0.136: Ascii.GetString raises FormatException on any byte > 0x7F.
+BEZEL_TEST(codegen_encoding, ascii_getstring_high_byte_raises_format_spec_3_2) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var b: Array<byte> := new Array<byte>(); "
+        "  b.Add(byte(65)); b.Add(byte(200)); "  // 200 > 0x7F
+        "  try "
+        "    using var s: string := Encoding.Ascii.GetString(b); "
+        "    return 0; "
+        "  catch FormatException => return 1; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// §3.2 v0.136: Ascii.Name == "us-ascii".
+BEZEL_TEST(codegen_encoding, ascii_name_spec_3_2) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  var n: string := Encoding.Ascii.Name; "
+        "  return (1 if n = \"us-ascii\" else 0); "
+        "end Main; end C;", 1);
+}
+
+// §3.2 v0.136: Utf8.Name == "utf-8" (regression guard, name property sanity).
+BEZEL_TEST(codegen_encoding, utf8_name_spec_3_2) {
+    expectValueAndNoCorruption(
+        "module M; class C public static method Main(): int "
+        "  var n: string := Encoding.Utf8.Name; "
+        "  return (1 if n = \"utf-8\" else 0); "
+        "end Main; end C;", 1);
 }
 
 // §3.2: an `Encoding` value is reachable ONLY as the immediate receiver of a

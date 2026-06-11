@@ -1535,6 +1535,33 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 builder_.CreateCall(fn, {grp, keySlot});
                 return builder_.CreateLoad(keyTy, keySlot, "grp.key");
             }
+            // stdlib §3.2 v0.136: Encoding.Utf8.Name / Utf16.Name / Utf32.Name /
+            // Ascii.Name — read-only property returning the IANA encoding label.
+            // The shape is: ma->member == "Name", ma->target is a
+            // MemberAccessExpr(target=Id("Encoding"), member=<singleton>).
+            if (ma->member == "Name") {
+                if (auto* inner2 =
+                        dynamic_cast<const ast::MemberAccessExpr*>(
+                            ma->target.get())) {
+                    if (auto* encId =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                inner2->target.get())) {
+                        if (encId->name == "Encoding") {
+                            const char* nameStr = nullptr;
+                            if (inner2->member == "Utf8")  nameStr = "utf-8";
+                            if (inner2->member == "Utf16") nameStr = "utf-16le";
+                            if (inner2->member == "Utf32") nameStr = "utf-32le";
+                            if (inner2->member == "Ascii") nameStr = "us-ascii";
+                            if (nameStr) {
+                                // Emit as a string literal (constant global).
+                                // Wrap in quotes — lowerStringLiteral strips them.
+                                return lowerStringLiteral(
+                                    std::string("\"") + nameStr + "\"", false);
+                            }
+                        }
+                    }
+                }
+            }
             // CancellationToken.None (static property, target is type-name identifier).
             if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
                 if (id2->name == "CancellationToken" && ma->member == "None") {

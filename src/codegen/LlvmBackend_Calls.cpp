@@ -1602,6 +1602,110 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             freeLazyTemp();
             return resultV;
         }
+        // stdlib §5 (#661): SingleOrNull(predicate: (T)->bool): T? — return the
+        // single element satisfying the predicate, or null if zero or two+ match.
+        // Per stdlib §5 "*OrNull variants return null instead [of throwing]" and
+        // Single() "throws if not exactly one". Semantics: scan ALL elements;
+        // if exactly one satisfies pred → return it; if none or more than one → null.
+        if (m == "SingleOrNull" && call.args.size() == 1 && call.args[0].value) {
+            const bool relCl = argIsInlineLambda(0);
+            llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(),
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+            if (!closure) return nullptr;
+            llvm::Type* elemTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            // resultSlot: stores the (first) matching element.
+            // matchCountSlot (i32): 0=none, 1=exactly one, 2+=too many.
+            auto* resultSlot    = entryAlloca(elemTy);
+            auto* matchCountSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(0), matchCountSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "son.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "son.b", currentFn_);
+            auto* matchBB = llvm::BasicBlock::Create(llvm_, "son.m", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "son.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "son.e", currentFn_);
+            builder_.CreateBr(condBB);
+            // Loop condition: idx < len.
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            // Loop body: test predicate.
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(ptrFn,
+                {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callClosure(closure, el, i1());
+            builder_.CreateCondBr(ok, matchBB, nextBB);
+            // Match: store first match element, increment counter (capped at 2).
+            builder_.SetInsertPoint(matchBB);
+            llvm::Value* curCnt = builder_.CreateLoad(i32(), matchCountSlot);
+            // Only overwrite resultSlot if this is the first match (cnt == 0).
+            llvm::Value* isFirst = builder_.CreateICmpEQ(curCnt, builder_.getInt32(0));
+            llvm::Value* slotAddr = resultSlot;
+            (void)slotAddr;
+            // Conditional store: write element only when count == 0.
+            auto* storeMatchBB = llvm::BasicBlock::Create(llvm_, "son.sm", currentFn_);
+            auto* afterStoreBB = llvm::BasicBlock::Create(llvm_, "son.as", currentFn_);
+            builder_.CreateCondBr(isFirst, storeMatchBB, afterStoreBB);
+            builder_.SetInsertPoint(storeMatchBB);
+            builder_.CreateStore(el, resultSlot);
+            builder_.CreateBr(afterStoreBB);
+            builder_.SetInsertPoint(afterStoreBB);
+            // Increment count: saturate at 2.
+            llvm::Value* newCnt = builder_.CreateAdd(curCnt, builder_.getInt32(1));
+            llvm::Value* saturated = builder_.CreateSelect(
+                builder_.CreateICmpSGT(newCnt, builder_.getInt32(2)),
+                builder_.getInt32(2), newCnt);
+            builder_.CreateStore(saturated, matchCountSlot);
+            builder_.CreateBr(nextBB);
+            // Advance index.
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            if (relCl) emitClosureRelease(closure);
+
+            // Build T? result: valid iff matchCount == 1.
+            sema::TypeRef* elemRefNN = (recvTy && !recvTy->genericArgs.empty())
+                ? recvTy->genericArgs[0] : nullptr;
+            sema::TypeRef nullRT;
+            if (elemRefNN) { nullRT = *elemRefNN; nullRT.nullable = true; }
+            bool isValTy = elemRefNN && isNullableValueTy(&nullRT);
+
+            llvm::Value* finalCnt = builder_.CreateLoad(i32(), matchCountSlot);
+            llvm::Value* exactlyOne = builder_.CreateICmpEQ(
+                finalCnt, builder_.getInt32(1));
+            llvm::Value* notExactlyOne = builder_.CreateNot(exactlyOne);
+            llvm::Value* loadedV = builder_.CreateLoad(elemTy, resultSlot, "son.v");
+            llvm::Value* resultV = nullptr;
+            if (isValTy) {
+                auto* nst = nullableValueStructTy(&nullRT);
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst),
+                    builder_.CreateSelect(notExactlyOne,
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1)),
+                    {0u});
+                resultV = builder_.CreateInsertValue(
+                    res,
+                    builder_.CreateSelect(notExactlyOne,
+                        llvm::Constant::getNullValue(elemTy), loadedV),
+                    {1u});
+            } else {
+                // Pointer / class / string: null when not exactly one match.
+                resultV = builder_.CreateSelect(notExactlyOne,
+                    llvm::Constant::getNullValue(elemTy), loadedV,
+                    "son.ptr");
+            }
+            freeLazyTemp();
+            return resultV;
+        }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
 
         // per §3: .Sort() — in-place ascending sort for int arrays.
@@ -5251,15 +5355,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
 }
 
 
-// stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes[,i,c]).
+// stdlib §3.2 v0.136: Encoding.{Utf8,Utf16,Utf32,Ascii}.GetBytes/GetString/Name.
 // The call's callee is `(Encoding.Utf8).GetBytes` — a member access whose TARGET
 // is itself the member access `Encoding.Utf8`. We match that two-level shape:
 //   ma          = (Encoding.Utf8).GetBytes        (the callee)
 //   ma->target  = Encoding.Utf8                    (a MemberAccessExpr)
 //   inner       = Encoding.Utf8 — inner->target is the `Encoding` identifier,
 //                 inner->member is the singleton name (Utf8/Utf16/Utf32/Ascii).
-// Only Utf8 is implemented (see bz_encoding_*); the others are rejected in sema,
-// so we never reach codegen for them — defensively return null if seen here.
+// All four singletons are implemented (see bz_encoding_* in bezel_runtime.cpp).
+// For Utf16/Utf32/Ascii: GetString and GetBytes may return null on encoding
+// error; codegen checks for null and emits emitGuardThrow("FormatException").
 llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -5268,19 +5373,41 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     if (!inner || !inner->target) return nullptr;
     auto* clsId = dynamic_cast<const ast::IdentifierExpr*>(inner->target.get());
     if (!clsId || clsId->name != "Encoding") return nullptr;
-    // Only the Utf8 singleton is implemented (§3.2). Utf16/Utf32/Ascii are
-    // deferred; sema rejects them, so this guard is a defensive backstop.
-    if (inner->member != "Utf8") return nullptr;
 
-    const auto& m = ma->member;
+    const auto& sg = inner->member;  // "Utf8", "Utf16", "Utf32", or "Ascii"
+    const auto& m  = ma->member;     // "GetBytes", "GetString", or "Name"
 
-    // GetBytes(s): owned Array<byte> — UTF-8 encode the string into a fresh
-    // bz_array_t* of bytes (elem_size 1). The result is owned by the caller.
+    // Determine runtime function names and whether GetBytes/GetString can fail.
+    // Utf8: lenient decoder (no error); Utf16/Utf32/Ascii: strict, return null.
+    bool canFail = (sg != "Utf8");
+    std::string getBytesName = "bz_encoding_" +
+        (sg == "Utf8"  ? std::string("utf8")  :
+         sg == "Utf16" ? std::string("utf16") :
+         sg == "Utf32" ? std::string("utf32") :
+                         std::string("ascii")) + "_get_bytes";
+    std::string getStringName = "bz_encoding_" +
+        (sg == "Utf8"  ? std::string("utf8")  :
+         sg == "Utf16" ? std::string("utf16") :
+         sg == "Utf32" ? std::string("utf32") :
+                         std::string("ascii")) + "_get_string";
+
+    if (sg != "Utf8" && sg != "Utf16" && sg != "Utf32" && sg != "Ascii")
+        return nullptr;
+
+    // GetBytes(s): owned Array<byte>.  Returns null on failure for strict
+    // encodings; codegen adds emitGuardThrow(null_check, "FormatException").
     if (m == "GetBytes" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* strPtr = lowerExpr(*call.args[0].value);
         if (!strPtr) return nullptr;
-        auto* fn = declareC("bz_encoding_utf8_get_bytes", ptrTy(), {ptrTy()});
-        return builder_.CreateCall(fn, {strPtr}, "enc.bytes");
+        auto* fn = declareC(getBytesName.c_str(), ptrTy(), {ptrTy()});
+        llvm::Value* result = builder_.CreateCall(fn, {strPtr}, "enc.bytes");
+        if (canFail) {
+            // Null return → FormatException (stdlib §3.2 v0.136 error model).
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                result, llvm::Constant::getNullValue(ptrTy()), "enc.fail");
+            emitGuardThrow(isNull, "FormatException");
+        }
+        return result;
     }
 
     // GetString(bytes): string — decode the whole array (index 0, count Length).
@@ -5308,9 +5435,17 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
             count = cv->getType()->isIntegerTy(64)
                         ? cv : builder_.CreateSExt(cv, i64(), "enc.cnt");
         }
-        auto* fn = declareC("bz_encoding_utf8_get_string", ptrTy(),
+        auto* fn = declareC(getStringName.c_str(), ptrTy(),
                             {ptrTy(), i64(), i64()});
-        return builder_.CreateCall(fn, {arr, index, count}, "enc.str");
+        llvm::Value* result = builder_.CreateCall(fn, {arr, index, count},
+                                                  "enc.str");
+        if (canFail) {
+            // Null return → FormatException (stdlib §3.2 v0.136 error model).
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                result, llvm::Constant::getNullValue(ptrTy()), "enc.fail");
+            emitGuardThrow(isNull, "FormatException");
+        }
+        return result;
     }
 
     return nullptr;

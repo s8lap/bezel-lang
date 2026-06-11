@@ -154,6 +154,75 @@ BEZEL_TEST(codegen_stdlib_650_firstornull_pred, firstornull_pred_on_lazy_source)
         "return -1; ")), 6);
 }
 
+// ===========================================================================
+// #661 — SingleOrNull(predicate) — stdlib §5
+// ===========================================================================
+// Per stdlib §5: "the *OrNull variants return null instead [of throwing]" and
+// Single() "throws if not exactly one".  SingleOrNull(pred) returns the unique
+// element satisfying the predicate, or null if zero or two+ match.
+
+// stdlib §5 (#661): SingleOrNull(pred) — no element matches → null.
+BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_no_match_returns_null) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(10); a.Add(20); a.Add(30); "
+        "var r := a.SingleOrNull((x: int) => x > 100); "
+        "if r = null then return 0; end; "
+        "return 1; ")), 0);
+}
+
+// stdlib §5 (#661): SingleOrNull(pred) — exactly one match → that element.
+BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_one_match_returns_it) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(10); a.Add(20); a.Add(30); "
+        "var r := a.SingleOrNull((x: int) => x = 20); "
+        "if r <> null then return r!; end; "
+        "return -1; ")), 20);
+}
+
+// stdlib §5 (#661): SingleOrNull(pred) — two matches → null (not unique).
+BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_two_matches_returns_null) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(10); a.Add(20); a.Add(20); a.Add(30); "
+        "var r := a.SingleOrNull((x: int) => x = 20); "
+        "if r = null then return 0; end; "
+        "return 1; ")), 0);
+}
+
+// stdlib §5 (#661): SingleOrNull(pred) — empty source → null.
+BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_empty_returns_null) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "var r := a.SingleOrNull((x: int) => x > 0); "
+        "if r = null then return 0; end; "
+        "return 1; ")), 0);
+}
+
+// stdlib §5 (#661): SingleOrNull(pred) — scans all elements (does not short-circuit).
+// Three elements, only element at index 2 matches — must scan to the end.
+BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_match_at_end) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(1); a.Add(2); a.Add(99); "
+        "var r := a.SingleOrNull((x: int) => x = 99); "
+        "if r <> null then return r!; end; "
+        "return -1; ")), 99);
+}
+
+// stdlib §5 (#661): probe_071b verification — the original failing probe.
+// a=[10,20,30]; SingleOrNull(x=20) → 20.
+BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_probe_071b_case) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "using var a := new Array<int>(); "
+        "a.Add(10); a.Add(20); a.Add(30); "
+        "var f: int? := a.FirstOrNull((x: int) => x > 15); "
+        "var l: int? := a.LastOrNull(); "
+        "var s: int? := a.SingleOrNull((x: int) => x = 20); "
+        "if f! = 20 and l! = 30 and s! = 20 then return 1; end; "
+        "return 0; ")), 1);
+}
 
 // ===========================================================================
 // #651 — GroupBy / OfType — stdlib §5
