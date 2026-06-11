@@ -1,0 +1,15 @@
+public class Person: INotifyPropertyChanged
+  public event PropertyChanged: PropertyChangedEvent;
+
+  private _name: string := "";
+
+  public property Name: string
+    get => _name;
+    set => do
+      if _name <> value then
+        _name := value;
+        PropertyChanged.Raise(new PropertyChangedEvent(this, nameof(Name)));
+      end;
+    end;
+  end Name;
+end Person;

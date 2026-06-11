@@ -1,0 +1,5 @@
+nameof(amount)              // "amount"
+nameof(_balance)            // "_balance"
+nameof(BankAccount)         // "BankAccount"
+nameof(BankAccount.Deposit) // "Deposit"
+nameof(System.Console)      // "Console"

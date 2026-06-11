@@ -1,0 +1,5 @@
+private _onClicked: (ClickedEvent) -> () := (e) => UpdateStatus(e.X, e.Y);
+// ...
+button.Clicked += _onClicked;
+// later:
+button.Clicked -= _onClicked;          // same reference; matches and unsubscribes
