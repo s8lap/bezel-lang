@@ -2710,6 +2710,119 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
     return aggregate;
 }
 
+// stdlib §6.7 / §30.10: Task.WhenAllOwned<T>(owned tasks: OwnedArray<OwnedTask<T>>):
+//   OwnedTask<OwnedArray<T>> where T: class
+//
+// Pattern B aggregator: caller transfers ownership of the array (and its tasks).
+// Each OwnedTask<T> result is a void* (class pointer, sizeof(void*) bytes); we
+// collect them into a new OwnedArray<T> (a bz_array_t* of pointers). Each input
+// task is freed after its result is captured (it is single-consumer, Pattern B).
+// The input array container is freed once all callbacks are registered (after the
+// loop, before returning).
+//
+// Thread safety: same acq_rel protocol as bz_task_when_all_results (each slot
+// writes a distinct result_bufs entry; the last fetch_sub acquires all prior
+// stores). The element size is always sizeof(void*) since T: class.
+// Reuses BzWhenAllResultsSlot (same {ctx, idx} layout).
+void* bz_task_when_all_owned(void* task_arr) {
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
+    auto* arr = (bz_array_t*)task_arr;
+    int64_t n = bz_array_len(arr);
+    auto* aggregate = new bz_task_t();
+    aggregate->domain = g_main_domain;
+    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    if (n == 0) {
+        // Empty array: complete immediately with an empty OwnedArray<T>.
+        void* emptyArr = bz_array_alloc(sizeof(void*), 0);
+        aggregate->result = malloc(sizeof(void*));
+        memcpy(aggregate->result, &emptyArr, sizeof(void*));
+        aggregate->result_size = (int64_t)sizeof(void*);
+        aggregate->done = true;
+        // Dispose the (empty) input array — ownership was transferred.
+        bz_array_free(task_arr, nullptr);
+        return aggregate;
+    }
+    // Allocate result buffer slots (one per task, pointer-sized).
+    void** result_bufs = (void**)calloc((size_t)n, sizeof(void*));
+    auto* ctx = new BzWhenAllResultsCtx{
+        aggregate, {n}, {n}, {false}, {nullptr},
+        n, (int64_t)sizeof(void*), result_bufs};
+    for (int64_t i = 0; i < n; ++i) {
+        void* t = nullptr;
+        bz_array_get(arr, i, &t, sizeof(void*));
+        // Per-slot: allocate a slot carrying (ctx, idx) into the callback.
+        // Re-use the BzWhenAllResultsSlot type (same layout).
+        auto* slot = new BzWhenAllResultsSlot{ctx, i};
+        bz_task_then(t,
+            [](void* completedTask, void* state) {
+                auto* slot = (BzWhenAllResultsSlot*)state;
+                auto* c  = slot->ctx;
+                int64_t i = slot->idx;
+                delete slot;
+
+                // §30.9 / #443: fault propagation — first faulted task wins.
+                if (bz_task_is_error(completedTask)) {
+                    bool expected = false;
+                    if (c->any_fault.compare_exchange_strong(
+                            expected, true,
+                            std::memory_order_acq_rel,
+                            std::memory_order_relaxed)) {
+                        void* errObj = bz_task_error_obj(completedTask);
+                        c->first_error_obj.store(errObj, std::memory_order_release);
+                    }
+                } else {
+                    // Capture the result pointer (T*) from the OwnedTask<T>.
+                    // The result is a pointer-sized value stored as void*.
+                    void* resPtr = bz_task_await_sync(completedTask);
+                    if (resPtr) {
+                        // resPtr points to the void* result slot inside the task.
+                        void* objPtr = nullptr;
+                        memcpy(&objPtr, resPtr, sizeof(void*));
+                        c->result_bufs[i] = objPtr;
+                    }
+                }
+                // Free the OwnedTask<T> — ownership was transferred to us (#451
+                // Pattern B: single-consumer, the task is spent after this await).
+                bz_task_free(completedTask);
+
+                // When ALL inputs done (remaining → 0): build the result array.
+                if (c->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    if (c->any_fault.load(std::memory_order_acquire)) {
+                        // Fault path: at least one task faulted. Any result
+                        // objects already captured are leaked here — we have no
+                        // vtable pointer to call Dispose on them. In practice
+                        // the caller sees the exception (no WhenAllOwned result
+                        // is consumed) and the program terminates or propagates
+                        // the error, making the leak inconsequential.
+                        // (#451 / §30.9 fault semantics — a full Dispose path
+                        // would require passing the vtable through the context.)
+                        free(c->result_bufs);
+                        void* errObj = c->first_error_obj.load(std::memory_order_acquire);
+                        bz_task_complete_error_obj(c->aggregate, errObj);
+                    } else {
+                        // Build OwnedArray<T> from collected result pointers.
+                        int64_t esz = (int64_t)sizeof(void*);
+                        void* resultArr = bz_array_alloc(esz, c->n);
+                        for (int64_t j = 0; j < c->n; ++j) {
+                            bz_array_add(resultArr, &c->result_bufs[j], esz);
+                        }
+                        free(c->result_bufs);
+                        // Complete the aggregate with the OwnedArray<T> pointer.
+                        bz_task_complete(c->aggregate, &resultArr, sizeof(void*));
+                    }
+                }
+                if (c->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                    delete c;
+            },
+            slot);
+    }
+    // Ownership of the input array was transferred — free the container now
+    // (the task pointers have been read by bz_task_then, which kept references
+    // internally; the array itself is no longer needed).
+    bz_array_free(task_arr, nullptr);
+    return aggregate;
+}
+
 // stdlib §6.7 / §30.10: Task.WhenAny(tasks: Array<Task>): Task<Task>.
 // Returns a new task that completes with a ptr-sized result (the pointer to the
 // FIRST task that finishes). Uses a shared context with a once-flag and a

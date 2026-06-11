@@ -1675,6 +1675,57 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             tt->genericArgs.push_back(makeTaskTypeRef());
                             ctx_.setExprType(&ce, tt);
                         }
+                        // stdlib §6.7 (line 2942): Task.WhenAllOwned<T>(
+                        //   owned tasks: OwnedArray<OwnedTask<T>>
+                        // ): OwnedTask<OwnedArray<T>> where T: class.
+                        //
+                        // Pattern B aggregator: takes ownership of an
+                        // OwnedArray<OwnedTask<T>> and produces an
+                        // OwnedTask<OwnedArray<T>>. T must be a class type.
+                        // The result type is built as OwnedTask<OwnedArray<T>>
+                        // where T is the innermost generic arg of the input.
+                        if (m == "WhenAllOwned") {
+                            // Build OwnedTask<OwnedArray<T>> TypeRef.
+                            // Detect T from the arg type: OwnedArray<OwnedTask<T>>.
+                            TypeRef* T = nullptr;
+                            if (!ce.args.empty() && ce.args[0].value) {
+                                TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+                                // argTy = OwnedArray<OwnedTask<T>>
+                                if (argTy && argTy->kind == TypeRef::Kind::Named &&
+                                    !argTy->genericArgs.empty() &&
+                                    argTy->genericArgs[0]) {
+                                    TypeRef* elemTy = argTy->genericArgs[0]; // OwnedTask<T>
+                                    if (elemTy->kind == TypeRef::Kind::Named &&
+                                        !elemTy->genericArgs.empty() &&
+                                        elemTy->genericArgs[0]) {
+                                        T = elemTy->genericArgs[0];
+                                    }
+                                }
+                            }
+                            // Build OwnedArray<T> TypeRef.
+                            auto* arrTy = ctx_.makeTypeRef();
+                            arrTy->kind = TypeRef::Kind::Named;
+                            arrTy->nullable = false;
+                            auto* arrAnn = new ast::Type();
+                            arrAnn->kind = ast::TypeKind::Named;
+                            auto* arrNm = new ast::QualifiedName();
+                            arrNm->parts.push_back("OwnedArray");
+                            arrAnn->name.reset(arrNm);
+                            arrTy->astNode = arrAnn;
+                            if (T) arrTy->genericArgs.push_back(T);
+                            // Build OwnedTask<OwnedArray<T>> TypeRef.
+                            auto* ownedTaskTy = ctx_.makeTypeRef();
+                            ownedTaskTy->kind = TypeRef::Kind::Named;
+                            ownedTaskTy->nullable = false;
+                            auto* otAnn = new ast::Type();
+                            otAnn->kind = ast::TypeKind::Named;
+                            auto* otNm = new ast::QualifiedName();
+                            otNm->parts.push_back("OwnedTask");
+                            otAnn->name.reset(otNm);
+                            ownedTaskTy->astNode = otAnn;
+                            ownedTaskTy->genericArgs.push_back(arrTy);
+                            ctx_.setExprType(&ce, ownedTaskTy);
+                        }
                         // stdlib §6.7 (line 2885): Task.FireAndForget(owned task):
                         // void/unit. Ownership of the task transfers; the caller
                         // does not need the return value. No TypeRef set → unit.

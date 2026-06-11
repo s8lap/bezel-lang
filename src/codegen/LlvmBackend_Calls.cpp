@@ -4025,6 +4025,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* whenAnyFn = declareC("bz_task_when_any", ptrTy(), {ptrTy()});
             return builder_.CreateCall(whenAnyFn, {arr}, "task.when_any");
         }
+        // stdlib §6.7 (line 2942): Task.WhenAllOwned<T>(
+        //   owned tasks: OwnedArray<OwnedTask<T>>): OwnedTask<OwnedArray<T>>
+        //   where T: class.
+        //
+        // Pattern B aggregator for class T. The caller transfers ownership of
+        // the OwnedArray<OwnedTask<T>>; bz_task_when_all_owned collects each
+        // OwnedTask<T> result (a pointer) into a new OwnedArray<T> and frees
+        // each input task and the input array. Returns OwnedTask<OwnedArray<T>>
+        // (a bz_task_t* whose result is an OwnedArray<T> pointer).
+        if (m == "WhenAllOwned" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            if (!arr) return nullptr;
+            auto* whenAllOwnedFn = declareC("bz_task_when_all_owned",
+                                            ptrTy(), {ptrTy()});
+            return builder_.CreateCall(whenAllOwnedFn, {arr},
+                                       "task.when_all_owned");
+        }
         // stdlib §6.7 (line 2885): Task.FireAndForget(owned task: Task): void.
         // Registers a continuation that frees the task on completion; ownership
         // transfers. Returns unit (nullptr from codegen → discarded).
