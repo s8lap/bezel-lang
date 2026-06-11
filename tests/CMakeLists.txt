@@ -463,6 +463,7 @@ set(BEZEL_TEST_SOURCES
     codegen/iterator_exception_630_test.cpp
     codegen/codegen_unimplemented_hard_error_628_test.cpp
     codegen/owned_dict_drain_628_test.cpp
+    codegen/owned_drain_639_test.cpp
     codegen/owned_collection_accessors_test.cpp
     codegen/user_exception_unqualified_msg_625_test.cpp
     codegen/serialization_synthesis_550_test.cpp

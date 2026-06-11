@@ -855,6 +855,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // stdlib §5: `for var x in <lazy LINQ pipeline>` — iterate the deferred
         // enumerator without materializing it.
         if (lowerLazyLinqFor(*fors)) return false;
+        // #639 / stdlib §4.5/§4.7/§4.11 v0.135: `for var x in coll.Drain()`
+        // ownership-transferring drain over OwnedArray<T>, OwnedLinkedList<T>,
+        // OwnedStack<T>, OwnedQueue<T>.
+        // Must run BEFORE lowerDictDrainFor and lowerIEnumerableBuiltinFor.
+        if (lowerOwnedSeqDrainFor(*fors)) return false;
         // #628 / stdlib §4.9 v0.135: `for var entry in ownedDict.Drain()`
         // ownership-transferring drain over OwnedDictionary<K,V>.
         // Must run BEFORE lowerIEnumerableBuiltinFor (which also handles
@@ -2449,6 +2454,145 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     builder_.SetInsertPoint(incBB);
     llvm::Value* idxInc = builder_.CreateLoad(i64(), idxSlot);
     builder_.CreateStore(builder_.CreateAdd(idxInc, builder_.getInt64(1)), idxSlot);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    return true;
+}
+
+
+// #639 / stdlib §4.5/§4.7/§4.11 v0.135: `for var x in coll.Drain()` —
+// ownership-transferring drain over OwnedArray<T>, OwnedLinkedList<T>,
+// OwnedStack<T>, OwnedQueue<T>.
+//
+// Detection: the iterable expression has type OwnedEnumerable<T> (set by sema
+// for the four collection names above) with genericArgs[0] NOT being a
+// DrainedEntry (which would be the OwnedDictionary case, handled below).
+// Additionally, the iterable must be a Drain() call whose receiver has one of
+// the four recognised type names.
+//
+// Drain order per §28.11 / stdlib §4.5/§4.7/§4.11:
+//   OwnedArray<T>       — front-to-back (bz_array_drain_next)
+//   OwnedQueue<T>       — FIFO = front-to-back (bz_array_drain_next)
+//   OwnedStack<T>       — LIFO = top-first (bz_array_drain_next_lifo)
+//   OwnedLinkedList<T>  — head-to-tail (bz_llist_drain_next)
+//
+// Runtime shape: a single call to the appropriate drain function per loop
+// iteration.  The function pops one element pointer into *val_out and
+// decrements the collection's count.  Returns false when the collection is
+// empty.  The loop variable alloca holds the popped pointer; lowerExpr reads it
+// as the owned T value.
+//
+// Partial drain: break exits the loop; remaining elements stay in the
+// collection and are disposed by the collection's own Dispose() at scope-end.
+// Exception mid-drain: same — unwinding invokes the collection's disposer via
+// the standard using-var cleanup chain.
+bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
+    if (!fs.iterable) return false;
+    auto* iterTy = ctx_.exprType(*fs.iterable);
+    if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
+
+    // Must be OwnedEnumerable<T>.
+    std::string_view iterName;
+    if (iterTy->astNode && iterTy->astNode->name &&
+        !iterTy->astNode->name->parts.empty())
+        iterName = iterTy->astNode->name->parts[0];
+    else if (!iterTy->importedName.empty())
+        iterName = iterTy->importedName;
+    if (iterName != "OwnedEnumerable") return false;
+
+    // Must have one generic arg T that is NOT DrainedEntry (that's the dict path).
+    if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
+    const sema::TypeRef* elemTy = iterTy->genericArgs[0];
+    if (elemTy->kind == sema::TypeRef::Kind::Named &&
+        elemTy->importedName == "DrainedEntry")
+        return false;  // let lowerDictDrainFor handle it
+
+    // The iterable must be a Drain() call on one of the four collection types.
+    const ast::Expr* collExpr = nullptr;
+    std::string_view collName;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(fs.iterable.get())) {
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get())) {
+            if (ma->member == "Drain" && ma->target) {
+                collExpr = ma->target.get();
+                const sema::TypeRef* ct = ctx_.exprType(*collExpr);
+                if (ct && ct->kind == sema::TypeRef::Kind::Named) {
+                    if (ct->astNode && ct->astNode->name &&
+                        !ct->astNode->name->parts.empty())
+                        collName = ct->astNode->name->parts[0];
+                    else if (!ct->importedName.empty())
+                        collName = ct->importedName;
+                }
+            }
+        }
+    }
+    if (!collExpr) return false;
+    if (collName != "OwnedArray" && collName != "OwnedLinkedList" &&
+        collName != "OwnedStack" && collName != "OwnedQueue")
+        return false;
+
+    // Evaluate the collection object.
+    llvm::Value* collObj = lowerExpr(*collExpr);
+    if (!collObj) return false;
+
+    // The element type is always a class pointer (ptrTy()) for owned collections.
+    llvm::Type* elemLlvm = lowerTypeRef(elemTy);
+    if (!elemLlvm) return false;
+
+    // Alloca for the loop variable (holds the popped owned pointer).
+    auto* varSlot = entryAlloca(elemLlvm);
+    locals_[&fs] = varSlot;
+
+    // Alloca for the raw element output from the drain function.
+    auto* valOutSlot = entryAlloca(ptrTy());
+
+    // Choose the drain runtime function name based on the collection kind.
+    const char* drainFnName;
+    if (collName == "OwnedLinkedList") {
+        drainFnName = "bz_llist_drain_next";      // pops head → head-to-tail
+    } else if (collName == "OwnedStack") {
+        drainFnName = "bz_array_drain_next_lifo"; // pops tail → LIFO
+    } else {
+        // OwnedArray and OwnedQueue: both drain front-to-back.
+        drainFnName = "bz_array_drain_next";      // pops index 0 → FIFO/front-to-back
+    }
+    // bz_array_drain_next / bz_array_drain_next_lifo / bz_llist_drain_next
+    //   (void* coll, void** val_out) → bool (i1)
+    auto* drainFn = declareC(drainFnName, i1(), {ptrTy(), ptrTy()});
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "sd.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sd.body", currentFn_);
+    auto* incBB  = llvm::BasicBlock::Create(llvm_, "sd.inc",  currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "sd.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    // cond: call the drain function; it pops one element into valOutSlot.
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* popped = builder_.CreateCall(drainFn,
+        {collObj, valOutSlot}, "sd.popped");
+    builder_.CreateCondBr(popped, bodyBB, endBB);
+
+    // body: load the popped element pointer and store into the loop var slot.
+    builder_.SetInsertPoint(bodyBB);
+    {
+        llvm::Value* rawPtr = builder_.CreateLoad(ptrTy(), valOutSlot);
+        // The drain functions return a void* holding the class object pointer.
+        // If elemLlvm is ptrTy() we use rawPtr directly; otherwise bitcast.
+        llvm::Value* elemVal =
+            (elemLlvm == ptrTy())
+            ? rawPtr
+            : builder_.CreateBitCast(rawPtr, elemLlvm, "sd.elem");
+        builder_.CreateStore(elemVal, varSlot);
+    }
+
+    loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+    bool term = lowerScopedBlock(fs.body);
+    loopStack_.pop_back();
+    if (!term) builder_.CreateBr(incBB);
+
+    // inc: jump back to cond (the collection is already smaller after each pop).
+    builder_.SetInsertPoint(incBB);
     builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(endBB);

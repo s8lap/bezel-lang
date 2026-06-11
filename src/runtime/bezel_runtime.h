@@ -307,6 +307,21 @@ bool bz_dict_drain_next_str(void* d, int64_t* cursor,
 bool bz_dict_drain_next_gen(void* d, int64_t* cursor,
                              void** key_out, void** val_out);
 
+// issue #639 / stdlib §4.5/§4.7/§4.11 v0.135: ordered owning collection drain.
+//
+// bz_array_drain_next — pops index 0 (front-to-back); for OwnedArray<T>.Drain()
+// (front-to-back) and OwnedQueue<T>.Drain() (FIFO). Returns true if an element
+// was popped into *val_out; false when the array is empty.
+bool bz_array_drain_next(void* arr, void** val_out);
+//
+// bz_array_drain_next_lifo — pops the last element (LIFO); for OwnedStack<T>.Drain()
+// which pops top-first. Returns true if an element was popped; false when empty.
+bool bz_array_drain_next_lifo(void* arr, void** val_out);
+//
+// bz_llist_drain_next — pops the head node (front-to-back); for OwnedLinkedList<T>.Drain()
+// which iterates head-to-tail. Returns true if a node was popped; false when empty.
+bool bz_llist_drain_next(void* list, void** val_out);
+
 // issue #389 / stdlib §4.10: fold a key snapshot of `other` into/against a
 // dict-backed Set `self` (generic-key table). `keys` is a malloc'd array of `n`
 // pointers, each a malloc'd copy of one element's `self->key_size` bytes — the
