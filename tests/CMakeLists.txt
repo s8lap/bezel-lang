@@ -505,7 +505,8 @@ set(BEZEL_TEST_SOURCES
     ownership/catch_borrow_escaping_via_ctor_test.cpp
     ownership/async_ownership_test.cpp
     ownership/move_interface_slot_test.cpp
-    ownership/value_builtin_ownership_test.cpp)
+    ownership/value_builtin_ownership_test.cpp
+    ownership/use_after_dispose_warn_601_test.cpp)
 
 add_executable(bezel_tests ${BEZEL_TEST_SOURCES})
 target_include_directories(bezel_tests PRIVATE
