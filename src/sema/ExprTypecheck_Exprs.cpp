@@ -295,7 +295,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    // §30.14 (#600): Domain is a static class auto-imported for
                    // Domain.Spawn; recognized here so Domain.Spawn(…) can resolve
                    // as a call on a known-class receiver.
-                   id->name == "Domain") {
+                   id->name == "Domain" ||
+                   // §8.1 / issue #646: Stopwatch — static factory StartNew() and
+                   // instance methods. Recognized here so Stopwatch.StartNew() and
+                   // sw.Start()/Stop()/… resolve as calls on a known-class receiver.
+                   id->name == "Stopwatch" ||
+                   // §8.2 / issue #646: Debug — static class for Assert/WriteLine.
+                   // Recognized here so Debug.Assert(…) and Debug.WriteLine(…)
+                   // resolve as calls on a known-class receiver.
+                   id->name == "Debug") {
             // §2.3: these System classes are auto-imported and always
             // available without an explicit import. Give them a synthetic
             // TypeSymbol (null decl) so member access can proceed; the

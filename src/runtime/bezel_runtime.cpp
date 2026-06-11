@@ -6981,3 +6981,167 @@ void bz_owned_buffer_get_span(void* bufp,
 }
 
 } // extern "C" (binary serialization)
+
+// ---------------------------------------------------------------------------
+// §8.1 System.Diagnostics.Stopwatch runtime
+//
+// Representation: bz_stopwatch_t* (heap pointer, owned by the Bezel Stopwatch
+// instance). Layout mirrors the .NET semantics: accumulated elapsed_ns holds
+// time from previous Start/Stop cycles; start_ts holds the CLOCK_MONOTONIC
+// timestamp at the most recent Start() call (valid only when running == 1).
+//
+// ElapsedMilliseconds = (elapsed_ns + running_ns) / 1_000_000  (i64)
+// Elapsed (TimeSpan)  = (elapsed_ns + running_ns) / 100        (i64, 100-ns ticks)
+//
+// All functions are extern "C" with the bz_sw_* prefix.
+// ---------------------------------------------------------------------------
+
+struct bz_stopwatch_t {
+    struct timespec start_ts;  // CLOCK_MONOTONIC timestamp of last Start()
+    int64_t elapsed_ns;        // accumulated nanoseconds from completed Start/Stop cycles
+    int32_t running;           // 1 = running, 0 = stopped
+};
+
+// Internal: nanoseconds since start_ts (only call when running == 1).
+static int64_t bz_sw_running_ns(const bz_stopwatch_t* sw) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t sec_diff  = (int64_t)now.tv_sec  - (int64_t)sw->start_ts.tv_sec;
+    int64_t nsec_diff = (int64_t)now.tv_nsec - (int64_t)sw->start_ts.tv_nsec;
+    return sec_diff * (int64_t)1000000000 + nsec_diff;
+}
+
+extern "C" {
+
+// new Stopwatch() — allocate and zero-initialise.
+void* bz_stopwatch_alloc(void) {
+    auto* sw = (bz_stopwatch_t*)calloc(1, sizeof(bz_stopwatch_t));
+    return sw;
+}
+
+// Stopwatch.Dispose() — free the heap object (no IDisposable semantics needed).
+void bz_stopwatch_free(void* swp) {
+    free(swp);
+}
+
+// Stopwatch.Start() — begin (or resume) timing.
+void bz_stopwatch_start(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw || sw->running) return;  // idempotent: already running → no-op
+    clock_gettime(CLOCK_MONOTONIC, &sw->start_ts);
+    sw->running = 1;
+}
+
+// Stopwatch.Stop() — pause timing; accumulate elapsed.
+void bz_stopwatch_stop(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw || !sw->running) return;  // idempotent: already stopped → no-op
+    sw->elapsed_ns += bz_sw_running_ns(sw);
+    sw->running = 0;
+}
+
+// Stopwatch.Reset() — stop (if running) and zero elapsed.
+void bz_stopwatch_reset(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return;
+    sw->running = 0;
+    sw->elapsed_ns = 0;
+    sw->start_ts.tv_sec  = 0;
+    sw->start_ts.tv_nsec = 0;
+}
+
+// Stopwatch.Restart() — reset and start immediately.
+void bz_stopwatch_restart(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return;
+    sw->elapsed_ns = 0;
+    clock_gettime(CLOCK_MONOTONIC, &sw->start_ts);
+    sw->running = 1;
+}
+
+// Stopwatch.IsRunning — returns 1 (true) or 0 (false).
+int32_t bz_stopwatch_is_running(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return 0;
+    return sw->running;
+}
+
+// Stopwatch.ElapsedMilliseconds — total elapsed as i64 milliseconds.
+int64_t bz_stopwatch_elapsed_ms(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return 0;
+    int64_t ns = sw->elapsed_ns;
+    if (sw->running) ns += bz_sw_running_ns(sw);
+    return ns / (int64_t)1000000;
+}
+
+// Stopwatch.Elapsed — total elapsed as TimeSpan (i64, 100-ns ticks).
+int64_t bz_stopwatch_elapsed_ticks(void* swp) {
+    auto* sw = (bz_stopwatch_t*)swp;
+    if (!sw) return 0;
+    int64_t ns = sw->elapsed_ns;
+    if (sw->running) ns += bz_sw_running_ns(sw);
+    return ns / (int64_t)100;   // nanoseconds → 100-ns ticks
+}
+
+} // extern "C" (Stopwatch)
+
+// ---------------------------------------------------------------------------
+// §8.2 System.Diagnostics.Debug runtime
+//
+// Debug.Assert(condition) / Debug.Assert(condition, message):
+//   If condition is false, write the assertion message to stderr and call
+//   abort(). This implementation is always-on (no --debug flag yet, per
+//   recorded choice in diagnostics_646_test.cpp §8.2 gap note 2).
+//
+// Debug.WriteLine(message):
+//   Write message followed by a newline to stderr. Always-on.
+// ---------------------------------------------------------------------------
+
+extern "C" {
+
+// bz_debug_assert_fail(msg_p) — print message to stderr and abort.
+// msg_p is a bz_string* (the string object; we extract data/len the same way
+// Console.Write does). Called only when the condition is false.
+void bz_debug_assert_fail(void* msg_p) {
+    if (msg_p) {
+        // bz_string layout: data ptr @ offset 0, len (code-point count) @ offset 8,
+        // width byte @ offset 16. UTF-8 (width=1) path only; mirror Console.Write.
+        const uint8_t* hdr = (const uint8_t*)msg_p;
+        void* data_ptr;
+        memcpy(&data_ptr, hdr, sizeof(void*));
+        int64_t len;
+        memcpy(&len, hdr + 8, sizeof(int64_t));
+        uint8_t width = hdr[16];
+        // Only width-1 (UTF-8) is printable without transcoding; for wider
+        // encodings fall through to the generic abort message.
+        if (width == 1 && data_ptr && len > 0) {
+            fputs("Assertion failed: ", stderr);
+            fwrite(data_ptr, 1, (size_t)len, stderr);
+            fputc('\n', stderr);
+            fflush(stderr);
+            abort();
+        }
+    }
+    fputs("Assertion failed\n", stderr);
+    fflush(stderr);
+    abort();
+}
+
+// bz_debug_writeline(msg_p) — write message + newline to stderr.
+void bz_debug_writeline(void* msg_p) {
+    if (!msg_p) { fputs("\n", stderr); return; }
+    const uint8_t* hdr = (const uint8_t*)msg_p;
+    void* data_ptr;
+    memcpy(&data_ptr, hdr, sizeof(void*));
+    int64_t len;
+    memcpy(&len, hdr + 8, sizeof(int64_t));
+    uint8_t width = hdr[16];
+    if (width == 1 && data_ptr && len > 0) {
+        fwrite(data_ptr, 1, (size_t)len, stderr);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+} // extern "C" (Debug)

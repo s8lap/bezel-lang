@@ -97,7 +97,14 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §2.15 / issue #550: BinarySerializer / BinaryDeserializer (opaque
         // runtime handles; require `import System.Serialization` per spec, but
         // like CancellationTokenSource we do not yet enforce import-gating here).
-        n == "BinarySerializer" || n == "BinaryDeserializer") return 0;
+        n == "BinarySerializer" || n == "BinaryDeserializer" ||
+        // §8.1 / issue #646: Stopwatch — heap-allocated timing class.
+        // §8.2 / issue #646: Debug — static class for assertions and logging.
+        // Both require `import System.Diagnostics` per spec (stdlib §8); the
+        // compiler does not yet enforce this gate, matching the existing pattern
+        // for System.IO types (File/Directory/Path) which also resolve without
+        // import in the current implementation.
+        n == "Stopwatch" || n == "Debug") return 0;
     // §32.5 / stdlib §10: FFI-boundary types. IntPtr/UIntPtr are
     // compiler-intrinsic value types (pointer-sized integers); CString,
     // WString, RawBytes are FFI-boundary classes. They have no user

@@ -4316,6 +4316,57 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
+    // §8.1 / issue #646: Stopwatch static factory.
+    // StartNew() allocates a new Stopwatch and immediately starts it.
+    if (cls == "Stopwatch") {
+        if (m == "StartNew" && call.args.empty()) {
+            auto* allocFn = declareC("bz_stopwatch_alloc", ptrTy(), {});
+            llvm::Value* sw = builder_.CreateCall(allocFn, {}, "sw.new");
+            auto* startFn = declareC("bz_stopwatch_start",
+                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(startFn, {sw});
+            return sw;
+        }
+    }
+
+    // §8.2 / issue #646: Debug static methods.
+    // Assert(condition) / Assert(condition, message): no-op if true; abort if false.
+    // WriteLine(message): write to stderr.
+    if (cls == "Debug") {
+        if (m == "Assert" && call.args.size() >= 1 && call.args[0].value) {
+            llvm::Value* cond = lowerExpr(*call.args[0].value);
+            if (!cond) return nullptr;
+            // Normalize condition to i1.
+            if (!cond->getType()->isIntegerTy(1)) {
+                cond = builder_.CreateICmpNE(cond, llvm::ConstantInt::get(cond->getType(), 0));
+            }
+            auto* okBB   = llvm::BasicBlock::Create(llvm_, "dbg.assert.ok",   currentFn_);
+            auto* failBB = llvm::BasicBlock::Create(llvm_, "dbg.assert.fail", currentFn_);
+            builder_.CreateCondBr(cond, okBB, failBB);
+            builder_.SetInsertPoint(failBB);
+            // Determine the message argument (string ptr or null).
+            llvm::Value* msgPtr = llvm::ConstantPointerNull::get(ptrTy());
+            if (call.args.size() >= 2 && call.args[1].value) {
+                llvm::Value* mv = lowerExpr(*call.args[1].value);
+                if (mv && mv->getType()->isPointerTy()) msgPtr = mv;
+            }
+            auto* failFn = declareC("bz_debug_assert_fail",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(failFn, {msgPtr});
+            builder_.CreateUnreachable();
+            builder_.SetInsertPoint(okBB);
+            return nullptr;
+        }
+        if (m == "WriteLine" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* msgPtr = lowerExpr(*call.args[0].value);
+            if (!msgPtr) msgPtr = llvm::ConstantPointerNull::get(ptrTy());
+            auto* wlFn = declareC("bz_debug_writeline",
+                                  llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(wlFn, {msgPtr});
+            return nullptr;
+        }
+    }
+
     // §30.10 / stdlib §6.7: Task static helpers. `Task.Delay(...)` produces a
     // genuinely-incomplete Task that a thread-pool worker completes after the
     // delay elapses (bz_task_delay). This is the primitive that exercises the
@@ -5034,6 +5085,49 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         auto* fn = declareC("bz_random_next_double",
                                             llvm::Type::getDoubleTy(llvm_), {ptrTy()});
                         return builder_.CreateCall(fn, {rng});
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // §8.1 / issue #646: Stopwatch instance methods.
+    // Receiver's exprType name-part is "Stopwatch".
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target) {
+                auto* recvTy = ctx_.exprType(*ma2->target);
+                bool isSW = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    builtinTypeName(recvTy) == "Stopwatch";
+                if (isSW) {
+                    llvm::Value* sw = lowerExpr(*ma2->target);
+                    if (!sw) return nullptr;
+                    const auto& mname = ma2->member;
+                    if (mname == "Start" && call.args.empty()) {
+                        auto* fn = declareC("bz_stopwatch_start",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {sw});
+                        return nullptr;
+                    }
+                    if (mname == "Stop" && call.args.empty()) {
+                        auto* fn = declareC("bz_stopwatch_stop",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {sw});
+                        return nullptr;
+                    }
+                    if (mname == "Reset" && call.args.empty()) {
+                        auto* fn = declareC("bz_stopwatch_reset",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {sw});
+                        return nullptr;
+                    }
+                    if (mname == "Restart" && call.args.empty()) {
+                        auto* fn = declareC("bz_stopwatch_restart",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        builder_.CreateCall(fn, {sw});
+                        return nullptr;
                     }
                 }
             }
@@ -7283,6 +7377,22 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                         llvm::ConstantPointerNull::get(ptrTy()),
                                         slot);
                             }
+                        }
+                        return nullptr;
+                    }
+                }
+                // §8.1 / issue #646: Stopwatch.Dispose() — free the bz_stopwatch_t
+                // heap object via bz_stopwatch_free.  Called by `using var` scope
+                // exit (§28.2 exactly-once rule).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        builtinTypeName(recvTy) == "Stopwatch") {
+                        llvm::Value* recv = lowerExpr(*ma->target);
+                        if (recv && recv->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_stopwatch_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {recv});
                         }
                         return nullptr;
                     }
