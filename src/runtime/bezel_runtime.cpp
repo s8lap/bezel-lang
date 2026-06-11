@@ -5665,27 +5665,81 @@ static int bz_binder_read_le64_impl(bz_binder_t* d, uint64_t* out) {
 }
 
 // Read a LE32-prefixed UTF-8 byte string and return a heap-allocated
-// bz_string_struct* (width=1, caller must free via bz_string_release or
-// direct free of both the struct and its data buffer).
+// bz_string_struct* with adaptive-width code-point storage.
 // Returns nullptr on truncated data.
+//
+// #635: the bz_string `len` field is a CODE-POINT count, not a byte count.
+// Previously this function set len=byte_len with width=1 (treating each byte as
+// one code point).  For multi-byte UTF-8 strings (CJK, emoji, etc.) this created
+// a length mismatch against the original string literal whose len=code_point_count;
+// emitStringEq's length check then always returned false even for identical content.
+//
+// Fix: decode the UTF-8 bytes into code points, select the narrowest width that
+// fits all code points (1/2/4, per §4.6 adaptive-width storage), allocate the data
+// buffer at that width, and set len to the decoded code-point count.  This mirrors
+// exactly what lowerStringLiteralConst() does at compile time.
 static void* bz_binder_read_bz_string(bz_binder_t* d) {
     uint32_t byte_len = 0;
     if (!bz_binder_read_le32_impl(d, &byte_len)) return nullptr;
     if (d->pos + (int64_t)byte_len > d->len)     return nullptr;
-    // Allocate data buffer (NUL-terminate for bz_string_to_utf8z compat).
-    char* buf = static_cast<char*>(malloc((size_t)byte_len + 1));
-    memcpy(buf, d->data + d->pos, byte_len);
-    buf[byte_len] = '\0';
-    d->pos += byte_len;
+
+    const uint8_t* src = d->data + d->pos;
+    d->pos += (int64_t)byte_len;
+
+    // --- pass 1: decode UTF-8 bytes → code points; determine count + max cp ---
+    // Worst case: every byte is a single ASCII code point.
+    uint32_t* cps = static_cast<uint32_t*>(malloc((size_t)byte_len * sizeof(uint32_t) + 4));
+    if (!cps) return nullptr;
+    int64_t ncp = 0;
+    uint32_t max_cp = 0;
+    int64_t i = 0;
+    while (i < (int64_t)byte_len) {
+        uint8_t b0 = src[i];
+        uint32_t cp;
+        int seq;
+        if      (b0 < 0x80) { cp = b0;                    seq = 1; }
+        else if (b0 < 0xC0) { cp = 0xFFFD; seq = 1; }  // unexpected continuation → replacement
+        else if (b0 < 0xE0) { cp = b0 & 0x1F;            seq = 2; }
+        else if (b0 < 0xF0) { cp = b0 & 0x0F;            seq = 3; }
+        else                 { cp = b0 & 0x07;            seq = 4; }
+        for (int k = 1; k < seq && i + k < (int64_t)byte_len; ++k)
+            cp = (cp << 6) | (src[i + k] & 0x3F);
+        i += seq;
+        cps[ncp++] = cp;
+        if (cp > max_cp) max_cp = cp;
+    }
+
+    // --- pass 2: select adaptive width (§4.6) ---
+    uint8_t width = (max_cp <= 0xFF) ? 1 : (max_cp <= 0xFFFF) ? 2 : 4;
+
+    // --- pass 3: allocate data buffer at selected width ---
+    size_t data_bytes = (size_t)ncp * width + width; // +1 element NUL terminator
+    uint8_t* buf = static_cast<uint8_t*>(malloc(data_bytes));
+    if (!buf) { free(cps); return nullptr; }
+    memset(buf + (size_t)ncp * width, 0, width); // NUL terminator
+    for (int64_t j = 0; j < ncp; ++j) {
+        if (width == 1)
+            buf[j] = (uint8_t)cps[j];
+        else if (width == 2) {
+            uint16_t v = (uint16_t)cps[j];
+            memcpy(buf + j * 2, &v, 2);
+        } else {
+            uint32_t v = cps[j];
+            memcpy(buf + j * 4, &v, 4);
+        }
+    }
+    free(cps);
+
+    // --- build the bz_string header ---
     // Allocate a full BZ_STRING_SIZEOF (32-byte) object with rc initialized so
     // that bz_string_release works correctly (#550: deserialized field names are
-    // passed to bz_string_release by generated code; using a smaller struct
-    // would leave rc at offset 24 uninitialized, corrupting the heap).
+    // passed to bz_string_release by generated code).
     uint8_t* strObj = static_cast<uint8_t*>(calloc(1, (size_t)BZ_STRING_SIZEOF));
-    int64_t str_len64 = (int64_t)byte_len;
-    memcpy(strObj,      &buf,        sizeof(void*));    // data
-    memcpy(strObj + 8,  &str_len64,  sizeof(int64_t)); // len
-    strObj[16] = 1;                                     // width = 1
+    if (!strObj) { free(buf); return nullptr; }
+    void* buf_ptr = buf;
+    memcpy(strObj,      &buf_ptr, sizeof(void*));   // data
+    memcpy(strObj + 8,  &ncp,     sizeof(int64_t)); // len = CODE-POINT count
+    strObj[16] = width;                              // width
     bz_string_init_rc(strObj);  // #422: rc := 1 (producer's reference)
     return strObj;
 }
