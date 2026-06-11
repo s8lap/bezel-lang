@@ -28,6 +28,10 @@ void* bz_array_alloc(int64_t elem_size, int64_t initial_cap);
 // Return the current element count.
 int64_t bz_array_len(void* arr);
 
+// §4.14: allocate with n pre-filled (zero-initialized) slots; count == capacity == n.
+// Used by `new OwnedBuffer<T>(n)`.
+void* bz_array_alloc_count_n(int64_t elem_size, int64_t n);
+
 // Append one element (elem_size bytes) to the end. Grows capacity as needed.
 void bz_array_add(void* arr, const void* elem, int64_t elem_size);
 
@@ -489,6 +493,20 @@ bool    bz_file_exists(const char* path);
 bool    bz_file_delete(const char* path);
 int32_t bz_file_copy(const char* src, const char* dst, bool overwrite);
 int32_t bz_file_move(const char* src, const char* dst);
+
+// Higher-level File I/O helpers that work directly with bz_array_t* (per §7.3).
+// These are the codegen entry-points for File.ReadAllBytes/WriteAllBytes/WriteAllLines.
+
+// Read file into a freshly-allocated bz_array_t* of uint8_t (elem_size=1).
+// Returns the array on success (count == file bytes), or null on I/O error.
+void*   bz_file_read_all_bytes_arr(const char* path);
+
+// Write file from a bz_array_t* of uint8_t (elem_size=1). Returns 0 or -errno.
+int32_t bz_file_write_all_bytes_arr(const char* path, void* arr);
+
+// Write file from a bz_array_t* of bz_string* (Array<string>), joining with '\n'.
+// Returns 0 on success, -errno on I/O failure.
+int32_t bz_file_write_all_lines(const char* path, void* arr);
 
 bool    bz_dir_exists(const char* path);
 int32_t bz_dir_create(const char* path);   // creates all intermediate dirs
