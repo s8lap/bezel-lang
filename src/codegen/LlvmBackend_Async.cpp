@@ -545,9 +545,28 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+        pendingArgsDisposal_.reset();
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
         builder_.SetInsertPoint(entry);
-        bindParameters(fn, isInstance, &ms->params);
+        // fix #633 / §33.4: async Main(args: Array<string>) has C ABI signature
+        // `i32(i32 argc, ptr argv)`.  Build Array<string> before spilling params
+        // into the heap frame so the frame capture gets the real pointer.
+        if (isMain(ms) && !ms->params.empty()) {
+            auto argIt = fn->args().begin();
+            llvm::Value* argc = &*argIt++;
+            llvm::Value* argv = &*argIt;
+            auto* bz_args_fn = declareC("bz_args_array", ptrTy(), {i32(), ptrTy()});
+            llvm::AllocaInst* argsSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(
+                builder_.CreateCall(bz_args_fn, {argc, argv}, "main.args"),
+                argsSlot);
+            paramSlots_[ms->params[0]] = argsSlot;
+            pendingArgsDisposal_ = Disposal{argsSlot, nullptr};
+            pendingArgsDisposal_->collection = true;
+            pendingArgsDisposal_->collectionElemDisposer = stringElementReleaseThunk();
+        } else {
+            bindParameters(fn, isInstance, &ms->params);
+        }
 
         // outerTask = bz_task_alloc()
         auto* allocFn = declareC("bz_task_alloc", ptrTy(), {});
