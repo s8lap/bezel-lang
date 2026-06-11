@@ -1998,4 +1998,239 @@ BEZEL_TEST(cross_module_import, imported_generic_ctor_body_still_diagnosed_spec_
     BEZEL_EXPECT_TRUE(r->hadErrors);
 }
 
+// === #428 phase B — sema member-type substitution ============================
+//
+// §14.1 / §9 (#428 phase B sema fix): a field read on an imported generic record
+// must produce the SUBSTITUTED concrete type, not `?`.  The operator/method that
+// follows the field read is what fails when the type is unresolved.
+
+// (10) §14.1 / §9 (#428 phase B sema): arithmetic on an imported Box<int>.Value
+// field.  `b.Value + b.Value` failed with "operator + not defined for type ?"
+// before the fix (sema left the field type unsubstituted because the imported
+// TypeRef carries importedName="T" rather than an astNode).  After the fix the
+// field type is substituted to `int` and the operator resolves.
+BEZEL_TEST(cross_module_import,
+           imported_generic_record_field_arithmetic_typechecks_spec_14_1) {
+    ModuleMetadata dep = buildMetaFor(
+        "module BoxArithLib; "
+        "public record Box<T>(Value: T); ");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import BoxArithLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := new Box<int>(21); "
+        "    return b.Value + b.Value; "  // sema must type b.Value as int
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// (11) §14.1 / §9 (#428 phase B sema): string method (.Length) on an imported
+// Box<string>.Value field.  Before the fix the field typed as `?` and
+// `.Length` was rejected.  After: field is typed as `string`, `.Length` → `int`.
+BEZEL_TEST(cross_module_import,
+           imported_generic_record_field_string_method_typechecks_spec_14_1) {
+    ModuleMetadata dep = buildMetaFor(
+        "module BoxStrLib; "
+        "public record Box<T>(Value: T); ");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import BoxStrLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := new Box<string>(\"bezel\"); "
+        "    return b.Value.Length; "  // b.Value must be typed as string
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// (12) §14.1 / §9 (#428 phase B sema): comparison on imported Pair<int,int>
+// fields.  `p.First = p.Second` compares two int-typed results; if either field
+// were untyped the equality would reject.
+BEZEL_TEST(cross_module_import,
+           imported_generic_record_pair_field_comparison_typechecks_spec_14_1) {
+    ModuleMetadata dep = buildMetaFor(
+        "module PairCmpLib; "
+        "public record Pair<A, B>(First: A, Second: B); ");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import PairCmpLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var p := new Pair<int, int>(3, 7); "
+        "    if p.First = p.Second then "  // both must be int
+        "      return 0; "
+        "    end; "
+        "    return p.First; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// (13) §14.1 / §9 (#428 phase B sema): an imported record field passed as a
+// typed argument to a local method.  The method expects `int`; passing `b.Value`
+// where the field is inferred `int` must type-check without errors.
+BEZEL_TEST(cross_module_import,
+           imported_generic_record_field_as_method_arg_typechecks_spec_14_1) {
+    ModuleMetadata dep = buildMetaFor(
+        "module BoxArgLib; "
+        "public record Box<T>(Value: T); ");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import BoxArgLib; "
+        "public class Program "
+        "  public static method Double(x: int): int => x * 2; "
+        "  public static method Main(): int "
+        "    var b := new Box<int>(13); "
+        "    return Double(b.Value); "  // b.Value must be int to match param
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// (14) §14.1 / §2.6 (#428 phase B sema): AOT native build — arithmetic on
+// Box<int>.Value.  `b.Value + b.Value` where `Value = 21` must produce 42.
+// This is the full end-to-end proof that the codegen path works after the sema fix.
+BEZEL_TEST(cross_module_import,
+           imported_generic_record_field_arithmetic_native_spec_14_1) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_428_grmath_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module BoxMathLib; "
+        "public record Box<T>(Value: T); ");
+    writeSource(bSrc.path,
+        "module App; "
+        "import BoxMathLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := new Box<int>(21); "
+        "    return b.Value + b.Value; "  // 21 + 21 = 42
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency dep14;
+    dep14.metadataPath = aObj.path;
+    dep14.objectPath = aObj.path;
+    deps.push_back(dep14);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);  // 21 + 21
+}
+
+// (15) §14.1 / §2.6 (#428 phase B sema): AOT native build — string method on
+// Box<string>.Value.  `b.Value.Length` where Value = "bezel" must return 5.
+// Exercises the sema substitution for a string-typed field and the subsequent
+// .Length dispatch.
+BEZEL_TEST(cross_module_import,
+           imported_generic_record_field_string_length_native_spec_14_1) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_428_grstrlen_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module BoxStrNLib; "
+        "public record Box<T>(Value: T); ");
+    writeSource(bSrc.path,
+        "module App; "
+        "import BoxStrNLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := new Box<string>(\"bezel\"); "
+        "    return b.Value.Length; "  // "bezel".Length == 5
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency dep15;
+    dep15.metadataPath = aObj.path;
+    dep15.objectPath = aObj.path;
+    deps.push_back(dep15);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 5);  // "bezel".Length
+}
+
+// (16) §14.1 / §2.6 (#428 phase B sema): AOT native build — comparison on
+// imported Pair<int,double>.First and Second.  First=40, Second=2.5;
+// `p.First + int(p.Second)` must be 42 via the `with` path in modb.bzl.
+BEZEL_TEST(cross_module_import,
+           imported_generic_record_pair_comparison_native_spec_14_1) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_428_grpair2_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module GenPair2Lib; "
+        "public record Box<T>(Value: T); "
+        "public record Pair<A, B>(First: A, Second: B); ");
+    writeSource(bSrc.path,
+        "module App; "
+        "import GenPair2Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := new Box<string>(\"bezel\"); "
+        "    var p := new Pair<int, double>(40, 2.5); "
+        "    var b2 := b with Value := \"ok\" end; "
+        "    if b2.Value = \"ok\" and b.Value.Length = 5 then "
+        "      return p.First + int(p.Second); "  // 40 + 2 = 42
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency dep16;
+    dep16.metadataPath = aObj.path;
+    dep16.objectPath = aObj.path;
+    deps.push_back(dep16);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);  // 40 + int(2.5) = 42
+}
+
 }  // namespace bezel::module
