@@ -62,6 +62,19 @@ int64_t bz_array_len(void* arrp) {
     return arrp ? ((bz_array_t*)arrp)->count : 0;
 }
 
+// §4.14: allocate a bz_array_t with n pre-filled (zero-initialized) slots.
+// Used by `new OwnedBuffer<T>(n)` so that index-assignment data[i] := v is valid
+// for i in 0..<n without requiring Add() first. All n elements are calloc'd to 0.
+void* bz_array_alloc_count_n(int64_t elem_size, int64_t n) {
+    auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
+    if (n > 0) {
+        arr->data = calloc((size_t)n, (size_t)elem_size);
+        arr->capacity = n;
+        arr->count    = n;  // all slots are pre-populated (zero-valued)
+    }
+    return arr;
+}
+
 static void bz_array_grow(bz_array_t* arr, int64_t elem_size, int64_t min_cap) {
     int64_t new_cap = arr->capacity < 4 ? 4 : arr->capacity * 2;
     if (new_cap < min_cap) new_cap = min_cap;
@@ -1939,6 +1952,10 @@ void* bz_file_read_all_lines(const char* path) {
         if (i == len || buf[i] == '\n') {
             int64_t lineLen = i - start;
             if (lineLen > 0 && buf[start + lineLen - 1] == '\r') lineLen--;
+            // Skip a single trailing empty "line" produced by a terminal '\n'
+            // (mirrors .NET File.ReadAllLines, which returns n entries when
+            //  the file contains n lines each terminated by '\n').
+            if (i == len && lineLen == 0) break;
             // Build a bz.string struct: { data ptr, len i64, width i8 }
             char* lineData = (char*)malloc((size_t)(lineLen + 1));
             memcpy(lineData, buf + start, (size_t)lineLen);
@@ -1999,6 +2016,52 @@ int32_t bz_file_move(const char* src, const char* dst) {
     int32_t r = bz_file_copy(src, dst, true);
     if (r == 0) unlink(src);
     return r;
+}
+
+// §7.3: higher-level File.ReadAllBytes → bz_array_t* of uint8_t (elem_size=1).
+void* bz_file_read_all_bytes_arr(const char* path) {
+    uint8_t* buf; int64_t len;
+    if (bz_file_read_all_bytes(path, &buf, &len) != 0)
+        return nullptr;
+    void* arr = bz_array_alloc(1, len > 0 ? len : 1);
+    auto* a = (bz_array_t*)arr;
+    memcpy(a->data, buf, (size_t)len);
+    a->count = len;
+    free(buf);
+    return arr;
+}
+
+// §7.3: File.WriteAllBytes — write from bz_array_t* of uint8_t (elem_size=1).
+int32_t bz_file_write_all_bytes_arr(const char* path, void* arrp) {
+    if (!arrp) return bz_file_write_all_bytes(path, nullptr, 0);
+    auto* a = (bz_array_t*)arrp;
+    return bz_file_write_all_bytes(path, (const uint8_t*)a->data, a->count);
+}
+
+// §7.3: File.WriteAllLines — write bz_array_t* of bz_string* with '\n' between
+// lines.  Mirrors .NET File.WriteAllLines: each line is terminated with a newline
+// (including the last), so ReadAllLines sees exactly n lines.  The trailing '\n'
+// is excluded for the empty-array case to avoid a spurious blank file entry.
+// bz_string layout: { void* data (off 0), int64_t len (off 8), int8_t width (off 16) }.
+int32_t bz_file_write_all_lines(const char* path, void* arrp) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return -errno;
+    auto* a = (bz_array_t*)arrp;
+    int64_t n = a ? a->count : 0;
+    for (int64_t i = 0; i < n; ++i) {
+        // each element is a pointer to a bz_string header
+        void* sp = ((void**)a->data)[i];
+        if (sp) {
+            void* strData; int64_t strLen;
+            memcpy(&strData, sp, sizeof(void*));
+            memcpy(&strLen, (uint8_t*)sp + 8, sizeof(int64_t));
+            if (strLen > 0 && strData) fwrite(strData, 1, (size_t)strLen, f);
+        }
+        // terminate each line with '\n'; ReadAllLines strips it back out
+        fputc('\n', f);
+    }
+    fclose(f);
+    return 0;
 }
 
 bool bz_dir_exists(const char* path) {

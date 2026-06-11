@@ -4984,9 +4984,27 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return builder_.CreateCall(allocFn, {builder_.getInt64(elemSize)});
             }
             if (colName == "Array" || colName == "OwnedArray" ||
+                // §4.14: OwnedBuffer<T> uses the same bz_array_t* backing.
+                // new OwnedBuffer<T>(capacity) pre-allocates `capacity` slots
+                // (all zero-initialized), mirroring the Array no-arg ctor.
+                colName == "OwnedBuffer" ||
                 colName == "Stack" || colName == "OwnedStack" ||
                 colName == "Queue" || colName == "OwnedQueue" ||
                 colName == "Set" || colName == "OwnedSet") {
+                // For OwnedBuffer<T>(n): the arg is the capacity / initial count.
+                // Pre-allocate n slots AND set count=n so index-assignment is valid.
+                if (colName == "OwnedBuffer" && !ne.args.empty() && ne.args[0].value) {
+                    llvm::Value* nArg = lowerExpr(*ne.args[0].value);
+                    if (!nArg) return nullptr;
+                    if (!nArg->getType()->isIntegerTy(64))
+                        nArg = builder_.CreateSExt(nArg, i64());
+                    // bz_array_alloc_count_n: alloc with capacity n and set count=n.
+                    // (All slots are zero-initialized by calloc inside the runtime.)
+                    auto* fn = declareC("bz_array_alloc_count_n", ptrTy(),
+                                       {i64(), i64()});
+                    return builder_.CreateCall(fn,
+                        {builder_.getInt64(elemSize), nArg}, "ob.arr");
+                }
                 auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
                 return builder_.CreateCall(allocFn,
                     {builder_.getInt64(elemSize), builder_.getInt64(16)});

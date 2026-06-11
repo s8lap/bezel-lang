@@ -370,6 +370,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 !rt->astNode->name->parts.empty()) {
                 auto n = rt->astNode->name->parts[0];
                 if (n == "Array" || n == "OwnedArray" ||
+                    // §4.14: OwnedBuffer<T> is heap-allocated (bz_array_t*);
+                    // without this it fell through to i32 default → IR mismatch.
+                    n == "OwnedBuffer" ||
                     n == "Dictionary" || n == "OwnedDictionary" ||
                     n == "Stack" || n == "OwnedStack" ||
                     n == "Queue" || n == "OwnedQueue" ||

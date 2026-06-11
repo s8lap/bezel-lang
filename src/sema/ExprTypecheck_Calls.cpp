@@ -1637,14 +1637,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "Join")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                     }
-                    // File static methods
+                    // File static methods (§7.3)
                     if (colName == "File") {
                         if (m == "ReadAllText")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                         else if (m == "Exists" || m == "Delete")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
-                        // ReadAllLines → Array<string>; sema type set when callee
-                        // is typed explicitly (var lines: Array<string> := ...).
+                        // §7.3: ReadAllBytes → owned Array<byte>.
+                        else if (m == "ReadAllBytes")
+                            ctx_.setExprType(
+                                &ce, makeConcreteCollectionResult(
+                                    "Array", ctx_.primitiveTypeRef(P::Byte)));
+                        // ReadAllLines → owned Array<string>.
+                        else if (m == "ReadAllLines")
+                            ctx_.setExprType(
+                                &ce, makeConcreteCollectionResult(
+                                    "Array", ctx_.primitiveTypeRef(P::String)));
+                        // WriteAllBytes/WriteAllLines/Copy/Move/AppendAllText: void.
+                        // (no setExprType needed for void-returning calls)
                     }
                     // Path static methods
                     if (colName == "Path") {
