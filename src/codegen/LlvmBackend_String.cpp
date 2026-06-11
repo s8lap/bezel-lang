@@ -849,10 +849,11 @@ llvm::Value* Emitter::emitStringOrdCmp(llvm::Value* l, llvm::Value* r) {
 
 
 llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
-                                   const ast::MemberAccessExpr& ma) {
+                                   const ast::MemberAccessExpr& ma,
+                                   llvm::Value* self) {
     const auto& method = ma.member;
     if (!ma.target) return nullptr;
-    llvm::Value* self = lowerExpr(*ma.target);
+    if (!self) self = lowerExpr(*ma.target);
     if (!self) return nullptr;
 
     // Helpers for extracting the first string argument.
