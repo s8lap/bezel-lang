@@ -3778,7 +3778,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     cn == "Queue" || cn == "OwnedQueue" ||
                     cn == "Set" || cn == "OwnedSet" ||
                     cn == "LinkedList" || cn == "OwnedLinkedList" ||
-                    cn == "Dictionary" || cn == "OwnedDictionary";
+                    cn == "Dictionary" || cn == "OwnedDictionary" ||
+                    // §4.14 / issue #550: OwnedBuffer<T>.Count (bz_array_t-backed).
+                    cn == "OwnedBuffer";
                 bool hasCapacity = cn == "Array" || cn == "OwnedArray";
                 bool ok = ma.member == "Count" ? hasCount : hasCapacity;
                 if (ok) {
@@ -4542,23 +4544,41 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             mm == "ToString" || mm == "Equals" || mm == "GetHashCode" ||
             mm == "GetType" || mm == "ReferenceEquals" || mm == "Dispose";
         // §9.8 / issue #550: Serialize and Deserialize are synthesized for
-        // records/enums that declare ISerializable/IDeserializable. They have
-        // no MemberSymbol, so we must not fire "no member" on them.  We check
-        // the AST TypeDecl::baseTypes (TypeSymbol::baseTypes skips builtin
-        // interface bases like ISerializable because they carry no user TypeDecl).
+        // records/enums/serialized-tree-classes that declare
+        // ISerializable/IDeserializable. They have no MemberSymbol, so we must
+        // not fire "no member" on them.  We check the AST TypeDecl::baseTypes
+        // (TypeSymbol::baseTypes skips builtin interface bases like ISerializable
+        // because they carry no user TypeDecl).
         bool isSerializationSynthesizedMember = false;
         if ((mm == "Serialize" || mm == "Deserialize") && knownCompleteUserType &&
                 (targetType->kind == ast::TypeDeclKind::Record ||
-                 targetType->kind == ast::TypeDeclKind::Enum)) {
+                 targetType->kind == ast::TypeDeclKind::Enum ||
+                 targetType->kind == ast::TypeDeclKind::Class)) {
             auto* tdSer = dynamic_cast<const ast::TypeDecl*>(targetType->decl);
             if (tdSer) {
-                for (const auto& bt : tdSer->baseTypes) {
-                    if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                    const auto& bn = bt->name->parts.back();
-                    if (mm == "Serialize"   && bn == "ISerializable")   { isSerializationSynthesizedMember = true; break; }
-                    if (mm == "Deserialize" && bn == "IDeserializable") { isSerializationSynthesizedMember = true; break; }
+                // For classes: only synthesized when a serialized-class clause
+                // is present (§9.8 tier 2+). Without it the class must hand-write.
+                bool classOk = (targetType->kind != ast::TypeDeclKind::Class) ||
+                               (tdSer->serializedClass != nullptr);
+                if (classOk) {
+                    for (const auto& bt : tdSer->baseTypes) {
+                        if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                        const auto& bn = bt->name->parts.back();
+                        if (mm == "Serialize"   && bn == "ISerializable")   { isSerializationSynthesizedMember = true; break; }
+                        if (mm == "Deserialize" && bn == "IDeserializable") { isSerializationSynthesizedMember = true; break; }
+                    }
                 }
             }
+        }
+        // §9.8 tier 2: for a `serialized tree/graph/cyclic` class, set the
+        // return type of synthesized Deserialize so that inferred-type locals
+        // (`using var b2 := Box.Deserialize(d)`) get the right type.
+        if (isSerializationSynthesizedMember && mm == "Deserialize" &&
+                targetType->kind == ast::TypeDeclKind::Class) {
+            auto* retTy = ctx_.makeTypeRef();
+            retTy->kind = TypeRef::Kind::Named;
+            retTy->declaration = targetType;
+            ctx_.setExprType(&ma, retTy);
         }
         // #595 / §12 / §31: `Message` is an inherited member on any user class
         // that derives (directly or via a user-class chain) from a built-in

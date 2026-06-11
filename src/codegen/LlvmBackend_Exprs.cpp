@@ -1770,6 +1770,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     return builder_.CreateTrunc(cnt64, i32(), "ll.cnt");
                 }
             }
+            // §4.14 / §9.8 / issue #550: OwnedBuffer<T>.Count → bz_array_len.
+            // OwnedBuffer is array-backed (bz_array_t*) but is not in
+            // isCollectionTypeName (which lists element-owning collections).
+            {
+                bool isOB = tt && tt->kind == sema::TypeRef::Kind::Named &&
+                            !tt->declaration && tt->astNode && tt->astNode->name &&
+                            !tt->astNode->name->parts.empty() &&
+                            tt->astNode->name->parts[0] == "OwnedBuffer";
+                if (isOB) {
+                    llvm::Value* obj = lowerExpr(*ma->target);
+                    if (obj) {
+                        auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
+                        llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
+                        return builder_.CreateTrunc(cnt64, i32(), "ob.cnt");
+                    }
+                }
+            }
             if (isCollectionTypeName(tt)) {
                 // issues #343 / D8 / §4.10: a Set is dict-backed (records,
                 // primitives, AND strings — see lowerNew), so its Count comes

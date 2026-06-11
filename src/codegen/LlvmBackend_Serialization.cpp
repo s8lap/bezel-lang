@@ -1,12 +1,16 @@
 // LlvmBackend_Serialization.cpp — §9.8 / §2.14–2.15 synthesis codegen.
 //
-// Synthesised Serialize / Deserialize for records and enums (tier 1: tree
-// shape, Binary format only).  BinarySerializer / BinaryDeserializer
-// construction, ToBytes, AsReadOnlySpan, and Dispose forwarding.
+// Tier 1: records and enums (tree shape, Binary format only).
+// Tier 2: classes with `serialized tree` clause (§9.8 v0.136).
+//         `serialized graph`, `serialized cyclic`, and `polymorphic` emit
+//         a clean tier-boundary diagnostic (not yet implemented).
+//
+// BinarySerializer / BinaryDeserializer construction, ToBytes, AsReadOnlySpan,
+// and Dispose forwarding.
 //
 // Spec: lang §9.8; stdlib §2.14 (ISerializer/IDeserializer), §2.15
 // (BinarySerializer/BinaryDeserializer), §4.14 (OwnedBuffer<T>/Span<T>).
-// Issue #550, tier 1.
+// Issue #550, tiers 1+2.
 
 #include "codegen/LlvmBackend_impl.hpp"
 
@@ -14,6 +18,7 @@
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
+#include <cctype>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -71,6 +76,81 @@ static std::string_view enumConstWireName(const ast::EnumConstant& ec) {
     if (ec.serialized && !ec.serialized->name.empty())
         return ec.serialized->name;
     return ec.name;
+}
+
+// ---------------------------------------------------------------------------
+// Class serialization helpers (§9.8 tier 2, v0.136)
+// ---------------------------------------------------------------------------
+
+// Describes one serialized component of a class.
+struct ClassComponent {
+    std::string wireName;    // wire name (serialized "x" override or declared name)
+    std::string declName;    // declared identifier (matches ctor param name)
+    const sema::TypeRef* ty; // resolved component type
+    unsigned fieldIdx;       // index in classStruct (for GEP on serialize)
+    bool isSkip    = false;  // serialized skip
+    bool isOptional = false; // serialized optional
+    bool isOwned   = false;  // `owned` class-typed component (not a value field)
+};
+
+// Collect the serialized components of a `serialized tree` class in declaration
+// order.  Per §9.8: owned and value-typed fields/auto-properties.  Back-edges
+// (non-owned class-typed fields) are tier 3 (serialized graph/cyclic) and are
+// excluded here.
+//
+// `storage` must already be populated by collectInstanceStorage().
+// `fieldIndex_` must be current (call classStruct(ts) first).
+static void collectClassComponents(
+        const TypeSymbol* ts,
+        const std::vector<const Symbol*>& storage,
+        const std::unordered_map<const Symbol*, unsigned>& fieldIndex,
+        sema::SemaContext& ctx,
+        std::vector<ClassComponent>& out) {
+    if (!ts || !ts->decl) return;
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+    if (!td) return;
+
+    for (const Symbol* m : storage) {
+        // Find the field index.
+        auto idxIt = fieldIndex.find(m);
+        if (idxIt == fieldIndex.end()) continue;
+
+        ClassComponent comp;
+        comp.fieldIdx = idxIt->second;
+        comp.declName = std::string(m->name);
+        comp.ty       = nullptr;
+
+        // Determine ty, wireName, skip, optional from the symbol's decl.
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
+            // Check if owned modifier is set.
+            bool isOwned = false;
+            for (auto mod : fd->modifiers) if (mod == "owned") { isOwned = true; break; }
+            comp.isOwned = isOwned;
+            comp.wireName = comp.declName;
+            comp.ty = ctx.resolvedType(*fd->type);
+        } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl)) {
+            if (pd->serialized) {
+                comp.isSkip     = pd->serialized->isSkip;
+                comp.isOptional = pd->serialized->isOptional;
+                if (!pd->serialized->name.empty())
+                    comp.wireName = std::string(pd->serialized->name);
+                else
+                    comp.wireName = comp.declName;
+            } else {
+                comp.wireName = comp.declName;
+            }
+            if (pd->type) comp.ty = ctx.resolvedType(*pd->type);
+        } else {
+            // Fallback (no decl — e.g. imported field).
+            comp.wireName = comp.declName;
+            comp.ty = ctx.importedMemberType(m);
+        }
+
+        if (comp.isSkip) { out.push_back(std::move(comp)); continue; }
+        if (!comp.ty) continue;
+
+        out.push_back(std::move(comp));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +427,16 @@ void Emitter::emitSerializeField(llvm::Value* val,
                 recVal = builder_.CreateLoad(st, recVal);
             emitRecordSerialize(fieldTs, recVal, serPtr);
             return;
+        }
+
+        if (fieldTs->kind == ast::TypeDeclKind::Class) {
+            // §9.8 tier 2: owned class-typed component.
+            // `val` is a ptr to the class instance.
+            auto* td = dynamic_cast<const ast::TypeDecl*>(fieldTs->decl);
+            if (td && td->serializedClass) {
+                emitClassSerialize(fieldTs, val, serPtr);
+                return;
+            }
         }
     }
 
@@ -786,6 +876,15 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
 
         if (fieldTs->kind == ast::TypeDeclKind::Record)
             return emitRecordDeserialize(fieldTs, derPtr);
+
+        if (fieldTs->kind == ast::TypeDeclKind::Class) {
+            // §9.8 tier 2: deserialize a class-typed component.
+            // Returns an owned ptr.
+            auto* td = dynamic_cast<const ast::TypeDecl*>(fieldTs->decl);
+            if (td && td->serializedClass) {
+                return emitClassDeserialize(fieldTs, derPtr);
+            }
+        }
     }
 
     return nullptr;
@@ -887,6 +986,352 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
 }
 
 // ---------------------------------------------------------------------------
+// Emitter::emitClassSerialize  §9.8 tier 2
+//
+// Synthesized Serialize body for a `serialized tree` class.
+// `objPtr` is an opaque ptr to the class instance (ptr to classStruct).
+// Iterates the class's serialized components in declaration order, GEPs each
+// field, and calls emitSerializeField for its value.
+// ---------------------------------------------------------------------------
+void Emitter::emitClassSerialize(const TypeSymbol* ts,
+                                 llvm::Value* objPtr,
+                                 llvm::Value* serPtr) {
+    if (!ts || !ts->decl) return;
+
+    // Ensure classStruct is built and fieldIndex_ is populated.
+    llvm::StructType* st = classStruct(ts);
+
+    std::vector<const Symbol*> storage;
+    collectInstanceStorage(ts, storage);
+
+    std::vector<ClassComponent> comps;
+    collectClassComponents(ts, storage, fieldIndex_, ctx_, comps);
+
+    llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
+
+    // Determine field count for BeginObject.  Non-skip, non-optional fields are
+    // always included.  Optional nullable fields are included only when non-null
+    // (§9.8: "serialized optional: omit null on write").  If there are optional
+    // fields, the count must be computed at runtime.
+    uint32_t staticCount = 0;      // non-skip non-optional fields (always written)
+    bool hasOptionals = false;
+    for (const auto& comp : comps) {
+        if (comp.isSkip) continue;
+        if (!comp.ty) continue;
+        if (comp.isOptional && comp.ty->nullable) { hasOptionals = true; continue; }
+        ++staticCount;
+    }
+
+    // Pre-load all optional nullable fields' null flags to compute runtime count.
+    // For each optional comp, we load the field value and check for null.
+    // Build: count = staticCount + sum(optional_i is non-null ? 1 : 0)
+    struct OptInfo {
+        llvm::Value* isNonNull;  // i1: true = non-null (should be written)
+        std::size_t compIdx;     // index into comps
+    };
+    std::vector<OptInfo> optInfos;
+    if (hasOptionals) {
+        for (std::size_t i = 0; i < comps.size(); ++i) {
+            const auto& comp = comps[i];
+            if (comp.isSkip || !comp.ty) continue;
+            if (!(comp.isOptional && comp.ty->nullable)) continue;
+            llvm::Type* llvmFty = lowerTypeRef(comp.ty);
+            if (!llvmFty) continue;
+            llvm::Value* fieldPtr =
+                builder_.CreateStructGEP(st, objPtr, comp.fieldIdx, "cser.ofp");
+            llvm::Value* fieldVal = builder_.CreateLoad(llvmFty, fieldPtr, "cser.ofv");
+            llvm::Value* isNull;
+            if (fieldVal->getType()->isPointerTy()) {
+                isNull = builder_.CreateICmpEQ(
+                    fieldVal, llvm::ConstantPointerNull::get(ptrTy()), "cser.oisnull");
+            } else if (fieldVal->getType()->isStructTy()) {
+                llvm::Value* hv = builder_.CreateExtractValue(fieldVal, {0u}, "cser.ohv");
+                isNull = builder_.CreateICmpEQ(hv, builder_.getInt8(0), "cser.oisnull");
+            } else {
+                isNull = builder_.getFalse();
+            }
+            llvm::Value* isNonNull = builder_.CreateNot(isNull, "cser.onnull");
+            optInfos.push_back({isNonNull, i});
+        }
+    }
+
+    // Compute the dynamic field count.
+    llvm::Value* dynCount = builder_.getInt32((int32_t)staticCount);
+    for (const auto& oi : optInfos) {
+        llvm::Value* inc = builder_.CreateZExt(oi.isNonNull, i32(), "cser.inc");
+        dynCount = builder_.CreateAdd(dynCount, inc, "cser.cnt");
+    }
+
+    // BeginObject(dynamic_field_count).
+    auto* beginFn = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
+    builder_.CreateCall(beginFn, {serPtr, dynCount});
+
+    // Map optional comp index to its isNonNull flag for the write-gate check.
+    std::unordered_map<std::size_t, llvm::Value*> optNonNullMap;
+    for (const auto& oi : optInfos)
+        optNonNullMap[oi.compIdx] = oi.isNonNull;
+
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        const auto& comp = comps[i];
+        if (comp.isSkip) continue;
+        if (!comp.ty) continue;
+
+        llvm::Value* fieldPtr =
+            builder_.CreateStructGEP(st, objPtr, comp.fieldIdx, "cser.fp");
+        const sema::TypeRef* fty = comp.ty;
+        llvm::Type* llvmFty = lowerTypeRef(fty);
+        if (!llvmFty) continue;
+
+        // Handle `serialized optional`: on write, omit null nullable fields.
+        if (comp.isOptional && fty->nullable) {
+            // The isNonNull flag was already computed; use it as the write-gate.
+            auto nit = optNonNullMap.find(i);
+            llvm::Value* isNonNull = (nit != optNonNullMap.end())
+                ? nit->second : builder_.getTrue();
+            auto* writeBB = llvm::BasicBlock::Create(llvm_, "cser.opt.write", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "cser.opt.end",   currentFn_);
+            builder_.CreateCondBr(isNonNull, writeBB, endBB);
+            builder_.SetInsertPoint(writeBB);
+            {
+                // Re-load the field value (using the same fieldPtr already computed).
+                llvm::Value* fieldVal = builder_.CreateLoad(llvmFty, fieldPtr, "cser.fv");
+                llvm::Value* nameStr = lowerStringLiteral(
+                    "\"" + comp.wireName + "\"", false);
+                auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
+                                             {ptrTy(), ptrTy()});
+                builder_.CreateCall(writeNameFn, {serPtr, nameStr});
+                emitSerializeField(fieldVal, fty, serPtr);
+            }
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            continue;
+        }
+
+        // Standard (non-optional) field: always write.
+        llvm::Value* fieldVal = builder_.CreateLoad(llvmFty, fieldPtr, "cser.fv");
+        llvm::Value* nameStr = lowerStringLiteral(
+            "\"" + comp.wireName + "\"", false);
+        auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
+                                     {ptrTy(), ptrTy()});
+        builder_.CreateCall(writeNameFn, {serPtr, nameStr});
+        emitSerializeField(fieldVal, fty, serPtr);
+    }
+
+    // EndObject.
+    auto* endFn = declareC("bz_binser_end_object", voidTy, {ptrTy()});
+    builder_.CreateCall(endFn, {serPtr});
+}
+
+// ---------------------------------------------------------------------------
+// Emitter::emitClassDeserialize  §9.8 tier 2
+//
+// Synthesized Deserialize body for a `serialized tree` class.
+// Returns an owned ptr to the newly constructed class instance.
+//
+// Algorithm:
+//   1. Read all non-skip serialized components into local slots.
+//   2. Allocate the class via calloc + emitInstanceInit.
+//   3. Find the unique constructor matching serialized components by name.
+//   4. Call that constructor with the deserialized values.
+//   5. Return the owned ptr.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
+                                           llvm::Value* derPtr) {
+    if (!ts || !ts->decl) return llvm::ConstantPointerNull::get(ptrTy());
+
+    llvm::StructType* st = classStruct(ts);
+    llvm::Type* voidTy   = llvm::Type::getVoidTy(llvm_);
+
+    std::vector<const Symbol*> storage;
+    collectInstanceStorage(ts, storage);
+
+    std::vector<ClassComponent> comps;
+    collectClassComponents(ts, storage, fieldIndex_, ctx_, comps);
+
+    // Allocate local slots for each non-skip component.
+    std::vector<llvm::AllocaInst*> slots(comps.size(), nullptr);
+    for (unsigned i = 0; i < comps.size(); ++i) {
+        if (comps[i].isSkip || !comps[i].ty) continue;
+        llvm::Type* lt = lowerTypeRef(comps[i].ty);
+        if (!lt) continue;
+        llvm::AllocaInst* slot = entryAlloca(lt);
+        builder_.CreateStore(llvm::Constant::getNullValue(lt), slot);
+        slots[i] = slot;
+    }
+
+    // BeginObject → read field count.
+    auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
+    llvm::Value* fieldCount = builder_.CreateCall(beginFn, {derPtr}, "cdeser.cnt");
+
+    // Loop over fieldCount, reading each field name and dispatching.
+    auto* loopHdr  = llvm::BasicBlock::Create(llvm_, "cdeser.hdr",  currentFn_);
+    auto* loopBody = llvm::BasicBlock::Create(llvm_, "cdeser.body", currentFn_);
+    auto* loopEnd  = llvm::BasicBlock::Create(llvm_, "cdeser.lend", currentFn_);
+
+    llvm::AllocaInst* idxSlot = entryAlloca(i32());
+    builder_.CreateStore(builder_.getInt32(0), idxSlot);
+    builder_.CreateBr(loopHdr);
+
+    builder_.SetInsertPoint(loopHdr);
+    llvm::Value* idx  = builder_.CreateLoad(i32(), idxSlot, "cdeser.idx");
+    llvm::Value* cond = builder_.CreateICmpSLT(idx, fieldCount, "cdeser.more");
+    builder_.CreateCondBr(cond, loopBody, loopEnd);
+
+    builder_.SetInsertPoint(loopBody);
+
+    auto* readNameFn = declareC("bz_binder_read_field_name", ptrTy(), {ptrTy()});
+    llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "cdeser.fname");
+
+    auto* cmpFn = declareC("bz_string_compare", i32(),
+                           {ptrTy(), i64(), ptrTy(), i64(), i32()});
+    auto* strTy = stringType();
+
+    auto* skipBB  = llvm::BasicBlock::Create(llvm_, "cdeser.skip",  currentFn_);
+    auto* afterBB = llvm::BasicBlock::Create(llvm_, "cdeser.after", currentFn_);
+
+    for (unsigned ci = 0; ci < comps.size(); ++ci) {
+        const ClassComponent& comp = comps[ci];
+        if (comp.isSkip || !slots[ci]) continue;
+
+        const std::string& wn = comp.wireName;
+        llvm::Value* litStr = lowerStringLiteral("\"" + wn + "\"", false);
+
+        llvm::Value* litData  = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(strTy, litStr, 0), "clit.data");
+        llvm::Value* litLen   = builder_.CreateLoad(i64(),
+            builder_.CreateStructGEP(strTy, litStr, 1), "clit.len");
+        llvm::Value* nameData = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(strTy, namePtr, 0), "cname.data");
+        llvm::Value* nameLen  = builder_.CreateLoad(i64(),
+            builder_.CreateStructGEP(strTy, namePtr, 1), "cname.len");
+
+        llvm::Value* cmpRes = builder_.CreateCall(cmpFn,
+            {nameData, nameLen, litData, litLen, builder_.getInt32(0)}, "cdeser.cmp");
+        llvm::Value* isMatch = builder_.CreateICmpEQ(
+            cmpRes, builder_.getInt32(0), "cdeser.match");
+
+        auto* readBB = llvm::BasicBlock::Create(llvm_, "cdeser.rd", currentFn_);
+        auto* nextBB = llvm::BasicBlock::Create(llvm_, "cdeser.nd", currentFn_);
+        builder_.CreateCondBr(isMatch, readBB, nextBB);
+
+        builder_.SetInsertPoint(readBB);
+        {
+            llvm::Value* fv = emitDeserializeField(comp.ty, derPtr);
+            if (fv && slots[ci]) {
+                llvm::Type* lt = lowerTypeRef(comp.ty);
+                if (fv->getType() == lt)
+                    builder_.CreateStore(fv, slots[ci]);
+            }
+            auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
+            builder_.CreateCall(relFn, {namePtr});
+        }
+        builder_.CreateBr(afterBB);
+
+        builder_.SetInsertPoint(nextBB);
+    }
+
+    // No match → SkipValue.
+    builder_.CreateBr(skipBB);
+    builder_.SetInsertPoint(skipBB);
+    {
+        auto* skipFn = declareC("bz_binder_skip_value", voidTy, {ptrTy()});
+        builder_.CreateCall(skipFn, {derPtr});
+        auto* relFn  = declareC("bz_string_release", voidTy, {ptrTy()});
+        builder_.CreateCall(relFn, {namePtr});
+    }
+    builder_.CreateBr(afterBB);
+
+    builder_.SetInsertPoint(afterBB);
+    {
+        llvm::Value* newIdx = builder_.CreateAdd(idx, builder_.getInt32(1), "cdeser.i1");
+        builder_.CreateStore(newIdx, idxSlot);
+    }
+    builder_.CreateBr(loopHdr);
+
+    builder_.SetInsertPoint(loopEnd);
+
+    // EndObject.
+    auto* endFn = declareC("bz_binder_end_object", voidTy, {ptrTy()});
+    builder_.CreateCall(endFn, {derPtr});
+
+    // Allocate the class instance.
+    llvm::Value* sizeofSt = builder_.CreatePtrToInt(
+        builder_.CreateGEP(st, llvm::ConstantPointerNull::get(ptrTy()),
+                           {builder_.getInt32(1)}),
+        i64());
+    llvm::Value* obj = builder_.CreateCall(callocFn(), {builder_.getInt64(1), sizeofSt});
+
+    // Run field initializers (emitInstanceInit).
+    {
+        llvm::Value* savedThis = currentThis_;
+        currentThis_ = obj;
+        emitInstanceInit(ts, obj, st);
+        currentThis_ = savedThis;
+    }
+
+    // §9.8 v0.136: find the unique constructor whose parameter count matches
+    // the number of ALL serialized components (skip + non-skip).  Arguments
+    // are passed in component declaration order (positional):
+    //   - non-skip component: the deserialized value from its slot
+    //   - skip component:     default(T) (zero/null — §9.8 "supply default(T)")
+    //
+    // This positional approach handles the typical Bezel idiom where the ctor
+    // param is a camelCase abbreviation of the PascalCase property (e.g. `v`
+    // for property `Value`, or `x` for property `X`) — no name correspondence
+    // is assumed; only the COUNT and ORDER are used.
+    sema::ConstructorSymbol* matchedCtor = nullptr;
+    for (Symbol* m : ts->members) {
+        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) continue;
+        // Match: param count must equal total component count.
+        if (cd->params.size() == comps.size()) {
+            matchedCtor = cs;
+            break;
+        }
+    }
+
+    if (matchedCtor) {
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(matchedCtor->decl);
+        auto it  = ctorFns_.find(matchedCtor);
+        if (it != ctorFns_.end() && cd) {
+            // Build the argument list in component declaration order (= ctor param
+            // order under the positional convention).
+            // Non-skip components: supply the deserialized value from the slot.
+            // Skip components: supply default(T) (zero/null).
+            std::vector<llvm::Value*> args;
+            args.push_back(obj);  // `this`
+
+            auto* fnTy = it->second->getFunctionType();
+            bool  ok   = true;
+            for (std::size_t ci = 0; ci < comps.size(); ++ci) {
+                if (!comps[ci].ty) { ok = false; break; }
+                llvm::Type* lt = lowerTypeRef(comps[ci].ty);
+                if (!lt) { ok = false; break; }
+                llvm::Value* fv;
+                if (comps[ci].isSkip || !slots[ci]) {
+                    // Skip component or unresolved slot → default(T).
+                    fv = llvm::Constant::getNullValue(lt);
+                } else {
+                    fv = builder_.CreateLoad(lt, slots[ci], "cdeser.arg");
+                }
+                // Coerce to ctor param type if needed.
+                if (ci + 1 < fnTy->getNumParams())
+                    fv = coerceNumericToType(fv, fnTy->getParamType(ci + 1), false);
+                args.push_back(fv);
+            }
+            if (ok && args.size() == it->second->arg_size()) {
+                builder_.CreateCall(it->second, args);
+                emitNewPendingCheck(obj);
+            }
+        }
+    }
+
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
 // Emitter::isSerializationCall
 //
 // Returns true iff the call is a serialization-related call that should be
@@ -898,15 +1343,20 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
     const std::string_view mn = ma.member;
     if (!ma.target) return false;
 
-    // BinarySerializer / BinaryDeserializer instance methods.
+    // BinarySerializer / BinaryDeserializer / ISerializer / IDeserializer
+    // instance methods.
     auto* recvTy = ctx_.exprType(*ma.target);
     if (recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty()) {
         const std::string_view rcn = recvTy->astNode->name->parts[0];
         if (rcn == "BinarySerializer" || rcn == "BinaryDeserializer") return true;
-        // OwnedBuffer<byte>.AsReadOnlySpan() / AsSpan().
+        // §2.14: ISerializer / IDeserializer methods (used in hand-written
+        // Serialize/Deserialize bodies; the concrete object is always a
+        // BinarySerializer* / BinaryDeserializer* at runtime).
+        if (rcn == "ISerializer" || rcn == "IDeserializer") return true;
+        // OwnedBuffer<byte>.AsReadOnlySpan() / AsSpan() / .Count.
         if ((rcn == "OwnedBuffer" || rcn == "Array") &&
-            (mn == "AsReadOnlySpan" || mn == "AsSpan")) {
+            (mn == "AsReadOnlySpan" || mn == "AsSpan" || mn == "Count")) {
             bool isByte = !recvTy->genericArgs.empty() &&
                 recvTy->genericArgs[0] &&
                 recvTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
@@ -915,7 +1365,7 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
         }
     }
 
-    // Synthesized Serialize on record/enum.
+    // Synthesized Serialize on record/enum/class.
     if (mn == "Serialize" && call.args.size() == 1) {
         auto* recvTy2 = ctx_.exprType(*ma.target);
         if (recvTy2 && recvTy2->declaration) {
@@ -925,13 +1375,18 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
                 declaresConformance(ts, "ISerializable") &&
                 !hasHandWrittenMethod(ts, "Serialize"))
                 return true;
+            // §9.8 tier 2: synthesized Serialize on a class with serialized clause.
+            if (ts->kind == ast::TypeDeclKind::Class &&
+                declaresConformance(ts, "ISerializable") &&
+                !hasHandWrittenMethod(ts, "Serialize")) {
+                auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+                if (td && td->serializedClass) return true;
+            }
         }
     }
 
-    // Synthesized static Deserialize on record/enum type name.
+    // Synthesized static Deserialize on record/enum/class type name.
     if (mn == "Deserialize" && call.args.size() == 1) {
-        // Instance Deserialize on record (rare but possible if hand-written?)
-        // Check for static: target resolves to a TypeSymbol.
         const sema::Symbol* sym = ctx_.exprSymbol(*ma.target);
         if (auto* ts = dynamic_cast<const TypeSymbol*>(sym)) {
             if ((ts->kind == ast::TypeDeclKind::Record ||
@@ -939,6 +1394,13 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
                 declaresConformance(ts, "IDeserializable") &&
                 !hasHandWrittenMethod(ts, "Deserialize"))
                 return true;
+            // §9.8 tier 2: synthesized Deserialize on a class with serialized clause.
+            if (ts->kind == ast::TypeDeclKind::Class &&
+                declaresConformance(ts, "IDeserializable") &&
+                !hasHandWrittenMethod(ts, "Deserialize")) {
+                auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+                if (td && td->serializedClass) return true;
+            }
         }
     }
 
@@ -1004,6 +1466,114 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
             return nullptr;
         }
 
+        // §2.14: ISerializer — forwarded to bz_binser_* functions.
+        // The concrete object is always a BinarySerializer* at runtime.
+        if (rcn == "ISerializer") {
+            llvm::Value* ser = lowerExpr(*ma->target);
+            if (!ser) return nullptr;
+            auto voidTy = llvm::Type::getVoidTy(llvm_);
+
+            if (methodName == "BeginObject" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* cnt = lowerExpr(*call.args[0].value);
+                if (!cnt) return nullptr;
+                cnt = builder_.CreateSExtOrTrunc(cnt, i32(), "begin.cnt");
+                auto* fn = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
+                builder_.CreateCall(fn, {ser, cnt});
+                return nullptr;
+            }
+            if (methodName == "EndObject" && call.args.empty()) {
+                auto* fn = declareC("bz_binser_end_object", voidTy, {ptrTy()});
+                builder_.CreateCall(fn, {ser});
+                return nullptr;
+            }
+            if (methodName == "WriteFieldName" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* nm = lowerExpr(*call.args[0].value);
+                if (!nm) return nullptr;
+                auto* fn = declareC("bz_binser_write_field_name", voidTy, {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ser, nm});
+                return nullptr;
+            }
+            if (methodName == "WriteInt" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                v = builder_.CreateSExtOrTrunc(v, i64(), "wrint.v");
+                auto* fn = declareC("bz_binser_write_int", voidTy, {ptrTy(), i64()});
+                builder_.CreateCall(fn, {ser, v});
+                return nullptr;
+            }
+            if (methodName == "WriteUInt" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                v = builder_.CreateZExtOrTrunc(v, i64(), "wruint.v");
+                auto* fn = declareC("bz_binser_write_uint", voidTy, {ptrTy(), i64()});
+                builder_.CreateCall(fn, {ser, v});
+                return nullptr;
+            }
+            if (methodName == "WriteFloat" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                if (!v->getType()->isDoubleTy())
+                    v = builder_.CreateFPExt(v, llvm::Type::getDoubleTy(llvm_), "wrflt.v");
+                auto* fn = declareC("bz_binser_write_float", voidTy,
+                    {ptrTy(), llvm::Type::getDoubleTy(llvm_)});
+                builder_.CreateCall(fn, {ser, v});
+                return nullptr;
+            }
+            if (methodName == "WriteBool" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                v = builder_.CreateZExtOrTrunc(v, i8(), "wrbool.v");
+                auto* fn = declareC("bz_binser_write_bool", voidTy, {ptrTy(), i8()});
+                builder_.CreateCall(fn, {ser, v});
+                return nullptr;
+            }
+            if (methodName == "WriteString" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                auto* fn = declareC("bz_binser_write_string", voidTy, {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ser, v});
+                return nullptr;
+            }
+            if (methodName == "WriteChar" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                v = builder_.CreateSExtOrTrunc(v, i32(), "wrchar.v");
+                auto* fn = declareC("bz_binser_write_char", voidTy, {ptrTy(), i32()});
+                builder_.CreateCall(fn, {ser, v});
+                return nullptr;
+            }
+            if (methodName == "WriteNull" && call.args.empty()) {
+                auto* fn = declareC("bz_binser_write_null", voidTy, {ptrTy()});
+                builder_.CreateCall(fn, {ser});
+                return nullptr;
+            }
+            if (methodName == "BeginArray" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* cnt = lowerExpr(*call.args[0].value);
+                if (!cnt) return nullptr;
+                cnt = builder_.CreateSExtOrTrunc(cnt, i32(), "bgarr.cnt");
+                auto* fn = declareC("bz_binser_begin_array", voidTy, {ptrTy(), i32()});
+                builder_.CreateCall(fn, {ser, cnt});
+                return nullptr;
+            }
+            if (methodName == "EndArray" && call.args.empty()) {
+                auto* fn = declareC("bz_binser_end_array", voidTy, {ptrTy()});
+                builder_.CreateCall(fn, {ser});
+                return nullptr;
+            }
+            return nullptr;
+        }
+
+        // §2.14: IDeserializer — forwarded to bz_binder_* functions.
+        if (rcn == "IDeserializer") {
+            llvm::Value* der = lowerExpr(*ma->target);
+            if (!der) return nullptr;
+            // IDeserializer methods not yet needed in hand-written Deserialize
+            // bodies (no test exercises this path in tier 2). Return nullptr to
+            // fall through gracefully.
+            (void)der;
+            return nullptr;
+        }
+
         // OwnedBuffer<byte>.AsReadOnlySpan() → span {ptr, 0, count}
         if (rcn == "OwnedBuffer" || rcn == "Array") {
             bool isOwnedBuffer = (rcn == "OwnedBuffer");
@@ -1012,22 +1582,30 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 recvTy->genericArgs[0] &&
                 recvTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
                 recvTy->genericArgs[0]->primitive == sema::PrimitiveType::Byte;
-            if (isByteBuffer &&
-                (methodName == "AsReadOnlySpan" || methodName == "AsSpan") &&
-                call.args.empty()) {
-                llvm::Value* arr = lowerExpr(*ma->target);
-                if (!arr) return nullptr;
-                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-                llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
-                llvm::Value* count   = builder_.CreateTrunc(count64, i32(), "ob.cnt32");
-                return buildArraySpan(arr, builder_.getInt32(0), count);
+            if (isByteBuffer && call.args.empty()) {
+                if (methodName == "AsReadOnlySpan" || methodName == "AsSpan") {
+                    llvm::Value* arr = lowerExpr(*ma->target);
+                    if (!arr) return nullptr;
+                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
+                    llvm::Value* count   = builder_.CreateTrunc(count64, i32(), "ob.cnt32");
+                    return buildArraySpan(arr, builder_.getInt32(0), count);
+                }
+                if (methodName == "Count") {
+                    // OwnedBuffer<byte>.Count → bz_array_len → i32
+                    llvm::Value* arr = lowerExpr(*ma->target);
+                    if (!arr) return nullptr;
+                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
+                    return builder_.CreateTrunc(count64, i32(), "ob.cnt32");
+                }
             }
             (void)isOwnedBuffer;
         }
     }
 
     // -----------------------------------------------------------------------
-    // Synthesized Serialize(s: ISerializer) on a record or enum receiver.
+    // Synthesized Serialize(s: ISerializer) on a record, enum, or class.
     // -----------------------------------------------------------------------
     if (methodName == "Serialize" && call.args.size() == 1 && call.args[0].value) {
         auto* recvTy2 = ctx_.exprType(*ma->target);
@@ -1036,9 +1614,16 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
             const TypeSymbol* ts = recvTy2->declaration;
             bool isRecord = ts->kind == ast::TypeDeclKind::Record;
             bool isEnum   = ts->kind == ast::TypeDeclKind::Enum;
-            if ((isRecord || isEnum) &&
+            bool isClass  = ts->kind == ast::TypeDeclKind::Class;
+            if ((isRecord || isEnum || isClass) &&
                 declaresConformance(ts, "ISerializable") &&
                 !hasHandWrittenMethod(ts, "Serialize")) {
+
+                if (isClass) {
+                    auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+                    if (!td || !td->serializedClass) return nullptr;
+                }
+
                 llvm::Value* serArg = lowerExpr(*call.args[0].value);
                 if (!serArg) return nullptr;
                 llvm::Value* recv = lowerExpr(*ma->target);
@@ -1049,11 +1634,13 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                     if (recv->getType()->isPointerTy())
                         recv = builder_.CreateLoad(st, recv);
                     emitRecordSerialize(ts, recv, serArg);
-                } else {
-                    // Enum: recv is i32.
+                } else if (isEnum) {
                     if (!recv->getType()->isIntegerTy(32))
                         recv = builder_.CreateSExtOrTrunc(recv, i32(), "enum.v");
                     emitEnumSerialize(ts, recv, serArg);
+                } else {
+                    // Class: recv is a ptr to the class instance.
+                    emitClassSerialize(ts, recv, serArg);
                 }
                 return nullptr;  // void method
             }
@@ -1061,26 +1648,32 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
     }
 
     // -----------------------------------------------------------------------
-    // Synthesized static Deserialize(d: IDeserializer) on a record or enum type.
+    // Synthesized static Deserialize(d: IDeserializer) on a record, enum, or class.
     // The callee is a MemberAccessExpr with target = IdentifierExpr(<TypeName>).
     // -----------------------------------------------------------------------
     if (methodName == "Deserialize" && call.args.size() == 1 && call.args[0].value) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
         if (id) {
-            // Resolve the identifier to a TypeSymbol.
             const sema::Symbol* sym = ctx_.exprSymbol(*ma->target);
             const TypeSymbol* ts = dynamic_cast<const TypeSymbol*>(sym);
-            if (ts && (ts->kind == ast::TypeDeclKind::Record ||
-                       ts->kind == ast::TypeDeclKind::Enum) &&
-                declaresConformance(ts, "IDeserializable") &&
+            if (ts && declaresConformance(ts, "IDeserializable") &&
                 !hasHandWrittenMethod(ts, "Deserialize")) {
-                llvm::Value* derArg = lowerExpr(*call.args[0].value);
-                if (!derArg) return nullptr;
-
-                if (ts->kind == ast::TypeDeclKind::Record)
-                    return emitRecordDeserialize(ts, derArg);
-                else
-                    return emitEnumDeserialize(ts, derArg);
+                if (ts->kind == ast::TypeDeclKind::Record ||
+                    ts->kind == ast::TypeDeclKind::Enum) {
+                    llvm::Value* derArg = lowerExpr(*call.args[0].value);
+                    if (!derArg) return nullptr;
+                    if (ts->kind == ast::TypeDeclKind::Record)
+                        return emitRecordDeserialize(ts, derArg);
+                    else
+                        return emitEnumDeserialize(ts, derArg);
+                }
+                if (ts->kind == ast::TypeDeclKind::Class) {
+                    auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+                    if (!td || !td->serializedClass) return nullptr;
+                    llvm::Value* derArg = lowerExpr(*call.args[0].value);
+                    if (!derArg) return nullptr;
+                    return emitClassDeserialize(ts, derArg);
+                }
             }
         }
     }
