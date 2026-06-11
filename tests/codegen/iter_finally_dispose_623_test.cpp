@@ -227,14 +227,14 @@ end C;
 
 // ===========================================================================
 // (6) §29.7 regression: exception in iterator body — finally ran via the
-//     exception path inside MoveNext; the for-loop cleanup then calls Dispose
-//     but since the iterator is now faulted (state=-1 set before running
-//     finally on unwind), Dispose must be a no-op.  counter must be 1 (ran
-//     once via unwind), not 2 (which would indicate a double-dispose).
-//     Note: sync-iterator exception propagation to the consumer is a separate
-//     unimplemented feature; the exception is currently swallowed by MoveNext
-//     returning false.  This test only verifies the no-double-finally property.
-//     Expected exit code: 1 (counter == 1 after finally ran once).
+//     exception path inside MoveNext (#623); the exception then propagates to
+//     the consumer (#630).  The for-loop unwind calls Dispose on the enumerator,
+//     but since the iterator is now faulted (state=-1 set before running finally
+//     on unwind), Dispose must be a no-op — so the finally does NOT run a second
+//     time.  counter must be 1 (ran once via unwind), not 2 (double-dispose).
+//     The consumer wraps the loop in try/catch to receive the exception; it then
+//     returns C.counter, which must be 1.
+//     Expected exit code: 1 (counter == 1 after finally ran once, exception caught).
 // ===========================================================================
 BEZEL_TEST(iter_finally_dispose_623, sync_exception_finally_once) {
     BEZEL_EXPECT_EQ(compileAndRun(R"(
@@ -252,7 +252,11 @@ class C
   end Gen;
 
   public static method Main(): int
-    for var x in Gen() do
+    try
+      for var x in Gen() do
+      end;
+    catch Exception =>
+      return C.counter;
     end;
     return C.counter;
   end Main;
