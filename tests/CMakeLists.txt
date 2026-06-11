@@ -458,6 +458,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_insertion_order_622_test.cpp
     codegen/async_iter_try_finally_554_test.cpp
     codegen/codegen_unimplemented_hard_error_628_test.cpp
+    codegen/owned_dict_drain_628_test.cpp
     codegen/user_exception_unqualified_msg_625_test.cpp
 
     module/module_metadata_test.cpp

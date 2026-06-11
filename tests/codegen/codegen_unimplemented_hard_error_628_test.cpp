@@ -1,20 +1,11 @@
-// Codegen — unimplemented paths must be hard compile errors (#628 part 1).
+// Codegen — OwnedDictionary.Drain() loop now fully implemented (#628 part 2).
 //
-// Issue #628 (part 1): when codegen emits a "not yet implemented" diagnostic
-// (Severity::Error), compilation must abort — no binary is produced and the
-// JIT harness must see `ran == false`.  The historical bug was that
-// `emitModule` returned the partially-built module even when errors had been
-// recorded, so the driver (AOT path) proceeded to emit an object file and link
-// a binary whose loop body had been silently dropped.
-//
-// This file covers the two codegen-stage "not yet implemented" sites that are
-// reachable via the JIT test harness (the `for-statement` fallthrough and the
-// `await for` fallthrough).  The `typeof` / `GetType` sites are already tested
-// in tests/sema/typeof_gettype_487_test.cpp.
+// Issue #628 part 1 verified that the unimplemented drain loop emitted a hard
+// error (no binary produced). Part 2 implements the feature; these tests are
+// updated to verify the feature now COMPILES AND RUNS correctly.
 //
 // Spec references:
 //   §4.9 v0.135 — OwnedDictionary.Drain() owned-consuming iteration
-//   §30.7        — `await for` async iteration
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -22,43 +13,34 @@
 using bezel::test::JitResult;
 using bezel::test::runJit;
 
-namespace {
-
-// Helper: returns true when a source string fails to compile AND the JIT never
-// executes.  This is the minimal "must be a hard error" assertion.
-bool compileFails(const std::string& src) {
-    JitResult r = runJit(src);
-    return r.diagnostics.hasErrors() && !r.ran;
-}
-
-}  // namespace
-
 // ===========================================================================
-// §4.9 / #628: `for var entry in ownedDict.Drain()` — OwnedDictionary drain
-// iteration is not yet implemented (part 2 of #628 tracks the feature).  The
-// compile must FAIL with a hard error and produce NO output; the loop must
-// NOT be silently dropped.
+// §4.9 / #628 part 2: drain loop must now compile and run (not fail).
+// These were hard-error tests in part 1; they verify the opposite after part 2.
 // ===========================================================================
 
-// §4.9 / #628: OwnedDictionary.Drain() in a for loop — must be a hard
-// compile error (no binary produced, JIT never runs).
+// §4.9 / #628 part 2: drain over OwnedDictionary<string, int> — one entry
+// added, loop increments count once, returns 1.
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_is_hard_error) {
-    BEZEL_EXPECT_TRUE(compileFails(
+    JitResult r = runJit(
         "module M; class C "
         "  public static method Main(): int "
         "    using var d := new OwnedDictionary<string, int>(); "
         "    d.Set(\"a\", 1); "
         "    var count := 0; "
         "    for var entry in d.Drain() do "
+        "      using var e := entry; "
         "      count := count + 1; "
         "    end; "
         "    return count; "
         "  end Main; "
-        "end C;"));
+        "end C;");
+    // Part 2: drain is fully implemented — must compile and run.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);  // one entry drained
 }
 
-// §4.9 / #628: Verify that the diagnostic engine recorded at least one error
-// (not just that `ran` is false due to a JIT/link failure).
+// §4.9 / #628 part 2: empty drain loop body compiles and runs (count stays 0).
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_records_error) {
     JitResult r = runJit(
         "module M; class C "
@@ -69,17 +51,15 @@ BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_records_error) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    // Part 2: must compile and run cleanly.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// ===========================================================================
-// §4.9 / #628: A program whose ONLY unimplemented construct is the Drain loop
-// must fail — not partially succeed (exit code 0 with the loop dropped).
-// ===========================================================================
-
-// §4.9 / #628: With the bug, this returned exitCode=0 and ran=true (the loop
-// was silently dropped).  After the fix: ran=false (compile fails).
+// §4.9 / #628 part 2: drain loop with `return` in body executes correctly.
+// With the old bug the loop was silently dropped (returned 0). Now it must
+// enter the loop body and return 1 (one entry was added).
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_does_not_silently_succeed) {
     JitResult r = runJit(
         "module M; class C "
@@ -87,13 +67,14 @@ BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_does_not_silently_succeed
         "    using var d := new OwnedDictionary<string, int>(); "
         "    d.Set(\"x\", 42); "
         "    for var entry in d.Drain() do "
+        "      using var e := entry; "
         "      return 1; "
         "    end; "
         "    return 0; "
         "  end Main; "
         "end C;");
-    // Must NOT have run — the loop is unimplemented, so the whole compile
-    // must fail rather than silently producing a binary that returns 0.
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // Part 2: loop body executes — must return 1, not 0.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }

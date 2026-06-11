@@ -2517,6 +2517,26 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             entryStTy->getElementType(fi), fieldPtr, "de.load");
                     }
                 }
+                // #628 / stdlib §4.9 v0.135: `e.Key` / `e.Value` on a
+                // DrainedEntry<K,V> loop variable (from lowerDictDrainFor).
+                // The entry alloca is a {K, V*} struct — same layout as
+                // DictionaryEntry: field 0 = Key, field 1 = Value (owned ptr).
+                if (tt->kind == sema::TypeRef::Kind::Named &&
+                    !tt->declaration &&
+                    tt->importedName == "DrainedEntry" &&
+                    tt->genericArgs.size() >= 2) {
+                    if (llvm::AllocaInst* slot = localSlot(*ma->target)) {
+                        unsigned fi = ma->member == "Key" ? 0 : 1;
+                        llvm::Type* kTy = lowerTypeRef(tt->genericArgs[0]);
+                        llvm::Type* vTy = lowerTypeRef(tt->genericArgs[1]);
+                        llvm::StructType* entryStTy =
+                            llvm::StructType::get(llvm_, {kTy, vTy});
+                        llvm::Value* fieldPtr = builder_.CreateStructGEP(
+                            entryStTy, slot, fi, "dde.fld");
+                        return builder_.CreateLoad(
+                            entryStTy->getElementType(fi), fieldPtr, "dde.load");
+                    }
+                }
             }
         }
         llvm::Type* elemTy = nullptr;

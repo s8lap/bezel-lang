@@ -829,6 +829,78 @@ void bz_dict_values_gen(void* dp, void*** vals_out, int64_t* n_out) {
     if (n_out)    *n_out    = j;
 }
 
+// issue #628 / stdlib §4.9 v0.135: OwnedDictionary<K,V>.Drain() per-entry pop.
+//
+// bz_dict_drain_next_str — string-keyed dict (key_size == 0).
+// Pops the next live entry in insertion order from the dict: removes it from
+// the bucket (marks deleted) and returns its raw key bytes and value pointer.
+// The caller takes ownership of the value; the key bytes are a freshly malloc'd
+// copy that the caller must free(). Returns true if an entry was popped; false
+// if the dict is empty (drain complete).
+//
+// The dict's `order[]` array is consumed from the front: we scan forward from
+// the current scan position (tracked by a caller-supplied cursor, starting at 0)
+// for the first live slot, pop it, and return. Because the caller advances the
+// cursor each call, the scan is amortized O(1) per live entry over the full drain.
+// The cursor is purely a scan hint; the caller passes a pointer to an int64_t
+// that starts at 0 and is updated here.
+bool bz_dict_drain_next_str(void* dp, int64_t* cursor,
+                             char** key_out, int64_t* key_len_out,
+                             void** val_out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || d->count == 0) return false;
+    // Advance cursor to the first live slot in the order array.
+    while (*cursor < d->order_count) {
+        int64_t slot = d->order[*cursor];
+        (*cursor)++;
+        if (slot < 0) continue;  // tombstone
+        bz_entry_t& e = d->buckets[slot];
+        if (!e.key || e.deleted) continue;  // already gone
+        // Found a live entry: hand ownership of key+val to caller.
+        if (key_out)     *key_out     = strndup(e.key, (size_t)e.key_len);
+        if (key_len_out) *key_len_out = e.key_len;
+        if (val_out)     *val_out     = e.val;
+        // Remove from the bucket (mark deleted, free key storage, nil val).
+        free(e.key);
+        e.key     = nullptr;
+        e.val     = nullptr;
+        e.deleted = true;
+        d->count--;
+        return true;
+    }
+    return false;
+}
+
+// bz_dict_drain_next_gen — generic-keyed dict (key_size > 0).
+// Mirrors bz_dict_drain_next_str; the key is returned as a malloc'd copy of the
+// raw bytes (size = d->key_size). The caller must free() it when done.
+bool bz_dict_drain_next_gen(void* dp, int64_t* cursor,
+                             void** key_out, void** val_out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || d->count == 0 || d->key_size <= 0) return false;
+    while (*cursor < d->order_count) {
+        int64_t slot = d->order[*cursor];
+        (*cursor)++;
+        if (slot < 0) continue;  // tombstone
+        bz_entry_t& e = d->buckets[slot];
+        if (!e.key || e.deleted) continue;
+        // Pop: return copies of key bytes and the value pointer.
+        if (key_out) {
+            void* kc = malloc((size_t)d->key_size);
+            memcpy(kc, e.key, (size_t)d->key_size);
+            *key_out = kc;
+        }
+        if (val_out) *val_out = e.val;
+        free(e.key);
+        e.key     = nullptr;
+        e.val     = nullptr;
+        e.deleted = true;
+        d->count--;
+        return true;
+    }
+    return false;
+}
+
 // issue #389 / stdlib §4.10: fold a snapshot of `other`'s elements into/against
 // a dict-backed Set `self`. See the header for the `op` codes and the snapshot
 // contract. Frees the snapshot before returning. UnionWith/ExceptWith iterate
