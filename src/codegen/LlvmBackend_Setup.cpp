@@ -6736,17 +6736,15 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                 // sema never sets an exprSymbol on their MemberAccessExpr callee
                 // (ctx_.exprSymbol returns null), so (b1) above misses them.
                 // Detect by the method name on the callee MemberAccessExpr when
-                // the sema result type is a class/interface that HAS a registered
-                // disposer (disposerFns_ entry).  The dynamicDispose path in
-                // emitDisposals dispatches through vtable slot 2 (Dispose); that
-                // slot is null for classes without a destructor (see declareVtables
-                // Pass D, line ~1431), so registering such classes would crash at
-                // JIT runtime.  Classes without a destructor have nothing to
-                // dispose anyway — their heap block is reclaimed by the collection
-                // that contained them (the Pop* call already removed it from the
-                // collection's internal free-on-destruct list, but there is no
-                // per-element destructor to run).  Only register when there is a
-                // real Dispose to dispatch.
+                // the sema result type is a class/interface with a registered
+                // disposer (all local classes + imported public classes are in
+                // disposerFns_; the guard catches any gap in e.g. a compiler
+                // extension that synthesises a class without the normal
+                // declaration pipeline).  The dynamicDispose path in emitDisposals
+                // dispatches through vtable slot 2 (Dispose) — declareVtables Pass
+                // D installs the compiler-generated `bz$T$Dispose` for EVERY local
+                // class (including those with no user destructor), so slot 2 is
+                // always non-null for a class that's in disposerFns_.
                 if (isClassOrInterfaceRef(ctx_.exprType(*ld->initializer))) {
                     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         call->callee.get());
