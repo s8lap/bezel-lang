@@ -6865,8 +6865,15 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                         call->callee.get());
                     if (ma) {
                         auto nm = ma->member;
+                        // §2.14 / #550: T.Deserialize(d) is the synthesized
+                        // (or hand-written conforming) factory returning
+                        // `owned T` by contract — sema sets no exprSymbol on
+                        // the synthesized form, so (b1) misses it and the
+                        // deserialized tree leaked under `using var` (found by
+                        // the t2/t3 ASan round-trip probes, 2026-06-12).
                         if (nm == "PopLast" || nm == "PopFirst" ||
-                            nm == "PopAt"   || nm == "PopValue") {
+                            nm == "PopAt"   || nm == "PopValue" ||
+                            nm == "Deserialize") {
                             // Only register if the element class has a disposer
                             // (vtable slot 2 non-null).  Interface-typed results
                             // always dispatch dynamically and always have a vtable,
