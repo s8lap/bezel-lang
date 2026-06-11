@@ -2,6 +2,8 @@
 
 #include "sema/TypeResolution.hpp"
 
+#include <cctype>
+
 namespace bezel::sema {
 
 // Free-function wrapper exposing the resolver's structural type equality
@@ -2029,14 +2031,15 @@ void Resolver::checkVariancePositions() {
 // method suppresses synthesis on that direction — it is always valid regardless
 // of eligibility, because the hand-written body is the contract (§9.8).
 //
-// Eligible component types (§9.8 — tier 1, trees only):
+// Eligible component types (§9.8 — tier 2):
 //   - Primitive types (bool, char, the integer types, float, double, decimal)
 //   - string
 //   - An enum type
 //   - A positional record or auto-equality-bearing body record that itself
 //     declares ISerializable/IDeserializable (recursive eligibility)
+//   - A class with a `serialized tree`/`graph`/`cyclic` clause (§9.8 v0.136)
 //   - A nullable T? whose T is an eligible component type
-// NOT eligible (in tier 1):
+// NOT eligible:
 //   - A class without a `serialized tree`/`graph`/`cyclic` clause
 //   - A record that does not itself declare ISerializable/IDeserializable
 //   - Any other Named type (interface, etc.)
@@ -2146,6 +2149,60 @@ static bool declaredConformance(const ast::TypeDecl& td,
     return false;
 }
 
+// §9.8 / `serialized cyclic`: check whether an expression tree contains a call
+// to an instance method on `this` (i.e. `this.SomeMethod(args)` pattern).
+// Returns true iff such a call is found.
+static bool exprContainsThisMethodCall(const ast::Expr& e);
+static bool stmtsContainThisMethodCall(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+
+static bool exprContainsThisMethodCall(const ast::Expr& e) {
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) {
+            auto* mae = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+            if (mae && mae->target) {
+                auto* ide = dynamic_cast<const ast::IdentifierExpr*>(mae->target.get());
+                if (ide && ide->name == "this") return true;
+            }
+        }
+        for (const auto& arg : ce->args)
+            if (arg.value && exprContainsThisMethodCall(*arg.value)) return true;
+    }
+    if (auto* mae = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        if (mae->target && exprContainsThisMethodCall(*mae->target)) return true;
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left  && exprContainsThisMethodCall(*be->left))  return true;
+        if (be->right && exprContainsThisMethodCall(*be->right)) return true;
+    }
+    return false;
+}
+
+static bool stmtsContainThisMethodCall(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s.get()))
+            if (es->expr && exprContainsThisMethodCall(*es->expr)) return true;
+        if (auto* ls = dynamic_cast<const ast::LocalDecl*>(s.get()))
+            if (ls->initializer && exprContainsThisMethodCall(*ls->initializer)) return true;
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get()))
+            if (as->value && exprContainsThisMethodCall(*as->value)) return true;
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get()))
+            if (rs->value && exprContainsThisMethodCall(*rs->value)) return true;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+            if (ifs->ifBranch.condition &&
+                exprContainsThisMethodCall(*ifs->ifBranch.condition)) return true;
+            if (stmtsContainThisMethodCall(ifs->ifBranch.body)) return true;
+            for (const auto& el : ifs->elifBranches) {
+                if (el.condition && exprContainsThisMethodCall(*el.condition)) return true;
+                if (stmtsContainThisMethodCall(el.body)) return true;
+            }
+            if (stmtsContainThisMethodCall(ifs->elseBody)) return true;
+        }
+    }
+    return false;
+}
+
 // §9.8: the serialized name for a positional field — the `serialized "X"` clause
 // if present, else the declared identifier.  Returns the clause name if set and
 // non-empty, else the field name.  Also returns whether this field is skip.
@@ -2178,19 +2235,333 @@ void Resolver::checkSerializationEligibility() {
         // Enums are always serialization-eligible (§9.8).
         if (isEnum) continue;  // no further check needed
 
-        // Classes without a serialized-class clause cannot use synthesis
-        // (tier 1 scope — classes with the clause are deferred to later tiers).
+        // Classes: §9.8 tier-2 eligibility checking.
         if (isClass) {
             if (!td->serializedClass) {
                 // A class declaring ISerializable/IDeserializable without a
-                // `serialized tree`/`graph`/`cyclic` clause AND without a
-                // hand-written Serialize/Deserialize is a tier-1 ineligibility
-                // error (emitted at codegen via the ERROR channel, not here).
-                // Sema does not diagnose class conformance in tier 1 — we skip.
-                // The codegen call will produce a "not yet implemented" hard error.
+                // `serialized tree`/`graph`/`cyclic` clause is a compile error
+                // at the conformance declaration (§9.8 — classes outside synthesis
+                // must hand-write Serialize/Deserialize).
+                // Check for hand-written suppression first.
+                bool hwS = typeHasHandWrittenMethod(t, "Serialize");
+                bool hwD = typeHasHandWrittenMethod(t, "Deserialize");
+                if (wantsIS && !hwS) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "class `" + std::string(t->name) + "` declares "
+                        "`ISerializable` but has no `serialized tree`/`graph`/"
+                        "`cyclic` clause and no hand-written `Serialize` (§9.8): "
+                        "add a graph-shape clause or hand-write `Serialize`");
+                }
+                if (wantsID && !hwD) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "class `" + std::string(t->name) + "` declares "
+                        "`IDeserializable` but has no `serialized tree`/`graph`/"
+                        "`cyclic` clause and no hand-written `Deserialize` (§9.8): "
+                        "add a graph-shape clause or hand-write `Deserialize`");
+                }
                 continue;
             }
-            continue;  // serialized-class clause present: defer to tier 2+
+
+            // Class has a serialized-class clause. §9.8: eligibility requires
+            // every serialized component to itself be serialization-eligible.
+            // The serialized components of a class are its owned and value-typed
+            // fields and auto-properties in declaration order (§9.8).
+            // Per §9.8 v0.136: a borrowing (non-owned) class-typed field is a
+            // back-edge — eligible only under serialized graph/cyclic (tier 3+).
+            // For tier 2 (serialized tree), only owned and value-typed components
+            // are admitted.
+            //
+            // Hand-written suppression: if the class has hand-written Serialize
+            // AND hand-written Deserialize, no synthesis occurs — skip check.
+            bool hwS2 = typeHasHandWrittenMethod(t, "Serialize");
+            bool hwD2 = typeHasHandWrittenMethod(t, "Deserialize");
+            if (hwS2 && hwD2) continue;  // fully hand-written: always valid
+
+            // Check: ineligible polymorphic registered types (§9.8).
+            // A registered type that is not serialization-eligible is a compile
+            // error at the registry.
+            const auto& scc = *td->serializedClass;
+            for (const auto& pc : scc.polyCases) {
+                if (!pc.type) continue;
+                const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
+                if (!pcTr || !pcTr->declaration) continue;
+                const TypeSymbol* pcTs = pcTr->declaration;
+                auto* pcTd = dynamic_cast<const ast::TypeDecl*>(pcTs->decl);
+                if (!pcTd || !pcTd->serializedClass) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "class `" + std::string(t->name) + "` polymorphic "
+                        "registry: registered type `" + std::string(pcTs->name) +
+                        "` has no `serialized tree`/`graph`/`cyclic` clause and "
+                        "is not serialization-eligible (§9.8); add a graph-shape "
+                        "clause to the registered type");
+                }
+            }
+
+            // §9.8 tier-boundary (tier 4): polymorphic dispatch is not yet
+            // implemented.  A class with a non-empty polymorphic registry is a
+            // compile error until tier 4 is implemented (issue #550 tier 4).
+            if (!scc.polyCases.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    "class `" + std::string(t->name) + "` uses `polymorphic` "
+                    "registry dispatch (§9.8), which is not yet implemented "
+                    "(issue #550 tier 4); remove the `polymorphic(...)` clause "
+                    "or hand-write `Serialize`/`Deserialize`");
+                continue;
+            }
+
+            // Check component eligibility for owned/value fields and auto-props.
+            std::unordered_set<const TypeSymbol*> visited;
+            visited.insert(t);
+
+            auto reportIneligible = [&](std::string_view memberName,
+                                        std::string_view reason) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    "class `" + std::string(t->name) + "` declares `ISerializable`/"
+                    "`IDeserializable` but is not serialization-eligible (§9.8): "
+                    "field `" + std::string(memberName) + "` " +
+                    std::string(reason) + "; remove the conformance declaration, "
+                    "mark the field `serialized skip`, make the field type "
+                    "serializable, or hand-write `Serialize`/`Deserialize`");
+            };
+
+            // Check owned class-typed fields and auto-properties whose types
+            // are class-typed.  A non-owned (borrowing) class-typed field is a
+            // back-edge; back-edges require tier-3 (serialized graph/cyclic back-
+            // edge serialization) and are not yet implemented.
+            bool foundBackEdge = false;
+            for (const Symbol* m : t->members) {
+                // Fields (FieldDecl).
+                auto* fs = dynamic_cast<const FieldSymbol*>(m);
+                if (fs) {
+                    auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                    if (!fd) continue;
+                    // Check static: FieldDecl.modifiers contains "static".
+                    bool isStat = false;
+                    bool isOwned = false;
+                    for (auto mod : fd->modifiers) {
+                        if (mod == "static") isStat = true;
+                        if (mod == "owned")  isOwned = true;
+                    }
+                    if (isStat) continue;
+                    const TypeRef* tr = ctx_.resolvedType(*fd->type);
+                    if (!tr) continue;
+                    // §9.8 tier-boundary: a non-owned class-typed field is a
+                    // back-edge; back-edge serialization is tier 3 (not yet
+                    // implemented — issue #550 tier 3).
+                    bool fieldIsClass = (tr->kind == TypeRef::Kind::Named &&
+                                        tr->declaration &&
+                                        tr->declaration->kind ==
+                                            ast::TypeDeclKind::Class);
+                    // Nullable T?: peel and check inner.
+                    bool fieldIsNullableClass = false;
+                    if (!fieldIsClass && tr->nullable) {
+                        TypeRef inner = *tr; inner.nullable = false;
+                        fieldIsNullableClass =
+                            inner.kind == TypeRef::Kind::Named &&
+                            inner.declaration &&
+                            inner.declaration->kind == ast::TypeDeclKind::Class;
+                    }
+                    if ((fieldIsClass || fieldIsNullableClass) && !isOwned) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` (`serialized "
+                            + std::string(scc.shape) +
+                            "`): field `" + std::string(fs->name) +
+                            "` is a non-owned (borrowing) class-typed field "
+                            "(a back-edge in the serialized graph), which is not "
+                            "yet implemented (issue #550 tier 3); mark the field "
+                            "`owned`, declare `serialized skip`, or hand-write "
+                            "`Serialize`/`Deserialize`");
+                        foundBackEdge = true;
+                        break;
+                    }
+                    if (!isSerializationEligibleType(tr, visited)) {
+                        reportIneligible(fs->name,
+                            "has a type that is not serialization-eligible");
+                        break;
+                    }
+                    continue;
+                }
+                // Auto-properties (PropertySymbol with auto backing).
+                if (!isAutoPropertySymbol(m)) continue;
+                auto* ps = dynamic_cast<const PropertySymbol*>(m);
+                if (!ps) continue;
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (!pd) continue;
+                if (pd->serialized && pd->serialized->isSkip) continue;
+                if (!pd->type) continue;
+                const TypeRef* tr = ctx_.resolvedType(*pd->type);
+                if (!tr) continue;
+                if (!isSerializationEligibleType(tr, visited)) {
+                    reportIneligible(m->name,
+                        "has a type that is not serialization-eligible");
+                    break;
+                }
+            }
+            if (foundBackEdge) continue;
+
+            // §9.8 / `serialized cyclic`: the constructor must be self-contained.
+            // Self-contained: assigns own fields from constructor params/value fields
+            // only.  MUST NOT: (1) read a back-edge field; (2) call any instance
+            // method on `this`; (3) let `this` escape; (4) call virtual/abstract.
+            // We check rule (2) — calling an instance method on `this` — which is
+            // detectable via a simple AST walk.
+            if (scc.shape == "cyclic") {
+                // Walk constructor bodies looking for `this.SomeMethod()` calls.
+                for (const Symbol* m : t->members) {
+                    auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic) continue;
+                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                    if (!cd) continue;
+
+                    if (stmtsContainThisMethodCall(cd->body)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` (`serialized "
+                            "cyclic`) constructor is not self-contained (§9.8): "
+                            "it calls an instance method on `this`, which is "
+                            "forbidden; the constructor may only assign own "
+                            "fields from constructor parameters and own value "
+                            "fields (§9.8, rule 2)");
+                        break;
+                    }
+                }
+            }
+
+            // §9.8 v0.136 constructor-selection check (applies when synthesis of
+            // Deserialize is needed — i.e. !hwD2).
+            // Rule: there must be exactly one non-static constructor whose
+            // parameter names match exactly the set of serialized component
+            // declared identifiers (bijection, order-insensitive, case-
+            // insensitive).  `serialized "<name>"` renames do NOT affect the
+            // match — which uses declared identifiers only (§9.8 v0.136).
+            // Case-insensitivity: Bezel convention is PascalCase fields and
+            // camelCase parameters; `id` and `Id` are treated as the same
+            // component name in the synthesized-Deserialize match.
+            if (!hwD2) {
+                // Helper: fold to lowercase (ASCII).
+                auto toLower = [](std::string_view sv) {
+                    std::string r(sv);
+                    for (char& c : r)
+                        c = (char)std::tolower((unsigned char)c);
+                    return r;
+                };
+
+                // Collect the lowercased declared identifiers of ALL serialized
+                // components — including `serialized skip` ones.  Skip
+                // components are still passed to the constructor as default(T),
+                // so they count toward the parameter-name match.  What `skip`
+                // means is only that the value is not read/written on the wire;
+                // the param name must still appear in the ctor (§9.8 v0.136).
+                // For field members: FieldDecl.name (non-static).
+                // For auto-property members: the member name (all, skip or not).
+                std::unordered_set<std::string> compNamesLower;
+                std::vector<std::string> compNamesOrig;  // for error message
+                for (const Symbol* m : t->members) {
+                    auto* fs = dynamic_cast<const FieldSymbol*>(m);
+                    if (fs) {
+                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                        if (!fd) continue;
+                        bool isStat = false;
+                        for (auto mod : fd->modifiers)
+                            if (mod == "static") { isStat = true; break; }
+                        if (isStat) continue;
+                        compNamesLower.insert(toLower(fd->name));
+                        compNamesOrig.push_back(std::string(fd->name));
+                        continue;
+                    }
+                    if (!isAutoPropertySymbol(m)) continue;
+                    auto* ps = dynamic_cast<const PropertySymbol*>(m);
+                    if (!ps) continue;
+                    // Include skip-marked auto-properties: skip means "don't
+                    // serialize" but the component still appears in the ctor.
+                    compNamesLower.insert(toLower(m->name));
+                    compNamesOrig.push_back(std::string(m->name));
+                }
+
+                // Collect non-static constructors and check which ones match.
+                std::vector<std::string> matchingCtors;  // for error message
+                std::vector<std::string> allCtors;
+                for (const Symbol* m : t->members) {
+                    auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic) continue;
+                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                    if (!cd) continue;
+
+                    // Build a string representation for the error message.
+                    std::string ctorDesc = "constructor(";
+                    for (unsigned pi = 0; pi < cd->params.size(); ++pi) {
+                        if (pi) ctorDesc += ", ";
+                        ctorDesc += std::string(cd->params[pi].name);
+                    }
+                    ctorDesc += ")";
+                    allCtors.push_back(ctorDesc);
+
+                    // Match: param count == component count AND every param
+                    // name (lowercased) appears in compNamesLower (bijection).
+                    if (cd->params.size() != compNamesLower.size()) continue;
+                    bool allMatch = true;
+                    for (const auto& p : cd->params) {
+                        if (compNamesLower.find(toLower(p.name)) ==
+                                compNamesLower.end()) {
+                            allMatch = false;
+                            break;
+                        }
+                    }
+                    if (allMatch) matchingCtors.push_back(ctorDesc);
+                }
+
+                if (matchingCtors.size() != 1) {
+                    // Build candidate list for the error message.
+                    std::string candidates;
+                    const auto& list = allCtors.empty() ? matchingCtors : allCtors;
+                    for (const auto& c : list) {
+                        if (!candidates.empty()) candidates += ", ";
+                        candidates += c;
+                    }
+                    if (candidates.empty()) candidates = "(none)";
+                    // Build component-set string for the error message.
+                    std::string compSet;
+                    for (const auto& n : compNamesOrig) {
+                        if (!compSet.empty()) compSet += ", ";
+                        compSet += n;
+                    }
+                    if (matchingCtors.size() == 0) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` declares "
+                            "`IDeserializable` (`serialized " +
+                            std::string(scc.shape) +
+                            "`): no constructor has parameter names matching "
+                            "the serialized component set {" + compSet +
+                            "} — candidates: " + candidates +
+                            " (§9.8 v0.136: constructor selection is by name, "
+                            "case-insensitive, order-insensitive)");
+                    } else {
+                        // >1 match
+                        std::string matchList;
+                        for (const auto& c : matchingCtors) {
+                            if (!matchList.empty()) matchList += ", ";
+                            matchList += c;
+                        }
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` declares "
+                            "`IDeserializable` (`serialized " +
+                            std::string(scc.shape) +
+                            "`): more than one constructor matches the serialized "
+                            "component set — ambiguous: " + matchList +
+                            " (§9.8 v0.136: the unique matching constructor is "
+                            "required)");
+                    }
+                }
+            }
+            continue;
         }
 
         // Record: check hand-written suppression and then eligibility.

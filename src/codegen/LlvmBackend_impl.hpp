@@ -1489,6 +1489,16 @@ private:
     llvm::Value* emitEnumDeserialize(const sema::TypeSymbol* ts,
                                      llvm::Value* derPtr);
 
+    // §9.8 tier 2 — class synthesis (tree shape).
+    // Emit the Serialize body for a `serialized tree` class object pointer.
+    void emitClassSerialize(const sema::TypeSymbol* ts,
+                            llvm::Value* objPtr,
+                            llvm::Value* serPtr);
+    // Emit the Deserialize body for a `serialized tree` class.
+    // Returns an owned heap pointer (ptr) to the newly constructed instance.
+    llvm::Value* emitClassDeserialize(const sema::TypeSymbol* ts,
+                                      llvm::Value* derPtr);
+
     // The resolved sema TypeRef of a record field's declared type (positional
     // Param or body FieldDecl). Null if it cannot be determined.
     const sema::TypeRef* recordFieldType(const sema::FieldSymbol* fs);
