@@ -6720,6 +6720,8 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
         if (auto* call = dynamic_cast<const ast::CallExpr*>(
                 ld->initializer.get())) {
             if (call->callee) {
+                // (b1) User method with returnOwned: the MethodSymbol exists and
+                // its MethodDecl declares `owned` on the return.
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(
                     ctx_.exprSymbol(*call->callee));
                 if (ms) {
@@ -6727,6 +6729,49 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                     if (md && md->returnOwned &&
                         isClassOrInterfaceRef(ctx_.exprType(*ld->initializer)))
                         return true;
+                }
+                // (b2) fix #642/#643: builtin collection Pop* methods (PopLast,
+                // PopFirst, PopAt, PopValue) transfer ownership of a class element
+                // to the caller (§4.5/§4.7/§4.9).  These are BUILTIN methods —
+                // sema never sets an exprSymbol on their MemberAccessExpr callee
+                // (ctx_.exprSymbol returns null), so (b1) above misses them.
+                // Detect by the method name on the callee MemberAccessExpr when
+                // the sema result type is a class/interface that HAS a registered
+                // disposer (disposerFns_ entry).  The dynamicDispose path in
+                // emitDisposals dispatches through vtable slot 2 (Dispose); that
+                // slot is null for classes without a destructor (see declareVtables
+                // Pass D, line ~1431), so registering such classes would crash at
+                // JIT runtime.  Classes without a destructor have nothing to
+                // dispose anyway — their heap block is reclaimed by the collection
+                // that contained them (the Pop* call already removed it from the
+                // collection's internal free-on-destruct list, but there is no
+                // per-element destructor to run).  Only register when there is a
+                // real Dispose to dispatch.
+                if (isClassOrInterfaceRef(ctx_.exprType(*ld->initializer))) {
+                    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        call->callee.get());
+                    if (ma) {
+                        auto nm = ma->member;
+                        if (nm == "PopLast" || nm == "PopFirst" ||
+                            nm == "PopAt"   || nm == "PopValue") {
+                            // Only register if the element class has a disposer
+                            // (vtable slot 2 non-null).  Interface-typed results
+                            // always dispatch dynamically and always have a vtable,
+                            // so treat them as having a disposer too.
+                            const sema::TypeRef* eTy =
+                                ctx_.exprType(*ld->initializer);
+                            if (eTy && eTy->declaration) {
+                                bool hasDisposer =
+                                    disposerFns_.find(eTy->declaration) !=
+                                    disposerFns_.end();
+                                bool isIface =
+                                    eTy->declaration->kind ==
+                                    ast::TypeDeclKind::Interface;
+                                if (hasDisposer || isIface)
+                                    return true;
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -170,6 +170,20 @@ void bz_array_remove_at_disposing(void* arrp, int64_t idx, int64_t elem_size,
     bz_array_remove_at(arrp, idx, elem_size);
 }
 
+// fix #642 / stdlib §4.5: PopAt(i) — copy element at idx into *out (transferring
+// ownership to the caller) then remove the slot WITHOUT disposal.  The caller
+// holds the sole reference after this call; it must dispose when done.
+// Unlike bz_array_remove_at_disposing this never invokes a disposer.
+void bz_array_pop_at(void* arrp, int64_t idx, void* out, int64_t elem_size) {
+    if (!arrp || !out) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (idx < 0 || idx >= arr->count) return;
+    // Copy the element bytes BEFORE shifting so the pointer/value is captured.
+    memcpy(out, (char*)arr->data + idx * elem_size, (size_t)elem_size);
+    // Remove the slot (no disposal — ownership transferred to caller).
+    bz_array_remove_at(arrp, idx, elem_size);
+}
+
 void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;
@@ -729,6 +743,44 @@ bool bz_dict_contains_gen(void* dp, const void* key) {
     return bz_dict_try_get_gen(dp, key, nullptr);
 }
 
+// fix #643 / stdlib §4.9: PopValue(key) — retrieve the stored value pointer,
+// unlink the entry WITHOUT disposing the value (ownership transfers to caller),
+// and return true.  Returns false when the key is absent (callee raises).
+// String-key variant.
+bool bz_dict_pop_value_str(void* dp, const char* k, int64_t k_len,
+                            void** out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !k) return false;
+    uint32_t h = fnv1a(k, k_len);
+    int64_t idx = dict_find(d, k, k_len, h);
+    if (idx < 0) return false;
+    if (out) *out = d->buckets[idx].val;
+    dict_order_remove(d, idx);
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    return true;
+}
+
+// Generic-key variant.
+bool bz_dict_pop_value_gen(void* dp, const void* key, void** out) {
+    auto* d = (bz_dict_t*)dp;
+    if (!d || !key || d->key_size <= 0) return false;
+    uint32_t h = (uint32_t)d->hash_fn(key);
+    int64_t idx = dict_find_gen(d, key, h);
+    if (idx < 0) return false;
+    if (out) *out = d->buckets[idx].val;
+    dict_order_remove(d, idx);
+    free(d->buckets[idx].key);
+    d->buckets[idx].key = nullptr;
+    d->buckets[idx].val = nullptr;
+    d->buckets[idx].deleted = true;
+    d->count--;
+    return true;
+}
+
 // stdlib §4.10 / §4.8: empty a hash table in place, keeping it allocated for
 // reuse. Frees each live key's malloc'd copy and, if `dispose_val` is non-null,
 // disposes each live value; then zeroes every bucket and resets the count. Used
@@ -1158,6 +1210,27 @@ void bz_llist_remove_node(void* listp, void* nodep,
     auto* node = (bz_llist_node_t*)nodep;
     if (!l || !node) return;
     llist_unlink(l, node, dispose_elem);
+}
+
+// fix #642 / stdlib §4.7: PopFirst() / PopLast() — copy the first/last element
+// into *out, transferring ownership to the caller, then unlink WITHOUT disposal.
+// Unlike llist_unlink (which calls dispose_elem), these never invoke a disposer.
+void bz_llist_pop_first(void* listp, void* out, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->head || !out) return;
+    bz_llist_node_t* node = l->head;
+    // Copy the inline element bytes into the caller's output buffer.
+    memcpy(out, (char*)node + sizeof(bz_llist_node_t), (size_t)elem_size);
+    // Unlink without disposal (ownership transferred to caller).
+    llist_unlink(l, node, /*dispose_elem=*/nullptr);
+}
+
+void bz_llist_pop_last(void* listp, void* out, int64_t elem_size) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l || !l->tail || !out) return;
+    bz_llist_node_t* node = l->tail;
+    memcpy(out, (char*)node + sizeof(bz_llist_node_t), (size_t)elem_size);
+    llist_unlink(l, node, /*dispose_elem=*/nullptr);
 }
 
 // Find by memcmp equality on the inline element bytes.
