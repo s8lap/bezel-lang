@@ -3802,6 +3802,13 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 if (ty && ty->kind == sema::TypeRef::Kind::Primitive &&
                     ty->primitive == P::Decimal)
                     return v;  // already decimal struct
+                // fix #666: if the LLVM value is already a %bz.decimal struct
+                // (e.g. the return value of a LINQ Sum/Average selector lambda
+                // whose sema type was not annotated as decimal by the type
+                // checker), return it directly.  Without this guard the code
+                // below would try CreateSExt(%bz.decimal, i32) — invalid IR.
+                if (v->getType() == dst)
+                    return v;
                 // Integer widening to decimal (§5.1).
                 llvm::AllocaInst* slot = entryAlloca(dst);
                 if (ty && ty->kind == sema::TypeRef::Kind::Primitive) {
@@ -6084,6 +6091,141 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
     }
     llvm::Value* src = lowerExpr(argE);
     if (!src) return nullptr;
+
+    // §5.2 / fix #664: decimal is a 16-byte struct, not a scalar — the
+    // generic FP/integer cast paths below would crash on it.  Handle the four
+    // decimal conversion directions here, before any scalar-type logic runs.
+    //
+    //   int/double → decimal : bz_decimal_from_int32/int64/double
+    //   decimal → int        : bz_decimal_to_int32/int64 (truncate toward zero)
+    //   decimal → double     : bz_decimal_to_double
+    {
+        // Determine source primitive from the sema type annotation.
+        P srcPrim = P::None;
+        if (auto* rt = ctx_.exprType(argE))
+            if (rt->kind == sema::TypeRef::Kind::Primitive)
+                srcPrim = rt->primitive;
+
+        llvm::StructType* decTy = decimalStructType();
+
+        // Helper: get OverflowException vtable pointer (may be null if not set up yet).
+        auto getOVEVtable = [&]() -> llvm::Value* {
+            auto vit = builtinVtable_.find("OverflowException");
+            if (vit == builtinVtable_.end())
+                return llvm::ConstantPointerNull::get(ptrTy());
+            return vit->second;
+        };
+
+        // Case A: integer or double → decimal (target == P::Decimal).
+        if (target == P::Decimal) {
+            llvm::AllocaInst* outSlot = entryAlloca(decTy);
+            if (src->getType()->isFloatingPointTy()) {
+                // double/float → decimal: bz_decimal_from_double (§5.2: explicit).
+                // Widen float to double first (the runtime takes double).
+                llvm::Value* dv = src;
+                if (!src->getType()->isDoubleTy())
+                    dv = builder_.CreateFPExt(src, llvm::Type::getDoubleTy(llvm_));
+                auto* fn = declareC("bz_decimal_from_double",
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {llvm::Type::getDoubleTy(llvm_), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {dv, outSlot, getOVEVtable()});
+                emitPendingCheck();  // OverflowException from out-of-range double
+            } else if (src->getType()->isIntegerTy()) {
+                // int/long (and narrower integers) → decimal: widen to int32/int64
+                // then call the appropriate from_int.  This covers the explicit
+                // decimal(x) cast (§5.2) the same way the implicit §5.1 widening
+                // in lowerBinary does it.
+                llvm::Type* srcTy = src->getType();
+                bool srcUns = isUnsignedPrim(srcPrim) ||
+                              srcPrim == P::Byte || srcPrim == P::UShort ||
+                              srcPrim == P::UInt || srcPrim == P::Char;
+                if (srcTy->isIntegerTy(64)) {
+                    auto* fn = declareC("bz_decimal_from_int64",
+                                       llvm::Type::getVoidTy(llvm_),
+                                       {i64(), ptrTy()});
+                    builder_.CreateCall(fn, {src, outSlot});
+                } else {
+                    // Narrow → i32 (sign- or zero-extend as appropriate).
+                    llvm::Value* v32 = src;
+                    if (!srcTy->isIntegerTy(32))
+                        v32 = srcUns ? builder_.CreateZExt(src, i32())
+                                     : builder_.CreateSExt(src, i32());
+                    auto* fn = declareC("bz_decimal_from_int32",
+                                       llvm::Type::getVoidTy(llvm_),
+                                       {i32(), ptrTy()});
+                    builder_.CreateCall(fn, {v32, outSlot});
+                }
+            } else {
+                return nullptr;  // unrecognised source — should not occur after sema
+            }
+            return builder_.CreateLoad(decTy, outSlot, "dec.conv");
+        }
+
+        // Case B: decimal → int (any integer target). §5.2: truncate toward zero;
+        // OverflowException when the truncated value is out of the target's range.
+        if (srcPrim == P::Decimal && src->getType() == decTy) {
+            if (lowerPrimitive(target)->isIntegerTy()) {
+                llvm::AllocaInst* srcSlot = entryAlloca(decTy);
+                builder_.CreateStore(src, srcSlot);
+                if (lowerPrimitive(target)->getIntegerBitWidth() <= 32) {
+                    // Target fits in int32 (byte, sbyte, short, ushort, int, char).
+                    // Strategy: convert decimal → int64 (no vtable — decimal values
+                    // in the int32 range never overflow int64), then do an IR-level
+                    // range check with emitGuardThrow.  This avoids the bz_set_exc
+                    // vtable-pointer indirection, which is unreliable in the JIT
+                    // harness where the vtable lives in JIT memory but the check
+                    // happens in the host process.  (fix #664 §5.2)
+                    auto* fn64 = declareC("bz_decimal_to_int64", i64(),
+                                         {ptrTy(), ptrTy()});
+                    llvm::Value* v64 = builder_.CreateCall(
+                        fn64, {srcSlot,
+                               llvm::ConstantPointerNull::get(ptrTy())},
+                        "dec.toi64v");
+                    // Range check: [-2147483648 .. 2147483647]
+                    llvm::Value* lo = builder_.CreateICmpSLT(
+                        v64, llvm::ConstantInt::get(i64(), (int64_t)INT32_MIN),
+                        "dec.ilo");
+                    llvm::Value* hi = builder_.CreateICmpSGT(
+                        v64, llvm::ConstantInt::get(i64(), (int64_t)INT32_MAX),
+                        "dec.ihi");
+                    emitGuardThrow(builder_.CreateOr(lo, hi), "OverflowException");
+                    llvm::Value* v32 = builder_.CreateTrunc(v64, i32(), "dec.toi32");
+                    llvm::Type* dstTy = lowerPrimitive(target);
+                    if (dstTy == i32()) return v32;
+                    // Further narrowing (e.g. to i8/i16): check sub-range and trunc.
+                    bool dstUns = isUnsignedPrim(target);
+                    llvm::Value* trunc = builder_.CreateTrunc(v32, dstTy);
+                    llvm::Value* back = dstUns
+                        ? builder_.CreateZExt(trunc, i32())
+                        : builder_.CreateSExt(trunc, i32());
+                    emitGuardThrow(builder_.CreateICmpNE(back, v32), "OverflowException");
+                    return trunc;
+                } else {
+                    // int64 or uint64 target.
+                    auto* fn = declareC("bz_decimal_to_int64", i64(),
+                                       {ptrTy(), ptrTy()});
+                    llvm::Value* v64 = builder_.CreateCall(fn, {srcSlot, getOVEVtable()},
+                                                           "dec.toi64");
+                    emitPendingCheck();
+                    return v64;
+                }
+            }
+            // Case C: decimal → double/float. §5.2: "double(m)" — bz_decimal_to_double.
+            if (lowerPrimitive(target)->isFloatingPointTy()) {
+                llvm::AllocaInst* srcSlot = entryAlloca(decTy);
+                builder_.CreateStore(src, srcSlot);
+                auto* fn = declareC("bz_decimal_to_double",
+                                   llvm::Type::getDoubleTy(llvm_),
+                                   {ptrTy()});
+                llvm::Value* dv = builder_.CreateCall(fn, {srcSlot}, "dec.todbl");
+                llvm::Type* dstTy = lowerPrimitive(target);
+                if (dstTy->isDoubleTy()) return dv;
+                // Narrow to float if target is float.
+                return builder_.CreateFPTrunc(dv, dstTy);
+            }
+        }
+    }
+
     // §5.2 (L421): casting an integer to char requires the value to be in
     // U+0000–U+10FFFF excluding the surrogate range U+D800–U+DFFF; otherwise
     // raise OverflowException.  This check must precede the same-width-identity

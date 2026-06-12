@@ -432,6 +432,12 @@ void bz_decimal_from_int32(int32_t v, bz_decimal_t* out);
 void   bz_decimal_from_double(double v, bz_decimal_t* out, void* ove_vtable);
 double bz_decimal_to_double(const bz_decimal_t* a);
 
+// Conversions — to integer (explicit only, per §5.2).
+// §5.2: truncates toward zero; raises OverflowException (via ove_vtable) when
+// the truncated integer value does not fit in the target type's range.
+int32_t bz_decimal_to_int32(const bz_decimal_t* a, void* ove_vtable);
+int64_t bz_decimal_to_int64(const bz_decimal_t* a, void* ove_vtable);
+
 // Parse from string (stdlib §9.3 Decimal.Parse / TryParse).
 // per fix #521: bz_decimal_parse raises FormatException (fe_vtable) for
 // malformed input and OverflowException (ove_vtable) for out-of-range.

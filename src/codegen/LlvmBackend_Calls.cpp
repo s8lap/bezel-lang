@@ -1130,9 +1130,91 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return len32;
         }
         // per §5 LINQ: .Sum(fn: (T)->int): int  /  .Sum(): int (for Array<int>)
+        // fix #666: also handles Sum over decimal (struct accumulator via bz_decimal_add).
         if (m == "Sum") {
             const bool relCl = argIsInlineLambda(0);
             llvm::Type* elemTy = getElemTy();
+
+            // fix #666 / stdlib §5: decimal Sum — element/selector result is a
+            // 16-byte %bz.decimal struct; accumulate via bz_decimal_add into an
+            // alloca'd slot (pointer-based ABI, same as all other decimal ops).
+            // Selector form: closure returns decimal struct by value (LLVM IR ABI).
+            // No-selector form: element is loaded as decimal struct directly.
+            llvm::StructType* decTy = decimalStructType();
+            bool isDecimalSum = (elemTy == decTy);
+            // If the selector returns decimal, also use the decimal path.
+            if (!isDecimalSum && !call.args.empty() && call.args[0].value) {
+                if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+                    if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn)
+                        if (auto* rt = lamTy->funcReturn)
+                            if (rt->kind == sema::TypeRef::Kind::Primitive &&
+                                rt->primitive == sema::PrimitiveType::Decimal)
+                                isDecimalSum = true;
+            }
+            if (isDecimalSum) {
+                // Lower selector with decimal return TypeRef so unannotated lambdas
+                // get the right param hint.
+                sema::TypeRef* decRetRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Decimal);
+                llvm::Value* closure = call.args.empty() ? nullptr
+                    : lowerLinqLambda(call.args[0].value.get(), decRetRef);
+                if (!call.args.empty() && !closure) return nullptr;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                // Accumulator: alloca'd decimal slot, zero-initialised.
+                auto* accSlot = entryAlloca(decTy);
+                builder_.CreateStore(llvm::ConstantAggregateZero::get(decTy), accSlot);
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* addFn = declareC("bz_decimal_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                // OverflowException vtable (null if not yet set up — decimal sum
+                // overflow is extremely unlikely in practice but spec-required).
+                auto getOVEVtable = [&]() -> llvm::Value* {
+                    auto vit = builtinVtable_.find("OverflowException");
+                    if (vit == builtinVtable_.end())
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                    return vit->second;
+                };
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "sum.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sum.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "sum.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                // Load element (decimal struct by value from the slot).
+                llvm::Value* el = builder_.CreateLoad(decTy, ep);
+                // Apply selector if present: fn(env, elem) -> decimal struct.
+                llvm::Value* val = el;
+                if (closure) {
+                    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
+                    llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure,
+                                                              {builder_.getInt32(1)});
+                    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+                    auto* fnTy = llvm::FunctionType::get(decTy, {ptrTy(), decTy}, false);
+                    val = builder_.CreateCall(fnTy, fnPtr, {envPtr, el}, "cl.dec");
+                }
+                // Store val into a temp slot for the add call.
+                auto* valSlot = entryAlloca(decTy);
+                builder_.CreateStore(val, valSlot);
+                // out slot for the add result (reuse accSlot after copying).
+                auto* outSlot = entryAlloca(decTy);
+                builder_.CreateCall(addFn, {accSlot, valSlot, outSlot, getOVEVtable()});
+                emitPendingCheck();
+                // Copy result back to accSlot.
+                llvm::Value* addResult = builder_.CreateLoad(decTy, outSlot);
+                builder_.CreateStore(addResult, accSlot);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                if (relCl && closure) emitClosureRelease(closure);
+                freeLazyTemp();
+                return builder_.CreateLoad(decTy, accSlot, "sum.r");
+            }
+
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), retTyRef);
@@ -1217,6 +1299,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // — eager. Accumulate each element (or selector result) as a double and
         // divide by the element count. The §5 selector overloads (int/long/double)
         // and the §5.1 per-type no-selector forms all return double.
+        // fix #666 / stdlib §5: Average(selector: (T)->decimal): decimal
+        //   and IEnumerable<decimal>.Average(): decimal — accumulate via
+        //   bz_decimal_add, then divide by count via bz_decimal_div.
         if (m == "Average") {
             const bool relCl = argIsInlineLambda(0);
             llvm::Type* elemTy = getElemTy();
@@ -1231,6 +1316,77 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         selRetRef = lamTy->funcReturn;
                         if (auto* t = lowerTypeRef(selRetRef)) selRetTy = t;
                     }
+
+            // Detect decimal selector or decimal element type.
+            llvm::StructType* decTy = decimalStructType();
+            bool isDecimalAvg = (elemTy == decTy || selRetTy == decTy);
+            if (isDecimalAvg) {
+                // stdlib §5 (L2589) / §5.1 (L2676):
+                //   Average(selector: (T)->decimal): decimal
+                //   IEnumerable<decimal>.Average(): decimal
+                // Accumulate via bz_decimal_add; divide sum by count via bz_decimal_div.
+                sema::TypeRef* decRetRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Decimal);
+                llvm::Value* closure = call.args.empty() ? nullptr
+                    : lowerLinqLambda(call.args[0].value.get(), decRetRef);
+                if (!call.args.empty() && !closure) return nullptr;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                auto* idxSlot = entryAlloca(i64());
+                auto* accSlot = entryAlloca(decTy);
+                builder_.CreateStore(llvm::ConstantAggregateZero::get(decTy), accSlot);
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* addFn = declareC("bz_decimal_add", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                auto getOVEVtable = [&]() -> llvm::Value* {
+                    auto vit = builtinVtable_.find("OverflowException");
+                    if (vit == builtinVtable_.end())
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                    return vit->second;
+                };
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "avg.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "avg.b", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "avg.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                llvm::Value* el = builder_.CreateLoad(decTy, ep);
+                llvm::Value* val = el;
+                if (closure) {
+                    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
+                    llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure,
+                                                              {builder_.getInt32(1)});
+                    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+                    auto* fnTy = llvm::FunctionType::get(decTy, {ptrTy(), decTy}, false);
+                    val = builder_.CreateCall(fnTy, fnPtr, {envPtr, el}, "cl.dec");
+                }
+                auto* valSlot = entryAlloca(decTy);
+                builder_.CreateStore(val, valSlot);
+                auto* outSlot = entryAlloca(decTy);
+                builder_.CreateCall(addFn, {accSlot, valSlot, outSlot, getOVEVtable()});
+                emitPendingCheck();
+                builder_.CreateStore(builder_.CreateLoad(decTy, outSlot), accSlot);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                // Divide sum by count: bz_decimal_from_int64(len) then bz_decimal_div.
+                auto* cntSlot = entryAlloca(decTy);
+                auto* fromI64 = declareC("bz_decimal_from_int64",
+                                         llvm::Type::getVoidTy(llvm_), {i64(), ptrTy()});
+                builder_.CreateCall(fromI64, {len, cntSlot});
+                auto* divSlot = entryAlloca(decTy);
+                auto* divFn = declareC("bz_decimal_div", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(divFn, {accSlot, cntSlot, divSlot, getOVEVtable()});
+                emitPendingCheck();
+                if (relCl && closure) emitClosureRelease(closure);
+                freeLazyTemp();
+                return builder_.CreateLoad(decTy, divSlot, "avg.r");
+            }
+
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), selRetRef);
             if (!call.args.empty() && !closure) return nullptr;
@@ -1274,11 +1430,68 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return builder_.CreateFDiv(total, cnt, "avg.r");
         }
         // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
+        // fix #666 / stdlib §5.1: also handles Min/Max over Array<decimal> via bz_decimal_cmp.
         if ((m == "Min" || m == "Max") &&
             (call.args.empty() || call.args.size() == 1)) {
             bool isMax = (m == "Max");
             const bool relCl = argIsInlineLambda(0);
             llvm::Type* elemTy = getElemTy();
+
+            // Detect decimal element type (no selector case: stdlib §5.1 T: IComparable<T>).
+            llvm::StructType* decTy = decimalStructType();
+            if (elemTy == decTy && call.args.empty()) {
+                // stdlib §5.1: Array<decimal>.Min()/Max(): decimal
+                // Throws InvalidOperationException on empty source.
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                llvm::Value* isEmpty = builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                emitGuardThrow(isEmpty, "InvalidOperationException");
+                auto* idxSlot  = entryAlloca(i64());
+                auto* accSlot  = entryAlloca(decTy);
+                auto* initSlot = entryAlloca(i1());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                builder_.CreateStore(llvm::ConstantAggregateZero::get(decTy), accSlot);
+                builder_.CreateStore(builder_.getFalse(), initSlot);
+                auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "mm.c",  currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mm.b",  currentFn_);
+                auto* updBB  = llvm::BasicBlock::Create(llvm_, "mm.u",  currentFn_);
+                auto* nextBB = llvm::BasicBlock::Create(llvm_, "mm.n",  currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "mm.e",  currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                // Store element into a temp slot for bz_decimal_cmp.
+                auto* valSlot = entryAlloca(decTy);
+                llvm::Value* el = builder_.CreateLoad(decTy, ep);
+                builder_.CreateStore(el, valSlot);
+                // Compare val vs acc: cmp = bz_decimal_cmp(val, acc)
+                // isMax: update when cmp > 0 (val > acc)
+                // isMin: update when cmp < 0 (val < acc)
+                llvm::Value* cmpResult = builder_.CreateCall(cmpFn, {valSlot, accSlot}, "dec.cmp");
+                llvm::Value* shouldUpdate = isMax
+                    ? builder_.CreateICmpSGT(cmpResult, builder_.getInt32(0))
+                    : builder_.CreateICmpSLT(cmpResult, builder_.getInt32(0));
+                llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateOr(builder_.CreateNot(inited), shouldUpdate),
+                    updBB, nextBB);
+                builder_.SetInsertPoint(updBB);
+                builder_.CreateStore(el, accSlot);
+                builder_.CreateStore(builder_.getTrue(), initSlot);
+                builder_.CreateBr(nextBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                freeLazyTemp();
+                return builder_.CreateLoad(decTy, accSlot, "mm.r");
+            }
+
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), retTyRef);
