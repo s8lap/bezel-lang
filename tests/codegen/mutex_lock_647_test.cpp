@@ -16,8 +16,9 @@
 //   - SYNC Acquire / TryAcquire only.
 //   - AcquireAsync / TryAcquireAsync: clean "not yet implemented (#647 async acquire)"
 //     diagnostic at the call site (tested in sema, not here).
-//   - Sendability: Mutex NOT sendable (conservative, docs ruling pending).
-//     Lock NOT sendable (a held guard is domain-local by nature).
+//   - Sendability: Mutex IS sendable per stdlib §6.2 v0.138 / #647
+//     (internally synchronized, like Channel<T>; ownership transfers on move).
+//     Lock NOT sendable (a held guard is domain-local; see §6.2 v0.138).
 //
 // Tests derive from:
 //   - stdlib §6.2 Acquire example (using var guard idiom)
@@ -325,6 +326,69 @@ BEZEL_TEST(codegen_mutex_lock_asan_6_2, guard_in_loop_5x_leak_free) {
     ));
     if (r == -1) return;
     BEZEL_EXPECT_EQ(r, 0);
+}
+
+// ---------------------------------------------------------------------------
+// §6.2 v0.138 / §30.14 / #647: Mutex sendability — AOT compile probe.
+//
+// Verify that a program passing Mutex as a Domain.Spawn argument compiles to
+// a valid LLVM module without sema or IR-generation errors.  This is the
+// AOT-level "transfer shape" probe: it exercises the isSendable(Mutex)==true
+// path in ExprTC and verifies no diagnostic fires.
+//
+// NOTE: full runtime execution of the spawned domain is NOT tested here (that
+// requires the async test infrastructure from async_618_domain_serial_test.cpp).
+// The sema tests (mutex_sendable_647_test.cpp) cover the accept/reject contract;
+// this test covers the IR generation path for the accepted shape.
+// ---------------------------------------------------------------------------
+
+// §6.2 v0.138 / §30.14 / #647: Mutex as Domain.Spawn arg compiles to valid IR.
+// The program must emit a module without diagnostics.  (LLVM module is not JIT'd
+// because running an async-main requires the full bezel_runtime; we check the
+// compile step only — the JIT path is exercised by async_618 tests for correctness
+// of Domain.Spawn itself.)
+BEZEL_TEST(codegen_mutex_lock_6_2_v0138, mutex_spawn_arg_compiles_to_valid_ir) {
+    // §30.14: Mutex is sendable — it may be owned-transferred to a spawned domain.
+    // The worker acquires the mutex (scoped using var guard), then the guard
+    // disposes at end of the inner do-block; m.Dispose() satisfies the ownership
+    // obligation on the `owned m: Mutex` parameter per §28.3.
+    const std::string source =
+        "module M; "
+        "class Worker "
+        "  public static method Run(owned m: Mutex) "
+        "    do "
+        "      using var guard := m.Acquire(); "
+        "    end; "
+        "    m.Dispose(); "
+        "  end Run; "
+        "end Worker; "
+        "class Program "
+        "  public static async method Main(): Task<int> "
+        "    using var t := Domain.Spawn(Worker.Run, new Mutex()); "
+        "    await t; "
+        "    return 42; "
+        "  end Main; "
+        "end Program;";
+
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(source, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    BEZEL_EXPECT_TRUE(!!unit);
+
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    bezel::sema::checkDefiniteAssignment(*unit, ctx);
+    bezel::ownership::checkOwnership(*unit, ctx);
+    // No sendability diagnostic should fire (Mutex is sendable per §6.2 v0.138).
+    BEZEL_EXPECT_FALSE(diags.hasErrors());
+
+    // Also verify the IR module emits cleanly (no IR-generation assertion/crash).
+    llvm::LLVMContext llvmCtx;
+    auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
+    BEZEL_EXPECT_TRUE(!!module);
 }
 
 } // namespace
