@@ -1,18 +1,26 @@
-public static class File
-  public static method ReadAllText(path: string): string;
-  public static method WriteAllText(path: string, contents: string);
-  public static method ReadAllBytes(path: string): owned Array<byte>;
-  public static method WriteAllBytes(path: string, contents: Array<byte>);
-  public static method ReadAllLines(path: string): owned Array<string>;
-  public static method WriteAllLines(path: string, lines: IEnumerable<string>);
+public abstract class Stream
+  public abstract readonly property CanRead: bool;
+  public abstract readonly property CanWrite: bool;
+  public abstract readonly property CanSeek: bool;
 
-  public static async method ReadAllTextAsync(path: string,
-                                                token: CancellationToken := CancellationToken.None): Task<string>;
-  public static async method WriteAllTextAsync(path: string, contents: string,
-                                                 token: CancellationToken := CancellationToken.None): Task;
+  public abstract method Read(buffer: Array<byte>, offset: int, count: int): int;
+  public abstract method Write(buffer: Array<byte>, offset: int, count: int);
+  public abstract method Flush();
 
-  public static method Exists(path: string): bool;
-  public static method Delete(path: string);
-  public static method Copy(source: string, destination: string, overwrite: bool);
-  public static method Move(source: string, destination: string);
-end File;
+  public abstract method Seek(offset: long, origin: SeekOrigin): long;
+  public abstract readonly property Length: long;
+  public abstract property Position: long;
+
+  public async method ReadAsync(buffer: Array<byte>, offset: int, count: int,
+                                 token: CancellationToken := CancellationToken.None): Task<int>;
+  public async method WriteAsync(buffer: Array<byte>, offset: int, count: int,
+                                  token: CancellationToken := CancellationToken.None): Task;
+
+  // Convenience methods
+  public method ReadAll(): owned Array<byte>;            // reads from current position to end
+  public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwnedTask<Array<byte>>;
+end Stream;
+
+public enum SeekOrigin: byte
+  Begin, Current, End;
+end SeekOrigin;

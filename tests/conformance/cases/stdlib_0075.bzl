@@ -1,5 +1,12 @@
-using var guard := mutex.TryAcquire(TimeSpan.FromSeconds(5));
-if guard <> null then
-  // critical section; guard non-null in this branch (narrowing)
-end;
-// At scope end: guard disposed if non-null, releasing the lock; null is a no-op.
+public class Mutex
+  public constructor();
+  public method Acquire(): owned Lock;
+  public method TryAcquire(timeout: TimeSpan): owned Lock?;
+  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwnedTask<Lock>;
+  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwnedTask<Lock?>;
+end Mutex;
+
+public class Lock
+  // No public constructor; obtained from Mutex.Acquire / TryAcquire.
+  destructor;       // releases the held lock
+end Lock;

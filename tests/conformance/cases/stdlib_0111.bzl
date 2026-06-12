@@ -1,12 +1,14 @@
-public class RawBytes
+public class CString
   // No public constructor; obtained via factory methods.
 
-  public static method From(buffer: Array<byte>): owned RawBytes;
+  public static method From(s: string): owned CString;
+  public static method FromBytes(bytes: Array<byte>): owned CString;
 
-  public readonly property Length: int;
-  public readonly property Pointer: IntPtr;
+  public readonly property Length: int;       // byte length, excluding the null terminator
+  public method ToBytes(): owned Array<byte>;
 
-  public method CopyTo(destination: Array<byte>, destOffset: int);
-
-  destructor;       // releases the underlying buffer if owned by this instance
-end RawBytes;
+  destructor;       // releases the underlying buffer when this CString
+                    //   allocated it (CString.From / FromBytes); for a CString
+                    //   wrapping a native-allocated buffer, the disposal
+                    //   behavior is governed by the FFI declaration. See prose.
+end CString;

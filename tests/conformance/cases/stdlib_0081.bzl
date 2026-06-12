@@ -1,25 +1,12 @@
-public interface IEvent<out T>
-  method Subscribe(handler: (T) -> ()): owned Subscription;
-end IEvent;
+/// Compiler-intrinsic; T restricted to cell-sized primitive types.
+public class Atomic<T> where T: value
+  public constructor(initial: T);
 
-public interface IAsyncEvent<out T>
-  method Subscribe(handler: (T) -> Task): owned Subscription;
-end IAsyncEvent;
+  public property Value: T
+    get;       // hardware-atomic read
+    set;       // hardware-atomic write
+  end Value;
 
-public class EventSource<T>: IEvent<T>
-  // No public constructor; obtained via event declaration.
-  public method Subscribe(handler: (T) -> ()): owned Subscription;
-  public method Raise(payload: T);
-
-  public method Add(handler: (T) -> ());
-  public method Remove(handler: (T) -> ());
-end EventSource;
-
-public class AsyncEventSource<T>: IAsyncEvent<T>
-  // No public constructor; obtained via event declaration.
-  public method Subscribe(handler: (T) -> Task): owned Subscription;
-  public async method RaiseAsync(payload: T): Task;
-
-  public method Add(handler: (T) -> Task);
-  public method Remove(handler: (T) -> Task);
-end AsyncEventSource;
+  public method Exchange(value: T): T;
+  public method CompareExchange(expected: T, replacement: T): T;
+end Atomic;

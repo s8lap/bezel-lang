@@ -1,15 +1,12 @@
-/// Compiler-intrinsic; pointer-sized integer (32 or 64 bits depending on target).
-public record IntPtr
-  public static const Zero: IntPtr;
+/// Compiler-intrinsic; T restricted to integer types and char.
+public record Range<T>: IEnumerable<T>
+  public readonly property Start: T?;              // null if open-ended on the lower side
+  public readonly property End: T?;                // null if open-ended on the upper side
+  public readonly property Step: long;             // default 1; signed to support descending
+  public readonly property IsEndInclusive: bool;   // true for `..`, false for `..<`
+  public readonly property IsOpenEnded: bool;      // true if Start or End is null
+  public readonly property IsEmpty: bool;          // true if the range contains no values
 
-  public static method operator =(a: IntPtr, b: IntPtr): bool;
-  public static method operator <>(a: IntPtr, b: IntPtr): bool;
-end IntPtr;
-
-/// Compiler-intrinsic; unsigned pointer-sized integer.
-public record UIntPtr
-  public static const Zero: UIntPtr;
-
-  public static method operator =(a: UIntPtr, b: UIntPtr): bool;
-  public static method operator <>(a: UIntPtr, b: UIntPtr): bool;
-end UIntPtr;
+  public method Contains(value: T): bool;
+  public method GetEnumerator(): owned IEnumerator<T>;
+end Range;

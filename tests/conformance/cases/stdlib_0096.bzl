@@ -1,15 +1,14 @@
-public abstract class TextReader
-  public abstract method Read(): int;             // next char as int, or -1 at EOF
-  public abstract method ReadLine(): string?;      // null at EOF
-  public method ReadToEnd(): string;
-  destructor;       // releases the underlying resource
-end TextReader;
+public class FileStream: Stream
+  public constructor(path: string, mode: FileMode);
+  public constructor(path: string, mode: FileMode, access: FileAccess);
+  // Stream operations plus file-specific:
+  public readonly property Path: string;
+end FileStream;
 
-public abstract class TextWriter
-  public abstract method Write(value: string);
-  public abstract method Write(value: char);
-  public method WriteLine();
-  public method WriteLine(value: string);
-  public abstract method Flush();
-  destructor;       // flushes and releases the underlying resource
-end TextWriter;
+public enum FileMode: byte
+  CreateNew, Create, Open, OpenOrCreate, Truncate, Append;
+end FileMode;
+
+public enum FileAccess: byte
+  Read, Write, ReadWrite;
+end FileAccess;

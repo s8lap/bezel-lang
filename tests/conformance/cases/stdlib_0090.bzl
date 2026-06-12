@@ -1,4 +1,13 @@
-public class DomainFaultedException: Exception
-  public readonly property FaultStackTrace: string;   // stack trace text of the original exception
-  // Message carries the original exception's message text.
-end DomainFaultedException;
+public async method OpenFiles(paths: Array<string>): OwnedAsyncEnumerable<FileStream>
+  for var path in paths do
+    yield return await OpenFileAsync(path);
+  end;
+end OpenFiles;
+
+// Consumer takes ownership of each FileStream:
+public async method ProcessAll(paths: Array<string>): Task
+  await for var file in OpenFiles(paths) do
+    using var f := file;      // discharge on entry — covers all exit edges
+    await ProcessAsync(f);
+  end;
+end ProcessAll;
