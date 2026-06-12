@@ -86,6 +86,76 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     // `a[i]` reads the slot at i (the getter borrows for class T, copies for
     // value T). The element type is genericArgs[0]; bounds-check against Count.
     if (isArr) {
+        // fix #682 / §15.6: `arr[r]` where r is a Range<int> → slice (new Array<T>).
+        // The index expression is a RangeExpr or a Range-typed variable. Both lower
+        // to a %bz.range struct { i64 start, i64 end, i64 step, i8 flags }; extract
+        // lo/hi, bounds-check, then call bz_array_slice(arr, start, end_excl, esz).
+        {
+            auto* idxTy = ctx_.exprType(*ix.indices[0].value);
+            bool isRangeIdx = isRangeType(idxTy);
+            if (!isRangeIdx) {
+                if (dynamic_cast<const ast::RangeExpr*>(
+                        ix.indices[0].value.get()))
+                    isRangeIdx = true;  // any RangeExpr used as an index
+            }
+            if (isRangeIdx) {
+                int64_t esz = collectionElemSize(recvTy);
+                // Get array length for open-ended endpoints and bounds-checking.
+                auto* lenFnS = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* arrLen = builder_.CreateCall(lenFnS, {recv}, "sl.arrlen");
+                llvm::Value* lo = nullptr, *hi = nullptr;
+                bool inclusive = true;
+                if (auto* re = dynamic_cast<const ast::RangeExpr*>(
+                        ix.indices[0].value.get())) {
+                    if (re->lo) {
+                        lo = lowerExpr(*re->lo);
+                        if (lo && !lo->getType()->isIntegerTy(64))
+                            lo = builder_.CreateSExt(lo, i64(), "sl.lo");
+                    }
+                    if (re->hi) {
+                        hi = lowerExpr(*re->hi);
+                        if (hi && !hi->getType()->isIntegerTy(64))
+                            hi = builder_.CreateSExt(hi, i64(), "sl.hi");
+                    }
+                    inclusive = re->inclusive;
+                } else {
+                    // Range-typed variable: load struct and extract lo/hi/flags.
+                    llvm::Value* rv = lowerExpr(*ix.indices[0].value);
+                    if (!rv) return nullptr;
+                    lo  = builder_.CreateExtractValue(rv, {0u}, "sl.lo");
+                    hi  = builder_.CreateExtractValue(rv, {1u}, "sl.hi");
+                    llvm::Value* flg  = builder_.CreateExtractValue(rv, {3u}, "sl.flg");
+                    llvm::Value* incl = builder_.CreateTrunc(flg, i1(), "sl.incl");
+                    // Convert inclusive hi to exclusive hi dynamically.
+                    llvm::Value* hiPlus = builder_.CreateAdd(hi, builder_.getInt64(1));
+                    hi = builder_.CreateSelect(incl, hiPlus, hi, "sl.endexcl");
+                    inclusive = false;  // already exclusive
+                }
+                // Resolve open-ended endpoints.
+                if (!lo) lo = builder_.getInt64(0);
+                if (!hi) {
+                    hi = arrLen;
+                    inclusive = false;  // open end is past-the-end (exclusive)
+                }
+                // Convert inclusive end to exclusive.
+                llvm::Value* endExcl = inclusive
+                    ? builder_.CreateAdd(hi, builder_.getInt64(1), "sl.endexcl")
+                    : hi;
+                // §15.6: bounds-check — start must be in [0, Count], end in [0, Count],
+                // start <= end.  Raise IndexOutOfRangeException on violation.
+                llvm::Value* loNeg = builder_.CreateICmpSLT(lo, builder_.getInt64(0), "sl.loneg");
+                llvm::Value* endOOB = builder_.CreateICmpSGT(endExcl, arrLen, "sl.eoob");
+                llvm::Value* loGtEnd = builder_.CreateICmpSGT(lo, endExcl, "sl.loge");
+                llvm::Value* oor = builder_.CreateOr(
+                    builder_.CreateOr(loNeg, endOOB), loGtEnd, "sl.oor");
+                emitGuardThrow(oor, "IndexOutOfRangeException");
+                auto* slFn = declareC("bz_array_slice", ptrTy(),
+                                      {ptrTy(), i64(), i64(), i64()});
+                llvm::Value* result = builder_.CreateCall(
+                    slFn, {recv, lo, endExcl, builder_.getInt64(esz)}, "sl.arr");
+                return result;
+            }
+        }
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
         if (!idx) return nullptr;
         idx = idx->getType()->isIntegerTy(64) ? idx
@@ -161,11 +231,14 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     // §4.8: absent key → KeyNotFoundException.
     emitGuardThrow(builder_.CreateNot(found), "KeyNotFoundException");
     // Decode the stored void* into the value type (mirror TryGetValue). The
-    // cases are: a record or nullable-value-type tagged struct — load the boxed
-    // struct out of the box (issue #393 / #539); scalars — decoded from the
-    // inttoptr'd slot; object/string pointers — the void* IS the pointer.
+    // cases are: a record, nullable-value-type, or primitive struct (decimal) —
+    // load the boxed struct out of the box (issue #393 / #539 / fix #685);
+    // scalars — decoded from the inttoptr'd slot; object/string pointers — the
+    // void* IS the pointer.
     llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
-    if ((valRec || valNullableVal) && valLlvm->isStructTy())
+    // fix #685: any struct-valued type (record, nullable, or e.g. decimal) stored
+    // as a heap-boxed void* — load the struct bytes back from the box.
+    if (valLlvm->isStructTy())
         return builder_.CreateLoad(valLlvm, valPtr, "ix.rec");
     if (!valLlvm->isPointerTy()) {
         llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());

@@ -299,6 +299,23 @@ void* bz_array_copy(void* arrp, int64_t elem_size) {
     return dst;
 }
 
+// fix #682 / §15.6: copy elements [start, end) from `arr` into a fresh array.
+// `end` is exclusive (half-open interval). Precondition: callers have already
+// verified start >= 0, end <= Count, and start <= end via codegen bounds-checks
+// (emitGuardThrow before this call).
+void* bz_array_slice(void* arrp, int64_t start, int64_t end, int64_t elem_size) {
+    auto* src = (bz_array_t*)arrp;
+    int64_t count = end - start;
+    if (count < 0) count = 0;
+    auto* dst = (bz_array_t*)bz_array_alloc(elem_size, count > 0 ? count : 0);
+    if (count > 0 && src && src->data) {
+        memcpy(dst->data, (char*)src->data + start * elem_size,
+               (size_t)(count * elem_size));
+        dst->count = count;
+    }
+    return dst;
+}
+
 // #429 / §4.6 / §28.9: retain every non-null pointer-sized string element so a
 // freshly copied / materialized Array<string> independently co-owns a +1 per
 // element. Each slot is a bz_string*; bz_string_retain is a no-op on a
@@ -1807,6 +1824,36 @@ extern "C" int32_t bz_decimal_cmp(const bz_decimal_t* a, const bz_decimal_t* b) 
     dec_align(ma, dec_scale(a), mb, dec_scale(b), &ra, &rb, &rs);
     int32_t cmp = (ra < rb) ? -1 : (ra > rb) ? 1 : 0;
     return signa ? -cmp : cmp;  // negative numbers: larger mantissa = smaller value
+}
+
+// fix #685 / §4.4 / §8.3: hash a decimal value consistently with bz_decimal_cmp.
+// Two decimals that compare equal (e.g. 1.0m and 1.00m) must hash identically.
+// Strategy: normalize by stripping trailing decimal zeros — divide the mantissa
+// by 10 while it divides evenly and decrement the scale — then fold the canonical
+// (sign, normalized mantissa) into an i32.  Any zero value (mantissa = 0)
+// always returns 0 regardless of scale or sign bit.
+extern "C" int32_t bz_decimal_hash(const bz_decimal_t* a) {
+    __uint128_t m = dec_mantissa(a);
+    uint32_t s    = dec_scale(a);
+    int neg       = dec_sign(a);
+    // All-zero mantissa: canonical zero (independent of scale and sign).
+    if (m == 0) return 0;
+    // Normalize: strip trailing decimal zeros by dividing m by 10 while
+    // divisible, decrementing s in lock-step.
+    while (s > 0 && m % 10 == 0) { m /= 10; --s; }
+    // FNV-style fold of (sign, scale, mantissa lo64, mantissa hi64) → i32.
+    // We use the low 96 bits of the mantissa (hi32 is the top word; in practice
+    // a Bezel decimal fits within 96 bits).
+    uint32_t lo32 = (uint32_t)( m        & 0xFFFFFFFFu);
+    uint32_t md32 = (uint32_t)((m >> 32) & 0xFFFFFFFFu);
+    uint32_t hi32 = (uint32_t)((m >> 64) & 0xFFFFFFFFu);
+    uint32_t h    = 17u;
+    h = h * 31u + lo32;
+    h = h * 31u + md32;
+    h = h * 31u + hi32;
+    h = h * 31u + s;
+    if (neg) h ^= 0x80000000u;
+    return (int32_t)h;
 }
 
 // Conversion from int64/int32 (implicit per §5.1).
