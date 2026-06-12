@@ -1342,6 +1342,14 @@ void    bz_binder_graph_mark_in_progress(void* der, int32_t tag_id);
 void    bz_binder_graph_register_tag(void* der, int32_t tag_id, void* ptr);
 void*   bz_binder_graph_resolve_tag(void* der, int32_t tag_id);
 
+// §9.8 tier-4: polymorphic-dispatch deserialization entry point.
+// Reads the opening object and the "$type" discriminator field; sets up
+// poly_preread_count so the concrete type's bz_binder_begin_object returns
+// the remaining field count without re-consuming the object header.
+// Returns a newly-allocated bz_string* (rc=1) holding the discriminator value.
+// Raises SerializationException if the first field is not "$type" or input is truncated.
+void* bz_binder_read_poly_discriminator(void* der);
+
 // SerializationException throw helper — called by synthesized code on bad input.
 // `msg` is a NUL-terminated C string describing the fault (for diagnostics).
 // Stores a built-in SerializationException in the global exception slot (bz_exc)

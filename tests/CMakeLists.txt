@@ -510,6 +510,9 @@ set(BEZEL_TEST_SOURCES
     # --- #550 tier-3 contract tests (serialized-graph back-edges, §9.8) ---
     codegen/serialization_tier3_graph_test.cpp
     # --- end #550 tier-3 contract ---
+    # --- #550 tier-4 contract tests (polymorphic registry, §9.8) ---
+    codegen/serialization_tier4_poly_test.cpp
+    # --- end #550 tier-4 contract ---
     # --- #668/#669 fix tests (missing-required-field raise; AOT null-nullable-class) ---
     codegen/serialization_668_669_test.cpp
     # --- end #668/#669 ---
