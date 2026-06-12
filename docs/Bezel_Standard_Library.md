@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.137 — June 2026**
+**Companion to the Bezel Language Specification, v0.138 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2771,6 +2771,8 @@ end;
 // At scope end: guard disposed if non-null, releasing the lock; null is a no-op.
 ```
 
+**Sendability (specified in v0.138).** `Mutex` is *sendable* (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) and internally synchronized — like `Channel<T>` ([§6.9](#sec-channel)), it may be reached by multiple domains simultaneously; that is its purpose. `Lock` is **not** sendable: a held guard is bound to the acquiring domain and is released there (moving a held lock between domains would decouple acquisition from release and break the `using var` discipline that makes the guard idiom sound).
+
 `AcquireAsync` and `TryAcquireAsync` are the async counterparts. `AcquireAsync` returns a `OwnedTask<Lock>` (Pattern B, single-consumer); `TryAcquireAsync` returns `OwnedTask<Lock?>` — the same nullable shape inside a Pattern B task. Consumers write:
 
 ```bezel
@@ -3151,7 +3153,7 @@ There is no built-in cross-domain cancellation: `CancellationToken` is a borrow-
 <a id="sec-channel"></a>
 ### 6.9 `Channel<T>` and `ChannelSender<T>`
 
-Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized — the only standard types two domains may reach simultaneously. T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)).
+Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex` ([§6.2](#sec-mutex-and-lock), v0.138) they are the only standard types two domains may reach simultaneously. T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)).
 
 The signature surface dispatches on T's category, as with `OwnedBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
 

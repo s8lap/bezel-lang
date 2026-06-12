@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.137 — June 2026**
+**Companion to the Bezel Language Specification, v0.138 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6726,6 +6726,20 @@ synchronous. Ordinary `async` methods are unaffected (§30.9).
 Programs that awaited inside an async iterator's `finally` were already broken (silently
 skipped cleanup on early disposal); they now fail to compile with a remedy in the message.
 No other program changes meaning.
+
+---
+
+### v0.138 changelog (v0.137 → v0.138)
+
+One ruling: **`Mutex` is sendable; `Lock` is not** (stdlib §6.2; settles the question flagged in the #647 design note).
+
+A mutex exists to be reached from multiple domains — it joins `Channel<T>`/`ChannelSender<T>` as the third internally-synchronized standard type two domains may touch simultaneously (§6.9's "only" sentence amended accordingly). A held `Lock` stays on its acquiring domain: acquisition and release must pair on one domain for the `using var` guard discipline to stay sound; *declined: sendable Lock* — moving a held guard would let domain B release what domain A acquired, reintroducing exactly the cross-thread release hazards the guard idiom exists to prevent.
+
+#### Touched
+- **Stdlib §6.2** — sendability paragraph. **Stdlib §6.9** — "only standard types" sentence now includes Mutex. **Rationale** — this entry.
+
+#### Migration
+None; this only widens acceptance (Mutex was conservatively rejected at Spawn boundaries pending the ruling).
 
 ---
 
