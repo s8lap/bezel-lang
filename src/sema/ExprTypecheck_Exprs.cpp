@@ -604,9 +604,21 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     bool isDict =
                         cn == "Dictionary" || cn == "OwnedDictionary";
                     if ((isArrLike || isSpan) && !tt->genericArgs.empty() &&
-                        tt->genericArgs[0])
-                        ctx_.setExprType(&e, tt->genericArgs[0]);
-                    else if (isDict && tt->genericArgs.size() > 1 &&
+                        tt->genericArgs[0]) {
+                        // §15.6 / fix #690: `arr[range]` on Array<T> produces
+                        // a new Array<T> — the result type is the ARRAY type
+                        // (tt), not the element type (T). Only Array<T> supports
+                        // range slicing; OwnedArray<T>, span types, and list
+                        // interfaces use the scalar-element path.
+                        bool isRangeIdx =
+                            !ix->indices.empty() && ix->indices[0].value &&
+                            dynamic_cast<const ast::RangeExpr*>(
+                                ix->indices[0].value.get()) != nullptr;
+                        if (isRangeIdx && cn == "Array")
+                            ctx_.setExprType(&e, tt);
+                        else
+                            ctx_.setExprType(&e, tt->genericArgs[0]);
+                    } else if (isDict && tt->genericArgs.size() > 1 &&
                              tt->genericArgs[1])
                         ctx_.setExprType(&e, tt->genericArgs[1]);
                 }
