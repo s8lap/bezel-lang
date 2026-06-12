@@ -89,6 +89,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
     if (n == "Channel" || n == "ChannelSender") return 1;
     if (n == "Domain" || n == "ChannelClosedException" ||
         n == "DomainFaultedException") return 0;
+    // §6.2 / issue #647: Mutex and Lock — synchronization primitives.
+    // Mutex has a public constructor(). Lock has NO public constructor (obtained
+    // only from Mutex.Acquire / TryAcquire); both are nullary class types.
+    if (n == "Mutex" || n == "Lock") return 0;
     // §3 nullary stdlib classes:
     if (n == "StringBuilder" || n == "Random" ||
         n == "DateTime" || n == "TimeSpan" ||

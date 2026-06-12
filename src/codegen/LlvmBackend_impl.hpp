@@ -572,6 +572,17 @@ private:
         // (for class-typed T) is embedded in the channel struct itself (set at
         // construction time), so the Disposal struct needs no extra field.
         bool channel = false;
+        // §6.2 / issue #647: a `using var` bound to a Mutex. At scope end it
+        // is disposed via bz_mutex_dispose (idempotent: marks disposed, drops
+        // the Mutex object's core ref). No user TypeSymbol; recognised by
+        // initializer type name "Mutex" or by declared type annotation.
+        bool mutex = false;
+        // §6.2 / issue #647: a `using var` bound to a Lock. At scope end it
+        // is released via bz_lock_release (idempotent per §28.2: released flag
+        // prevents double-release). No user TypeSymbol; recognised by the
+        // inferred expression type name "Lock" (return of Acquire/TryAcquire).
+        // bz_lock_release is null-safe (handles a null Lock? that was never set).
+        bool lock = false;
         // §30.15 (#600 phase c): a `using var` bound to a ChannelSender<T>. At
         // scope end it is released via bz_channel_sender_release (decrements
         // sender count; if last sender, closes the channel and faults pending
@@ -4712,6 +4723,8 @@ private:
     // §30.14/§30.15 (#600 phase c): Channel<T>/ChannelSender<T> instance methods
     // and Domain.Spawn(entry, arg?) lowering. Returns null when not matched.
     llvm::Value* tryLowerChannelAndDomainCall(const ast::CallExpr& call);
+    // §6.2 / issue #647: Mutex.Acquire, TryAcquire, AcquireAsync, TryAcquireAsync.
+    llvm::Value* tryLowerMutexLockCall(const ast::CallExpr& call);
 
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
     // The callee is a member access whose target is itself `Encoding.<singleton>`.

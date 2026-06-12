@@ -6962,6 +6962,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* v = tryLowerEncodingCall(call)) return v;
     // §30.14/§30.15 (#600 phase c): Channel<T>/ChannelSender<T> methods + Domain.Spawn.
     if (auto* v = tryLowerChannelAndDomainCall(call)) return v;
+    // §6.2 / issue #647: Mutex.Acquire / TryAcquire / AcquireAsync / TryAcquireAsync.
+    if (auto* v = tryLowerMutexLockCall(call)) return v;
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
     if (auto* v = tryLowerBuiltinClassCall(call)) return v;
     // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
@@ -7722,6 +7724,55 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             builder_.CreateCall(fn, {tx, cceVt});
                             // Null the slot so any subsequent using-var scope-exit
                             // reload sees null and skips (§28.2).
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
+                // §6.2 / issue #647: Mutex.Dispose() — marks disposed (idempotent),
+                // drops the Mutex object's core ref (destroys the underlying
+                // pthread_mutex when no Lock is outstanding).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && builtinTypeName(recvTy) == "Mutex") {
+                        llvm::Value* mx = lowerExpr(*ma->target);
+                        if (mx && mx->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_mutex_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {mx});
+                            // Null the slot so any following using-var scope-exit
+                            // reload sees null and skips the dispose (§28.2).
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
+                // §6.2 / issue #647: Lock.Dispose() — release the held lock
+                // (idempotent per §28.2: bz_lock_release handles the released flag).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && builtinTypeName(recvTy) == "Lock") {
+                        llvm::Value* lk = lowerExpr(*ma->target);
+                        if (lk && lk->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_lock_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {lk});
+                            // Null the slot so the using-var scope-exit guard
+                            // finds null and skips (§28.2 exactly-once rule).
                             if (!checkedDisposal_) {
                                 llvm::Type* slotTy = nullptr;
                                 if (llvm::Value* slot =
@@ -11896,6 +11947,70 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 {adapter, argVal, getDFEVtable()},
                 "domain.spawn");
         }
+    }
+
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// §6.2 / issue #647: Mutex instance methods.
+//
+//   Acquire()                 → bz_mutex_acquire(mx)          → ptr (owned Lock)
+//   TryAcquire(timeout: ts)   → bz_mutex_try_acquire(mx, ms)  → ptr? (owned Lock?)
+//   AcquireAsync / TryAcquireAsync → compile error (not yet implemented)
+//   Dispose()                 → handled in the explicit-Dispose block above.
+//
+// TryAcquire lowers the TimeSpan argument to milliseconds (i64) using
+// bz_timespan_total_milliseconds, truncated to int64_t. A null return from the
+// runtime (timeout) is returned as a null ptr to the Bezel nullable owned Lock?.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view mname = ma->member;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || builtinTypeName(recvTy) != "Mutex") return nullptr;
+
+    llvm::Value* mx = lowerExpr(*ma->target);
+    if (!mx) return nullptr;
+
+    if (mname == "Acquire" && call.args.empty()) {
+        // Acquire(): blocks until the mutex is available, returns owned Lock.
+        // per §6.2: the non-null return makes the guard idiom straightforward.
+        auto* fn = declareC("bz_mutex_acquire", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {mx}, "mx.acquire");
+    }
+
+    if (mname == "TryAcquire" && call.args.size() == 1 && call.args[0].value) {
+        // TryAcquire(timeout: TimeSpan): owned Lock?
+        // Convert the TimeSpan (i64 tick value) to milliseconds (i64) and
+        // call bz_mutex_try_acquire(mutex, timeout_ms). Returns null on timeout.
+        llvm::Value* tsVal = lowerExpr(*call.args[0].value);
+        if (!tsVal) return nullptr;
+        // TimeSpan is stored as an i64 tick value (100-ns units).
+        // Convert to milliseconds via bz_timespan_total_milliseconds (returns double).
+        // Then truncate to i64 for the runtime's timeout_ms parameter.
+        if (!tsVal->getType()->isIntegerTy(64)) {
+            // Coerce to i64 if needed (e.g. i32 zero-extension).
+            tsVal = builder_.CreateSExtOrTrunc(tsVal, i64(), "ts.i64");
+        }
+        auto* msFn = declareC("bz_timespan_total_milliseconds",
+                               llvm::Type::getDoubleTy(llvm_), {i64()});
+        llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
+        // Truncate double to i64 (floor towards zero per standard C conv).
+        llvm::Value* msI64 = builder_.CreateFPToSI(
+            msDouble, i64(), "ts.ms.i64");
+        auto* fn = declareC("bz_mutex_try_acquire", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(fn, {mx, msI64}, "mx.tryacq");
+    }
+
+    // AcquireAsync / TryAcquireAsync: not yet implemented.
+    // Diagnostic is emitted by sema; codegen returns null so the JIT does not crash.
+    // (The sema error prevents code from reaching codegen, but be defensive.)
+    if (mname == "AcquireAsync" || mname == "TryAcquireAsync") {
+        return nullptr;
     }
 
     return nullptr;

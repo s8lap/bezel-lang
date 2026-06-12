@@ -4314,6 +4314,62 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // §6.2 / issue #647: a `using var` bound to a Mutex.
+    // No user TypeSymbol; recognised by NewExpr type name or inferred exprType
+    // name "Mutex". At scope end, bz_mutex_dispose is called (idempotent:
+    // marks disposed, drops the Mutex object's core ref).
+    {
+        bool isMx = false;
+        auto isMutexTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "Mutex";
+        };
+        if (ld->type)
+            isMx = isMutexTypeName(ctx_.resolvedType(*ld->type));
+        if (!isMx && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isMx = ne->type && ne->type->name &&
+                       !ne->type->name->parts.empty() &&
+                       ne->type->name->parts[0] == "Mutex";
+        }
+        if (!isMx && ld->initializer)
+            isMx = isMutexTypeName(ctx_.exprType(*ld->initializer));
+        if (isMx) {
+            Disposal d{it->second, nullptr};
+            d.mutex = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+    // §6.2 / issue #647: a `using var` bound to a Lock (owned guard returned
+    // by Mutex.Acquire() / TryAcquire()). No user TypeSymbol; recognised by the
+    // inferred expression type name "Lock". At scope end, bz_lock_release is
+    // called (idempotent per §28.2: the released flag prevents double-release).
+    // bz_lock_release is null-safe (handles a null Lock? on the timeout path).
+    {
+        bool isLk = false;
+        auto isLockTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "Lock";
+        };
+        if (ld->type)
+            isLk = isLockTypeName(ctx_.resolvedType(*ld->type));
+        // Lock can only be obtained from a method call, so check the initializer
+        // expression type (the return type of Acquire / TryAcquire).
+        if (!isLk && ld->initializer)
+            isLk = isLockTypeName(ctx_.exprType(*ld->initializer));
+        if (isLk) {
+            Disposal d{it->second, nullptr};
+            d.lock = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // §30.15 (#600 phase c): a `using var` bound to a Channel<T>.
     // No user TypeSymbol; recognised by type name "Channel". At scope end,
     // bz_channel_dispose is called (closes channel, faults pending receivers with
@@ -7820,6 +7876,48 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_task_fire_and_forget",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {t});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §6.2 / issue #647: a `using var` Mutex. Dispose via bz_mutex_dispose
+        // (marks disposed, drops the Mutex object's core ref; destroys the
+        // underlying pthread_mutex when the last Lock is also released).
+        // Null-guarded: bz_mutex_dispose is null-safe, but we guard for
+        // consistency with other builtin disposal sites.
+        if (it->mutex) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* mx = builder_.CreateLoad(ptrTy(), addr, "mx.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                mx, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB  = llvm::BasicBlock::Create(llvm_, "mx.dispose",  currentFn_);
+            auto* contBB  = llvm::BasicBlock::Create(llvm_, "mx.cont",     currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            auto* fn = declareC("bz_mutex_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {mx});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §6.2 / issue #647: a `using var` Lock. Release via bz_lock_release
+        // (idempotent per §28.2: bz_lock_release checks the released flag).
+        // Null-guarded: bz_lock_release handles null (null Lock? on timeout path).
+        if (it->lock) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* lk = builder_.CreateLoad(ptrTy(), addr, "lk.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                lk, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* relBB  = llvm::BasicBlock::Create(llvm_, "lk.release",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "lk.cont",     currentFn_);
+            builder_.CreateCondBr(isNull, contBB, relBB);
+            builder_.SetInsertPoint(relBB);
+            auto* fn = declareC("bz_lock_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {lk});
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

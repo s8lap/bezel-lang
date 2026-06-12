@@ -2279,6 +2279,47 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
+                    // §6.2 / issue #647: Mutex instance methods.
+                    // Mutex TypeRef: Named, no declaration, astNode name "Mutex".
+                    if (rcn == "Mutex" && recvTy) {
+                        // Helper: build a Lock TypeRef (nullary, no declaration).
+                        static const ast::Type* kLockNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("Lock");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto makeLockTypeRef = [&]() -> TypeRef* {
+                            auto* tr = ctx_.makeTypeRef();
+                            tr->kind = TypeRef::Kind::Named;
+                            tr->nullable = false;
+                            tr->declaration = nullptr;
+                            tr->astNode = kLockNode;
+                            return tr;
+                        };
+                        if (m == "Acquire" && ce.args.empty()) {
+                            // Acquire(): owned Lock.
+                            ctx_.setExprType(&ce, makeLockTypeRef());
+                        } else if (m == "TryAcquire" && ce.args.size() == 1) {
+                            // TryAcquire(timeout: TimeSpan): owned Lock?
+                            // Build a nullable Lock TypeRef.
+                            auto* tr = makeLockTypeRef();
+                            tr->nullable = true;
+                            ctx_.setExprType(&ce, tr);
+                        } else if (m == "AcquireAsync" || m == "TryAcquireAsync") {
+                            // §6.2 / #647 async variants: not yet implemented.
+                            // Emit a clean diagnostic at the call site.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "not yet implemented (#647 async acquire): "
+                                "AcquireAsync / TryAcquireAsync require suspension "
+                                "integration with the task runtime and are deferred "
+                                "to a follow-up lane");
+                        }
+                        // Dispose(): unit; no return type set.
+                    }
                     // §9.8 / §2.15 / issue #550: BinarySerializer.ToBytes() →
                     // OwnedBuffer<byte>.  Set on the CallExpr so that inferred-type
                     // locals (`using var bytes := s.ToBytes()`) pick up the element
@@ -5325,6 +5366,9 @@ bool ExprTC::isSendable(const TypeRef* rt,
                 bname == "Shared" || bname == "Weak" ||
                 bname == "EventSource" || bname == "AsyncEventSource" ||
                 bname == "Mutex" || bname == "Semaphore" ||
+                // §6.2 / #647: Mutex not sendable (docs ruling pending — conservative);
+                // Lock not sendable (a held guard is domain-local by nature).
+                bname == "Lock" ||
                 bname == "CancellationTokenSource")
                 return false;
             // CancellationToken is a borrow-bearing record per §30.14
