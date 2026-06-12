@@ -733,7 +733,7 @@ end LoadPoint;
 <a id="sec-shared-and-weak"></a>
 ### 2.16 `Shared<T>` and `Weak<T>`
 
-Scoped shared ownership (language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership)): N handles jointly own one underlying value; the last handle's disposal disposes it. Both types are compiler-known; the shared count and last-one-disposes behavior are not expressible in user Bezel. Both are auto-imported with `System`. Neither is sendable (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) — the count is not synchronized; handles are domain-local.
+Scoped shared ownership (language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership)): N handles jointly own one underlying value; the last handle's disposal disposes it. Both types are compiler-known; the shared count and last-one-disposes behavior are not expressible in user Bezel. Both are auto-imported with `System`. `Shared<T>` is sendable iff `T` is sendable and internally synchronized — the v0.140 rule of language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership) (the count is maintained with synchronized operations); `Weak<T>` and `Shared<T>` of any other `T` remain domain-local ([§30.14](Bezel_Language_Spec.md#sec-sendable-types)).
 
 ```bezel
 public class Shared<T>: IDisposable where T: class      // proper class types only;
