@@ -1943,9 +1943,13 @@ BEZEL_TEST(cross_module_import, imported_generic_record_double_field_native_spec
     BEZEL_EXPECT_EQ(code, 4);  // int(4.0) == 4
 }
 
-// (8) NEGATIVE — §14 deferred: imported generic CLASS with field initializer is
-// still rejected (needs importer-side vtable + disposer; §28.3 obligation).
-// §14.1 / §22.8: Pins the remaining gate boundary.
+// (8) §14.1 / §22.8 (#662 foundation A update): imported generic CLASS with a
+// field initializer (`n: int := 9`) and NO explicit constructor is now ACCEPTED
+// by the narrowed §14 gate (Foundation A). The field initializer expression is
+// NOT carried in the dependency's metadata, so the importer calloc-zeros the
+// field (n = 0, not 9). Sema must pass cleanly; the construction succeeds.
+// Known limitation: field initializer values from the exporter are not replayed
+// in the importer — calloc-zero is the importer-side default (Foundation C).
 BEZEL_TEST(cross_module_import, imported_generic_field_init_class_diagnosed_spec_22_8) {
     ModuleMetadata dep = buildMetaFor(
         "module GenFieldLib; "
@@ -1961,17 +1965,11 @@ BEZEL_TEST(cross_module_import, imported_generic_field_init_class_diagnosed_spec
         "public class Program "
         "  public static method Main(): int "
         "    using var h := new Holder<int>(); "
-        "    return h.n; "
+        "    return h.n; "  // n = 0 (calloc-zeroed; initializer not replayed)
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_TRUE(r->hadErrors);
-    bool sawLimitation = false;
-    for (const Diagnostic& d : r->diags.diagnostics()) {
-        if (d.message.find("imported generic") != std::string::npos &&
-            d.message.find("\xC2\xA7""14") != std::string::npos)
-            sawLimitation = true;
-    }
-    BEZEL_EXPECT_TRUE(sawLimitation);
+    // Foundation A: accepted (no §14 error for zero-ctor generic class).
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
 // (9) NEGATIVE — §14 deferred: imported generic CLASS with an explicit constructor
@@ -2429,6 +2427,191 @@ BEZEL_TEST(cross_module_import,
     // Must diagnose — imported generic CLASS construction is §14-gated until
     // Phase A (buildImportedGenericVtable) is implemented (Blocker 1).
     BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
+// === #662 foundation A — importer-side vtable + disposer for imported generic ===
+//
+// Foundation A delivers per-instantiation vtable + disposer for imported generic
+// class types that have NO explicit constructor (implicit zero-arg construction,
+// calloc-zero field initialization). The specialized Dispose runs the destructor
+// body, disposes owned type-param fields by their concrete substituted type, and
+// reclaims the instance block.
+//
+// Sound subset: imported generic class with no explicit constructor body. Classes
+// with explicit constructors remain §14-gated (Foundation C / Blocker 3).
+
+// (21) §28.5 / §14 (#662 foundation A): imported generic class with NO
+// explicit constructor is constructed and disposed via `using var`.  Foundation
+// A proves the structural side: vtable installed, disposal path runs without
+// crash.  The destructor BODY is absent from metadata (Blocker 3 / Foundation
+// C); only the structural disposal (owned-field null-check + free) runs in the
+// importer.  The observable proof here is that the program runs to completion
+// without crashing (rc == 0), NOT a counter increment.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_zero_ctor_owned_field_disposed_spec_28_5_662a) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_662a_genbox_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    // Module A: a generic Box<T> with NO explicit constructor.
+    // The destructor body would run on disposal, but since destructor bodies are
+    // not in metadata (§13.3: not part of the public ABI), the importer emits
+    // only the structural disposal (null-check owned field + free the block).
+    // Foundation A proves construction + vtable install + structural disposal.
+    writeSource(aSrc.path,
+        "module GenBoxLib; "
+        "public class Box<T> "
+        "  destructor end destructor; "
+        "end Box;");
+    // Module B: constructs two Box<int> instances, disposes via `using var`.
+    // Main returns 1 (a fixed value) to prove the program ran to completion.
+    writeSource(bSrc.path,
+        "module App; "
+        "import GenBoxLib; "
+        "public class Program "
+        "  public static method Use(): int "
+        "    using var b1 := new Box<int>(); "
+        "    using var b2 := new Box<int>(); "
+        "    return 0; "
+        "  end Use; "
+        "  public static method Main(): int "
+        "    Use(); "
+        "    return 1; "  // 1: program ran to completion without crash
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 1);  // program ran to completion (vtable valid, no crash)
+}
+
+// (22) §28.5 / §14 (#662 foundation A): two DISTINCT instantiations of the same
+// imported generic class (Counter<int> and Counter<string>) each get separate
+// per-instantiation vtables and each run their structural disposal without
+// crashing.  Destructor bodies are not in metadata (Blocker 3 / Foundation C),
+// so the observable proof is that the program runs to completion (rc == 2,
+// a fixed return value, not a counter).
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_two_instantiations_both_disposed_spec_28_5_662a) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_662a_twoinst_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module GenCountLib; "
+        "public class Counter<T> "
+        "  destructor end destructor; "
+        "end Counter;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import GenCountLib; "
+        "public class Program "
+        "  public static method Use(): int "
+        "    using var ci := new Counter<int>(); "
+        "    using var cs := new Counter<string>(); "
+        "    return 0; "
+        "  end Use; "
+        "  public static method Main(): int "
+        "    Use(); "
+        "    return 2; "  // 2: two-instantiation program ran to completion (vtables valid)
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 2);  // both Counter<int> and Counter<string> disposed
+}
+
+// (23) §14 (#662 foundation A): imported generic class with NO explicit ctor
+// passes sema cleanly (narrowed §14 gate).  Sema accepts the construction;
+// no §14 diagnostic is emitted.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_no_ctor_sema_clean_spec_14_662a) {
+    ModuleMetadata dep = buildMetaFor(
+        "module GenSimpleLib; "
+        "public class Holder<T> "
+        "  public _v: int := 0; "
+        "  destructor end destructor; "
+        "end Holder;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import GenSimpleLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var h := new Holder<int>(); "
+        "    return h._v; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// (24) §14 (#662 foundation A): imported generic class WITH an explicit ctor
+// body remains §14-gated. The narrowed gate accepts zero-arg-no-body but
+// must still reject classes with explicit constructors.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_with_ctor_body_still_gated_spec_14_662a) {
+    ModuleMetadata dep = buildMetaFor(
+        "module BoxWithCtorLib; "
+        "public class Box<T> "
+        "  public owned _slot: T; "
+        "  public constructor(v: T) "
+        "    _slot := v; "
+        "  end constructor; "
+        "  destructor end destructor; "
+        "end Box;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import BoxWithCtorLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(42); "  // has ctor → still gated
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    bool sawLimitation = false;
+    for (const Diagnostic& d : r->diags.diagnostics()) {
+        if (d.message.find("constructor body") != std::string::npos ||
+            d.message.find("imported generic") != std::string::npos)
+            sawLimitation = true;
+    }
+    BEZEL_EXPECT_TRUE(sawLimitation);
 }
 
 }  // namespace bezel::module

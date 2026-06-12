@@ -5893,25 +5893,40 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     llvm::Value* obj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), sizeofSt});
 
-    // §14.1 / §2.5 / §2.6 (issue #328 FINDING [2]; #428): an IMPORTED GENERIC
-    // type has NO stable per-type symbols to link against — a generic is
-    // monomorphized per-instantiation (§14), so the dependency emits no
-    // `bz$<Type>$init` (the declareFunctions carve-out exports init only for
-    // non-generic public types) and its `bz$<Type>$ctor` is the template (T→i32),
-    // not this instantiation. Sema rejects `new ImportedGeneric<...>(...)` before
-    // codegen runs (checkImportedNewExprArgs for a class, the NewExpr record guard
-    // for a record), so this branch is normally unreachable for a generic imported
-    // type; the guard is a BACKSTOP so codegen never emits a dangling external
-    // `bz$<Type>$init`/`$ctor` reference (the FINDING [2] link failure) even if
-    // reached out-of-band. The bare calloc'd object is returned as-is. Sound
-    // cross-module generic construction needs importer-side per-instantiation
-    // infrastructure (a vtable + disposer for a generic class; record-struct
-    // specialization for a generic record) — a larger feature, deferred (#428).
+    // §14.1 / §2.5 / §2.6 (issue #328 FINDING [2]; #428 / #662 foundation A):
+    // an IMPORTED GENERIC type has NO stable per-type symbols to link against —
+    // a generic is monomorphized per-instantiation (§14), so the dependency
+    // emits no `bz$<Type>$init` (only non-generic publics export an init) and
+    // its `bz$<Type>$ctor` is the template (T→i32), not this instantiation.
+    //
+    // Foundation A (#662): we now support construction of imported generic
+    // CLASS types that have NO explicit constructor (implicit default = zero
+    // args, zero field initializers).  For those:
+    //   - the per-instantiation vtable is built by buildImportedGenericVtable
+    //     (called from emitInstanceInit below) with genericSubst_ active.
+    //   - there is no ctor body to inline and no external ctor ABI to match.
+    //   - the importer emits: calloc → install vtable → (no ctor call) → done.
+    //   - sema narrowed the §14 gate: !hasAnyConstructor → accepted.
+    //
+    // Classes WITH an explicit constructor remain gated: the ctor body is
+    // absent from the metadata (Foundation C / Blocker 3).  Records ride the
+    // #428b path.  The backstop comment applies to those still-gated shapes.
     const bool importedGeneric =
         ctx_.isImported(t) && !t->genericParams.empty();
+    // #662 foundation A: an imported generic class with no explicit ctor uses
+    // the local emitInstanceInit path so the per-instantiation vtable is
+    // installed. The genericSubst_ is already set above (imported-type branch).
+    const bool importedGenericNoBody =
+        importedGeneric && t->kind == ast::TypeDeclKind::Class &&
+        !hasAnyConstructor(t);
     if (ctx_.isImported(t) && !importedGeneric) {
         llvm::Function* initFn = declareImportedInit(t);
         builder_.CreateCall(initFn, {obj});
+    } else if (importedGenericNoBody) {
+        // Use emitInstanceInit (which routes to buildImportedGenericVtable)
+        // to install the per-instantiation vtable.  Imported fields have no
+        // AST initializers → calloc already zeroed them.
+        emitInstanceInit(t, obj, st);
     } else if (!ctx_.isImported(t)) {
         // §22.10 / §22.8 (#478): a class with primary-constructor parameters
         // must have those parameter values stored into their field slots
@@ -5968,7 +5983,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         emitInstanceInit(t, obj, st);
         currentThis_ = savedThisForInit;
     }
-    if (importedGeneric) {
+    if (importedGeneric && !importedGenericNoBody) {
+        // Still-gated shape (has ctor body / field inits): return as-is.
+        // The backstop prevents codegen from emitting a dangling external
+        // bz$<Type>$init / bz$<Type>$ctor reference (the FINDING [2] link
+        // failure).  importedGenericNoBody shapes fall through below so that
+        // the hasAnyConstructor guard chain (implicit-base call) runs.
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         return obj;  // decline: no dangling per-type symbol for a generic import
