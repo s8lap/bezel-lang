@@ -248,8 +248,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerBoxFieldStore(*as->target, addr, rhs,
                                                  as->value.get());
-                if (!handled)
+                if (!handled) {
                     builder_.CreateStore(rhs, addr);
+                    // §27.5 / #673: guarded-boxed (non-for-var) locals keep the
+                    // original pre-boxing alloca in sync so pre-emitted code that
+                    // loads from it (e.g. a while-loop condition) sees the update.
+                    if (llvm::AllocaInst* ns = localSlot(*as->target))
+                        syncCellToOrigSlot(ns, rhs);
+                }
             } else if (as->op == "??=") {
                 // §4.7: null-coalescing assignment `x ??= e` — store e
                 // into x only when x is currently null.
@@ -339,7 +345,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         std::vector<llvm::Value*> args{cur, rhs};
                         llvm::Value* res = emitMethodCall(
                             opMethod, args, /*baseQualified=*/false);
-                        if (res) builder_.CreateStore(res, addr);
+                        if (res) {
+                            builder_.CreateStore(res, addr);
+                            // §27.5 / #673: sync compound-assignment result back
+                            // to the original alloca for guarded-boxed locals.
+                            if (llvm::AllocaInst* ns = localSlot(*as->target))
+                                syncCellToOrigSlot(ns, res);
+                        }
                         return false;
                     }
                 }
@@ -350,7 +362,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 llvm::Value* res = emitCompoundOp(
                     op, cur, rhs, elemTy->isFloatingPointTy(),
                     isUnsignedTargetExpr(*as->target));
-                if (res) builder_.CreateStore(res, addr);
+                if (res) {
+                    builder_.CreateStore(res, addr);
+                    // §27.5 / #673: sync back to original alloca.
+                    if (llvm::AllocaInst* ns = localSlot(*as->target))
+                        syncCellToOrigSlot(ns, res);
+                }
             }
         }
         return false;
@@ -401,7 +418,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     std::vector<llvm::Value*> args{cur};
                     llvm::Value* res =
                         emitMethodCall(opMethod, args, /*baseQualified=*/false);
-                    if (res) builder_.CreateStore(res, addr);
+                    if (res) {
+                        builder_.CreateStore(res, addr);
+                        // §27.5 / #673: sync to original alloca.
+                        if (llvm::AllocaInst* ns = localSlot(*inc->target))
+                            syncCellToOrigSlot(ns, res);
+                    }
                 } else {
                     // Built-in numeric increment/decrement.
                     bool fp = elemTy->isFloatingPointTy();
@@ -414,7 +436,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Value* res = emitCompoundOp(
                         inc->op == "++" ? "+" : "-", cur, one, fp,
                         isUnsignedTargetExpr(*inc->target));
-                    if (res) builder_.CreateStore(res, addr);
+                    if (res) {
+                        builder_.CreateStore(res, addr);
+                        // §27.5 / #673: sync to original alloca.
+                        if (llvm::AllocaInst* ns = localSlot(*inc->target))
+                            syncCellToOrigSlot(ns, res);
+                    }
                 }
             } else {
                 // fix #587 / §20.5: lvalueAddr returned null — the target is either

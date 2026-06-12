@@ -1468,6 +1468,10 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
     llvm::Value* cellPtr = builder_.CreateLoad(ptrTy(), newSlot, "cell");
 
     cellVars_[newSlot] = valTy;
+    // §27.5 / #673: record the original slot so writes to the cell also
+    // sync back to the pre-boxing alloca.  This keeps pre-emitted code
+    // (e.g. a while-loop condition already lowered before boxing) in sync.
+    cellVarSyncSlot_[newSlot] = slot;
     return cellPtr;
 }
 
