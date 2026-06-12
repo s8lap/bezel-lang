@@ -358,6 +358,7 @@ set(BEZEL_TEST_SOURCES
     codegen/event_479_test.cpp
     codegen/event_leak_480_test.cpp
     codegen/cancellation_token_test.cpp
+    codegen/mutex_lock_647_test.cpp             # §6.2 Mutex + Lock, issue #647
     codegen/datetime_timespan_test.cpp
     codegen/stdlib_wave1_648_649_652_test.cpp
     codegen/stdlib_wave2_test.cpp

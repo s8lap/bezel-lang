@@ -820,6 +820,19 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         }
                     }
                 }
+                // §6.2 / issue #647: `new Lock()` is a compile error.
+                // Lock has NO public constructor — instances are obtained only
+                // from Mutex.Acquire() / TryAcquire().  Reject `new Lock(...)` here.
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->astNode->name->parts[0] == "Lock") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne->span.begin,
+                        "`Lock` has no public constructor: obtain a Lock via "
+                        "`mutex.Acquire()` or `mutex.TryAcquire(timeout)` "
+                        "(stdlib \xC2\xA7""6.2, #647)");
+                }
                 // §2.15 / issue #631: `new BinaryDeserializer(arg)` requires
                 // `arg` to be a `ReadOnlySpan<byte>` (the result of calling
                 // `.AsReadOnlySpan()` on an `OwnedBuffer<byte>`). Passing the

@@ -8072,3 +8072,150 @@ void bz_debug_writeline(void* msg_p) {
 }
 
 } // extern "C" (Debug)
+
+// ---------------------------------------------------------------------------
+// Mutex and Lock runtime (stdlib §6.2, issue #647)
+//
+// bz_mutex_t — a POSIX mutex with a refcounted core.
+//
+// Lifetime via reference counting (mirrors fix #634 / bz_channel_t):
+//
+//   Every holder that can dereference a bz_mutex_t* acquires +1 on core_refs
+//   and releases -1 when done; the last release (core_refs → 0) destroys the
+//   pthread_mutex and deletes the struct.
+//
+//   Holders and their acquire / release sites:
+//     - Mutex object: bz_mutex_new acquires +1 (starts at 1);
+//       bz_mutex_dispose releases -1 after marking disposed.
+//     - Lock handle: bz_mutex_acquire / bz_mutex_try_acquire acquires +1;
+//       bz_lock_release releases -1 after releasing the pthread_mutex.
+//
+//   This prevents bz_mutex_dispose from destroying the core while a live
+//   Lock handle still holds a bz_mutex_t* (UAF-safe: Lock outliving Mutex).
+//
+// Recursiveness (documented choice, not specified by §6.2):
+//   NON-RECURSIVE (PTHREAD_MUTEX_ERRORCHECK). A second pthread_mutex_lock or
+//   pthread_mutex_timedlock from the same thread returns EDEADLK / ETIMEDOUT.
+//   TryAcquire-while-held returns null immediately (timeout path) rather than
+//   deadlocking, enabling the held-mutex test without a second thread.
+//
+// bz_lock_t — the owned guard returned by Acquire / TryAcquire.
+//   Holds a borrowed pointer to bz_mutex_t (core ref) and an idempotent
+//   released flag (§28.2 exactly-once release).
+// ---------------------------------------------------------------------------
+
+struct bz_mutex_t {
+    pthread_mutex_t     mtx;
+    // per #647 (mirrors #634): refcount — Mutex object holds +1, each Lock holds +1.
+    // Last release (core_refs → 0) calls pthread_mutex_destroy and deletes.
+    std::atomic<int>    core_refs{1};
+    // disposed flag: set by bz_mutex_dispose so the object slot can be nulled
+    // safely (idempotent disposal per §28.2).
+    bool                disposed{false};
+};
+
+struct bz_lock_t {
+    bz_mutex_t* mutex;   // borrowed (+ core_refs held)
+    bool        released; // idempotent flag (§28.2)
+};
+
+static void mutex_core_ref(bz_mutex_t* m) {
+    m->core_refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void mutex_core_release(bz_mutex_t* m) {
+    if (m->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        pthread_mutex_destroy(&m->mtx);
+        delete m;
+    }
+}
+
+extern "C" {
+
+// bz_mutex_new — allocate a new non-recursive POSIX mutex.  core_refs = 1
+// (the Mutex object's reference).  Returns bz_mutex_t* (opaque to Bezel code).
+void* bz_mutex_new(void) {
+    auto* m = new bz_mutex_t();
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    // PTHREAD_MUTEX_ERRORCHECK: prevents deadlock on self-lock; EDEADLK returned
+    // instead of blocking, which maps cleanly to TryAcquire → null.
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+    pthread_mutex_init(&m->mtx, &attr);
+    pthread_mutexattr_destroy(&attr);
+    // core_refs already 1 (Mutex object ref) via the in-struct initializer.
+    return m;
+}
+
+// bz_mutex_acquire — block until the mutex is available; return an owned bz_lock_t*.
+// The lock struct acquires a core ref (+1) so the mutex core stays alive even if
+// the Mutex object is disposed before the Lock is released.
+void* bz_mutex_acquire(void* mp) {
+    auto* m = (bz_mutex_t*)mp;
+    pthread_mutex_lock(&m->mtx);  // blocking; non-recursive → always enters if not held
+    mutex_core_ref(m);             // Lock holds a ref on the core
+    auto* lk = new bz_lock_t{m, false};
+    return lk;
+}
+
+// bz_mutex_try_acquire — attempt to acquire with a millisecond timeout.
+// Returns an owned bz_lock_t* on success, or null on timeout / already-held.
+// Uses pthread_mutex_timedlock with CLOCK_REALTIME (per POSIX timedlock).
+// An EDEADLK (same-thread re-lock on ERRORCHECK mutex) maps to the timeout
+// null path — enabling the TryAcquire-while-held test shape from the note.
+void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
+    auto* m = (bz_mutex_t*)mp;
+    int rc;
+    if (timeout_ms <= 0) {
+        // Zero / negative timeout: try without waiting.
+        rc = pthread_mutex_trylock(&m->mtx);
+        // EDEADLK = same thread already holds it (ERRORCHECK); treat as EBUSY.
+        if (rc == EDEADLK) rc = EBUSY;
+    } else {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec  += timeout_ms / 1000;
+        deadline.tv_nsec += (timeout_ms % 1000) * 1000000LL;
+        if (deadline.tv_nsec >= 1000000000LL) {
+            deadline.tv_sec  += 1;
+            deadline.tv_nsec -= 1000000000LL;
+        }
+        rc = pthread_mutex_timedlock(&m->mtx, &deadline);
+        if (rc == EDEADLK) rc = ETIMEDOUT;
+    }
+    if (rc != 0) return nullptr;   // timeout or contention → null (owned Lock?)
+    mutex_core_ref(m);
+    auto* lk = new bz_lock_t{m, false};
+    return lk;
+}
+
+// bz_lock_release — release the held lock.  Idempotent per §28.2: the first
+// call releases the pthread_mutex; subsequent calls are no-ops.
+// Called by the Lock's disposer (scope exit / explicit Dispose()).
+void bz_lock_release(void* lkp) {
+    if (!lkp) return;
+    auto* lk = (bz_lock_t*)lkp;
+    if (!lk->released) {
+        lk->released = true;
+        pthread_mutex_unlock(&lk->mutex->mtx);
+    }
+    // Release the core ref the Lock holds; may destroy the mutex if the Mutex
+    // object was already disposed (Lock-outlives-Mutex scenario).
+    bz_mutex_t* m = lk->mutex;
+    delete lk;          // free the bz_lock_t struct
+    mutex_core_release(m);
+}
+
+// bz_mutex_dispose — dispose the Mutex object.  Marks disposed (for idempotency)
+// and releases the Mutex object's core ref.  The pthread_mutex is destroyed only
+// when the last Lock is also released (via mutex_core_release → core_refs → 0).
+// Idempotent: calling twice is a no-op on the second call.
+void bz_mutex_dispose(void* mp) {
+    if (!mp) return;
+    auto* m = (bz_mutex_t*)mp;
+    if (m->disposed) return;
+    m->disposed = true;
+    mutex_core_release(m);  // drop the Mutex object's own ref
+}
+
+} // extern "C" (Mutex + Lock)

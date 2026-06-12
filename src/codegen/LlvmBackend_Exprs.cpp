@@ -5693,6 +5693,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 auto* allocFn = declareC("bz_channel_new", ptrTy(), {ptrTy()});
                 return builder_.CreateCall(allocFn, {dispArg}, "ch.new");
             }
+            // §6.2 / issue #647: new Mutex() — allocate via bz_mutex_new.
+            // Mutex is a non-recursive POSIX mutex with refcounted core.
+            if (colName == "Mutex") {
+                auto* allocFn = declareC("bz_mutex_new", ptrTy(), {});
+                return builder_.CreateCall(allocFn, {}, "mx.new");
+            }
             // §6.1 / §30.8: new CancellationTokenSource() — allocate via
             // bz_cts_alloc (stdlib §6.1 default constructor).
             if (colName == "CancellationTokenSource") {

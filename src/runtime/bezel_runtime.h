@@ -1315,6 +1315,39 @@ void* bz_owned_buffer_byte_alloc(const uint8_t* data, int64_t len);
 // The span borrows the buffer; the buffer must outlive the deserializer.
 void bz_owned_buffer_get_span(void* buf, const uint8_t** data_out, int64_t* len_out);
 
+// ---------------------------------------------------------------------------
+// Mutex and Lock runtime (stdlib §6.2, issue #647)
+//
+// Mutex: non-recursive POSIX mutex with refcounted core (bz_mutex_t*).
+// Lock:  owned guard (bz_lock_t*) returned by acquire/try_acquire.
+//
+// Recursiveness (recorded decision — §6.2 is silent):
+//   NON-RECURSIVE (PTHREAD_MUTEX_ERRORCHECK). TryAcquire-while-held in the
+//   same thread times out (returns null) rather than deadlocking.
+//
+// All extern "C" (no mangling — the JIT-mangling lesson from #632).
+// ---------------------------------------------------------------------------
+
+// Allocate a new Mutex. Returns bz_mutex_t* (core_refs = 1 for the Mutex object).
+void* bz_mutex_new(void);
+
+// Block until the mutex is available; return an owned bz_lock_t*. Per §6.2
+// Acquire(): owned Lock. The Lock acquires a core ref so it can outlive the Mutex.
+void* bz_mutex_acquire(void* mutex);
+
+// Attempt to acquire with a millisecond timeout. Returns an owned bz_lock_t*
+// on success, or null on timeout / already-held (non-recursive: EDEADLK → null).
+// Per §6.2 TryAcquire(timeout: TimeSpan): owned Lock? . timeout_ms <= 0 → trylock.
+void* bz_mutex_try_acquire(void* mutex, int64_t timeout_ms);
+
+// Release the held lock (idempotent per §28.2). Called by Lock's disposer at
+// scope exit or explicit Dispose(). Frees the bz_lock_t and drops its core ref.
+void  bz_lock_release(void* lock);
+
+// Dispose the Mutex object: marks disposed (idempotent), drops the Mutex's own
+// core ref. The pthread_mutex is destroyed only when the last Lock is also gone.
+void  bz_mutex_dispose(void* mutex);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
