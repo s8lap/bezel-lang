@@ -6437,44 +6437,60 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
 
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
-// increment).
+// increment; issue #672 typed env-disposer foundation).
 //
 // Function-typed values (lambda closures — capturing or not — and method
 // references) are RUNTIME-MANAGED (§28.9): "Runtime management governs the
 // function value itself — the heap-allocated closure object that backs the
 // function value." Codegen lowers each such value to a heap cell laid out as
-//   { void* fn (off 0), void* env (off 8), int64_t rc (off 16) } = 24 bytes.
+//   { void* fn      (off  0),
+//     void* env     (off  8),
+//     int64_t rc    (off 16),
+//     void* envdtor (off 24) }  = 32 bytes.
 // `fn` is the function/thunk pointer; `env` is null (non-capturing / static
 // method reference) or points at a separately-allocated env block holding the
 // capture pointers. The rc was appended AFTER env so fn (off 0) and env (off 8)
 // keep their offsets: every codegen call site loads fn at offset 0 and env at
 // GEP index 1, both unmoved.
 //
-// LEAF with respect to ownership. Per §28.9, a closure does NOT own the values
-// it captures: "Capturing an owned class-typed local does NOT transfer
-// ownership into the closure ... The original `using var` (or other owned
-// location) retains the disposal obligation." The §28.3 capture table likewise
-// classifies every closure capture as a BORROW. So a closure cell holds only
-// borrows; freeing it must free ONLY the cell and its env block — never a
-// captured value's storage. (The env block holds the capture pointers; freeing
-// the block does not touch the pointees, which are the enclosing frame's shared
-// cells / the `using var`'s object, disposed exactly once by their owner.)
-// Acyclic reference counting is therefore sound: no owning edge out of a closure
-// means no cycle to leak and no captured destructor to run on free.
+// #672 TYPED ENV-DISPOSER (foundation). `envdtor` (off 24) is a per-lambda
+// typed disposal function emitted by codegen beside the trampoline. When
+// non-null, bz_closure_release calls it as `envdtor(env)` at last-drop BEFORE
+// freeing the env block. This lets the disposer release refcounted captures
+// (strings, class references) that the lambda holds via a +1 retain (the
+// follow-up activation lane). Foundation: all producers store envdtor = null
+// (calloc zero-fill + explicit store); at null the behaviour is identical to
+// the old 24-byte layout (back-compat for all existing closures).
 //
-// §28.9 / #439: the count is ATOMIC now that async lands — a closure may be
-// captured into an async frame (or passed to a worker that runs it) and released
-// on a different thread than the one that retained it (§30.13). A single
-// __atomic_add_fetch / __atomic_sub_fetch (acq_rel) on the 8-byte-aligned rc
-// word is the cheapest sound read-modify-write; the final decrement
-// synchronizes-with prior releases before the env block + cell are freed.
+// LEAF with respect to ownership (foundation state). Per §28.9, a closure does
+// NOT own the values it captures: "Capturing an owned class-typed local does
+// NOT transfer ownership into the closure ... The original `using var` (or
+// other owned location) retains the disposal obligation." The §28.3 capture
+// table likewise classifies every closure capture as a BORROW. So in the
+// CURRENT state (envdtor = null) a closure cell holds only borrows; freeing it
+// frees ONLY the cell and its env block — never a captured value's storage.
+// When the activation lane lands (populating envdtor for retaining captures),
+// the envdtor will call the appropriate release helpers for the +1-owned slots,
+// and the over-release rule will be enforced: envdtor only releases what the
+// retain at capture-site added, no more.
+// Acyclic reference counting is sound in both states (null and populated).
 //
-// null is a no-op for both (a nullable `((...) -> ...)?` slot may hold null).
+// §28.9 / #439: the count is ATOMIC — a closure may be captured into an async
+// frame (or passed to a worker that runs it) and released on a different thread
+// (§30.13). A single __atomic_add_fetch / __atomic_sub_fetch (acq_rel) on the
+// 8-byte-aligned rc word is the cheapest sound read-modify-write; the final
+// decrement synchronizes-with prior releases before the env block + cell are
+// freed.
+//
+// null is a no-op for both retain and release (a nullable `((...) -> ...)?`
+// slot may hold null).
 
 // Byte offset of the rc field inside the closure cell (after fn + env).
 static const int64_t BZ_CLOSURE_RC_OFFSET = 16;
 // Byte offset of the env pointer inside the closure cell (after fn).
 static const int64_t BZ_CLOSURE_ENV_OFFSET = 8;
+// #672: byte offset of the envdtor pointer inside the closure cell (after rc).
+static const int64_t BZ_CLOSURE_ENVDTOR_OFFSET = 24;
 
 extern "C" void bz_closure_retain(void* c) {
     if (!c) return;
@@ -6487,14 +6503,26 @@ extern "C" void bz_closure_release(void* c) {
     int64_t* rcp = (int64_t*)((uint8_t*)c + BZ_CLOSURE_RC_OFFSET);
     if (__atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL) > 0)
         return;
-    // Last reference gone: free the env block (if any), then the cell. The env
-    // block is uniquely owned by this cell (each lowerLambda / makeMethodThunk
-    // allocates a fresh env for the one cell it builds), so freeing it here is a
-    // single free, no dangler. The env's CONTENTS (capture pointers) are NOT
-    // touched — they are borrows the closure does not own (§28.9). free(NULL) is
-    // safe (a non-capturing closure carries a null env).
+    // Last reference gone.
     void* env;
     memcpy(&env, (uint8_t*)c + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
+    // #672: invoke the typed env-disposer (if any) BEFORE freeing the env block.
+    // Foundation: envdtor is always null today (calloc zero-fill; initClosureEnvdtor
+    // stores null explicitly). When the capture-retain activation lane lands,
+    // envdtor will be a per-lambda bz$lam$N$envdtor(ptr env) that releases the
+    // +1-retained slots.  null check makes old and new paths identical when there
+    // is nothing to dispose.  The envdtor is idempotent-safe: it runs exactly once
+    // here, at the LAST release (rc == 0), so it can never double-release.
+    void* envdtor_fn;
+    memcpy(&envdtor_fn, (uint8_t*)c + BZ_CLOSURE_ENVDTOR_OFFSET, sizeof(void*));
+    if (envdtor_fn && env) {
+        // Cast to void(*)(void*) — the envdtor ABI: takes the env pointer.
+        typedef void (*envdtor_t)(void*);
+        ((envdtor_t)envdtor_fn)(env);
+    }
+    // Free the env block (uniquely owned by this cell; allocations in
+    // lowerLambda/makeMethodThunk each produce one fresh env per cell).
+    // free(NULL) is safe (a non-capturing closure carries a null env).
     free(env);
     free(c);
 }

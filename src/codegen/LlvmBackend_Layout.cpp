@@ -1720,14 +1720,16 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     diverged_ = savedDiverged;
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
-    // Build closure cell { thunk_ptr, env_ptr, rc }.
-    // #422 / §27.6 / §28.9: a method reference is a runtime-managed function
-    // value backed by the same 24-byte closure cell as a lambda (rc appended
-    // after env). The env is null for a static method, or an 8-byte block
-    // holding the receiver (a BORROW of the receiver, §28.3 — the cell does
-    // not own it). bz_closure_release frees the cell + env block, never the
-    // receiver. For a primitive/enum extension receiver the env block stores
-    // the raw value bytes (≤ 8 bytes for all supported primitives).
+    // Build closure cell { thunk_ptr, env_ptr, rc, envdtor }.
+    // #422 / #672 / §27.6 / §28.9: a method reference is a runtime-managed
+    // function value backed by the same closure cell as a lambda (now 32 bytes:
+    // rc at off 16, envdtor at off 24 — #672 foundation). The env is null for a
+    // static method, or an 8-byte block holding the receiver (a BORROW of the
+    // receiver, §28.3 — the cell does not own it). bz_closure_release frees the
+    // cell + env block, never the receiver. envdtor is null (foundation: the env
+    // for a method thunk holds a borrow and needs no typed disposal).
+    // For a primitive/enum extension receiver the env block stores the raw value
+    // bytes (≤ 8 bytes for all supported primitives).
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
@@ -1751,7 +1753,8 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     builder_.CreateStore(
         envObj,
         builder_.CreateGEP(ptrTy(), closureObj, {builder_.getInt32(1)}));
-    initClosureRc(closureObj);  // #422: producer's reference, rc := 1
+    initClosureRc(closureObj);      // #422: producer's reference, rc := 1
+    initClosureEnvdtor(closureObj); // #672: foundation null envdtor
     return closureObj;
 }
 
