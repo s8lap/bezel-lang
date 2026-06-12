@@ -3022,6 +3022,20 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // reaches the catch arm; otherwise it propagates to Main's propagateBB
     // (bz_unhandled_exception).
     if (isMain(ms)) {
+        // §2.15 / §9.8: register the SerializationException vtable with the
+        // runtime so bz_ser_throw (called by JSON runtime helpers) produces a
+        // well-formed exception that emitIsA's catch dispatch can identify.
+        // Must run before any user code (incl. static ctors) can call serializer
+        // APIs.  The vtable pointer is always defined here (setupBuiltinExceptions
+        // runs in emitModule before any method lowering).
+        {
+            auto vit = builtinVtable_.find("SerializationException");
+            if (vit != builtinVtable_.end()) {
+                auto* initFn = declareC("bz_ser_exc_vtable_init",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(initFn, {vit->second});
+            }
+        }
         for (auto& e : staticCtors_) {
             builder_.CreateCall(e.fn, {});
             emitPendingCheck();
@@ -4383,6 +4397,46 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (isBinDer) {
             Disposal d{it->second, nullptr};
             d.binaryDeserializer = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+    // §2.15 / issue #550: a `using var` bound to JsonSerializer or
+    // JsonDeserializer — opaque runtime handles freed via bz_binser_free /
+    // bz_binder_free (same free functions as Binary variants).
+    {
+        auto isJsonName = [](const sema::TypeRef* rt, std::string_view nm) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == nm;
+        };
+        bool isJsonSer = false, isJsonDer = false;
+        if (ld->type) {
+            auto* rt = ctx_.resolvedType(*ld->type);
+            isJsonSer = isJsonName(rt, "JsonSerializer");
+            isJsonDer = isJsonName(rt, "JsonDeserializer");
+        }
+        if (!isJsonSer && !isJsonDer && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+                isJsonSer = ne->type && ne->type->name &&
+                            !ne->type->name->parts.empty() &&
+                            ne->type->name->parts[0] == "JsonSerializer";
+                isJsonDer = ne->type && ne->type->name &&
+                            !ne->type->name->parts.empty() &&
+                            ne->type->name->parts[0] == "JsonDeserializer";
+            }
+        }
+        if (isJsonSer) {
+            Disposal d{it->second, nullptr};
+            d.jsonSerializer = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+        if (isJsonDer) {
+            Disposal d{it->second, nullptr};
+            d.jsonDeserializer = true;
             disposeStack_.back().push_back(d);
             return;
         }
@@ -7937,6 +7991,44 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 h, llvm::ConstantPointerNull::get(ptrTy()));
             auto* frBB   = llvm::BasicBlock::Create(llvm_, "binder.free",  currentFn_);
             auto* contBB = llvm::BasicBlock::Create(llvm_, "binder.cont",  currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_binder_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {h});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §2.15 / issue #550: a `using var` JsonSerializer — free via
+        // bz_binser_free (same as BinarySerializer; kind field differentiates).
+        if (it->jsonSerializer) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                h, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "jser.free",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "jser.cont",  currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_binser_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {h});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §2.15 / issue #550: a `using var` JsonDeserializer — free via
+        // bz_binder_free (same as BinaryDeserializer; kind field differentiates).
+        if (it->jsonDeserializer) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                h, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "jder.free",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "jder.cont",  currentFn_);
             builder_.CreateCondBr(isNull, contBB, frBB);
             builder_.SetInsertPoint(frBB);
             auto* fn = declareC("bz_binder_free",

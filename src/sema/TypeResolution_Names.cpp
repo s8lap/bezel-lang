@@ -102,6 +102,9 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // runtime handles; require `import System.Serialization` per spec, but
         // like CancellationTokenSource we do not yet enforce import-gating here).
         n == "BinarySerializer" || n == "BinaryDeserializer" ||
+        // §2.15 / issue #550: JsonSerializer / JsonDeserializer (opaque
+        // runtime handles; same import-gating behaviour as Binary variants).
+        n == "JsonSerializer" || n == "JsonDeserializer" ||
         // §8.1 / issue #646: Stopwatch — heap-allocated timing class.
         // §8.2 / issue #646: Debug — static class for assertions and logging.
         // Both require `import System.Diagnostics` per spec (stdlib §8); the
@@ -553,7 +556,9 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // error when the required import is absent. The TypeRef is
                 // still populated so the pass does not cascade further errors.
                 if ((first == "BinarySerializer" ||
-                     first == "BinaryDeserializer") &&
+                     first == "BinaryDeserializer" ||
+                     first == "JsonSerializer" ||
+                     first == "JsonDeserializer") &&
                     !sourceImports_.count("System.Serialization")) {
                     ctx_.diagnostics().report(
                         Severity::Error, t.span.begin,
