@@ -219,3 +219,67 @@ BEZEL_TEST(channel_spawn_sink_692_693,
         "end Program;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// §30.14 / #693 residual: Domain.Spawn(entry, move X, ownedProducingCall())
+// — pos 1 is a `move` of an owned local, pos 2 is an owned-returning call.
+// The reopen comment on #693 observed that the pos-2 arg was falsely rejected
+// with "borrow cannot be passed where owned required" when pos-1 was a `move`
+// instead of another call expression. Each arg is checked independently, so
+// a `move` at pos-1 must NOT affect the owned-sink acceptance of pos-2.
+//
+// Shape: Worker.Run(owned tx1: ChannelSender<int>, owned tx2: ChannelSender<int>)
+// Domain.Spawn(Worker.Run, move sender1, ch2.NewSender())
+//   pos 1: move sender1   — explicit move of an owned local (consumed)
+//   pos 2: ch2.NewSender() — owned-returning call (must be accepted)
+BEZEL_TEST(channel_spawn_sink_692_693,
+           spawn_move_at_pos1_then_owned_call_at_pos2_accepted_30_14) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Worker "
+        "  public static method Run("
+        "      owned tx1: ChannelSender<int>, "
+        "      owned tx2: ChannelSender<int>) "
+        "    using var s1 := tx1; "
+        "    using var s2 := tx2; "
+        "    s1.Send(1); "
+        "    s2.Send(2); "
+        "  end Run; "
+        "end Worker; "
+        "class Program "
+        "  public static async method Main("
+        "      owned sender1: ChannelSender<int>): Task<int> "
+        "    using var ch2 := new Channel<int>(); "
+        "    using var w := Domain.Spawn(Worker.Run, move sender1, ch2.NewSender()); "
+        "    await w; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §30.14 / #693 residual — NEGATIVE boundary: when pos-1 is a `move` and
+// pos-2 is a BORROW (not an owned-producing call), pos-2 must still be
+// rejected. The move at pos-1 must not suppress the owned-sink check at pos-2.
+BEZEL_TEST(channel_spawn_sink_692_693,
+           spawn_move_at_pos1_then_borrow_at_pos2_rejected_30_14) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Worker "
+        "  public static method Run("
+        "      owned tx1: ChannelSender<int>, "
+        "      owned tx2: ChannelSender<int>) "
+        "    using var s1 := tx1; "
+        "    using var s2 := tx2; "
+        "  end Run; "
+        "end Worker; "
+        "class Program "
+        "  public static async method Main("
+        "      owned sender1: ChannelSender<int>, "
+        "      b2: ChannelSender<int>): Task<int> "  // b2 is a borrow
+        "    using var w := Domain.Spawn(Worker.Run, move sender1, b2); "  // b2 → rejected
+        "    await w; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
