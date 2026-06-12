@@ -245,3 +245,157 @@ BEZEL_TEST(own_escape, return_value_user_indexer_on_param_clean) {
         "  end Use; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §28.3 / §28.9 / §9.7 (issue #641): runtime-managed field reads from a
+// `using var` local are NOT borrow escapes.
+//
+// The spec §28.3 "Borrow lifetime rules" lists three allowed-return forms:
+// "receiver-borrows from extension methods, value-typed returns, and
+// runtime-managed returns."  §28.9 enumerates runtime-managed types: string,
+// function values, and boxed value types.  A field read whose type is
+// runtime-managed is a runtime-managed copy, not a class-reference borrow;
+// returning it cannot outlive the source (the runtime handles its lifetime).
+//
+// The false positive: `isBorrowableType` returned true for `string` (and
+// function types), so `returnedExprMayBorrow` classified a string-field read
+// as a borrow and `checkBorrowEscapesOnReturn` fired on `return popped.Name;`
+// and `checkIndirectEscapeOnReturn` fired on `var x := popped.Name; return x;`.
+// Both are false positives per §28.3/§28.9.
+//
+// The guard: class-typed fields remain borrows — `return popped.Child;` where
+// Child is a class field must still be rejected (cardinal risk).
+// ===========================================================================
+
+// §28.3 / §28.9 (#641): a STRING field read from a `using var` class local is
+// a runtime-managed copy — not a borrow — and may be returned directly.
+// `isBorrowableType(string) = false` prevents the false positive.
+BEZEL_TEST(own_escape, return_string_field_on_using_var_clean_641) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Obj "
+        "  public Name: string := \"\"; "
+        "  destructor end destructor; "
+        "end Obj; "
+        "class C public static method Get(): string "
+        "  using var r := new Obj(); "
+        "  return r.Name; "
+        "end Get; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 / §28.9 (#641): INDIRECT form — `var x := r.Name; return x;` where x
+// is a string local inferred from a string field read.  The string field read
+// must not taint x as a borrow of r (§9.7/§28.9: runtime-managed copy).
+BEZEL_TEST(own_escape, return_string_field_indirect_on_using_var_clean_641) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Obj "
+        "  public Name: string := \"\"; "
+        "  destructor end destructor; "
+        "end Obj; "
+        "class C public static method Get(): string "
+        "  using var r := new Obj(); "
+        "  var x := r.Name; "
+        "  return x; "
+        "end Get; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 / §28.9 (#641): OwnedArray<Obj>.PopLast() shape — the exact repro.
+// `using var popped := arr.PopLast(); return popped.Val;` where Val: int.
+// The direct value-field return from a popped-element `using var` is accepted.
+BEZEL_TEST(own_escape, return_int_field_from_owned_array_poplast_clean_641) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Obj "
+        "  public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; "
+        "  destructor end destructor; "
+        "end Obj; "
+        "class C public static method Main(): int "
+        "  using var arr := new OwnedArray<Obj>(); "
+        "  arr.Add(new Obj(7)); "
+        "  arr.Add(new Obj(9)); "
+        "  using var popped := arr.PopLast(); "
+        "  return popped.Val; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 / §28.9 (#641): OwnedArray shape — INDIRECT form (the sa_v2b repro).
+// `var x := popped.Val; return x;` where Val: int.
+BEZEL_TEST(own_escape, return_int_field_from_owned_array_poplast_indirect_clean_641) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Obj "
+        "  public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; "
+        "  destructor end destructor; "
+        "end Obj; "
+        "class C public static method Main(): int "
+        "  using var arr := new OwnedArray<Obj>(); "
+        "  arr.Add(new Obj(7)); "
+        "  arr.Add(new Obj(9)); "
+        "  using var popped := arr.PopLast(); "
+        "  var x := popped.Val; "
+        "  return x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 / §28.9 (#641): arithmetic on a copied int field is accepted.
+// `var x := popped.Val; return x + 1;` — not a borrow, just a value copy.
+BEZEL_TEST(own_escape, arithmetic_on_copied_field_from_using_var_clean_641) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Obj "
+        "  public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; "
+        "  destructor end destructor; "
+        "end Obj; "
+        "class C public static method Main(): int "
+        "  using var arr := new OwnedArray<Obj>(); "
+        "  arr.Add(new Obj(5)); "
+        "  using var popped := arr.PopLast(); "
+        "  var x := popped.Val; "
+        "  return x + 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 GUARD (cardinal risk — #641 must NOT over-accept): a CLASS-typed field
+// read from a `using var` is still a borrow of the source — `return popped.Child;`
+// where Child is a class field MUST still be diagnosed (use-after-dispose on
+// scope exit). Only runtime-managed and value-typed reads are exempt.
+BEZEL_TEST(own_escape, return_class_field_from_using_var_still_diagnosed_641) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Obj "
+        "  public Child: Obj := null; "
+        "  destructor end destructor; "
+        "end Obj; "
+        "class C public static method Leak(): Obj "
+        "  using var popped := new Obj(); "
+        "  return popped.Child; "
+        "end Leak; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.3 GUARD (#641): INDIRECT class-field escape is still diagnosed.
+// `var x := popped.Child; return x;` — x carries a borrow of popped whose
+// source is disposed at scope end (§28.9 / §9.7 indirect escape).
+BEZEL_TEST(own_escape, return_class_field_indirect_from_using_var_still_diagnosed_641) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Obj "
+        "  public Child: Obj := null; "
+        "  destructor end destructor; "
+        "end Obj; "
+        "class C public static method Leak(): Obj "
+        "  using var popped := new Obj(); "
+        "  var x := popped.Child; "
+        "  return x; "
+        "end Leak; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
