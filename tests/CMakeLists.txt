@@ -526,6 +526,12 @@ set(BEZEL_TEST_SOURCES
     # --- fix #690: arr[range] typed as Array<T> per §15.6 ---
     codegen/array_slice_690_test.cpp
     # --- end #690 ---
+    # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
+    codegen/record_method_case_expr_677_test.cpp
+    # --- end #677 ---
+    # --- fix #678: lambda void return type — inferred-param/untyped-var void body ---
+    codegen/lambda_void_return_678_test.cpp
+    # --- end #678 ---
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp
