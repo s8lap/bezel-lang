@@ -355,6 +355,19 @@ private:
     // loop variables (their incBB manages the original slot directly).
     // Part of the saved/restored emitter state across nested-function emission.
     std::unordered_map<llvm::AllocaInst*, llvm::AllocaInst*> cellVarSyncSlot_;
+    // #429 / §27.5: cells registered by the most-recent lowerLambda call:
+    // pairs of (newSlot, captured-decl-or-sym-key) for freshly-boxed,
+    // non-for-var captures.  Consumed by lowerLocalDecl when the lambda is
+    // proven non-escaping to register boxedCellFree disposals.  Gated on
+    // cellFreeEligible_ (pre-scan result) to avoid freeing cells shared with
+    // escaping lambdas.  Saved/restored across lowerLambda body-emission so
+    // nested lambdas compiled inside this body do not clobber the outer
+    // lambda's captures.
+    struct LastCellEntry {
+        llvm::AllocaInst* newSlot;
+        const void* key;   // LocalDecl* (ast::Node*) or Symbol* for params
+    };
+    std::vector<LastCellEntry> lastLambdaCapturedCells_;
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
@@ -639,6 +652,23 @@ private:
         // vtable[1](self) then free the frame.  Distinct from `dynamicDispose`
         // which dispatches through slot 2 of the class vtable.
         bool iterEnumDispose = false;
+        // #429 / §27.5: a boxed capture cell (the shared heap alloc from
+        // boxLocalSlot) whose owning lambda is proven non-escaping.  `slot`
+        // is the ptr-alloca (newSlot) whose current value is the cell ptr.
+        // At scope end: free(load(slot)).  Sound because:
+        //   (a) lowerLocalDecl registers boxedCellFree BEFORE closureRelease in
+        //       the disposal vector; emitDisposals iterates in reverse, so
+        //       closureRelease (higher index) fires FIRST — the envdtor reads
+        //       all captured values through the cell — THEN boxedCellFree
+        //       (lower index) frees the cell.  No UAF: the cell is not read
+        //       after the closureRelease completes.
+        //   (b) All lambdas that captured this cell are non-escaping
+        //       (cellFreeEligible_ pre-scan), so no live env holds a pointer
+        //       to this cell past scope exit.
+        //   (c) The cell ptr may be null (guarded boxing, guard never ran).
+        //       free(null) is a no-op per POSIX.
+        // Fires on BOTH normal and unwind paths (symmetric with closureRelease).
+        bool boxedCellFree = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -3939,6 +3969,24 @@ private:
     // Compute boxReleaseEligible_ for a block body (see the .cpp).
     void collectBoxReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
+    // #429 / §27.5: the set of LOCAL DECL NODES (ast::Node*) and PARAMETER
+    // SYMBOLS (sema::Symbol*) whose boxed capture cell can be safely freed at
+    // outer-scope exit.  A captured local/param qualifies iff EVERY lambda in
+    // the function body that captures it is proven non-escaping (in
+    // closureReleaseEligible_) AND it is not a for-var capture (fresh-per-
+    // iter cells are excluded — the scope-exit free would only reclaim the last
+    // iteration's cell; prior iterations' cells would still leak). Computed
+    // once per body by collectCellFreeEligible AFTER closureReleaseEligible_.
+    // Consulted in lowerLambda when registering boxedCellFree disposals.
+    std::unordered_set<const void*> cellFreeEligible_;
+    // The function for which cellFreeEligible_ was computed (mirrors
+    // closureReleaseEligibleFn_): a lambda/thunk body lowered mid-function
+    // is NOT analyzed; its cells continue to leak (never double-freed).
+    llvm::Function* cellFreeEligibleFn_ = nullptr;
+    // Compute cellFreeEligible_ for a block body (see the .cpp).
+    void collectCellFreeEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // True if local `ld` is a codegen-internal +1 box producer: its declared
     // type is Object or an interface AND its initializer's static type is a
     // boxable VALUE type (record/enum/primitive/nullable value). boxForTarget
@@ -4299,8 +4347,17 @@ private:
     //           first boxing (all writes go through the cell); a null-guarded
     //           single cell is used so the accumulated value is never reset
     //           by a re-initialisation on subsequent loop iterations.
+    // #429 / §27.5: `wasGuardedBoxing` (optional) is set to true when the
+    // boxing uses the guarded path (the local was declared outside the current
+    // loop body — its cell is allocated ONCE and reused across iterations).
+    // Set to false for the fresh-each-iteration path (for-var loop variables
+    // or per-iteration re-init locals).  Callers use this to decide whether
+    // it is safe to free the cell at inner-scope exit (only fresh-path cells
+    // are safe to free inside the loop; guarded cells must survive until the
+    // captured variable's own scope exits).
     llvm::Value* boxLocalSlot(llvm::AllocaInst* slot, llvm::AllocaInst*& newSlot,
-                              bool forLoopVar = false);
+                              bool forLoopVar = false,
+                              bool* wasGuardedBoxing = nullptr);
 
     // §27.5 / #673: after writing `val` to the cell of a guarded-boxed
     // local (whose cell-holder alloca is `newSlot`), also store `val` to

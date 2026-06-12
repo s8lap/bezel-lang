@@ -2948,11 +2948,17 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // VALUE may be released at scope end (mirrors stringReleaseEligible_).
     boxReleaseEligible_.clear();
     boxReleaseEligibleFn_ = fn;
+    // #429 / §27.5: which captured locals/params have ALL-non-escaping lambdas
+    // and may have their boxed cells freed at outer-scope exit.
+    cellFreeEligible_.clear();
+    cellFreeEligibleFn_ = fn;
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectUnwindIneligible(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
+        // Must run AFTER collectClosureReleaseEligible (uses the result).
+        collectCellFreeEligible(*ci.stmts);
     }
 
     // fix #633 / §33.4: Main(args: Array<string>) has C ABI signature
@@ -4275,10 +4281,81 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (v && currentFn_ == closureReleaseEligibleFn_ &&
         closureReleaseEligible_.count(static_cast<const void*>(declNode)) &&
         !disposeStack_.empty()) {
+        // #429 / §27.5: register boxedCellFree BEFORE closureRelease so that
+        // in reverse-iteration order (emitDisposals LIFO), closureRelease fires
+        // FIRST, then boxedCellFree.
+        //
+        // Ordering is critical: closureRelease → bz_closure_release → envdtor
+        // reads captured values through the cell.  Only after that is the cell
+        // safe to free.  Registering boxedCellFree first in the forward list
+        // means it appears earlier (lower index), so reverse iteration reaches
+        // closureRelease (higher index) first, then boxedCellFree — correct.
+        //
+        // Safety rationale for boxedCellFree:
+        //   (a) cellFreeEligible_ (pre-scan) guarantees the captured local is
+        //       captured ONLY by non-escaping lambdas — no escaping lambda env
+        //       holds a pointer to this cell past scope exit.
+        //   (b) closureRelease fires FIRST (see ordering above), running the
+        //       envdtor which reads all values through the cell; only then does
+        //       boxedCellFree free the cell itself — no UAF.
+        //   (c) free(null) is a no-op (POSIX); the guarded boxing path null-
+        //       initialises the cell-holder alloca in the function entry block
+        //       so a scope-exit free on a never-run guard is safe.
+        //
+        // OVER-DISPOSAL GUARD / fix for the six failing tests:
+        //   Some captured variables have their OWN disposal entry in the same
+        //   scope — most commonly a `using var` class-object entry (cls != null,
+        //   dynamicDispose, etc.) that reads the OBJECT POINTER through the cell
+        //   via boxedStorage(slot).  If we free the cell before that disposal
+        //   fires, the disposal performs a UAF on freed memory when it dereferences
+        //   the cell.  (Example: `using var r := new R()` followed by a non-
+        //   escaping lambda that captures `r` — LIFO order makes closureRelease
+        //   fire first (correct), then boxedCellFree would free the cell, then
+        //   the using-var disposal tries to load r* through the now-freed cell.)
+        //
+        //   Fix: skip boxedCellFree for any cell whose cell-holder slot already
+        //   appears in a "reads-through-the-cell" disposal in the current scope.
+        //   A "reads-through-the-cell" disposal is any entry that is NOT purely
+        //   a runtime-managed release (closureRelease, stringRelease, boxRelease,
+        //   boxedCellFree) — i.e., any entry that calls boxedStorage(slot) to
+        //   load the CONTENTS of the cell (using-var class/collection/dict/linked-
+        //   list/dynamic/unwindOnly/subscription/...).  For those variables the
+        //   cell must remain valid until THEIR disposal fires.
+        //
+        //   The cell will continue to leak (its prior contained-leak status is
+        //   preserved); this is the correct sound choice per the PRIME DIRECTIVE.
+        const auto& curScope = disposeStack_.back();
+        for (const auto& ce : lastLambdaCapturedCells_) {
+            // Check: does this cell's slot have any reads-through-cell disposal?
+            bool hasOwnerDisposal = false;
+            for (const auto& existing : curScope) {
+                if (existing.slot != ce.newSlot) continue;
+                // These flags indicate disposals that do NOT read through the
+                // cell (they just release a runtime-managed value stored in the
+                // slot, not a value reached by dereferencing the slot as a cell
+                // pointer).  All other disposals use boxedStorage(slot) which
+                // dereferences the cell — unsafe to free beforehand.
+                if (existing.stringRelease || existing.closureRelease ||
+                    existing.boxRelease    || existing.boxedCellFree)
+                    continue;
+                // This existing disposal READS THROUGH the cell; freeing the
+                // cell via boxedCellFree would be a UAF.
+                hasOwnerDisposal = true;
+                break;
+            }
+            if (hasOwnerDisposal) continue;  // leave cell alive for owner disposal
+            Disposal dc{ce.newSlot, nullptr};
+            dc.boxedCellFree = true;
+            disposeStack_.back().push_back(dc);
+        }
         Disposal d{slot, nullptr};
         d.closureRelease = true;
         disposeStack_.back().push_back(d);
     }
+    // Consume lastLambdaCapturedCells_ after any lambda-initialised local is
+    // processed; the vector belongs to the most-recent lowerLambda call and
+    // should not be reused by subsequent locals in the same scope.
+    lastLambdaCapturedCells_.clear();
     // #422 / §8.6 / §28.9: if this `var` Object/interface local was proven
     // non-escaping and initialized by a codegen +1 BOX producer (a boxable-value
     // initializer that boxForTarget wrapped), register a scope-end bz_box_release
@@ -6942,6 +7019,344 @@ void Emitter::collectBoxReleaseEligible(
 }
 
 
+// #429 / §27.5: compute cellFreeEligible_ for the function body.
+//
+// A captured local/param's CELL is safe to free at outer-scope exit iff
+// EVERY lambda in the function body that captures it is proven non-escaping
+// (in closureReleaseEligible_).  An escaping lambda's env outlives the scope
+// and holds a raw pointer into the cell; freeing the cell while that env
+// lives is a UAF.  A non-escaping lambda's env is guaranteed to be released
+// BEFORE scope exit (via the closureRelease disposal), so the cell is dead.
+//
+// Algorithm:
+//   1. Walk the entire function body and collect ALL lambda expressions,
+//      classifying each as "non-escaping" or "escaping".
+//      A lambda is non-escaping iff its direct owner `var` LocalDecl is in
+//      closureReleaseEligible_.  Any lambda NOT directly assigned to a `var`
+//      local (e.g. passed as an argument, stored in a collection, returned
+//      inline) is CONSERVATIVELY treated as escaping.
+//   2. For each lambda, collect its captured outer locals/params.
+//   3. A captured entity is in cellFreeEligible_ iff:
+//        (a) at least one lambda captures it, AND
+//        (b) NO escaping lambda captures it.
+//
+// This is a whole-body pre-pass; it runs after collectClosureReleaseEligible
+// so closureReleaseEligible_ is fully populated.
+void Emitter::collectCellFreeEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    cellFreeEligible_.clear();
+
+    // Sets to accumulate captured entities per classification.
+    std::unordered_set<const void*> capturedByNonEscaping; // LocalDecl* / Symbol*
+    std::unordered_set<const void*> capturedByEscaping;    // same keys
+
+    // Walk ALL expressions in the function body looking for LambdaExpr nodes.
+    // We use two walkers:
+    //   (a) scanStmt: descends through statements to find lambda initializers
+    //       of `var` LocalDecls (whose owner is in closureReleaseEligible_).
+    //   (b) For any LambdaExpr found elsewhere (as an argument, collection
+    //       element, etc.), treat it as escaping.
+    //
+    // To find ALL lambdas (not just top-level ones), we need a full recursive
+    // expression walk. We reuse the CaptureWalker pattern.
+    struct LambdaFinder {
+        const sema::SemaContext& ctx;
+        Emitter& em;
+        const std::unordered_set<const void*>& closureNonEscaping; // closureReleaseEligible_
+        std::unordered_set<const void*>& capturedByNonEscaping;
+        std::unordered_set<const void*>& capturedByEscaping;
+
+        // Track whether we're inside a "direct initializer" position for a
+        // `var` local that is in closureReleaseEligible_. Only at the TOP
+        // level (safePos=true) can a lambda be non-escaping.
+        bool safePos = false;
+
+        // Collect symbols referenced inside a lambda body via a lightweight
+        // walk (mirrors CaptureWalker from LlvmBackend_Layout.cpp; duplicated
+        // here because CaptureWalker lives in an anonymous namespace there and
+        // is not visible in this translation unit).
+        static void walkExpr(const sema::SemaContext& ctx,
+                             const ast::Expr* e,
+                             std::unordered_set<const sema::Symbol*>& out) {
+            if (!e) return;
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+                if (auto* s = ctx.exprSymbol(*id)) out.insert(s);
+                return;
+            }
+            if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+                walkExpr(ctx, b->left.get(), out);
+                walkExpr(ctx, b->right.get(), out); return; }
+            if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+                walkExpr(ctx, u->operand.get(), out); return; }
+            if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                walkExpr(ctx, p->operand.get(), out); return; }
+            if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+                walkExpr(ctx, m->target.get(), out); return; }
+            if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+                walkExpr(ctx, m->target.get(), out); return; }
+            if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+                walkExpr(ctx, c->callee.get(), out);
+                for (auto& a : c->args) walkExpr(ctx, a.value.get(), out);
+                return; }
+            if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+                walkExpr(ctx, c->callee.get(), out);
+                for (auto& a : c->args) walkExpr(ctx, a.value.get(), out);
+                return; }
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+                walkExpr(ctx, ix->target.get(), out);
+                for (auto& a : ix->indices) walkExpr(ctx, a.value.get(), out);
+                return; }
+            if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+                walkExpr(ctx, t->operand.get(), out); return; }
+            if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+                walkExpr(ctx, co->condition.get(), out);
+                walkExpr(ctx, co->thenValue.get(), out);
+                walkExpr(ctx, co->elseValue.get(), out); return; }
+            if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+                walkExpr(ctx, th->operand.get(), out); return; }
+            if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+                walkExpr(ctx, r->lo.get(), out);
+                walkExpr(ctx, r->hi.get(), out);
+                walkExpr(ctx, r->step.get(), out); return; }
+            if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+                for (auto& a : n->args) walkExpr(ctx, a.value.get(), out);
+                return; }
+            if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+                walkExpr(ctx, w->source.get(), out);
+                for (auto& a : w->assigns) walkExpr(ctx, a.value.get(), out);
+                return; }
+            if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+                for (auto& el : cl->elements) walkExpr(ctx, el.get(), out);
+                for (auto& k : cl->keys) walkExpr(ctx, k.get(), out);
+                return; }
+            if (auto* is2 = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+                for (auto& part : is2->parts)
+                    walkExpr(ctx, part.expr.get(), out); return; }
+            if (auto* lam2 = dynamic_cast<const ast::LambdaExpr*>(e)) {
+                // Recurse into nested lambdas to capture outer symbols.
+                if (lam2->exprBody) walkExpr(ctx, lam2->exprBody.get(), out);
+                for (auto& s : lam2->stmts) walkStmt(ctx, s.get(), out);
+                return; }
+            if (auto* ce2 = dynamic_cast<const ast::CaseExpr*>(e)) {
+                walkExpr(ctx, ce2->scrutinee.get(), out);
+                for (auto& arm : ce2->arms) {
+                    walkExpr(ctx, arm.guard.get(), out);
+                    walkExpr(ctx, arm.exprBody.get(), out); }
+                return; }
+        }
+        static void walkStmt(const sema::SemaContext& ctx,
+                             const ast::Stmt* s,
+                             std::unordered_set<const sema::Symbol*>& out) {
+            if (!s) return;
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+                if (ld->initializer) walkExpr(ctx, ld->initializer.get(), out);
+                return; }
+            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                if (as->target) walkExpr(ctx, as->target.get(), out);
+                if (as->value) walkExpr(ctx, as->value.get(), out); return; }
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                if (rs->value) walkExpr(ctx, rs->value.get(), out); return; }
+            if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+                if (ts->value) walkExpr(ctx, ts->value.get(), out); return; }
+            if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+                if (es->expr) walkExpr(ctx, es->expr.get(), out); return; }
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                walkExpr(ctx, is->ifBranch.condition.get(), out);
+                for (auto& b : is->ifBranch.body) walkStmt(ctx, b.get(), out);
+                for (auto& br : is->elifBranches) {
+                    walkExpr(ctx, br.condition.get(), out);
+                    for (auto& b : br.body) walkStmt(ctx, b.get(), out); }
+                for (auto& b : is->elseBody) walkStmt(ctx, b.get(), out);
+                return; }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                walkExpr(ctx, ws->condition.get(), out);
+                for (auto& b : ws->body) walkStmt(ctx, b.get(), out); return; }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                if (fs->iterable) walkExpr(ctx, fs->iterable.get(), out);
+                for (auto& b : fs->body) walkStmt(ctx, b.get(), out); return; }
+            if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) walkStmt(ctx, b.get(), out); return; }
+            if (auto* ts2 = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts2->body) walkStmt(ctx, b.get(), out);
+                for (auto& c : ts2->catches) {
+                    walkExpr(ctx, c.guard.get(), out);
+                    if (c.body) walkStmt(ctx, c.body.get(), out); }
+                for (auto& b : ts2->finallyBody) walkStmt(ctx, b.get(), out);
+                return; }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                walkExpr(ctx, cs->scrutinee.get(), out);
+                for (auto& arm : cs->arms) {
+                    walkExpr(ctx, arm.guard.get(), out);
+                    walkExpr(ctx, arm.exprBody.get(), out);
+                    for (auto& b : arm.stmts) walkStmt(ctx, b.get(), out); }
+                return; }
+        }
+
+        void collectLambdaCaptures(const ast::LambdaExpr* lam,
+                                   Emitter& /*em*/, bool isNonEscaping) {
+            std::unordered_set<const sema::Symbol*> syms;
+            if (lam->exprBody) walkExpr(ctx, lam->exprBody.get(), syms);
+            for (auto& s : lam->stmts) walkStmt(ctx, s.get(), syms);
+            if (isNonEscaping) {
+                for (const sema::Symbol* s : syms) {
+                    if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
+                        if (loc->decl)
+                            capturedByNonEscaping.insert(
+                                static_cast<const void*>(loc->decl));
+                    } else if (dynamic_cast<const sema::ParameterSymbol*>(s)) {
+                        capturedByNonEscaping.insert(
+                            static_cast<const void*>(s));
+                    }
+                }
+            } else {
+                for (const sema::Symbol* s : syms) {
+                    if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
+                        if (loc->decl)
+                            capturedByEscaping.insert(
+                                static_cast<const void*>(loc->decl));
+                    } else if (dynamic_cast<const sema::ParameterSymbol*>(s)) {
+                        capturedByEscaping.insert(
+                            static_cast<const void*>(s));
+                    }
+                }
+            }
+            // Recursively scan the BODY of the lambda for nested lambdas —
+            // they are all in an escaping context (from the outer scope's
+            // perspective, any lambda inside another lambda's body captures
+            // the outer local through the outer lambda's env, so the inner
+            // lambda does NOT have a direct fresh cell from the outer scope).
+            // We can safely treat nested lambdas as escaping from the
+            // outer scope's perspective (they do not box the outer scope's
+            // locals directly — the outer lambda already boxed them).
+            // Nothing to do: the outer lambda's CaptureWalker already
+            // collected all referenced outer symbols transitively.
+        }
+
+        void expr(const ast::Expr* e, bool topPos) {
+            if (!e) return;
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+                collectLambdaCaptures(lam, em, topPos);
+                // Don't recurse into the body — captured syms already handled.
+                return;
+            }
+            // For all other expressions, recurse without top-level position.
+            if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+                expr(b->left.get(), false); expr(b->right.get(), false); return; }
+            if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+                expr(u->operand.get(), false); return; }
+            if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                expr(p->operand.get(), false); return; }
+            if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+                expr(m->target.get(), false); return; }
+            if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+                expr(m->target.get(), false); return; }
+            if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+                expr(c->callee.get(), false);
+                for (auto& a : c->args) expr(a.value.get(), false); return; }
+            if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+                expr(c->callee.get(), false);
+                for (auto& a : c->args) expr(a.value.get(), false); return; }
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+                expr(ix->target.get(), false);
+                for (auto& a : ix->indices) expr(a.value.get(), false); return; }
+            if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+                expr(t->operand.get(), false); return; }
+            if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+                expr(co->condition.get(), false);
+                expr(co->thenValue.get(), false);
+                expr(co->elseValue.get(), false); return; }
+            if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+                expr(th->operand.get(), false); return; }
+            if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+                expr(r->lo.get(), false); expr(r->hi.get(), false);
+                expr(r->step.get(), false); return; }
+            if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+                for (auto& a : n->args) expr(a.value.get(), false); return; }
+            if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+                expr(w->source.get(), false);
+                for (auto& a : w->assigns) expr(a.value.get(), false); return; }
+            if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+                for (auto& el : cl->elements) expr(el.get(), false);
+                for (auto& k : cl->keys) expr(k.get(), false); return; }
+            if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+                for (auto& part : is->parts) expr(part.expr.get(), false);
+                return; }
+            if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+                expr(ce->scrutinee.get(), false);
+                for (auto& arm : ce->arms) {
+                    expr(arm.guard.get(), false);
+                    expr(arm.exprBody.get(), false); } return; }
+            // Literals, identifiers, null: no lambdas.
+        }
+
+        void stmt(const ast::Stmt* s) {
+            if (!s) return;
+            // A `var f := lambda` where f is in closureReleaseEligible_:
+            // the lambda is in "non-escaping" top-level position.
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+                bool nonEsc = !ld->isUsing &&
+                    closureNonEscaping.count(static_cast<const void*>(ld));
+                if (ld->initializer)
+                    expr(ld->initializer.get(), nonEsc);
+                return;
+            }
+            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                if (as->value) expr(as->value.get(), false);
+                if (as->target) expr(as->target.get(), false); return; }
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                if (rs->value) expr(rs->value.get(), false); return; }
+            if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+                if (ts->value) expr(ts->value.get(), false); return; }
+            if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+                if (es->expr) expr(es->expr.get(), false); return; }
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                if (is->ifBranch.condition)
+                    expr(is->ifBranch.condition.get(), false);
+                for (auto& b : is->ifBranch.body) stmt(b.get());
+                for (auto& br : is->elifBranches) {
+                    if (br.condition) expr(br.condition.get(), false);
+                    for (auto& b : br.body) stmt(b.get()); }
+                for (auto& b : is->elseBody) stmt(b.get()); return; }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                if (ws->condition) expr(ws->condition.get(), false);
+                for (auto& b : ws->body) stmt(b.get()); return; }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                if (fs->iterable) expr(fs->iterable.get(), false);
+                for (auto& b : fs->body) stmt(b.get()); return; }
+            if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) stmt(b.get()); return; }
+            if (auto* ts2 = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts2->body) stmt(b.get());
+                for (auto& c : ts2->catches) {
+                    if (c.guard) expr(c.guard.get(), false);
+                    if (c.body) stmt(c.body.get()); }
+                for (auto& b : ts2->finallyBody) stmt(b.get()); return; }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                if (cs->scrutinee) expr(cs->scrutinee.get(), false);
+                for (auto& arm : cs->arms) {
+                    if (arm.guard) expr(arm.guard.get(), false);
+                    if (arm.exprBody) expr(arm.exprBody.get(), false);
+                    for (auto& b : arm.stmts) stmt(b.get()); }
+                return; }
+        }
+    };
+
+    LambdaFinder finder{ctx_, *this, closureReleaseEligible_,
+                        capturedByNonEscaping, capturedByEscaping};
+    for (auto& s : body) finder.stmt(s.get());
+
+    // A captured entity qualifies iff:
+    //   - it appears in capturedByNonEscaping (at least one non-escaping lambda
+    //     captures it → it was boxed and should be freed), AND
+    //   - it does NOT appear in capturedByEscaping (no escaping lambda holds
+    //     a cell pointer that would outlive the scope).
+    for (const void* key : capturedByNonEscaping) {
+        if (!capturedByEscaping.count(key))
+            cellFreeEligible_.insert(key);
+    }
+}
+
+
 // #429 (box RETURN category) / §8.6 / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. Scan all locally-compiled method bodies in methodFns_.
 // A MethodSymbol is added to boxReturnMethods_ iff its declared return type is
@@ -7883,6 +8298,26 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (it->boxRelease) {
             llvm::Value* b = builder_.CreateLoad(ptrTy(), it->slot, "box.rel");
             emitBoxRelease(b);
+            continue;
+        }
+        // #429 / §27.5: a boxed capture cell (shared heap allocation from
+        // boxLocalSlot) whose owning lambda is proven non-escaping.  `slot`
+        // is the ptr-alloca (newSlot) holding the cell pointer.  At scope end
+        // we load the cell pointer and call free() on it.
+        // ORDER: this entry is registered for the captured-local slot, which
+        // was declared BEFORE the lambda local.  In reverse-decl order the
+        // lambda local's closureRelease fires FIRST (LIFO), running the envdtor
+        // which reads all values through the cell.  Only then does this entry
+        // fire and free the cell itself — no UAF.
+        // NULL SAFETY: the guarded boxing path null-initialises the cell-holder
+        // in the function entry block; free(null) is a no-op (POSIX).
+        // BOTH normal and unwind paths: the cell has no live external references
+        // at this point (all lambdas referencing it are non-escaping and have
+        // been released), so freeing on either path is safe.
+        if (it->boxedCellFree) {
+            llvm::Value* cell =
+                builder_.CreateLoad(ptrTy(), it->slot, "cell.ptr");
+            builder_.CreateCall(freeFn(), {cell});
             continue;
         }
         // #383 / §31.1: the caught exception object. On a normal handled exit

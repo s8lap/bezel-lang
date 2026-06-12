@@ -4856,6 +4856,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     std::unordered_set<const sema::Symbol*> capturedSyms;
     collectCapturedSyms(lam, capturedSyms);
 
+    // #429 / §27.5: record freshly-boxed cells for this lambda so lowerLocalDecl
+    // can register boxedCellFree disposals when the lambda is non-escaping.
+    // cellFreeEligible_ (computed by the pre-scan collectCellFreeEligible before
+    // lowering) says which captured locals/params are captured ONLY by non-
+    // escaping lambdas and are thus safe to free at scope exit. A cell is also
+    // "freshly boxed" when boxLocalSlot allocates a new ptr-alloca for it (vs
+    // the Already-boxed path where another lambda already controls the alloca
+    // — in that case this is the SECOND capture; the cell was created by the
+    // first lambda's compilation and its eligibility was already determined then).
+    // For-var loop captures use a fresh cell EVERY iteration so freeing only at
+    // scope exit would miss prior iterations; those are excluded (documented).
+    lastLambdaCapturedCells_.clear();
+
     // Box and collect captured outer params. Boxing promotes the variable's
     // storage to a shared heap cell held in a fresh ptr-slot, which we rebind.
     // Collect the symbols first to avoid mutating the map while iterating.
@@ -4867,15 +4880,30 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     }
     for (const sema::Symbol* sym : capturedParamSyms) {
         llvm::AllocaInst* slot = paramSlots_[sym];
+        bool alreadyBoxed = cellVars_.count(slot) != 0;
         CaptureEntry ce;
-        ce.valTy = cellVars_.count(slot) ? cellVars_[slot]
-                                         : slot->getAllocatedType();
+        ce.valTy = alreadyBoxed ? cellVars_[slot]
+                                : slot->getAllocatedType();
         llvm::AllocaInst* newSlot = nullptr;
-        ce.envValue = boxLocalSlot(slot, newSlot);  // the shared cell pointer
+        bool wasGuardedParam = false;
+        ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/false,
+                                   &wasGuardedParam);  // the shared cell pointer
         paramSlots_[sym] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
         ce.sym = sym;
         ce.decl = nullptr;
+        // #429: record freshly-boxed param cells that are eligible for free
+        // at scope exit (cellFreeEligible_ pre-scan says the param is captured
+        // only by non-escaping lambdas; params are never for-var).
+        // Skip guarded-boxing cells — a param declared outside a loop whose
+        // lambda capture is inside the loop body must not have its cell freed
+        // at inner-scope exit (the cell is reused across iterations).
+        if (!alreadyBoxed && !wasGuardedParam &&
+            currentFn_ == cellFreeEligibleFn_ &&
+            cellFreeEligible_.count(static_cast<const void*>(sym))) {
+            lastLambdaCapturedCells_.push_back({newSlot,
+                                                static_cast<const void*>(sym)});
+        }
         // #429/#672: resolve sema type for retain/release classification.
         if (auto* par = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
             if (par->resolvedDeclType)
@@ -4897,9 +4925,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     }
     for (const ast::Node* decl : capturedLocalDecls) {
         llvm::AllocaInst* slot = locals_[decl];
+        bool alreadyBoxed = cellVars_.count(slot) != 0;
         CaptureEntry ce;
-        ce.valTy = cellVars_.count(slot) ? cellVars_[slot]
-                                         : slot->getAllocatedType();
+        ce.valTy = alreadyBoxed ? cellVars_[slot]
+                                : slot->getAllocatedType();
         llvm::AllocaInst* newSlot = nullptr;
         // BUG-L2 / §27.5: for-var loop variables (decl is a ForStmt) use fresh
         // boxing each iteration — the incBB updates the original slot so each
@@ -4909,11 +4938,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // subsequent iterations, so the accumulated value is never overwritten by
         // a re-initialisation from the (potentially stale) original slot.
         bool isForVar = dynamic_cast<const ast::ForStmt*>(decl) != nullptr;
-        ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/isForVar);
+        bool wasGuardedLocal = false;
+        ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/isForVar,
+                                   &wasGuardedLocal);
         locals_[decl] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
         ce.sym = nullptr;
         ce.decl = decl;
+        // #429: record freshly-boxed, non-for-var local cells that are
+        // eligible for free at scope exit (cellFreeEligible_ pre-scan says the
+        // local is captured only by non-escaping lambdas).
+        // Skip guarded-boxing cells: when a local is declared in an outer scope
+        // (e.g. method body) and captured by a lambda in an inner scope (e.g.
+        // loop body), boxLocalSlot uses the guarded path — a single cell is
+        // allocated once and reused across loop iterations.  Freeing it at the
+        // inner-scope (lambda-declaration) exit would corrupt subsequent
+        // iterations.  Such cells continue to be freed at the outer scope exit
+        // through the variable's own disposal entry (future work).
+        if (!alreadyBoxed && !isForVar && !wasGuardedLocal &&
+            currentFn_ == cellFreeEligibleFn_ &&
+            cellFreeEligible_.count(static_cast<const void*>(decl))) {
+            lastLambdaCapturedCells_.push_back({newSlot,
+                                                static_cast<const void*>(decl)});
+        }
         // #429/#672: resolve sema type for retain/release classification.
         for (const sema::Symbol* s : capturedSyms) {
             if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
@@ -5008,6 +5055,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     auto savedCellVars = cellVars_;
     auto savedCellVarSyncSlot = cellVarSyncSlot_;
     auto savedDisposeStack = disposeStack_;
+    // #429 / §27.5: save/restore lastLambdaCapturedCells_ across body emission
+    // so nested lambdas compiled inside this body do not clobber the cells
+    // recorded by THIS lambda's capture-boxing phase above.  The outer lambda's
+    // cells are already in lastLambdaCapturedCells_; save them now, let the
+    // body run with a fresh vector, and restore them before returning so
+    // lowerLocalDecl (our caller) sees the outer lambda's cells.
+    auto savedLambdaCapturedCells = std::move(lastLambdaCapturedCells_);
+    lastLambdaCapturedCells_.clear();
     currentFn_ = fn;
     currentThis_ = nullptr;
     locals_.clear();
@@ -5223,6 +5278,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     cellVars_ = std::move(savedCellVars);
     cellVarSyncSlot_ = std::move(savedCellVarSyncSlot);
     disposeStack_ = std::move(savedDisposeStack);
+    // #429: restore the outer lambda's captured cells (see save above).
+    lastLambdaCapturedCells_ = std::move(savedLambdaCapturedCells);
+    // (The inner function's lastLambdaCapturedCells_ — populated during body
+    // emission — is discarded here because it belongs to lambdas defined inside
+    // this lambda's body, not to this lambda's own captures.)
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);  // #546 / §31.2: restore
     unwindTarget_ = savedUnwind;

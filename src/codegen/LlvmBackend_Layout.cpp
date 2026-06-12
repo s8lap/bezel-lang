@@ -1392,11 +1392,13 @@ llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) 
 // the original slot current, so each pass reads the correct iteration value).
 llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
                                    llvm::AllocaInst*& newSlot,
-                                   bool forLoopVar) {
+                                   bool forLoopVar,
+                                   bool* wasGuardedBoxing) {
     auto it = cellVars_.find(slot);
     if (it != cellVars_.end()) {
         // Already boxed: the slot is already a ptr-alloca holding the cell.
         newSlot = slot;
+        if (wasGuardedBoxing) *wasGuardedBoxing = false; // treat as non-guarded (already boxed)
         return builder_.CreateLoad(ptrTy(), slot, "cell");
     }
     llvm::Type* valTy = slot->getAllocatedType();
@@ -1426,6 +1428,8 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
     if (freshEachIteration) {
         // Fresh cell each iteration: allocate and initialise from slot on every
         // pass (for-var loop variable fresh binding, or per-iteration re-init).
+        // NOT guarded: a fresh cell is created every time this code runs.
+        if (wasGuardedBoxing) *wasGuardedBoxing = false;
         llvm::Value* cellSize = builder_.CreatePtrToInt(
             builder_.CreateGEP(valTy, llvm::ConstantPointerNull::get(ptrTy()),
                                {builder_.getInt32(1)}),
@@ -1446,6 +1450,9 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
     // stale original slot.
     // The cell-holder alloca lives in the entry block and is null-initialised
     // there so the runtime guard can distinguish first vs. subsequent passes.
+    // GUARDED: the cell outlives any inner scope (loop body) where it is used.
+    // The caller must NOT free this cell at inner-scope exit.
+    if (wasGuardedBoxing) *wasGuardedBoxing = true;
     newSlot = entryAlloca(ptrTy());
     {
         llvm::BasicBlock& entry = currentFn_->getEntryBlock();
