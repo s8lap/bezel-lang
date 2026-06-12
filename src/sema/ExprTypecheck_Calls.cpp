@@ -2424,6 +2424,79 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
+                    // §6.3 / issue #647: Semaphore instance methods.
+                    // Semaphore TypeRef: Named, no declaration, astNode name "Semaphore".
+                    if (rcn == "Semaphore" && recvTy) {
+                        // Helper: build a SemaphoreToken TypeRef (nullary, no declaration).
+                        static const ast::Type* kSemTokenNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("SemaphoreToken");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto makeSemTokenTypeRef = [&]() -> TypeRef* {
+                            auto* tr = ctx_.makeTypeRef();
+                            tr->kind = TypeRef::Kind::Named;
+                            tr->nullable = false;
+                            tr->declaration = nullptr;
+                            tr->astNode = kSemTokenNode;
+                            return tr;
+                        };
+                        if (m == "Acquire" && ce.args.empty()) {
+                            // Acquire(): owned SemaphoreToken.
+                            ctx_.setExprType(&ce, makeSemTokenTypeRef());
+                        } else if (m == "TryAcquire" && ce.args.size() == 1) {
+                            // TryAcquire(timeout: TimeSpan): owned SemaphoreToken?
+                            auto* tr = makeSemTokenTypeRef();
+                            tr->nullable = true;
+                            ctx_.setExprType(&ce, tr);
+                        } else if (m == "AcquireAsync" || m == "TryAcquireAsync") {
+                            // §6.3 / #647 / v0.140:
+                            //   AcquireAsync(token := CancellationToken.None)
+                            //     → OwnedTask<SemaphoreToken>
+                            //   TryAcquireAsync(timeout: TimeSpan,
+                            //                   token := CancellationToken.None)
+                            //     → OwnedTask<SemaphoreToken?>
+                            auto makeOwnedTaskOf = [&](TypeRef* inner) -> TypeRef* {
+                                auto* ot = ctx_.makeTypeRef();
+                                ot->kind = TypeRef::Kind::Named;
+                                ot->nullable = false;
+                                auto* ann = new ast::Type();
+                                ann->kind = ast::TypeKind::Named;
+                                auto* nm = new ast::QualifiedName();
+                                nm->parts.push_back("OwnedTask");
+                                ann->name.reset(nm);
+                                ot->astNode = ann;
+                                if (inner) ot->genericArgs.push_back(inner);
+                                return ot;
+                            };
+                            if (m == "AcquireAsync") {
+                                // OwnedTask<SemaphoreToken>
+                                ctx_.setExprType(&ce,
+                                    makeOwnedTaskOf(makeSemTokenTypeRef()));
+                            } else {
+                                // TryAcquireAsync → OwnedTask<SemaphoreToken?>
+                                auto* tokNullable = makeSemTokenTypeRef();
+                                tokNullable->nullable = true;
+                                ctx_.setExprType(&ce,
+                                    makeOwnedTaskOf(tokNullable));
+                            }
+                        } else if (m != "Dispose") {
+                            // §6.3 / #674: Semaphore exposes only Acquire(),
+                            // TryAcquire(), AcquireAsync(), TryAcquireAsync(),
+                            // and Dispose().  Any other member is an error.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `Semaphore`; documented surface: "
+                                "Acquire(), TryAcquire(timeout: TimeSpan), "
+                                "AcquireAsync(), TryAcquireAsync(), Dispose() "
+                                "(stdlib \xC2\xA7""6.3)");
+                        }
+                        // Dispose(): unit; no return type set.
+                    }
                     // §9.8 / §2.15 / issue #550: BinarySerializer.ToBytes() →
                     // OwnedBuffer<byte>.  Set on the CallExpr so that inferred-type
                     // locals (`using var bytes := s.ToBytes()`) pick up the element
@@ -5562,20 +5635,22 @@ bool ExprTC::isSendable(const TypeRef* rt,
             //     but the spec text was conservative: only handles (Shared<T>)
             //     were lifted, not weak handles.  Weak stays domain-local.
             //   EventSource<T>, AsyncEventSource<T>: domain-local.
-            //   Semaphore: domain-local synchronization primitive.
-            //     NOTE: Semaphore IS in the internally-synchronized set for
-            //     Shared<Semaphore> purposes (§28.13 v0.140) but a raw Semaphore
-            //     handle is NOT itself sendable (domain-local; stdlib §6.3).
+            //   Semaphore: sendable per the §6.2-Mutex precedent (internally
+            //     synchronized; SemaphoreToken is the non-sendable guard like Lock).
+            //     §6.3 is silent — docs sentence queued in the 0.141 batch (#691).
             //   Lock: held guard is domain-local; must be released in the acquiring
             //     domain (stdlib §6.2 v0.138 / #647).
+            //   SemaphoreToken: held permit guard is domain-local (same reasoning
+            //     as Lock; §6.3 v0.140 / #647).
             //   CancellationTokenSource, CancellationToken: borrow-bearing record.
-            // NOTE: Mutex is NOT in this list — it is sendable per stdlib §6.2 v0.138
-            //   / #647: Mutex is internally synchronized, like Channel<T>, and may
-            //   be reached by multiple domains simultaneously.
+            // NOTE: Mutex is NOT in this list — sendable per stdlib §6.2 v0.138
+            //   / #647: internally synchronized, like Channel<T>.
+            // NOTE: Semaphore is NOT in this list — sendable per stdlib §6.3
+            //   v0.140 / #647: internally synchronized (same reasoning as Mutex).
             if (bname == "Task" || bname == "OwnedTask" ||
                 bname == "Weak" ||
                 bname == "EventSource" || bname == "AsyncEventSource" ||
-                bname == "Semaphore" ||
+                bname == "SemaphoreToken" ||
                 bname == "Lock" ||
                 bname == "CancellationTokenSource")
                 return false;
@@ -5657,6 +5732,12 @@ bool ExprTC::isSendable(const TypeRef* rt,
             // internally synchronized; may be reached by multiple domains
             // simultaneously (like Channel<T>). Ownership transfers on move.
             if (bname == "Mutex")
+                return true;
+
+            // §30.14 / stdlib §6.3 v0.140 / #647: Semaphore is sendable —
+            // internally synchronized (counting semaphore); same reasoning as
+            // Mutex above. Ownership transfers on move.
+            if (bname == "Semaphore")
                 return true;
 
             // Other builtin types with no user TypeDecl: conservatively

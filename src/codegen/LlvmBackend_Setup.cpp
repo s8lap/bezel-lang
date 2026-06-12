@@ -4565,6 +4565,62 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // §6.3 / issue #647: a `using var` bound to a Semaphore.
+    // No user TypeSymbol; recognised by type name "Semaphore". At scope end,
+    // bz_semaphore_dispose is called (idempotent: marks disposed, drops the
+    // Semaphore object's core ref).
+    {
+        bool isSem = false;
+        auto isSemaphoreTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "Semaphore";
+        };
+        if (ld->type)
+            isSem = isSemaphoreTypeName(ctx_.resolvedType(*ld->type));
+        if (!isSem && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isSem = ne->type && ne->type->name &&
+                        !ne->type->name->parts.empty() &&
+                        ne->type->name->parts[0] == "Semaphore";
+        }
+        if (!isSem && ld->initializer)
+            isSem = isSemaphoreTypeName(ctx_.exprType(*ld->initializer));
+        if (isSem) {
+            Disposal d{it->second, nullptr};
+            d.semaphore = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+    // §6.3 / issue #647: a `using var` bound to a SemaphoreToken (owned
+    // permit guard returned by Semaphore.Acquire() / TryAcquire()). No user
+    // TypeSymbol; recognised by the inferred expression type name "SemaphoreToken".
+    // At scope end, bz_semaphore_token_release is called (idempotent per §28.2).
+    // bz_semaphore_token_release is null-safe (handles null SemaphoreToken?).
+    {
+        bool isTok = false;
+        auto isSemTokenTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "SemaphoreToken";
+        };
+        if (ld->type)
+            isTok = isSemTokenTypeName(ctx_.resolvedType(*ld->type));
+        // SemaphoreToken can only be obtained from a method call (Acquire /
+        // TryAcquire), so check the initializer expression type.
+        if (!isTok && ld->initializer)
+            isTok = isSemTokenTypeName(ctx_.exprType(*ld->initializer));
+        if (isTok) {
+            Disposal d{it->second, nullptr};
+            d.semaphoreToken = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // §30.15 (#600 phase c): a `using var` bound to a Channel<T>.
     // No user TypeSymbol; recognised by type name "Channel". At scope end,
     // bz_channel_dispose is called (closes channel, faults pending receivers with
@@ -8174,6 +8230,47 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_lock_release",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {lk});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §6.3 / issue #647: a `using var` Semaphore. Dispose via bz_semaphore_dispose
+        // (marks disposed, drops the Semaphore object's core ref; destroys the
+        // underlying sem_t when the last SemaphoreToken is also released).
+        if (it->semaphore) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* sem = builder_.CreateLoad(ptrTy(), addr, "sem.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                sem, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB  = llvm::BasicBlock::Create(llvm_, "sem.dispose",  currentFn_);
+            auto* contBB  = llvm::BasicBlock::Create(llvm_, "sem.cont",     currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            auto* fn = declareC("bz_semaphore_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {sem});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // §6.3 / issue #647: a `using var` SemaphoreToken. Release via
+        // bz_semaphore_token_release (idempotent per §28.2: released flag
+        // prevents double-release).  Null-safe (handles null SemaphoreToken?
+        // on the timeout path).
+        if (it->semaphoreToken) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* tok = builder_.CreateLoad(ptrTy(), addr, "stok.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                tok, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* relBB  = llvm::BasicBlock::Create(llvm_, "stok.release",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "stok.cont",     currentFn_);
+            builder_.CreateCondBr(isNull, contBB, relBB);
+            builder_.SetInsertPoint(relBB);
+            auto* fn = declareC("bz_semaphore_token_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {tok});
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

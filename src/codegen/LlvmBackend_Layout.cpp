@@ -442,7 +442,10 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // to i32, making CreateLoad(i32, resPtr) load 4 bytes from an
                     // 8-byte result buffer; the loaded i32 was then used as a
                     // pointer by using-var disposal → segfault / IR mismatch.
-                    n == "Mutex" || n == "Lock") {
+                    n == "Mutex" || n == "Lock" ||
+                    // §6.3 / #647: Semaphore (bz_semaphore_t*) and SemaphoreToken
+                    // (bz_semaphore_token_t*) — same fix applied proactively.
+                    n == "Semaphore" || n == "SemaphoreToken") {
                     return ptrTy();
                 }
             }
@@ -510,7 +513,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // stdlib §5 (#651): imported IGrouping<TKey, T>.
                     n == "IGrouping" ||
                     // §6.2 / #647: imported Mutex (bz_mutex_t*) and Lock (bz_lock_t*).
-                    n == "Mutex" || n == "Lock") {
+                    n == "Mutex" || n == "Lock" ||
+                    // §6.3 / #647: imported Semaphore / SemaphoreToken.
+                    n == "Semaphore" || n == "SemaphoreToken") {
                     return ptrTy();
                 }
             }

@@ -5760,6 +5760,38 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 auto* allocFn = declareC("bz_mutex_new", ptrTy(), {});
                 return builder_.CreateCall(allocFn, {}, "mx.new");
             }
+            // §6.3 / issue #647: new Semaphore(initialCount) or
+            //   new Semaphore(initialCount, maxCount) — allocate via
+            //   bz_semaphore_new(initial_count, max_count).
+            // One-arg form: maxCount defaults to INT_MAX (uncapped).
+            // Two-arg form: passes both values.
+            if (colName == "Semaphore") {
+                // Evaluate initialCount (arg 0).
+                llvm::Value* initCount = builder_.getInt32(0);
+                if (!ne.args.empty() && ne.args[0].value) {
+                    llvm::Value* v = lowerExpr(*ne.args[0].value);
+                    if (v) {
+                        if (!v->getType()->isIntegerTy(32))
+                            v = builder_.CreateTrunc(v, i32());
+                        initCount = v;
+                    }
+                }
+                // Evaluate maxCount (arg 1); default = INT_MAX if not provided.
+                llvm::Value* maxCount = builder_.getInt32(
+                    std::numeric_limits<int>::max());
+                if (ne.args.size() >= 2 && ne.args[1].value) {
+                    llvm::Value* v = lowerExpr(*ne.args[1].value);
+                    if (v) {
+                        if (!v->getType()->isIntegerTy(32))
+                            v = builder_.CreateTrunc(v, i32());
+                        maxCount = v;
+                    }
+                }
+                auto* allocFn = declareC("bz_semaphore_new",
+                    ptrTy(), {i32(), i32()});
+                return builder_.CreateCall(allocFn,
+                    {initCount, maxCount}, "sem.new");
+            }
             // §6.1 / §30.8: new CancellationTokenSource() — allocate via
             // bz_cts_alloc (stdlib §6.1 default constructor).
             if (colName == "CancellationTokenSource") {

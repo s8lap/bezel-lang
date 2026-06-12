@@ -597,6 +597,18 @@ private:
         // inferred expression type name "Lock" (return of Acquire/TryAcquire).
         // bz_lock_release is null-safe (handles a null Lock? that was never set).
         bool lock = false;
+        // §6.3 / issue #647: a `using var` bound to a Semaphore. At scope end
+        // it is disposed via bz_semaphore_dispose (idempotent: marks disposed,
+        // drops the Semaphore object's core ref). No user TypeSymbol; recognised
+        // by initializer type name "Semaphore" or by declared type annotation.
+        bool semaphore = false;
+        // §6.3 / issue #647: a `using var` bound to a SemaphoreToken. At scope
+        // end it is released via bz_semaphore_token_release (idempotent per §28.2:
+        // released flag prevents double-release). No user TypeSymbol; recognised
+        // by the inferred expression type name "SemaphoreToken" (return of
+        // Semaphore.Acquire/TryAcquire).
+        // bz_semaphore_token_release is null-safe (handles null SemaphoreToken?).
+        bool semaphoreToken = false;
         // §30.15 (#600 phase c): a `using var` bound to a ChannelSender<T>. At
         // scope end it is released via bz_channel_sender_release (decrements
         // sender count; if last sender, closes the channel and faults pending
@@ -4584,6 +4596,13 @@ private:
             // and the nullable-type-param branch (fix #568) lowered it to {i8,i32}
             // instead of ptr → emitStructEquality crash on `guard <> null`.
             "Mutex", "Lock",
+            // §6.3 / #647: Semaphore and SemaphoreToken are compiler-known
+            // heap-pointer builtins (bz_semaphore_t* and bz_semaphore_token_t*
+            // respectively). Same fix as Mutex/Lock above: without these entries a
+            // nullable `SemaphoreToken?` was mis-classified as a bare generic
+            // type-parameter and the nullable-type-param branch lowered it to
+            // {i8,i32} instead of ptr → emitStructEquality crash on `tok <> null`.
+            "Semaphore", "SemaphoreToken",
         };
         if (kBuiltins.count(name)) return true;
         // §31.4: a built-in exception type (Exception / a subtype).
@@ -4784,6 +4803,8 @@ private:
     llvm::Value* tryLowerChannelAndDomainCall(const ast::CallExpr& call);
     // §6.2 / issue #647: Mutex.Acquire, TryAcquire, AcquireAsync, TryAcquireAsync.
     llvm::Value* tryLowerMutexLockCall(const ast::CallExpr& call);
+    // §6.3 / issue #647: Semaphore.Acquire, TryAcquire, AcquireAsync, TryAcquireAsync.
+    llvm::Value* tryLowerSemaphoreTokenCall(const ast::CallExpr& call);
 
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
     // The callee is a member access whose target is itself `Encoding.<singleton>`.

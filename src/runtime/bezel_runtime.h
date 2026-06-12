@@ -1416,6 +1416,53 @@ void* bz_mutex_acquire_async(void* mutex, void* token, void* oce_vtable);
 void* bz_mutex_try_acquire_async(void* mutex, int64_t timeout_ms,
                                   void* token, void* oce_vtable);
 
+// ---------------------------------------------------------------------------
+// Semaphore and SemaphoreToken runtime (stdlib §6.3, issue #647)
+//
+// Semaphore: counting semaphore with refcounted core (bz_semaphore_t*).
+// SemaphoreToken: owned guard (bz_semaphore_token_t*) returned by acquire.
+//
+// bz_semaphore_new(initial_count, max_count) — allocate a new Semaphore.
+//   initial_count: initial permit count; max_count: advisory upper bound.
+// bz_semaphore_acquire(sem) — block until a permit is available; return
+//   an owned bz_semaphore_token_t*.  Per §6.3 Acquire(): owned SemaphoreToken.
+//   The token acquires a core ref so it can outlive the Semaphore object.
+// bz_semaphore_try_acquire(sem, timeout_ms) — attempt with a millisecond
+//   timeout.  Returns an owned bz_semaphore_token_t* on success, or null on
+//   timeout / no permits available.
+// bz_semaphore_token_release(tok) — release the held permit (idempotent per
+//   §28.2).  Called by SemaphoreToken's disposer (scope exit / Dispose()).
+//   Frees the bz_semaphore_token_t and drops its core ref.
+// bz_semaphore_dispose(sem) — dispose the Semaphore object (idempotent),
+//   drops the Semaphore's own core ref.  sem_t destroyed only when all tokens
+//   are also released (via semaphore_core_release → core_refs → 0).
+// ---------------------------------------------------------------------------
+void* bz_semaphore_new(int initial_count, int max_count);
+void* bz_semaphore_acquire(void* sem);
+void* bz_semaphore_try_acquire(void* sem, int64_t timeout_ms);
+void  bz_semaphore_token_release(void* token);
+void  bz_semaphore_dispose(void* sem);
+
+// ---------------------------------------------------------------------------
+// §6.3 async variants (issue #647, v0.140): AcquireAsync / TryAcquireAsync.
+//
+// Both return an OwnedTask<SemaphoreToken> / OwnedTask<SemaphoreToken?>.
+//
+// bz_semaphore_acquire_async(sem, cancel_token, oce_vtable)
+//   Returns bz_task_t* whose result, once done, is a bz_semaphore_token_t*.
+//
+// bz_semaphore_try_acquire_async(sem, timeout_ms, cancel_token, oce_vtable)
+//   Returns bz_task_t* whose result is bz_semaphore_token_t* (success)
+//   or null (timeout).
+//
+// Design mirrors bz_mutex_acquire_async (§6.2 / v0.139): uncontended fast
+// path via sem_trywait; contended path submits a pool worker that blocks on
+// sem_wait / sem_timedwait; cancellation pre-checked before pool submission.
+// ---------------------------------------------------------------------------
+void* bz_semaphore_acquire_async(void* sem, void* token, void* oce_vtable);
+void* bz_semaphore_try_acquire_async(void* sem, int64_t timeout_ms,
+                                      void* token, void* oce_vtable);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
