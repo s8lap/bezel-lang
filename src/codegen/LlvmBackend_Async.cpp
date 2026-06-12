@@ -381,6 +381,55 @@ bool Emitter::stmtContainsAwait(const ast::Stmt* s) {
 }
 
 
+// §30.7 v0.137 (#655): detect an `await` inside a `finally` block anywhere in
+// the body.  Forbidden in async iterators because the Dispose path (§29.7) runs
+// synchronously — when a consumer abandons iteration early there is no async
+// driver, so a suspension inside a `finally` would have nowhere to resume; the
+// continuation would be silently discarded.
+//
+// This check is ONLY for async iterators.  Ordinary async methods may await in
+// their `finally` (§30.9); emitAsyncMethod must not call this function.
+//
+// Recurses through compound statements (loops, if, do-blocks, nested try bodies
+// and catch arm bodies) but not into nested try's finally blocks visited via
+// the top-level (they are found when we descend into that TryStmt).
+bool Emitter::awaitInFinallyPosition(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // Check: is there an await directly in this try's finally body?
+            if (containsAwait(ts->finallyBody)) return true;
+            // Recurse into the try body and catch arm bodies for nested try stmts.
+            if (awaitInFinallyPosition(ts->body)) return true;
+            for (const auto& arm : ts->catches) {
+                const ast::Stmt* ab = arm.body.get();
+                if (auto* db = dynamic_cast<const ast::DoEndBlock*>(ab)) {
+                    if (awaitInFinallyPosition(db->body)) return true;
+                }
+            }
+            // Recurse into this finally for nested try statements inside it
+            // (a try/finally nested inside a finally).
+            if (awaitInFinallyPosition(ts->finallyBody)) return true;
+            continue;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
+            if (awaitInFinallyPosition(fs->body)) return true;
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
+            if (awaitInFinallyPosition(ws->body)) return true;
+        } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
+            if (awaitInFinallyPosition(ifs->ifBranch.body)) return true;
+            for (const auto& el : ifs->elifBranches)
+                if (awaitInFinallyPosition(el.body)) return true;
+            if (ifs->hasElse && awaitInFinallyPosition(ifs->elseBody)) return true;
+        } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+            if (awaitInFinallyPosition(db->body)) return true;
+        }
+    }
+    return false;
+}
+
+
 // §29.6 / §30.7 (#554): detect a FORBIDDEN suspend position in an async
 // iterator body. The spec (§29.6) allows `yield return` / `yield break` inside a
 // `try` body whose surrounding statement has ONLY a `finally` (no catch arms) —
@@ -1204,9 +1253,11 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // §29.6 / §30.7 (#554): check for FORBIDDEN suspend positions in this async
     // iterator body. The allowed positions are (§29.6 / §30.9):
     //   • `yield` or `await` in a try body with ONLY a finally (no catch arms).
-    //   • `await` in a catch arm body or a finally (§30.9 plain-async rules apply).
+    //   • `await` in a catch arm body (§30.9 plain-async rules apply).
     // The forbidden positions (yield in try-with-catch, yield in catch arm body,
     // yield in finally, await in catch guard) are rejected with a clean diagnostic.
+    // NOTE: `await` in a finally is now also forbidden (§30.7 v0.137); that check
+    // follows immediately below.
     if (suspendInTryPosition(*ci.stmts)) {
         ctx_.diagnostics().report(
             Severity::Error,
@@ -1214,7 +1265,30 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             "forbidden by §29.6: `yield` inside a try body with catch arms, "
             "`yield` inside a catch arm body, or `yield` inside a finally block "
             "in an async iterator (`yield` in a try body with only a finally is "
-            "allowed; `await` in try/catch/finally bodies is allowed per §30.9)");
+            "allowed; `await` in a try body or catch arm body is allowed per §30.9; "
+            "`await` in a finally is forbidden per §30.7 v0.137)");
+        emitAsyncStub(ms, fn, ci);
+        return;
+    }
+    // §30.7 v0.137 (#655): `await` inside a `finally` block in an async iterator
+    // is forbidden.  The Dispose path (§29.7) runs synchronously when a consumer
+    // abandons iteration early — there is no async driver at that point, so a
+    // suspension inside a `finally` would have nowhere to resume; the continuation
+    // would be silently discarded.  Remedy: hoist the `await` before the `try`,
+    // or move the asynchronous cleanup into the type's `Dispose` path.
+    // (An ordinary async method may await in its `finally`; §30.9 is unaffected —
+    // this check is only called from emitAsyncIteratorMethod, not emitAsyncMethod.)
+    if (awaitInFinallyPosition(*ci.stmts)) {
+        ctx_.diagnostics().report(
+            Severity::Error,
+            ms->decl ? ms->decl->span.begin : SourceLocation{},
+            "forbidden by §30.7 v0.137 (#655): `await` inside a `finally` block "
+            "in an async iterator — the iterator's `finally` blocks run "
+            "synchronously inside `Dispose` (§29.7) when a consumer abandons "
+            "iteration early; there is no async driver at that point, so a "
+            "suspension would be silently discarded. "
+            "Remedy: hoist the `await` before the `try`, or move async cleanup "
+            "into the type's `Dispose` path");
         emitAsyncStub(ms, fn, ci);
         return;
     }

@@ -188,6 +188,7 @@ set(BEZEL_TEST_SOURCES
     sema/send_600_runtime_semantics_test.cpp   # #600c (runtime phase) — enabled
     sema/channel_634_uaf_test.cpp              # fix #634: channel core refcounting + send-after-close CCE
     sema/channel_667_valuetype_test.cpp        # fix #667: value-typed payloads, TryReceive/IsClosed after dispose
+    sema/channel_640_phantom_members_test.cpp  # fix #640: Channel<T> phantom Send/TrySend/Bogus rejected (§6.9)
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
@@ -472,6 +473,7 @@ set(BEZEL_TEST_SOURCES
     codegen/dict_entry_iter_548_test.cpp
     codegen/dict_insertion_order_622_test.cpp
     codegen/async_iter_try_finally_554_test.cpp
+    codegen/async_iter_await_finally_655_test.cpp  # fix #655: await-in-async-iterator-finally rejected (§30.7 v0.137)
     codegen/iter_finally_dispose_623_test.cpp
     codegen/iterator_exception_630_test.cpp
     codegen/codegen_unimplemented_hard_error_628_test.cpp
