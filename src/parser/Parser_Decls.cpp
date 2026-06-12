@@ -1131,11 +1131,43 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                                 "expected ':' after interface property name");
         }
         pd->type = parseType();
-        pd->bodyKind = ast::PropertyBodyKind::Auto; // iface: signature only
-        if (!consumePunctuator(";")) {
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "expected ';' after interface property declaration");
+        // §23.3 / §23.4: interface accessor bodies may use the block form
+        // `Accessor* "end" ";"` where each Accessor has the abstract body
+        // (`;`-terminated), optionally carrying a SetterParamSpec (e.g.
+        // `set(owned);`).  This is required for owned-setter declarations on
+        // interface indexers (`IOwnedList<T>`) per §23.3.  The grammar
+        // appendix A shows only the simple `";"` form for IfaceIndexer /
+        // IfaceProperty; the prose of §23.3 extends it.  per §23.3.
+        if (isPropertyAccessorStart()) {
+            pd->bodyKind = ast::PropertyBodyKind::Block;
+            while (isPropertyAccessorStart()) {
+                pd->accessors.push_back(parsePropertyAccessor());
+            }
+            if (!consumeKeyword("end")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected 'end' to close interface property accessor block");
+            }
+            // Interface properties have no name to label `end` with; plain
+            // `end;` is the only valid form (enforced semantically for named
+            // properties; indexers have no name per §23.4).
+            if (current_.kind == TokenKind::Identifier &&
+                !pd->isIndexer && !pd->name.empty()) {
+                pd->blockEndLabel = current_.text;
+                advance();
+            }
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after 'end' of interface property accessor block");
+            }
+        } else {
+            pd->bodyKind = ast::PropertyBodyKind::Auto; // simple signature form
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after interface property declaration");
+            }
         }
         return std::unique_ptr<ast::Member>(pd.release());
     }
@@ -1291,8 +1323,60 @@ ast::PropertyAccessor Parser::parsePropertyAccessor() {
                     "expected 'end' to close accessor block body");
             }
         } else {
-            acc.bodyKind = ast::PropertyAccessorBodyKind::Expression;
-            acc.exprBody = parseExpression();
+            // §13.6 / §23.3 / §A.4: the `=> ...` body admits both an
+            // Expression (followed by `;`) and a single Statement whose own
+            // terminating `;` also closes the AccessorBody.  The latter is
+            // required by the §13.6 example `set => _name := value;` because
+            // §A.6 / §17 prose establish that assignments are statements, not
+            // expressions.  We detect the statement cases (assignment and
+            // increment) after parsing the leading expression/LHS, mirroring
+            // the logic in parseStatement()'s expression-led path.  per §13.6
+            auto lhs = parseExpression();
+            const bool isAssignOp =
+                current_.kind == TokenKind::Punctuator &&
+                (current_.text == ":="  || current_.text == "+="  ||
+                 current_.text == "-="  || current_.text == "*="  ||
+                 current_.text == "/="  || current_.text == "&="  ||
+                 current_.text == "|="  || current_.text == "^="  ||
+                 current_.text == "<<=" || current_.text == ">>=" ||
+                 current_.text == "??=");
+            const bool isIncrOp =
+                current_.kind == TokenKind::Punctuator &&
+                (current_.text == "++" || current_.text == "--");
+            if (isAssignOp) {
+                // Single assignment statement body: store as Block so the
+                // §A.4 invariant (accessor block == stmts list) is preserved.
+                acc.bodyKind = ast::PropertyAccessorBodyKind::Block;
+                auto a = std::make_unique<ast::AssignmentStmt>();
+                a->target = std::move(lhs);
+                a->op = current_.text;
+                advance(); // past assignment operator
+                a->value = parseExpression();
+                if (!consumePunctuator(";")) {
+                    diagnostics_.report(Severity::Error, current_.location,
+                                        "expected ';' after accessor body");
+                }
+                acc.stmts.push_back(
+                    std::unique_ptr<ast::Stmt>(a.release()));
+                return acc; // `;` already consumed above
+            } else if (isIncrOp) {
+                // Single increment statement body.
+                acc.bodyKind = ast::PropertyAccessorBodyKind::Block;
+                auto inc = std::make_unique<ast::IncrementStmt>();
+                inc->target = std::move(lhs);
+                inc->op = current_.text;
+                advance();
+                if (!consumePunctuator(";")) {
+                    diagnostics_.report(Severity::Error, current_.location,
+                                        "expected ';' after accessor body");
+                }
+                acc.stmts.push_back(
+                    std::unique_ptr<ast::Stmt>(inc.release()));
+                return acc; // `;` already consumed above
+            } else {
+                acc.bodyKind = ast::PropertyAccessorBodyKind::Expression;
+                acc.exprBody = std::move(lhs);
+            }
         }
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
