@@ -807,7 +807,10 @@ private:
     // §4.15: ArraySpan<T>/ReadOnlyArraySpan<T> value struct { ptr source, i32 start, i32 length }.
     // Both writable and read-only spans share the same LLVM layout (per §4.15).
     llvm::StructType* arraySpanStructTy_ = nullptr;
-    // #422 / §27.5 / §28.9: the closure-cell type { ptr fn, ptr env, i64 rc }.
+    // #422 / #672 / §27.5 / §28.9: the closure-cell type
+    // { ptr fn, ptr env, i64 rc, ptr envdtor }.
+    // envdtor (field 3, off 24) is a per-lambda typed disposal function emitted
+    // beside the trampoline (#672 foundation); null = no env disposal (back-compat).
     llvm::StructType* closureCellTy_ = nullptr;
     unsigned stringLiteralIdx_ = 0;
 
@@ -1264,16 +1267,22 @@ private:
         builder_.CreateCall(fn, {s});
     }
 
-    // #422 / §27.5 / §28.9: the closure-cell heap layout — { ptr fn, ptr env,
-    // i64 rc } = 24 bytes. fn (off 0) and env (off 8) keep the offsets the
-    // existing closure-call sites use (fn at offset 0, env at GEP index 1); rc
-    // (field index 2, off 16) is appended after env so neither moves. Every
-    // closure-cell producer (lowerLambda, makeMethodThunk) calloc's this size
-    // and stores rc := 1.
+    // #422 / #672 / §27.5 / §28.9: the closure-cell heap layout —
+    //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24) }
+    //   = 32 bytes.
+    // fn (off 0) and env (off 8) keep the offsets the existing closure-call sites
+    // use (fn at offset 0, env at GEP index 1); rc (field index 2, off 16) is
+    // unchanged; envdtor (field index 3, off 24) is NEW (#672 foundation): a
+    // per-lambda typed disposal function emitted beside the trampoline that, when
+    // non-null, is called by bz_closure_release at last-drop BEFORE the env block
+    // is freed.  null = old behaviour (back-compat for makeMethodThunk and any
+    // non-capturing lambda whose env has nothing to dispose).
+    // Every closure-cell producer (lowerLambda, makeMethodThunk) calloc's this
+    // size and stores rc := 1 and envdtor := null (foundation).
     llvm::StructType* closureCellType() {
         if (!closureCellTy_)
             closureCellTy_ = llvm::StructType::create(
-                llvm_, {ptrTy(), ptrTy(), i64()}, "bz.closure");
+                llvm_, {ptrTy(), ptrTy(), i64(), ptrTy()}, "bz.closure");
         return closureCellTy_;
     }
 
@@ -1283,6 +1292,18 @@ private:
         builder_.CreateStore(
             llvm::ConstantInt::get(i64(), 1),
             builder_.CreateStructGEP(closureCellType(), cellObj, 2));
+    }
+
+    // #672: store envdtor := null into a freshly calloc'd closure cell (field 3).
+    // Foundation: all producers start with a null envdtor (no env disposal yet).
+    // The follow-up activation lane will populate this for closures that retain
+    // owned captures.  callocFn zero-fills the allocation so this is technically
+    // redundant, but the explicit store makes the intent clear and guards against
+    // any future switch away from calloc.
+    void initClosureEnvdtor(llvm::Value* cellObj) {
+        builder_.CreateStore(
+            llvm::ConstantPointerNull::get(ptrTy()),
+            builder_.CreateStructGEP(closureCellType(), cellObj, 3));
     }
 
     // #422: emit a call to bz_closure_retain(c) — increments rc (no-op on null).

@@ -840,17 +840,23 @@ int32_t bz_obj_is_string(void* obj, void** vtable_table);
 
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
-// increment). Function-typed values (lambda closures, capturing or not, and
-// method references) are runtime-managed (§28.9): the heap-allocated closure
-// object backing the value is reclaimed automatically. The cell is laid out
-// { void* fn, void* env, int64 rc } (rc at offset 16, total 24 bytes); every
-// producer (lowerLambda, makeMethodThunk) initializes rc to 1. retain
-// increments; release decrements and, at zero, frees the env block (if any)
-// then the cell. A closure owns NEITHER its captures (they are borrows per
-// §28.9 / §28.3) nor the boxed cells backing them, so release frees only the
-// cell + its env block — never a captured value (which the original owned
-// location disposes exactly once). null is a no-op. Non-atomic for now; becomes
-// atomic when async lands.
+// increment; issue #672 typed env-disposer foundation).
+// Function-typed values (lambda closures, capturing or not, and method
+// references) are runtime-managed (§28.9): the heap-allocated closure object
+// backing the value is reclaimed automatically.  The cell is laid out
+//   { void* fn (off 0), void* env (off 8), int64 rc (off 16),
+//     void* envdtor (off 24) }  total 32 bytes.
+// fn (off 0) and env (off 8) keep their offsets.  rc at off 16 is unchanged.
+// envdtor (off 24, #672 foundation): a per-lambda typed env-disposal function
+// emitted by codegen beside the trampoline.  When non-null, bz_closure_release
+// calls it as envdtor(env) at the last drop BEFORE freeing the env block; this
+// is the hook the follow-up capture-retain activation lane will use to release
+// +1-retained string / class / box captures.  Foundation: all producers store
+// envdtor = null (calloc zero-fill + explicit store); behaviour is identical
+// to the prior 24-byte layout.
+// A closure owns NEITHER its captures (they are borrows per §28.9 / §28.3) nor
+// the boxed cells backing them in the current foundation state; release frees
+// only the cell + env block, never a captured value. null is a no-op.
 void bz_closure_retain(void* c);
 void bz_closure_release(void* c);
 

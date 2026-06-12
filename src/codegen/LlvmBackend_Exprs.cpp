@@ -5207,7 +5207,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     llvm::Value* envSlot = builder_.CreateGEP(
         ptrTy(), closureObj, {builder_.getInt32(1)});
     builder_.CreateStore(envAlloc, envSlot);
-    initClosureRc(closureObj);  // #422: producer's reference, rc := 1
+    initClosureRc(closureObj);     // #422: producer's reference, rc := 1
+    initClosureEnvdtor(closureObj); // #672: foundation null — no env disposal yet
     return closureObj;
 }
 
