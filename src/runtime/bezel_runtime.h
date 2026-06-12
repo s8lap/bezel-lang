@@ -1281,6 +1281,10 @@ void    bz_binser_write_ref_tag(void* ser, int32_t tag_id);
 // --- §2.15 JsonSerializer (kind=1) helpers ---
 // Allocate a new JsonSerializer (same bz_binser_t, kind=1, writes JSON text).
 void* bz_jser_alloc(void);
+// Allocate a JsonSerializer with options (fix #687 / stdlib §2.15 JsonOptions).
+// indented=1 → pretty-print with newlines; indent_width = spaces per level.
+// max_depth = nesting guard (raises SerializationException when exceeded).
+void* bz_jser_alloc_opts(int8_t indented, int32_t indent_width, int32_t max_depth);
 // Transfer the accumulated JSON bytes as an owned OwnedBuffer<byte>.
 void* bz_jser_to_bytes(void* ser);
 // Transfer the accumulated JSON bytes as a Bezel string (UTF-8 → bz_string*).
@@ -1290,9 +1294,17 @@ void* bz_jser_to_string(void* ser);
 // --- §2.15 JsonDeserializer (kind=1/2) helpers ---
 // Allocate a JsonDeserializer reading from a UTF-8 JSON byte span (kind=1, borrows data).
 void* bz_jder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown);
+// Allocate a JsonDeserializer with full options (fix #687 / stdlib §2.15 JsonOptions).
+void* bz_jder_alloc_opts(const uint8_t* data, int64_t len,
+                          int8_t ignore_unknown, int8_t allow_trailing_commas,
+                          int32_t max_depth);
 // Allocate a JsonDeserializer from a malloc'd UTF-8 buffer (kind=2, takes ownership of utf8z).
 // `utf8z` is a malloc'd byte buffer of `len` bytes; bz_binder_free will free it.
 void* bz_jder_alloc_str(char* utf8z, int64_t len, int8_t ignore_unknown);
+// Allocate a JsonDeserializer from a malloc'd UTF-8 buffer with full options.
+void* bz_jder_alloc_str_opts(char* utf8z, int64_t len,
+                              int8_t ignore_unknown, int8_t allow_trailing_commas,
+                              int32_t max_depth);
 // (bz_binder_free handles disposal for both binary and JSON — same struct)
 
 // --- Deserializer (reader) ---

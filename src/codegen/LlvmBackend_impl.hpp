@@ -832,6 +832,10 @@ private:
     // §4.15: ArraySpan<T>/ReadOnlyArraySpan<T> value struct { ptr source, i32 start, i32 length }.
     // Both writable and read-only spans share the same LLVM layout (per §4.15).
     llvm::StructType* arraySpanStructTy_ = nullptr;
+    // §2.15 / issue #687: JsonOptions value struct
+    // { i1 Indented, i32 IndentWidth, i1 AllowTrailingCommas,
+    //   i1 IgnoreUnknownFields, i32 MaxDepth }.
+    llvm::StructType* jsonOptionsStructTy_ = nullptr;
     // #422 / #672 / §27.5 / §28.9: the closure-cell type
     // { ptr fn, ptr env, i64 rc, ptr envdtor }.
     // envdtor (field 3, off 24) is a per-lambda typed disposal function emitted
@@ -1236,6 +1240,62 @@ private:
         builder_.CreateStore(start,  builder_.CreateStructGEP(st, slot, 1));
         builder_.CreateStore(length, builder_.CreateStructGEP(st, slot, 2));
         return builder_.CreateLoad(st, slot, "span.val");
+    }
+
+    // §2.15 / issue #687: JsonOptions value struct.
+    // Layout: { i1 Indented, i32 IndentWidth, i1 AllowTrailingCommas,
+    //           i1 IgnoreUnknownFields, i32 MaxDepth }
+    // Field indices:  0=Indented, 1=IndentWidth, 2=AllowTrailingCommas,
+    //                 3=IgnoreUnknownFields, 4=MaxDepth
+    llvm::StructType* jsonOptionsStructType() {
+        if (!jsonOptionsStructTy_)
+            jsonOptionsStructTy_ = llvm::StructType::create(
+                llvm_,
+                {i1(), i32(), i1(), i1(), i32()},
+                "bz.json_options");
+        return jsonOptionsStructTy_;
+    }
+
+    // §2.15 / #687: helpers to extract the individual JsonOptions fields from
+    // a lowered JsonOptions struct value (held in a register or an alloca slot).
+    // Each helper stores the struct into a temp alloca and GEPs the field.
+    llvm::Value* jsonOptIndented(llvm::Value* opts) {
+        auto* st = jsonOptionsStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(opts, slot);
+        llvm::Value* v = builder_.CreateLoad(i1(),
+            builder_.CreateStructGEP(st, slot, 0), "jopt.indented");
+        return builder_.CreateZExt(v, i8(), "jopt.indented8");
+    }
+    llvm::Value* jsonOptIndentWidth(llvm::Value* opts) {
+        auto* st = jsonOptionsStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(opts, slot);
+        return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(st, slot, 1), "jopt.iwidth");
+    }
+    llvm::Value* jsonOptAllowTrailing(llvm::Value* opts) {
+        auto* st = jsonOptionsStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(opts, slot);
+        llvm::Value* v = builder_.CreateLoad(i1(),
+            builder_.CreateStructGEP(st, slot, 2), "jopt.trailing");
+        return builder_.CreateZExt(v, i8(), "jopt.trailing8");
+    }
+    llvm::Value* jsonOptIgnoreUnknown(llvm::Value* opts) {
+        auto* st = jsonOptionsStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(opts, slot);
+        llvm::Value* v = builder_.CreateLoad(i1(),
+            builder_.CreateStructGEP(st, slot, 3), "jopt.ignunk");
+        return builder_.CreateZExt(v, i8(), "jopt.ignunk8");
+    }
+    llvm::Value* jsonOptMaxDepth(llvm::Value* opts) {
+        auto* st = jsonOptionsStructType();
+        auto* slot = entryAlloca(st);
+        builder_.CreateStore(opts, slot);
+        return builder_.CreateLoad(i32(),
+            builder_.CreateStructGEP(st, slot, 4), "jopt.maxdepth");
     }
 
     // fix #499 / §9.8: test whether a TypeRef is a Range type (set by sema

@@ -1153,6 +1153,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 isDecimalSum = true;
             }
             if (isDecimalSum) {
+                // fix #686: detect nullable-decimal elements (Array<decimal?>).
+                // elemTy for decimal? is {i8, bz.decimal} (not decTy itself).
+                // We must load the full {i8,decimal} struct from the element slot
+                // and pass it to the closure with the correct ABI, not truncate to
+                // decTy (which misreads the 17-byte slot as 16 bytes).
+                auto* nullDecTy = nullablePrimStructTy(sema::PrimitiveType::Decimal);
+                bool isNullableDecElem = (elemTy == nullDecTy);
+                // Actual load type for element: {i8,decimal} for decimal?, decimal for decimal.
+                llvm::Type* loadTy = isNullableDecElem ? static_cast<llvm::Type*>(nullDecTy)
+                                                       : static_cast<llvm::Type*>(decTy);
+
                 // Lower selector with decimal return TypeRef so unannotated lambdas
                 // get the right param hint.
                 sema::TypeRef* decRetRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Decimal);
@@ -1186,16 +1197,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(bodyBB);
                 auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
                 llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-                // Load element (decimal struct by value from the slot).
-                llvm::Value* el = builder_.CreateLoad(decTy, ep);
-                // Apply selector if present: fn(env, elem) -> decimal struct.
+                // fix #686: load element at the correct width.
+                // For decimal?: load full {i8,decimal} struct (NOT just decTy).
+                // For decimal:  load decTy directly (as before).
+                llvm::Value* el = builder_.CreateLoad(loadTy, ep);
+                // Apply selector if present.
+                // fix #686: closure ABI uses loadTy (element's actual LLVM type)
+                // as the param type; return type is always decTy.
                 llvm::Value* val = el;
                 if (closure) {
                     llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
                     llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure,
                                                               {builder_.getInt32(1)});
                     llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
-                    auto* fnTy = llvm::FunctionType::get(decTy, {ptrTy(), decTy}, false);
+                    // fix #686: param type is loadTy (decimal? → {i8,decimal};
+                    // decimal → decTy). The selector returns decimal (decTy).
+                    auto* fnTy = llvm::FunctionType::get(decTy, {ptrTy(), loadTy}, false);
                     val = builder_.CreateCall(fnTy, fnPtr, {envPtr, el}, "cl.dec");
                 }
                 // Store val into a temp slot for the add call.
@@ -1320,12 +1337,21 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 
             // Detect decimal selector or decimal element type.
             llvm::StructType* decTy = decimalStructType();
-            bool isDecimalAvg = (elemTy == decTy || selRetTy == decTy);
+            // fix #686: also detect nullable-decimal element type ({i8,decimal}).
+            auto* nullDecTyAvg = nullablePrimStructTy(sema::PrimitiveType::Decimal);
+            bool isNullableDecElemAvg = (elemTy == nullDecTyAvg);
+            bool isDecimalAvg = (elemTy == decTy || selRetTy == decTy ||
+                                 isNullableDecElemAvg);
             if (isDecimalAvg) {
                 // stdlib §5 (L2589) / §5.1 (L2676):
                 //   Average(selector: (T)->decimal): decimal
                 //   IEnumerable<decimal>.Average(): decimal
                 // Accumulate via bz_decimal_add; divide sum by count via bz_decimal_div.
+                // fix #686: load type for element: {i8,decimal} for decimal?,
+                // decimal for decimal.
+                llvm::Type* loadTyAvg = isNullableDecElemAvg
+                    ? static_cast<llvm::Type*>(nullDecTyAvg)
+                    : static_cast<llvm::Type*>(decTy);
                 sema::TypeRef* decRetRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Decimal);
                 llvm::Value* closure = call.args.empty() ? nullptr
                     : lowerLinqLambda(call.args[0].value.get(), decRetRef);
@@ -1354,14 +1380,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(bodyBB);
                 auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
                 llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-                llvm::Value* el = builder_.CreateLoad(decTy, ep);
+                // fix #686: load at correct width (nullable-decimal vs decimal).
+                llvm::Value* el = builder_.CreateLoad(loadTyAvg, ep);
                 llvm::Value* val = el;
                 if (closure) {
                     llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
                     llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure,
                                                               {builder_.getInt32(1)});
                     llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
-                    auto* fnTy = llvm::FunctionType::get(decTy, {ptrTy(), decTy}, false);
+                    // fix #686: param type is loadTyAvg.
+                    auto* fnTy = llvm::FunctionType::get(decTy, {ptrTy(), loadTyAvg}, false);
                     val = builder_.CreateCall(fnTy, fnPtr, {envPtr, el}, "cl.dec");
                 }
                 auto* valSlot = entryAlloca(decTy);
@@ -1440,6 +1468,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 
             // Detect decimal element type (no selector case: stdlib §5.1 T: IComparable<T>).
             llvm::StructType* decTy = decimalStructType();
+            // fix #686: also handle decimal selector with nullable-decimal elements.
+            auto* nullDecTyMM = nullablePrimStructTy(sema::PrimitiveType::Decimal);
+            bool isNullableDecElemMM = (elemTy == nullDecTyMM);
+            // Check if the selector (if any) returns decimal.
+            bool decSelectorMM = false;
+            if (!call.args.empty() && call.args[0].value)
+                if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+                    if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn)
+                        if (lamTy->funcReturn->kind == sema::TypeRef::Kind::Primitive &&
+                            lamTy->funcReturn->primitive == sema::PrimitiveType::Decimal)
+                            decSelectorMM = true;
             if (elemTy == decTy && call.args.empty()) {
                 // stdlib §5.1: Array<decimal>.Min()/Max(): decimal
                 // Throws InvalidOperationException on empty source.
@@ -1489,6 +1528,71 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
                 builder_.CreateBr(condBB);
                 builder_.SetInsertPoint(endBB);
+                freeLazyTemp();
+                return builder_.CreateLoad(decTy, accSlot, "mm.r");
+            }
+
+            // fix #686 / stdlib §5.1: Min/Max with decimal selector
+            // (e.g. Array<decimal?>.Min((x) => x ?? sentinel)).
+            // loadTy is the element LLVM type: {i8,decimal} for decimal?, decimal for decimal.
+            if (decSelectorMM || (isNullableDecElemMM && call.args.size() == 1)) {
+                llvm::Type* loadTyMM = isNullableDecElemMM
+                    ? static_cast<llvm::Type*>(nullDecTyMM)
+                    : static_cast<llvm::Type*>(decTy);
+                sema::TypeRef* decRetRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Decimal);
+                llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), decRetRef);
+                if (!closure) return nullptr;
+                const bool relClMM = argIsInlineLambda(0);
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                llvm::Value* isEmpty = builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                emitGuardThrow(isEmpty, "InvalidOperationException");
+                auto* idxSlot  = entryAlloca(i64());
+                auto* accSlot  = entryAlloca(decTy);
+                auto* initSlot = entryAlloca(i1());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                builder_.CreateStore(llvm::ConstantAggregateZero::get(decTy), accSlot);
+                builder_.CreateStore(builder_.getFalse(), initSlot);
+                auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+                auto* condBB = llvm::BasicBlock::Create(llvm_, "mm.c", currentFn_);
+                auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mm.b", currentFn_);
+                auto* updBB  = llvm::BasicBlock::Create(llvm_, "mm.u", currentFn_);
+                auto* nextBB = llvm::BasicBlock::Create(llvm_, "mm.n", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "mm.e", currentFn_);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(condBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+                builder_.SetInsertPoint(bodyBB);
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+                llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
+                // fix #686: load at correct width per element type.
+                llvm::Value* el = builder_.CreateLoad(loadTyMM, ep);
+                // Call selector: (env, elem) -> decimal.
+                llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
+                llvm::Value* envSlotP = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
+                llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlotP, "cl.env");
+                auto* fnTyMM = llvm::FunctionType::get(decTy, {ptrTy(), loadTyMM}, false);
+                llvm::Value* selVal = builder_.CreateCall(fnTyMM, fnPtr, {envPtr, el}, "cl.dec");
+                auto* valSlot = entryAlloca(decTy);
+                builder_.CreateStore(selVal, valSlot);
+                llvm::Value* cmpResult = builder_.CreateCall(cmpFn, {valSlot, accSlot}, "dec.cmp");
+                llvm::Value* shouldUpdate = isMax
+                    ? builder_.CreateICmpSGT(cmpResult, builder_.getInt32(0))
+                    : builder_.CreateICmpSLT(cmpResult, builder_.getInt32(0));
+                llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateOr(builder_.CreateNot(inited), shouldUpdate),
+                    updBB, nextBB);
+                builder_.SetInsertPoint(updBB);
+                builder_.CreateStore(selVal, accSlot);
+                builder_.CreateStore(builder_.getTrue(), initSlot);
+                builder_.CreateBr(nextBB);
+                builder_.SetInsertPoint(nextBB);
+                builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(condBB);
+                builder_.SetInsertPoint(endBB);
+                if (relClMM) emitClosureRelease(closure);
                 freeLazyTemp();
                 return builder_.CreateLoad(decTy, accSlot, "mm.r");
             }
