@@ -226,6 +226,7 @@ set(BEZEL_TEST_SOURCES
     codegen/closure_refcount_test.cpp
     codegen/env_disposer_672_test.cpp
     codegen/capture_retain_429_test.cpp
+    codegen/closure_call_string_return_429_test.cpp
     codegen/linq_refcount_test.cpp
     codegen/box_refcount_test.cpp
     codegen/escaping_box_refcount_test.cpp
