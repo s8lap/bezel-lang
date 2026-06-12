@@ -1891,8 +1891,10 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
     // exprType, so match it syntactically before the typed path below.
     if (const auto* tid =
             dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+        // per §30.14 (#693): Domain.Spawn transfers ALL extra args (pos >= 1)
+        // into the spawned domain — each is an owned-consuming position.
         if (tid->name == "Domain" && ma->member == "Spawn")
-            return argPos == 1;
+            return argPos >= 1;
     }
     const sema::TypeRef* tt = ctx_.exprType(*ma->target);
     // Built-in collections resolve to a Named TypeRef with a null declaration
@@ -1904,11 +1906,27 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
         tt->astNode->name->parts.empty())
         return false;
     const std::string_view cn = tt->astNode->name->parts[0];
-    // per §30.15 (#600): ChannelSender<T>.Send(owned item) transfers ownership
-    // into the channel (stdlib §6.9). For value/string element types the slot
-    // is a copy and the sink classification is a harmless no-op.
-    if (cn == "ChannelSender" && ma->member == "Send")
-        return argPos == 0;
+    // per §30.15 / §6.9 (#600, #692): ChannelSender<T>.Send(owned item)
+    // transfers ownership only when T is a class or interface type — the
+    // channel takes ownership of the heap object and the owned-sink rule
+    // must fire so a borrow is rejected. For value-typed T and string the
+    // ownership modifiers drop out (§6.9: "Send(item: T)") — the slot is a
+    // copy, no heap disposal obligation, so the owned-sink rule must NOT fire.
+    if (cn == "ChannelSender" && ma->member == "Send" && argPos == 0) {
+        // Inspect the first generic argument (T) of ChannelSender<T>.
+        // If T is a class or interface type, the sink applies; otherwise skip.
+        if (!tt->genericArgs.empty() && tt->genericArgs[0]) {
+            const sema::TypeRef* elemT = tt->genericArgs[0];
+            if (elemT->kind == sema::TypeRef::Kind::Named &&
+                elemT->declaration &&
+                (elemT->declaration->kind == ast::TypeDeclKind::Class ||
+                 elemT->declaration->kind == ast::TypeDeclKind::Interface))
+                return true;  // class/interface T → owned-sink applies
+        }
+        // Value-typed T (or unresolved/generic T): ownership modifiers drop
+        // out per §6.9 — not an owned sink.
+        return false;
+    }
     const bool isOwning =
         cn == "OwnedArray" || cn == "OwnedDictionary" ||
         cn == "OwnedSet" || cn == "OwnedStack" || cn == "OwnedQueue" ||
