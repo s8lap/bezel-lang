@@ -5313,6 +5313,34 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // and a string-field store TRANSFERS it into the field. Builtin stdlib string
     // methods and cross-module imported methods are EXCLUDED (see the helper).
     if (isUserMethodStringReturnCall(init)) return true;
+    // #429 (closure CALL-RETURN category) / §28.9 / §27.5: a CALL to a
+    // function-typed LOCAL or PARAMETER whose declared funcReturn is non-nullable
+    // `string`. After the lambda expr-body minting fix (lowerLambda Part 1) ALL
+    // `() -> string` closures hand their caller exactly +1 — the expr-body path
+    // now mints +1 for borrow returns (mirroring ReturnStmt), and the block-body
+    // path always went through ReturnStmt which already minted. So calling any
+    // `() -> string` local/param is a +1 string producer at the call site.
+    // Recognised by: CallExpr whose callee resolves to a LocalSymbol or
+    // ParameterSymbol, AND whose call-expression sema type is non-nullable
+    // string (the callee's funcReturn is string). MethodSymbol callees are
+    // covered by isUserMethodStringReturnCall above; this catches the
+    // closure-local-call shape (`var f := C.Make(...); f()` → `f().Length`
+    // must release the +1 string returned by calling f).
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->callee) {
+            sema::Symbol* sym = ctx_.exprSymbol(*call->callee);
+            if (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                // The result type of the call is the funcReturn of the callee.
+                // If that result is non-nullable string, this call is a +1 producer.
+                const sema::TypeRef* resultTy = ctx_.exprType(*init);
+                if (resultTy && !resultTy->nullable &&
+                    resultTy->kind == sema::TypeRef::Kind::Primitive &&
+                    resultTy->primitive == sema::PrimitiveType::String)
+                    return true;
+            }
+        }
+    }
     return false;
 }
 

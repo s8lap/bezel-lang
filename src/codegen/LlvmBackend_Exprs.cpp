@@ -5163,6 +5163,36 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                             v = wrapNullableValue(retSemaTy, v);
                     }
                 }
+                // #429 (closure CALL-RETURN category) / §28.9 / §27.5: a lambda
+                // with an expression body must also mint +1 for reference-counted
+                // return types, exactly as the block-body path does via
+                // ReturnStmt lowering (LlvmBackend_Stmts.cpp lines ~718-751).
+                // Without this, a `() => <borrow>` lambda body returns a +0
+                // borrow to its caller, who then tries to release a +1 that was
+                // never minted — double-free (PRIME DIRECTIVE violation).
+                // Mirror ReturnStmt: TRANSFER (skip retain) when the expr already
+                // owns a +1; RETAIN (mint) when it is a borrow.
+                //
+                // String: retain unless the body is a +1 producer (concat/interp/
+                //   range-slice/numeric-ToString/user-method-call) or is an
+                //   identifier naming a non-nullable local that owns +1.
+                if (v && v->getType()->isPointerTy() &&
+                    retSemaTy && !retSemaTy->nullable &&
+                    retSemaTy->kind == sema::TypeRef::Kind::Primitive &&
+                    retSemaTy->primitive == sema::PrimitiveType::String &&
+                    !isPlusOneStringProducer(lam.exprBody.get()) &&
+                    !returnedStringLocalOwnsPlusOne(lam.exprBody.get()))
+                    emitStringRetain(v);
+                // Closure: retain unless the body is a +1 closure producer
+                //   (lambda / method-ref / user-method-closure-return) or is an
+                //   identifier naming a closure local that owns +1.
+                if (v && v->getType()->isPointerTy() &&
+                    retSemaTy &&
+                    retSemaTy->kind == sema::TypeRef::Kind::Function &&
+                    !isPlusOneClosureProducer(lam.exprBody.get()) &&
+                    !isUserMethodClosureReturnCall(lam.exprBody.get()) &&
+                    !returnedClosureLocalOwnsPlusOne(lam.exprBody.get()))
+                    emitClosureRetain(v);
                 builder_.CreateRet(v);
             } else {
                 builder_.CreateRetVoid();
