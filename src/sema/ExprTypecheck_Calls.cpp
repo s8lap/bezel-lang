@@ -5385,14 +5385,17 @@ bool ExprTC::isSendable(const TypeRef* rt,
             //   Task<T>, OwnedTask<T>, Task (bare): domain-local.
             //   Shared<T>, Weak<T>: ref-count not synchronized (§28.13).
             //   EventSource<T>, AsyncEventSource<T>: domain-local.
-            //   Mutex, Semaphore: domain-local synchronization primitives.
+            //   Semaphore: domain-local synchronization primitive.
+            //   Lock: held guard is domain-local; must be released in the acquiring
+            //     domain (stdlib §6.2 v0.138 / #647).
             //   CancellationTokenSource, CancellationToken: borrow-bearing record.
+            // NOTE: Mutex is NOT in this list — it is sendable per stdlib §6.2 v0.138
+            //   / #647: Mutex is internally synchronized, like Channel<T>, and may
+            //   be reached by multiple domains simultaneously.
             if (bname == "Task" || bname == "OwnedTask" ||
                 bname == "Shared" || bname == "Weak" ||
                 bname == "EventSource" || bname == "AsyncEventSource" ||
-                bname == "Mutex" || bname == "Semaphore" ||
-                // §6.2 / #647: Mutex not sendable (docs ruling pending — conservative);
-                // Lock not sendable (a held guard is domain-local by nature).
+                bname == "Semaphore" ||
                 bname == "Lock" ||
                 bname == "CancellationTokenSource")
                 return false;
@@ -5449,6 +5452,12 @@ bool ExprTC::isSendable(const TypeRef* rt,
             // themselves sendable (they carry ownership of the underlying
             // channel object — a move-transfer).
             if (bname == "Channel" || bname == "ChannelSender")
+                return true;
+
+            // §30.14 / stdlib §6.2 v0.138 / #647: Mutex is sendable —
+            // internally synchronized; may be reached by multiple domains
+            // simultaneously (like Channel<T>). Ownership transfers on move.
+            if (bname == "Mutex")
                 return true;
 
             // Other builtin types with no user TypeDecl: conservatively
