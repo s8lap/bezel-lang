@@ -2115,6 +2115,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             tr->astNode = kRONode;
                             tr->genericArgs.push_back(recvTy->genericArgs[0]);
                             ctx_.setExprType(&ce, tr);
+                        } else if (
+                            // Void-return bulk-mutation / copy methods (§4.15):
+                            m == "Fill"   || m == "CopyFrom" ||
+                            m == "CopyTo" || m == "Reverse") {
+                            // All return unit; no return type needs to be set.
+                        } else {
+                            // §4.15 / #674: ArraySpan<T>/ReadOnlyArraySpan<T>
+                            // documented surface: Length, IsEmpty, IndexOf,
+                            // Contains, SequenceEqual, Slice, AsReadOnly
+                            // (ArraySpan only), Fill/CopyFrom/CopyTo/Reverse
+                            // (ArraySpan only).  Any other member is an error.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `" + std::string(rcn) + "<T>`; "
+                                "documented surface: Length, IsEmpty, "
+                                "IndexOf(), Contains(), SequenceEqual(), "
+                                "Slice(), AsReadOnly() [ArraySpan only], "
+                                "Fill()/CopyFrom()/CopyTo()/Reverse() "
+                                "[ArraySpan only] (stdlib \xC2\xA7""4.15)");
                         }
                         // Fill/CopyFrom/CopyTo/Reverse → unit (void); no type set.
                     }
@@ -2154,6 +2174,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             weakTy->genericArgs.push_back(
                                 const_cast<TypeRef*>(elemTy));
                             ctx_.setExprType(&ce, weakTy);
+                        } else if (m != "Dispose") {
+                            // §2.16 / #674: Shared<T> exposes only Clone(),
+                            // Get(), Downgrade(), and Dispose().  Any other
+                            // member is an error.  Dispose is compiler-generated
+                            // and must pass silently.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `Shared<T>`; documented surface: "
+                                "Clone(), Get(), Downgrade(), Dispose() "
+                                "(stdlib \xC2\xA7""2.16)");
                         }
                         // Dispose(): unit; no return type set.
                     }
@@ -2189,6 +2220,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 }
                             }
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        } else if (m != "Dispose") {
+                            // §2.16 / #674: Weak<T> exposes only TryUpgrade()
+                            // and Dispose().  Any other member is an error.
+                            // Dispose is compiler-generated and must pass silently.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `Weak<T>`; documented surface: "
+                                "TryUpgrade(out owned s: Shared<T>?), Dispose() "
+                                "(stdlib \xC2\xA7""2.16)");
                         }
                         // Dispose(): unit; no return type set.
                     }
@@ -2291,6 +2332,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         if (m == "Send") {
                             // Send(owned item: T) → void (no return type set = unit).
+                        } else if (m != "Dispose") {
+                            // §6.9 / #674: ChannelSender<T> exposes only Send()
+                            // and Dispose().  Any other member is an error.
+                            // Dispose is compiler-generated and must pass silently.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `ChannelSender<T>`; documented surface: "
+                                "Send(owned item: T), Dispose() "
+                                "(stdlib \xC2\xA7""6.9)");
                         }
                         // Dispose(): unit; no return type set.
                     }
@@ -2332,6 +2383,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "AcquireAsync / TryAcquireAsync require suspension "
                                 "integration with the task runtime and are deferred "
                                 "to a follow-up lane");
+                        } else if (m != "Dispose") {
+                            // §6.2 / #674: Mutex exposes only Acquire(),
+                            // TryAcquire(), AcquireAsync(), TryAcquireAsync(),
+                            // and Dispose().  Any other member is an error.
+                            // Dispose is compiler-generated and must pass silently.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `Mutex`; documented surface: "
+                                "Acquire(), TryAcquire(timeout: TimeSpan), "
+                                "AcquireAsync(), TryAcquireAsync(), Dispose() "
+                                "(stdlib \xC2\xA7""6.2)");
                         }
                         // Dispose(): unit; no return type set.
                     }
@@ -2353,21 +2416,46 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         //  ExprTypecheck_Exprs visitMemberAccess, not here, but
                         //  we guard the method form just in case.)
                     }
-                    if (rcn == "BinarySerializer" && m == "ToBytes") {
-                        static const ast::Type* kOwnedBufNode2 = []() -> ast::Type* {
-                            auto* qn = new ast::QualifiedName;
-                            qn->parts.push_back("OwnedBuffer");
-                            auto* t = new ast::Type;
-                            t->kind = ast::TypeKind::Named;
-                            t->name.reset(qn);
-                            return t;
-                        }();
-                        auto* byTy2 = ctx_.primitiveTypeRef(PrimitiveType::Byte);
-                        auto* obTy2 = ctx_.makeTypeRef();
-                        obTy2->kind  = TypeRef::Kind::Named;
-                        obTy2->astNode = kOwnedBufNode2;
-                        obTy2->genericArgs.push_back(byTy2);
-                        ctx_.setExprType(&ce, obTy2);
+                    if (rcn == "BinarySerializer") {
+                        if (m == "ToBytes") {
+                            static const ast::Type* kOwnedBufNode2 = []() -> ast::Type* {
+                                auto* qn = new ast::QualifiedName;
+                                qn->parts.push_back("OwnedBuffer");
+                                auto* t = new ast::Type;
+                                t->kind = ast::TypeKind::Named;
+                                t->name.reset(qn);
+                                return t;
+                            }();
+                            auto* byTy2 = ctx_.primitiveTypeRef(PrimitiveType::Byte);
+                            auto* obTy2 = ctx_.makeTypeRef();
+                            obTy2->kind  = TypeRef::Kind::Named;
+                            obTy2->astNode = kOwnedBufNode2;
+                            obTy2->genericArgs.push_back(byTy2);
+                            ctx_.setExprType(&ce, obTy2);
+                        } else if (
+                            // ISerializer surface (stdlib §2.14): all return unit.
+                            m == "WriteInt"     || m == "WriteUInt"    ||
+                            m == "WriteFloat"   || m == "WriteDecimal" ||
+                            m == "WriteBool"    || m == "WriteString"  ||
+                            m == "WriteChar"    || m == "WriteNull"    ||
+                            m == "BeginObject"  || m == "WriteFieldName" ||
+                            m == "EndObject"    || m == "BeginArray"   ||
+                            m == "EndArray"     || m == "Dispose") {
+                            // All ISerializer / IDisposable methods return unit;
+                            // no return type needs to be set.
+                        } else {
+                            // §2.15 / #674: BinarySerializer exposes ToBytes()
+                            // plus the full ISerializer surface (stdlib §2.14).
+                            // Any other member name is an error.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `BinarySerializer`; documented surface: "
+                                "ToBytes(), WriteInt/UInt/Float/Decimal/Bool/"
+                                "String/Char/WriteNull(), BeginObject/EndObject(), "
+                                "WriteFieldName(), BeginArray/EndArray(), Dispose() "
+                                "(stdlib \xC2\xA7""2.14" "\xE2\x80\x93" "2.15)");
+                        }
                     }
                 }
 
