@@ -1463,6 +1463,68 @@ void* bz_semaphore_acquire_async(void* sem, void* token, void* oce_vtable);
 void* bz_semaphore_try_acquire_async(void* sem, int64_t timeout_ms,
                                       void* token, void* oce_vtable);
 
+// ---------------------------------------------------------------------------
+// Atomic<T> and AtomicInteger<T> runtime (stdlib §6.4, issue #647)
+//
+// All operations are sequentially consistent (__ATOMIC_SEQ_CST) per §6.4 v0.140.
+// The cell is a heap object (bz_atomic_t*) with a refcounted core and a
+// payload slot whose width is determined by the T restriction:
+//   Atomic<T>:        T in {bool, char, byte, sbyte, short, ushort, int, uint,
+//                           long, ulong, IntPtr, UIntPtr}  (cell width 1–8 bytes).
+//   AtomicInteger<T>: T in {byte, sbyte, short, ushort, int, uint, long, ulong}.
+//
+// cell_size: width of the atomic cell in bytes (1, 2, 4, or 8).
+//   Used for allocation and for routing __atomic_* builtins in the runtime.
+//
+// bz_atomic_new(cell_size, initial) — allocate. initial is zero-extended into
+//   the cell; passed as uint64_t regardless of T width for ABI uniformity.
+// bz_atomic_dispose(ptr)            — idempotent dispose; drops the core ref.
+// bz_atomic_load(ptr, cell_size)    — seq-cst load; returned as uint64_t.
+// bz_atomic_store(ptr, val, cell_size) — seq-cst store; val as uint64_t.
+// bz_atomic_exchange(ptr, val, cell_size) — atomic swap; returns old value.
+// bz_atomic_compare_exchange(ptr, expected, replacement, cell_size)
+//   — strong CAS; returns the observed value (== expected on success,
+//     != expected on failure).
+// bz_atomic_add(ptr, delta, signed_, cell_size, ove_vtable)
+//   — seq-cst fetch_add; returns POST-add value (§6.4).  On arithmetic
+//     overflow raises OverflowException via ove_vtable (§6.1 rule).
+//     signed_: 1 if T is signed (sbyte/short/int/long), 0 if unsigned.
+//
+// AtomicInteger uses the same bz_atomic_t layout; bz_atomic_add covers
+// Add/Increment/Decrement (delta=1/-1 respectively).
+// ---------------------------------------------------------------------------
+
+// Allocate a new Atomic<T> / AtomicInteger<T> cell. cell_size in {1,2,4,8}.
+// initial is passed as uint64_t; only the low cell_size bytes are stored.
+void* bz_atomic_new(int cell_size, uint64_t initial);
+
+// Idempotent dispose. Drops the core ref; last drop frees the object.
+void  bz_atomic_dispose(void* atom);
+
+// Sequentially-consistent load. Returns the value zero-extended to uint64_t.
+uint64_t bz_atomic_load(void* atom, int cell_size);
+
+// Sequentially-consistent store. val is zero-/sign-truncated to cell_size bytes.
+void     bz_atomic_store(void* atom, uint64_t val, int cell_size);
+
+// Atomic exchange: stores val, returns old value (both as uint64_t).
+uint64_t bz_atomic_exchange(void* atom, uint64_t val, int cell_size);
+
+// Strong compare-and-swap.  Returns the observed value before the swap
+// (== expected on success; != expected on failure).
+uint64_t bz_atomic_compare_exchange(void* atom, uint64_t expected,
+                                    uint64_t replacement, int cell_size);
+
+// Atomic fetch-add with overflow check (§6.1 / §6.4).
+// delta: addend (as int64_t — sign matters for signed T, but the raw bits are
+//   the same as uint64_t for twos-complement; callers pass the int64_t bits).
+// signed_: 1 if T is signed, 0 if unsigned.
+// ove_vtable: vtable* for OverflowException; null → no check (should not
+//   happen in a well-typed program but guards against stale IR).
+// Returns the POST-add value (§6.4: "returns post-operation value").
+uint64_t bz_atomic_add(void* atom, int64_t delta, int signed_,
+                       int cell_size, void* ove_vtable);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

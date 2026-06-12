@@ -6969,6 +6969,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* v = tryLowerMutexLockCall(call)) return v;
     // §6.3 / issue #647: Semaphore.Acquire / TryAcquire / AcquireAsync / TryAcquireAsync.
     if (auto* v = tryLowerSemaphoreTokenCall(call)) return v;
+    // §6.4 / issue #647: Atomic<T> / AtomicInteger<T> instance methods.
+    if (auto* v = tryLowerAtomicCall(call)) return v;
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
     if (auto* v = tryLowerBuiltinClassCall(call)) return v;
     // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
@@ -7822,6 +7824,29 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             auto* fn = declareC("bz_semaphore_token_release",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
                             builder_.CreateCall(fn, {tok});
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
+                // §6.4 / issue #647: Atomic<T>.Dispose() and AtomicInteger<T>.Dispose()
+                // — idempotent dispose via bz_atomic_dispose (§28.2 exactly-once rule).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    std::string_view rbn = builtinTypeName(recvTy);
+                    if (rbn == "Atomic" || rbn == "AtomicInteger") {
+                        llvm::Value* atom = lowerExpr(*ma->target);
+                        if (atom && atom->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_atomic_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {atom});
                             if (!checkedDisposal_) {
                                 llvm::Type* slotTy = nullptr;
                                 if (llvm::Value* slot =
@@ -12228,6 +12253,169 @@ llvm::Value* Emitter::tryLowerSemaphoreTokenCall(const ast::CallExpr& call) {
                              ptrTy(), {ptrTy(), i64(), ptrTy(), ptrTy()});
         return builder_.CreateCall(fn,
             {sem, msI64, token, oceVtable}, "sem.tryacq.async");
+    }
+
+    return nullptr;
+}
+
+
+// §6.4 / issue #647: Atomic<T> / AtomicInteger<T> instance methods.
+//
+// Handles:
+//   Exchange(value: T): T      → bz_atomic_exchange(atom, val, cell_size)
+//   CompareExchange(expected: T, replacement: T): T
+//                              → bz_atomic_compare_exchange(atom, exp, rep, cell_size)
+//   Increment(): T             → bz_atomic_add(atom,  1, signed_, cell_size, ove)
+//   Decrement(): T             → bz_atomic_add(atom, -1, signed_, cell_size, ove)
+//   Add(delta: T): T           → bz_atomic_add(atom, delta, signed_, cell_size, ove)
+//
+// The Value property setter `atom.Value := v` is handled in LlvmBackend_Stmts.cpp
+// (tryLowerAtomicValueSet) so it intercepts before the plain lvalue path.
+// The Value getter is handled in LlvmBackend_Exprs.cpp (cn == "Atomic" branch).
+llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
+    // Callee must be a MemberAccessExpr whose target type is Atomic<T> or
+    // AtomicInteger<T>.
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    auto* recvTy = ctx_.exprType(*ma->target);
+    std::string_view rbn = builtinTypeName(recvTy);
+    if (rbn != "Atomic" && rbn != "AtomicInteger") return nullptr;
+
+    const std::string mname(ma->member);
+    llvm::Value* atom = lowerExpr(*ma->target);
+    if (!atom) return nullptr;
+
+    // Helper: compute cell_size from T (genericArgs[0]).
+    auto getCellSize = [&]() -> int {
+        if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+            const sema::TypeRef* tArg = recvTy->genericArgs[0];
+            if (tArg->kind == sema::TypeRef::Kind::Primitive) {
+                using P = sema::PrimitiveType;
+                switch (tArg->primitive) {
+                    case P::Bool: case P::Byte: case P::SByte: return 1;
+                    case P::Short: case P::UShort:             return 2;
+                    case P::Long: case P::ULong:               return 8;
+                    default: return 4;
+                }
+            }
+            return 8;  // IntPtr/UIntPtr
+        }
+        return 4;
+    };
+
+    // Helper: is T a signed type (for overflow detection in bz_atomic_add).
+    auto isSigned = [&]() -> bool {
+        if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+            const sema::TypeRef* tArg = recvTy->genericArgs[0];
+            if (tArg->kind == sema::TypeRef::Kind::Primitive) {
+                using P = sema::PrimitiveType;
+                auto p = tArg->primitive;
+                return (p == P::SByte || p == P::Short ||
+                        p == P::Int   || p == P::Long);
+            }
+        }
+        return true;  // default: int (signed)
+    };
+
+    // Helper: get T's LLVM type for truncation.
+    auto getTTy = [&]() -> llvm::Type* {
+        if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+            if (auto* ty = lowerTypeRef(recvTy->genericArgs[0])) return ty;
+        return i32();
+    };
+
+    // Helper: truncate an i64 result to T's width.
+    auto truncResult = [&](llvm::Value* v64, const char* name) -> llvm::Value* {
+        llvm::Type* tTy = getTTy();
+        if (tTy->isIntegerTy() && !tTy->isIntegerTy(64))
+            return builder_.CreateTrunc(v64, tTy, name);
+        return v64;
+    };
+
+    int cs = getCellSize();
+
+    if (mname == "Exchange" && !call.args.empty() && call.args[0].value) {
+        // Exchange(value: T): T — seq-cst swap, returns old value.
+        llvm::Value* rawVal = lowerExpr(*call.args[0].value);
+        if (!rawVal) return nullptr;
+        // Widen arg to i64.
+        llvm::Value* v64 = rawVal;
+        if (rawVal->getType()->isIntegerTy() && !rawVal->getType()->isIntegerTy(64))
+            v64 = builder_.CreateZExt(rawVal, i64(), "exch.v64");
+        auto* fn = declareC("bz_atomic_exchange", i64(), {ptrTy(), i64(), i32()});
+        llvm::Value* old64 = builder_.CreateCall(
+            fn, {atom, v64, builder_.getInt32(cs)}, "atom.exch");
+        return truncResult(old64, "atom.exch.v");
+    }
+
+    if (mname == "CompareExchange" &&
+        call.args.size() >= 2 && call.args[0].value && call.args[1].value) {
+        // CompareExchange(expected: T, replacement: T): T — strong CAS.
+        llvm::Value* expVal = lowerExpr(*call.args[0].value);
+        llvm::Value* repVal = lowerExpr(*call.args[1].value);
+        if (!expVal || !repVal) return nullptr;
+        auto widen = [&](llvm::Value* v) -> llvm::Value* {
+            if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(64))
+                return builder_.CreateZExt(v, i64());
+            return v;
+        };
+        auto* fn = declareC("bz_atomic_compare_exchange",
+                             i64(), {ptrTy(), i64(), i64(), i32()});
+        llvm::Value* obs64 = builder_.CreateCall(
+            fn, {atom, widen(expVal), widen(repVal), builder_.getInt32(cs)},
+            "atom.cas");
+        return truncResult(obs64, "atom.cas.v");
+    }
+
+    // AtomicInteger<T> arithmetic (§6.4): Increment, Decrement, Add.
+    // bz_atomic_add(atom, delta, signed_, cell_size, ove_vtable) → post-add as i64.
+    if (rbn == "AtomicInteger") {
+        auto getOveVtable = [&]() -> llvm::Value* {
+            auto vit = builtinVtable_.find("OverflowException");
+            if (vit != builtinVtable_.end())
+                return builder_.CreateBitCast(vit->second, ptrTy());
+            return llvm::ConstantPointerNull::get(ptrTy());
+        };
+        auto* addFn = declareC("bz_atomic_add",
+                                i64(), {ptrTy(), i64(), i32(), i32(), ptrTy()});
+        int sg = isSigned() ? 1 : 0;
+
+        if (mname == "Increment" && call.args.empty()) {
+            llvm::Value* res = builder_.CreateCall(
+                addFn,
+                {atom, builder_.getInt64(1), builder_.getInt32(sg),
+                 builder_.getInt32(cs), getOveVtable()},
+                "atom.incr");
+            emitPendingCheck();  // OverflowException from bz_atomic_add
+            return truncResult(res, "atom.incr.v");
+        }
+        if (mname == "Decrement" && call.args.empty()) {
+            llvm::Value* res = builder_.CreateCall(
+                addFn,
+                {atom, builder_.getInt64(-1LL), builder_.getInt32(sg),
+                 builder_.getInt32(cs), getOveVtable()},
+                "atom.decr");
+            emitPendingCheck();
+            return truncResult(res, "atom.decr.v");
+        }
+        if (mname == "Add" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* deltaRaw = lowerExpr(*call.args[0].value);
+            if (!deltaRaw) return nullptr;
+            // Sign-extend to i64 for signed T; zero-extend for unsigned T.
+            llvm::Value* delta64 = deltaRaw;
+            if (deltaRaw->getType()->isIntegerTy() &&
+                !deltaRaw->getType()->isIntegerTy(64)) {
+                delta64 = sg ? builder_.CreateSExt(deltaRaw, i64(), "add.d64")
+                             : builder_.CreateZExt(deltaRaw, i64(), "add.d64");
+            }
+            llvm::Value* res = builder_.CreateCall(
+                addFn,
+                {atom, delta64, builder_.getInt32(sg),
+                 builder_.getInt32(cs), getOveVtable()},
+                "atom.add");
+            emitPendingCheck();
+            return truncResult(res, "atom.add.v");
+        }
     }
 
     return nullptr;

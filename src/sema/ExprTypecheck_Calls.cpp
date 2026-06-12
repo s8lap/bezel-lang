@@ -2497,6 +2497,60 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
+                    // §6.4 / issue #647: Atomic<T> instance methods.
+                    // Receiver TypeRef: Named, no declaration, astNode name "Atomic",
+                    // genericArgs[0] = T (the element type).
+                    // Value is a property — getter handled here as a method-call-like
+                    // case so that `v := atom.Value` works; setter handled in sema
+                    // as a block-setter-absent path (codegen intercepts via lowerExpr).
+                    if ((rcn == "Atomic" || rcn == "AtomicInteger") && recvTy) {
+                        // Helper: get the T TypeRef (genericArgs[0] of the receiver).
+                        auto getElemTy = [&]() -> TypeRef* {
+                            if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                                return const_cast<TypeRef*>(recvTy->genericArgs[0]);
+                            // Fallback: int if T unavailable.
+                            return ctx_.primitiveTypeRef(P::Int);
+                        };
+                        // Exchange(value: T): T — returns the old value.
+                        if (m == "Exchange" && ce.args.size() == 1) {
+                            ctx_.setExprType(&ce, getElemTy());
+                        // CompareExchange(expected: T, replacement: T): T
+                        // — returns the observed value (== expected on success).
+                        } else if (m == "CompareExchange" && ce.args.size() == 2) {
+                            ctx_.setExprType(&ce, getElemTy());
+                        } else if (rcn == "AtomicInteger") {
+                            // AtomicInteger<T>: integer-arithmetic extensions (§6.4).
+                            // Increment(): T — post-increment.
+                            // Decrement(): T — post-decrement.
+                            // Add(delta: T): T — post-add.
+                            if ((m == "Increment" || m == "Decrement") &&
+                                ce.args.empty()) {
+                                ctx_.setExprType(&ce, getElemTy());
+                            } else if (m == "Add" && ce.args.size() == 1) {
+                                ctx_.setExprType(&ce, getElemTy());
+                            } else if (m != "Dispose") {
+                                // §6.4 / #674: unknown method on AtomicInteger.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("no member `") + std::string(m) +
+                                    "` on `AtomicInteger<T>`; documented surface: "
+                                    "Value (get/set), Exchange(T), "
+                                    "CompareExchange(T, T), Increment(), "
+                                    "Decrement(), Add(T), Dispose() "
+                                    "(stdlib \xC2\xA7""6.4)");
+                            }
+                        } else if (m != "Dispose") {
+                            // §6.4 / #674: unknown method on Atomic<T>.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `Atomic<T>`; documented surface: "
+                                "Value (get/set), Exchange(T), "
+                                "CompareExchange(T, T), Dispose() "
+                                "(stdlib \xC2\xA7""6.4)");
+                        }
+                        // Dispose(): unit; no return type set.
+                    }
                     // §9.8 / §2.15 / issue #550: BinarySerializer.ToBytes() →
                     // OwnedBuffer<byte>.  Set on the CallExpr so that inferred-type
                     // locals (`using var bytes := s.ToBytes()`) pick up the element
@@ -4476,6 +4530,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // §6.4 / issue #647: Atomic<T> and AtomicInteger<T> property accesses.
+        // The `Value` property getter returns T (genericArgs[0]).  The ordinary
+        // member-lookup path never finds it (no user TypeDecl for Atomic<T>).
+        if (ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            bool isAtomicLike = tt && tt->kind == TypeRef::Kind::Named &&
+                !tt->declaration && tt->astNode && tt->astNode->name &&
+                !tt->astNode->name->parts.empty() &&
+                (tt->astNode->name->parts[0] == "Atomic" ||
+                 tt->astNode->name->parts[0] == "AtomicInteger");
+            if (isAtomicLike && ma.member == "Value") {
+                TypeRef* elemTy = (!tt->genericArgs.empty() && tt->genericArgs[0])
+                    ? const_cast<TypeRef*>(tt->genericArgs[0])
+                    : ctx_.primitiveTypeRef(PrimitiveType::Int);
+                ctx_.setExprType(&ma, elemTy);
+                return;
+            }
+        }
         // §2.5: DateTime and TimeSpan instance property/method member accesses.
         // These are builtin value types stored as scalar i64; the ordinary
         // member-lookup path never finds their properties.
@@ -5728,6 +5800,13 @@ bool ExprTC::isSendable(const TypeRef* rt,
             if (bname == "Channel" || bname == "ChannelSender")
                 return true;
 
+            // §30.14 / stdlib §6.4 / #647: Atomic<T> and AtomicInteger<T> are
+            // sendable — internally synchronized (all operations seq_cst per §6.4
+            // v0.140); may be reached by multiple domains simultaneously. Ownership
+            // transfers on move. This entry is the compiler-known companion to the
+            // Shared<Atomic<T>> sendability check in the "Shared" branch above.
+            if (bname == "Atomic" || bname == "AtomicInteger")
+                return true;
             // §30.14 / stdlib §6.2 v0.138 / #647: Mutex is sendable —
             // internally synchronized; may be reached by multiple domains
             // simultaneously (like Channel<T>). Ownership transfers on move.

@@ -89,6 +89,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
     if (n == "Channel" || n == "ChannelSender") return 1;
     if (n == "Domain" || n == "ChannelClosedException" ||
         n == "DomainFaultedException") return 0;
+    // §6.4 / issue #647: Atomic<T> (arity 1) and AtomicInteger<T> (arity 1).
+    // Both are generic compiler-intrinsic classes; T is restricted by the compiler
+    // (see ExprTypecheck_Exprs.cpp).
+    if (n == "Atomic" || n == "AtomicInteger") return 1;
     // §6.2 / issue #647: Mutex and Lock — synchronization primitives.
     // Mutex has a public constructor(). Lock has NO public constructor (obtained
     // only from Mutex.Acquire / TryAcquire); both are nullary class types.

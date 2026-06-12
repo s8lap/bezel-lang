@@ -46,6 +46,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // assignment. Checked first so the event target is not treated as
             // an lvalue.
             if (tryLowerEventCompound(*as)) return false;
+            // §6.4 / #647: `atom.Value := v` — seq-cst store into Atomic<T> /
+            // AtomicInteger<T>.  Must come before lowerPropertySet since Atomic<T>
+            // has no user PropertyDecl and the fallthrough would silently drop
+            // the write.
+            if (tryLowerAtomicValueSet(*as)) return false;
             // §22.9: `obj.P := v` / `obj.P OP= v` where P is a block-form
             // property runs its setter body (with `value` = v); compound
             // assignment is a read-modify-write through getter + setter.
@@ -3452,6 +3457,54 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     builder_.CreateBr(endBB);
     builder_.SetInsertPoint(endBB);
     return false;
+}
+
+
+// §6.4 / issue #647: `atom.Value := v` — seq-cst store into Atomic<T> /
+// AtomicInteger<T> via bz_atomic_store(atom, val_as_u64, cell_size).
+// Returns true when handled (so the main assignment dispatcher returns early).
+bool Emitter::tryLowerAtomicValueSet(const ast::AssignmentStmt& as) {
+    if (!as.target || !as.value || as.op != ":=") return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(as.target.get());
+    if (!ma || !ma->target || ma->member != "Value") return false;
+    auto* recvTy = ctx_.exprType(*ma->target);
+    std::string_view rbn = builtinTypeName(recvTy);
+    if (rbn != "Atomic" && rbn != "AtomicInteger") return false;
+
+    // Evaluate the atom pointer and the new value.
+    llvm::Value* atom = lowerExpr(*ma->target);
+    if (!atom) return true;  // handled (to suppress fallthrough to lvalueAddr)
+    llvm::Value* newVal = lowerExpr(*as.value);
+    if (!newVal) return true;
+
+    // Determine cell_size.
+    int cs = 4;
+    if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+        const sema::TypeRef* tArg = recvTy->genericArgs[0];
+        if (tArg->kind == sema::TypeRef::Kind::Primitive) {
+            using P = sema::PrimitiveType;
+            switch (tArg->primitive) {
+                case P::Bool: case P::Byte: case P::SByte: cs = 1; break;
+                case P::Short: case P::UShort: cs = 2; break;
+                case P::Long: case P::ULong:  cs = 8; break;
+                default: cs = 4; break;
+            }
+        } else {
+            cs = 8;  // IntPtr/UIntPtr
+        }
+    }
+
+    // Widen newVal to i64 for bz_atomic_store's uint64_t parameter.
+    llvm::Value* v64 = newVal;
+    if (newVal->getType()->isIntegerTy() && !newVal->getType()->isIntegerTy(64))
+        v64 = builder_.CreateZExt(newVal, i64(), "aset.v64");
+
+    auto* storeFn = declareC("bz_atomic_store",
+                              llvm::Type::getVoidTy(llvm_),
+                              {ptrTy(), i64(), i32()});
+    builder_.CreateCall(storeFn,
+        {atom, v64, builder_.getInt32(cs)});
+    return true;
 }
 
 

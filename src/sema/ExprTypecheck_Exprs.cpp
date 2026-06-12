@@ -898,6 +898,88 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "`semaphore.TryAcquire(timeout)` "
                         "(stdlib \xC2\xA7""6.3, #647)");
                 }
+                // §6.4 / issue #647: `new Atomic<T>(initial)` — T-restriction check.
+                // Atomic<T> requires T to be a cell-sized primitive type per §6.4:
+                // {bool, char, byte, sbyte, short, ushort, int, uint, long, ulong,
+                //  IntPtr, UIntPtr}.  Any other type argument is a compile error.
+                // Verbatim diagnostic from §6.4: "Atomic<T> requires a cell-sized
+                // primitive type; T is not eligible. For floating-point atomics,
+                // use Atomic<int> with a bit-cast; for record-typed atomics, use
+                // a Mutex."
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->astNode->name->parts[0] == "Atomic") {
+                    bool tOk = false;
+                    if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
+                        const TypeRef* ta = rt->genericArgs[0];
+                        if (ta->kind == TypeRef::Kind::Primitive) {
+                            using P = sema::PrimitiveType;
+                            auto p = ta->primitive;
+                            tOk = (p == P::Bool || p == P::Char ||
+                                   p == P::Byte || p == P::SByte ||
+                                   p == P::Short || p == P::UShort ||
+                                   p == P::Int || p == P::UInt ||
+                                   p == P::Long || p == P::ULong);
+                        } else if (ta->kind == TypeRef::Kind::Named &&
+                                   !ta->declaration && ta->astNode &&
+                                   ta->astNode->name &&
+                                   !ta->astNode->name->parts.empty()) {
+                            // IntPtr and UIntPtr are registered as nullary builtin
+                            // Named types (not PrimitiveType); accept them here.
+                            auto& tn = ta->astNode->name->parts[0];
+                            tOk = (tn == "IntPtr" || tn == "UIntPtr");
+                        }
+                    } else {
+                        // No type argument provided — sema will report "wrong arity";
+                        // avoid a second diagnostic.
+                        tOk = true;
+                    }
+                    if (!tOk) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ne->span.begin,
+                            "Atomic<T> requires a cell-sized primitive type; T is "
+                            "not eligible. For floating-point atomics, use "
+                            "Atomic<int> with a bit-cast; for record-typed atomics, "
+                            "use a Mutex. (stdlib \xC2\xA7""6.4, #647)");
+                    }
+                }
+                // §6.4 / issue #647: `new AtomicInteger<T>(initial)` — T-restriction.
+                // AtomicInteger<T> requires T to be a primitive integer type:
+                // {byte, sbyte, short, ushort, int, uint, long, ulong}.
+                // bool, char, IntPtr, UIntPtr are NOT eligible (use Atomic<T>
+                // and CompareExchange directly per §6.4).
+                // Diagnostic NOT verbatim (§6.4 has none for AtomicInteger);
+                // wording mirrors §6.4 §AtomicInteger restriction prose.
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->astNode->name->parts[0] == "AtomicInteger") {
+                    bool tOk = false;
+                    if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
+                        const TypeRef* ta = rt->genericArgs[0];
+                        if (ta->kind == TypeRef::Kind::Primitive) {
+                            using P = sema::PrimitiveType;
+                            auto p = ta->primitive;
+                            tOk = (p == P::Byte || p == P::SByte ||
+                                   p == P::Short || p == P::UShort ||
+                                   p == P::Int || p == P::UInt ||
+                                   p == P::Long || p == P::ULong);
+                        }
+                        // bool, char, IntPtr, UIntPtr are NOT eligible.
+                    } else {
+                        tOk = true;  // arity error reported elsewhere
+                    }
+                    if (!tOk) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ne->span.begin,
+                            "AtomicInteger<T> requires a primitive integer type "
+                            "(byte, sbyte, short, ushort, int, uint, long, ulong); "
+                            "T is not eligible. For bool, char, IntPtr, or UIntPtr "
+                            "atomics, use Atomic<T> and CompareExchange directly. "
+                            "(stdlib \xC2\xA7""6.4, #647)");
+                    }
+                }
                 // §2.15 / issue #631: `new BinaryDeserializer(arg)` requires
                 // `arg` to be a `ReadOnlySpan<byte>` (the result of calling
                 // `.AsReadOnlySpan()` on an `OwnedBuffer<byte>`). Passing the
