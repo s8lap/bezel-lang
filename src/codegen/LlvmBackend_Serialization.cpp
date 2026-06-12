@@ -423,14 +423,14 @@ void Emitter::emitSerializeField(llvm::Value* val,
             break;
         }
         case sema::PrimitiveType::Decimal: {
-            // Decimal: stub — write as double.
-            llvm::Value* d = val;
-            if (!d->getType()->isDoubleTy())
-                d = builder_.CreateBitOrPointerCast(
-                    d, llvm::Type::getDoubleTy(llvm_));
-            auto* fn = declareC("bz_binser_write_float", voidTy,
-                                {ptrTy(), llvm::Type::getDoubleTy(llvm_)});
-            builder_.CreateCall(fn, {serPtr, d});
+            // §2.14 / #665: WriteDecimal — pass the 16-byte {i32×4} struct by
+            // pointer to bz_binser_write_decimal (wire format: 4×u32 LE).
+            // Spill the struct value to an alloca so we can pass its address.
+            llvm::AllocaInst* decSlot = entryAlloca(decimalStructType());
+            builder_.CreateStore(val, decSlot);
+            auto* fn = declareC("bz_binser_write_decimal", voidTy,
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {serPtr, decSlot});
             break;
         }
         case sema::PrimitiveType::String: {
@@ -939,9 +939,29 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
             return builder_.CreateCall(fn, {derPtr}, "deser.dbl");
         }
         case sema::PrimitiveType::Decimal: {
-            auto* fn = declareC("bz_binder_read_float",
-                                llvm::Type::getDoubleTy(llvm_), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.dec");
+            // §2.14 / #665: ReadDecimal — bz_binder_read_decimal returns a
+            // void* (ptr to alloca'd 16-byte struct), load it back to a value.
+            auto* fn = declareC("bz_binder_read_decimal", ptrTy(), {ptrTy()});
+            llvm::Value* decPtr = builder_.CreateCall(fn, {derPtr}, "deser.decptr");
+            // decPtr is a ptr to a 16-byte {i32×4} struct on the runtime stack.
+            // Load the decimal value via the pointer.
+            llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+            {
+                // Load from runtime-returned ptr only if non-null; otherwise
+                // leave the alloca zero-initialised (default(decimal) = 0).
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    decPtr, llvm::ConstantPointerNull::get(ptrTy()), "dec.null");
+                auto* loadBB = llvm::BasicBlock::Create(llvm_, "dec.load", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "dec.end",  currentFn_);
+                builder_.CreateCondBr(isNull, endBB, loadBB);
+                builder_.SetInsertPoint(loadBB);
+                llvm::Value* decVal = builder_.CreateLoad(
+                    decimalStructType(), decPtr, "deser.decv");
+                builder_.CreateStore(decVal, slot);
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+            }
+            return builder_.CreateLoad(decimalStructType(), slot, "deser.dec");
         }
         case sema::PrimitiveType::String: {
             auto* fn = declareC("bz_binder_read_string", ptrTy(), {ptrTy()});
@@ -1816,6 +1836,57 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
             if (ok && args.size() == it->second->arg_size()) {
                 builder_.CreateCall(it->second, args);
                 emitNewPendingCheck(obj);
+                // fix #671 / §4.6 / §28.9: the ctor body stores each string
+                // parameter into its corresponding auto-property field via
+                // lowerStringFieldStore, which RETAINS the value (the param is
+                // not a +1 producer, so a fresh +1 is minted for the field).
+                // bz_binder_read_string returned rc=1; after the ctor's retain
+                // the field holds a +1 reference (rc=2) and the slot's original
+                // reference (rc=1) is the binder's still-live extra.  Release
+                // that binder reference by reading back from the FIELD after the
+                // ctor — so we observe exactly the retained ptr — and calling
+                // bz_string_release once.  The disposer's later release then
+                // correctly brings rc to 0.
+                // Only string components carry a runtime-managed rc; skip all
+                // other value types (int, bool, double, decimal, enum, record).
+                llvm::Type* voidTy2 = llvm::Type::getVoidTy(llvm_);
+                auto* relFn = declareC("bz_string_release", voidTy2, {ptrTy()});
+                for (std::size_t pi = 0; pi < cd->params.size(); ++pi) {
+                    auto cit2 = compByNameLower.find(
+                        toLowerAscii(cd->params[pi].name));
+                    if (cit2 == compByNameLower.end()) continue;
+                    std::size_t ci2 = cit2->second;
+                    if (comps[ci2].isSkip || !slots[ci2]) continue;
+                    if (!comps[ci2].ty) continue;
+                    if (comps[ci2].ty->kind != sema::TypeRef::Kind::Primitive ||
+                        comps[ci2].ty->primitive != sema::PrimitiveType::String)
+                        continue;
+                    // Read the string ptr from the FIELD (not the pre-ctor
+                    // slot) so we observe exactly what the ctor wrote and
+                    // retained.  The field ptr is the same as the slot ptr
+                    // (ctor stores the incoming arg), but reading from the field
+                    // is the canonical post-ctor source of truth.
+                    unsigned fIdx = comps[ci2].fieldIdx;
+                    llvm::Value* fAddr = builder_.CreateStructGEP(
+                        st, obj, fIdx, "cdeser.faddr");
+                    llvm::Value* sp = builder_.CreateLoad(
+                        ptrTy(), fAddr, "cdeser.frel");
+                    // Null-guard (defensive — the ctor should always set the
+                    // field, but if it fails to do so a null release is harmless
+                    // since bz_string_release is null-safe).
+                    llvm::Value* nonNull = builder_.CreateICmpNE(
+                        sp, llvm::ConstantPointerNull::get(ptrTy()),
+                        "cdeser.fnn");
+                    auto* relBB  = llvm::BasicBlock::Create(
+                        llvm_, "cdeser.fstr.rel", currentFn_);
+                    auto* skipBB = llvm::BasicBlock::Create(
+                        llvm_, "cdeser.fstr.skip", currentFn_);
+                    builder_.CreateCondBr(nonNull, relBB, skipBB);
+                    builder_.SetInsertPoint(relBB);
+                    builder_.CreateCall(relFn, {sp});
+                    builder_.CreateBr(skipBB);
+                    builder_.SetInsertPoint(skipBB);
+                }
             }
         }
     }
@@ -2033,6 +2104,19 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 v = builder_.CreateSExtOrTrunc(v, i32(), "wrchar.v");
                 auto* fn = declareC("bz_binser_write_char", voidTy, {ptrTy(), i32()});
                 builder_.CreateCall(fn, {ser, v});
+                return nullptr;
+            }
+            if (methodName == "WriteDecimal" && call.args.size() == 1 && call.args[0].value) {
+                // §2.14 / #665: ISerializer.WriteDecimal — pass the 16-byte decimal
+                // struct by pointer (4×u32 LE wire format).
+                llvm::Value* v = lowerExpr(*call.args[0].value);
+                if (!v) return nullptr;
+                llvm::AllocaInst* decSlot = entryAlloca(decimalStructType());
+                if (v->getType() == decimalStructType())
+                    builder_.CreateStore(v, decSlot);
+                auto* fn = declareC("bz_binser_write_decimal", voidTy,
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ser, decSlot});
                 return nullptr;
             }
             if (methodName == "WriteNull" && call.args.empty()) {
