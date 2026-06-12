@@ -7388,13 +7388,23 @@ void bz_binser_write_float(void* serp, double v) {
     bz_binser_write_le64_impl(static_cast<bz_binser_t*>(serp), bits);
 }
 
-// WriteDecimal: Bezel decimal wire rep is implementation-defined in §2.15;
-// we use 8-byte IEEE 754 LE (same as WriteFloat) for now.
-void bz_binser_write_decimal(void* serp, void* /*val*/) {
-    // val is a Bezel decimal value; we receive it as a double via LLVM ABI.
-    // Treat as 0.0 stub (decimal synthesis deferred).
-    double zero = 0.0;
-    bz_binser_write_float(serp, zero);
+// fix #665 / §2.14 / §9.8: WriteDecimal — wire format is 4×u32 LE (the
+// bz.decimal struct layout: lo32, mid32, hi32, flags — same as .NET Decimal
+// System.Decimal binary representation).  `val` is a ptr to a 16-byte
+// {i32, i32, i32, i32} struct (codegen spills to an alloca, passes address).
+void bz_binser_write_decimal(void* serp, void* val) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (!val) {
+        // Null val (should not happen — codegen always spills): write 16 zero bytes.
+        uint32_t zero = 0;
+        for (int i = 0; i < 4; ++i) bz_binser_write_le32_impl(s, zero);
+        return;
+    }
+    // Read 4 u32 fields from the struct and write them LE.
+    uint32_t fields[4];
+    memcpy(fields, val, sizeof(fields));
+    for (int i = 0; i < 4; ++i)
+        bz_binser_write_le32_impl(s, fields[i]);
 }
 
 void bz_binser_write_bool(void* serp, int8_t v) {
@@ -7677,11 +7687,20 @@ double bz_binder_read_float(void* derp) {
     return v;
 }
 
+// fix #665 / §2.14 / §9.8: ReadDecimal — reads 4×u32 LE (16 bytes) from the
+// wire.  Returns a pointer to a thread-local static 16-byte buffer holding the
+// decoded {lo32, mid32, hi32, flags} struct (the bz.decimal layout).  The
+// caller (codegen) loads the struct from this pointer immediately (no ownership
+// transfer; the buffer is overwritten on the next call).
 void* bz_binder_read_decimal(void* derp) {
-    // Stub: read 8 bytes (to advance position) and return nullptr.
-    uint64_t bits = 0;
-    bz_binder_read_le64_impl(static_cast<bz_binder_t*>(derp), &bits);
-    return nullptr;
+    static thread_local uint32_t dec_buf[4];
+    auto* d = static_cast<bz_binder_t*>(derp);
+    for (int i = 0; i < 4; ++i) {
+        uint32_t v = 0;
+        bz_binder_read_le32_impl(d, &v);
+        dec_buf[i] = v;
+    }
+    return dec_buf;
 }
 
 int8_t bz_binder_read_bool(void* derp) {

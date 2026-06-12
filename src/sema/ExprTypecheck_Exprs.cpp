@@ -246,6 +246,28 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         ctx_.setExprType(&e, rt);
                     }
                 }
+            } else if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
+                // §12.1 / §23: implicit `this.<auto-property>` form: a bare
+                // identifier resolving to a class or record auto-property
+                // (bodyKind == Auto).  The property's declared type gives the
+                // expression type so that downstream checks (isStringExprType,
+                // isStringFieldLvalue, etc.) see the correct type.
+                // Without this, `Name := name` in a ctor body where `Name` is
+                // a string auto-property has exprType=null → lowerStringFieldStore
+                // skips the retain → the ctor stores the string pointer without
+                // incrementing the rc, causing a reference-count imbalance when
+                // the synthesized deserializer attempts to release the binder's
+                // reference after the ctor has "consumed" it via plain store.
+                if (!ps->isIndexer) {
+                    if (auto* pd =
+                            dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                        if (pd->type) {
+                            if (auto* rt = ctx_.resolvedType(*pd->type)) {
+                                ctx_.setExprType(&e, rt);
+                            }
+                        }
+                    }
+                }
             }
             // §12.7: flow narrowing. Inside the controlled block of `if x is T`
             // (or the else of `if x is not T`), a reference to the narrowed
