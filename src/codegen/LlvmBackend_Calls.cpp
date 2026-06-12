@@ -6967,6 +6967,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     if (auto* v = tryLowerChannelAndDomainCall(call)) return v;
     // §6.2 / issue #647: Mutex.Acquire / TryAcquire / AcquireAsync / TryAcquireAsync.
     if (auto* v = tryLowerMutexLockCall(call)) return v;
+    // §6.3 / issue #647: Semaphore.Acquire / TryAcquire / AcquireAsync / TryAcquireAsync.
+    if (auto* v = tryLowerSemaphoreTokenCall(call)) return v;
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
     if (auto* v = tryLowerBuiltinClassCall(call)) return v;
     // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a
@@ -7776,6 +7778,50 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             builder_.CreateCall(fn, {lk});
                             // Null the slot so the using-var scope-exit guard
                             // finds null and skips (§28.2 exactly-once rule).
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
+                // §6.3 / issue #647: Semaphore.Dispose() — marks disposed (idempotent),
+                // drops the Semaphore object's core ref.
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && builtinTypeName(recvTy) == "Semaphore") {
+                        llvm::Value* sem = lowerExpr(*ma->target);
+                        if (sem && sem->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_semaphore_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {sem});
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
+                // §6.3 / issue #647: SemaphoreToken.Dispose() — release the held permit
+                // (idempotent per §28.2: bz_semaphore_token_release handles the flag).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && builtinTypeName(recvTy) == "SemaphoreToken") {
+                        llvm::Value* tok = lowerExpr(*ma->target);
+                        if (tok && tok->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_semaphore_token_release",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {tok});
                             if (!checkedDisposal_) {
                                 llvm::Type* slotTy = nullptr;
                                 if (llvm::Value* slot =
@@ -12092,6 +12138,96 @@ llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
                              ptrTy(), {ptrTy(), i64(), ptrTy(), ptrTy()});
         return builder_.CreateCall(fn,
             {mx, msI64, token, oceVtable}, "mx.tryacq.async");
+    }
+
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// §6.3 / issue #647: Semaphore instance methods.
+//
+//   Acquire()                 → bz_semaphore_acquire(sem)             → ptr (SemaphoreToken)
+//   TryAcquire(timeout: ts)   → bz_semaphore_try_acquire(sem, ms)     → ptr? (SemaphoreToken?)
+//   AcquireAsync(token?)      → bz_semaphore_acquire_async(sem,t,oce) → ptr (OwnedTask<SemaphoreToken>)
+//   TryAcquireAsync(ts,tok?)  → bz_semaphore_try_acquire_async(...)   → ptr (OwnedTask<SemaphoreToken?>)
+//   Dispose()                 → handled in the explicit-Dispose block above.
+//
+// Mirrors tryLowerMutexLockCall exactly, substituting Semaphore/SemaphoreToken
+// for Mutex/Lock and the bz_semaphore_* runtime functions.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::tryLowerSemaphoreTokenCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+
+    const std::string_view mname = ma->member;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || builtinTypeName(recvTy) != "Semaphore") return nullptr;
+
+    llvm::Value* sem = lowerExpr(*ma->target);
+    if (!sem) return nullptr;
+
+    if (mname == "Acquire" && call.args.empty()) {
+        // Acquire(): blocks until a permit is available, returns owned SemaphoreToken.
+        auto* fn = declareC("bz_semaphore_acquire", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {sem}, "sem.acquire");
+    }
+
+    if (mname == "TryAcquire" && call.args.size() == 1 && call.args[0].value) {
+        // TryAcquire(timeout: TimeSpan): owned SemaphoreToken?
+        // Convert TimeSpan to milliseconds (i64) and call bz_semaphore_try_acquire.
+        llvm::Value* tsVal = lowerExpr(*call.args[0].value);
+        if (!tsVal) return nullptr;
+        if (!tsVal->getType()->isIntegerTy(64))
+            tsVal = builder_.CreateSExtOrTrunc(tsVal, i64(), "ts.i64");
+        auto* msFn = declareC("bz_timespan_total_milliseconds",
+                               llvm::Type::getDoubleTy(llvm_), {i64()});
+        llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
+        llvm::Value* msI64 = builder_.CreateFPToSI(msDouble, i64(), "ts.ms.i64");
+        auto* fn = declareC("bz_semaphore_try_acquire", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(fn, {sem, msI64}, "sem.tryacq");
+    }
+
+    // §6.3 / #647 / v0.140: AcquireAsync / TryAcquireAsync.
+    //   AcquireAsync(token?)   → bz_semaphore_acquire_async(sem, token, oce_vtable)
+    //   TryAcquireAsync(ts, token?) → bz_semaphore_try_acquire_async(...)
+    auto getOceVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("OperationCanceledException");
+        if (vit != builtinVtable_.end())
+            return builder_.CreateBitCast(vit->second, ptrTy());
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+    auto getTokenArg = [&](size_t argIdx) -> llvm::Value* {
+        if (argIdx < call.args.size() && call.args[argIdx].value) {
+            llvm::Value* tok = lowerExpr(*call.args[argIdx].value);
+            if (tok) return tok;
+        }
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+
+    if (mname == "AcquireAsync") {
+        llvm::Value* token = getTokenArg(0);
+        llvm::Value* oceVtable = getOceVtable();
+        auto* fn = declareC("bz_semaphore_acquire_async",
+                             ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {sem, token, oceVtable}, "sem.acq.async");
+    }
+
+    if (mname == "TryAcquireAsync" && !call.args.empty() && call.args[0].value) {
+        llvm::Value* tsVal = lowerExpr(*call.args[0].value);
+        if (!tsVal) return nullptr;
+        if (!tsVal->getType()->isIntegerTy(64))
+            tsVal = builder_.CreateSExtOrTrunc(tsVal, i64(), "ts.i64");
+        auto* msFn = declareC("bz_timespan_total_milliseconds",
+                               llvm::Type::getDoubleTy(llvm_), {i64()});
+        llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
+        llvm::Value* msI64 = builder_.CreateFPToSI(msDouble, i64(), "ts.ms.i64");
+        llvm::Value* token = getTokenArg(1);
+        llvm::Value* oceVtable = getOceVtable();
+        auto* fn = declareC("bz_semaphore_try_acquire_async",
+                             ptrTy(), {ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn,
+            {sem, msI64, token, oceVtable}, "sem.tryacq.async");
     }
 
     return nullptr;

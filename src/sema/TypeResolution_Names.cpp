@@ -93,6 +93,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // Mutex has a public constructor(). Lock has NO public constructor (obtained
     // only from Mutex.Acquire / TryAcquire); both are nullary class types.
     if (n == "Mutex" || n == "Lock") return 0;
+    // §6.3 / issue #647: Semaphore and SemaphoreToken — counting semaphore.
+    // Semaphore has constructor(initialCount: int) and constructor(initialCount,
+    // maxCount); SemaphoreToken has NO public constructor (obtained only from
+    // Semaphore.Acquire / TryAcquire); both are nullary class types here.
+    if (n == "Semaphore" || n == "SemaphoreToken") return 0;
     // §3 nullary stdlib classes:
     if (n == "StringBuilder" || n == "Random" ||
         n == "DateTime" || n == "TimeSpan" ||
