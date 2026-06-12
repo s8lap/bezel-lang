@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.138 — June 2026**
+**Companion to the Bezel Language Specification, v0.139 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6740,6 +6740,28 @@ A mutex exists to be reached from multiple domains — it joins `Channel<T>`/`Ch
 
 #### Migration
 None; this only widens acceptance (Mutex was conservatively rejected at Spawn boundaries pending the ruling).
+
+---
+
+### v0.139 changelog (v0.138 → v0.139)
+
+One amendment: **the JSON wire form for graph-identity tokens** (stdlib §2.15). v0.138's JSON
+mapping covered the value tokens but not §9.8's identity operations; the implementation
+truncated output at the first tag (found by the 06-13 verification probe). Now: `"$id": n` as
+a reserved first field at the tagged object's first occurrence; `{"$ref": n}` for
+back-references; `$`-initial field names reserved (a `serialized "$..."` rename is a compile
+error). *Declined: a side-table section* (all identities collected in a separate JSON member)
+— it separates an object from its identity, breaks streaming reads, and has no precedent in
+the §9.8 design, which interleaves tags with the owning-tree walk. The `$id`/`$ref` spelling
+follows the vocabulary §9.8's prose already uses.
+
+#### Touched
+Stdlib §2.15 (JSON-mapping paragraph); rationale (this entry).
+
+#### Migration
+None: graph-mode JSON serialization previously produced truncated output (an implementation
+defect, now also tracked as a compiler issue); tree-mode JSON and all binary forms are
+unchanged.
 
 ---
 
