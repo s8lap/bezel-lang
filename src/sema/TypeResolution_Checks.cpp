@@ -2299,8 +2299,32 @@ void Resolver::checkSerializationEligibility() {
 
             // Check: ineligible polymorphic registered types (§9.8).
             // A registered type that is not serialization-eligible is a compile
-            // error at the registry.
+            // error at the registry.  Also: each registered type must be
+            // assignable to (a subtype of) the declaring base class (§9.8:
+            // "each named type must be assignable to the declaring class").
             const auto& scc = *td->serializedClass;
+            bool polyError = false;
+
+            // BFS subtype predicate: is `sub` a subtype of `base`?
+            // Used to enforce §9.8 assignability.
+            auto isSubtypeOf = [](const TypeSymbol* sub,
+                                  const TypeSymbol* base) -> bool {
+                if (!sub || !base) return false;
+                std::vector<const TypeSymbol*> frontier;
+                frontier.push_back(sub);
+                std::unordered_set<const TypeSymbol*> seen;
+                std::size_t i = 0;
+                while (i < frontier.size()) {
+                    const TypeSymbol* cur = frontier[i++];
+                    if (!seen.insert(cur).second) continue;
+                    if (cur == base) return true;
+                    for (TypeSymbol* b : cur->baseTypes) {
+                        if (b) frontier.push_back(b);
+                    }
+                }
+                return false;
+            };
+
             for (const auto& pc : scc.polyCases) {
                 if (!pc.type) continue;
                 const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
@@ -2315,21 +2339,50 @@ void Resolver::checkSerializationEligibility() {
                         "` has no `serialized tree`/`graph`/`cyclic` clause and "
                         "is not serialization-eligible (§9.8); add a graph-shape "
                         "clause to the registered type");
+                    polyError = true;
+                    continue;
+                }
+                // §9.8: "each named type must be assignable to the declaring class"
+                if (!isSubtypeOf(pcTs, t)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "class `" + std::string(t->name) + "` polymorphic "
+                        "registry: registered type `" + std::string(pcTs->name) +
+                        "` is not a subtype of `" + std::string(t->name) +
+                        "` (§9.8 — each registered type must be assignable to "
+                        "the declaring class)");
+                    polyError = true;
                 }
             }
 
-            // §9.8 tier-boundary (tier 4): polymorphic dispatch is not yet
-            // implemented.  A class with a non-empty polymorphic registry is a
-            // compile error until tier 4 is implemented (issue #550 tier 4).
+            // §9.8: each discriminator must be a unique non-empty string literal
+            // within the clause.
             if (!scc.polyCases.empty()) {
-                ctx_.diagnostics().report(
-                    Severity::Error, t->declLoc,
-                    "class `" + std::string(t->name) + "` uses `polymorphic` "
-                    "registry dispatch (§9.8), which is not yet implemented "
-                    "(issue #550 tier 4); remove the `polymorphic(...)` clause "
-                    "or hand-write `Serialize`/`Deserialize`");
-                continue;
+                std::unordered_set<std::string> seenDiscs;
+                for (const auto& pc : scc.polyCases) {
+                    if (pc.discriminator.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` polymorphic "
+                            "registry: discriminator must be a non-empty string "
+                            "literal (§9.8)");
+                        polyError = true;
+                        continue;
+                    }
+                    std::string disc(pc.discriminator);
+                    if (!seenDiscs.insert(disc).second) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` polymorphic "
+                            "registry: discriminator \"" + disc + "\" is not "
+                            "unique within the clause (§9.8); each discriminator "
+                            "must appear exactly once");
+                        polyError = true;
+                    }
+                }
             }
+
+            if (polyError) continue;   // skip component checks on registry errors
 
             // Check component eligibility for owned/value fields and auto-props.
             std::unordered_set<const TypeSymbol*> visited;
@@ -2503,7 +2556,15 @@ void Resolver::checkSerializationEligibility() {
             // Case-insensitivity: Bezel convention is PascalCase fields and
             // camelCase parameters; `id` and `Id` are treated as the same
             // component name in the synthesized-Deserialize match.
-            if (!hwD2) {
+            //
+            // §9.8 tier-4 exception: a class with a non-empty `polymorphic`
+            // registry is a polymorphic base.  Its synthesized Deserialize is
+            // a pure dispatcher — it reads $type and delegates to the registered
+            // concrete type's Deserialize; it does NOT invoke any constructor on
+            // the base class itself.  Therefore the constructor-matching check
+            // does not apply to the declaring base.  Skip it.
+            if (!scc.polyCases.empty()) { /* skip ctor check for poly base */ }
+            else if (!hwD2) {
                 // Helper: fold to lowercase (ASCII).
                 auto toLower = [](std::string_view sv) {
                     std::string r(sv);

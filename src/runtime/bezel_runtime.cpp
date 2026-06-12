@@ -8127,6 +8127,13 @@ struct bz_binder_t {
     void**   tag_ptrs;
     int8_t*  tag_in_progress;
     int32_t  tag_count;  // slots allocated (capacity = tag_count; grows as needed)
+
+    // §9.8 tier-4: polymorphic dispatch — preread field count.
+    // Set by bz_binder_read_poly_discriminator after consuming the `$type` field;
+    // the next bz_binder_begin_object call returns this value instead of reading
+    // from the stream (the opening '{' and `$type` field have already been consumed).
+    // For JSON: json_obj_preread is also set to 1 alongside this.
+    int32_t  poly_preread_count;  // 0 = not set; >0 = preread field count
 };
 
 static int bz_binder_read_byte_impl(bz_binder_t* d, uint8_t* out) {
@@ -8840,6 +8847,22 @@ static int32_t bz_jder_count_object_fields(bz_binder_t* d) {
 
 int32_t bz_binder_begin_object(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
+
+    // §9.8 tier-4 polymorphic: poly_preread_count is set by
+    // bz_binder_read_poly_discriminator after consuming '{' and the "$type"
+    // field.  Use it directly without reading the stream again.
+    if (d->poly_preread_count > 0) {
+        int32_t n = d->poly_preread_count;
+        d->poly_preread_count = 0;
+        d->in_object = true;
+        // For JSON: json_obj_preread is already set to 1 by
+        // bz_binder_read_poly_discriminator ('{' already consumed).
+        if (d->kind >= 1) {
+            d->json_obj_preread = 0;  // already cleared (we return n directly)
+        }
+        return n;
+    }
+
     if (d->kind >= 1) {
         // §2.15: for JSON we pre-count fields so the synthesized for-loop runs
         // the right number of times.  The loop is: idx in [0, fieldCount), and
@@ -9178,6 +9201,155 @@ void* bz_binder_graph_resolve_tag(void* derp, int32_t tag_id) {
     if (tag_id > d->tag_count)     return nullptr;  // not yet registered
     if (d->tag_in_progress[tag_id - 1]) return nullptr;  // cycle
     return d->tag_ptrs[tag_id - 1];
+}
+
+// §9.8 tier-4: polymorphic-dispatch deserialization entry point.
+//
+// Reads the opening object and the "$type" discriminator field, then sets up
+// state so the concrete type's synthesized Deserialize (which calls
+// bz_binder_begin_object) reads the REMAINING fields without re-consuming
+// the object header.
+//
+// Binary: reads LE32(field_count), reads field-name ("$type"), reads discriminator
+//         string.  Sets poly_preread_count = field_count - 1 so the concrete's
+//         bz_binder_begin_object returns field_count - 1.
+//
+// JSON:   reads '{', pre-counts fields (N), reads "$type":value, sets
+//         poly_preread_count = N - 1 so the concrete's bz_binder_begin_object
+//         returns N - 1 without re-reading '{' (json_obj_preread is NOT set since
+//         poly_preread_count is the primary gate).
+//
+// Returns: a newly-allocated bz_string* (rc=1) holding the discriminator value.
+//          The caller must bz_string_release it.  Returns nullptr and throws
+//          SerializationException if the first field is not "$type" or input
+//          is truncated.
+//
+// After this call, invoke the concrete type's synthesized Deserialize(d) as
+// usual; its bz_binder_begin_object will consume poly_preread_count and return
+// the pre-set value (without reading another object header from the stream).
+// The concrete's bz_binder_end_object closes the same outer object.
+void* bz_binder_read_poly_discriminator(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+
+    if (d->kind >= 1) {
+        // JSON path.
+        // §9.8 / §2.15 v0.139: when the graph-identity marker reader already consumed
+        // '{' and "$id":n (setting json_obj_preread=1), we must NOT read '{' again.
+        // Clear the preread flag and continue reading the next field ("$type").
+        bool preread = (d->json_obj_preread != 0);
+        if (preread) {
+            d->json_obj_preread = 0;  // consumed
+            d->in_object = true;
+        } else {
+            bz_jder_skip_ws(d);
+            if (d->pos >= d->len || d->data[d->pos] != '{') {
+                bz_ser_throw("Polymorphic deserialize: expected '{' (§9.8)", nullptr);
+                return nullptr;
+            }
+            ++d->pos;  // consume '{'
+            d->in_object = true;
+        }
+
+        // Pre-count the remaining fields (from current position).
+        int32_t total_count = bz_jder_count_object_fields(d);
+        if (total_count <= 0) {
+            bz_ser_throw("Polymorphic deserialize: empty object, missing \"$type\" field (§9.8)",
+                         nullptr);
+            return nullptr;
+        }
+
+        // Read the first field name — must be "$type".
+        bz_jder_skip_ws(d);
+        // Skip optional comma before the first field in preread mode (there should
+        // not be one at the first field, but handle defensively).
+        if (d->pos < d->len && d->data[d->pos] == ',') ++d->pos;
+        bz_jder_skip_ws(d);
+        // Check for '}' (empty object).
+        if (d->pos >= d->len || d->data[d->pos] == '}') {
+            bz_ser_throw("Polymorphic deserialize: missing \"$type\" field (§9.8)", nullptr);
+            return nullptr;
+        }
+        // Parse the key (without allocating: just verify it's "$type").
+        if (d->data[d->pos] != '"') {
+            bz_ser_throw("Polymorphic deserialize: expected '\"' for field name (§9.8)", nullptr);
+            return nullptr;
+        }
+        ++d->pos;  // skip opening '"'
+        const int64_t kStart = d->pos;
+        while (d->pos < d->len && d->data[d->pos] != '"') ++d->pos;
+        const int64_t kLen = d->pos - kStart;
+        if (d->pos < d->len) ++d->pos;  // skip closing '"'
+        // Verify key is "$type".
+        bool isTypeKey = (kLen == 5 &&
+                          d->data[kStart+0] == '$' &&
+                          d->data[kStart+1] == 't' &&
+                          d->data[kStart+2] == 'y' &&
+                          d->data[kStart+3] == 'p' &&
+                          d->data[kStart+4] == 'e');
+        if (!isTypeKey) {
+            bz_ser_throw("Polymorphic deserialize: first field must be \"$type\" (§9.8)", nullptr);
+            return nullptr;
+        }
+        // Skip ':'.
+        if (!bz_jder_expect_char(d, ':')) {
+            bz_ser_throw("Polymorphic deserialize: expected ':' after \"$type\" (§9.8)", nullptr);
+            return nullptr;
+        }
+        // Read the discriminator string value.
+        void* disc = bz_jder_parse_string(d);
+        if (!disc) {
+            bz_ser_throw("Polymorphic deserialize: failed to read \"$type\" value (§9.8)", nullptr);
+            return nullptr;
+        }
+        // Skip optional ',' after "$type" value.
+        bz_jder_skip_ws(d);
+        if (d->pos < d->len && d->data[d->pos] == ',') ++d->pos;
+
+        // Set preread_count so concrete's begin_object returns total_count-1.
+        d->poly_preread_count = total_count - 1;
+        // Note: do NOT set json_obj_preread here — poly_preread_count gates the
+        // begin_object path directly without going through the JSON preread path.
+        return disc;
+    }
+
+    // Binary path.
+    uint32_t field_count = 0;
+    if (!bz_binder_read_le32_impl(d, &field_count)) {
+        bz_ser_throw("Polymorphic deserialize: truncated binary object header (§9.8)", nullptr);
+        return nullptr;
+    }
+    if (field_count == 0) {
+        bz_ser_throw("Polymorphic deserialize: empty object, missing \"$type\" field (§9.8)", nullptr);
+        return nullptr;
+    }
+    // Read field name (should be "$type").
+    void* keyStr = bz_binder_read_bz_string(d);
+    if (!keyStr) {
+        bz_ser_throw("Polymorphic deserialize: missing field name (§9.8)", nullptr);
+        return nullptr;
+    }
+    // Verify key is "$type" (length 5, ASCII).
+    const auto* kbz = static_cast<const bz_string_struct*>(keyStr);
+    bool isTypeKey = (kbz->len == 5 && kbz->width == 1);
+    if (isTypeKey) {
+        const uint8_t* kd = static_cast<const uint8_t*>(kbz->data);
+        isTypeKey = (kd[0]=='$' && kd[1]=='t' && kd[2]=='y' && kd[3]=='p' && kd[4]=='e');
+    }
+    bz_string_release(keyStr);
+    if (!isTypeKey) {
+        bz_ser_throw("Polymorphic deserialize: first binary field must be \"$type\" (§9.8)", nullptr);
+        return nullptr;
+    }
+    // Read discriminator string value.
+    void* disc = bz_binder_read_bz_string(d);
+    if (!disc) {
+        bz_ser_throw("Polymorphic deserialize: failed to read \"$type\" binary value (§9.8)", nullptr);
+        return nullptr;
+    }
+    // Set preread_count so concrete's begin_object returns field_count-1.
+    d->poly_preread_count = (int32_t)(field_count - 1);
+    d->in_object = true;
+    return disc;
 }
 
 // §2.15 / §9.8: the SerializationException vtable pointer registered by the

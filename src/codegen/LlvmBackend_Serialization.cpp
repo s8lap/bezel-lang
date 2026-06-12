@@ -468,11 +468,17 @@ void Emitter::emitSerializeField(llvm::Value* val,
         }
 
         if (fieldTs->kind == ast::TypeDeclKind::Class) {
-            // §9.8 tier 2: owned class-typed component.
+            // §9.8 tier 2/tier 4: owned class-typed component.
             // `val` is a ptr to the class instance.
             auto* td = dynamic_cast<const ast::TypeDecl*>(fieldTs->decl);
             if (td && td->serializedClass) {
-                emitClassSerialize(fieldTs, val, serPtr);
+                // §9.8 tier 4: if the class has a polymorphic registry, use
+                // polymorphic dispatch (emitPolyClassSerialize) which reads the
+                // dynamic type from the vtable and writes "$type" + concrete body.
+                if (!td->serializedClass->polyCases.empty())
+                    emitPolyClassSerialize(fieldTs, val, serPtr);
+                else
+                    emitClassSerialize(fieldTs, val, serPtr);
                 return;
             }
         }
@@ -995,10 +1001,13 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
             return emitRecordDeserialize(fieldTs, derPtr);
 
         if (fieldTs->kind == ast::TypeDeclKind::Class) {
-            // §9.8 tier 2: deserialize a class-typed component.
+            // §9.8 tier 2/tier 4: deserialize a class-typed component.
             // Returns an owned ptr.
             auto* td = dynamic_cast<const ast::TypeDecl*>(fieldTs->decl);
             if (td && td->serializedClass) {
+                // §9.8 tier 4: polymorphic base — dispatch via "$type" discriminator.
+                if (!td->serializedClass->polyCases.empty())
+                    return emitPolyClassDeserialize(fieldTs, derPtr);
                 return emitClassDeserialize(fieldTs, derPtr);
             }
         }
@@ -1103,7 +1112,223 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
 }
 
 // ---------------------------------------------------------------------------
-// Emitter::emitClassSerialize  §9.8 tier 2 + tier 3
+// Emitter::emitPolyClassSerialize  §9.8 tier 4
+//
+// Polymorphic Serialize dispatch for a base class with a `polymorphic(...)` registry.
+// `objPtr` is a ptr to the actual (concrete) class instance stored at the base
+// class's static type.  Reads the vtable type-descriptor at vptr[0] to identify
+// the concrete type, then writes "$type" + concrete fields for the matching case.
+// An unregistered dynamic type raises SerializationException (§9.8: "closed set
+// enforced on both directions").
+// ---------------------------------------------------------------------------
+void Emitter::emitPolyClassSerialize(const TypeSymbol* baseTs,
+                                     llvm::Value* objPtr,
+                                     llvm::Value* serPtr) {
+    if (!baseTs || !baseTs->decl) return;
+    const auto* baseTd = dynamic_cast<const ast::TypeDecl*>(baseTs->decl);
+    if (!baseTd || !baseTd->serializedClass) return;
+    const auto& polyCases = baseTd->serializedClass->polyCases;
+    if (polyCases.empty()) {
+        // No poly cases: just serialize the base type directly (degenerate case).
+        emitClassSerialize(baseTs, objPtr, serPtr);
+        return;
+    }
+
+    // Load vptr = *objPtr (vtable pointer at offset 0 of class layout).
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), objPtr, "poly.ser.vptr");
+    // Load td = vptr[0] (type descriptor at vtable slot 0).
+    llvm::Value* td = builder_.CreateLoad(
+        ptrTy(),
+        builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(0)}),
+        "poly.ser.td");
+
+    // Create end block and (fallthrough) throw block.
+    auto* throwBB = llvm::BasicBlock::Create(llvm_, "poly.ser.throw", currentFn_);
+    auto* endBB   = llvm::BasicBlock::Create(llvm_, "poly.ser.end",   currentFn_);
+
+    for (const auto& pc : polyCases) {
+        if (!pc.type) continue;
+        const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
+        if (!pcTr || !pcTr->declaration) continue;
+        const TypeSymbol* pcTs = pcTr->declaration;
+        auto* pcTd = dynamic_cast<const ast::TypeDecl*>(pcTs->decl);
+        if (!pcTd || !pcTd->serializedClass) continue;
+
+        // Find the concrete type's descriptor in descArray_.
+        auto descIt = descArray_.find(pcTs);
+        if (descIt == descArray_.end()) continue;
+        llvm::Value* concDesc = llvm::cast<llvm::Value>(descIt->second);
+
+        // Compare td with the concrete type's descriptor.
+        llvm::Value* isMatch = builder_.CreateICmpEQ(td, concDesc, "poly.ser.match");
+        auto* matchBB = llvm::BasicBlock::Create(llvm_, "poly.ser.case", currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "poly.ser.next", currentFn_);
+        builder_.CreateCondBr(isMatch, matchBB, nextBB);
+
+        // Matching branch: serialize the concrete type with $type discriminator.
+        builder_.SetInsertPoint(matchBB);
+        emitClassSerialize(pcTs, objPtr, serPtr, pc.discriminator);
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(nextBB);
+    }
+
+    // No match: raise SerializationException (unregistered dynamic type, §9.8).
+    // Per §9.8: "A run-time type not present in the registry is a
+    // SerializationException at serialization."
+    // Use emitThrowBuiltin which stores the exception and unwinds (unlike
+    // bz_ser_throw which only sets bz_exc and returns, requiring a separate
+    // emitPendingCheck to propagate it).
+    builder_.CreateBr(throwBB);
+    builder_.SetInsertPoint(throwBB);
+    emitThrowBuiltin("SerializationException");
+    // emitThrowBuiltin branches to unwindBB(); add unreachable fallback.
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateUnreachable();
+
+    builder_.SetInsertPoint(endBB);
+}
+
+// ---------------------------------------------------------------------------
+// Emitter::emitPolyClassDeserialize  §9.8 tier 4
+//
+// Polymorphic Deserialize dispatch for a base class with a `polymorphic(...)`
+// registry.  Reads the "$type" discriminator via bz_binder_read_poly_discriminator,
+// compares against registered discriminators, and dispatches to the matching
+// concrete type's emitClassDeserialize.
+// An unknown discriminator raises SerializationException (§9.8: "closed set").
+// Returns an owned ptr typed as the base class (ptr to concrete instance).
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::emitPolyClassDeserialize(const TypeSymbol* baseTs,
+                                               llvm::Value* derPtr) {
+    if (!baseTs || !baseTs->decl)
+        return llvm::ConstantPointerNull::get(ptrTy());
+    const auto* baseTd = dynamic_cast<const ast::TypeDecl*>(baseTs->decl);
+    if (!baseTd || !baseTd->serializedClass)
+        return llvm::ConstantPointerNull::get(ptrTy());
+    const auto& polyCases = baseTd->serializedClass->polyCases;
+    if (polyCases.empty())
+        return emitClassDeserialize(baseTs, derPtr);
+
+    llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
+
+    // Read the "$type" discriminator; sets up poly_preread_count for the concrete
+    // type's begin_object.  Returns bz_string* discriminator (rc=1).
+    auto* readDiscFn = declareC("bz_binder_read_poly_discriminator", ptrTy(),
+                                 {ptrTy()});
+    llvm::Value* discPtr = builder_.CreateCall(readDiscFn, {derPtr}, "poly.disc");
+    emitPendingCheck();
+
+    // Null discriminator → truncated input (SerializationException from bz_binder_read_poly_discriminator).
+    {
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            discPtr, llvm::ConstantPointerNull::get(ptrTy()), "poly.disc.null");
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "poly.disc.null", currentFn_);
+        auto* liveDiscBB = llvm::BasicBlock::Create(llvm_, "poly.disc.live", currentFn_);
+        builder_.CreateCondBr(isNull, nullBB, liveDiscBB);
+        builder_.SetInsertPoint(nullBB);
+        emitThrowBuiltin("SerializationException");
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateUnreachable();
+        builder_.SetInsertPoint(liveDiscBB);
+    }
+
+    // Register discriminator string for cleanup if something throws.
+    // We release it at the end of this function.
+    llvm::AllocaInst* discSlot = entryAlloca(ptrTy());
+    {
+        llvm::BasicBlock& eb = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> eb_b(&eb, std::next(discSlot->getIterator()));
+        eb_b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), discSlot);
+    }
+    builder_.CreateStore(discPtr, discSlot);
+    if (!disposeStack_.empty()) {
+        Disposal nd{discSlot, nullptr};
+        nd.stringRelease = true;
+        disposeStack_.back().push_back(nd);
+    }
+
+    // Allocate a slot for the result ptr.
+    llvm::AllocaInst* resultSlot = entryAlloca(ptrTy());
+    {
+        llvm::BasicBlock& eb = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> eb_b(&eb, std::next(resultSlot->getIterator()));
+        eb_b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), resultSlot);
+    }
+
+    auto* endBB   = llvm::BasicBlock::Create(llvm_, "poly.deser.end",   currentFn_);
+    auto* throwBB = llvm::BasicBlock::Create(llvm_, "poly.deser.throw", currentFn_);
+
+    // Build comparison function for disc strings.
+    auto* cmpFn = declareC("bz_string_compare", i32(),
+                           {ptrTy(), i64(), ptrTy(), i64(), i32()});
+    auto* strTy = stringType();
+
+    llvm::Value* discData = builder_.CreateLoad(ptrTy(),
+        builder_.CreateStructGEP(strTy, discPtr, 0), "poly.disc.data");
+    llvm::Value* discLen  = builder_.CreateLoad(i64(),
+        builder_.CreateStructGEP(strTy, discPtr, 1), "poly.disc.len");
+
+    for (const auto& pc : polyCases) {
+        if (!pc.type) continue;
+        const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
+        if (!pcTr || !pcTr->declaration) continue;
+        const TypeSymbol* pcTs = pcTr->declaration;
+        auto* pcTd = dynamic_cast<const ast::TypeDecl*>(pcTs->decl);
+        if (!pcTd || !pcTd->serializedClass) continue;
+
+        // Compare discriminator string with this case's literal.
+        llvm::Value* litStr = lowerStringLiteral(
+            "\"" + std::string(pc.discriminator) + "\"", false);
+        llvm::Value* litData = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(strTy, litStr, 0), "poly.lit.data");
+        llvm::Value* litLen  = builder_.CreateLoad(i64(),
+            builder_.CreateStructGEP(strTy, litStr, 1), "poly.lit.len");
+        llvm::Value* cmpRes = builder_.CreateCall(cmpFn,
+            {discData, discLen, litData, litLen, builder_.getInt32(0)}, "poly.cmp");
+        llvm::Value* isMatch = builder_.CreateICmpEQ(cmpRes, builder_.getInt32(0), "poly.match");
+
+        auto* matchBB = llvm::BasicBlock::Create(llvm_, "poly.deser.case", currentFn_);
+        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "poly.deser.next", currentFn_);
+        builder_.CreateCondBr(isMatch, matchBB, nextBB);
+
+        builder_.SetInsertPoint(matchBB);
+        {
+            // Release the discriminator string before dispatching to concrete
+            // (concrete's deserialize may throw; the discSlot cleanup handles it).
+            auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
+            builder_.CreateCall(relFn, {discPtr});
+            // Null the slot so cleanup doesn't double-release.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), discSlot);
+
+            // Deserialize the concrete type (reads remaining fields + end_object).
+            llvm::Value* concretePtr = emitClassDeserialize(pcTs, derPtr);
+            builder_.CreateStore(concretePtr, resultSlot);
+        }
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(nextBB);
+    }
+
+    // No match: unknown discriminator → SerializationException (§9.8).
+    builder_.CreateBr(throwBB);
+    builder_.SetInsertPoint(throwBB);
+    {
+        // Release discriminator before throwing.
+        auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
+        builder_.CreateCall(relFn, {discPtr});
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), discSlot);
+        emitThrowBuiltin("SerializationException");
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateUnreachable();
+    }
+
+    builder_.SetInsertPoint(endBB);
+    return builder_.CreateLoad(ptrTy(), resultSlot, "poly.result");
+}
+
+// ---------------------------------------------------------------------------
+// Emitter::emitClassSerialize  §9.8 tier 2 + tier 3 + tier 4
 //
 // Synthesized Serialize body for a `serialized tree`/`graph`/`cyclic` class.
 // `objPtr` is an opaque ptr to the class instance (ptr to classStruct).
@@ -1115,10 +1340,16 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
 // identity-tag table in the serializer.  For back-edge (non-owned class-typed)
 // components, writes BZ_SER_REF (0x02) + LE32 tag_id referencing the existing
 // tag of the borrowed object.
+//
+// §9.8 tier 4 (polymorphic): when `polyDiscriminator` is non-empty, the "$type"
+// field (with `polyDiscriminator` as value) is written as the first field in the
+// serialized object.  The BeginObject field count is incremented by 1 accordingly.
+// This is called per dispatch branch from emitPolyClassSerialize.
 // ---------------------------------------------------------------------------
 void Emitter::emitClassSerialize(const TypeSymbol* ts,
                                  llvm::Value* objPtr,
-                                 llvm::Value* serPtr) {
+                                 llvm::Value* serPtr,
+                                 std::string_view polyDiscriminator) {
     if (!ts || !ts->decl) return;
 
     // Detect graph mode: true for `serialized graph` and `serialized cyclic`.
@@ -1185,7 +1416,10 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
     }
 
     // Compute the dynamic field count.
-    llvm::Value* dynCount = builder_.getInt32((int32_t)staticCount);
+    // §9.8 tier 4: when polyDiscriminator is non-empty, add 1 for the leading
+    // "$type" field written before all component fields.
+    int32_t polyOffset = polyDiscriminator.empty() ? 0 : 1;
+    llvm::Value* dynCount = builder_.getInt32((int32_t)staticCount + polyOffset);
     for (const auto& oi : optInfos) {
         llvm::Value* inc = builder_.CreateZExt(oi.isNonNull, i32(), "cser.inc");
         dynCount = builder_.CreateAdd(dynCount, inc, "cser.cnt");
@@ -1197,6 +1431,21 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
     // §2.15 / fix #687: bz_binser_begin_object can now set bz_exc (MaxDepth guard).
     // Check for pending exception so a try/catch SerializationException can catch it.
     emitPendingCheck();
+
+    // §9.8 tier 4: write "$type" discriminator field as the leading field.
+    // Per §9.8: "the discriminator field name is '$type', reserved within an object
+    // written for a polymorphic base; it precedes all component fields."
+    if (!polyDiscriminator.empty()) {
+        auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
+                                     {ptrTy(), ptrTy()});
+        auto* writeStrFn  = declareC("bz_binser_write_string", voidTy,
+                                     {ptrTy(), ptrTy()});
+        llvm::Value* typeFieldName = lowerStringLiteral("\"$type\"", false);
+        builder_.CreateCall(writeNameFn, {serPtr, typeFieldName});
+        llvm::Value* discStr = lowerStringLiteral(
+            "\"" + std::string(polyDiscriminator) + "\"", false);
+        builder_.CreateCall(writeStrFn, {serPtr, discStr});
+    }
 
     // Map optional comp index to its isNonNull flag for the write-gate check.
     std::unordered_map<std::size_t, llvm::Value*> optNonNullMap;
@@ -1675,8 +1924,15 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 auto* markFn = declareC("bz_binder_graph_mark_in_progress",
                                         voidTy, {ptrTy(), i32()});
                 builder_.CreateCall(markFn, {derPtr, tagId});
-                // Deserialize the inline object body.
-                llvm::Value* childPtr = emitClassDeserialize(comp.ty->declaration, derPtr);
+                // §9.8 tier 4: deserialize the inline object body; if the component
+                // type has a polymorphic registry, dispatch via "$type" discriminator.
+                const TypeSymbol* compTs = comp.ty->declaration;
+                auto* compTd = dynamic_cast<const ast::TypeDecl*>(compTs->decl);
+                llvm::Value* childPtr =
+                    (compTd && compTd->serializedClass &&
+                     !compTd->serializedClass->polyCases.empty())
+                    ? emitPolyClassDeserialize(compTs, derPtr)
+                    : emitClassDeserialize(compTs, derPtr);
                 // Register the constructed object with the tag.
                 auto* regFn = declareC("bz_binder_graph_register_tag",
                                        voidTy, {ptrTy(), i32(), ptrTy()});
@@ -2315,7 +2571,13 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                     emitEnumSerialize(ts, recv, serArg);
                 } else {
                     // Class: recv is a ptr to the class instance.
-                    emitClassSerialize(ts, recv, serArg);
+                    // §9.8 tier 4: polymorphic base → poly dispatch.
+                    auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+                    if (td && td->serializedClass &&
+                        !td->serializedClass->polyCases.empty())
+                        emitPolyClassSerialize(ts, recv, serArg);
+                    else
+                        emitClassSerialize(ts, recv, serArg);
                 }
                 return nullptr;  // void method
             }
@@ -2347,6 +2609,9 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                     if (!td || !td->serializedClass) return nullptr;
                     llvm::Value* derArg = lowerExpr(*call.args[0].value);
                     if (!derArg) return nullptr;
+                    // §9.8 tier 4: polymorphic base → poly dispatch.
+                    if (!td->serializedClass->polyCases.empty())
+                        return emitPolyClassDeserialize(ts, derArg);
                     return emitClassDeserialize(ts, derArg);
                 }
             }

@@ -1695,14 +1695,33 @@ private:
                                      llvm::Value* derPtr);
 
     // §9.8 tier 2 — class synthesis (tree shape).
-    // Emit the Serialize body for a `serialized tree` class object pointer.
+    // Emit the Serialize body for a `serialized tree`/`graph`/`cyclic` class.
+    // `polyDiscriminator`: when non-empty, adds a leading "$type" field with
+    // this value to the serialized object — used by polymorphic dispatch (§9.8
+    // tier 4) when the concrete type is known statically at each dispatch branch.
     void emitClassSerialize(const sema::TypeSymbol* ts,
                             llvm::Value* objPtr,
-                            llvm::Value* serPtr);
-    // Emit the Deserialize body for a `serialized tree` class.
+                            llvm::Value* serPtr,
+                            std::string_view polyDiscriminator = {});
+    // Emit the Deserialize body for a `serialized tree`/`graph`/`cyclic` class.
     // Returns an owned heap pointer (ptr) to the newly constructed instance.
     llvm::Value* emitClassDeserialize(const sema::TypeSymbol* ts,
                                       llvm::Value* derPtr);
+
+    // §9.8 tier 4 — polymorphic registry dispatch synthesis.
+    // Emits runtime type dispatch for a `serialized * polymorphic(...)` base class:
+    //   Serialize:   reads vtable type-descriptor, compares against each registered
+    //                concrete type, writes "$type" + body for the match; raises
+    //                SerializationException for an unregistered dynamic type.
+    //   Deserialize: reads "$type" discriminator via bz_binder_read_poly_discriminator,
+    //                compares against each registered discriminator string, dispatches
+    //                to that type's emitClassDeserialize; raises SerializationException
+    //                for an unknown discriminator.
+    void emitPolyClassSerialize(const sema::TypeSymbol* baseTs,
+                                llvm::Value* objPtr,
+                                llvm::Value* serPtr);
+    llvm::Value* emitPolyClassDeserialize(const sema::TypeSymbol* baseTs,
+                                          llvm::Value* derPtr);
 
     // The resolved sema TypeRef of a record field's declared type (positional
     // Param or body FieldDecl). Null if it cannot be determined.

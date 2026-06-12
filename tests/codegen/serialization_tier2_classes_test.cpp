@@ -787,58 +787,99 @@ BEZEL_TEST(codegen_serialization_t2_classes,
 // §9.8 `polymorphic`: Circle registered as "circle" — serialize a Circle,
 // deserialize as Shape, verify discriminator dispatch selected Circle.
 //
-// TIER BOUNDARY (tier 4): polymorphic registry dispatch is not yet implemented
-// (issue #550 tier 4 — requires $type field injection in Serialize and
-// discriminator-keyed deserialization in Deserialize). A class declaring a
-// `polymorphic(...)` registry currently produces a compile error at the
-// conformance declaration (§9.8) rather than generating working round-trip code.
-// When tier 4 is implemented, this test should be changed to verify the actual
-// discriminator-dispatched round-trip.
+// §9.8: "When writing a component whose static type is a polymorphic base, the
+// synthesized serializer writes the discriminator of the value's concrete
+// run-time type as a distinguished leading field ($type)."
+// "The deserializer looks the discriminator up in the registry, selects the
+// concrete type's synthesized Deserialize, and delegates the remainder of the
+// object to it (returning owned Base)."
+//
+// Wire: $type="circle" precedes Radius in the binary stream.
+// After deserializing as Shape, Kind() returns 1 (Circle's override).
+// Result: 42 if dispatch selected Circle, 91 if wrong type, -999 on compile fail.
 BEZEL_TEST(codegen_serialization_t2_classes,
            polymorphic_dispatch_circle_roundtrip_spec_9_8) {
-    // §9.8 tier-boundary: polymorphic dispatch is not yet supported
-    // (issue #550 tier 4). The compiler emits a clean diagnostic.
-    BEZEL_EXPECT_TRUE(compileFails(
+    // §9.8 tier 4: polymorphic discriminator dispatch — Circle branch.
+    // Shape is `abstract` (no discriminator for itself). Circle and Square
+    // each inherit from Shape and carry their own `serialized tree` clause.
+    // A Container with an owned Shape field is used to trigger the polymorphic
+    // serialization path (the Shape-typed field triggers emitPolyClassSerialize
+    // and emitPolyClassDeserialize).
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Circle serialized tree : ISerializable, IDeserializable "
-        "  public property Radius: double; "
-        "  public constructor(radius: double) Radius := radius; end constructor; "
-        "end Circle; "
-        "class Square serialized tree : ISerializable, IDeserializable "
-        "  public property Side: double; "
-        "  public constructor(side: double) Side := side; end constructor; "
-        "end Square; "
-        "class Shape serialized graph "
+        // Shape: abstract polymorphic base.
+        "abstract class Shape serialized graph "
         "  polymorphic(\"circle\": Circle, \"square\": Square) "
         "  : ISerializable, IDeserializable "
+        "  public abstract method Kind(): int; "
         "end Shape; "
-        "class C public static method Main(): int return 0; end Main; end C;"));
+        // Circle: concrete subtype of Shape; re-declares ISerializable for synthesis.
+        "class Circle serialized tree : Shape, ISerializable, IDeserializable "
+        "  public property Radius: double; "
+        "  public constructor(radius: double) Radius := radius; end constructor; "
+        "  public override method Kind(): int return 1; end Kind; "
+        "end Circle; "
+        // Square: concrete subtype of Shape; re-declares ISerializable for synthesis.
+        "class Square serialized tree : Shape, ISerializable, IDeserializable "
+        "  public property Side: double; "
+        "  public constructor(side: double) Side := side; end constructor; "
+        "  public override method Kind(): int return 2; end Kind; "
+        "end Square; "
+        // Container: owns a Shape field — triggers polymorphic ser/deser.
+        "class Container serialized tree : ISerializable, IDeserializable "
+        "  public owned S: Shape; "
+        "  public constructor(owned s: Shape) S := move s; end constructor; "
+        "end Container; "
+        "class C public static method Main(): int "
+        "  using var box := new Container(new Circle(5.0)); "
+        "  using var s := new BinarySerializer(); "
+        "  box.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var box2 := Container.Deserialize(d); "
+        "  return (42 if box2.S.Kind() = 1 else 91); "
+        "end Main; end C;"), 42);
 }
 
 // §9.8 `polymorphic`: serialize a Square, deserialize as Shape — verifies
 // discriminator dispatch selects Square (second registered type).
 //
-// TIER BOUNDARY (tier 4): see polymorphic_dispatch_circle_roundtrip_spec_9_8
-// above. Same tier-4 boundary applies.
+// §9.8: same polymorphic dispatch rules as the Circle case above, but now the
+// $type discriminator written is "square" and Deserialize must dispatch to
+// Square's synthesized Deserialize.  Kind() returns 2 for Square.
 BEZEL_TEST(codegen_serialization_t2_classes,
            polymorphic_dispatch_square_roundtrip_spec_9_8) {
-    // §9.8 tier-boundary: polymorphic dispatch is not yet supported
-    // (issue #550 tier 4). The compiler emits a clean diagnostic.
-    BEZEL_EXPECT_TRUE(compileFails(
+    // §9.8 tier 4: polymorphic discriminator dispatch — Square branch.
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Circle serialized tree : ISerializable, IDeserializable "
-        "  public property Radius: double; "
-        "  public constructor(radius: double) Radius := radius; end constructor; "
-        "end Circle; "
-        "class Square serialized tree : ISerializable, IDeserializable "
-        "  public property Side: double; "
-        "  public constructor(side: double) Side := side; end constructor; "
-        "end Square; "
-        "class Shape serialized graph "
+        "abstract class Shape serialized graph "
         "  polymorphic(\"circle\": Circle, \"square\": Square) "
         "  : ISerializable, IDeserializable "
+        "  public abstract method Kind(): int; "
         "end Shape; "
-        "class C public static method Main(): int return 0; end Main; end C;"));
+        "class Circle serialized tree : Shape, ISerializable, IDeserializable "
+        "  public property Radius: double; "
+        "  public constructor(radius: double) Radius := radius; end constructor; "
+        "  public override method Kind(): int return 1; end Kind; "
+        "end Circle; "
+        "class Square serialized tree : Shape, ISerializable, IDeserializable "
+        "  public property Side: double; "
+        "  public constructor(side: double) Side := side; end constructor; "
+        "  public override method Kind(): int return 2; end Kind; "
+        "end Square; "
+        "class Container serialized tree : ISerializable, IDeserializable "
+        "  public owned S: Shape; "
+        "  public constructor(owned s: Shape) S := move s; end constructor; "
+        "end Container; "
+        "class C public static method Main(): int "
+        "  using var box := new Container(new Square(3.0)); "
+        "  using var s := new BinarySerializer(); "
+        "  box.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var box2 := Container.Deserialize(d); "
+        "  return (42 if box2.S.Kind() = 2 else 91); "
+        "end Main; end C;"), 42);
 }
 
 // §9.8 `polymorphic`: a registered subtype without a graph-shape clause is a
