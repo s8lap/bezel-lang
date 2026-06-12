@@ -4223,6 +4223,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                n == "TypeInitializationException" ||
                                n == "FormatException"           ||
                                n == "StackOverflowException"    ||
+                               // §9.8 / #688 / stdlib §2.15: SerializationException
+                               // lives in System.Serialization (not §31.4) but is
+                               // registered as a built-in exception (declaration==null).
+                               // Add it here so `e.Message` is typed as string when
+                               // `catch var e: SerializationException` is used.
+                               n == "SerializationException"    ||
                                n == "ChannelClosedException"    ||  // §30.15 #600c
                                n == "DomainFaultedException";       // §30.14 #600c
                     };

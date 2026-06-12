@@ -511,6 +511,9 @@ set(BEZEL_TEST_SOURCES
     # --- #668/#669 fix tests (missing-required-field raise; AOT null-nullable-class) ---
     codegen/serialization_668_669_test.cpp
     # --- end #668/#669 ---
+    # --- #688 fix tests (SerializationException position info — byte offset / line/column) ---
+    codegen/serialization_688_posinfo_test.cpp
+    # --- end #688 ---
     # --- #550 JSON format tier (§2.15 JsonSerializer/JsonDeserializer) ---
     codegen/json_550_test.cpp
     # --- end #550 JSON ---

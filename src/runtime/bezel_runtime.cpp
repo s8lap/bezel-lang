@@ -8108,7 +8108,7 @@ struct bz_binder_t {
     int8_t         ignore_unknown;
     int32_t        fields_remaining;
     bool           in_object;
-    int8_t         kind;  // 0 = binary, 1 = JSON
+    int8_t         kind;  // 0 = binary, 1 = JSON, 2 = JSON+owns data
     // fix #687 / stdlib §2.15 JsonOptions:
     int8_t         allow_trailing_commas;  // tolerate trailing comma in JSON objects/arrays
     int32_t        max_depth;              // nesting guard (0 = unlimited)
@@ -8118,6 +8118,12 @@ struct bz_binder_t {
     // pseudo-field).  bz_binder_begin_object checks this flag and, when set,
     // skips re-reading `{` and starts the field count from the current position.
     int8_t  json_obj_preread;
+
+    // fix #688 / stdlib §2.15: JSON position tracking — line/column for error messages.
+    // Line and column are 1-based; updated by bz_jder_advance_tracking as characters
+    // are consumed.  Only meaningful when kind >= 1 (JSON).
+    int64_t json_line;  // current line (1-based)
+    int64_t json_col;   // current column (1-based)
 
     // §9.8 tier-3: identity-tag→object table for `serialized graph` deserialize.
     // tag_ptrs[i]        = the constructed object pointer for tag_id (i+1).
@@ -8263,12 +8269,22 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
 // All read functions throw SerializationException on malformed input.
 // ---------------------------------------------------------------------------
 
-// Skip whitespace.
+// Skip whitespace; track newlines for line/column position (#688).
 static void bz_jder_skip_ws(bz_binder_t* d) {
     while (d->pos < d->len) {
         uint8_t c = d->data[d->pos];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') ++d->pos;
-        else break;
+        if (c == '\n') {
+            ++d->pos; ++d->json_line; d->json_col = 1;
+        } else if (c == '\r') {
+            ++d->pos;
+            // CR-LF: absorb the LF together with the CR
+            if (d->pos < d->len && d->data[d->pos] == '\n') ++d->pos;
+            ++d->json_line; d->json_col = 1;
+        } else if (c == ' ' || c == '\t') {
+            ++d->pos; ++d->json_col;
+        } else {
+            break;
+        }
     }
 }
 
@@ -8280,13 +8296,71 @@ static int bz_jder_peek(bz_binder_t* d) {
     return d->data[d->pos];
 }
 
-// Throw a SerializationException and return.
-#define BZ_JDER_THROW(msg) do { \
-    bz_ser_throw((msg), nullptr); \
+// fix #688 / stdlib §2.15: compute the 1-based line+column at `pos` by scanning
+// from the beginning of the input.  Called only on error paths.
+static void bz_jder_line_col_at(const bz_binder_t* d, int64_t pos,
+                                 int64_t* out_line, int64_t* out_col) {
+    int64_t line = 1, col = 1;
+    for (int64_t i = 0; i < pos && i < d->len; ) {
+        uint8_t c = d->data[i++];
+        if (c == '\n') { ++line; col = 1; }
+        else if (c == '\r') {
+            ++line; col = 1;
+            if (i < d->len && d->data[i] == '\n') ++i; // skip LF of CRLF
+        } else {
+            ++col;
+        }
+    }
+    *out_line = line;
+    *out_col  = col;
+}
+
+// fix #688 / stdlib §2.15: build a positioned message and throw.
+// For JSON: appends " at line L, column C".
+// For binary: appends " at byte offset N".
+// bz_ser_throw_at_json uses bz_jder_line_col_at so it is always accurate even
+// when the error is detected mid-token (not after a skip_ws call).
+static void bz_ser_throw_at_json(const char* msg, const bz_binder_t* d) {
+    int64_t line = 1, col = 1;
+    // Use current d->pos as the fault position.
+    bz_jder_line_col_at(d, d->pos, &line, &col);
+    // Format: "<msg> at line L, column C"
+    char pos_buf[64];
+    int n = snprintf(pos_buf, sizeof(pos_buf), " at line %lld, column %lld",
+                     (long long)line, (long long)col);
+    (void)n;
+    size_t msg_len = msg ? strlen(msg) : 0;
+    size_t pos_len = strlen(pos_buf);
+    char* buf = static_cast<char*>(malloc(msg_len + pos_len + 1));
+    if (msg_len > 0) memcpy(buf, msg, msg_len);
+    memcpy(buf + msg_len, pos_buf, pos_len);
+    buf[msg_len + pos_len] = '\0';
+    bz_ser_throw(buf, nullptr);
+    free(buf);
+}
+
+// fix #688 / stdlib §2.15: binary raise with byte-offset annotation.
+static void bz_ser_throw_at_binary(const char* msg, int64_t offset) {
+    char pos_buf[64];
+    int n = snprintf(pos_buf, sizeof(pos_buf), " at byte offset %lld", (long long)offset);
+    (void)n;
+    size_t msg_len = msg ? strlen(msg) : 0;
+    size_t pos_len = strlen(pos_buf);
+    char* buf = static_cast<char*>(malloc(msg_len + pos_len + 1));
+    if (msg_len > 0) memcpy(buf, msg, msg_len);
+    memcpy(buf + msg_len, pos_buf, pos_len);
+    buf[msg_len + pos_len] = '\0';
+    bz_ser_throw(buf, nullptr);
+    free(buf);
+}
+
+// Throw a SerializationException with position and return.
+#define BZ_JDER_THROW(d, msg) do { \
+    bz_ser_throw_at_json((msg), (d)); \
     return; \
 } while(0)
-#define BZ_JDER_THROW_V(msg, ret) do { \
-    bz_ser_throw((msg), nullptr); \
+#define BZ_JDER_THROW_V(d, msg, ret) do { \
+    bz_ser_throw_at_json((msg), (d)); \
     return (ret); \
 } while(0)
 
@@ -8295,11 +8369,11 @@ static int bz_jder_peek(bz_binder_t* d) {
 static bool bz_jder_expect_char(bz_binder_t* d, char expected) {
     bz_jder_skip_ws(d);
     if (d->pos >= d->len) {
-        bz_ser_throw("Unexpected end of JSON input (§2.15)", nullptr);
+        bz_ser_throw_at_json("Unexpected end of JSON input (§2.15)", d);
         return false;
     }
     if ((char)d->data[d->pos] != expected) {
-        bz_ser_throw("Unexpected JSON token (§2.15)", nullptr);
+        bz_ser_throw_at_json("Unexpected JSON token (§2.15)", d);
         return false;
     }
     ++d->pos;
@@ -8329,7 +8403,7 @@ static uint32_t bz_jder_decode_utf8(const uint8_t* src, int64_t len, int64_t* i)
 // Returns nullptr on malformed input (and has thrown).
 static uint32_t* bz_jder_parse_string_cps(bz_binder_t* d, int64_t* ncp_out) {
     if (d->pos >= d->len || d->data[d->pos] != '"') {
-        bz_ser_throw("Expected '\"' in JSON string (§2.15)", nullptr);
+        bz_ser_throw_at_json("Expected '\"' in JSON string (§2.15)", d);
         *ncp_out = 0;
         return nullptr;
     }
@@ -8339,7 +8413,7 @@ static uint32_t* bz_jder_parse_string_cps(bz_binder_t* d, int64_t* ncp_out) {
     int64_t cap = 32;
     int64_t n   = 0;
     uint32_t* cps = static_cast<uint32_t*>(malloc((size_t)cap * sizeof(uint32_t)));
-    if (!cps) { bz_ser_throw("OOM in JSON string parse", nullptr); *ncp_out=0; return nullptr; }
+    if (!cps) { bz_ser_throw_at_json("OOM in JSON string parse", d); *ncp_out=0; return nullptr; }
 
     while (d->pos < d->len) {
         uint8_t b = d->data[d->pos];
@@ -8348,7 +8422,7 @@ static uint32_t* bz_jder_parse_string_cps(bz_binder_t* d, int64_t* ncp_out) {
         uint32_t cp;
         if (b == '\\') {
             ++d->pos;
-            if (d->pos >= d->len) { free(cps); bz_ser_throw("Truncated JSON escape (§2.15)", nullptr); *ncp_out=0; return nullptr; }
+            if (d->pos >= d->len) { free(cps); bz_ser_throw_at_json("Truncated JSON escape (§2.15)", d); *ncp_out=0; return nullptr; }
             uint8_t esc = d->data[d->pos++];
             switch (esc) {
             case '"':  cp = '"';  break;
@@ -8361,7 +8435,7 @@ static uint32_t* bz_jder_parse_string_cps(bz_binder_t* d, int64_t* ncp_out) {
             case 'f':  cp = '\f'; break;
             case 'u': {
                 // \uXXXX — read 4 hex digits.
-                if (d->pos + 4 > d->len) { free(cps); bz_ser_throw("Short \\uXXXX escape (§2.15)", nullptr); *ncp_out=0; return nullptr; }
+                if (d->pos + 4 > d->len) { free(cps); bz_ser_throw_at_json("Short \\uXXXX escape (§2.15)", d); *ncp_out=0; return nullptr; }
                 uint32_t code = 0;
                 for (int k = 0; k < 4; ++k) {
                     uint8_t hx = d->data[d->pos+k];
@@ -8369,7 +8443,7 @@ static uint32_t* bz_jder_parse_string_cps(bz_binder_t* d, int64_t* ncp_out) {
                     if (hx >= '0' && hx <= '9')      nib = hx - '0';
                     else if (hx >= 'a' && hx <= 'f') nib = hx - 'a' + 10;
                     else if (hx >= 'A' && hx <= 'F') nib = hx - 'A' + 10;
-                    else { free(cps); bz_ser_throw("Bad hex in \\uXXXX (§2.15)", nullptr); *ncp_out=0; return nullptr; }
+                    else { free(cps); bz_ser_throw_at_json("Bad hex in \\uXXXX (§2.15)", d); *ncp_out=0; return nullptr; }
                     code = (code << 4) | nib;
                 }
                 d->pos += 4;
@@ -8377,7 +8451,7 @@ static uint32_t* bz_jder_parse_string_cps(bz_binder_t* d, int64_t* ncp_out) {
                 break;
             }
             default:
-                free(cps); bz_ser_throw("Unknown JSON escape (§2.15)", nullptr); *ncp_out=0; return nullptr;
+                free(cps); bz_ser_throw_at_json("Unknown JSON escape (§2.15)", d); *ncp_out=0; return nullptr;
             }
         } else {
             // Raw UTF-8 codepoint.
@@ -8387,7 +8461,7 @@ static uint32_t* bz_jder_parse_string_cps(bz_binder_t* d, int64_t* ncp_out) {
         if (n >= cap) {
             cap *= 2;
             uint32_t* nc = static_cast<uint32_t*>(realloc(cps, (size_t)cap * sizeof(uint32_t)));
-            if (!nc) { free(cps); bz_ser_throw("OOM in JSON string parse", nullptr); *ncp_out=0; return nullptr; }
+            if (!nc) { free(cps); bz_ser_throw_at_json("OOM in JSON string parse", d); *ncp_out=0; return nullptr; }
             cps = nc;
         }
         cps[n++] = cp;
@@ -8436,7 +8510,7 @@ static void bz_jder_skip_value(bz_binder_t* d);
 
 static void bz_jder_skip_value_impl(bz_binder_t* d) {
     int c = bz_jder_peek(d);
-    if (c < 0) { bz_ser_throw("Unexpected end in JSON skip (§2.15)", nullptr); return; }
+    if (c < 0) { bz_ser_throw_at_json("Unexpected end in JSON skip (§2.15)", d); return; }
 
     if (c == '"') {
         // String: parse and discard.
@@ -8456,10 +8530,10 @@ static void bz_jder_skip_value_impl(bz_binder_t* d) {
             if (!bz_jder_expect_char(d, ':')) return;
             bz_jder_skip_value(d);
             bz_jder_skip_ws(d);
-            if (d->pos >= d->len) { bz_ser_throw("Truncated JSON object in skip (§2.15)", nullptr); return; }
+            if (d->pos >= d->len) { bz_ser_throw_at_json("Truncated JSON object in skip (§2.15)", d); return; }
             if (d->data[d->pos] == ',') { ++d->pos; continue; }
             if (d->data[d->pos] == '}') { ++d->pos; return; }
-            bz_ser_throw("Expected ',' or '}' in JSON object skip (§2.15)", nullptr);
+            bz_ser_throw_at_json("Expected ',' or '}' in JSON object skip (§2.15)", d);
             return;
         }
     } else if (c == '[') {
@@ -8469,10 +8543,10 @@ static void bz_jder_skip_value_impl(bz_binder_t* d) {
         while (true) {
             bz_jder_skip_value(d);
             bz_jder_skip_ws(d);
-            if (d->pos >= d->len) { bz_ser_throw("Truncated JSON array in skip (§2.15)", nullptr); return; }
+            if (d->pos >= d->len) { bz_ser_throw_at_json("Truncated JSON array in skip (§2.15)", d); return; }
             if (d->data[d->pos] == ',') { ++d->pos; continue; }
             if (d->data[d->pos] == ']') { ++d->pos; return; }
-            bz_ser_throw("Expected ',' or ']' in JSON array skip (§2.15)", nullptr);
+            bz_ser_throw_at_json("Expected ',' or ']' in JSON array skip (§2.15)", d);
             return;
         }
     } else if (c == 't' || c == 'f' || c == 'n') {
@@ -8481,7 +8555,7 @@ static void bz_jder_skip_value_impl(bz_binder_t* d) {
         if (c == 't' && d->pos + 4 <= d->len && memcmp(kw, "true",  4) == 0) d->pos += 4;
         else if (c == 'f' && d->pos + 5 <= d->len && memcmp(kw, "false", 5) == 0) d->pos += 5;
         else if (c == 'n' && d->pos + 4 <= d->len && memcmp(kw, "null",  4) == 0) d->pos += 4;
-        else { bz_ser_throw("Unknown JSON keyword in skip (§2.15)", nullptr); }
+        else { bz_ser_throw_at_json("Unknown JSON keyword in skip (§2.15)", d); }
     } else if (c == '-' || (c >= '0' && c <= '9')) {
         // number: consume digits and optional .digits and optional eXX
         if (d->data[d->pos] == '-') ++d->pos;
@@ -8496,7 +8570,7 @@ static void bz_jder_skip_value_impl(bz_binder_t* d) {
             while (d->pos < d->len && (d->data[d->pos] >= '0' && d->data[d->pos] <= '9')) ++d->pos;
         }
     } else {
-        bz_ser_throw("Unexpected JSON token in skip (§2.15)", nullptr);
+        bz_ser_throw_at_json("Unexpected JSON token in skip (§2.15)", d);
     }
 }
 
@@ -8509,20 +8583,20 @@ static void bz_jder_skip_value(bz_binder_t* d) {
 static int64_t bz_jder_parse_int(bz_binder_t* d) {
     bz_jder_skip_ws(d);
     if (d->pos >= d->len) {
-        bz_ser_throw("Expected JSON number, got end of input (§2.15)", nullptr);
+        bz_ser_throw_at_json("Expected JSON number, got end of input (§2.15)", d);
         return 0;
     }
     // Collect the number text.
     int64_t start = d->pos;
     if (d->data[d->pos] == '-') ++d->pos;
     if (d->pos >= d->len || d->data[d->pos] < '0' || d->data[d->pos] > '9') {
-        bz_ser_throw("Expected JSON integer (§2.15)", nullptr);
+        bz_ser_throw_at_json("Expected JSON integer (§2.15)", d);
         return 0;
     }
     while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
     // No decimal point or exponent allowed for integer reads.
     int64_t numlen = d->pos - start;
-    if (numlen > 20) { bz_ser_throw("JSON integer overflow (§2.15)", nullptr); return 0; }
+    if (numlen > 20) { bz_ser_throw_at_json("JSON integer overflow (§2.15)", d); return 0; }
     char buf[24] = {};
     memcpy(buf, d->data + start, (size_t)numlen);
     return strtoll(buf, nullptr, 10);
@@ -8531,13 +8605,13 @@ static int64_t bz_jder_parse_int(bz_binder_t* d) {
 static uint64_t bz_jder_parse_uint(bz_binder_t* d) {
     bz_jder_skip_ws(d);
     if (d->pos >= d->len || d->data[d->pos] < '0' || d->data[d->pos] > '9') {
-        bz_ser_throw("Expected JSON unsigned integer (§2.15)", nullptr);
+        bz_ser_throw_at_json("Expected JSON unsigned integer (§2.15)", d);
         return 0;
     }
     int64_t start = d->pos;
     while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
     int64_t numlen = d->pos - start;
-    if (numlen > 20) { bz_ser_throw("JSON uint overflow (§2.15)", nullptr); return 0; }
+    if (numlen > 20) { bz_ser_throw_at_json("JSON uint overflow (§2.15)", d); return 0; }
     char buf[24] = {};
     memcpy(buf, d->data + start, (size_t)numlen);
     return strtoull(buf, nullptr, 10);
@@ -8546,7 +8620,7 @@ static uint64_t bz_jder_parse_uint(bz_binder_t* d) {
 static double bz_jder_parse_float(bz_binder_t* d) {
     bz_jder_skip_ws(d);
     if (d->pos >= d->len) {
-        bz_ser_throw("Expected JSON number (float), got end of input (§2.15)", nullptr);
+        bz_ser_throw_at_json("Expected JSON number (float), got end of input (§2.15)", d);
         return 0.0;
     }
     int64_t start = d->pos;
@@ -8562,7 +8636,7 @@ static double bz_jder_parse_float(bz_binder_t* d) {
         while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
     }
     int64_t numlen = d->pos - start;
-    if (numlen > 50) { bz_ser_throw("JSON float too long (§2.15)", nullptr); return 0.0; }
+    if (numlen > 50) { bz_ser_throw_at_json("JSON float too long (§2.15)", d); return 0.0; }
     char buf[64] = {};
     memcpy(buf, d->data + start, (size_t)numlen);
     return strtod(buf, nullptr);
@@ -8573,7 +8647,7 @@ static double bz_jder_parse_float(bz_binder_t* d) {
 static void* bz_jder_parse_decimal(bz_binder_t* d) {
     bz_jder_skip_ws(d);
     if (d->pos >= d->len) {
-        bz_ser_throw("Expected JSON decimal number, got end of input (§2.15)", nullptr);
+        bz_ser_throw_at_json("Expected JSON decimal number, got end of input (§2.15)", d);
         return nullptr;
     }
     int64_t start = d->pos;
@@ -8584,7 +8658,7 @@ static void* bz_jder_parse_decimal(bz_binder_t* d) {
         while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
     }
     int64_t numlen = d->pos - start;
-    if (numlen > 50) { bz_ser_throw("JSON decimal too long (§2.15)", nullptr); return nullptr; }
+    if (numlen > 50) { bz_ser_throw_at_json("JSON decimal too long (§2.15)", d); return nullptr; }
     char buf[64] = {};
     memcpy(buf, d->data + start, (size_t)numlen);
     // Use a thread-local buffer for the result (same pattern as bz_binder_read_decimal).
@@ -8616,6 +8690,8 @@ void* bz_jder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
     d->allow_trailing_commas = 0;
     d->max_depth             = 64;
     d->kind                  = 1;  // JSON
+    d->json_line             = 1;  // fix #688: 1-based position tracking
+    d->json_col              = 1;
     return d;
 }
 
@@ -8631,6 +8707,8 @@ void* bz_jder_alloc_opts(const uint8_t* data, int64_t len,
     d->allow_trailing_commas = allow_trailing_commas;
     d->max_depth             = (max_depth > 0) ? max_depth : 64;
     d->kind                  = 1;  // JSON
+    d->json_line             = 1;  // fix #688: 1-based position tracking
+    d->json_col              = 1;
     return d;
 }
 
@@ -8646,6 +8724,8 @@ void* bz_jder_alloc_str(char* utf8z, int64_t len, int8_t ignore_unknown) {
     d->allow_trailing_commas = 0;
     d->max_depth             = 64;
     d->kind                  = 2;  // JSON + owns data (free on bz_binder_free)
+    d->json_line             = 1;  // fix #688: 1-based position tracking
+    d->json_col              = 1;
     return d;
 }
 
@@ -8661,6 +8741,8 @@ void* bz_jder_alloc_str_opts(char* utf8z, int64_t len,
     d->allow_trailing_commas = allow_trailing_commas;
     d->max_depth             = (max_depth > 0) ? max_depth : 64;
     d->kind                  = 2;  // JSON + owns data (free on bz_binder_free)
+    d->json_line             = 1;  // fix #688: 1-based position tracking
+    d->json_col              = 1;
     return d;
 }
 
@@ -8679,24 +8761,34 @@ void bz_binder_free(void* derp) {
 int64_t bz_binder_read_int(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) return bz_jder_parse_int(d);
+    // fix #688 / stdlib §2.15: binary truncation → byte offset in message.
+    int64_t off = d->pos;
     uint64_t v = 0;
-    bz_binder_read_le64_impl(d, &v);
+    if (!bz_binder_read_le64_impl(d, &v)) {
+        bz_ser_throw_at_binary("Truncated binary input reading int (§2.15)", off);
+    }
     return (int64_t)v;
 }
 
 uint64_t bz_binder_read_uint(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) return bz_jder_parse_uint(d);
+    int64_t off = d->pos;
     uint64_t v = 0;
-    bz_binder_read_le64_impl(d, &v);
+    if (!bz_binder_read_le64_impl(d, &v)) {
+        bz_ser_throw_at_binary("Truncated binary input reading uint (§2.15)", off);
+    }
     return v;
 }
 
 double bz_binder_read_float(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) return bz_jder_parse_float(d);
+    int64_t off = d->pos;
     uint64_t bits = 0;
-    bz_binder_read_le64_impl(d, &bits);
+    if (!bz_binder_read_le64_impl(d, &bits)) {
+        bz_ser_throw_at_binary("Truncated binary input reading float (§2.15)", off);
+    }
     double v;
     memcpy(&v, &bits, 8);
     return v;
@@ -8729,7 +8821,7 @@ int8_t bz_binder_read_bool(void* derp) {
         if (d->pos + 5 <= d->len && memcmp(d->data + d->pos, "false", 5) == 0) {
             d->pos += 5; return 0;
         }
-        bz_ser_throw("Expected JSON bool (§2.15)", nullptr);
+        bz_ser_throw_at_json("Expected JSON bool (§2.15)", d);
         return 0;
     }
     uint8_t b = 0;
@@ -8834,6 +8926,15 @@ static int32_t bz_jder_count_object_fields(bz_binder_t* d) {
         }
     }
 
+    // fix #688 / §2.15: if we exhausted input without closing '}', the JSON is
+    // truncated.  Throw at current position (before restoring), so
+    // bz_ser_throw_at_json reports the correct end-of-input location.
+    if (depth > 0) {
+        bz_ser_throw_at_json("Truncated JSON: unexpected end of input inside object (§2.15)", d);
+        d->pos = saved;
+        return -1;
+    }
+
     d->pos = saved;
     return count;
 }
@@ -8857,7 +8958,7 @@ int32_t bz_binder_begin_object(void* derp) {
         }
         bz_jder_skip_ws(d);
         if (d->pos >= d->len || d->data[d->pos] != '{') {
-            bz_ser_throw("Expected '{' in JSON object (§2.15)", nullptr);
+            bz_ser_throw_at_json("Expected '{' in JSON object (§2.15)", d);
             return -1;
         }
         ++d->pos;  // skip '{'
@@ -8865,8 +8966,13 @@ int32_t bz_binder_begin_object(void* derp) {
         int32_t cnt = bz_jder_count_object_fields(d);
         return cnt;
     }
+    // fix #688 / §2.15: binary truncation → report byte offset.
+    int64_t off = d->pos;
     uint32_t cnt = 0;
-    if (!bz_binder_read_le32_impl(d, &cnt)) return -1;
+    if (!bz_binder_read_le32_impl(d, &cnt)) {
+        bz_ser_throw_at_binary("Truncated binary input at object header (§2.15)", off);
+        return -1;
+    }
     d->in_object = true;
     return (int32_t)cnt;
 }
@@ -8950,7 +9056,7 @@ void bz_binder_skip_value(void* derp) {
     if (d->kind >= 1) {
         // §2.15: SkipValue — unknown field; if ignore_unknown=0 → raise.
         if (!d->ignore_unknown) {
-            bz_ser_throw("Unknown field in JSON input (§2.15)", nullptr);
+            bz_ser_throw_at_json("Unknown field in JSON input (§2.15)", d);
             return;
         }
         bz_jder_skip_ws(d);
@@ -8974,7 +9080,7 @@ void bz_binder_end_object(void* derp) {
         // when it is not.
         if (d->pos < d->len && d->data[d->pos] == ',') {
             if (!d->allow_trailing_commas) {
-                bz_ser_throw("Trailing comma in JSON object (§2.15)", nullptr);
+                bz_ser_throw_at_json("Trailing comma in JSON object (§2.15)", d);
                 d->in_object = false;
                 return;
             }
@@ -9075,8 +9181,8 @@ int32_t bz_binder_read_graph_marker(void* derp, int32_t* out_tag) {
         // JSON path — per §2.15 v0.139.
         bz_jder_skip_ws(d);
         if (d->pos >= d->len || d->data[d->pos] != '{') {
-            bz_ser_throw("Expected '{' for JSON graph-identity token (§2.15 v0.139)",
-                         nullptr);
+            bz_ser_throw_at_json("Expected '{' for JSON graph-identity token (§2.15 v0.139)",
+                                 d);
             return 0;
         }
         ++d->pos;  // consume '{'
@@ -9084,8 +9190,8 @@ int32_t bz_binder_read_graph_marker(void* derp, int32_t* out_tag) {
         // Parse the first field name (must be "$id" or "$ref").
         bz_jder_skip_ws(d);
         if (d->pos >= d->len || d->data[d->pos] != '"') {
-            bz_ser_throw("Expected '\"' in JSON graph-identity object (§2.15 v0.139)",
-                         nullptr);
+            bz_ser_throw_at_json("Expected '\"' in JSON graph-identity object (§2.15 v0.139)",
+                                 d);
             return 0;
         }
         // Read the key without allocating: find the closing '"'.
@@ -9109,8 +9215,8 @@ int32_t bz_binder_read_graph_marker(void* derp, int32_t* out_tag) {
                       d->data[keyStart+3] == 'f');
 
         if (!isId && !isRef) {
-            bz_ser_throw("Expected \"$id\" or \"$ref\" as first field in JSON "
-                         "graph-identity object (§2.15 v0.139)", nullptr);
+            bz_ser_throw_at_json("Expected \"$id\" or \"$ref\" as first field in JSON "
+                                 "graph-identity object (§2.15 v0.139)", d);
             return 0;
         }
 
@@ -9197,23 +9303,43 @@ void bz_ser_exc_vtable_init(void* vtable) {
 // The legacy `ser_exn_vtable` parameter is kept for ABI compatibility but
 // ignored — the global is always used so runtime-internal JSON throws work.
 void bz_ser_throw(const char* msg, void* /*ser_exn_vtable*/) {
-    // Build a bz_string_struct for the message.
+    // fix #688 / §2.15: allocate exception object, bz_string_struct, and message
+    // buffer as a SINGLE contiguous block so that free(exc_obj) — called by the
+    // no-op-Dispose + reclaim path in emitDisposeAndReclaim — frees everything
+    // without a separate per-field free.  Layout (all tightly packed):
+    //   [0]  void*           : vtable pointer
+    //   [8]  void*           : pointer to bz_string_struct (at offset 16)
+    //   [16] bz_string_struct: {data*, len, width, rc} = BZ_STRING_SIZEOF bytes
+    //   [16+BZ_STRING_SIZEOF] char[]: message text (null-terminated)
+    // e.Message codegen GEPs at byte 8 → reads the bz_string* which points
+    // right back into this same block, so Contains/etc work normally.
     size_t msg_len = msg ? strlen(msg) : 0;
-    char* buf = static_cast<char*>(malloc(msg_len + 1));
+    // Header: 2 pointers (vtable + str*).
+    static constexpr size_t kHdr   = 2 * sizeof(void*);   // 16 bytes
+    static constexpr size_t kSStr  = sizeof(bz_string_struct);
+    size_t total = kHdr + kSStr + msg_len + 1;
+
+    char* block = static_cast<char*>(malloc(total));
+    memset(block, 0, kHdr + kSStr);  // zero vtable+strptr+string-struct fields
+
+    // Pointer slots.
+    void** exc_obj = reinterpret_cast<void**>(block);
+    exc_obj[0] = bz_ser_exc_vtable;  // vtable
+    exc_obj[1] = block + kHdr;       // → bz_string_struct at [16]
+
+    // bz_string_struct lives at block+kHdr.
+    auto* str = reinterpret_cast<bz_string_struct*>(block + kHdr);
+    // Message text follows the struct.
+    char* buf = block + kHdr + kSStr;
     if (msg_len > 0) memcpy(buf, msg, msg_len);
     buf[msg_len] = '\0';
-    auto* str = static_cast<bz_string_struct*>(malloc(sizeof(bz_string_struct)));
     str->data  = buf;
     str->len   = (int64_t)msg_len;
     str->width = 1;
+    // str->rc is already 0 from memset; bz_str_contains does not touch rc.
 
-    // An exception object layout is {vtable*, message bz_string*}.
-    // Allocate a 2-pointer object: [vtable*, str*].
-    void** exc_obj = static_cast<void**>(malloc(2 * sizeof(void*)));
-    exc_obj[0] = bz_ser_exc_vtable;  // use registered vtable, not nullptr
-    exc_obj[1] = str;
     extern void* bz_exc;
-    bz_exc = exc_obj;
+    bz_exc = block;
 }
 
 // OwnedBuffer<byte> helpers --------------------------------------------------
