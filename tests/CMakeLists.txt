@@ -360,6 +360,7 @@ set(BEZEL_TEST_SOURCES
     codegen/stdlib_wave2_test.cpp
     codegen/timespan_encoding_525_526_test.cpp
     codegen/decimal_521_test.cpp
+    codegen/decimal_nullable_663_test.cpp
     codegen/guid_test.cpp
     codegen/owned_collection_ops_test.cpp
     codegen/linked_list_test.cpp
