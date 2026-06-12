@@ -1,13 +1,24 @@
 // Codegen — yield / await inside try / catch / finally in an async iterator
-// (#554, §30.7 / §29.6 / §29.7 v0.135).
+// (#554, §30.7 / §29.6 / §29.7 v0.135; updated for §30.7 v0.137).
 //
 // Spec authorities:
 //   §29.6: yield in try-with-only-finally: allowed. yield in try-with-catch:
 //          forbidden. yield in catch arm body or finally: forbidden.
 //   §29.7: on early disposal (break / exception / scope-end), the state machine
 //          runs all finally clauses active at the suspension point.
-//   §30.7: async iterators obey the same rules; await is additionally permitted
-//          in try/catch/finally bodies (§30.9) — just not in a catch GUARD.
+//   §30.7 v0.135: async iterators obey the same rules; await is additionally
+//          permitted in try/catch/finally bodies (§30.9) — just not in a catch
+//          GUARD.
+//   §30.7 v0.137 (NEW): `await` inside the `finally` of an async iterator is
+//          now a compile error. The Dispose path runs synchronously — no async
+//          driver is present when a consumer abandons iteration early, so the
+//          continuation would be silently discarded. Test (6) below was updated
+//          to reflect this ruling: the await-in-finally shape is now ill-formed
+//          and must produce a diagnostic.  Remedy: hoist the await before the
+//          try, or move cleanup to Dispose (per §30.7 v0.137 text).
+//          The new positive tests (await-in-finally-rejected; async METHOD
+//          finally still OK; sync iterator unaffected) live in
+//          async_iter_await_finally_655_test.cpp.
 //
 // Tests:
 //   (1) yield inside try-with-only-finally: compiles and runs. Finally runs on
@@ -19,7 +30,9 @@
 //       `await for` propagates the exception (§29.7 / §31.2).
 //   (4) await inside a try body in an async iterator: resumes correctly (§30.7).
 //   (5) await inside a catch arm body in an async iterator: resumes correctly.
-//   (6) await inside a finally block in an async iterator: runs correctly (§30.9).
+//   (6) await inside a finally block in an async iterator: NOW ILL-FORMED per
+//       §30.7 v0.137 — must produce a compile-time diagnostic.
+//       (Was: "runs correctly per §30.9". Ruling changed in v0.137.)
 //   (7) yield in try-with-catch: rejected with a clean diagnostic (§29.6).
 //   (8) yield in a catch arm body: rejected with a clean diagnostic (§29.6).
 //   (9) yield in a finally block: rejected with a clean diagnostic (§29.6).
@@ -269,12 +282,29 @@ end C;
 }
 
 // ===========================================================================
-// (6) §30.7 / §30.9: await inside a finally block in an async iterator.
-//     The finally awaits a completed task that increments a static counter.
-//     Expected exit code: 4 when finallyRan == 1.
+// (6) §30.7 v0.137: await inside a finally block in an async iterator is now
+//     ILL-FORMED — must produce a compile error.
+//
+//     Ruling changed in v0.137: "Inside an async iterator, `await` may not
+//     appear in a `finally` block — a compile error."  The motivating failure
+//     is the Dispose path: when a consumer abandons iteration early, the
+//     iterator's pending `finally` blocks run synchronously inside `Dispose`
+//     (§29.7) — there is no async driver at that point, so a suspension
+//     inside the `finally` would have nowhere to resume; the continuation
+//     would be silently discarded.
+//
+//     Remedy (per §30.7 v0.137): hoist the await before the `try`, or move
+//     the asynchronous cleanup into the type's `Dispose` path.
+//
+//     The previously-passing compile-and-run shape is now expected to FAIL
+//     compilation.  The positive form (async METHOD finally-await still OK;
+//     await in async-iterator try body still OK; sync iterator unaffected)
+//     is tested in async_iter_await_finally_655_test.cpp.
 // ===========================================================================
 BEZEL_TEST(async_iter_try_finally_554, await_in_finally_in_async_iter) {
-    BEZEL_EXPECT_EQ(compileAndRun(R"(
+    // §30.7 v0.137 (#655): `await` in the `finally` of an async iterator is
+    // forbidden.  This shape must be rejected with a diagnostic.
+    BEZEL_EXPECT_EQ(compileFails(R"(
 module M;
 class C
   public static finallyRan: int := 0;
@@ -300,7 +330,7 @@ class C
     return sum;
   end Main;
 end C;
-)"), 4);
+)"), true);
 }
 
 // ===========================================================================

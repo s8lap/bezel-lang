@@ -2260,14 +2260,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         } else if (m == "NewSender") {
                             // NewSender() → owned ChannelSender<T>.
                             ctx_.setExprType(&ce, makeChannelSender(elemTy));
-                        } else if (m == "Send") {
-                            // Send(owned item: T) → void (no return type set = unit).
                         } else if (m == "Count" || m == "IsClosed") {
                             // Count → int; IsClosed → bool.
                             if (m == "Count")
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                             else
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        } else if (m != "Dispose") {
+                            // §6.9 / #640: Channel<T> does not expose `Send` or
+                            // `TrySend` (those live on ChannelSender<T>); any other
+                            // unknown name is equally invalid.  Emit a diagnostic
+                            // pointing to the correct API surface.
+                            // `Dispose` is compiler-generated and must silently pass.
+                            std::string hint;
+                            if (m == "Send" || m == "TrySend") {
+                                hint = "; `" + std::string(m) + "` is only available "
+                                       "on `ChannelSender<T>` — obtain one via "
+                                       "`ch.NewSender()` (stdlib \xC2\xA7""6.9, #640)";
+                            }
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `Channel<T>`" + hint +
+                                " (stdlib \xC2\xA7""6.9)");
                         }
                     }
 

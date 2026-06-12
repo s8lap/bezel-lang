@@ -3279,6 +3279,15 @@ private:
     // allocas of an async catch arm (the binding / caught-exc disposal slots).
     static bool stmtContainsAwait(const ast::Stmt* s);
 
+    // §30.7 v0.137 (#655): does the body contain an `await` inside ANY `finally`
+    // block?  Forbidden in async iterators because the Dispose path runs
+    // synchronously — there is no async driver when a consumer abandons iteration
+    // early (§29.7), so a suspension there would have nowhere to resume.
+    // Only called from emitAsyncIteratorMethod; emitAsyncMethod must NOT call
+    // this (an ordinary async method may await in its finally, §30.9).
+    static bool awaitInFinallyPosition(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+
     // §30.1 / §30.2: emit an `async` method (one returning Task / Task<T> /
     // OwnedTask<T>; the async-iterator forms — async + yield — are deferred).
     // Mirrors emitIteratorMethod with smKind_ == Await. Layers the task-driver
