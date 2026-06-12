@@ -50,6 +50,8 @@ set(BEZEL_TEST_SOURCES
     parser/await_using_and_for_test.cpp
     parser/parameterised_lambdas_test.cpp
     parser/property_accessor_blocks_test.cpp
+    parser/property_setter_expr_body_676_test.cpp
+    parser/iface_indexer_owned_setter_681_test.cpp
     parser/case_and_patterns_test.cpp
     parser/case_stmt_test.cpp
     parser/case_scrutineeless_test.cpp
