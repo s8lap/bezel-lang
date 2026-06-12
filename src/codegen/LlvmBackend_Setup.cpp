@@ -7506,14 +7506,9 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         genericBackingType(dictTy, 0, /*isSet=*/false, nullptr);
     bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
 
-    // Value type analysis (mirrors .Add branch for record-value boxing — D4).
+    // Value type analysis (only valTy is needed now; encodeVal boxes all structs).
     const sema::TypeRef* valTy =
         (dictTy->genericArgs.size() > 1) ? dictTy->genericArgs[1] : nullptr;
-    const sema::TypeSymbol* valRec =
-        (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
-         valTy->declaration &&
-         valTy->declaration->kind == ast::TypeDeclKind::Record)
-            ? valTy->declaration : nullptr;
 
     // --- 1. Allocate the backing hash table (same as lowerNew Dictionary). ---
     llvm::Value* dict = nullptr;
@@ -7539,10 +7534,10 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
     // Encode a scalar/float/ptr/record value into the void* slot the runtime
     // stores (mirrors the encodeValue lambda in tryLowerCollectionInstanceCall).
     auto encodeVal = [&](llvm::Value* v) -> llvm::Value* {
-        if (valRec && v->getType()->isStructTy()) {
-            // Record value: heap-box it (malloc + store) — issue D4.
-            llvm::StructType* vst = recordStruct(valRec);
-            uint64_t vsz = module_->getDataLayout().getTypeAllocSize(vst);
+        // fix #685: any struct-typed value (record, nullable, or primitive struct
+        // e.g. decimal) must be heap-boxed — too wide for the scalar inttoptr slot.
+        if (v->getType()->isStructTy()) {
+            uint64_t vsz = module_->getDataLayout().getTypeAllocSize(v->getType());
             auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
             llvm::Value* box =
                 builder_.CreateCall(mallocFn, {builder_.getInt64((int64_t)vsz)});

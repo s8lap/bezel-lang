@@ -504,6 +504,9 @@ set(BEZEL_TEST_SOURCES
     # --- #550 JSON format tier (§2.15 JsonSerializer/JsonDeserializer) ---
     codegen/json_550_test.cpp
     # --- end #550 JSON ---
+    # --- fix #685/#679/#682: struct-as-scalar lowering (decimal Set/Dict, field Mutex, range slice) ---
+    codegen/struct_scalar_685_679_682_test.cpp
+    # --- end #685/#679/#682 ---
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

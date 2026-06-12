@@ -3045,10 +3045,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (valNullableVal && v->getType()->isStructTy() &&
                 v->getType() != nullableValueStructTy(valTy))
                 v = wrapNullableValue(valTy, v);  // inner record → {i8=1, record}
-            if ((valRec || valNullableVal) && v->getType()->isStructTy()) {
-                // Box the struct (record or nullable-value-type tagged struct)
-                // into a malloc'd region.  The tag byte for nullable types is
-                // preserved in the stored bytes, so null vs non-null survives.
+            // fix #685 / §4.4: any struct-typed value (record, nullable-record, and
+            // primitive structs such as decimal { i32×4 }) must be heap-boxed —
+            // they are too wide for the scalar inttoptr void* slot and ZExt is
+            // illegal on aggregate types.  (Records and nullable-value-types are
+            // already handled by the valRec/valNullableVal guards above; this arm
+            // catches remaining struct types — decimal is the current case.)
+            if (v->getType()->isStructTy()) {
+                // Box the struct into a malloc'd region (size = LLVM alloc size).
                 uint64_t vsz =
                     module_->getDataLayout().getTypeAllocSize(v->getType());
                 auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
@@ -3243,8 +3247,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* notFound = builder_.CreateNot(found, "pv.notfound");
             emitGuardThrow(notFound, "InvalidOperationException");
             // Decode the stored void* into the value LLVM type (same as TryGetValue).
+            // fix #685: any struct-typed value (record, nullable, decimal, etc.) is
+            // heap-boxed by encodeValue; load the struct bytes back from the box.
             llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot, "pv.vptr");
-            if ((valRec || valNullableVal) && valLlvm->isStructTy()) {
+            if (valLlvm->isStructTy()) {
                 return builder_.CreateLoad(valLlvm, valPtr, "pv.rec");
             } else if (!valLlvm->isPointerTy()) {
                 llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
@@ -3288,13 +3294,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
             }
             llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot);
-            if ((valRec || valNullableVal) && outTy && outTy->isStructTy()) {
-                // Load the boxed struct (record or nullable-value-type tagged
-                // struct) and store it into the out slot.  Guard the box pointer
-                // (it is null on a not-found lookup) so we never dereference
-                // null: only copy on the found path.
-                // issue #539: nullable value types produce a non-null box even
-                // for the null? value (hasValue=0 is in the bytes, not the ptr).
+            // fix #685: any struct-typed value (record, nullable, or primitive
+            // struct e.g. decimal) is heap-boxed by encodeValue; load back from box.
+            if (outTy && outTy->isStructTy()) {
+                // Load the boxed struct and store it into the out slot.  Guard the
+                // box pointer (null on not-found) so we never dereference null.
                 auto* copyBB = llvm::BasicBlock::Create(llvm_, "tg.copy", currentFn_);
                 auto* endBB  = llvm::BasicBlock::Create(llvm_, "tg.end", currentFn_);
                 llvm::Value* nonNull = builder_.CreateICmpNE(
@@ -3364,14 +3368,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!valLlvm) valLlvm = ptrTy();
 
             // Decode a stored void* slot value into the V LLVM type — identical to
-            // the TryGetValue / indexer-get decode (record or nullable-value-type
-            // tagged struct → load the boxed struct; scalar → ptrtoint then
+            // the TryGetValue / indexer-get decode (record, nullable, or primitive
+            // struct e.g. decimal → load the boxed struct; scalar → ptrtoint then
             // truncate/bitcast; pointer → the void* IS the string/object pointer).
-            // issue #539: nullable value types (int?, bool?, etc.) lower to a
-            // {i8,T} struct and must be unboxed the same way records are.
+            // fix #685: any struct-typed value is heap-boxed; unbox via Load.
             // `slotV` is the raw stored void*.
             auto decodeSlot = [&](llvm::Value* slotV) -> llvm::Value* {
-                if ((valRec || valNullableVal) && valLlvm->isStructTy())
+                if (valLlvm->isStructTy())
                     return builder_.CreateLoad(valLlvm, slotV, "goa.rec");
                 if (!valLlvm->isPointerTy()) {
                     llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
@@ -9792,9 +9795,11 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
     else if (isString) eligible = true;  // set element only (dict returned above)
     else if (!ty->nullable && ty->kind == K::Primitive &&
              ty->primitive != sema::PrimitiveType::String &&
-             ty->primitive != sema::PrimitiveType::Object &&
-             ty->primitive != sema::PrimitiveType::Decimal)
-        eligible = true;  // int/long/bool/char/byte/short/uint/.../float/double
+             ty->primitive != sema::PrimitiveType::Object)
+        // fix #685 / §4.4 / §8.3: decimal is a 16-byte struct but has well-defined
+        // value equality (bz_decimal_cmp) and hash (bz_decimal_hash — normalized so
+        // 1.0m == 1.00m).  Allow decimal as a generic-backed key/set-element.
+        eligible = true;  // int/long/bool/char/byte/short/uint/.../float/double/decimal
     else if (!ty->nullable && ty->kind == K::Named && ty->declaration &&
              ty->declaration->kind == ast::TypeDeclKind::Enum)
         eligible = true;  // enum key/element (lowers to i32; value-compared)
@@ -9865,9 +9870,24 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
     currentFn_ = fn;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     builder_.SetInsertPoint(entry);
+    using K = sema::TypeRef::Kind;
+    // fix #685 / §4.4 / §8.3: decimal trampoline — load the two structs directly
+    // from the byte pointers and call bz_decimal_cmp (normalized equality).
+    bool isDecimal = ty && ty->kind == K::Primitive &&
+                     ty->primitive == sema::PrimitiveType::Decimal && !ty->nullable;
+    if (isDecimal) {
+        // The key bytes are the raw %bz.decimal struct bytes; ptr arg is the key ptr.
+        auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* cmp = builder_.CreateCall(cmpFn,
+            {fn->getArg(0), fn->getArg(1)}, "dec.eq.cmp");
+        llvm::Value* eq = builder_.CreateICmpEQ(cmp, llvm::ConstantInt::get(i32(), 0));
+        builder_.CreateRet(eq);
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        return fn;
+    }
     llvm::Value* a = builder_.CreateLoad(lt, fn->getArg(0), "eq.a");
     llvm::Value* b = builder_.CreateLoad(lt, fn->getArg(1), "eq.b");
-    using K = sema::TypeRef::Kind;
     bool isString = ty->kind == K::Primitive &&
                     ty->primitive == sema::PrimitiveType::String;
     llvm::Value* eq;

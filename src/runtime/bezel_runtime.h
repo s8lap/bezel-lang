@@ -115,6 +115,14 @@ void bz_array_sort_closure(void* arr, int64_t elem_size,
 // and Array<T>.Sorted[...] (stdlib §3 / #472).
 void* bz_array_copy(void* arr, int64_t elem_size);
 
+// fix #682 / §15.6: return a fresh Array<T> containing copies of elements in
+// the half-open range [start, end).  `end` is exclusive.  Precondition: the
+// caller has already bounds-checked start/end against Count (raises
+// IndexOutOfRangeException via codegen emitGuardThrow before calling here).
+// The caller owns the returned array and must free it with
+// bz_array_free(result, /*disposer=*/null).
+void* bz_array_slice(void* arr, int64_t start, int64_t end, int64_t elem_size);
+
 // #429 / §4.6 / §28.9: bz_string_retain every non-null pointer-sized element of
 // `arr` (each slot holds a bz_string*).  Codegen calls this on a freshly copied
 // or materialized Array<string> (bz_array_copy / bz_lazy_to_array result) so the
@@ -422,6 +430,12 @@ void bz_decimal_neg(const bz_decimal_t* a, bz_decimal_t* out);
 
 // Comparison — returns negative/zero/positive like memcmp.
 int32_t bz_decimal_cmp(const bz_decimal_t* a, const bz_decimal_t* b);
+
+// fix #685 / §4.4 / §8.3: content-based hash consistent with bz_decimal_cmp
+// equality (1.0m and 1.00m compare equal → must hash identically). Normalizes
+// by stripping trailing zeros from the mantissa+scale, then folds the canonical
+// (sign, mantissa) into a 32-bit value.  Always returns 0 for any zero value.
+int32_t bz_decimal_hash(const bz_decimal_t* a);
 
 // Conversions — from integer (per §5.1 implicit widening table).
 void bz_decimal_from_int64(int64_t v, bz_decimal_t* out);

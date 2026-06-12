@@ -2196,6 +2196,16 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
         builder_.SetInsertPoint(endBB);
         return builder_.CreateLoad(i32(), hashSlot);
     }
+    // fix #685 / §4.4 / §8.3: decimal value struct { i32×4 } — bz_decimal_hash
+    // (normalized, consistent with bz_decimal_cmp so 1.0m == 1.00m → same hash).
+    if (fieldTy && fieldTy->kind == sema::TypeRef::Kind::Primitive &&
+        fieldTy->primitive == sema::PrimitiveType::Decimal &&
+        !fieldTy->nullable) {
+        llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+        builder_.CreateStore(val, slot);
+        auto* hashFn = declareC("bz_decimal_hash", i32(), {ptrTy()});
+        return builder_.CreateCall(hashFn, {slot}, "dec.hash");
+    }
     // Numeric / bool / char / enum: derive an i32 from the bits.
     if (val->getType()->isIntegerTy()) {
         if (val->getType()->isIntegerTy(64)) {
