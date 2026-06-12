@@ -346,6 +346,15 @@ private:
     // through the cell (see `boxedStorage`). The set is part of the saved/
     // restored emitter state across nested-function emission.
     std::unordered_map<llvm::AllocaInst*, llvm::Type*> cellVars_;
+    // §27.5 / #673: for guarded-boxed (non-for-var) locals, maps each
+    // cell-holder alloca (newSlot) to the ORIGINAL pre-boxing alloca
+    // (the variable's original storage slot).  After boxing, the original
+    // slot is kept in sync on every write so that pre-emitted code (e.g.
+    // a while-loop condition lowered before the body) that loads from the
+    // original alloca sees the updated value.  NOT populated for for-var
+    // loop variables (their incBB manages the original slot directly).
+    // Part of the saved/restored emitter state across nested-function emission.
+    std::unordered_map<llvm::AllocaInst*, llvm::AllocaInst*> cellVarSyncSlot_;
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
@@ -4280,6 +4289,19 @@ private:
     //           by a re-initialisation on subsequent loop iterations.
     llvm::Value* boxLocalSlot(llvm::AllocaInst* slot, llvm::AllocaInst*& newSlot,
                               bool forLoopVar = false);
+
+    // §27.5 / #673: after writing `val` to the cell of a guarded-boxed
+    // local (whose cell-holder alloca is `newSlot`), also store `val` to
+    // the original pre-boxing alloca if `cellVarSyncSlot_` has an entry.
+    // This keeps pre-emitted code that reads the original alloca (e.g. a
+    // while-loop condition lowered before the lambda was encountered) in
+    // sync with the cell.  No-op for for-var locals (their incBB manages
+    // the original slot directly and they have no cellVarSyncSlot_ entry).
+    void syncCellToOrigSlot(llvm::AllocaInst* newSlot, llvm::Value* val) {
+        auto it = cellVarSyncSlot_.find(newSlot);
+        if (it != cellVarSyncSlot_.end() && it->second)
+            builder_.CreateStore(val, it->second);
+    }
 
     // §27.5: when a `using var` local is boxed for capture its storage slot
     // changes; update any pending disposal entry so scope-end disposal loads

@@ -206,3 +206,74 @@ BEZEL_TEST(codegen_closures_27_5, nested_lambda_capture) {
         "  end Main; "
         "end C;"), 11);
 }
+
+// §27.5 / #673: for-var loop variable captured by lambda, then REASSIGNED in
+// the loop body.  §27.5 fresh binding per iteration: each iteration k has a
+// new cell initialised from the loop counter; the body's `k := k + 1`
+// modifies that fresh cell; f() returns the UPDATED cell value.
+// Expected: f() on iter 0 returns 0+1=1, iter 1 returns 1+1=2, iter 2
+// returns 2+1=3; total = 6.  The loop terminates after exactly 3 iterations
+// (incBB advances the original slot; condBB checks the slot).
+// This shape CRASHED codegen before #673 (miscompile/codegen abort).
+BEZEL_TEST(codegen_closures_27_5, for_var_capture_then_reassign_spec_27_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var total: int := 0; "
+        "    for var k in 0..2 do "
+        "      var f: () -> int := () => k; "
+        "      k := k + 1; "          // reassign the for-var loop variable
+        "      total := total + f(); " // f sees the updated k
+        "    end; "
+        "    return total; "
+        "  end Main; "
+        "end C;"), 6);
+}
+
+// §27.5 / #673: named lambda in a while-loop capturing the loop variable
+// that is also used as the loop increment.  After boxing with the guarded
+// path (non-for-var), all writes to `k` go through the cell.  The
+// pre-boxing alloca (read by the while condition in condBB) is kept in
+// sync via the cellVarSyncSlot_ write-back so the condition sees updates.
+//
+// Without the fix: `k := k + 1` writes to the cell only; the original
+// alloca stays at 0 → condition `0 < 3` is always true → infinite loop.
+// With the fix: each write also syncs to the original alloca → condition
+// correctly observes the updated k → loop terminates after 3 iterations.
+// After the loop, f() reads the cell (which holds 3) → returns 3.
+BEZEL_TEST(codegen_closures_27_5, while_var_capture_and_loop_increment_spec_27_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var k: int := 0; "
+        "    var f: () -> int := () => 0; "
+        "    while k < 3 do "
+        "      f := () => k; "   // capture k via shared cell (guarded boxing)
+        "      k := k + 1; "     // writes to cell AND syncs to original alloca
+        "    end; "
+        "    return f(); "       // cell holds 3 after 3 increments
+        "  end Main; "
+        "end C;"), 3);
+}
+
+// §27.5 / #673: while-loop with IIFE capturing the loop counter variable
+// (the pattern that triggered the original pre-existing crash report in
+// commit ee35cdd via the #429 activation lane).  The loop variable `k`
+// is captured by the IIFE and also serves as the loop increment.  The
+// IIFE returns k*k; the loop accumulates the squares of 0..4.
+// Without the fix: infinite loop (condition reads stale alloca).
+// With the fix: terminates; total = 0+1+4+9+16 = 30.
+BEZEL_TEST(codegen_closures_27_5, while_iife_capture_and_loop_increment_spec_27_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var k: int := 0; "
+        "    var total: int := 0; "
+        "    while k < 5 do "
+        "      total := total + (() => k * k)(); " // IIFE captures k
+        "      k := k + 1; "                        // sync keeps condBB in sync
+        "    end; "
+        "    return total; "    // 0+1+4+9+16 = 30
+        "  end Main; "
+        "end C;"), 30);
+}

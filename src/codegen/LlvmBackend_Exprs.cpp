@@ -5006,6 +5006,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     auto savedLocals = locals_;
     auto savedParams = paramSlots_;
     auto savedCellVars = cellVars_;
+    auto savedCellVarSyncSlot = cellVarSyncSlot_;
     auto savedDisposeStack = disposeStack_;
     currentFn_ = fn;
     currentThis_ = nullptr;
@@ -5013,6 +5014,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     paramSlots_.clear();
     refParams_.clear();
     cellVars_.clear();
+    cellVarSyncSlot_.clear();
     disposeStack_.clear();
     loopStack_.clear(); finallyStack_.clear();
     unwindTarget_ = nullptr;
@@ -5219,6 +5221,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     paramSlots_ = std::move(savedParams);
     refParams_ = std::move(savedRefParams);
     cellVars_ = std::move(savedCellVars);
+    cellVarSyncSlot_ = std::move(savedCellVarSyncSlot);
     disposeStack_ = std::move(savedDisposeStack);
     loopStack_ = std::move(savedLoopStack);
     finallyStack_ = std::move(savedFinallyStack);  // #546 / §31.2: restore
