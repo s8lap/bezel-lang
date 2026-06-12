@@ -6683,10 +6683,15 @@ extern "C" void* bz_cts_alloc(void) {
 }
 
 extern "C" void* bz_cts_token(void* srcp) {
+    // §6.1 / #647: returns the bz_cancel_state_t* as a BORROW — the CTS object
+    // keeps the state alive (rc=1) for as long as the CTS itself is alive.
+    // The caller does NOT retain: the token is valid until the CTS is disposed,
+    // which in idiomatic Bezel always outlives the token's use (using-var scope).
+    // Async slow paths (bz_mutex_acquire_async / bz_task_delay_cancelable) that
+    // capture the token beyond the call boundary do their own retain/release.
     auto* src = (bz_cancel_source_t*)srcp;
     if (!src || !src->state) return nullptr;
-    bz_cancel_state_retain(src->state);  // token borrows a reference
-    return src->state;                   // CancellationToken handle
+    return src->state;   // CancellationToken handle (borrowed, not retained)
 }
 
 extern "C" int32_t bz_cts_is_cancelled(void* srcp) {
@@ -6796,14 +6801,19 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
     // Not cancelled: schedule the delay worker.
     if (!g_scheduler) bz_scheduler_init(4);
     int64_t ms = milliseconds < 0 ? 0 : milliseconds;
+    // Retain the token for the pool worker so the bz_cancel_state_t stays alive
+    // even if the CTS is disposed before the sleep finishes (#647 / §6.1).
+    bz_cancel_state_retain(s);
     g_scheduler->submit([task, ms, s, oce_vtable]() {
         if (ms > 0)
             std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         // Post-sleep check: if token was cancelled while sleeping, fault.
         if (s && s->cancelled) {
             void* excObj = bz_task_make_oce(oce_vtable);
+            bz_cancel_state_release(s);  // release the worker's token ref
             bz_task_complete_error_obj(task, excObj);
         } else {
+            bz_cancel_state_release(s);  // release the worker's token ref
             bz_task_complete(task, nullptr, 0);
         }
     });
@@ -9199,6 +9209,233 @@ void bz_mutex_dispose(void* mp) {
     if (m->disposed) return;
     m->disposed = true;
     mutex_core_release(m);  // drop the Mutex object's own ref
+}
+
+// ---------------------------------------------------------------------------
+// §6.2 async variants (issue #647, v0.139): AcquireAsync / TryAcquireAsync.
+//
+// Waiter/handoff design (recorded per CLAUDE.md §4 "decline-with-reasons"):
+//
+//   A true "waiter queue" on the mutex core with direct handoff on release
+//   would require replacing the pthread_mutex_t with a hand-rolled spinlock/
+//   condvar assembly and changing bz_lock_release to pop and complete the next
+//   waiter's task atomically.  That is sound but large.
+//
+//   Alternative chosen (simpler, auditable):
+//     Uncontended fast path — pthread_mutex_trylock succeeds → allocate the
+//     lock, complete the task immediately (already-done fast path in await).
+//     Contended path — submit a pool worker that calls pthread_mutex_lock (or
+//     timedlock) in a blocking manner, allocates the lock on acquire, then
+//     calls bz_task_complete.  bz_task_complete → task_notify → domain_enqueue
+//     wakes the awaiting continuation in its own domain queue — identical to
+//     the Task.Delay mechanism.  The "handoff" is thus: when the holder calls
+//     bz_lock_release (pthread_mutex_unlock), the OS wakes the blocking pool
+//     worker, which then completes the task and routes the continuation back to
+//     the domain.  This is correct: no starvation (POSIX liveliness), no UAF
+//     (core refs held across the blocking acquire and released after complete),
+//     no double-release (idempotent bz_lock_t flag).
+//
+//   Cancellation:
+//     Pre-checked before pool submission.  If already cancelled at call time →
+//     fault the task immediately (already-done, so await's fault path fires
+//     synchronously on the next domain step).  If cancellation arrives WHILE
+//     the pool worker is blocking inside pthread_mutex_lock, the worker detects
+//     it after lock acquisition: it releases the mutex immediately (unlock +
+//     core deref) and faults the task with OCE.  This is safe because the mutex
+//     was only briefly held by the pool worker and is released before the fault;
+//     the caller never sees the Lock object.
+//
+//   TryAcquireAsync:
+//     Same as AcquireAsync but uses pthread_mutex_timedlock / trylock on the
+//     pool worker.  If the timeout expires → complete the task with a null ptr
+//     (no lock) rather than a bz_lock_t.  Cancel + timeout: if already
+//     cancelled pre-submit → fault immediately (takes priority over timeout).
+//
+// ---------------------------------------------------------------------------
+
+// Internal helper: allocate an already-done task carrying a void*-result.
+// result_ptr is stored as sizeof(void*) bytes so the await machinery
+// (which reads task->result as a void*) retrieves the lock pointer.
+static bz_task_t* mutex_make_done_task(void* result_ptr) {
+    bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
+    auto* task = new bz_task_t();
+    task->domain = g_main_domain;
+    domain_ref(g_main_domain);
+    // Store the pointer as the task's result (sizeof(void*) bytes).
+    task->result = malloc(sizeof(void*));
+    memcpy(task->result, &result_ptr, sizeof(void*));
+    task->result_size = (int64_t)sizeof(void*);
+    task->done = true;
+    return task;
+}
+
+// Internal helper: allocate an already-faulted task with an OCE object.
+static bz_task_t* mutex_make_faulted_task(void* oce_vtable) {
+    bz_main_domain_get();
+    auto* task = new bz_task_t();
+    task->domain = g_main_domain;
+    domain_ref(g_main_domain);
+    task->error_obj = bz_task_make_oce(oce_vtable);
+    task->is_error = true;
+    task->done = true;
+    return task;
+}
+
+// bz_mutex_acquire_async — per §6.2 / #647.
+// Returns a bz_task_t* (OwnedTask<Lock>).
+// Fast path (trylock succeeds): already-done task with the lock pointer.
+// Slow path (contested): pool worker blocks, then completes the task.
+void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
+    auto* m = (bz_mutex_t*)mp;
+    auto* s = (bz_cancel_state_t*)token;
+
+    // Pre-cancel check.
+    if (s && s->cancelled) {
+        return mutex_make_faulted_task(oce_vtable);
+    }
+
+    // Uncontended fast path: try without blocking.
+    int rc = pthread_mutex_trylock(&m->mtx);
+    if (rc == 0) {
+        // Acquired immediately.
+        mutex_core_ref(m);
+        auto* lk = new bz_lock_t{m, false};
+        return mutex_make_done_task(lk);
+    }
+
+    // Contended path: submit a pool worker.
+    if (!g_scheduler) bz_scheduler_init(4);
+    bz_main_domain_get();
+    auto* task = new bz_task_t();
+    task->domain = g_main_domain;
+    domain_ref(g_main_domain);
+
+    // The worker holds a core ref so the mutex core cannot be destroyed while
+    // the pool thread is blocking inside pthread_mutex_lock.
+    mutex_core_ref(m);
+
+    // The worker captures the token pointer; retain it so the bz_cancel_state_t
+    // stays alive even if the caller's CTS is disposed before the pool thread
+    // finishes. The worker releases its reference when done (#647 / §6.1).
+    bz_cancel_state_retain(s);
+
+    g_scheduler->submit([task, m, s, oce_vtable]() {
+        pthread_mutex_lock(&m->mtx);
+        // Check cancel AFTER acquiring (the brief hold is released if cancelled).
+        if (s && s->cancelled) {
+            pthread_mutex_unlock(&m->mtx);
+            mutex_core_release(m);  // release the worker's extra core ref
+            bz_cancel_state_release(s);  // release the worker's token ref
+            void* excObj = bz_task_make_oce(oce_vtable);
+            bz_task_complete_error_obj(task, excObj);
+            return;
+        }
+        bz_cancel_state_release(s);  // release the worker's token ref
+        // Acquire succeeded and not cancelled: build a lock and complete.
+        // The core ref the worker held is transferred to the new bz_lock_t.
+        auto* lk = new bz_lock_t{m, false};
+        // (core ref already held — do NOT call mutex_core_ref again here)
+        void* lkPtr = lk;
+        bz_task_complete(task, &lkPtr, (int64_t)sizeof(void*));
+    });
+    return task;
+}
+
+// bz_mutex_try_acquire_async — per §6.2 / #647.
+// Returns a bz_task_t* (OwnedTask<Lock?>).
+// Result is a bz_lock_t* on success, or a null void* on timeout.
+void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
+                                  void* token, void* oce_vtable) {
+    auto* m = (bz_mutex_t*)mp;
+    auto* s = (bz_cancel_state_t*)token;
+
+    // Pre-cancel check (takes priority over timeout).
+    if (s && s->cancelled) {
+        return mutex_make_faulted_task(oce_vtable);
+    }
+
+    // Uncontended fast path: trylock (works for zero timeout too).
+    int rc;
+    if (timeout_ms <= 0) {
+        rc = pthread_mutex_trylock(&m->mtx);
+        if (rc == EDEADLK) rc = EBUSY;
+    } else {
+        // Try without blocking first; if held we go to slow path.
+        rc = pthread_mutex_trylock(&m->mtx);
+        if (rc == EDEADLK) rc = EBUSY;
+    }
+
+    if (rc == 0) {
+        // Acquired immediately → non-null result.
+        mutex_core_ref(m);
+        auto* lk = new bz_lock_t{m, false};
+        return mutex_make_done_task(lk);
+    }
+
+    // If zero/negative timeout: mutex is held, return null immediately (no point
+    // submitting a pool worker that would return instantly anyway).
+    if (timeout_ms <= 0) {
+        void* nullPtr = nullptr;
+        bz_main_domain_get();
+        auto* task = new bz_task_t();
+        task->domain = g_main_domain;
+        domain_ref(g_main_domain);
+        task->result = malloc(sizeof(void*));
+        memcpy(task->result, &nullPtr, sizeof(void*));
+        task->result_size = (int64_t)sizeof(void*);
+        task->done = true;
+        return task;
+    }
+
+    // Positive timeout + mutex currently held: submit timed blocking on pool.
+    if (!g_scheduler) bz_scheduler_init(4);
+    bz_main_domain_get();
+    auto* task = new bz_task_t();
+    task->domain = g_main_domain;
+    domain_ref(g_main_domain);
+
+    // Worker holds a core ref across the blocking timedlock.
+    mutex_core_ref(m);
+    int64_t tms = timeout_ms;
+
+    // Retain the token for the pool worker so the bz_cancel_state_t stays alive
+    // even if the CTS is disposed before the worker finishes (#647 / §6.1).
+    bz_cancel_state_retain(s);
+
+    g_scheduler->submit([task, m, tms, s, oce_vtable]() {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec  += tms / 1000;
+        deadline.tv_nsec += (tms % 1000) * 1000000LL;
+        if (deadline.tv_nsec >= 1000000000LL) {
+            deadline.tv_sec  += 1;
+            deadline.tv_nsec -= 1000000000LL;
+        }
+        int rc2 = pthread_mutex_timedlock(&m->mtx, &deadline);
+        if (rc2 != 0) {
+            // Timeout or same-thread deadlock detection → null result.
+            mutex_core_release(m);  // release the worker's extra core ref
+            bz_cancel_state_release(s);  // release the worker's token ref
+            void* nullPtr = nullptr;
+            bz_task_complete(task, &nullPtr, (int64_t)sizeof(void*));
+            return;
+        }
+        // Acquired: check cancellation post-acquire.
+        if (s && s->cancelled) {
+            pthread_mutex_unlock(&m->mtx);
+            mutex_core_release(m);
+            bz_cancel_state_release(s);  // release the worker's token ref
+            void* excObj = bz_task_make_oce(oce_vtable);
+            bz_task_complete_error_obj(task, excObj);
+            return;
+        }
+        bz_cancel_state_release(s);  // release the worker's token ref
+        // Build the lock; core ref transferred to bz_lock_t.
+        auto* lk = new bz_lock_t{m, false};
+        void* lkPtr = lk;
+        bz_task_complete(task, &lkPtr, (int64_t)sizeof(void*));
+    });
+    return task;
 }
 
 } // extern "C" (Mutex + Lock)

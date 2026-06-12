@@ -1374,6 +1374,34 @@ void  bz_lock_release(void* lock);
 // core ref. The pthread_mutex is destroyed only when the last Lock is also gone.
 void  bz_mutex_dispose(void* mutex);
 
+// ---------------------------------------------------------------------------
+// §6.2 async variants (issue #647, v0.139): AcquireAsync / TryAcquireAsync.
+//
+// Both return an OwnedTask<Lock> / OwnedTask<Lock?> (bz_task_t* carrying a
+// bz_lock_t* result stored as a void*-sized payload).
+//
+// bz_mutex_acquire_async(mutex, token, oce_vtable)
+//   token     — CancellationToken (bz_cancel_state_t*); null = .None.
+//   oce_vtable — vtable* for OperationCanceledException (for token cancel faults).
+//   Returns a bz_task_t* whose result, once done, is a bz_lock_t* (void*).
+//
+// bz_mutex_try_acquire_async(mutex, timeout_ms, token, oce_vtable)
+//   timeout_ms — milliseconds; <= 0 → trylock (immediate fail if held).
+//   Returns a bz_task_t* whose result is a bz_lock_t* (non-null) or null
+//   (stored as a null void*) on timeout.
+//
+// Design: uncontended fast-path via pthread_mutex_trylock → already-done task;
+// contended path submits a pool worker that blocks on the mutex (or times out),
+// then calls bz_task_complete with the lock pointer.  Cancellation is pre-checked
+// before submission; post-submit cancellation for the blocking worker faults the
+// task on wakeup (checked after blocking returns) -- the pthread blocking call
+// itself is not interrupted (conservative: no POSIX interruptible mutex wait),
+// but a cancel during the wait is detected immediately on return.
+// ---------------------------------------------------------------------------
+void* bz_mutex_acquire_async(void* mutex, void* token, void* oce_vtable);
+void* bz_mutex_try_acquire_async(void* mutex, int64_t timeout_ms,
+                                  void* token, void* oce_vtable);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

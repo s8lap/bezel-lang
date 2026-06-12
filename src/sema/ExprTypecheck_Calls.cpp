@@ -2375,14 +2375,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             tr->nullable = true;
                             ctx_.setExprType(&ce, tr);
                         } else if (m == "AcquireAsync" || m == "TryAcquireAsync") {
-                            // §6.2 / #647 async variants: not yet implemented.
-                            // Emit a clean diagnostic at the call site.
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                "not yet implemented (#647 async acquire): "
-                                "AcquireAsync / TryAcquireAsync require suspension "
-                                "integration with the task runtime and are deferred "
-                                "to a follow-up lane");
+                            // §6.2 / #647 / v0.139: AcquireAsync / TryAcquireAsync.
+                            //
+                            // AcquireAsync(token := CancellationToken.None)
+                            //   → OwnedTask<Lock>
+                            // TryAcquireAsync(timeout: TimeSpan,
+                            //                 token := CancellationToken.None)
+                            //   → OwnedTask<Lock?>
+                            //
+                            // Build OwnedTask<Lock> / OwnedTask<Lock?> TypeRef.
+                            // Helper: build OwnedTask<T> TypeRef.
+                            auto makeOwnedTaskOf = [&](TypeRef* inner) -> TypeRef* {
+                                auto* ot = ctx_.makeTypeRef();
+                                ot->kind = TypeRef::Kind::Named;
+                                ot->nullable = false;
+                                auto* ann = new ast::Type();
+                                ann->kind = ast::TypeKind::Named;
+                                auto* nm = new ast::QualifiedName();
+                                nm->parts.push_back("OwnedTask");
+                                ann->name.reset(nm);
+                                ot->astNode = ann;
+                                if (inner) ot->genericArgs.push_back(inner);
+                                return ot;
+                            };
+                            if (m == "AcquireAsync") {
+                                // OwnedTask<Lock>
+                                ctx_.setExprType(&ce,
+                                    makeOwnedTaskOf(makeLockTypeRef()));
+                            } else {
+                                // TryAcquireAsync → OwnedTask<Lock?>
+                                auto* lockNullable = makeLockTypeRef();
+                                lockNullable->nullable = true;
+                                ctx_.setExprType(&ce,
+                                    makeOwnedTaskOf(lockNullable));
+                            }
                         } else if (m != "Dispose") {
                             // §6.2 / #674: Mutex exposes only Acquire(),
                             // TryAcquire(), AcquireAsync(), TryAcquireAsync(),

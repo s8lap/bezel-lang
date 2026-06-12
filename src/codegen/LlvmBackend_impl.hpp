@@ -4556,6 +4556,12 @@ private:
             // stdlib §5 (#651): IGrouping<TKey, T> is a compiler-known pointer
             // (bz_grouping_t*) produced by GroupBy.
             "IGrouping",
+            // §6.2 / #647: Mutex and Lock are compiler-known heap-pointer builtins
+            // (bz_mutex_t* and bz_lock_t* respectively). Without these entries a
+            // nullable `Lock?` was mis-classified as a bare generic type-parameter
+            // and the nullable-type-param branch (fix #568) lowered it to {i8,i32}
+            // instead of ptr → emitStructEquality crash on `guard <> null`.
+            "Mutex", "Lock",
         };
         if (kBuiltins.count(name)) return true;
         // §31.4: a built-in exception type (Exception / a subtype).
