@@ -190,6 +190,7 @@ set(BEZEL_TEST_SOURCES
     sema/channel_667_valuetype_test.cpp        # fix #667: value-typed payloads, TryReceive/IsClosed after dispose
     sema/channel_640_phantom_members_test.cpp  # fix #640: Channel<T> phantom Send/TrySend/Bogus rejected (§6.9)
     sema/mutex_sendable_647_test.cpp           # #647: Mutex sendable per stdlib §6.2 v0.138; Lock not sendable
+    sema/builtin_674_uniform_unknown_member_test.cpp  # fix #674: uniform no-member diag for Shared/Weak/Mutex/ChannelSender/ArraySpan/BinarySerializer
     # --- end #600 contract ---
     flow/cfg_basic_test.cpp
     flow/cfg_try_catch_test.cpp
