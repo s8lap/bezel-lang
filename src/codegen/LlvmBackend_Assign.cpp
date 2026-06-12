@@ -59,6 +59,54 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         return builder_.CreateLoad(retTy, out, "sp.elem");
     }
 
+    // issue #545: Buffer<T>[i] get — §16 bounds-checked read via bz_buffer_get_ptr.
+    // Layout: bz_buffer_hdr_t { i64 len, i64 elem_size } + inline payload.
+    // Bounds check: raise IndexOutOfRangeException if idx < 0 OR idx >= len.
+    // Load: call bz_buffer_get_ptr(buf, idx64) → void* element pointer; load T.
+    // Returns the element value (copy — T is a value type per restriction).
+    {
+        bool isBuf = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                     !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
+                     !recvTy->astNode->name->parts.empty() &&
+                     recvTy->astNode->name->parts[0] == "Buffer";
+        if (isBuf) {
+            llvm::Value* buf = lowerExpr(*ix.target);
+            if (!buf) return nullptr;
+            llvm::Value* idx = lowerExpr(*ix.indices[0].value);
+            if (!idx) return nullptr;
+            // Widen idx to i64 for comparison and bz_buffer_get_ptr.
+            llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
+                ? idx : builder_.CreateSExt(idx, i64(), "buf.idx64");
+            // Load the header len field.
+            // bz_buffer_hdr_t: first field is int64 len at byte offset 0.
+            // We load directly from the buffer pointer (opaque ptr) as i64
+            // to avoid struct-type aliasing issues with CreateStructGEP.
+            llvm::Value* len64 = builder_.CreateLoad(i64(), buf, "buf.len");
+            // §16 / issue #545: bounds check — raise IndexOutOfRangeException
+            // if (uint64_t)idx >= (uint64_t)len (covers negative idx too).
+            llvm::Value* oor = builder_.CreateICmpUGE(idx64, len64, "buf.oor");
+            emitGuardThrow(oor, "IndexOutOfRangeException");
+            // Call bz_buffer_get_ptr to get the element pointer.
+            auto* ptrFn = declareC("bz_buffer_get_ptr", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* elemPtr =
+                builder_.CreateCall(ptrFn, {buf, idx64}, "buf.eptr");
+            // Determine the LLVM type for T so we can load the element.
+            llvm::Type* elemTy = i32();  // default: int
+            if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                if (auto* et = lowerTypeRef(recvTy->genericArgs[0]))
+                    elemTy = et;
+            }
+            llvm::Value* elem = builder_.CreateLoad(elemTy, elemPtr, "buf.elem");
+            // For narrow INTEGER types (i8/i16), sign-extend to i32 so arithmetic
+            // operations on the result work correctly (Bezel ints are i32).
+            // bool (i1) is left as i1 — used directly in `if` conditions; it never
+            // participates in integer arithmetic (sema prevents bool+bool etc.).
+            if (elemTy->isIntegerTy(8) || elemTy->isIntegerTy(16))
+                return builder_.CreateSExt(elem, i32(), "buf.elem.i32");
+            return elem;
+        }
+    }
+
     // issue #401 / §4.1-§4.3: a list-INTERFACE receiver (IReadOnlyList<T> /
     // IList<T> / IOwnedList<T>) is array-backed; its runtime pointer is the same
     // bz_array_t* as the concrete Array<T>/OwnedArray<T>, and its element type is
@@ -448,6 +496,56 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                                {ptrTy(), i64(), ptrTy(), i64()});
         builder_.CreateCall(setFn, {src, absIdx, valSlot, builder_.getInt64(esz)});
         return true;
+    }
+
+    // issue #545: Buffer<T>[i] := val — §16 bounds-checked write via bz_buffer_get_ptr.
+    // Bounds check, get element pointer, store val.  Value elements: no disposal of
+    // the displaced slot (no ownership obligation for primitives).
+    {
+        bool isBuf = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                     !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
+                     !recvTy->astNode->name->parts.empty() &&
+                     recvTy->astNode->name->parts[0] == "Buffer";
+        if (isBuf) {
+            llvm::Value* buf = lowerExpr(*ix.target);
+            if (!buf) return false;
+            llvm::Value* idx = lowerExpr(*ix.indices[0].value);
+            if (!idx) return false;
+            llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
+                ? idx : builder_.CreateSExt(idx, i64(), "buf.sidx64");
+            // Load header len for bounds check.
+            // bz_buffer_hdr_t: int64 len at byte offset 0 (opaque ptr direct load).
+            llvm::Value* len64 = builder_.CreateLoad(i64(), buf, "buf.slen");
+            // §16 / issue #545: bounds check.
+            llvm::Value* oor = builder_.CreateICmpUGE(idx64, len64, "buf.soor");
+            emitGuardThrow(oor, "IndexOutOfRangeException");
+            // Get element pointer.
+            auto* ptrFn = declareC("bz_buffer_get_ptr", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* elemPtr =
+                builder_.CreateCall(ptrFn, {buf, idx64}, "buf.septr");
+            // Determine the slot element type from T (genericArgs[0]) so we
+            // can truncate a wider-than-slot value (e.g. i32 literal into a
+            // byte slot).  If val's type already matches or is narrower, store
+            // directly; otherwise truncate to the slot width.
+            llvm::Type* slotTy = val->getType();
+            if (!recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                if (auto* et = lowerTypeRef(recvTy->genericArgs[0]))
+                    slotTy = et;
+            }
+            llvm::Value* storeVal = val;
+            if (storeVal->getType() != slotTy) {
+                if (slotTy->isIntegerTy() && storeVal->getType()->isIntegerTy()) {
+                    unsigned slotBits  = slotTy->getIntegerBitWidth();
+                    unsigned valBits   = storeVal->getType()->getIntegerBitWidth();
+                    if (valBits > slotBits)
+                        storeVal = builder_.CreateTrunc(storeVal, slotTy, "buf.str.trunc");
+                    else if (valBits < slotBits)
+                        storeVal = builder_.CreateSExt(storeVal, slotTy, "buf.str.ext");
+                }
+            }
+            builder_.CreateStore(storeVal, elemPtr);
+            return true;
+        }
     }
 
     // issue #401 / §4.1-§4.3: a list-INTERFACE receiver is array-backed (same

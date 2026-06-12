@@ -10652,3 +10652,57 @@ uint64_t bz_atomic_add(void* ptr, int64_t delta, int signed_,
 }
 
 } // extern "C" (Atomic<T> / AtomicInteger<T>)
+
+// ---------------------------------------------------------------------------
+// Buffer<T> — fixed-capacity compiler-intrinsic primitive (issue #545).
+//
+// Layout: 16-byte header {int64 len, int64 elem_size} followed immediately by
+// the zero-initialised payload (calloc'd as one contiguous allocation).
+// bz_buffer_get_ptr: pointer arithmetic on the payload region (no bounds check
+// — caller emits §16 bounds check before calling this).
+// bz_buffer_free: plain free (value elements carry no ownership obligation).
+// ---------------------------------------------------------------------------
+
+struct bz_buffer_hdr_t {
+    int64_t len;
+    int64_t elem_size;
+    // payload follows immediately in the same calloc block.
+};
+
+extern "C" {
+
+// bz_buffer_new — allocate a zero-initialised Buffer<T>.
+// The allocation is: sizeof(bz_buffer_hdr_t) + len * elem_size bytes,
+// all zeroed by calloc.
+void* bz_buffer_new(int64_t len, int64_t elem_size) {
+    if (len < 0) len = 0;
+    if (elem_size <= 0) elem_size = 1;
+    // Overflow guard: use calloc for both zero-init and implicit overflow
+    // detection.  calloc(nmemb, size) multiplies safely on POSIX; the header
+    // fits in one extra elem_size-aligned block — allocate header + payload
+    // as a byte array of total_bytes.
+    int64_t payload = len * elem_size;      // len >= 0, elem_size >= 1
+    int64_t total   = (int64_t)sizeof(bz_buffer_hdr_t) + payload;
+    auto* hdr = static_cast<bz_buffer_hdr_t*>(calloc(1, (size_t)total));
+    if (!hdr) return nullptr;
+    hdr->len       = len;
+    hdr->elem_size = elem_size;
+    return hdr;
+}
+
+// bz_buffer_get_ptr — pointer to element at index idx inside the payload.
+// Does NOT bounds-check; caller emits the §16 guard before calling.
+void* bz_buffer_get_ptr(void* buf, int64_t idx) {
+    if (!buf) return nullptr;
+    auto* hdr = static_cast<bz_buffer_hdr_t*>(buf);
+    uint8_t* payload = reinterpret_cast<uint8_t*>(hdr + 1);
+    return payload + idx * hdr->elem_size;
+}
+
+// bz_buffer_free — null-safe free of the whole header+payload block.
+void bz_buffer_free(void* buf) {
+    if (!buf) return;
+    free(buf);
+}
+
+} // extern "C" (Buffer<T>)

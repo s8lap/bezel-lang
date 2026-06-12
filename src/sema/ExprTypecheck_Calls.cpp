@@ -2497,6 +2497,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
+                    // issue #545: Buffer<T> instance methods.
+                    // Receiver: Named, no declaration, name "Buffer", genericArgs[0]=T.
+                    // Surface: [i] (indexer), Length (property), Dispose().
+                    // Unknown method produces a clean compile error.
+                    if (rcn == "Buffer" && recvTy) {
+                        if (m == "Dispose") {
+                            // Dispose(): unit; no return type set.
+                        } else {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `Buffer<T>`; documented surface: "
+                                "[i] (get/set), Length, Dispose() "
+                                "(issue #545)");
+                        }
+                    }
                     // §6.4 / issue #647: Atomic<T> instance methods.
                     // Receiver TypeRef: Named, no declaration, astNode name "Atomic",
                     // genericArgs[0] = T (the element type).
@@ -4534,6 +4550,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, nt);
                     return;
                 }
+            }
+        }
+        // issue #545: Buffer<T>.Length property — returns int.
+        // The ordinary member-lookup path never finds it (no user TypeDecl).
+        if (ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            bool isBuffer = tt && tt->kind == TypeRef::Kind::Named &&
+                !tt->declaration && tt->astNode && tt->astNode->name &&
+                !tt->astNode->name->parts.empty() &&
+                tt->astNode->name->parts[0] == "Buffer";
+            if (isBuffer && ma.member == "Length") {
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                return;
             }
         }
         // §6.4 / issue #647: Atomic<T> and AtomicInteger<T> property accesses.

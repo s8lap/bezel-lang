@@ -1887,9 +1887,31 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // assignable (compound ops like `+=` have their own
             // operator semantics and are left to a later slice).
             if (as->op == ":=" && as->target && as->value) {
+                // §5.1 special (mirrors LocalDecl init narrowing above):
+                // an int literal on the RHS assigns to any narrower integer
+                // target type without a diagnostic — retype the literal so
+                // checkAssignable sees matching primitive types. This covers
+                // Buffer<byte>[i] := 1, local byte b := 1, etc.
+                TypeRef* fromTy = ctx_.exprType(*as->value);
+                TypeRef* toTy   = ctx_.exprType(*as->target);
+                if (fromTy && toTy &&
+                    fromTy->kind == TypeRef::Kind::Primitive &&
+                    toTy->kind   == TypeRef::Kind::Primitive &&
+                    fromTy->primitive == PrimitiveType::Int) {
+                    PrimitiveType tgt = toTy->primitive;
+                    if (tgt == PrimitiveType::Byte  ||
+                        tgt == PrimitiveType::SByte ||
+                        tgt == PrimitiveType::Short ||
+                        tgt == PrimitiveType::UShort||
+                        tgt == PrimitiveType::UInt  ||
+                        tgt == PrimitiveType::ULong) {
+                        ctx_.setExprType(as->value.get(), toTy);
+                        fromTy = toTy;
+                    }
+                }
                 checkAssignable(
-                    ctx_.exprType(*as->value),
-                    ctx_.exprType(*as->target),
+                    fromTy,
+                    toTy,
                     as->value->span.begin, "assigned value");
             }
         }

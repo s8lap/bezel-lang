@@ -1537,15 +1537,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             // string). Only apply when the target has NO declaration (built-in
             // exceptions) and NOT a Named type with a known user declaration
             // (which might have a computed 'Length' property of its own).
-            // Exclude StringBuilder from the string-fallback (it has its own
-            // Length handler that sums part lengths).
-            auto notStrBld = [&]() -> bool {
-                return !(tt && tt->kind == sema::TypeRef::Kind::Named &&
-                         !tt->declaration && tt->astNode && tt->astNode->name &&
-                         !tt->astNode->name->parts.empty() &&
-                         tt->astNode->name->parts[0] == "StringBuilder");
+            // Exclude StringBuilder (has its own handler that sums part lengths)
+            // and Buffer<T> (has its own header-load handler below — the string
+            // fallback would call loadStringLen which loads field[1]=elem_size
+            // instead of field[0]=len, producing a wrong value per issue #545).
+            auto isStringFallbackTarget = [&]() -> bool {
+                if (!tt) return true;  // unknown type → fallback
+                if (tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+                    return false;
+                if (!tt->astNode || !tt->astNode->name ||
+                    tt->astNode->name->parts.empty())
+                    return true;
+                std::string_view n = tt->astNode->name->parts[0];
+                if (n == "StringBuilder") return false;  // has own handler
+                if (n == "Buffer") return false;          // issue #545: own handler
+                return true;
             };
-            if (ma->member == "Length" && notStrBld() &&
+            if (ma->member == "Length" && isStringFallbackTarget() &&
                 (!tt ||
                  (tt->kind == sema::TypeRef::Kind::Named &&
                   !tt->declaration))) {
@@ -2024,6 +2032,28 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     auto* fn = declareC("bz_llist_count", i64(), {ptrTy()});
                     llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
                     return builder_.CreateTrunc(cnt64, i32(), "ll.cnt");
+                }
+            }
+            // issue #545: Buffer<T>.Length → i64 header field load.
+            // The header layout is { i64 len, i64 elem_size } (bz_buffer_hdr_t).
+            // GEP field[0] from the buffer pointer and load as i64, then trunc to
+            // i32 (Bezel `int`) for consistency with other collection Length values.
+            {
+                bool isBuf = tt && tt->kind == sema::TypeRef::Kind::Named &&
+                             !tt->declaration && tt->astNode && tt->astNode->name &&
+                             !tt->astNode->name->parts.empty() &&
+                             tt->astNode->name->parts[0] == "Buffer";
+                if (isBuf && ma->member == "Length") {
+                    llvm::Value* obj = lowerExpr(*ma->target);
+                    if (obj) {
+                        // bz_buffer_hdr_t: { int64 len, int64 elem_size }.
+                        // The `len` field is at byte offset 0.
+                        // Use a GEP into the raw bytes (i8*) at offset 0 and
+                        // load as i64 to avoid struct-type aliasing surprises.
+                        llvm::Value* len64 =
+                            builder_.CreateLoad(i64(), obj, "buf.len");
+                        return builder_.CreateTrunc(len64, i32(), "buf.len.i32");
+                    }
                 }
             }
             // §4.14 / §9.8 / issue #550: OwnedBuffer<T>.Count → bz_array_len.
@@ -5966,6 +5996,51 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     allocFn,
                     {builder_.getInt32(cellSize), initVal},
                     "atom.new");
+            }
+            // issue #545: new Buffer<T>(n) — allocate via bz_buffer_new(len, elem_size).
+            // The element size is derived from T (genericArgs[0]) via collectionElemSize-
+            // style logic; for decimal (16-byte struct) we use the DataLayout alloc size
+            // so the #685 16-byte slot category works correctly.
+            // The length argument (n) is required; it is evaluated and passed as i64.
+            // Result: opaque heap pointer (bz_buffer_hdr_t*); zero-initialised payload.
+            if (colName == "Buffer") {
+                // Determine elem_size from T.
+                int64_t eSize = 8;  // default (double / long)
+                const sema::TypeRef* newTR =
+                    ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
+                if (newTR && !newTR->genericArgs.empty() && newTR->genericArgs[0]) {
+                    const sema::TypeRef* tArg = newTR->genericArgs[0];
+                    llvm::Type* et = lowerTypeRef(tArg);
+                    if (et) {
+                        if (et->isStructTy())
+                            eSize = (int64_t)module_->getDataLayout()
+                                        .getTypeAllocSize(et);
+                        else if (et->isIntegerTy(1) || et->isIntegerTy(8))
+                            eSize = 1;
+                        else if (et->isIntegerTy(16))
+                            eSize = 2;
+                        else if (et->isIntegerTy(32) || et->isFloatTy())
+                            eSize = 4;
+                        else
+                            eSize = 8;  // i64 / double / ptr-sized
+                    }
+                }
+                // Evaluate the length argument (required; must be int/long).
+                llvm::Value* lenVal = builder_.getInt64(0);
+                if (!ne.args.empty() && ne.args[0].value) {
+                    llvm::Value* raw = lowerExpr(*ne.args[0].value);
+                    if (raw) {
+                        if (raw->getType()->isIntegerTy(64))
+                            lenVal = raw;
+                        else if (raw->getType()->isIntegerTy())
+                            lenVal = builder_.CreateSExt(raw, i64(), "buf.len64");
+                    }
+                }
+                auto* allocFn = declareC("bz_buffer_new", ptrTy(), {i64(), i64()});
+                return builder_.CreateCall(
+                    allocFn,
+                    {lenVal, builder_.getInt64(eSize)},
+                    "buf.new");
             }
             // §6.1 / §30.8: new CancellationTokenSource() — allocate via
             // bz_cts_alloc (stdlib §6.1 default constructor).

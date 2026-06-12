@@ -685,6 +685,12 @@ private:
         llvm::Value* drainedEntryValDisposer = nullptr;
         llvm::Type* drainedEntryKeyType  = nullptr;
         llvm::Type* drainedEntryValType  = nullptr;
+        // issue #545: a `using var` bound to a Buffer<T>. At scope end it is
+        // freed via bz_buffer_free (null-safe; plain free because value elements
+        // have no disposal obligation — no per-element callback needed).
+        // No user TypeSymbol; recognised by the builtin type name "Buffer" in
+        // lowerLocalDecl.
+        bool buffer = false;
         // §29.7 (#623): an iterator enumerator (IEnumerable<T> state machine)
         // whose Dispose is at vtable slot 1 (iterator vtable format:
         // [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current) — NOT slot 2 (class
@@ -4779,6 +4785,17 @@ private:
             // type-parameter and the nullable-type-param branch lowered it to
             // {i8,i32} instead of ptr → emitStructEquality crash on `tok <> null`.
             "Semaphore", "SemaphoreToken",
+            // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
+            // heap-pointer builtins (bz_atomic_t*).  Without these entries a
+            // nullable `Atomic<T>?` was mis-classified as a bare generic
+            // type-parameter and the nullable-type-param branch lowered it to
+            // {i8,i32} instead of ptr.
+            "Atomic", "AtomicInteger",
+            // issue #545: Buffer<T> is a compiler-known heap-pointer builtin
+            // (bz_buffer_hdr_t* + inline payload).  Without this entry a
+            // nullable `Buffer<T>?` would be mis-classified as a bare generic
+            // type-parameter and lowered to {i8,i32} instead of ptr.
+            "Buffer",
         };
         if (kBuiltins.count(name)) return true;
         // §31.4: a built-in exception type (Exception / a subtype).

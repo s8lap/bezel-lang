@@ -4836,6 +4836,36 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // issue #545: a `using var` bound to a Buffer<T>.
+    // No user TypeSymbol; recognised by type name "Buffer" in the declared type
+    // or the NewExpr type name.  At scope end, bz_buffer_free is called (null-safe
+    // plain free — value elements carry no disposal obligation).
+    {
+        bool isBuf = false;
+        auto isBufferTypeName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->astNode->name->parts[0] == "Buffer";
+        };
+        if (ld->type)
+            isBuf = isBufferTypeName(ctx_.resolvedType(*ld->type));
+        if (!isBuf && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isBuf = ne->type && ne->type->name &&
+                        !ne->type->name->parts.empty() &&
+                        ne->type->name->parts[0] == "Buffer";
+        }
+        if (!isBuf && ld->initializer)
+            isBuf = isBufferTypeName(ctx_.exprType(*ld->initializer));
+        if (isBuf) {
+            Disposal d{it->second, nullptr};
+            d.buffer = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // stdlib §6.7 / §30.5: a `using var` bound to a Task / Task<T> / OwnedTask<T>.
     // Tasks have no user TypeSymbol; at scope end the task is freed via bz_task_free.
     // Double-free safety: lowerAwait only frees tasks whose operand is an anonymous
@@ -8720,6 +8750,26 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_semaphore_token_release",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {tok});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // issue #545: a `using var` Buffer<T>. Free via bz_buffer_free (null-safe
+        // plain free — value elements carry no disposal obligation, so no per-element
+        // callback is needed). Null-guarded for consistency with other builtin disposal.
+        if (it->buffer) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* buf = builder_.CreateLoad(ptrTy(), addr, "buf.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                buf, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "buf.free",  currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "buf.cont",  currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_buffer_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {buf});
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
