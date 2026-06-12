@@ -193,6 +193,7 @@ set(BEZEL_TEST_SOURCES
     sema/channel_640_phantom_members_test.cpp  # fix #640: Channel<T> phantom Send/TrySend/Bogus rejected (§6.9)
     sema/mutex_sendable_647_test.cpp           # #647: Mutex sendable per stdlib §6.2 v0.138; Lock not sendable
     sema/semaphore_sendable_647_test.cpp      # #647: Semaphore sendable per stdlib §6.3 v0.140; SemaphoreToken not sendable
+    sema/atomic_647_test.cpp                  # #647: Atomic<T>/AtomicInteger<T> T-restriction, method surface, sendability (stdlib §6.4 v0.140)
     sema/builtin_674_uniform_unknown_member_test.cpp  # fix #674: uniform no-member diag for Shared/Weak/Mutex/ChannelSender/ArraySpan/BinarySerializer
     sema/shared_sync_sendable_689_test.cpp            # #689: Shared<T> sendable iff T in sync-set (§28.13 v0.140)
     # --- end #600 contract ---
@@ -369,6 +370,7 @@ set(BEZEL_TEST_SOURCES
     codegen/cancellation_token_test.cpp
     codegen/mutex_lock_647_test.cpp             # §6.2 Mutex + Lock, issue #647
     codegen/semaphore_647_test.cpp              # §6.3 Semaphore + SemaphoreToken, issue #647
+    codegen/atomic_647_test.cpp                 # §6.4 Atomic<T>/AtomicInteger<T>, issue #647
     codegen/datetime_timespan_test.cpp
     codegen/stdlib_wave1_648_649_652_test.cpp
     codegen/stdlib_wave2_test.cpp

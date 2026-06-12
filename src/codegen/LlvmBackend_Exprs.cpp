@@ -1599,6 +1599,42 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     return builder_.CreateCall(fn, {sw}, "sw.el");
                 }
             }
+            // §6.4 / issue #647: Atomic<T> and AtomicInteger<T> — Value getter.
+            // `atom.Value` → bz_atomic_load(atom, cell_size).
+            // T is in genericArgs[0] of the receiver's TypeRef.
+            if ((cn == "Atomic" || cn == "AtomicInteger") &&
+                ma->member == "Value") {
+                llvm::Value* atom = lowerExpr(*ma->target);
+                if (!atom) return nullptr;
+                // Determine cell_size from T.
+                int cellSize = 4;
+                if (tt && !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                    const sema::TypeRef* tArg = tt->genericArgs[0];
+                    if (tArg->kind == sema::TypeRef::Kind::Primitive) {
+                        using P = sema::PrimitiveType;
+                        switch (tArg->primitive) {
+                            case P::Bool: case P::Byte: case P::SByte:
+                                cellSize = 1; break;
+                            case P::Short: case P::UShort: cellSize = 2; break;
+                            case P::Long: case P::ULong:   cellSize = 8; break;
+                            default: cellSize = 4; break;
+                        }
+                    } else {
+                        cellSize = 8;  // IntPtr/UIntPtr
+                    }
+                }
+                auto* loadFn = declareC("bz_atomic_load", i64(), {ptrTy(), i32()});
+                llvm::Value* raw = builder_.CreateCall(
+                    loadFn, {atom, builder_.getInt32(cellSize)}, "atom.load");
+                // Truncate to the declared T width.
+                llvm::Type* tTy = i32();
+                if (tt && !tt->genericArgs.empty() && tt->genericArgs[0])
+                    tTy = lowerTypeRef(tt->genericArgs[0]);
+                if (!tTy) tTy = i32();
+                if (tTy->isIntegerTy() && !tTy->isIntegerTy(64))
+                    return builder_.CreateTrunc(raw, tTy, "atom.val");
+                return raw;  // i64 or bool (i1 from trunc handled above)
+            }
             // CancellationTokenSource property reads.
             if (cn == "CancellationTokenSource") {
                 llvm::Value* cts = lowerExpr(*ma->target);
@@ -5851,6 +5887,62 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     ptrTy(), {i32(), i32()});
                 return builder_.CreateCall(allocFn,
                     {initCount, maxCount}, "sem.new");
+            }
+            // §6.4 / issue #647: new Atomic<T>(initial) / new AtomicInteger<T>(initial).
+            // Allocate via bz_atomic_new(cell_size, initial).
+            // cell_size is derived from T: 1 (bool/byte/sbyte/char), 2 (short/ushort),
+            //   4 (int/uint — default), 8 (long/ulong/IntPtr/UIntPtr).
+            // initial comes from the constructor argument (zero if not provided).
+            if (colName == "Atomic" || colName == "AtomicInteger") {
+                // Determine cell_size from the type argument T.
+                int cellSize = 4;  // default: int/uint
+                const sema::TypeRef* newTR = ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
+                if (newTR && !newTR->genericArgs.empty() && newTR->genericArgs[0]) {
+                    const sema::TypeRef* tArg = newTR->genericArgs[0];
+                    if (tArg->kind == sema::TypeRef::Kind::Primitive) {
+                        using P = sema::PrimitiveType;
+                        switch (tArg->primitive) {
+                            case P::Bool: case P::Byte: case P::SByte:
+                                cellSize = 1; break;
+                            case P::Short: case P::UShort:
+                                cellSize = 2; break;
+                            case P::Long: case P::ULong:
+                                cellSize = 8; break;
+                            case P::Char:
+                                cellSize = 4; break;  // §6.4: char is 32-bit codepoint
+                            default:
+                                cellSize = 4; break;  // int/uint/float
+                        }
+                    } else if (tArg->kind == sema::TypeRef::Kind::Named &&
+                               !tArg->declaration && tArg->astNode &&
+                               tArg->astNode->name &&
+                               !tArg->astNode->name->parts.empty()) {
+                        // IntPtr / UIntPtr — pointer-sized = 8 on 64-bit target.
+                        cellSize = 8;
+                    }
+                }
+                // Evaluate the initial-value argument (zero if none).
+                llvm::Value* initVal = builder_.getInt64(0);
+                if (!ne.args.empty() && ne.args[0].value) {
+                    llvm::Value* raw = lowerExpr(*ne.args[0].value);
+                    if (raw) {
+                        // Widen to i64 for bz_atomic_new's uint64_t parameter.
+                        if (raw->getType()->isIntegerTy(1)) {
+                            initVal = builder_.CreateZExt(raw, i64());
+                        } else if (raw->getType()->isIntegerTy() &&
+                                   !raw->getType()->isIntegerTy(64)) {
+                            initVal = builder_.CreateZExt(raw, i64());
+                        } else if (raw->getType()->isIntegerTy(64)) {
+                            initVal = raw;
+                        }
+                        // Non-integer arg is ignored (sema would have rejected it).
+                    }
+                }
+                auto* allocFn = declareC("bz_atomic_new", ptrTy(), {i32(), i64()});
+                return builder_.CreateCall(
+                    allocFn,
+                    {builder_.getInt32(cellSize), initVal},
+                    "atom.new");
             }
             // §6.1 / §30.8: new CancellationTokenSource() — allocate via
             // bz_cts_alloc (stdlib §6.1 default constructor).

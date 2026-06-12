@@ -453,7 +453,11 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "Mutex" || n == "Lock" ||
                     // §6.3 / #647: Semaphore (bz_semaphore_t*) and SemaphoreToken
                     // (bz_semaphore_token_t*) — same fix applied proactively.
-                    n == "Semaphore" || n == "SemaphoreToken") {
+                    n == "Semaphore" || n == "SemaphoreToken" ||
+                    // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
+                    // heap-pointer builtins (bz_atomic_t*).  Same ptrTy treatment as
+                    // Mutex/Semaphore so lowerTypeRef returns ptrTy() not i32.
+                    n == "Atomic" || n == "AtomicInteger") {
                     return ptrTy();
                 }
             }
@@ -523,7 +527,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §6.2 / #647: imported Mutex (bz_mutex_t*) and Lock (bz_lock_t*).
                     n == "Mutex" || n == "Lock" ||
                     // §6.3 / #647: imported Semaphore / SemaphoreToken.
-                    n == "Semaphore" || n == "SemaphoreToken") {
+                    n == "Semaphore" || n == "SemaphoreToken" ||
+                    // §6.4 / #647: imported Atomic<T> and AtomicInteger<T>.
+                    n == "Atomic" || n == "AtomicInteger") {
                     return ptrTy();
                 }
             }

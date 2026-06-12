@@ -4922,6 +4922,9 @@ private:
     llvm::Value* tryLowerMutexLockCall(const ast::CallExpr& call);
     // §6.3 / issue #647: Semaphore.Acquire, TryAcquire, AcquireAsync, TryAcquireAsync.
     llvm::Value* tryLowerSemaphoreTokenCall(const ast::CallExpr& call);
+    // §6.4 / issue #647: Atomic<T>/AtomicInteger<T> Exchange, CompareExchange,
+    //   Increment, Decrement, Add; also Value setter (a.Value := v) via call shape.
+    llvm::Value* tryLowerAtomicCall(const ast::CallExpr& call);
 
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
     // The callee is a member access whose target is itself `Encoding.<singleton>`.
@@ -4979,6 +4982,9 @@ private:
     // per §24.4: `<event> += h` / `<event> -= h` inside the declaring class —
     // a fixed desugaring to Add/Remove. Returns true when handled.
     bool tryLowerEventCompound(const ast::AssignmentStmt& as);
+    // §6.4 / #647: `atom.Value := v` — seq-cst store into an Atomic<T> or
+    // AtomicInteger<T> cell via bz_atomic_store.  Returns true when handled.
+    bool tryLowerAtomicValueSet(const ast::AssignmentStmt& as);
 
     // per §2.11 / §24.4: true when `e`'s static type is the built-in
     // `Subscription` (stdlib §2.11), or — for an inferred local bound to a

@@ -10113,3 +10113,244 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
 }
 
 } // extern "C" (Semaphore + SemaphoreToken)
+
+// ---------------------------------------------------------------------------
+// Atomic<T> and AtomicInteger<T> runtime (stdlib §6.4, issue #647)
+//
+// Layout: bz_atomic_t has a refcounted core (for send-safe Shared<Atomic<T>>),
+// a disposed flag (§28.2 idempotent dispose), and an 8-byte payload slot that
+// holds cell_size bytes aligned to cell_size.  All __atomic_* operations use
+// __ATOMIC_SEQ_CST per §6.4 v0.140.
+//
+// cell_size ∈ {1, 2, 4, 8}: derived from the T type restriction at sema/codegen
+// time and baked in at construction.
+// ---------------------------------------------------------------------------
+
+struct bz_atomic_t {
+    std::atomic<int> core_refs{1};
+    bool             disposed{false};
+    int              cell_size;       // 1, 2, or 4 for short T; 8 for long T
+    // Value payload: 8-byte aligned buffer; cell_size bytes are used.
+    alignas(8) uint8_t cell[8];
+};
+
+static void atomic_core_release(bz_atomic_t* a) {
+    if (a->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete a;
+}
+
+extern "C" {
+
+// bz_atomic_new — allocate a new atomic cell; core_refs = 1.
+void* bz_atomic_new(int cell_size, uint64_t initial) {
+    if (cell_size <= 0 || cell_size > 8) cell_size = 4;  // defensive
+    auto* a = new bz_atomic_t();
+    a->cell_size = cell_size;
+    memset(a->cell, 0, 8);
+    // Store initial value (seq-cst) into the cell.
+    switch (cell_size) {
+        case 1: { uint8_t  v = (uint8_t)initial;
+                  __atomic_store(&a->cell[0], &v, __ATOMIC_SEQ_CST); break; }
+        case 2: { uint16_t v = (uint16_t)initial;
+                  __atomic_store((uint16_t*)a->cell, &v, __ATOMIC_SEQ_CST); break; }
+        case 4: { uint32_t v = (uint32_t)initial;
+                  __atomic_store((uint32_t*)a->cell, &v, __ATOMIC_SEQ_CST); break; }
+        case 8: { uint64_t v = initial;
+                  __atomic_store((uint64_t*)a->cell, &v, __ATOMIC_SEQ_CST); break; }
+        default: break;
+    }
+    return a;
+}
+
+// bz_atomic_dispose — idempotent dispose (§28.2); drops the core ref.
+void bz_atomic_dispose(void* ptr) {
+    if (!ptr) return;
+    auto* a = static_cast<bz_atomic_t*>(ptr);
+    if (a->disposed) return;
+    a->disposed = true;
+    atomic_core_release(a);
+}
+
+// bz_atomic_load — seq-cst load; returns value zero-extended to uint64_t.
+uint64_t bz_atomic_load(void* ptr, int cell_size) {
+    if (!ptr) return 0;
+    auto* a = static_cast<bz_atomic_t*>(ptr);
+    switch (cell_size) {
+        case 1: { uint8_t  v = 0;
+                  __atomic_load(&a->cell[0], &v, __ATOMIC_SEQ_CST);
+                  return (uint64_t)v; }
+        case 2: { uint16_t v = 0;
+                  __atomic_load((uint16_t*)a->cell, &v, __ATOMIC_SEQ_CST);
+                  return (uint64_t)v; }
+        case 4: { uint32_t v = 0;
+                  __atomic_load((uint32_t*)a->cell, &v, __ATOMIC_SEQ_CST);
+                  return (uint64_t)v; }
+        case 8: { uint64_t v = 0;
+                  __atomic_load((uint64_t*)a->cell, &v, __ATOMIC_SEQ_CST);
+                  return v; }
+        default: return 0;
+    }
+}
+
+// bz_atomic_store — seq-cst store; val truncated to cell_size bytes.
+void bz_atomic_store(void* ptr, uint64_t val, int cell_size) {
+    if (!ptr) return;
+    auto* a = static_cast<bz_atomic_t*>(ptr);
+    switch (cell_size) {
+        case 1: { uint8_t  v = (uint8_t)val;
+                  __atomic_store(&a->cell[0], &v, __ATOMIC_SEQ_CST); break; }
+        case 2: { uint16_t v = (uint16_t)val;
+                  __atomic_store((uint16_t*)a->cell, &v, __ATOMIC_SEQ_CST); break; }
+        case 4: { uint32_t v = (uint32_t)val;
+                  __atomic_store((uint32_t*)a->cell, &v, __ATOMIC_SEQ_CST); break; }
+        case 8: { uint64_t v = val;
+                  __atomic_store((uint64_t*)a->cell, &v, __ATOMIC_SEQ_CST); break; }
+        default: break;
+    }
+}
+
+// bz_atomic_exchange — seq-cst exchange; returns old value as uint64_t.
+uint64_t bz_atomic_exchange(void* ptr, uint64_t val, int cell_size) {
+    if (!ptr) return 0;
+    auto* a = static_cast<bz_atomic_t*>(ptr);
+    switch (cell_size) {
+        case 1: { uint8_t  nv = (uint8_t)val, ov = 0;
+                  __atomic_exchange(&a->cell[0], &nv, &ov, __ATOMIC_SEQ_CST);
+                  return (uint64_t)ov; }
+        case 2: { uint16_t nv = (uint16_t)val, ov = 0;
+                  __atomic_exchange((uint16_t*)a->cell, &nv, &ov, __ATOMIC_SEQ_CST);
+                  return (uint64_t)ov; }
+        case 4: { uint32_t nv = (uint32_t)val, ov = 0;
+                  __atomic_exchange((uint32_t*)a->cell, &nv, &ov, __ATOMIC_SEQ_CST);
+                  return (uint64_t)ov; }
+        case 8: { uint64_t nv = val, ov = 0;
+                  __atomic_exchange((uint64_t*)a->cell, &nv, &ov, __ATOMIC_SEQ_CST);
+                  return ov; }
+        default: return 0;
+    }
+}
+
+// bz_atomic_compare_exchange — strong CAS; returns the observed value.
+// Returns expected on success, the blocking value on failure.
+uint64_t bz_atomic_compare_exchange(void* ptr, uint64_t expected,
+                                    uint64_t replacement, int cell_size) {
+    if (!ptr) return expected;
+    auto* a = static_cast<bz_atomic_t*>(ptr);
+    switch (cell_size) {
+        case 1: {
+            uint8_t exp = (uint8_t)expected, rep = (uint8_t)replacement;
+            __atomic_compare_exchange(&a->cell[0], &exp, &rep,
+                                      /*weak=*/0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            return (uint64_t)exp;   // exp updated to observed value by __atomic_compare_exchange
+        }
+        case 2: {
+            uint16_t exp = (uint16_t)expected, rep = (uint16_t)replacement;
+            __atomic_compare_exchange((uint16_t*)a->cell, &exp, &rep,
+                                      0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            return (uint64_t)exp;
+        }
+        case 4: {
+            uint32_t exp = (uint32_t)expected, rep = (uint32_t)replacement;
+            __atomic_compare_exchange((uint32_t*)a->cell, &exp, &rep,
+                                      0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            return (uint64_t)exp;
+        }
+        case 8: {
+            uint64_t exp = expected, rep = replacement;
+            __atomic_compare_exchange((uint64_t*)a->cell, &exp, &rep,
+                                      0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            return exp;
+        }
+        default: return expected;
+    }
+}
+
+// bz_atomic_add — seq-cst fetch-add with §6.1 overflow check.
+// Returns the POST-add value (§6.4: "returns post-operation value").
+// signed_: 1 if T is a signed type (sbyte/short/int/long); 0 if unsigned.
+// ove_vtable: vtable* for OverflowException; passed through to bz_set_exc /
+//   bz_exc mechanism (same pattern as the checked-arithmetic codegen path).
+uint64_t bz_atomic_add(void* ptr, int64_t delta, int signed_,
+                       int cell_size, void* ove_vtable) {
+    if (!ptr) return 0;
+    auto* a = static_cast<bz_atomic_t*>(ptr);
+    // Perform a CAS loop: read current, check overflow, write new value.
+    // A seq-cst fetch_add would suffice for the atomic part, but we need the
+    // overflow check between read and write, so use a CAS loop per §6.4 note.
+    switch (cell_size) {
+        case 1: {
+            uint8_t cur;
+            __atomic_load(&a->cell[0], &cur, __ATOMIC_SEQ_CST);
+            for (;;) {
+                // Overflow check (§6.1).
+                int64_t c = signed_ ? (int64_t)(int8_t)cur : (int64_t)cur;
+                int64_t r = c + delta;
+                bool ovf = signed_ ? (r < -128 || r > 127) : (r < 0 || r > 255);
+                if (ovf && ove_vtable) { bz_set_exc(ove_vtable); return 0; }
+                uint8_t nv = (uint8_t)(uint64_t)r;
+                uint8_t exp = cur;
+                if (__atomic_compare_exchange(&a->cell[0], &exp, &nv,
+                                              0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+                    return (uint64_t)nv;
+                cur = exp;
+            }
+        }
+        case 2: {
+            uint16_t cur;
+            __atomic_load((uint16_t*)a->cell, &cur, __ATOMIC_SEQ_CST);
+            for (;;) {
+                int64_t c = signed_ ? (int64_t)(int16_t)cur : (int64_t)cur;
+                int64_t r = c + delta;
+                bool ovf = signed_ ? (r < -32768 || r > 32767) : (r < 0 || r > 65535);
+                if (ovf && ove_vtable) { bz_set_exc(ove_vtable); return 0; }
+                uint16_t nv = (uint16_t)(uint64_t)r;
+                uint16_t exp = cur;
+                if (__atomic_compare_exchange((uint16_t*)a->cell, &exp, &nv,
+                                              0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+                    return (uint64_t)nv;
+                cur = exp;
+            }
+        }
+        case 4: {
+            uint32_t cur;
+            __atomic_load((uint32_t*)a->cell, &cur, __ATOMIC_SEQ_CST);
+            for (;;) {
+                int64_t c = signed_ ? (int64_t)(int32_t)cur : (int64_t)cur;
+                int64_t r = c + delta;
+                bool ovf = signed_ ? (r < -2147483648LL || r > 2147483647LL)
+                                   : (r < 0 || r > 4294967295LL);
+                if (ovf && ove_vtable) { bz_set_exc(ove_vtable); return 0; }
+                uint32_t nv = (uint32_t)(uint64_t)r;
+                uint32_t exp = cur;
+                if (__atomic_compare_exchange((uint32_t*)a->cell, &exp, &nv,
+                                              0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+                    return (uint64_t)nv;
+                cur = exp;
+            }
+        }
+        case 8: {
+            uint64_t cur;
+            __atomic_load((uint64_t*)a->cell, &cur, __ATOMIC_SEQ_CST);
+            for (;;) {
+                // 64-bit overflow: use __int128 to detect cleanly.
+                __int128 c = signed_ ? (__int128)(int64_t)cur : (__int128)cur;
+                __int128 r = c + (__int128)delta;
+                bool ovf;
+                if (signed_)
+                    ovf = (r < (__int128)INT64_MIN || r > (__int128)INT64_MAX);
+                else
+                    ovf = (r < 0 || r > (__int128)(uint64_t)UINT64_MAX);
+                if (ovf && ove_vtable) { bz_set_exc(ove_vtable); return 0; }
+                uint64_t nv = (uint64_t)r;
+                uint64_t exp = cur;
+                if (__atomic_compare_exchange((uint64_t*)a->cell, &exp, &nv,
+                                              0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+                    return nv;
+                cur = exp;
+            }
+        }
+        default: return 0;
+    }
+}
+
+} // extern "C" (Atomic<T> / AtomicInteger<T>)
