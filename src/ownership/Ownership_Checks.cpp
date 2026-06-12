@@ -643,18 +643,30 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
 
 bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
     if (!rt) return true;            // unknown → conservative
-    if (rt->nullable) return true;   // nullable reference
     switch (rt->kind) {
         case sema::TypeRef::Kind::Primitive:
-            return rt->primitive == sema::PrimitiveType::String ||
-                   rt->primitive == sema::PrimitiveType::Object;
+            // §28.9 / §28.3: string and Object are runtime-managed reference types
+            // whose lifetime is not tied to any single owner — returning one from a
+            // borrow is safe (the spec's "runtime-managed returns" exception).
+            // All other primitives are value types and are also never borrows.
+            // So ALL primitive reads are non-borrowable.
+            return false;
         case sema::TypeRef::Kind::Function:
-            return true;
+            // §28.9: function values (closures, method references) are
+            // runtime-managed — the function object's lifetime is managed by the
+            // runtime, not by the caller's scope. Not a borrow.
+            return false;
         case sema::TypeRef::Kind::Named:
             if (!rt->declaration) return false;  // generic param → not conservative
             // §2.5 / §2.6 / §6.1 / §28 (issue #434): value-type builtins are
             // scalars/structs — they are not reference types and not borrowable.
             if (rt->declaration->isValueBuiltin) return false;
+            // Only class and interface references are borrow-bearing.
+            // NOTE: nullable class/interface refs are also borrow-bearing — if the
+            // nullable flag is set on a Named class type, we must still return true
+            // to catch nullable-reference borrows.  But nullable primitives/records
+            // are NOT borrows, so the old unconditional `if (rt->nullable) return
+            // true` was over-broad; the nullable check now lives here only.
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
         case sema::TypeRef::Kind::Error:
