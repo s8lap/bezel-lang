@@ -1237,12 +1237,27 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
             }
             builder_.CreateBr(beEndBB);
             // Non-null path: look up existing tag, write BZ_SER_REF + tag_id.
+            // §9.8 cycle detection: tag_id=0 means the back-edge target was never
+            // registered as an owned component — it forms a cycle.  Raise
+            // SerializationException instead of emitting a dangling $ref.
             builder_.SetInsertPoint(beRefBB);
             {
                 auto* getTagFn = declareC("bz_binser_graph_get_tag", i32(),
                                           {ptrTy(), ptrTy()});
                 llvm::Value* existingTag = builder_.CreateCall(
                     getTagFn, {serPtr, bePtr}, "cser.be.tag");
+                llvm::Value* isCycle = builder_.CreateICmpEQ(
+                    existingTag, builder_.getInt32(0), "cser.be.cycle");
+                auto* cycleBB   = llvm::BasicBlock::Create(llvm_, "cser.be.cyclic", currentFn_);
+                auto* noRefBB   = llvm::BasicBlock::Create(llvm_, "cser.be.noref",  currentFn_);
+                builder_.CreateCondBr(isCycle, cycleBB, noRefBB);
+                // Cycle: raise SerializationException.
+                builder_.SetInsertPoint(cycleBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                // No cycle: write the $ref.
+                builder_.SetInsertPoint(noRefBB);
                 auto* writeRefFn = declareC("bz_binser_write_ref_tag", voidTy,
                                             {ptrTy(), i32()});
                 builder_.CreateCall(writeRefFn, {serPtr, existingTag});

@@ -2423,6 +2423,19 @@ void Resolver::checkSerializationEligibility() {
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                 if (!pd) continue;
                 if (pd->serialized && pd->serialized->isSkip) continue;
+                // §2.15 v0.139: `serialized "xxx"` rename beginning with `$` reserved.
+                if (pd->serialized && !pd->serialized->name.empty() &&
+                    pd->serialized->name.front() == '$') {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "class `" + std::string(t->name) + "`: `serialized` "
+                        "rename `" + std::string(pd->serialized->name) +
+                        "` for property `" + std::string(m->name) +
+                        "` begins with `$`, which is reserved for JSON "
+                        "graph-identity tokens (§2.15 v0.139); choose a name "
+                        "that does not start with `$`");
+                    break;
+                }
                 if (!pd->type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pd->type);
                 if (!tr) continue;
@@ -2629,6 +2642,21 @@ void Resolver::checkSerializationEligibility() {
         if (td->hasPositionalFields) {
             for (const auto& pf : td->positionalFields) {
                 if (positionalFieldIsSkip(pf)) continue;  // skip → excluded
+                // §2.15 v0.139: `serialized "xxx"` rename whose name begins with
+                // `$` is reserved for JSON graph-identity tokens — compile error.
+                if (pf.serialized && !pf.serialized->name.empty() &&
+                    pf.serialized->name.front() == '$') {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "`: `serialized` "
+                        "rename `" + std::string(pf.serialized->name) +
+                        "` for field `" + std::string(pf.name) +
+                        "` begins with `$`, which is reserved for JSON "
+                        "graph-identity tokens (§2.15 v0.139); choose a name "
+                        "that does not start with `$`");
+                    foundError = true;
+                    break;
+                }
                 if (!pf.type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pf.type);
                 if (!tr) continue;
@@ -2649,6 +2677,20 @@ void Resolver::checkSerializationEligibility() {
                 if (!pd) continue;
                 // Check for serialized skip on the auto-property.
                 if (pd->serialized && pd->serialized->isSkip) continue;
+                // §2.15 v0.139: `serialized "xxx"` rename beginning with `$` reserved.
+                if (pd->serialized && !pd->serialized->name.empty() &&
+                    pd->serialized->name.front() == '$') {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "`: `serialized` "
+                        "rename `" + std::string(pd->serialized->name) +
+                        "` for property `" + std::string(m->name) +
+                        "` begins with `$`, which is reserved for JSON "
+                        "graph-identity tokens (§2.15 v0.139); choose a name "
+                        "that does not start with `$`");
+                    foundError = true;
+                    break;
+                }
                 if (!pd->type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pd->type);
                 if (!tr) continue;

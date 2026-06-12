@@ -1,5 +1,5 @@
 // Codegen tests — §9.8 serialization / stdlib §2.15: JsonSerializer/JsonDeserializer.
-// Issue #550, JSON format tier.
+// Issue #550, JSON format tier.  Issue #675: JSON graph-identity tokens.
 //
 // Tests: record round-trip (all primitive kinds incl. decimal + string escaping),
 // enum name form, nested records, tree-class round-trip, nullable null/non-null,
@@ -21,12 +21,13 @@
 //   - Unknown-field strict by default (IgnoreUnknownFields=false)
 //   - Missing required field → SerializationException (§9.8/§2.15)
 //
-// Graph-identity JSON form ($id/$ref equivalent) is NOT specified in §2.15.
-// Tree-only JSON is implemented. Synthesis with JsonSerializer on a
-// `serialized graph`/`serialized cyclic` class is not yet wired (reported as
-// a docs-candidate gap — §2.15 does not specify the JSON graph wire form).
+// §2.15 v0.139 graph-identity JSON form (issue #675):
+//   - Inline tag: `"$id":n` as first field inside the object (write_inline_tag)
+//   - Back-reference: `{"$ref":n}` as complete object value (write_ref_tag)
+//   - Reader: first field "$id" registers tag; single field "$ref" resolves tag
+//   - `serialized "$..."` rename is a compile error at the conformance declaration
 //
-// Spec refs: §9.8, stdlib §2.14, §2.15.
+// Spec refs: §9.8, stdlib §2.14, §2.15, §2.15 v0.139.
 
 #include <cstdlib>
 #include <filesystem>
@@ -556,4 +557,212 @@ BEZEL_TEST(codegen_json_550, asan_malformed_json_no_leaks_spec_2_15) {
     // exit(1) — which with exitcode=99 override means: if rc==1 → clean asan.
     // Only rc==99 is an asan trigger. rc==-1 is skip.
     BEZEL_EXPECT_TRUE(rc == 0 || rc == 1 || rc == -1);
+}
+
+// ===========================================================================
+// §2.15 v0.139 / issue #675: JSON graph-identity tokens ($id / $ref)
+//
+// Per §2.15 v0.139: an object carrying an identity tag is written with a
+// reserved first field `"$id": n`; a back-reference is written as `{"$ref":n}`.
+// On the read side: first field "$id" registers the tag; only field "$ref"
+// resolves it.  Field names beginning with `$` are reserved.
+// ===========================================================================
+
+// §2.15 v0.139: JSON `serialized graph` diamond round-trip — identity preserved.
+// Topology: Diamond owns Node (Shared), borrows the same Node (Alias).
+// After round-trip: mutating Shared.Val through one alias is visible via Alias.
+// Wire must contain "$id" and "$ref" fields (verified separately below).
+BEZEL_TEST(codegen_json_675, graph_diamond_roundtrip_spec_2_15_v0139) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "class Node serialized graph : ISerializable, IDeserializable "
+        "  public Val: int := 0; "
+        "  public constructor(val: int) Val := val; end constructor; "
+        "end Node; "
+        "class Diamond serialized graph : ISerializable, IDeserializable "
+        "  public owned Shared: Node; "
+        "  public Alias: Node?; "
+        "  public constructor(owned shared: Node, alias: Node?) "
+        "    Shared := move shared; Alias := alias; "
+        "  end constructor; "
+        "end Diamond; "
+        "class C public static method Main(): int "
+        "  var n := new Node(40); "
+        "  using var d := new Diamond(move n, n); "
+        "  using var ser := new JsonSerializer(); "
+        "  d.Serialize(ser); "
+        "  using var bytes := ser.ToBytes(); "
+        "  using var de := new JsonDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var back := Diamond.Deserialize(de); "
+        "  back.Shared.Val := back.Shared.Val + 2; "
+        // After mutating via Shared, Alias must reflect the same value (identity).
+        "  if back.Alias = null then return 91; end; "
+        "  if back.Alias?.Val = 42 then return 42; end; "
+        "  return back.Alias?.Val ?? 0; "
+        "end Main; end C;"), 42);
+}
+
+// §2.15 v0.139: JSON output MUST contain "$id" and "$ref" fields.
+// String-compare test: verifies the wire text is the expected JSON graph form.
+BEZEL_TEST(codegen_json_675, graph_wire_text_contains_id_and_ref_spec_2_15_v0139) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "class Node serialized graph : ISerializable, IDeserializable "
+        "  public Val: int := 0; "
+        "  public constructor(val: int) Val := val; end constructor; "
+        "end Node; "
+        "class Hub serialized graph : ISerializable, IDeserializable "
+        "  public owned Target: Node; "
+        "  public Alias: Node?; "
+        "  public constructor(owned target: Node, alias: Node?) "
+        "    Target := move target; Alias := alias; "
+        "  end constructor; "
+        "end Hub; "
+        "class C public static method Main(): int "
+        "  var n := new Node(7); "
+        "  using var h := new Hub(move n, n); "
+        "  using var ser := new JsonSerializer(); "
+        "  h.Serialize(ser); "
+        "  var json := ser.ToString(); "
+        // The JSON must contain "$id" (inline tag) and "$ref" (back-reference).
+        "  var hasId  := json.Contains(\"\\\"$id\\\"\"); "
+        "  var hasRef := json.Contains(\"\\\"$ref\\\"\"); "
+        "  if hasId and hasRef then return 42; end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// §2.15 v0.139: null back-edge in JSON graph mode serializes as `null` and
+// deserializes back to null (the null-ref path must remain working).
+BEZEL_TEST(codegen_json_675, graph_null_back_edge_json_spec_2_15_v0139) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "class Slot serialized graph : ISerializable, IDeserializable "
+        "  public Name: string := \"\"; "
+        "  public constructor(name: string) Name := name; end constructor; "
+        "end Slot; "
+        "class Hub serialized graph : ISerializable, IDeserializable "
+        "  public owned Target: Slot; "
+        "  public Alias: Slot?; "
+        "  public constructor(owned target: Slot, alias: Slot?) "
+        "    Target := move target; Alias := alias; "
+        "  end constructor; "
+        "end Hub; "
+        "class C public static method Main(): int "
+        // Alias intentionally left null — exercises null back-edge in JSON mode.
+        "  using var hub := new Hub(new Slot(\"beta\"), null); "
+        "  using var ser := new JsonSerializer(); "
+        "  hub.Serialize(ser); "
+        "  using var bytes := ser.ToBytes(); "
+        "  using var de := new JsonDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var hub2 := Hub.Deserialize(de); "
+        "  if hub2.Target.Name <> \"beta\" then return 91; end; "
+        "  if hub2.Alias <> null then return 92; end; "
+        "  return 42; "
+        "end Main; end C;"), 42);
+}
+
+// §2.15 v0.139: `serialized graph` cycle raises SerializationException in JSON mode.
+// (Same contract as binary mode — cycle detection is format-agnostic.)
+BEZEL_TEST(codegen_json_675, graph_json_cycle_raises_spec_2_15_v0139) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "class Link serialized cyclic : ISerializable, IDeserializable "
+        "  public Val: int := 0; "
+        "  public Next: Link?; "
+        "  public constructor(val: int, next: Link?) "
+        "    Val := val; Next := next; "
+        "  end constructor; "
+        "end Link; "
+        "class C public static method Main(): int "
+        "  using var a := new Link(1, null); "
+        // Build a self-loop (cycle): a.Next = a.
+        "  a.Next := a; "
+        "  using var ser := new JsonSerializer(); "
+        "  try "
+        "    a.Serialize(ser); "
+        "    return 0; "
+        "  catch SerializationException => return 42; "
+        "  end; "
+        "end Main; end C;"), 42);
+}
+
+// §2.15 v0.139: tree-mode JSON is UNCHANGED — no $id/$ref fields appear for
+// `serialized tree` classes.  The tree JSON round-trip still returns 42.
+BEZEL_TEST(codegen_json_675, tree_json_unchanged_spec_2_15_v0139) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "class Leaf serialized tree : ISerializable, IDeserializable "
+        "  public N: int := 0; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "end Leaf; "
+        "class Root serialized tree : ISerializable, IDeserializable "
+        "  public owned L: Leaf; "
+        "  public Id: int := 0; "
+        "  public constructor(id: int, owned l: Leaf) Id := id; L := move l; end constructor; "
+        "end Root; "
+        "class C public static method Main(): int "
+        "  using var r := new Root(7, new Leaf(35)); "
+        "  using var ser := new JsonSerializer(); "
+        "  r.Serialize(ser); "
+        "  var json := ser.ToString(); "
+        // Tree JSON must NOT contain "$id" or "$ref".
+        "  if json.Contains(\"\\\"$id\\\"\") then return 91; end; "
+        "  if json.Contains(\"\\\"$ref\\\"\") then return 92; end; "
+        "  using var bytes := ser.ToBytes(); "
+        "  using var de := new JsonDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var back := Root.Deserialize(de); "
+        "  if back.Id = 7 and back.L.N = 35 then return 42; end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// §2.15 v0.139: `serialized "xxx"` rename whose name begins with `$` is a
+// compile error at the conformance declaration (reserved for graph-identity).
+// Syntax: `Name: Type serialized "wireName"` (SerializedClause follows the type).
+BEZEL_TEST(codegen_json_675,
+           dollar_rename_record_field_is_error_spec_2_15_v0139) {
+    // A positional record field with serialized "$foo" rename → compile error.
+    BEZEL_EXPECT_TRUE(compileFails(
+        std::string("module M; ") + kImport +
+        "record R(X: int serialized \"$foo\"): ISerializable, IDeserializable; "
+        "class C public static method Main(): int return 0; end Main; end C;"));
+}
+
+// §2.15 v0.139: ASan/LeakSanitizer verify JSON graph round-trip is leak-free.
+// detect_leaks=1: no leaks from tag table allocations or deserializer state.
+BEZEL_TEST(codegen_json_675,
+           asan_graph_diamond_roundtrip_no_leaks_spec_2_15_v0139) {
+    int rc = runUnderLeakSanitizerJson(
+        std::string("module M; ") + kImport +
+        "class Node serialized graph : ISerializable, IDeserializable "
+        "  public Val: int := 0; "
+        "  public constructor(val: int) Val := val; end constructor; "
+        "end Node; "
+        "class Diamond serialized graph : ISerializable, IDeserializable "
+        "  public owned Shared: Node; "
+        "  public Alias: Node?; "
+        "  public constructor(owned shared: Node, alias: Node?) "
+        "    Shared := move shared; Alias := alias; "
+        "  end constructor; "
+        "end Diamond; "
+        "class C public static method Main(): int "
+        "  var n := new Node(40); "
+        "  using var d := new Diamond(move n, n); "
+        "  using var ser := new JsonSerializer(); "
+        "  d.Serialize(ser); "
+        "  using var bytes := ser.ToBytes(); "
+        "  using var de := new JsonDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var back := Diamond.Deserialize(de); "
+        "  back.Shared.Val := back.Shared.Val + 2; "
+        "  if back.Alias = null then return 1; end; "
+        "  if back.Alias?.Val = 42 then return 42; end; "
+        "  return 1; "
+        "end Main; end C;",
+        /*detectLeaks=*/true);
+    // rc == -1 → toolchain unavailable (SKIP).
+    // rc == 42 → correct exit code + no leaks.
+    // rc == 0  → exit(0) + no leaks (also clean).
+    // rc == 99 → ASan/leak triggered → FAIL.
+    BEZEL_EXPECT_TRUE(rc == 0 || rc == 42 || rc == -1);
 }
