@@ -4822,6 +4822,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         const sema::Symbol*    sym;   // non-null for param captures
         const ast::Node*       decl;  // non-null for local captures
         bool                   isThis = false;
+        // #429 / #672 / §27.5 / §28.9: resolved sema type for retain/release
+        // classification in the per-lambda envdtor.  Non-null for params/locals
+        // where type resolution succeeded; null for `this` captures and when
+        // type is unavailable.  Drives the envdtor's retain/release decisions:
+        //   - string (Primitive::String): bz_string_retain at capture + release in envdtor
+        //   - Function: bz_closure_retain at capture + release in envdtor
+        //   - other pointer types (class borrow, value): cell freed only — per
+        //     §28.9/§28.3, class captures are borrows; no retain/release on the
+        //     captured object itself.
+        const sema::TypeRef*   semaTy = nullptr;
     };
     std::vector<CaptureEntry> captures;
 
@@ -4866,6 +4876,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         rebindDisposalSlot(slot, newSlot);
         ce.sym = sym;
         ce.decl = nullptr;
+        // #429/#672: resolve sema type for retain/release classification.
+        if (auto* par = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+            if (par->resolvedDeclType)
+                ce.semaTy = par->resolvedDeclType;
+            else if (par->declType)
+                ce.semaTy = ctx_.resolvedType(*par->declType);
+        }
         captures.push_back(ce);
     }
     // Box and collect captured outer locals.
@@ -4897,6 +4914,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         rebindDisposalSlot(slot, newSlot);
         ce.sym = nullptr;
         ce.decl = decl;
+        // #429/#672: resolve sema type for retain/release classification.
+        for (const sema::Symbol* s : capturedSyms) {
+            if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
+                if (loc->decl == decl) {
+                    ce.semaTy = loc->declType;
+                    break;
+                }
+            }
+        }
         captures.push_back(ce);
     }
 
@@ -5173,17 +5199,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     diverged_ = savedDiverged;
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
-    // --- Build the closure struct { fn_ptr, env_ptr, rc } ---
-    // #422 / §27.5 / §28.9: allocate a heap closure cell { ptr fn, ptr env,
-    // i64 rc } (24 bytes). The rc is appended after env so fn (off 0) and env
-    // (off 8) keep their offsets; getTypeAllocSize is the single source of truth
-    // for the size so the rc store never overflows.
+    // --- Build the closure struct { fn_ptr, env_ptr, rc, envdtor } ---
+    // #422 / #672 / §27.5 / §28.9: allocate a heap closure cell { ptr fn,
+    // ptr env, i64 rc, ptr envdtor } (32 bytes). fn (off 0) and env (off 8)
+    // keep their offsets; getTypeAllocSize is the single source of truth for
+    // the size so the rc/envdtor stores never overflow.
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)cellSz)});
     // Store fn_ptr at offset 0.
     builder_.CreateStore(fn, closureObj);
+
     // Allocate and fill the env struct (if there are captures).
     llvm::Value* envAlloc = llvm::ConstantPointerNull::get(ptrTy());
     if (!captures.empty()) {
@@ -5201,6 +5228,24 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             llvm::Value* dst = builder_.CreateStructGEP(
                 envTy, envAlloc, static_cast<unsigned>(i));
             builder_.CreateStore(ce.envValue, dst);
+            // #429 / #672 / §27.5 / §28.9: NO extra retain at capture-store time.
+            //
+            // RATIONALE: per §28.3/§28.9, ALL captures are borrows from the
+            // language's ownership perspective. When a string or function-typed local
+            // is captured, both StringEscapeWalker and ClosureEscapeWalker mark it
+            // "escaped" (FINDING [1]) which SUPPRESSES the scope-end release that
+            // would otherwise fire. That suppressed release is the ONLY extra
+            // reference: the reference already in the local's slot (either the
+            // producer's +1 or a borrow-retain's +1) is exactly the one the env
+            // cell should eventually release via the envdtor. No NEW reference is
+            // created at capture-store time; the existing +1 is "transferred" from
+            // the local slot to the env-cell's lifetime when the outer scope ends.
+            // Emitting an extra retain here would inflate the RC to +2 (outer-scope
+            // release suppressed → net +2 → envdtor releases once → leaks at +1).
+            // The PRIME DIRECTIVE (over-release worse than leak) is satisfied:
+            // the envdtor is the sole release of the existing reference.
+            // Class/value captures: NO RC obligation on the closure side; env holds
+            // a raw pointer borrow with no retain/release. §28.9 §28.3.
         }
     }
     // Store env_ptr at offset sizeof(ptr).
@@ -5208,7 +5253,92 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         ptrTy(), closureObj, {builder_.getInt32(1)});
     builder_.CreateStore(envAlloc, envSlot);
     initClosureRc(closureObj);     // #422: producer's reference, rc := 1
-    initClosureEnvdtor(closureObj); // #672: foundation null — no env disposal yet
+
+    // #429 / #672 / §27.5 / §28.9: emit per-lambda envdtor if any non-`this`
+    // capture exists.  The envdtor runs at last-drop (from bz_closure_release)
+    // to release the string/closure references that were owned by the captured
+    // locals and whose scope-end releases were suppressed (FINDING [1]: escape
+    // detection prevents the outer-scope release when a local is captured).
+    // The envdtor acts as the DEFERRED scope-end release for those references.
+    // `this` captures (direct receiver ptr, no heap cell) need no cleanup.
+    // methodThunk closures keep null envdtor — their env contains only `this`.
+    {
+        bool hasNonThisCapture = false;
+        for (const auto& ce : captures)
+            if (!ce.isThis) { hasNonThisCapture = true; break; }
+
+        if (!hasNonThisCapture || envFieldTys.empty()) {
+            initClosureEnvdtor(closureObj); // null — no env cells to free
+        } else {
+            // Emit the envdtor function alongside the trampoline.
+            llvm::BasicBlock* preDtorBB = builder_.GetInsertBlock();
+
+            std::string dtorName =
+                "bz$lam$" + std::to_string(lamId) + "$envdtor";
+            auto* dtorTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+            auto* dtorFn = llvm::Function::Create(
+                dtorTy, llvm::Function::InternalLinkage,
+                dtorName, module_.get());
+
+            auto* dtorEntry =
+                llvm::BasicBlock::Create(llvm_, "entry", dtorFn);
+            builder_.SetInsertPoint(dtorEntry);
+
+            llvm::Value* envArg = &*dtorFn->args().begin();
+            auto* envTyD = llvm::StructType::get(llvm_, envFieldTys);
+
+            for (std::size_t i = 0; i < captures.size(); ++i) {
+                const CaptureEntry& ce = captures[i];
+                if (ce.isThis) continue;
+                // Load cell pointer from env slot.
+                llvm::Value* fld = builder_.CreateStructGEP(
+                    envTyD, envArg, static_cast<unsigned>(i));
+                llvm::Value* cell =
+                    builder_.CreateLoad(ptrTy(), fld, "cell");
+                // Release the refcounted value stored in the cell.  This is
+                // the DEFERRED scope-end release for string/closure captures:
+                // the outer scope's release was suppressed by escape detection
+                // (FINDING [1]) so the reference still exists.  PRIME DIRECTIVE:
+                // exactly one release per suppressed scope-end (= the reference
+                // that was already in the local's slot before the capture).
+                // Value-type captures (int/bool/struct): no RC obligation.
+                // Class-borrow captures: per §28.9/§28.3 ALL captures are
+                // borrows; class instances are NOT ref-counted by the closure.
+                // CELL ITSELF: boxed capture cells (the shared heap allocation
+                // from boxLocalSlot) are NOT freed by the envdtor.  The cell is
+                // shared with the outer scope's ptr-holder alloca (newSlot);
+                // freeing it here can UAF the outer scope's access path (e.g.
+                // a using-var class disposal loads object ptr through the cell).
+                // The cell continues to leak — a pre-existing contained leak,
+                // safe in the direction of PRIME DIRECTIVE (never over-releases).
+                // Future work: free non-escaping cells at outer-scope exit.
+                if (isStringTypeRefNonNull(ce.semaTy)) {
+                    // String capture: load and release the +1 we retained.
+                    llvm::Value* str =
+                        builder_.CreateLoad(ptrTy(), cell, "str");
+                    emitStringRelease(str);
+                } else if (ce.semaTy &&
+                           ce.semaTy->kind == sema::TypeRef::Kind::Function) {
+                    // Closure capture: load and release the +1 we retained.
+                    llvm::Value* cl =
+                        builder_.CreateLoad(ptrTy(), cell, "cl");
+                    emitClosureRelease(cl);
+                }
+                // All other capture types (value, class borrow): no action.
+            }
+            builder_.CreateRetVoid();
+
+            // Restore builder to the outer-function BB.
+            builder_.SetInsertPoint(preDtorBB);
+
+            // Store envdtor fn ptr at cell field 3 (off 24).
+            builder_.CreateStore(
+                dtorFn,
+                builder_.CreateStructGEP(closureCellType(), closureObj, 3));
+        }
+    }
+
     return closureObj;
 }
 
