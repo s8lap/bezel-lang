@@ -8598,21 +8598,34 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                         recvTy->declaration == ms->parent &&
                         !recvTy->genericArgs.empty()) {
+                        // §22.12 / #684: for LOCAL generics, read the param
+                        // names from the ast::TypeDecl node (ms->parent->decl).
+                        // For IMPORTED generics, ms->parent->decl is null but
+                        // ms->parent->genericParams is populated by ModuleLoader
+                        // from the metadata (§14/#662c). Fall back to the
+                        // TypeSymbol's genericParams so imported generics get
+                        // the correct per-instantiation genericSubst_ and
+                        // staticFieldGlobal routes to the per-instantiation
+                        // global, not the external template-level declaration.
                         auto* td = dynamic_cast<const ast::TypeDecl*>(
                             ms->parent->decl);
-                        if (td && td->genericParams.size() ==
-                                  recvTy->genericArgs.size()) {
+                        const std::size_t nGP =
+                            td ? td->genericParams.size()
+                               : ms->parent->genericParams.size();
+                        if (nGP == recvTy->genericArgs.size()) {
                             std::unordered_map<std::string_view, llvm::Type*>
                                 newSubst;
                             std::unordered_map<std::string_view,
                                                const sema::TypeRef*>
                                 newSema;
-                            for (std::size_t gi = 0;
-                                 gi < td->genericParams.size(); ++gi) {
+                            for (std::size_t gi = 0; gi < nGP; ++gi) {
                                 llvm::Type* concrTy =
                                     lowerTypeRef(recvTy->genericArgs[gi]);
+                                // Local generic: name comes from ast::TypeDecl;
+                                // imported: name comes from sema::Symbol.
                                 std::string_view pname =
-                                    td->genericParams[gi].name;
+                                    td ? td->genericParams[gi].name
+                                       : ms->parent->genericParams[gi]->name;
                                 newSubst[pname] = concrTy;
                                 newSema[pname] = recvTy->genericArgs[gi];
                             }

@@ -564,10 +564,24 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             // Create the per-instantiation global with the same type and
             // constant initializer as the template-level global (which was
             // initialized by constInitFor in declareStatics).
+            //
+            // §22.12 / #684: for an imported generic, the template-level global
+            // is an external declaration created in declareStatics with nullptr
+            // initializer (ExternalLinkage, no definition here). Calling
+            // base->getInitializer() on such a global asserts in LLVM because
+            // external declarations have no initializer. Use zero-init for the
+            // per-instantiation copy; each importing module owns its own
+            // InternalLinkage instance (per §22.12 "each distinct instantiation
+            // has its own static state"). Any non-trivial constant initializer
+            // only occurs for locally-defined generics (non-imported), where
+            // base->hasInitializer() is always true.
+            llvm::Constant* instInit = base->hasInitializer()
+                ? base->getInitializer()
+                : llvm::Constant::getNullValue(base->getValueType());
             auto* gv = new llvm::GlobalVariable(
                 *module_, base->getValueType(), /*isConstant=*/false,
                 llvm::GlobalValue::InternalLinkage,
-                base->getInitializer(),
+                instInit,
                 gname);
             genericInstStaticGlobals_[key] = gv;
             return gv;
