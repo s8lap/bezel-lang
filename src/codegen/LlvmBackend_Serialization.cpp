@@ -661,6 +661,8 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // BeginObject → read field count.
     auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
     llvm::Value* fieldCount = builder_.CreateCall(beginFn, {derPtr}, "deser.count");
+    // §2.15: bz_binder_begin_object can throw (e.g. JSON: missing '{', truncated).
+    emitPendingCheck();
 
     // Loop: iterate fieldCount times, reading name + dispatching.
     auto* loopHdr  = llvm::BasicBlock::Create(llvm_, "deser.loop.hdr",  currentFn_);
@@ -683,6 +685,8 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
 
     auto* readNameFn = declareC("bz_binder_read_field_name", ptrTy(), {ptrTy()});
     llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "deser.fname");
+    // §2.15: bz_binder_read_field_name can throw (JSON: malformed input).
+    emitPendingCheck();
 
     // Dispatch: compare namePtr against each component's wire name.
     // Use bz_string_compare (runtime ordinal comparison) to test equality.
@@ -738,6 +742,8 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
             if (fieldVal->getType() == et)
                 builder_.CreateStore(fieldVal, slots[ci]);
         }
+        // §2.15: bz_binder_read_* can throw (JSON: type mismatch, malformed).
+        emitPendingCheck();
         // fix #668: mark this required component as seen.
         for (const auto& rse : recSeenFlags) {
             if (rse.compIdx == ci) {
@@ -758,6 +764,8 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     builder_.SetInsertPoint(skipBB);
     auto* skipFn = declareC("bz_binder_skip_value", voidTy, {ptrTy()});
     builder_.CreateCall(skipFn, {derPtr});
+    // §2.15: bz_binder_skip_value can throw (JSON strict: unknown field).
+    emitPendingCheck();
     // Release namePtr.
     auto* relFn2 = declareC("bz_string_release", voidTy, {ptrTy()});
     builder_.CreateCall(relFn2, {namePtr});
@@ -775,6 +783,8 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // EndObject.
     auto* endFn = declareC("bz_binder_end_object", voidTy, {ptrTy()});
     builder_.CreateCall(endFn, {derPtr});
+    // §2.15: bz_binder_end_object can throw (JSON: missing '}').
+    emitPendingCheck();
 
     // fix #668: §9.8 / §2.15: check all required components were seen.
     // Records have no owned class fields so there is nothing to dispose on this
@@ -1453,6 +1463,8 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // BeginObject → read field count.
     auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
     llvm::Value* fieldCount = builder_.CreateCall(beginFn, {derPtr}, "cdeser.cnt");
+    // §2.15: bz_binder_begin_object can throw (JSON: missing '{', truncated).
+    emitPendingCheck();
 
     // Loop over fieldCount, reading each field name and dispatching.
     auto* loopHdr  = llvm::BasicBlock::Create(llvm_, "cdeser.hdr",  currentFn_);
@@ -1913,6 +1925,8 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
         !recvTy->astNode->name->parts.empty()) {
         const std::string_view rcn = recvTy->astNode->name->parts[0];
         if (rcn == "BinarySerializer" || rcn == "BinaryDeserializer") return true;
+        // §2.15: JsonSerializer / JsonDeserializer instance methods.
+        if (rcn == "JsonSerializer" || rcn == "JsonDeserializer") return true;
         // §2.14: ISerializer / IDeserializer methods (used in hand-written
         // Serialize/Deserialize bodies; the concrete object is always a
         // BinarySerializer* / BinaryDeserializer* at runtime).
@@ -2017,6 +2031,48 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
         }
 
         if (rcn == "BinaryDeserializer") {
+            llvm::Value* der = lowerExpr(*ma->target);
+            if (!der) return nullptr;
+
+            // Dispose() → bz_binder_free(der)
+            if (methodName == "Dispose" && call.args.empty()) {
+                auto* fn = declareC("bz_binder_free",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {der});
+                return nullptr;
+            }
+            return nullptr;
+        }
+
+        // §2.15: JsonSerializer instance methods.
+        if (rcn == "JsonSerializer") {
+            llvm::Value* ser = lowerExpr(*ma->target);
+            if (!ser) return nullptr;
+
+            // ToBytes() → bz_jser_to_bytes(ser) returning bz_array_t*
+            if (methodName == "ToBytes" && call.args.empty()) {
+                auto* fn = declareC("bz_jser_to_bytes", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {ser}, "jser.bytes");
+            }
+
+            // ToString() → bz_jser_to_string(ser) returning bz_string_t*
+            if (methodName == "ToString" && call.args.empty()) {
+                auto* fn = declareC("bz_jser_to_string", ptrTy(), {ptrTy()});
+                return builder_.CreateCall(fn, {ser}, "jser.str");
+            }
+
+            // Dispose() → bz_binser_free(ser)
+            if (methodName == "Dispose" && call.args.empty()) {
+                auto* fn = declareC("bz_binser_free",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {ser});
+                return nullptr;
+            }
+            return nullptr;
+        }
+
+        // §2.15: JsonDeserializer instance methods.
+        if (rcn == "JsonDeserializer") {
             llvm::Value* der = lowerExpr(*ma->target);
             if (!der) return nullptr;
 

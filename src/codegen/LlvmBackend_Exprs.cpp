@@ -5762,13 +5762,22 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return builder_.getInt64(0);  // default: zero TimeSpan
             }
 
-            // §2.15 (issue #550): BinarySerializer / BinaryDeserializer.
+            // §2.15 (issue #550): BinarySerializer / BinaryDeserializer / JsonSerializer / JsonDeserializer.
             // These require `import System.Serialization`; they are compiler-known
             // builtin classes backed by bz_binser_t / bz_binder_t in the runtime.
             // new BinarySerializer() → bz_binser_alloc()  (opaque ptr)
             if (colName == "BinarySerializer" && ne.args.empty()) {
                 auto* fn = declareC("bz_binser_alloc", ptrTy(), {});
                 return builder_.CreateCall(fn, {}, "binser.new");
+            }
+            // new JsonSerializer() → bz_jser_alloc()  (same bz_binser_t, kind=1)
+            if (colName == "JsonSerializer" &&
+                (ne.args.empty() ||
+                 (ne.args.size() == 1 && ne.args[0].value))) {
+                // Both new JsonSerializer() and new JsonSerializer(options) → bz_jser_alloc().
+                // JsonOptions is not yet represented in codegen; options ignored.
+                auto* fn = declareC("bz_jser_alloc", ptrTy(), {});
+                return builder_.CreateCall(fn, {}, "jser.new");
             }
             // new BinaryDeserializer(span: ReadOnlySpan<byte>)  or
             // new BinaryDeserializer(span, ignoreUnknownFields: bool)
@@ -5810,6 +5819,65 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                     {ptrTy(), i64(), i8()});
                 return builder_.CreateCall(fn, {byteData, lenI64, ignoreFld},
                                            "bindeser.new");
+            }
+            // new JsonDeserializer(input: ReadOnlySpan<byte>) or
+            // new JsonDeserializer(input: string) or
+            // new JsonDeserializer(input: ReadOnlySpan<byte>, options: JsonOptions)
+            if (colName == "JsonDeserializer" && !ne.args.empty() && ne.args[0].value) {
+                // Check the first argument type to determine span vs string.
+                auto* argTy = ctx_.exprType(*ne.args[0].value);
+                bool isString = argTy &&
+                    argTy->kind == sema::TypeRef::Kind::Primitive &&
+                    argTy->primitive == sema::PrimitiveType::String;
+                llvm::Value* ignoreFld = builder_.getInt8(0);
+                // JsonOptions: ignore for now (not yet lowerable); second arg ignored.
+                if (isString) {
+                    // new JsonDeserializer(string) — string is a bz_string*.
+                    // We need the raw UTF-8 bytes and length from the bz_string.
+                    llvm::Value* strPtr = lowerExpr(*ne.args[0].value);
+                    if (!strPtr) return nullptr;
+                    // Extract data ptr and byte length from bz_string_struct.
+                    auto* strTy = stringType();
+                    llvm::Value* dataPtr = builder_.CreateLoad(ptrTy(),
+                        builder_.CreateStructGEP(strTy, strPtr, 0), "jder.sdata");
+                    llvm::Value* lenCp = builder_.CreateLoad(i64(),
+                        builder_.CreateStructGEP(strTy, strPtr, 1), "jder.slen");
+                    // Width-1 strings: data is raw bytes (UTF-8 or Latin-1);
+                    // width-2/4 strings: we need UTF-8; use bz_string_to_utf8z.
+                    // For simplicity, use bz_string_to_utf8z always (returns malloc'd NUL-terminated).
+                    // We allocate a bz_jder_alloc over the utf8z data.
+                    // NOTE: The utf8z buffer must outlive the deserializer call.
+                    // Since the deserializer only needs to read during Deserialize,
+                    // and the utf8z is freed at scope end (handled by using var disposal),
+                    // we pass the utf8z buffer directly. The deserializer borrows it.
+                    // The simplest correct approach: use bz_string_to_utf8z + strlen.
+                    auto* utf8zFn = declareC("bz_string_to_utf8z", ptrTy(), {ptrTy()});
+                    llvm::Value* utf8z = builder_.CreateCall(utf8zFn, {strPtr}, "jder.utf8z");
+                    // strlen the utf8z to get byte count.
+                    auto* strlenFn = declareC("strlen", i64(), {ptrTy()});
+                    llvm::Value* utf8Len = builder_.CreateCall(strlenFn, {utf8z}, "jder.utf8len");
+                    // bz_jder_alloc_from_utf8z: use bz_jder_alloc with (utf8z, utf8len, ignore).
+                    // Then we need to free utf8z after... but the deserializer only borrows.
+                    // Use bz_jder_alloc_str which takes ownership of the utf8z.
+                    auto* fn = declareC("bz_jder_alloc_str", ptrTy(),
+                                        {ptrTy(), i64(), i8()});
+                    return builder_.CreateCall(fn, {utf8z, utf8Len, ignoreFld}, "jder.new");
+                } else {
+                    // new JsonDeserializer(ReadOnlySpan<byte>) — unpack span.
+                    llvm::Value* spanVal = lowerExpr(*ne.args[0].value);
+                    if (!spanVal) return nullptr;
+                    llvm::Value* dataPtr = spanSource(spanVal);
+                    llvm::Value* lenI32  = spanLength(spanVal);
+                    llvm::Value* arrData = builder_.CreateLoad(ptrTy(), dataPtr, "jder.data");
+                    llvm::Value* startI32 = spanStart(spanVal);
+                    llvm::Value* startI64 = builder_.CreateZExt(startI32, i64(), "jder.s64");
+                    llvm::Value* lenI64   = builder_.CreateZExt(lenI32, i64(), "jder.l64");
+                    llvm::Value* byteData = builder_.CreateGEP(
+                        llvm::Type::getInt8Ty(llvm_), arrData, startI64, "jder.bdata");
+                    auto* fn = declareC("bz_jder_alloc", ptrTy(),
+                                        {ptrTy(), i64(), i8()});
+                    return builder_.CreateCall(fn, {byteData, lenI64, ignoreFld}, "jder.new");
+                }
             }
         }
         return nullptr;

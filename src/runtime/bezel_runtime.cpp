@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <ctype.h>
 #include <errno.h>
@@ -7281,10 +7282,25 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
 #define BZ_SER_INLINE 0x01
 #define BZ_SER_REF    0x02
 
+// JSON serializer state (used when kind == 1).
+// The output is accumulated in buf/used/cap (same as binary, but UTF-8 JSON text).
+// Nesting depth is tracked for comma logic; `needs_comma[d]` = true when the
+// current value at depth d needs a comma written before it.
+// Depth limit: BZ_JSER_MAX_DEPTH (must match §2.15 MaxDepth default = 64).
+#define BZ_JSER_MAX_DEPTH 64
+struct bz_jser_state_t {
+    int     depth;                         // current nesting depth
+    bool    needs_comma[BZ_JSER_MAX_DEPTH]; // does a comma precede the next value?
+};
+
 struct bz_binser_t {
     uint8_t* buf;
     int64_t  used;   // bytes written so far
     int64_t  cap;    // allocated capacity
+    int8_t   kind;   // 0 = binary (default), 1 = JSON
+
+    // JSON state (only valid when kind == 1).
+    bz_jser_state_t json;
 
     // §9.8 tier-3: identity-tag table (pointer → tag_id) for `serialized graph`.
     // tag_ptrs[i] = the object pointer for tag_id (i+1).  tag_id=0 means "not seen".
@@ -7336,13 +7352,15 @@ static void bz_binser_write_utf8_bytes(bz_binser_t* s, const char* data, int64_t
 extern "C" {
 
 void* bz_binser_alloc(void) {
-    auto* s = static_cast<bz_binser_t*>(malloc(sizeof(bz_binser_t)));
-    s->buf       = nullptr;
-    s->used      = 0;
-    s->cap       = 0;
-    s->tag_ptrs  = nullptr;
-    s->tag_count = 0;
-    s->tag_cap   = 0;
+    auto* s = static_cast<bz_binser_t*>(calloc(1, sizeof(bz_binser_t)));
+    s->kind      = 0;  // binary
+    return s;
+}
+
+// JSON serializer: same bz_binser_t, kind = 1.
+void* bz_jser_alloc(void) {
+    auto* s = static_cast<bz_binser_t*>(calloc(1, sizeof(bz_binser_t)));
+    s->kind = 1;  // JSON
     return s;
 }
 
@@ -7372,20 +7390,216 @@ void* bz_binser_to_bytes(void* serp) {
     return arr;
 }
 
+// bz_jser_to_bytes: transfer JSON bytes as an OwnedBuffer<byte>.
+// Same logic as bz_binser_to_bytes but for JSON kind.
+void* bz_jser_to_bytes(void* serp) {
+    return bz_binser_to_bytes(serp);  // same buffer layout; kind tag is ignored
+}
+
+// bz_jser_to_string: decode the UTF-8 JSON bytes into a Bezel string (bz_string_struct*).
+// Returns a newly-allocated bz_string_struct*; caller owns it (rc = 1).
+void* bz_jser_to_string(void* serp) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (!s || s->used == 0) {
+        // Return empty string.
+        uint8_t* strObj = static_cast<uint8_t*>(calloc(1, (size_t)BZ_STRING_SIZEOF));
+        if (!strObj) return nullptr;
+        // data = null (empty string has no data), len = 0, width = 1
+        strObj[16] = 1;
+        bz_string_init_rc(strObj);
+        return strObj;
+    }
+    // Build a bz_string from the UTF-8 bytes in s->buf.
+    // bz_binder_read_bz_string is not directly callable here (it needs a binder);
+    // re-implement the UTF-8 → code-point decode inline.
+    const uint8_t* src    = s->buf;
+    int64_t        byte_len = s->used;
+
+    // Pass 1: count code points + find max.
+    uint32_t* cps = static_cast<uint32_t*>(malloc((size_t)byte_len * sizeof(uint32_t) + 4));
+    if (!cps) return nullptr;
+    int64_t ncp = 0;
+    uint32_t max_cp = 0;
+    int64_t i = 0;
+    while (i < byte_len) {
+        uint8_t b0 = src[i];
+        uint32_t cp;
+        int seq;
+        if      (b0 < 0x80) { cp = b0;             seq = 1; }
+        else if (b0 < 0xC0) { cp = 0xFFFD;         seq = 1; }
+        else if (b0 < 0xE0) { cp = b0 & 0x1F;      seq = 2; }
+        else if (b0 < 0xF0) { cp = b0 & 0x0F;      seq = 3; }
+        else                 { cp = b0 & 0x07;      seq = 4; }
+        for (int k = 1; k < seq && i + k < byte_len; ++k)
+            cp = (cp << 6) | (src[i + k] & 0x3F);
+        i += seq;
+        cps[ncp++] = cp;
+        if (cp > max_cp) max_cp = cp;
+    }
+    uint8_t width = (max_cp <= 0xFF) ? 1 : (max_cp <= 0xFFFF) ? 2 : 4;
+    size_t data_bytes = (size_t)ncp * width + width;
+    uint8_t* buf2 = static_cast<uint8_t*>(malloc(data_bytes));
+    if (!buf2) { free(cps); return nullptr; }
+    memset(buf2 + (size_t)ncp * width, 0, width);
+    for (int64_t j = 0; j < ncp; ++j) {
+        if (width == 1)       buf2[j]          = (uint8_t)cps[j];
+        else if (width == 2) { uint16_t v = (uint16_t)cps[j]; memcpy(buf2 + j*2, &v, 2); }
+        else                 { uint32_t v = cps[j];            memcpy(buf2 + j*4, &v, 4); }
+    }
+    free(cps);
+    uint8_t* strObj = static_cast<uint8_t*>(calloc(1, (size_t)BZ_STRING_SIZEOF));
+    if (!strObj) { free(buf2); return nullptr; }
+    void* buf2p = buf2;
+    memcpy(strObj,      &buf2p, sizeof(void*));
+    memcpy(strObj + 8,  &ncp,   sizeof(int64_t));
+    strObj[16] = width;
+    bz_string_init_rc(strObj);
+    return strObj;
+}
+
+// ---------------------------------------------------------------------------
+// JSON serializer helpers (kind == 1)
+//
+// §2.15 JSON text rules:
+//   WriteInt/WriteUInt → JSON number (decimal digits, no decimal point)
+//   WriteFloat → JSON number; NaN/±Infinity → SerializationException
+//   WriteDecimal → JSON number without precision loss (printed as decimal)
+//   WriteBool → true / false
+//   WriteString → quoted, escaped JSON string (\", \\, \n, \r, \t, \uXXXX)
+//   WriteChar → one-character JSON string
+//   WriteNull → null
+//   BeginObject → { (fieldCount advisory, ignored)
+//   WriteFieldName → "name":
+//   EndObject → }
+//   BeginArray → [
+//   EndArray → ]
+// ---------------------------------------------------------------------------
+
+// Append raw bytes to the serializer buffer (same as binary path).
+static void bz_jser_raw(bz_binser_t* s, const char* p, int64_t n) {
+    bz_binser_ensure(s, n);
+    memcpy(s->buf + s->used, p, (size_t)n);
+    s->used += n;
+}
+
+// Append a NUL-terminated C string.
+static void bz_jser_cstr(bz_binser_t* s, const char* p) {
+    bz_jser_raw(s, p, (int64_t)strlen(p));
+}
+
+// If the current depth context needs a comma, write it now and clear the flag.
+// This must be called before every value (but NOT before WriteFieldName —
+// commas before field names are handled in WriteFieldName itself).
+static void bz_jser_maybe_comma(bz_binser_t* s) {
+    int d = s->json.depth;
+    if (d >= 0 && d < BZ_JSER_MAX_DEPTH && s->json.needs_comma[d]) {
+        bz_jser_cstr(s, ",");
+    }
+}
+
+// After writing a value at current depth, mark that the NEXT value needs a comma.
+static void bz_jser_mark_comma(bz_binser_t* s) {
+    int d = s->json.depth;
+    if (d >= 0 && d < BZ_JSER_MAX_DEPTH)
+        s->json.needs_comma[d] = true;
+}
+
+// Write a quoted, escaped JSON string from a bz_string*.
+// §2.15: "WriteString produces a quoted, escaped JSON string."
+// JSON escaping rules (RFC 8259 §7):
+//   " → \"   \ → \\   \n → \n   \r → \r   \t → \t
+//   control chars (U+0000..U+001F, except above) → \uXXXX
+static void bz_jser_write_string_impl(bz_binser_t* s, void* strp) {
+    bz_jser_cstr(s, "\"");
+    if (!strp) { bz_jser_cstr(s, "\""); return; }
+
+    // Decode codepoints from bz_string (adaptive width).
+    const auto* str = static_cast<const bz_string_struct*>(strp);
+    int64_t  len   = str->len;
+    uint8_t  width = str->width;
+    const uint8_t* data = static_cast<const uint8_t*>(str->data);
+
+    for (int64_t i = 0; i < len; ++i) {
+        uint32_t cp;
+        if (width == 1)      cp = data[i];
+        else if (width == 2) { uint16_t v; memcpy(&v, data + i*2, 2); cp = v; }
+        else                 { uint32_t v; memcpy(&v, data + i*4, 4); cp = v; }
+
+        if (cp == '"')       { bz_jser_raw(s, "\\\"", 2); }
+        else if (cp == '\\') { bz_jser_raw(s, "\\\\", 2); }
+        else if (cp == '\n') { bz_jser_raw(s, "\\n",  2); }
+        else if (cp == '\r') { bz_jser_raw(s, "\\r",  2); }
+        else if (cp == '\t') { bz_jser_raw(s, "\\t",  2); }
+        else if (cp < 0x20) {
+            // Other control characters: \uXXXX
+            char esc[7];
+            snprintf(esc, sizeof(esc), "\\u%04X", (unsigned)cp);
+            bz_jser_raw(s, esc, 6);
+        } else if (cp < 0x80) {
+            // ASCII non-control
+            char c = (char)cp;
+            bz_jser_raw(s, &c, 1);
+        } else {
+            // Multi-byte UTF-8 encode back
+            char utf8[5] = {};
+            int n = 0;
+            if      (cp < 0x800)   { utf8[n++]=(char)(0xC0|(cp>>6));   utf8[n++]=(char)(0x80|(cp&0x3F)); }
+            else if (cp < 0x10000) { utf8[n++]=(char)(0xE0|(cp>>12));  utf8[n++]=(char)(0x80|((cp>>6)&0x3F));  utf8[n++]=(char)(0x80|(cp&0x3F)); }
+            else                   { utf8[n++]=(char)(0xF0|(cp>>18));  utf8[n++]=(char)(0x80|((cp>>12)&0x3F)); utf8[n++]=(char)(0x80|((cp>>6)&0x3F)); utf8[n++]=(char)(0x80|(cp&0x3F)); }
+            bz_jser_raw(s, utf8, n);
+        }
+    }
+    bz_jser_cstr(s, "\"");
+}
+
 // ISerializer method implementations ----------------------------------------
 
 void bz_binser_write_int(void* serp, int64_t v) {
-    bz_binser_write_le64_impl(static_cast<bz_binser_t*>(serp), (uint64_t)v);
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        bz_jser_maybe_comma(s);
+        char buf[32];
+        int n = snprintf(buf, sizeof(buf), "%" PRId64, v);
+        bz_jser_raw(s, buf, n);
+        bz_jser_mark_comma(s);
+        return;
+    }
+    bz_binser_write_le64_impl(s, (uint64_t)v);
 }
 
 void bz_binser_write_uint(void* serp, uint64_t v) {
-    bz_binser_write_le64_impl(static_cast<bz_binser_t*>(serp), v);
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        bz_jser_maybe_comma(s);
+        char buf[32];
+        int n = snprintf(buf, sizeof(buf), "%" PRIu64, v);
+        bz_jser_raw(s, buf, n);
+        bz_jser_mark_comma(s);
+        return;
+    }
+    bz_binser_write_le64_impl(s, v);
 }
 
 void bz_binser_write_float(void* serp, double v) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        // §2.15: NaN / ±Infinity → SerializationException.
+        if (std::isnan(v) || std::isinf(v)) {
+            bz_ser_throw("Non-finite float cannot be represented in JSON (§2.15)",
+                         nullptr);
+            return;
+        }
+        bz_jser_maybe_comma(s);
+        // Print with enough precision to round-trip exactly.
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "%.17g", v);
+        bz_jser_raw(s, buf, n);
+        bz_jser_mark_comma(s);
+        return;
+    }
     uint64_t bits;
     memcpy(&bits, &v, 8);
-    bz_binser_write_le64_impl(static_cast<bz_binser_t*>(serp), bits);
+    bz_binser_write_le64_impl(s, bits);
 }
 
 // fix #665 / §2.14 / §9.8: WriteDecimal — wire format is 4×u32 LE (the
@@ -7394,13 +7608,84 @@ void bz_binser_write_float(void* serp, double v) {
 // {i32, i32, i32, i32} struct (codegen spills to an alloca, passes address).
 void bz_binser_write_decimal(void* serp, void* val) {
     auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        // §2.15: WriteDecimal → JSON number written without precision loss.
+        bz_jser_maybe_comma(s);
+        if (!val) {
+            bz_jser_cstr(s, "0");
+            bz_jser_mark_comma(s);
+            return;
+        }
+        // bz_decimal_t layout: { lo32, mid32, hi32, flags }
+        // flags bit31=sign, bits[16..23]=scale (0..28)
+        // value = (hi32*2^64 + mid32*2^32 + lo32) / 10^scale  (with sign)
+        uint32_t fields[4];
+        memcpy(fields, val, sizeof(fields));
+        uint32_t lo32   = fields[0];
+        uint32_t mid32  = fields[1];
+        uint32_t hi32   = fields[2];
+        uint32_t flags  = fields[3];
+        uint32_t scale  = (flags >> 16) & 0xFF;
+        int      negative = (flags >> 31) & 1;
+
+        // Reconstruct 96-bit mantissa as decimal string.
+        // Use __uint128_t for the arithmetic.
+        __uint128_t m = ((__uint128_t)hi32 << 64) |
+                        ((__uint128_t)mid32 << 32) |
+                        (__uint128_t)lo32;
+
+        if (m == 0) {
+            bz_jser_cstr(s, "0");
+            bz_jser_mark_comma(s);
+            return;
+        }
+
+        // Convert mantissa to decimal string (up to 29 digits + NUL).
+        char digits[40] = {};
+        int  ndigits = 0;
+        __uint128_t tmp = m;
+        while (tmp > 0) {
+            digits[ndigits++] = (char)('0' + (int)(tmp % 10));
+            tmp /= 10;
+        }
+        // digits is in reverse order; flip it.
+        for (int a = 0, b = ndigits - 1; a < b; ++a, --b) {
+            char t = digits[a]; digits[a] = digits[b]; digits[b] = t;
+        }
+
+        // Build the JSON number: [-] integer-part [. fraction-part]
+        char out[64];
+        int  olen = 0;
+        if (negative) out[olen++] = '-';
+
+        if (scale == 0) {
+            // Pure integer.
+            for (int i = 0; i < ndigits; ++i) out[olen++] = digits[i];
+        } else {
+            // ndigits with scale decimal places.
+            int int_digits = ndigits - (int)scale;
+            if (int_digits > 0) {
+                for (int i = 0; i < int_digits; ++i) out[olen++] = digits[i];
+                out[olen++] = '.';
+                for (int i = int_digits; i < ndigits; ++i) out[olen++] = digits[i];
+            } else {
+                // Number is 0.000...digits (int_digits <= 0).
+                out[olen++] = '0';
+                out[olen++] = '.';
+                int leading_zeros = -int_digits;
+                for (int i = 0; i < leading_zeros; ++i) out[olen++] = '0';
+                for (int i = 0; i < ndigits; ++i) out[olen++] = digits[i];
+            }
+        }
+        bz_jser_raw(s, out, olen);
+        bz_jser_mark_comma(s);
+        return;
+    }
     if (!val) {
-        // Null val (should not happen — codegen always spills): write 16 zero bytes.
         uint32_t zero = 0;
         for (int i = 0; i < 4; ++i) bz_binser_write_le32_impl(s, zero);
         return;
     }
-    // Read 4 u32 fields from the struct and write them LE.
     uint32_t fields[4];
     memcpy(fields, val, sizeof(fields));
     for (int i = 0; i < 4; ++i)
@@ -7408,29 +7693,33 @@ void bz_binser_write_decimal(void* serp, void* val) {
 }
 
 void bz_binser_write_bool(void* serp, int8_t v) {
-    bz_binser_write_byte_impl(static_cast<bz_binser_t*>(serp), v ? 1 : 0);
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        bz_jser_maybe_comma(s);
+        bz_jser_cstr(s, v ? "true" : "false");
+        bz_jser_mark_comma(s);
+        return;
+    }
+    bz_binser_write_byte_impl(s, v ? 1 : 0);
 }
 
 void bz_binser_write_string(void* serp, void* strp) {
     auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        bz_jser_maybe_comma(s);
+        bz_jser_write_string_impl(s, strp);
+        bz_jser_mark_comma(s);
+        return;
+    }
     if (!strp) {
         bz_binser_write_le32_impl(s, 0);
         return;
     }
-    // bz_string_struct layout: {void* data, int64_t len, int8_t width}
-    // For width==1, data points to uint8_t byte array (UTF-8 / Latin-1).
-    // For width==2, data points to uint16_t (UTF-16 LE).
-    // We re-encode to UTF-8 bytes for the wire format.
-    // Simplification: for width==1 we can write data directly (it's already
-    // byte-width; Bezel strings with width==1 are latin-1 or ASCII subset;
-    // non-ASCII wide chars use width==2 or width==4 so the byte content is
-    // valid as-is for our LE32-length-prefixed raw-bytes encoding).
     const auto* str = static_cast<const bz_string_struct*>(strp);
     if (str->width == 1) {
         bz_binser_write_utf8_bytes(s,
             static_cast<const char*>(str->data), str->len);
     } else {
-        // width==2 or width==4: use bz_string_to_utf8z to get a UTF-8 copy.
         char* utf8 = bz_string_to_utf8z(strp);
         int64_t n = utf8 ? (int64_t)strlen(utf8) : 0;
         bz_binser_write_utf8_bytes(s, utf8 ? utf8 : "", n);
@@ -7439,7 +7728,28 @@ void bz_binser_write_string(void* serp, void* strp) {
 }
 
 void bz_binser_write_char(void* serp, int32_t codepoint) {
-    // Encode Unicode scalar as UTF-8, then write as LE32-length-prefixed bytes.
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        // §2.15: WriteChar → one-character JSON string.
+        // Synthesize a tiny bz_string_struct on the stack, reuse write_string_impl.
+        uint8_t  tmp_data[5] = {};
+        int64_t  tmp_len  = 1;
+        uint8_t  tmp_width;
+        uint32_t cp = (uint32_t)codepoint;
+        if (cp <= 0xFF)       { tmp_data[0] = (uint8_t)cp; tmp_width = 1; }
+        else if (cp <= 0xFFFF){ uint16_t v = (uint16_t)cp; memcpy(tmp_data, &v, 2); tmp_width = 2; }
+        else                  { memcpy(tmp_data, &cp, 4); tmp_width = 4; }
+        // Build a minimal bz_string_struct on the stack.
+        uint8_t str_bytes[BZ_STRING_SIZEOF] = {};
+        void* dp = tmp_data;
+        memcpy(str_bytes,      &dp,       sizeof(void*));
+        memcpy(str_bytes + 8,  &tmp_len,  sizeof(int64_t));
+        str_bytes[16] = tmp_width;
+        bz_jser_maybe_comma(s);
+        bz_jser_write_string_impl(s, str_bytes);
+        bz_jser_mark_comma(s);
+        return;
+    }
     char buf[4];
     int n = 0;
     uint32_t cp = (uint32_t)codepoint;
@@ -7447,29 +7757,88 @@ void bz_binser_write_char(void* serp, int32_t codepoint) {
     else if (cp < 0x800)    { buf[n++] = (char)(0xC0|(cp>>6));  buf[n++] = (char)(0x80|(cp&0x3F)); }
     else if (cp < 0x10000)  { buf[n++] = (char)(0xE0|(cp>>12)); buf[n++] = (char)(0x80|((cp>>6)&0x3F));  buf[n++] = (char)(0x80|(cp&0x3F)); }
     else                    { buf[n++] = (char)(0xF0|(cp>>18)); buf[n++] = (char)(0x80|((cp>>12)&0x3F)); buf[n++] = (char)(0x80|((cp>>6)&0x3F)); buf[n++] = (char)(0x80|(cp&0x3F)); }
-    bz_binser_write_utf8_bytes(static_cast<bz_binser_t*>(serp), buf, n);
+    bz_binser_write_utf8_bytes(s, buf, n);
 }
 
 void bz_binser_write_null(void* serp) {
-    bz_binser_write_byte_impl(static_cast<bz_binser_t*>(serp), 0);
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        bz_jser_maybe_comma(s);
+        bz_jser_cstr(s, "null");
+        bz_jser_mark_comma(s);
+        return;
+    }
+    bz_binser_write_byte_impl(s, 0);
 }
 
 void bz_binser_begin_object(void* serp, int32_t field_count) {
-    bz_binser_write_le32_impl(static_cast<bz_binser_t*>(serp), (uint32_t)field_count);
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        // §2.15: fieldCount is advisory for JSON — ignored.
+        (void)field_count;
+        bz_jser_maybe_comma(s);
+        bz_jser_cstr(s, "{");
+        int nd = ++s->json.depth;
+        if (nd < BZ_JSER_MAX_DEPTH) s->json.needs_comma[nd] = false;
+        return;
+    }
+    bz_binser_write_le32_impl(s, (uint32_t)field_count);
 }
 
 // write_field_name: name is a bz_string* (void*)
 void bz_binser_write_field_name(void* serp, void* name) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        // For JSON: write comma+quote+field_name+":".
+        // The comma logic: between fields in an object.
+        int d = s->json.depth;
+        if (d >= 0 && d < BZ_JSER_MAX_DEPTH && s->json.needs_comma[d]) {
+            bz_jser_cstr(s, ",");
+        }
+        bz_jser_write_string_impl(s, name);
+        bz_jser_cstr(s, ":");
+        // Reset the needs_comma flag (the value that follows is NOT preceded by comma).
+        if (d >= 0 && d < BZ_JSER_MAX_DEPTH) s->json.needs_comma[d] = false;
+        return;
+    }
     bz_binser_write_string(serp, name);
 }
 
-void bz_binser_end_object(void* /*serp*/) { /* no trailer in binary format */ }
-
-void bz_binser_begin_array(void* serp, int32_t element_count) {
-    bz_binser_write_le32_impl(static_cast<bz_binser_t*>(serp), (uint32_t)element_count);
+void bz_binser_end_object(void* serp) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        --s->json.depth;
+        bz_jser_cstr(s, "}");
+        // After the } the parent context needs a comma.
+        bz_jser_mark_comma(s);
+        return;
+    }
+    /* no trailer in binary format */
 }
 
-void bz_binser_end_array(void* /*serp*/) { /* no trailer */ }
+void bz_binser_begin_array(void* serp, int32_t element_count) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        (void)element_count;
+        bz_jser_maybe_comma(s);
+        bz_jser_cstr(s, "[");
+        int nd = ++s->json.depth;
+        if (nd < BZ_JSER_MAX_DEPTH) s->json.needs_comma[nd] = false;
+        return;
+    }
+    bz_binser_write_le32_impl(s, (uint32_t)element_count);
+}
+
+void bz_binser_end_array(void* serp) {
+    auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        --s->json.depth;
+        bz_jser_cstr(s, "]");
+        bz_jser_mark_comma(s);
+        return;
+    }
+    /* no trailer */
+}
 
 // ---------------------------------------------------------------------------
 // §9.8 tier-3: identity-tag graph serialization helpers
@@ -7520,6 +7889,11 @@ void bz_binser_write_ref_tag(void* serp, int32_t tag_id) {
 
 // --- reader state -----------------------------------------------------------
 
+// JSON deserializer state (used when kind == 1).
+// The parser is a simple recursive-descent tokenizer.
+// We track the nesting stack for the object/array depth counter.
+#define BZ_JDER_MAX_DEPTH 64
+
 struct bz_binder_t {
     const uint8_t* data;
     int64_t        len;
@@ -7527,6 +7901,7 @@ struct bz_binder_t {
     int8_t         ignore_unknown;
     int32_t        fields_remaining;
     bool           in_object;
+    int8_t         kind;  // 0 = binary, 1 = JSON
 
     // §9.8 tier-3: identity-tag→object table for `serialized graph` deserialize.
     // tag_ptrs[i]        = the constructed object pointer for tag_id (i+1).
@@ -7643,19 +8018,399 @@ static void* bz_binder_read_bz_string(bz_binder_t* d) {
     return strObj;
 }
 
+// Forward declarations needed by JSON helpers.
+// (bz_decimal_t is defined in bezel_runtime.h — already included above)
+extern "C" void bz_string_release(void* s);
+// bz_decimal_parse_cstr: (text, out, ove_vtable, fe_vtable) — stores result in *out.
+extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
+                                       void* ove_vtable, void* fe_vtable);
+
+// ---------------------------------------------------------------------------
+// JSON deserializer helpers (kind == 1)
+//
+// §2.15 JSON read rules:
+//   BeginObject → skip '{', return -1
+//   ReadFieldName → read key string (unquote+unescape), skip ':'
+//   SkipValue → skip one JSON value (any type, including nested {}/[])
+//   EndObject → skip '}'
+//   BeginArray → skip '[', return -1
+//   HasMoreElements → peek: return 1 unless next non-ws char is ']'
+//   EndArray → skip ']'
+//   ReadInt/ReadUInt → parse JSON number as integer
+//   ReadFloat → parse JSON number as double
+//   ReadDecimal → parse JSON number as decimal
+//   ReadBool → parse true/false
+//   ReadString → parse JSON string value
+//   ReadChar → parse JSON string, take first codepoint
+//   TryReadNull → if next non-ws is "null", consume and return 1, else 0
+//
+// All read functions throw SerializationException on malformed input.
+// ---------------------------------------------------------------------------
+
+// Skip whitespace.
+static void bz_jder_skip_ws(bz_binder_t* d) {
+    while (d->pos < d->len) {
+        uint8_t c = d->data[d->pos];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') ++d->pos;
+        else break;
+    }
+}
+
+// Peek next non-ws character (does NOT advance pos).
+// Returns -1 on end of input.
+static int bz_jder_peek(bz_binder_t* d) {
+    bz_jder_skip_ws(d);
+    if (d->pos >= d->len) return -1;
+    return d->data[d->pos];
+}
+
+// Throw a SerializationException and return.
+#define BZ_JDER_THROW(msg) do { \
+    bz_ser_throw((msg), nullptr); \
+    return; \
+} while(0)
+#define BZ_JDER_THROW_V(msg, ret) do { \
+    bz_ser_throw((msg), nullptr); \
+    return (ret); \
+} while(0)
+
+// Expect a specific character, skip ws first, advance pos.
+// Returns true on success, throws otherwise.
+static bool bz_jder_expect_char(bz_binder_t* d, char expected) {
+    bz_jder_skip_ws(d);
+    if (d->pos >= d->len) {
+        bz_ser_throw("Unexpected end of JSON input (§2.15)", nullptr);
+        return false;
+    }
+    if ((char)d->data[d->pos] != expected) {
+        bz_ser_throw("Unexpected JSON token (§2.15)", nullptr);
+        return false;
+    }
+    ++d->pos;
+    return true;
+}
+
+// Decode a single UTF-8 codepoint from src[i..]; advance i.
+// Returns the codepoint.
+static uint32_t bz_jder_decode_utf8(const uint8_t* src, int64_t len, int64_t* i) {
+    uint8_t b0 = src[*i];
+    uint32_t cp;
+    int seq;
+    if      (b0 < 0x80) { cp = b0;        seq = 1; }
+    else if (b0 < 0xC0) { cp = 0xFFFD;    seq = 1; }
+    else if (b0 < 0xE0) { cp = b0 & 0x1F; seq = 2; }
+    else if (b0 < 0xF0) { cp = b0 & 0x0F; seq = 3; }
+    else                 { cp = b0 & 0x07; seq = 4; }
+    for (int k = 1; k < seq && *i + k < len; ++k)
+        cp = (cp << 6) | (src[*i + k] & 0x3F);
+    *i += seq;
+    return cp;
+}
+
+// Parse a JSON string value at current pos (which should be at '"').
+// Returns a malloc'd array of uint32_t codepoints.
+// *ncp_out receives the code-point count.
+// Returns nullptr on malformed input (and has thrown).
+static uint32_t* bz_jder_parse_string_cps(bz_binder_t* d, int64_t* ncp_out) {
+    if (d->pos >= d->len || d->data[d->pos] != '"') {
+        bz_ser_throw("Expected '\"' in JSON string (§2.15)", nullptr);
+        *ncp_out = 0;
+        return nullptr;
+    }
+    ++d->pos;  // skip opening "
+
+    // Collect codepoints into a growable buffer.
+    int64_t cap = 32;
+    int64_t n   = 0;
+    uint32_t* cps = static_cast<uint32_t*>(malloc((size_t)cap * sizeof(uint32_t)));
+    if (!cps) { bz_ser_throw("OOM in JSON string parse", nullptr); *ncp_out=0; return nullptr; }
+
+    while (d->pos < d->len) {
+        uint8_t b = d->data[d->pos];
+        if (b == '"') { ++d->pos; break; }  // end of string
+
+        uint32_t cp;
+        if (b == '\\') {
+            ++d->pos;
+            if (d->pos >= d->len) { free(cps); bz_ser_throw("Truncated JSON escape (§2.15)", nullptr); *ncp_out=0; return nullptr; }
+            uint8_t esc = d->data[d->pos++];
+            switch (esc) {
+            case '"':  cp = '"';  break;
+            case '\\': cp = '\\'; break;
+            case '/':  cp = '/';  break;
+            case 'n':  cp = '\n'; break;
+            case 'r':  cp = '\r'; break;
+            case 't':  cp = '\t'; break;
+            case 'b':  cp = '\b'; break;
+            case 'f':  cp = '\f'; break;
+            case 'u': {
+                // \uXXXX — read 4 hex digits.
+                if (d->pos + 4 > d->len) { free(cps); bz_ser_throw("Short \\uXXXX escape (§2.15)", nullptr); *ncp_out=0; return nullptr; }
+                uint32_t code = 0;
+                for (int k = 0; k < 4; ++k) {
+                    uint8_t hx = d->data[d->pos+k];
+                    uint32_t nib;
+                    if (hx >= '0' && hx <= '9')      nib = hx - '0';
+                    else if (hx >= 'a' && hx <= 'f') nib = hx - 'a' + 10;
+                    else if (hx >= 'A' && hx <= 'F') nib = hx - 'A' + 10;
+                    else { free(cps); bz_ser_throw("Bad hex in \\uXXXX (§2.15)", nullptr); *ncp_out=0; return nullptr; }
+                    code = (code << 4) | nib;
+                }
+                d->pos += 4;
+                cp = code;
+                break;
+            }
+            default:
+                free(cps); bz_ser_throw("Unknown JSON escape (§2.15)", nullptr); *ncp_out=0; return nullptr;
+            }
+        } else {
+            // Raw UTF-8 codepoint.
+            cp = bz_jder_decode_utf8(d->data, d->len, &d->pos);
+        }
+
+        if (n >= cap) {
+            cap *= 2;
+            uint32_t* nc = static_cast<uint32_t*>(realloc(cps, (size_t)cap * sizeof(uint32_t)));
+            if (!nc) { free(cps); bz_ser_throw("OOM in JSON string parse", nullptr); *ncp_out=0; return nullptr; }
+            cps = nc;
+        }
+        cps[n++] = cp;
+    }
+    *ncp_out = n;
+    return cps;
+}
+
+// Convert a codepoint array to a bz_string_struct*.
+static void* bz_jder_cps_to_bz_string(const uint32_t* cps, int64_t ncp) {
+    uint32_t max_cp = 0;
+    for (int64_t i = 0; i < ncp; ++i) if (cps[i] > max_cp) max_cp = cps[i];
+    uint8_t width = (max_cp <= 0xFF) ? 1 : (max_cp <= 0xFFFF) ? 2 : 4;
+    size_t data_bytes = (size_t)ncp * width + width;
+    uint8_t* buf = static_cast<uint8_t*>(malloc(data_bytes));
+    if (!buf) return nullptr;
+    memset(buf + (size_t)ncp * width, 0, width);
+    for (int64_t j = 0; j < ncp; ++j) {
+        if (width == 1)       buf[j]      = (uint8_t)cps[j];
+        else if (width == 2) { uint16_t v = (uint16_t)cps[j]; memcpy(buf + j*2, &v, 2); }
+        else                 { uint32_t v = cps[j];            memcpy(buf + j*4, &v, 4); }
+    }
+    uint8_t* strObj = static_cast<uint8_t*>(calloc(1, (size_t)BZ_STRING_SIZEOF));
+    if (!strObj) { free(buf); return nullptr; }
+    void* bufp = buf;
+    memcpy(strObj,      &bufp, sizeof(void*));
+    memcpy(strObj + 8,  &ncp,  sizeof(int64_t));
+    strObj[16] = width;
+    bz_string_init_rc(strObj);
+    return strObj;
+}
+
+// Parse a JSON string and return a bz_string_struct*.
+static void* bz_jder_parse_string(bz_binder_t* d) {
+    int64_t ncp = 0;
+    uint32_t* cps = bz_jder_parse_string_cps(d, &ncp);
+    if (!cps) return nullptr;
+    void* str = bz_jder_cps_to_bz_string(cps, ncp);
+    free(cps);
+    return str;
+}
+
+// Skip one complete JSON value at current pos (after ws skip).
+// Used by SkipValue (unknown-field policy).
+static void bz_jder_skip_value(bz_binder_t* d);
+
+static void bz_jder_skip_value_impl(bz_binder_t* d) {
+    int c = bz_jder_peek(d);
+    if (c < 0) { bz_ser_throw("Unexpected end in JSON skip (§2.15)", nullptr); return; }
+
+    if (c == '"') {
+        // String: parse and discard.
+        int64_t ncp = 0;
+        uint32_t* cps = bz_jder_parse_string_cps(d, &ncp);
+        free(cps);
+    } else if (c == '{') {
+        ++d->pos;  // skip '{'
+        bz_jder_skip_ws(d);
+        if (d->pos < d->len && d->data[d->pos] == '}') { ++d->pos; return; }
+        while (true) {
+            bz_jder_skip_ws(d);
+            // key
+            int64_t ncp = 0;
+            uint32_t* cps = bz_jder_parse_string_cps(d, &ncp);
+            free(cps);
+            if (!bz_jder_expect_char(d, ':')) return;
+            bz_jder_skip_value(d);
+            bz_jder_skip_ws(d);
+            if (d->pos >= d->len) { bz_ser_throw("Truncated JSON object in skip (§2.15)", nullptr); return; }
+            if (d->data[d->pos] == ',') { ++d->pos; continue; }
+            if (d->data[d->pos] == '}') { ++d->pos; return; }
+            bz_ser_throw("Expected ',' or '}' in JSON object skip (§2.15)", nullptr);
+            return;
+        }
+    } else if (c == '[') {
+        ++d->pos;  // skip '['
+        bz_jder_skip_ws(d);
+        if (d->pos < d->len && d->data[d->pos] == ']') { ++d->pos; return; }
+        while (true) {
+            bz_jder_skip_value(d);
+            bz_jder_skip_ws(d);
+            if (d->pos >= d->len) { bz_ser_throw("Truncated JSON array in skip (§2.15)", nullptr); return; }
+            if (d->data[d->pos] == ',') { ++d->pos; continue; }
+            if (d->data[d->pos] == ']') { ++d->pos; return; }
+            bz_ser_throw("Expected ',' or ']' in JSON array skip (§2.15)", nullptr);
+            return;
+        }
+    } else if (c == 't' || c == 'f' || c == 'n') {
+        // true / false / null
+        const uint8_t* kw = d->data + d->pos;
+        if (c == 't' && d->pos + 4 <= d->len && memcmp(kw, "true",  4) == 0) d->pos += 4;
+        else if (c == 'f' && d->pos + 5 <= d->len && memcmp(kw, "false", 5) == 0) d->pos += 5;
+        else if (c == 'n' && d->pos + 4 <= d->len && memcmp(kw, "null",  4) == 0) d->pos += 4;
+        else { bz_ser_throw("Unknown JSON keyword in skip (§2.15)", nullptr); }
+    } else if (c == '-' || (c >= '0' && c <= '9')) {
+        // number: consume digits and optional .digits and optional eXX
+        if (d->data[d->pos] == '-') ++d->pos;
+        while (d->pos < d->len && (d->data[d->pos] >= '0' && d->data[d->pos] <= '9')) ++d->pos;
+        if (d->pos < d->len && d->data[d->pos] == '.') {
+            ++d->pos;
+            while (d->pos < d->len && (d->data[d->pos] >= '0' && d->data[d->pos] <= '9')) ++d->pos;
+        }
+        if (d->pos < d->len && (d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
+            ++d->pos;
+            if (d->pos < d->len && (d->data[d->pos] == '+' || d->data[d->pos] == '-')) ++d->pos;
+            while (d->pos < d->len && (d->data[d->pos] >= '0' && d->data[d->pos] <= '9')) ++d->pos;
+        }
+    } else {
+        bz_ser_throw("Unexpected JSON token in skip (§2.15)", nullptr);
+    }
+}
+
+static void bz_jder_skip_value(bz_binder_t* d) {
+    bz_jder_skip_value_impl(d);
+}
+
+// Parse a JSON number as a 64-bit integer.
+// Advances pos past the number. Throws on non-number token.
+static int64_t bz_jder_parse_int(bz_binder_t* d) {
+    bz_jder_skip_ws(d);
+    if (d->pos >= d->len) {
+        bz_ser_throw("Expected JSON number, got end of input (§2.15)", nullptr);
+        return 0;
+    }
+    // Collect the number text.
+    int64_t start = d->pos;
+    if (d->data[d->pos] == '-') ++d->pos;
+    if (d->pos >= d->len || d->data[d->pos] < '0' || d->data[d->pos] > '9') {
+        bz_ser_throw("Expected JSON integer (§2.15)", nullptr);
+        return 0;
+    }
+    while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    // No decimal point or exponent allowed for integer reads.
+    int64_t numlen = d->pos - start;
+    if (numlen > 20) { bz_ser_throw("JSON integer overflow (§2.15)", nullptr); return 0; }
+    char buf[24] = {};
+    memcpy(buf, d->data + start, (size_t)numlen);
+    return strtoll(buf, nullptr, 10);
+}
+
+static uint64_t bz_jder_parse_uint(bz_binder_t* d) {
+    bz_jder_skip_ws(d);
+    if (d->pos >= d->len || d->data[d->pos] < '0' || d->data[d->pos] > '9') {
+        bz_ser_throw("Expected JSON unsigned integer (§2.15)", nullptr);
+        return 0;
+    }
+    int64_t start = d->pos;
+    while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    int64_t numlen = d->pos - start;
+    if (numlen > 20) { bz_ser_throw("JSON uint overflow (§2.15)", nullptr); return 0; }
+    char buf[24] = {};
+    memcpy(buf, d->data + start, (size_t)numlen);
+    return strtoull(buf, nullptr, 10);
+}
+
+static double bz_jder_parse_float(bz_binder_t* d) {
+    bz_jder_skip_ws(d);
+    if (d->pos >= d->len) {
+        bz_ser_throw("Expected JSON number (float), got end of input (§2.15)", nullptr);
+        return 0.0;
+    }
+    int64_t start = d->pos;
+    if (d->data[d->pos] == '-') ++d->pos;
+    while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    if (d->pos < d->len && d->data[d->pos] == '.') {
+        ++d->pos;
+        while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    }
+    if (d->pos < d->len && (d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
+        ++d->pos;
+        if (d->pos < d->len && (d->data[d->pos] == '+' || d->data[d->pos] == '-')) ++d->pos;
+        while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    }
+    int64_t numlen = d->pos - start;
+    if (numlen > 50) { bz_ser_throw("JSON float too long (§2.15)", nullptr); return 0.0; }
+    char buf[64] = {};
+    memcpy(buf, d->data + start, (size_t)numlen);
+    return strtod(buf, nullptr);
+}
+
+// Parse a JSON number as a decimal, returns a pointer to a thread-local bz_decimal_t.
+// §2.15: "WriteDecimal produces a JSON number written without precision loss."
+static void* bz_jder_parse_decimal(bz_binder_t* d) {
+    bz_jder_skip_ws(d);
+    if (d->pos >= d->len) {
+        bz_ser_throw("Expected JSON decimal number, got end of input (§2.15)", nullptr);
+        return nullptr;
+    }
+    int64_t start = d->pos;
+    if (d->data[d->pos] == '-') ++d->pos;
+    while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    if (d->pos < d->len && d->data[d->pos] == '.') {
+        ++d->pos;
+        while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    }
+    int64_t numlen = d->pos - start;
+    if (numlen > 50) { bz_ser_throw("JSON decimal too long (§2.15)", nullptr); return nullptr; }
+    char buf[64] = {};
+    memcpy(buf, d->data + start, (size_t)numlen);
+    // Use a thread-local buffer for the result (same pattern as bz_binder_read_decimal).
+    static thread_local uint32_t jdec_buf[4];
+    memset(jdec_buf, 0, sizeof(jdec_buf));
+    bz_decimal_parse_cstr(buf, reinterpret_cast<bz_decimal_t*>(jdec_buf), nullptr, nullptr);
+    return jdec_buf;
+}
+
 extern "C" {
 
 void* bz_binder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
-    auto* d = static_cast<bz_binder_t*>(malloc(sizeof(bz_binder_t)));
+    auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
     d->data             = data;
     d->len              = len;
     d->pos              = 0;
     d->ignore_unknown   = ignore_unknown;
-    d->fields_remaining = 0;
-    d->in_object        = false;
-    d->tag_ptrs         = nullptr;
-    d->tag_in_progress  = nullptr;
-    d->tag_count        = 0;
+    d->kind             = 0;  // binary
+    return d;
+}
+
+// JSON deserializer: data is a UTF-8 JSON byte span (borrowed from caller).
+void* bz_jder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
+    auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->data           = data;
+    d->len            = len;
+    d->pos            = 0;
+    d->ignore_unknown = ignore_unknown;
+    d->kind           = 1;  // JSON
+    return d;
+}
+
+// JSON deserializer from an owned malloc'd NUL-terminated UTF-8 string.
+// Takes ownership of `utf8z`; frees it in bz_binder_free.
+// Used by new JsonDeserializer(string) codegen path.
+void* bz_jder_alloc_str(char* utf8z, int64_t len, int8_t ignore_unknown) {
+    auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->data           = reinterpret_cast<const uint8_t*>(utf8z);
+    d->len            = len;
+    d->pos            = 0;
+    d->ignore_unknown = ignore_unknown;
+    d->kind           = 2;  // JSON + owns data (free on bz_binder_free)
     return d;
 }
 
@@ -7664,24 +8419,34 @@ void bz_binder_free(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     free(d->tag_ptrs);
     free(d->tag_in_progress);
+    if (d->kind == 2) {
+        // Owns the UTF-8 string buffer (allocated by bz_string_to_utf8z).
+        free(const_cast<uint8_t*>(d->data));
+    }
     free(d);
 }
 
 int64_t bz_binder_read_int(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) return bz_jder_parse_int(d);
     uint64_t v = 0;
-    bz_binder_read_le64_impl(static_cast<bz_binder_t*>(derp), &v);
+    bz_binder_read_le64_impl(d, &v);
     return (int64_t)v;
 }
 
 uint64_t bz_binder_read_uint(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) return bz_jder_parse_uint(d);
     uint64_t v = 0;
-    bz_binder_read_le64_impl(static_cast<bz_binder_t*>(derp), &v);
+    bz_binder_read_le64_impl(d, &v);
     return v;
 }
 
 double bz_binder_read_float(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) return bz_jder_parse_float(d);
     uint64_t bits = 0;
-    bz_binder_read_le64_impl(static_cast<bz_binder_t*>(derp), &bits);
+    bz_binder_read_le64_impl(d, &bits);
     double v;
     memcpy(&v, &bits, 8);
     return v;
@@ -7693,8 +8458,9 @@ double bz_binder_read_float(void* derp) {
 // caller (codegen) loads the struct from this pointer immediately (no ownership
 // transfer; the buffer is overwritten on the next call).
 void* bz_binder_read_decimal(void* derp) {
-    static thread_local uint32_t dec_buf[4];
     auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) return bz_jder_parse_decimal(d);
+    static thread_local uint32_t dec_buf[4];
     for (int i = 0; i < 4; ++i) {
         uint32_t v = 0;
         bz_binder_read_le32_impl(d, &v);
@@ -7704,19 +8470,47 @@ void* bz_binder_read_decimal(void* derp) {
 }
 
 int8_t bz_binder_read_bool(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        bz_jder_skip_ws(d);
+        if (d->pos + 4 <= d->len && memcmp(d->data + d->pos, "true", 4) == 0) {
+            d->pos += 4; return 1;
+        }
+        if (d->pos + 5 <= d->len && memcmp(d->data + d->pos, "false", 5) == 0) {
+            d->pos += 5; return 0;
+        }
+        bz_ser_throw("Expected JSON bool (§2.15)", nullptr);
+        return 0;
+    }
     uint8_t b = 0;
-    bz_binder_read_byte_impl(static_cast<bz_binder_t*>(derp), &b);
+    bz_binder_read_byte_impl(d, &b);
     return b ? 1 : 0;
 }
 
 // Returns a newly-allocated bz_string_struct* (caller owns).
 void* bz_binder_read_string(void* derp) {
-    return bz_binder_read_bz_string(static_cast<bz_binder_t*>(derp));
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        bz_jder_skip_ws(d);
+        return bz_jder_parse_string(d);
+    }
+    return bz_binder_read_bz_string(d);
 }
 
 int32_t bz_binder_read_char(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        // Parse a one-character JSON string.
+        bz_jder_skip_ws(d);
+        int64_t ncp = 0;
+        uint32_t* cps = bz_jder_parse_string_cps(d, &ncp);
+        if (!cps) return 0;
+        uint32_t cp = (ncp > 0) ? cps[0] : 0;
+        free(cps);
+        return (int32_t)cp;
+    }
     auto* str = static_cast<bz_string_struct*>(
-        bz_binder_read_bz_string(static_cast<bz_binder_t*>(derp)));
+        bz_binder_read_bz_string(d));
     if (!str || str->len == 0) {
         if (str) { free(str->data); free(str); }
         return 0;
@@ -7734,42 +8528,174 @@ int32_t bz_binder_read_char(void* derp) {
 
 int8_t bz_binder_try_read_null(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        bz_jder_skip_ws(d);
+        if (d->pos + 4 <= d->len && memcmp(d->data + d->pos, "null", 4) == 0) {
+            d->pos += 4; return 1;
+        }
+        return 0;
+    }
     if (d->pos >= d->len) return 0;
     if (d->data[d->pos] == 0) { d->pos++; return 1; }
     return 0;
 }
 
+// Count the number of top-level key-value pairs in a JSON object starting
+// right after '{' at current pos.  Does NOT advance d->pos.
+// Used to pre-count fields so the synthesized for-loop runs the right number
+// of times.  The actual parsing is done field-by-field in ReadFieldName.
+static int32_t bz_jder_count_object_fields(bz_binder_t* d) {
+    // Save pos, scan forward, restore.
+    int64_t saved = d->pos;
+
+    int32_t count = 0;
+    int     depth = 1;  // we are inside the opening '{'
+
+    bz_jder_skip_ws(d);
+    if (d->pos < d->len && d->data[d->pos] == '}') {
+        d->pos = saved;
+        return 0;
+    }
+
+    // Count comma-separated key-value pairs at depth 1.
+    // We need a proper scan because values can be nested objects/arrays.
+    while (d->pos < d->len && depth > 0) {
+        uint8_t c = d->data[d->pos];
+        if (c == '"') {
+            // String: skip over it.
+            ++d->pos;
+            while (d->pos < d->len) {
+                uint8_t s = d->data[d->pos++];
+                if (s == '\\') { if (d->pos < d->len) ++d->pos; }
+                else if (s == '"') break;
+            }
+        } else if (c == '{' || c == '[') {
+            ++depth; ++d->pos;
+        } else if (c == '}' || c == ']') {
+            --depth;
+            if (depth == 0) { ++d->pos; break; }
+            ++d->pos;
+        } else if (c == ':' && depth == 1) {
+            // The ':' that separates key from value at the top level.
+            ++d->pos;
+            count++;  // each ':' at depth 1 = one field.
+        } else {
+            ++d->pos;
+        }
+    }
+
+    d->pos = saved;
+    return count;
+}
+
 int32_t bz_binder_begin_object(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        // §2.15: for JSON we pre-count fields so the synthesized for-loop runs
+        // the right number of times.  The loop is: idx in [0, fieldCount), and
+        // each iteration calls ReadFieldName + dispatch + SkipValue/ReadXxx.
+        bz_jder_skip_ws(d);
+        if (d->pos >= d->len || d->data[d->pos] != '{') {
+            bz_ser_throw("Expected '{' in JSON object (§2.15)", nullptr);
+            return -1;
+        }
+        ++d->pos;  // skip '{'
+        d->in_object = true;
+        int32_t cnt = bz_jder_count_object_fields(d);
+        return cnt;
+    }
     uint32_t cnt = 0;
     if (!bz_binder_read_le32_impl(d, &cnt)) return -1;
-    // Note: fields_remaining is NOT set here.  The synthesized loop in
-    // emitRecordDeserialize uses the returned count directly; nested records
-    // call bz_binder_begin_object recursively which would clobber a flat
-    // fields_remaining field.  Reading is driven entirely by the loop counter
-    // held in LLVM IR, not by the binder state (§9.8 / issue #550).
     d->in_object = true;
     return (int32_t)cnt;
 }
 
 // Returns a newly-allocated bz_string* for the field name.
-// No fields_remaining guard: the synthesized deserialization loop in
-// emitRecordDeserialize calls this exactly fieldCount times, where fieldCount
-// is the value returned by bz_binder_begin_object for THIS object level.
-// Nesting works correctly because each emitRecordDeserialize invocation uses
-// its own fieldCount local (stored in an LLVM alloca), not shared state here.
+// JSON: skip ws, check if next char is '}' (object end → return null to signal
+// the loop to stop).  Otherwise parse "key": and return the key string.
+// The synthesized deserialization loop uses the returned count from BeginObject
+// (-1 for JSON) and the loop iterates until... wait, the synthesized loop uses
+// the returned field count from begin_object to drive the for-loop.
+// For JSON, the returned count is -1. This means the loop would run -1 times
+// which is 0 (since LLVM compiles `idx < -1` as always false with signed ints).
+//
+// This is a problem: the synthesized loop is `for idx in [0, fieldCount)`.
+// For JSON with fieldCount=-1, the loop body never runs.
+//
+// SOLUTION: For JSON mode, we return the actual number of fields in the object.
+// But we don't know it in advance. Instead, we must change the loop termination.
+//
+// §2.15: "consumers use ReadFieldName() driven by the object's textual extent".
+// This means the synthesized loop must be driven by HasMoreFields() for JSON.
+// But the current synthesis emitters emit a counted for-loop.
+//
+// ARCHITECTURAL NOTE: The current synthesis uses a counted for-loop
+//   idx = 0; while (idx < fieldCount) { readFieldName(); dispatch; idx++; }
+// For JSON, fieldCount=-1 makes the loop run 0 times (signed comparison: 0 < -1 is false).
+//
+// To fix this without changing the synthesis emitters, we count the fields
+// in BeginObject for JSON: parse {, then pre-scan to count key-value pairs.
+// But that requires two passes over the JSON.
+//
+// Alternative: return a large count (e.g., INT32_MAX) and detect end-of-object
+// in ReadFieldName (return null = loop stops via the null-check in emitClassDeserialize).
+// The record deserializer also checks: the loop header terminates on `idx < fieldCount`.
+//
+// Better: BeginObject for JSON pre-scans the object to count fields.
+// This is O(n) but correct and simple.
+//
+// Actually, looking at emitRecordDeserialize more carefully: after the loop
+// runs, EndObject is called. If fieldCount=-1 and the loop doesn't run,
+// then EndObject is called immediately. For JSON, EndObject would consume '}'.
+// But we haven't consumed any fields. This leaves the object unparsed.
+//
+// FINAL DECISION: bz_binder_begin_object for JSON does a lightweight pre-scan
+// to count top-level key-value pairs. We save the start position, count,
+// then restore the position so the normal read path proceeds from '{'.
+// Actually simpler: scan forward counting ',' at depth 1, return count+1
+// if non-empty, 0 if empty.
+//
+// This is the cleanest approach that keeps synthesis unchanged.
 void* bz_binder_read_field_name(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        bz_jder_skip_ws(d);
+        // Skip comma between fields (present for field N>0).
+        // The comma is NOT present before the first field.
+        if (d->pos < d->len && d->data[d->pos] == ',') {
+            ++d->pos;
+            bz_jder_skip_ws(d);
+        }
+        // Check for end-of-object (should not happen if we pre-counted correctly).
+        if (d->pos >= d->len || d->data[d->pos] == '}') {
+            return nullptr;  // null → truncated-input path in synthesized deserializer
+        }
+        // Parse the key string.
+        void* key = bz_jder_parse_string(d);
+        if (!key) return nullptr;
+        // Skip ':'.
+        if (!bz_jder_expect_char(d, ':')) {
+            bz_string_release(key);
+            return nullptr;
+        }
+        return key;
+    }
     return bz_binder_read_bz_string(d);
 }
 
 // skip_value: advance past one value at current position.
-// The binary format has no type tags, so this is a best-effort skip:
-// we read a LE32 "length" and skip that many bytes (works for all
-// string-prefixed and object/array values; for int/float the caller
-// would need to know the type — synthesis never generates unknown fields).
 void bz_binder_skip_value(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        // §2.15: SkipValue — unknown field; if ignore_unknown=0 → raise.
+        if (!d->ignore_unknown) {
+            bz_ser_throw("Unknown field in JSON input (§2.15)", nullptr);
+            return;
+        }
+        bz_jder_skip_ws(d);
+        bz_jder_skip_value(d);
+        return;
+    }
     if (d->pos >= d->len) return;
     uint32_t maybe_len = 0;
     if (!bz_binder_read_le32_impl(d, &maybe_len)) return;
@@ -7779,23 +8705,49 @@ void bz_binder_skip_value(void* derp) {
 
 void bz_binder_end_object(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        // Skip ws and consume '}'.
+        bz_jder_skip_ws(d);
+        if (d->pos < d->len && d->data[d->pos] == '}') ++d->pos;
+        d->in_object = false;
+        return;
+    }
     d->in_object = false;
     d->fields_remaining = 0;
 }
 
 int32_t bz_binder_begin_array(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        if (!bz_jder_expect_char(d, '[')) return -1;
+        return -1;  // count unknown
+    }
     uint32_t cnt = 0;
     if (!bz_binder_read_le32_impl(d, &cnt)) return -1;
     return (int32_t)cnt;
 }
 
-int8_t bz_binder_has_more_elements(void* /*derp*/) {
+int8_t bz_binder_has_more_elements(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        // §2.15: HasMoreElements — peek for ']'.
+        bz_jder_skip_ws(d);
+        if (d->pos >= d->len || d->data[d->pos] == ']') return 0;
+        return 1;
+    }
     // Count-prefixed format: caller drives the loop; this is a placeholder.
     return 0;
 }
 
-void bz_binder_end_array(void* /*derp*/) { /* no trailer */ }
+void bz_binder_end_array(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+    if (d->kind >= 1) {
+        bz_jder_skip_ws(d);
+        if (d->pos < d->len && d->data[d->pos] == ']') ++d->pos;
+        return;
+    }
+    /* no trailer */
+}
 
 // ---------------------------------------------------------------------------
 // §9.8 tier-3: identity-tag graph deserialization helpers
@@ -7877,11 +8829,23 @@ void* bz_binder_graph_resolve_tag(void* derp, int32_t tag_id) {
     return d->tag_ptrs[tag_id - 1];
 }
 
+// §2.15 / §9.8: the SerializationException vtable pointer registered by the
+// codegen-generated main prologue (bz_ser_exc_vtable_init).  Initially null;
+// set before any user code can throw.  bz_ser_throw uses this so runtime-
+// internal throws produce a well-formed exception with a valid vtable, enabling
+// emitIsA's catch dispatch to work correctly (it dereferences vtable[0]).
+void* bz_ser_exc_vtable = nullptr;
+
+void bz_ser_exc_vtable_init(void* vtable) {
+    bz_ser_exc_vtable = vtable;
+}
+
 // bz_ser_throw: build a minimal SerializationException-like exception object
-// and store it in the global bz_exc slot.  `ser_exn_vtable` is the vtable*
-// emitted by the codegen for the SerializationException class (nullptr in tests
-// that don't use vtable-dispatch).  `msg` is a NUL-terminated C string.
-void bz_ser_throw(const char* msg, void* ser_exn_vtable) {
+// and store it in the global bz_exc slot.  Uses bz_ser_exc_vtable (registered
+// by the main prologue) so that the exception passes emitIsA's type check.
+// The legacy `ser_exn_vtable` parameter is kept for ABI compatibility but
+// ignored — the global is always used so runtime-internal JSON throws work.
+void bz_ser_throw(const char* msg, void* /*ser_exn_vtable*/) {
     // Build a bz_string_struct for the message.
     size_t msg_len = msg ? strlen(msg) : 0;
     char* buf = static_cast<char*>(malloc(msg_len + 1));
@@ -7895,7 +8859,7 @@ void bz_ser_throw(const char* msg, void* ser_exn_vtable) {
     // An exception object layout is {vtable*, message bz_string*}.
     // Allocate a 2-pointer object: [vtable*, str*].
     void** exc_obj = static_cast<void**>(malloc(2 * sizeof(void*)));
-    exc_obj[0] = ser_exn_vtable;
+    exc_obj[0] = bz_ser_exc_vtable;  // use registered vtable, not nullptr
     exc_obj[1] = str;
     extern void* bz_exc;
     bz_exc = exc_obj;

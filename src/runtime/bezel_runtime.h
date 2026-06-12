@@ -1264,6 +1264,23 @@ int32_t bz_binser_graph_assign_tag(void* ser, void* ptr);
 void    bz_binser_write_inline_tag(void* ser, int32_t tag_id);
 void    bz_binser_write_ref_tag(void* ser, int32_t tag_id);
 
+// --- §2.15 JsonSerializer (kind=1) helpers ---
+// Allocate a new JsonSerializer (same bz_binser_t, kind=1, writes JSON text).
+void* bz_jser_alloc(void);
+// Transfer the accumulated JSON bytes as an owned OwnedBuffer<byte>.
+void* bz_jser_to_bytes(void* ser);
+// Transfer the accumulated JSON bytes as a Bezel string (UTF-8 → bz_string*).
+// Returns a newly-allocated bz_string_struct* (caller owns, rc=1).
+void* bz_jser_to_string(void* ser);
+
+// --- §2.15 JsonDeserializer (kind=1/2) helpers ---
+// Allocate a JsonDeserializer reading from a UTF-8 JSON byte span (kind=1, borrows data).
+void* bz_jder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown);
+// Allocate a JsonDeserializer from a malloc'd UTF-8 buffer (kind=2, takes ownership of utf8z).
+// `utf8z` is a malloc'd byte buffer of `len` bytes; bz_binder_free will free it.
+void* bz_jder_alloc_str(char* utf8z, int64_t len, int8_t ignore_unknown);
+// (bz_binder_free handles disposal for both binary and JSON — same struct)
+
 // --- Deserializer (reader) ---
 // Allocate a BinaryDeserializer reading from a byte span.
 // `data` is borrowed for the lifetime of the deserializer; `len` is byte count.
@@ -1304,6 +1321,15 @@ void*   bz_binder_graph_resolve_tag(void* der, int32_t tag_id);
 // Stores a built-in SerializationException in the global exception slot (bz_exc)
 // and returns (codegen emits the unwind branch after the call).
 void bz_ser_throw(const char* msg, void* ser_exn_vtable);
+
+// The SerializationException vtable pointer — registered by the codegen-generated
+// main prologue before any user code runs (bz_ser_exc_vtable_init stores it).
+// bz_ser_throw uses this so runtime-internal throws create a well-formed exception
+// object with a valid vtable pointer (required by emitIsA catch dispatch).
+extern void* bz_ser_exc_vtable;
+
+// Register the SerializationException vtable; called by the generated main prologue.
+void bz_ser_exc_vtable_init(void* vtable);
 
 // OwnedBuffer<byte> helpers used by BinarySerializer/BinaryDeserializer.
 // bz_owned_buffer_alloc: allocate an OwnedBuffer<byte> with the given bytes,

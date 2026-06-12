@@ -519,6 +519,11 @@ private:
         // local's declared/resolved type name or the NewExpr type name.
         bool binarySerializer = false;
         bool binaryDeserializer = false;
+        // §2.15: a `using var` bound to a JsonSerializer or JsonDeserializer.
+        // These are heap-allocated via bz_jser_alloc / bz_jder_alloc(/_str) and
+        // disposed via bz_binser_free / bz_binder_free respectively.
+        bool jsonSerializer = false;
+        bool jsonDeserializer = false;
         // §6.1 / §30.8: a `using var` bound to a CancellationTokenSource.
         // The source has no user TypeSymbol, so classOfLocal returns null and the
         // class-disposal path misses it. At scope end it is freed via

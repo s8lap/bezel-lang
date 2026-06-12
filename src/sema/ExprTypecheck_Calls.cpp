@@ -2369,6 +2369,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         obTy2->genericArgs.push_back(byTy2);
                         ctx_.setExprType(&ce, obTy2);
                     }
+                    // §2.15 / issue #550: JsonSerializer.ToBytes() → OwnedBuffer<byte>.
+                    // JsonSerializer.ToString() → string.
+                    if (rcn == "JsonSerializer" && m == "ToBytes") {
+                        static const ast::Type* kJserBufNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("OwnedBuffer");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* byTy3 = ctx_.primitiveTypeRef(PrimitiveType::Byte);
+                        auto* obTy3 = ctx_.makeTypeRef();
+                        obTy3->kind  = TypeRef::Kind::Named;
+                        obTy3->astNode = kJserBufNode;
+                        obTy3->genericArgs.push_back(byTy3);
+                        ctx_.setExprType(&ce, obTy3);
+                    }
+                    if (rcn == "JsonSerializer" && m == "ToString") {
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::String));
+                    }
                 }
 
                 // §30.14 (#600): Domain.Spawn — static class, colName == "Domain".
@@ -4845,6 +4866,35 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
             if (cls == "BinaryDeserializer") {
                 // All BinaryDeserializer methods are void; leave untyped.
+            }
+            // §2.15 / issue #550: JsonSerializer and JsonDeserializer.
+            if (cls == "JsonSerializer") {
+                if (m == "ToBytes") {
+                    // Returns OwnedBuffer<byte> (stdlib §2.15).
+                    static const ast::Type* kJserObNode = []() -> ast::Type* {
+                        auto* qn = new ast::QualifiedName;
+                        qn->parts.push_back("OwnedBuffer");
+                        auto* t = new ast::Type;
+                        t->kind = ast::TypeKind::Named;
+                        t->name.reset(qn);
+                        return t;
+                    }();
+                    auto* byTy  = ctx_.primitiveTypeRef(PrimitiveType::Byte);
+                    auto* obTy  = ctx_.makeTypeRef();
+                    obTy->kind  = TypeRef::Kind::Named;
+                    obTy->astNode = kJserObNode;
+                    obTy->genericArgs.push_back(byTy);
+                    ctx_.setExprType(&ma, obTy);
+                    // CallExpr type is set in the rcn == "JsonSerializer" block above.
+                } else if (m == "ToString") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                }
+                // Serialize(ISerializer) / Dispose → unit (leave untyped).
+            }
+            if (cls == "JsonDeserializer") {
+                // All JsonDeserializer methods are void or return -1 (int);
+                // leave untyped for now (downstream uses are in synthesized
+                // Deserialize which only reads typed results from binder calls).
             }
         } else if (targetType->kind == ast::TypeDeclKind::Record ||
                    targetType->kind == ast::TypeDeclKind::Enum) {
