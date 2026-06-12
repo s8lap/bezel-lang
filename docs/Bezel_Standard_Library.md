@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.139 — June 2026**
+**Companion to the Bezel Language Specification, v0.140 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2839,7 +2839,7 @@ public class Atomic<T> where T: value
 end Atomic;
 ```
 
-`Value`'s read and write are atomic with respect to other `Value` reads, `Value` writes, and the `Exchange`/`CompareExchange` methods on the same instance. The accessors are compiler-intrinsic; they are not auto-property storage.
+`Value`'s read and write are atomic with respect to other `Value` reads, `Value` writes, and the `Exchange`/`CompareExchange` methods on the same instance. All §6.4 atomic operations are **sequentially consistent** (specified in v0.140): they participate in a single global order; no weaker ordering is offered. (Relaxed/acquire-release variants were considered and declined — see the rationale changelog; the surface stays minimal until profiles demand otherwise.) `Atomic<T>` and `AtomicInteger<T>` are internally synchronized and participate in the `Shared<T>` cross-domain rule of language-spec §28.13 (v0.140). The accessors are compiler-intrinsic; they are not auto-property storage.
 
 `Exchange(value)` atomically replaces `Value` with `value` and returns the previous value. `CompareExchange(expected, replacement)` atomically replaces `Value` with `replacement` if and only if the current value equals `expected`, and returns the value observed (the original value, equal to `expected` on success, or the value that prevented the swap on failure).
 

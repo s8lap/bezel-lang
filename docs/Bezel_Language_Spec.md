@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.139 — June 2026**
+**Version 0.140 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -5733,7 +5733,7 @@ When a class implements both `IDisposable` and `IAsyncDisposable`, prefer `await
 <a id="sec-shared-ownership"></a>
 ### 28.13 Shared ownership: `Shared<T>` and `Weak<T>`
 
-The ownership model is single-owner: every disposal obligation has exactly one holder. `Shared<T>` (stdlib [§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)) is the scoped exception — a compiler-known class whose instances (*handles*) jointly own one underlying value; the value is disposed exactly once, when the last handle is disposed. Shared ownership is opt-in, visible at every site (`Clone()` is an explicit call), and **domain-local** (`Shared<T>` is not sendable, [§30.14](#sec-sendable-types)).
+The ownership model is single-owner: every disposal obligation has exactly one holder. `Shared<T>` (stdlib [§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)) is the scoped exception — a compiler-known class whose instances (*handles*) jointly own one underlying value; the value is disposed exactly once, when the last handle is disposed. Shared ownership is opt-in, visible at every site (`Clone()` is an explicit call), and **domain-local except for synchronized `T`** (see the sendability rule below; [§30.14](#sec-sendable-types)).
 
 ```bezel
 using var primary := new Shared<Connection>(Connect("db"));   // consumes the owned Connection; count = 1
@@ -5752,7 +5752,7 @@ The semantics, stated against the existing model:
 - **Cycles leak.** A value that (transitively, through owned fields) holds a `Shared<T>` handle participating in its own ownership keeps its count above zero forever — the standard reference-counting hazard. The compiler does not detect ownership cycles through `Shared<T>`. Break cycles with `Weak<T>`.
 - **`Weak<T>`** (stdlib [§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)) is a non-owning observer minted from a handle (`shared.Downgrade(): owned Weak<T>`). A weak handle does not keep the underlying value alive; **`TryUpgrade(out owned s: Shared<T>?): bool`** atomically produces a new strong handle if the value is still alive (Try pattern, `out using var` at the call site — [§22.3](#sec-parameter-modifiers)'s `out owned` rules). Weak handles are themselves ordinary owned class instances and are disposed like any other.
 - **Aliasing.** Multiple handles give multiple borrows of one mutable value within a domain. This is serial-execution-safe ([§30.13](#sec-runtime-model)) and carries the same *logical* aliasing hazards as any other long-lived borrow; nothing about `Shared<T>` relaxes use-after-dispose ([§28.2](#sec-checked-disposal)) for borrows taken from a handle that is then disposed.
-- **Not sendable.** The count is not synchronized; handles and weak handles are domain-local ([§30.14](#sec-sendable-types)). A synchronized cross-domain form is deferred; see the design rationale.
+- **Sendability (amended in v0.140).** `Shared<T>` is sendable **iff `T` is sendable and internally synchronized** — the compiler-known synchronized set: `Mutex`, `Atomic<T>`, `AtomicInteger<T>`, and `Semaphore` (stdlib §6.2–§6.4). For such `T`, a cloned handle may move to another domain (as a spawn argument or through a channel), and the handle count is maintained with synchronized operations; the underlying value is still disposed exactly once, by whichever domain drops the last handle. For every other `T`, `Shared<T>` remains domain-local and not sendable — the count synchronization alone would not make an unsynchronized `T` safe to reach from two domains. This realizes §6.2's "reached by multiple domains simultaneously" for mutexes: `Shared<Mutex>` is the cross-domain sharing idiom (clone, move the clone, both domains `Get().Acquire()`).
 
 ---
 

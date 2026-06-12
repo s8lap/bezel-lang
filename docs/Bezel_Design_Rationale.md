@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.139 — June 2026**
+**Companion to the Bezel Language Specification, v0.140 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6762,6 +6762,41 @@ Stdlib §2.15 (JSON-mapping paragraph); rationale (this entry).
 None: graph-mode JSON serialization previously produced truncated output (an implementation
 defect, now also tracked as a compiler issue); tree-mode JSON and all binary forms are
 unchanged.
+
+---
+
+### v0.140 changelog (v0.139 → v0.140)
+
+Two rulings closing the cross-domain synchronization gap the v0.138 Mutex work exposed.
+
+#### Amendment 1 — `Shared<T>` is sendable for internally-synchronized `T` (spec §28.13; lifts that section's recorded deferral)
+
+The v0.138 sendable-Mutex ruling left a hole: a mutex could only be *handed off* (spawn-arg
+move, channel relay) — never reached by two domains at once, which is a mutex's purpose.
+§28.13's "synchronized cross-domain form is deferred" note anticipated exactly this. Now:
+`Shared<T>` is sendable iff `T` is sendable AND internally synchronized (compiler-known set:
+`Mutex`, `Atomic<T>`, `AtomicInteger<T>`, `Semaphore`). `Shared<Mutex>` becomes the sharing
+idiom. *Declined: dedicated handle-minting types (`MutexHandle` via `NewHandle()`, the
+ChannelSender pattern)* — it duplicates `Shared<T>`'s entire lifecycle for each synchronized
+type and adds API surface with no semantic gain. *Declined: keeping the pure-handoff status
+quo* — it leaves §6.2's documented "multiple domains simultaneously" promise unrealizable.
+Implementation prerequisite (tracked as a compiler issue): the `Shared` control block's
+counts must become atomic; until that lands the facet stays off (conservative rejection).
+
+#### Amendment 2 — §6.4 atomics are sequentially consistent (stdlib §6.4)
+
+§6.4 was silent on ordering. All operations are seq_cst. *Declined: exposed ordering
+parameters (relaxed/acquire/release)* — they are an expert-only foot-gun whose absence costs
+only performance, recoverable later as opt-in overloads if profiles demand; a silent default
+plus hidden parameters is how other ecosystems accumulated subtle bugs.
+
+#### Touched
+Spec §28.13 (sendability rule, two edits); stdlib §6.4 (ordering + Shared participation);
+rationale (this entry).
+
+#### Migration
+None. Amendment 1 only widens acceptance once the implementation lands; Amendment 2 documents
+the only behavior the implementation has ever had.
 
 ---
 
