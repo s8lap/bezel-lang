@@ -100,6 +100,7 @@ set(BEZEL_TEST_SOURCES
     sema/abstract_impl_test.cpp
     sema/duplicate_member_test.cpp
     sema/hiding_override_test.cpp
+    sema/hiding_680_primary_ctor_param_test.cpp
     sema/sealed_member_override_485_test.cpp
     sema/static_class_members_test.cpp
     sema/class_modifier_combos_test.cpp
@@ -522,6 +523,9 @@ set(BEZEL_TEST_SOURCES
     # --- fix #685/#679/#682: struct-as-scalar lowering (decimal Set/Dict, field Mutex, range slice) ---
     codegen/struct_scalar_685_679_682_test.cpp
     # --- end #685/#679/#682 ---
+    # --- fix #690: arr[range] typed as Array<T> per §15.6 ---
+    codegen/array_slice_690_test.cpp
+    # --- end #690 ---
 
     module/module_metadata_test.cpp
     module/module_metadata_builder_test.cpp

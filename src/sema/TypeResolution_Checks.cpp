@@ -967,6 +967,17 @@ void Resolver::checkHidingAndOverride() {
                     dynamic_cast<DestructorSymbol*>(m)) {
                     continue;
                 }
+                // per §11.1 / §22.10: a class primary-constructor parameter
+                // is stored as a FieldSymbol with posParam != null and a Class
+                // parent kind. Such a parameter is NOT a member of the class's
+                // public API — it is an initialization-time value that may be
+                // captured into a private field, but it is not a declared
+                // member. It cannot be hidden or overridden (§12.2 applies to
+                // MEMBERS; fix #680).
+                if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                    if (fs->posParam && cur->kind == ast::TypeDeclKind::Class)
+                        continue;
+                }
                 if (auto* ms = dynamic_cast<MemberSymbol*>(m)) {
                     // First (most-derived) base wins on collision.
                     baseMembers.emplace(ms->name, ms);
@@ -983,6 +994,13 @@ void Resolver::checkHidingAndOverride() {
             if (dynamic_cast<ConstructorSymbol*>(m) ||
                 dynamic_cast<DestructorSymbol*>(m)) {
                 continue;
+            }
+            // per §11.1 / §22.10 / fix #680: a class primary-ctor parameter
+            // (FieldSymbol with posParam != null, Class parent) is not a
+            // member for hiding purposes — skip it.
+            if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                if (fs->posParam && t->kind == ast::TypeDeclKind::Class)
+                    continue;
             }
             auto* ms = dynamic_cast<MemberSymbol*>(m);
             if (!ms || ms->name.empty()) continue;
