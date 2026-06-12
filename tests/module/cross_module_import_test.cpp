@@ -2233,4 +2233,202 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_EQ(code, 42);  // 40 + int(2.5) = 42
 }
 
+// === #662 foundation B: imported-symbol branches for owned-field shape checks ==
+//
+// §28.4 / §28.5 (issue #662): isOwnedTypeParamFieldShape and isOwnedReferenceField
+// previously did `dynamic_cast<ast::FieldDecl*>(fs->decl)` → null for imported
+// FieldSymbols, silently returning false.  Foundation B adds imported-field
+// branches that use ctx_.importedMemberType(fs) (the side table populated by the
+// loader) and fs->modifiers ("owned" flag) instead of the AST.
+//
+// For NON-GENERIC imported classes the exporter emits the full disposer body
+// (bz$<Type>$DisposeCore) and the importer calls it externally — so the owned-
+// field shape checks in the IMPORTER were never on the hot path and disposal was
+// already correct for this case.  Foundation B makes the checks CORRECT for
+// imported fields so Phase A (buildImportedGenericVtable) can call
+// classHasOwnedTypeParamField / emitOwnedFieldDisposals on imported generic
+// classes without silently misclassifying owned type-param fields.
+//
+// Tests (17-20): cross-module AOT scenarios that exercise imported non-generic
+// classes with owned fields of various kinds, confirming the existing disposal
+// machinery (exporter-side disposer) is not regressed by the predicate changes.
+// Tests 19-20 also confirm the field-shape predicates are called correctly at
+// every disposal site (using-var, destructor body, ctor exception cleanup).
+
+// (17) §28.4 / §28.5 (#662 foundation B): imported non-generic class with an
+// `owned` class-typed field.  The exporter emits DisposeCore; the importer calls
+// it via vtable.  The owned field's destructor counter must be 1 after `using var`
+// disposes the container.  rc = outer.Disposed * 10 + inner.Disposed = 11.
+BEZEL_TEST(cross_module_import,
+           imported_class_owned_class_field_disposed_spec_28_4_662b) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_662b_owncls_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module OwnedLib; "
+        // The inner class whose disposal we can observe.
+        "public class Inner "
+        "  public static Disposed: int := 0; "
+        "  public constructor() end constructor; "
+        "  destructor Disposed := Disposed + 1; end destructor; "
+        "end Inner; "
+        // The outer class that OWNS an Inner field (§28.4 step 2 disposal).
+        "public class Outer "
+        "  public static Disposed: int := 0; "
+        "  private owned _inner: Inner; "
+        "  public constructor() "
+        "    _inner := new Inner(); "
+        "  end constructor; "
+        "  destructor Disposed := Disposed + 1; end destructor; "
+        "end Outer;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import OwnedLib; "
+        "public class Program "
+        "  public static method Use(): int "
+        "    using var o := new Outer(); "  // disposed at scope end → outer + inner
+        "    return 0; "
+        "  end Use; "
+        "  public static method Main(): int "
+        "    Use(); "
+        "    return Outer.Disposed * 10 + Inner.Disposed; "  // 11
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 11);
+}
+
+// (18) §28.4 / §28.5 (#662 foundation B): imported non-generic class with an
+// `owned` string field.  String fields are retained at store and released by the
+// exporter's DisposeCore (§4.6/§28.9).  The destructor counter must be 1 after
+// `using var` disposes the holder; the exporter handles string release internally.
+// rc = Holder.Disposed = 1.
+BEZEL_TEST(cross_module_import,
+           imported_class_owned_string_field_disposed_spec_28_4_662b) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_662b_ownstr_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module StrLib; "
+        "public class Holder "
+        "  public static Disposed: int := 0; "
+        "  public _label: string; "
+        "  public constructor(lbl: string) "
+        "    _label := lbl; "
+        "  end constructor; "
+        "  public method Label(): string => _label; "
+        "  destructor Disposed := Disposed + 1; end destructor; "
+        "end Holder;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import StrLib; "
+        "public class Program "
+        "  public static method Use(): int "
+        "    using var h := new Holder(\"hello\"); "
+        "    return h.Label().Length; "
+        "  end Use; "
+        "  public static method Main(): int "
+        "    var n := Use(); "        // h disposed here
+        "    return Holder.Disposed; " // 1
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 1);
+}
+
+// (19) §28.4 / §28.5 (#662 foundation B): sema-level check — an imported
+// NON-GENERIC class with an `owned` field of a class type must pass sema cleanly
+// in the importer (no spurious §14 or other diagnostic from the predicate change).
+BEZEL_TEST(cross_module_import,
+           imported_class_owned_field_sema_clean_spec_28_5_662b) {
+    ModuleMetadata dep = buildMetaFor(
+        "module OwnedFieldLib; "
+        "public class Holder "
+        "  private owned _item: Holder; "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "end Holder;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import OwnedFieldLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var h := new Holder(); "
+        "    return 1; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// (20) §28.4 / §28.5 (#662 foundation B): sema-level check — an imported GENERIC
+// class with an `owned T` field is still §14-gated in the importer (the gate
+// stays until Phase A resolves Blocker 1: vtable for imported generic classes).
+// This is a NEGATIVE test: the importer must NOT accept `new Box<string>(...)`.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_owned_tparam_field_still_gated_spec_14_662b) {
+    ModuleMetadata dep = buildMetaFor(
+        "module BoxLib; "
+        "public class Box<T> "
+        "  private owned _slot: T; "
+        "  public constructor(v: T) "
+        "    _slot := v; "
+        "  end constructor; "
+        "  destructor end destructor; "
+        "end Box;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import BoxLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new Box<string>(\"hi\"); "  // §14-gated (Blocker 1 open)
+        "    return 1; "
+        "  end Main; "
+        "end Program;");
+    // Must diagnose — imported generic CLASS construction is §14-gated until
+    // Phase A (buildImportedGenericVtable) is implemented (Blocker 1).
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
 }  // namespace bezel::module

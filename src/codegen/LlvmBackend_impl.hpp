@@ -2214,8 +2214,14 @@ private:
     // class/interface declaration) does not match them; they are nevertheless
     // ordinary owned heap class instances (§31.1) and the enclosing object's
     // Dispose must dispatch their (no-op) vtable Dispose and reclaim their block.
+    //
+    // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
+    // type rides ctx_.importedMemberType(fs).
     bool isOwnedBuiltinExceptionField(const sema::FieldSymbol* fs) {
         if (!hasOwnedModifier(fs)) return false;
+        // #662 foundation B: imported field — type from importedMemberType.
+        if (!fs->decl)
+            return isBuiltinExceptionTypeRef(ctx_.importedMemberType(fs));
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return false;
         return isBuiltinExceptionTypeRef(ctx_.resolvedType(*fd->type));
@@ -2437,7 +2443,7 @@ private:
     // its own generic type parameters? Such a field is classified (and so auto-
     // disposed) at INSTANTIATION, not in the shared type-erased disposer; a
     // class with one needs a per-instantiation specialized Dispose/vtable.
-    static bool classHasOwnedTypeParamField(const sema::TypeSymbol* ts);
+    bool classHasOwnedTypeParamField(const sema::TypeSymbol* ts);
 
     // §28.5: for the generic instantiation currently active in `genericSubst_`
     // (e.g. Box<Res>), return the per-instantiation vtable global to install in
@@ -2743,9 +2749,27 @@ private:
     // emitted PER INSTANTIATION (see emitSpecializedDisposer), so the active
     // `genericSubstSemaTy_` names the concrete bound type for THIS instantiation
     // (e.g. T → Res when emitting Box<Res>'s disposer).
+    //
+    // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
+    // declared type is in ctx_.importedMemberType(fs) and the param name is in
+    // that TypeRef's importedName (set by the loader when declaration == nullptr).
     const sema::TypeRef* ownedTypeParamConcreteType(const sema::FieldSymbol* fs) {
         if (!hasOwnedModifier(fs)) return nullptr;
         if (genericSubstSemaTy_.empty()) return nullptr;
+        // #662 foundation B / §28.5: imported field — type in importedMemberType.
+        if (!fs->decl) {
+            const sema::TypeRef* rt = ctx_.importedMemberType(fs);
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+                rt->declaration != nullptr)
+                return nullptr;
+            // The param name rides importedName for loader-reconstructed TypeRefs
+            // whose declaration is null (generic-param references have no user
+            // TypeSymbol, so lookupNamed returns null and the loader records the
+            // raw name in importedName — see ModuleLoader.cpp convert(), §2.5).
+            if (rt->importedName.empty()) return nullptr;
+            auto it = genericSubstSemaTy_.find(rt->importedName);
+            return it != genericSubstSemaTy_.end() ? it->second : nullptr;
+        }
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return nullptr;
         auto* rt = ctx_.resolvedType(*fd->type);
@@ -2808,15 +2832,32 @@ private:
     // The field's name must be one of the enclosing class's declared generic
     // parameters; a single-part name that is NOT a parameter (a concrete class)
     // takes the ordinary class-field disposal path, not specialization.
-    static bool isOwnedTypeParamFieldShape(const sema::FieldSymbol* fs) {
+    //
+    // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
+    // declared type rides ctx_.importedMemberType(fs); the param name is in that
+    // TypeRef's importedName when declaration == nullptr (loader sets it from the
+    // raw namedName when lookupNamed returns null — see ModuleLoader.cpp, §2.5).
+    bool isOwnedTypeParamFieldShape(const sema::FieldSymbol* fs) {
         if (!hasOwnedModifier(fs)) return false;
+        if (!fs->parent) return false;
+        // #662 foundation B: imported field — type and param name from side table.
+        if (!fs->decl) {
+            const sema::TypeRef* rt = ctx_.importedMemberType(fs);
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+                rt->declaration != nullptr || rt->importedName.empty() ||
+                !rt->genericArgs.empty())
+                return false;
+            std::string_view pname = rt->importedName;
+            for (const sema::Symbol* gp : fs->parent->genericParams)
+                if (gp && gp->name == pname) return true;
+            return false;
+        }
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return false;
         const ast::Type* ty = fd->type.get();
         if (!ty->name || ty->name->parts.size() != 1 ||
             !ty->genericArgs.empty())
             return false;
-        if (!fs->parent) return false;
         std::string_view pname = ty->name->parts[0];
         for (const sema::Symbol* gp : fs->parent->genericParams)
             if (gp && gp->name == pname) return true;
@@ -2833,11 +2874,23 @@ private:
     //       active; a value-type instantiation (where `owned` does not apply)
     //       yields no concrete class/interface and is NOT disposed as a
     //       reference (no spurious dispatch on a value slot).
+    //
+    // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
+    // declared type rides ctx_.importedMemberType(fs) rather than being read
+    // from the AST. The declaration pointer on the TypeRef is the TypeSymbol*
+    // resolved at load time; importedName covers the case where lookupNamed
+    // returned null (generic-param fields and builtin types — §2.5).
     bool isOwnedReferenceField(const sema::FieldSymbol* fs) {
         if (!hasOwnedModifier(fs)) return false;
-        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-        if (!fd || !fd->type) return false;
-        auto* rt = ctx_.resolvedType(*fd->type);
+        const sema::TypeRef* rt = nullptr;
+        // #662 foundation B: imported field — type from importedMemberType.
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return false;
+            rt = ctx_.resolvedType(*fd->type);
+        }
         if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
         // (b) §28.5: a generic type-parameter field — classify by the concrete
         // substituted type of the current instantiation.
@@ -2862,17 +2915,35 @@ private:
     // not apply). The enclosing class's disposal cascade must call
     // bz_shared_release / bz_weak_release directly on the field value.
     // isWeak is set to true for Weak<T> fields (selects bz_weak_release).
+    //
+    // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
+    // type rides ctx_.importedMemberType(fs); the type name is in importedName
+    // when declaration == nullptr (loader stores it for builtins not exported as
+    // user types — Shared<T>/Weak<T> are runtime builtins, §2.5/§28.13).
     bool isOwnedSharedWeakField(const sema::FieldSymbol* fs,
                                 bool* isWeak = nullptr) const {
         if (!hasOwnedModifier(fs)) return false;
-        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-        if (!fd || !fd->type) return false;
-        auto* rt = ctx_.resolvedType(*fd->type);
+        const sema::TypeRef* rt = nullptr;
+        // #662 foundation B: imported field — type from importedMemberType.
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return false;
+            rt = ctx_.resolvedType(*fd->type);
+        }
         if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
         if (rt->declaration) return false;  // user TypeDecl — not a builtin
-        if (!rt->astNode || !rt->astNode->name ||
-            rt->astNode->name->parts.empty()) return false;
-        auto n = rt->astNode->name->parts[0];
+        // Local (non-imported) field: name via astNode.
+        std::string_view n;
+        if (!fs->decl) {
+            // Imported field: loader sets importedName when declaration is null.
+            n = rt->importedName;
+        } else {
+            if (!rt->astNode || !rt->astNode->name ||
+                rt->astNode->name->parts.empty()) return false;
+            n = rt->astNode->name->parts[0];
+        }
         if (n == "Shared") { if (isWeak) *isWeak = false; return true; }
         if (n == "Weak")   { if (isWeak) *isWeak = true;  return true; }
         return false;
@@ -2883,11 +2954,25 @@ private:
     // isOwnedReferenceField does not match them), return its resolved TypeRef;
     // otherwise null. The owner's Dispose frees such a field's backing and
     // cascades disposal into its class elements for an owning collection.
+    //
+    // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
+    // type rides ctx_.importedMemberType(fs).  Collection builtins have no user
+    // TypeDecl so declaration == nullptr and importedName carries "Array" etc.;
+    // isCollectionTypeName / isLinkedListTypeName already check importedName for
+    // the TypeRef when astNode is null (they inspect the TypeRef via its own
+    // name-detection logic), so the same predicates work for imported fields once
+    // the TypeRef is obtained from the correct source.
     const sema::TypeRef* ownedCollectionFieldType(const sema::FieldSymbol* fs) {
         if (!hasOwnedModifier(fs)) return nullptr;
-        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-        if (!fd || !fd->type) return nullptr;
-        auto* rt = ctx_.resolvedType(*fd->type);
+        const sema::TypeRef* rt = nullptr;
+        // #662 foundation B: imported field — type from importedMemberType.
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return nullptr;
+            rt = ctx_.resolvedType(*fd->type);
+        }
         if (isCollectionTypeName(rt)) return rt;
         // per §4.6/§4.7: owned LinkedList<T>/OwnedLinkedList<T> fields are also
         // heap collections — freed via bz_llist_free, not bz_array_free; but
