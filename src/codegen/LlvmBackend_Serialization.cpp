@@ -232,6 +232,9 @@ void Emitter::emitRecordSerialize(const TypeSymbol* ts,
     if (!td->hasPositionalFields) nonSkipCount = (int32_t)storage.size();  // body
     auto* beginFn = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
     builder_.CreateCall(beginFn, {serPtr, builder_.getInt32(nonSkipCount)});
+    // §2.15 / fix #687: bz_binser_begin_object can now set bz_exc (MaxDepth guard).
+    // Check for pending exception so a try/catch SerializationException can catch it.
+    emitPendingCheck();
 
     // Per-field: WriteFieldName + Write
     unsigned storageIdx = 0;
@@ -1191,6 +1194,9 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
     // BeginObject(dynamic_field_count).
     auto* beginFn = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
     builder_.CreateCall(beginFn, {serPtr, dynCount});
+    // §2.15 / fix #687: bz_binser_begin_object can now set bz_exc (MaxDepth guard).
+    // Check for pending exception so a try/catch SerializationException can catch it.
+    emitPendingCheck();
 
     // Map optional comp index to its isNonNull flag for the write-gate check.
     std::unordered_map<std::size_t, llvm::Value*> optNonNullMap;

@@ -110,6 +110,11 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §2.15 / issue #550: JsonSerializer / JsonDeserializer (opaque
         // runtime handles; same import-gating behaviour as Binary variants).
         n == "JsonSerializer" || n == "JsonDeserializer" ||
+        // §2.15 / issue #687: JsonOptions — a compiler-known value record
+        // (Indented: bool, IndentWidth: int, AllowTrailingCommas: bool,
+        // IgnoreUnknownFields: bool, MaxDepth: int). Requires
+        // `import System.Serialization` like the serializer/deserializer types.
+        n == "JsonOptions" ||
         // §8.1 / issue #646: Stopwatch — heap-allocated timing class.
         // §8.2 / issue #646: Debug — static class for assertions and logging.
         // Both require `import System.Diagnostics` per spec (stdlib §8); the
@@ -563,7 +568,8 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if ((first == "BinarySerializer" ||
                      first == "BinaryDeserializer" ||
                      first == "JsonSerializer" ||
-                     first == "JsonDeserializer") &&
+                     first == "JsonDeserializer" ||
+                     first == "JsonOptions") &&
                     !sourceImports_.count("System.Serialization")) {
                     ctx_.diagnostics().report(
                         Severity::Error, t.span.begin,

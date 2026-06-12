@@ -7379,6 +7379,11 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
 struct bz_jser_state_t {
     int     depth;                         // current nesting depth
     bool    needs_comma[BZ_JSER_MAX_DEPTH]; // does a comma precede the next value?
+    // fix #687 / stdlib §2.15 JsonOptions:
+    bool    indented;           // pretty-print with newlines
+    int32_t indent_width;       // spaces per indent level (default 2)
+    int32_t max_depth;          // nesting guard: 0 = unlimited, >0 = raise when exceeded
+    bool    after_field_name;   // true after WriteFieldName; skip extra indent for value
 };
 
 struct bz_binser_t {
@@ -7454,6 +7459,20 @@ void* bz_binser_alloc(void) {
 void* bz_jser_alloc(void) {
     auto* s = static_cast<bz_binser_t*>(calloc(1, sizeof(bz_binser_t)));
     s->kind = 1;  // JSON
+    // Defaults per stdlib §2.15: Indented=false, IndentWidth=2, MaxDepth=64.
+    s->json.indented     = false;
+    s->json.indent_width = 2;
+    s->json.max_depth    = 64;
+    return s;
+}
+
+// fix #687 / stdlib §2.15 JsonOptions: allocate with explicit options.
+void* bz_jser_alloc_opts(int8_t indented, int32_t indent_width, int32_t max_depth) {
+    auto* s = static_cast<bz_binser_t*>(calloc(1, sizeof(bz_binser_t)));
+    s->kind = 1;  // JSON
+    s->json.indented     = (indented != 0);
+    s->json.indent_width = (indent_width > 0) ? indent_width : 2;
+    s->json.max_depth    = (max_depth > 0) ? max_depth : 64;
     return s;
 }
 
@@ -7580,14 +7599,32 @@ static void bz_jser_cstr(bz_binser_t* s, const char* p) {
     bz_jser_raw(s, p, (int64_t)strlen(p));
 }
 
+// fix #687 / stdlib §2.15 Indented: emit newline + `depth * indent_width` spaces.
+// Only emitted when s->json.indented is true.
+static void bz_jser_indent(bz_binser_t* s) {
+    if (!s->json.indented) return;
+    bz_jser_raw(s, "\n", 1);
+    int spaces = s->json.depth * s->json.indent_width;
+    for (int i = 0; i < spaces; ++i) bz_jser_raw(s, " ", 1);
+}
+
 // If the current depth context needs a comma, write it now and clear the flag.
 // This must be called before every value (but NOT before WriteFieldName —
 // commas before field names are handled in WriteFieldName itself).
+// fix #687: in indented mode, emit newline+indent before array elements
+// (but NOT before object-field values, which come right after "fieldname": ).
 static void bz_jser_maybe_comma(bz_binser_t* s) {
     int d = s->json.depth;
     if (d >= 0 && d < BZ_JSER_MAX_DEPTH && s->json.needs_comma[d]) {
         bz_jser_cstr(s, ",");
     }
+    // In indented mode: emit newline+indent before array elements.
+    // after_field_name is set by bz_binser_write_field_name and cleared here,
+    // so object field values (which follow ": ") don't get an extra newline.
+    if (s->json.indented && d > 0 && !s->json.after_field_name) {
+        bz_jser_indent(s);
+    }
+    s->json.after_field_name = false;
 }
 
 // After writing a value at current depth, mark that the NEXT value needs a comma.
@@ -7869,6 +7906,12 @@ void bz_binser_begin_object(void* serp, int32_t field_count) {
     if (s->kind == 1) {
         // §2.15: fieldCount is advisory for JSON — ignored.
         (void)field_count;
+        // fix #687 / stdlib §2.15 MaxDepth: raise SerializationException when
+        // nesting exceeds the configured max_depth.
+        if (s->json.max_depth > 0 && s->json.depth >= s->json.max_depth) {
+            bz_ser_throw("JSON nesting exceeds MaxDepth (stdlib §2.15, #687)", nullptr);
+            return;
+        }
         bz_jser_maybe_comma(s);
         bz_jser_cstr(s, "{");
         int nd = ++s->json.depth;
@@ -7876,6 +7919,8 @@ void bz_binser_begin_object(void* serp, int32_t field_count) {
         // §2.15 v0.139: if write_inline_tag left a pending tag, inject
         // `"$id":n` as the first (virtual) field inside this object.
         if (s->json_pending_tag_id > 0) {
+            // fix #687: in indented mode add indent before the $id field too.
+            if (s->json.indented) bz_jser_indent(s);
             char buf[32];
             int n = snprintf(buf, sizeof(buf), "\"$id\":%d", s->json_pending_tag_id);
             bz_jser_raw(s, buf, n);
@@ -7897,10 +7942,21 @@ void bz_binser_write_field_name(void* serp, void* name) {
         if (d >= 0 && d < BZ_JSER_MAX_DEPTH && s->json.needs_comma[d]) {
             bz_jser_cstr(s, ",");
         }
+        // fix #687: in indented mode, emit newline+indent before each field name.
+        if (s->json.indented) {
+            bz_jser_indent(s);
+        }
         bz_jser_write_string_impl(s, name);
-        bz_jser_cstr(s, ":");
+        if (s->json.indented) {
+            bz_jser_cstr(s, ": ");  // space after colon for readability
+        } else {
+            bz_jser_cstr(s, ":");
+        }
         // Reset the needs_comma flag (the value that follows is NOT preceded by comma).
         if (d >= 0 && d < BZ_JSER_MAX_DEPTH) s->json.needs_comma[d] = false;
+        // fix #687: signal that the next maybe_comma call should skip the indent
+        // (the value comes right after ": " on the same line).
+        s->json.after_field_name = true;
         return;
     }
     bz_binser_write_string(serp, name);
@@ -7909,7 +7965,16 @@ void bz_binser_write_field_name(void* serp, void* name) {
 void bz_binser_end_object(void* serp) {
     auto* s = static_cast<bz_binser_t*>(serp);
     if (s->kind == 1) {
+        int d = s->json.depth;
         --s->json.depth;
+        // fix #687: in indented mode, emit newline+indent before closing brace.
+        if (s->json.indented && d > 0) {
+            // Only emit newline if there were any fields (needs_comma[d] is true
+            // if at least one field was written).
+            if (d >= 0 && d < BZ_JSER_MAX_DEPTH && s->json.needs_comma[d]) {
+                bz_jser_indent(s);
+            }
+        }
         bz_jser_cstr(s, "}");
         // After the } the parent context needs a comma.
         bz_jser_mark_comma(s);
@@ -7934,7 +7999,13 @@ void bz_binser_begin_array(void* serp, int32_t element_count) {
 void bz_binser_end_array(void* serp) {
     auto* s = static_cast<bz_binser_t*>(serp);
     if (s->kind == 1) {
+        int d = s->json.depth;
         --s->json.depth;
+        // fix #687: in indented mode, emit newline+indent before closing bracket.
+        if (s->json.indented && d > 0 &&
+            d >= 0 && d < BZ_JSER_MAX_DEPTH && s->json.needs_comma[d]) {
+            bz_jser_indent(s);
+        }
         bz_jser_cstr(s, "]");
         bz_jser_mark_comma(s);
         return;
@@ -8038,6 +8109,9 @@ struct bz_binder_t {
     int32_t        fields_remaining;
     bool           in_object;
     int8_t         kind;  // 0 = binary, 1 = JSON
+    // fix #687 / stdlib §2.15 JsonOptions:
+    int8_t         allow_trailing_commas;  // tolerate trailing comma in JSON objects/arrays
+    int32_t        max_depth;              // nesting guard (0 = unlimited)
 
     // §2.15 v0.139 JSON graph-identity: set to 1 when bz_binder_read_graph_marker
     // has already consumed the opening `{` of an inline object (and the `"$id":n,`
@@ -8535,11 +8609,28 @@ void* bz_binder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
 // JSON deserializer: data is a UTF-8 JSON byte span (borrowed from caller).
 void* bz_jder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
     auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
-    d->data           = data;
-    d->len            = len;
-    d->pos            = 0;
-    d->ignore_unknown = ignore_unknown;
-    d->kind           = 1;  // JSON
+    d->data                  = data;
+    d->len                   = len;
+    d->pos                   = 0;
+    d->ignore_unknown        = ignore_unknown;
+    d->allow_trailing_commas = 0;
+    d->max_depth             = 64;
+    d->kind                  = 1;  // JSON
+    return d;
+}
+
+// fix #687 / stdlib §2.15 JsonOptions: JSON deserializer with full options.
+void* bz_jder_alloc_opts(const uint8_t* data, int64_t len,
+                          int8_t ignore_unknown, int8_t allow_trailing_commas,
+                          int32_t max_depth) {
+    auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->data                  = data;
+    d->len                   = len;
+    d->pos                   = 0;
+    d->ignore_unknown        = ignore_unknown;
+    d->allow_trailing_commas = allow_trailing_commas;
+    d->max_depth             = (max_depth > 0) ? max_depth : 64;
+    d->kind                  = 1;  // JSON
     return d;
 }
 
@@ -8548,11 +8639,28 @@ void* bz_jder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
 // Used by new JsonDeserializer(string) codegen path.
 void* bz_jder_alloc_str(char* utf8z, int64_t len, int8_t ignore_unknown) {
     auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
-    d->data           = reinterpret_cast<const uint8_t*>(utf8z);
-    d->len            = len;
-    d->pos            = 0;
-    d->ignore_unknown = ignore_unknown;
-    d->kind           = 2;  // JSON + owns data (free on bz_binder_free)
+    d->data                  = reinterpret_cast<const uint8_t*>(utf8z);
+    d->len                   = len;
+    d->pos                   = 0;
+    d->ignore_unknown        = ignore_unknown;
+    d->allow_trailing_commas = 0;
+    d->max_depth             = 64;
+    d->kind                  = 2;  // JSON + owns data (free on bz_binder_free)
+    return d;
+}
+
+// fix #687 / stdlib §2.15 JsonOptions: JSON deserializer from owned string with options.
+void* bz_jder_alloc_str_opts(char* utf8z, int64_t len,
+                              int8_t ignore_unknown, int8_t allow_trailing_commas,
+                              int32_t max_depth) {
+    auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->data                  = reinterpret_cast<const uint8_t*>(utf8z);
+    d->len                   = len;
+    d->pos                   = 0;
+    d->ignore_unknown        = ignore_unknown;
+    d->allow_trailing_commas = allow_trailing_commas;
+    d->max_depth             = (max_depth > 0) ? max_depth : 64;
+    d->kind                  = 2;  // JSON + owns data (free on bz_binder_free)
     return d;
 }
 
@@ -8861,6 +8969,18 @@ void bz_binder_end_object(void* derp) {
     if (d->kind >= 1) {
         // Skip ws and consume '}'.
         bz_jder_skip_ws(d);
+        // §2.15 JsonOptions.AllowTrailingCommas: a trailing comma immediately
+        // before '}' is legal when allow_trailing_commas is set, and an error
+        // when it is not.
+        if (d->pos < d->len && d->data[d->pos] == ',') {
+            if (!d->allow_trailing_commas) {
+                bz_ser_throw("Trailing comma in JSON object (§2.15)", nullptr);
+                d->in_object = false;
+                return;
+            }
+            ++d->pos;  // skip trailing comma
+            bz_jder_skip_ws(d);
+        }
         if (d->pos < d->len && d->data[d->pos] == '}') ++d->pos;
         d->in_object = false;
         return;

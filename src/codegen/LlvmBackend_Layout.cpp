@@ -378,6 +378,14 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                  rt->astNode->name->parts[0] == "ReadOnlyArraySpan")) {
                 return arraySpanStructType();
             }
+            // §2.15 / issue #687: JsonOptions is a compiler-known value record.
+            // { i1 Indented, i32 IndentWidth, i1 AllowTrailingCommas,
+            //   i1 IgnoreUnknownFields, i32 MaxDepth }
+            if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty() &&
+                rt->astNode->name->parts[0] == "JsonOptions") {
+                return jsonOptionsStructType();
+            }
             if (!rt->declaration && rt->astNode && rt->astNode->name &&
                 !rt->astNode->name->parts.empty()) {
                 auto n = rt->astNode->name->parts[0];

@@ -5915,6 +5915,51 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return builder_.getInt64(0);  // default: zero TimeSpan
             }
 
+            // §2.15 / issue #687: new JsonOptions(Indented, IndentWidth,
+            //   AllowTrailingCommas, IgnoreUnknownFields, MaxDepth)
+            // Constructs the bz.json_options value struct from 5 positional args.
+            // Fields: {i1 Indented, i32 IndentWidth, i1 AllowTrailingCommas,
+            //          i1 IgnoreUnknownFields, i32 MaxDepth}
+            if (colName == "JsonOptions") {
+                auto* st = jsonOptionsStructType();
+                llvm::Value* v = llvm::UndefValue::get(st);
+                // Defaults per stdlib §2.15: Indented=false, IndentWidth=2,
+                // AllowTrailingCommas=false, IgnoreUnknownFields=false, MaxDepth=64.
+                llvm::Value* indented   = builder_.getFalse();
+                llvm::Value* indentW    = builder_.getInt32(2);
+                llvm::Value* allowTrail = builder_.getFalse();
+                llvm::Value* ignoreUnk  = builder_.getFalse();
+                llvm::Value* maxDepth   = builder_.getInt32(64);
+                if (ne.args.size() >= 1 && ne.args[0].value) {
+                    llvm::Value* a = lowerExpr(*ne.args[0].value);
+                    if (a) indented = builder_.CreateTrunc(a, i1());
+                }
+                if (ne.args.size() >= 2 && ne.args[1].value) {
+                    llvm::Value* a = lowerExpr(*ne.args[1].value);
+                    // Bezel `int` literals lower as i64; truncate to i32 for struct field.
+                    if (a) indentW = builder_.CreateTrunc(a, i32(), "jopt.iw32");
+                }
+                if (ne.args.size() >= 3 && ne.args[2].value) {
+                    llvm::Value* a = lowerExpr(*ne.args[2].value);
+                    if (a) allowTrail = builder_.CreateTrunc(a, i1());
+                }
+                if (ne.args.size() >= 4 && ne.args[3].value) {
+                    llvm::Value* a = lowerExpr(*ne.args[3].value);
+                    if (a) ignoreUnk = builder_.CreateTrunc(a, i1());
+                }
+                if (ne.args.size() >= 5 && ne.args[4].value) {
+                    llvm::Value* a = lowerExpr(*ne.args[4].value);
+                    // Bezel `int` literals lower as i64; truncate to i32 for struct field.
+                    if (a) maxDepth = builder_.CreateTrunc(a, i32(), "jopt.md32");
+                }
+                v = builder_.CreateInsertValue(v, indented,   {0u});
+                v = builder_.CreateInsertValue(v, indentW,    {1u});
+                v = builder_.CreateInsertValue(v, allowTrail, {2u});
+                v = builder_.CreateInsertValue(v, ignoreUnk,  {3u});
+                v = builder_.CreateInsertValue(v, maxDepth,   {4u});
+                return v;
+            }
+
             // §2.15 (issue #550): BinarySerializer / BinaryDeserializer / JsonSerializer / JsonDeserializer.
             // These require `import System.Serialization`; they are compiler-known
             // builtin classes backed by bz_binser_t / bz_binder_t in the runtime.
@@ -5923,14 +5968,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 auto* fn = declareC("bz_binser_alloc", ptrTy(), {});
                 return builder_.CreateCall(fn, {}, "binser.new");
             }
-            // new JsonSerializer() → bz_jser_alloc()  (same bz_binser_t, kind=1)
+            // new JsonSerializer() → bz_jser_alloc() or bz_jser_alloc_opts()
+            // fix #687: when options are provided, extract the JsonOptions fields
+            // and pass them to bz_jser_alloc_opts().
             if (colName == "JsonSerializer" &&
                 (ne.args.empty() ||
                  (ne.args.size() == 1 && ne.args[0].value))) {
-                // Both new JsonSerializer() and new JsonSerializer(options) → bz_jser_alloc().
-                // JsonOptions is not yet represented in codegen; options ignored.
-                auto* fn = declareC("bz_jser_alloc", ptrTy(), {});
-                return builder_.CreateCall(fn, {}, "jser.new");
+                if (ne.args.empty()) {
+                    // new JsonSerializer() → bz_jser_alloc()  (defaults)
+                    auto* fn = declareC("bz_jser_alloc", ptrTy(), {});
+                    return builder_.CreateCall(fn, {}, "jser.new");
+                }
+                // new JsonSerializer(options: JsonOptions) →
+                // bz_jser_alloc_opts(indented, indent_width, max_depth)
+                llvm::Value* optsVal = lowerExpr(*ne.args[0].value);
+                if (!optsVal) return nullptr;
+                llvm::Value* indented  = jsonOptIndented(optsVal);
+                llvm::Value* indentW   = jsonOptIndentWidth(optsVal);
+                llvm::Value* maxDepth  = jsonOptMaxDepth(optsVal);
+                auto* fn = declareC("bz_jser_alloc_opts", ptrTy(),
+                                    {i8(), i32(), i32()});
+                return builder_.CreateCall(fn, {indented, indentW, maxDepth},
+                                           "jser.new");
             }
             // new BinaryDeserializer(span: ReadOnlySpan<byte>)  or
             // new BinaryDeserializer(span, ignoreUnknownFields: bool)
@@ -5976,47 +6035,43 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // new JsonDeserializer(input: ReadOnlySpan<byte>) or
             // new JsonDeserializer(input: string) or
             // new JsonDeserializer(input: ReadOnlySpan<byte>, options: JsonOptions)
+            // fix #687: extract JsonOptions from second arg when present.
             if (colName == "JsonDeserializer" && !ne.args.empty() && ne.args[0].value) {
                 // Check the first argument type to determine span vs string.
                 auto* argTy = ctx_.exprType(*ne.args[0].value);
                 bool isString = argTy &&
                     argTy->kind == sema::TypeRef::Kind::Primitive &&
                     argTy->primitive == sema::PrimitiveType::String;
-                llvm::Value* ignoreFld = builder_.getInt8(0);
-                // JsonOptions: ignore for now (not yet lowerable); second arg ignored.
+                // Extract options from second arg if present (JsonOptions struct).
+                // Defaults per stdlib §2.15.
+                llvm::Value* ignoreFld   = builder_.getInt8(0);   // IgnoreUnknownFields
+                llvm::Value* allowTrail  = builder_.getInt8(0);   // AllowTrailingCommas
+                llvm::Value* maxDepthVal = builder_.getInt32(64); // MaxDepth
+                if (ne.args.size() >= 2 && ne.args[1].value) {
+                    llvm::Value* optsVal = lowerExpr(*ne.args[1].value);
+                    if (optsVal) {
+                        ignoreFld   = jsonOptIgnoreUnknown(optsVal);
+                        allowTrail  = jsonOptAllowTrailing(optsVal);
+                        maxDepthVal = jsonOptMaxDepth(optsVal);
+                    }
+                }
                 if (isString) {
                     // new JsonDeserializer(string) — string is a bz_string*.
-                    // We need the raw UTF-8 bytes and length from the bz_string.
                     llvm::Value* strPtr = lowerExpr(*ne.args[0].value);
                     if (!strPtr) return nullptr;
-                    // Extract data ptr and byte length from bz_string_struct.
-                    auto* strTy = stringType();
-                    llvm::Value* dataPtr = builder_.CreateLoad(ptrTy(),
-                        builder_.CreateStructGEP(strTy, strPtr, 0), "jder.sdata");
-                    llvm::Value* lenCp = builder_.CreateLoad(i64(),
-                        builder_.CreateStructGEP(strTy, strPtr, 1), "jder.slen");
-                    // Width-1 strings: data is raw bytes (UTF-8 or Latin-1);
-                    // width-2/4 strings: we need UTF-8; use bz_string_to_utf8z.
-                    // For simplicity, use bz_string_to_utf8z always (returns malloc'd NUL-terminated).
-                    // We allocate a bz_jder_alloc over the utf8z data.
-                    // NOTE: The utf8z buffer must outlive the deserializer call.
-                    // Since the deserializer only needs to read during Deserialize,
-                    // and the utf8z is freed at scope end (handled by using var disposal),
-                    // we pass the utf8z buffer directly. The deserializer borrows it.
-                    // The simplest correct approach: use bz_string_to_utf8z + strlen.
                     auto* utf8zFn = declareC("bz_string_to_utf8z", ptrTy(), {ptrTy()});
                     llvm::Value* utf8z = builder_.CreateCall(utf8zFn, {strPtr}, "jder.utf8z");
-                    // strlen the utf8z to get byte count.
                     auto* strlenFn = declareC("strlen", i64(), {ptrTy()});
                     llvm::Value* utf8Len = builder_.CreateCall(strlenFn, {utf8z}, "jder.utf8len");
-                    // bz_jder_alloc_from_utf8z: use bz_jder_alloc with (utf8z, utf8len, ignore).
-                    // Then we need to free utf8z after... but the deserializer only borrows.
-                    // Use bz_jder_alloc_str which takes ownership of the utf8z.
-                    auto* fn = declareC("bz_jder_alloc_str", ptrTy(),
-                                        {ptrTy(), i64(), i8()});
-                    return builder_.CreateCall(fn, {utf8z, utf8Len, ignoreFld}, "jder.new");
+                    // fix #687: use bz_jder_alloc_str_opts (ignore_unknown,
+                    // allow_trailing, max_depth).
+                    auto* fn = declareC("bz_jder_alloc_str_opts", ptrTy(),
+                                        {ptrTy(), i64(), i8(), i8(), i32()});
+                    return builder_.CreateCall(fn,
+                        {utf8z, utf8Len, ignoreFld, allowTrail, maxDepthVal},
+                        "jder.new");
                 } else {
-                    // new JsonDeserializer(ReadOnlySpan<byte>) — unpack span.
+                    // new JsonDeserializer(ReadOnlySpan<byte>[, options]) — unpack span.
                     llvm::Value* spanVal = lowerExpr(*ne.args[0].value);
                     if (!spanVal) return nullptr;
                     llvm::Value* dataPtr = spanSource(spanVal);
@@ -6027,9 +6082,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     llvm::Value* lenI64   = builder_.CreateZExt(lenI32, i64(), "jder.l64");
                     llvm::Value* byteData = builder_.CreateGEP(
                         llvm::Type::getInt8Ty(llvm_), arrData, startI64, "jder.bdata");
-                    auto* fn = declareC("bz_jder_alloc", ptrTy(),
-                                        {ptrTy(), i64(), i8()});
-                    return builder_.CreateCall(fn, {byteData, lenI64, ignoreFld}, "jder.new");
+                    // fix #687: use bz_jder_alloc_opts (ignore_unknown, allow_trailing, max_depth).
+                    auto* fn = declareC("bz_jder_alloc_opts", ptrTy(),
+                                        {ptrTy(), i64(), i8(), i8(), i32()});
+                    return builder_.CreateCall(fn,
+                        {byteData, lenI64, ignoreFld, allowTrail, maxDepthVal},
+                        "jder.new");
                 }
             }
         }

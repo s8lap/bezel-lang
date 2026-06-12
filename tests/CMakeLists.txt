@@ -497,6 +497,9 @@ set(BEZEL_TEST_SOURCES
     codegen/file_io_644_test.cpp
     codegen/diagnostics_646_test.cpp
     codegen/decimal_integration_664_666_test.cpp
+    # --- fix #686: nullable-decimal LINQ aggregates ---
+    codegen/decimal_nullable_686_test.cpp
+    # --- end #686 ---
     # --- #550 tier-2 contract tests (class trees, §9.8) ---
     # Spec-derived CONTRACT for #550 tier 2; 23/25 red until the implementation
     # lands. Enable with the tier-2 implementation merge (pattern: #600 contract).
@@ -511,6 +514,9 @@ set(BEZEL_TEST_SOURCES
     # --- #550 JSON format tier (§2.15 JsonSerializer/JsonDeserializer) ---
     codegen/json_550_test.cpp
     # --- end #550 JSON ---
+    # --- fix #687: JsonOptions registered + wired (§2.15) ---
+    codegen/json_options_687_test.cpp
+    # --- end #687 ---
     # --- fix #685/#679/#682: struct-as-scalar lowering (decimal Set/Dict, field Mutex, range slice) ---
     codegen/struct_scalar_685_679_682_test.cpp
     # --- end #685/#679/#682 ---
