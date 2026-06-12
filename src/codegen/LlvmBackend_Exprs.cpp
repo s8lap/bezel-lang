@@ -3548,7 +3548,14 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                                    : builder_.CreateICmpSGE(lp, rp, "lift.cmp");
                 }
                 // §7.11: false when either operand is null; inner cmp when both present.
-                return builder_.CreateAnd(bothPresent, cmp, "lift.rel");
+                // Guard: cmp is nullptr when the payload type is neither FP nor integer
+                // (e.g. decimal? whose payload is a %bz.decimal struct). A null cmp
+                // would crash CreateAnd; when cmp is null fall through to let the
+                // non-lifted relational path handle it — decimal relational goes through
+                // operator overloads (bz_decimal_cmp) at the user-defined-overload
+                // call site above this block, so we never reach here for decimal?.
+                if (cmp)
+                    return builder_.CreateAnd(bothPresent, cmp, "lift.rel");
             }
 
             // ---- ARITHMETIC / BITWISE / SHIFT: result is T? ----
@@ -3599,16 +3606,61 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 };
                 lp = toFP(lp); rp = toFP(rp);
             }
+            // §4.4 / §7.11 / fix #663: decimal? lifted arithmetic — the payload
+            // of a decimal? struct is a %bz.decimal (itself a struct), not a scalar.
+            // All decimal runtime functions take pointers; mirror the non-nullable
+            // path (§6.4) but emit alloca/store/call inside the bothPresent branch.
+            // Relational (isRelOp) on decimal? is handled by the early return above.
+            llvm::Value* payloadResult = nullptr;
+            if (lp->getType()->isStructTy() &&
+                lp->getType() == decimalStructType() && isArithOp) {
+                llvm::StructType* dst = decimalStructType();
+                if (op == "/" || op == "mod") {
+                    // §6.4: zero-divisor check inside the bothPresent branch.
+                    llvm::Value* lo  = builder_.CreateExtractValue(rp, {0u});
+                    llvm::Value* mid = builder_.CreateExtractValue(rp, {1u});
+                    llvm::Value* hi  = builder_.CreateExtractValue(rp, {2u});
+                    llvm::Value* orv = builder_.CreateOr(
+                        builder_.CreateOr(lo, mid), hi);
+                    emitGuardThrow(
+                        builder_.CreateICmpEQ(orv, llvm::ConstantInt::get(i32(), 0)),
+                        "DivideByZeroException");
+                }
+                if (op == "+" || op == "-" || op == "*" ||
+                    op == "/" || op == "mod") {
+                    llvm::AllocaInst* aSlot = entryAlloca(dst);
+                    llvm::AllocaInst* bSlot = entryAlloca(dst);
+                    llvm::AllocaInst* oSlot = entryAlloca(dst);
+                    builder_.CreateStore(lp, aSlot);
+                    builder_.CreateStore(rp, bSlot);
+                    const char* fn_name =
+                        op == "+"   ? "bz_decimal_add" :
+                        op == "-"   ? "bz_decimal_sub" :
+                        op == "*"   ? "bz_decimal_mul" :
+                        op == "/"   ? "bz_decimal_div" :
+                        /* mod */     "bz_decimal_mod";
+                    auto getOVEVtable = [&]() -> llvm::Value* {
+                        auto vit = builtinVtable_.find("OverflowException");
+                        if (vit == builtinVtable_.end())
+                            return llvm::ConstantPointerNull::get(ptrTy());
+                        return vit->second;
+                    };
+                    auto* fn = declareC(fn_name, llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(fn, {aSlot, bSlot, oSlot, getOVEVtable()});
+                    emitPendingCheck();  // per fix #521 / §6.4: runtime sets bz_exc on overflow
+                    payloadResult = builder_.CreateLoad(dst, oSlot, "lift.dec.res");
+                }
+            }
             // Compute the payload result using the same logic as the non-nullable
             // path (including overflow and div-zero checks, per §7.11).
-            llvm::Value* payloadResult = nullptr;
-            if (lp->getType()->isFloatingPointTy()) {
+            if (!payloadResult && lp->getType()->isFloatingPointTy()) {
                 // FP arithmetic — no overflow/div-zero checks (§6.3).
                 if      (op == "+")   payloadResult = builder_.CreateFAdd(lp, rp);
                 else if (op == "-")   payloadResult = builder_.CreateFSub(lp, rp);
                 else if (op == "*")   payloadResult = builder_.CreateFMul(lp, rp);
                 else if (op == "/")   payloadResult = builder_.CreateFDiv(lp, rp);
-            } else {
+            } else if (!payloadResult) {
                 bool uns = isUnsignedBinOperand(bin);
                 // CG22 checked integer arithmetic (§6.1) — overflow/div-zero
                 // checks fire here, inside the bothPresent branch.
@@ -3715,16 +3767,34 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         using P = sema::PrimitiveType;
         const sema::TypeRef* lTy = bin.left  ? ctx_.exprType(*bin.left)  : nullptr;
         const sema::TypeRef* rTy = bin.right ? ctx_.exprType(*bin.right) : nullptr;
+        // fix #663: exclude nullable decimal (decimal?) — those values lower to
+        // the {i8, %bz.decimal} tagged struct; the lifted-arithmetic block above
+        // handles decimal? operands by extracting the payload before routing here.
+        // A decimal? operand reaching this point carries the full wrapper struct,
+        // not the bare %bz.decimal that the runtime functions expect.
         bool lDec = lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
-                    lTy->primitive == P::Decimal;
+                    lTy->primitive == P::Decimal && !lTy->nullable;
         bool rDec = rTy && rTy->kind == sema::TypeRef::Kind::Primitive &&
-                    rTy->primitive == P::Decimal;
+                    rTy->primitive == P::Decimal && !rTy->nullable;
         // §5.1: integers implicitly widen to decimal — promote an integer operand.
         // We detect this by: result type is decimal, and one operand is integer.
         const sema::TypeRef* resTy = ctx_.exprType(bin);
         bool resDec = resTy && resTy->kind == sema::TypeRef::Kind::Primitive &&
-                      resTy->primitive == P::Decimal;
-        if (lDec || rDec || resDec) {
+                      resTy->primitive == P::Decimal && !resTy->nullable;
+        // fix #663: if EITHER side is nullable decimal (decimal?), skip this
+        // block entirely. The lifted-arithmetic block above handles decimal? op
+        // decimal? (both nullable). A decimal? op decimal (mixed nullable vs.
+        // non-null) comparison reaches the nullable-value equality path at
+        // line ~3989, where the hasValue tag is checked and the inner payload
+        // is routed through emitValueEquality → bz_decimal_cmp. Entering here
+        // with a nullable side would pass the full {i8, %bz.decimal} wrapper
+        // struct to bz_decimal_cmp as if it were a bare %bz.decimal → wrong.
+        bool eitherNullableDecimal =
+            (lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
+             lTy->primitive == P::Decimal && lTy->nullable) ||
+            (rTy && rTy->kind == sema::TypeRef::Kind::Primitive &&
+             rTy->primitive == P::Decimal && rTy->nullable);
+        if (!eitherNullableDecimal && (lDec || rDec || resDec)) {
             llvm::StructType* dst = decimalStructType();
             // Helper: promote value to decimal struct (alloca + runtime call).
             auto toDecSlot = [&](llvm::Value* v,

@@ -161,8 +161,17 @@ bool Emitter::isNullablePrimTy(const sema::TypeRef* rt) {
         case P::Int: case P::UInt:
         case P::Long: case P::ULong:
         case P::Float: case P::Double:
+        // per §4.4 / fix #663: decimal is a 16-byte struct value type
+        // (§4.4, #521) — not a scalar, but still a nullable value type that
+        // needs the {i8 hasValue; %bz.decimal value} tagged-struct representation
+        // (exactly as int? / double? use {i8, i32} / {i8, double}).
+        // Before this fix `decimal?` fell through to the default → isNullableValueTy
+        // returned false → `return null` emitted `ret ptr null` against the struct
+        // return type (IR-verify abort, r04e), and the null tag was never set
+        // (null-comparison always failed, r04b/r04g).
+        case P::Decimal:
             return true;
-        default: return false;  // String, Char, Object, Decimal, None
+        default: return false;  // String, Char, Object, None
     }
 }
 
@@ -1837,6 +1846,22 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
         llvm::Value* notBoth = builder_.CreateNot(bothHave, "eq.nvnotboth");
         llvm::Value* inner = builder_.CreateOr(notBoth, valEq, "eq.nvinner");
         return builder_.CreateAnd(tagsEq, inner, "eq.nullableval");
+    }
+    // per §4.4 / fix #663: a non-nullable decimal field — the payload of a
+    // decimal? or a bare decimal record field — lowers to %bz.decimal
+    // ({i32×4}). Bit-wise struct equality is WRONG: 3.0m and 3.00m have
+    // different scale bits but are semantically equal. Route via bz_decimal_cmp.
+    if (fieldTy && fieldTy->kind == K::Primitive &&
+        fieldTy->primitive == sema::PrimitiveType::Decimal &&
+        !fieldTy->nullable &&
+        l->getType() == decimalStructType() && r->getType() == decimalStructType()) {
+        llvm::AllocaInst* aSlot = entryAlloca(decimalStructType());
+        llvm::AllocaInst* bSlot = entryAlloca(decimalStructType());
+        builder_.CreateStore(l, aSlot);
+        builder_.CreateStore(r, bSlot);
+        auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* cmp = builder_.CreateCall(cmpFn, {aSlot, bSlot}, "dec.eq.cmp");
+        return builder_.CreateICmpEQ(cmp, llvm::ConstantInt::get(i32(), 0), "dec.eq");
     }
     // String field: content equality (§4.6), not pointer identity. per §8.3
     bool isString = fieldTy && fieldTy->kind == K::Primitive &&
