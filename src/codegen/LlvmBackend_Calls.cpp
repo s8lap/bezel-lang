@@ -7515,6 +7515,12 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (iifeLam->exprBody) {
             if (auto* rt = ctx_.exprType(*iifeLam->exprBody))
                 retTy = lowerTypeRef(rt);
+            // fix #678 (narrowed) / §27.2: mirror the void-builtin check in
+            // lowerLambda — when the body is a Console.Write/WriteLine call
+            // (null exprType, no Unit TypeRef from sema), lowerLambda declares
+            // the lambda void(…); the call-site fnTy must match.
+            else if (isLambdaExprBodyVoidBuiltin(*iifeLam))
+                retTy = llvm::Type::getVoidTy(llvm_);
         } else if (auto* lamTy = ctx_.exprType(*iifeLam)) {
             // Block-body lambda: pull return type from the lambda's own
             // sema exprType (set by ExprTypecheck_Exprs.cpp).

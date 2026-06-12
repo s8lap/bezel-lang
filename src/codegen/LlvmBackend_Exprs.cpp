@@ -4762,6 +4762,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody)) {
             retTy = lowerTypeRef(rt);
             retSemaTy = rt;
+        } else {
+            // fix #678 (narrowed) / §27.2: sema leaves the body expression
+            // untyped (null exprType) for two reasons:
+            //   A. A void intrinsic call (Console.Write/WriteLine) — codegen's
+            //      lowerExpr returns nullptr for it, so the lambda body would
+            //      emit `ret void` into an i32-returning function → IR verifier
+            //      failure.  Infer void by recognising the Console pattern.
+            //   B. An unresolved value expression (unannotated IIFE `(x)=>x*2`,
+            //      generic-closure body `(x)=>x.v`, etc.) — null here means
+            //      "type unknown, will be resolved via expectedFunctionType_ or
+            //      left at i32 fallback".  These cases are NOT void; leave retTy.
+            //
+            // User-defined void methods (md->returnType==null) get a Kind::Unit
+            // exprType from sema (ExprTypecheck_Calls.cpp §549-553); lowerTypeRef
+            // maps Unit→voidTy and the branch above (ctx_.exprType != null) fires
+            // for them — they are already handled without reaching this else.
+            //
+            // The null-funcReturn of the lambda's own sema TypeRef is NOT a
+            // reliable void indicator: iife/generic-closure lambdas also have
+            // funcReturn==null when the body type is unresolvable at sema time
+            // (issue #678 rejection — the broader check broke 18 such tests).
+            if (isLambdaExprBodyVoidBuiltin(lam))
+                retTy = llvm::Type::getVoidTy(llvm_);
         }
     } else {
         // BUG-L3 / §27: for block-body lambdas the return type is NOT the
@@ -7188,6 +7211,52 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             if (resultTy)
                 v = coerceNumericToType(v, resultTy,
                                         isUnsignedTargetExpr(*arm.exprBody));
+            // fix #677 / §9.4 / §19.2: an arm body `_ => this` inside a record
+            // instance method returns `currentThis_` which is a POINTER to the
+            // record struct (record methods receive `this` by pointer, §9.4/CG29),
+            // but the case result type is the record struct by value. The PHI then
+            // mixes struct-valued arms with a pointer arm → "PHI node operands are
+            // not the same type" assertion in LLVM.
+            //
+            // Two cases to handle:
+            //  A. sema annotated the case expression's result type and it is a
+            //     struct (resultTy->isStructTy()): load through the ptr using that
+            //     struct type. This covers the multi-arm case where a different arm
+            //     already established the struct result type.
+            //  B. sema did NOT annotate the case result (resultTy == i32 default):
+            //     sema leaves `this` untyped for named-type methods (see
+            //     ExprTypecheck_Exprs.cpp — `this` in a record method has no
+            //     ctx_.exprType() → typeCase skips the arm → no common type → null
+            //     exprType on the case). Detect this by checking v == currentThis_
+            //     and looking up the current function in methodFns_ (same approach
+            //     as lowerWith §9.5). Load through the record struct so the PHI is
+            //     well-typed. This is the same load that lowerWith applies when
+            //     `this with {…}` is used in a record method body.
+            if (v->getType()->isPointerTy()) {
+                if (resultTy && resultTy->isStructTy()) {
+                    // Case A: sema-typed struct result — load through the ptr.
+                    v = builder_.CreateLoad(resultTy, v, "rec.this.val");
+                } else if (v == currentThis_ && currentFn_) {
+                    // Case B: untyped arm, arm value IS this → look up the
+                    // record struct from the emitter's method table.
+                    llvm::StructType* recSt = nullptr;
+                    for (const auto& [ms, fn] : methodFns_) {
+                        if (fn == currentFn_ && ms->parent &&
+                            ms->parent->kind == ast::TypeDeclKind::Record) {
+                            recSt = recordStruct(ms->parent);
+                            break;
+                        }
+                    }
+                    if (!recSt && currentSpecMethodSymbol_ &&
+                        currentSpecMethodSymbol_->parent &&
+                        currentSpecMethodSymbol_->parent->kind ==
+                            ast::TypeDeclKind::Record) {
+                        recSt = recordStruct(currentSpecMethodSymbol_->parent);
+                    }
+                    if (recSt)
+                        v = builder_.CreateLoad(recSt, v, "rec.this.val");
+                }
+            }
             // fix #573 / §19.2 / §7.1 / §7.5: defer the branch-to-endBB so
             // nullable widening can emit into this block after all arms are
             // seen (same discipline as lowerConditional — see Path A/B there).

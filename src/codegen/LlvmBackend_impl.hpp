@@ -180,6 +180,46 @@ inline std::int64_t parseCharLiteral(std::string_view text) {
     }
 }
 
+// fix #678 (narrowed) / §27.2: returns true when a lambda's expression body
+// is a call to a known void-returning BUILTIN INTRINSIC whose sema exprType
+// is null (never set to Kind::Unit by the typecheck pass).  Only these
+// intrinsic patterns need the explicit void-inference fallback in codegen;
+// user-defined void methods and extern void methods receive a Kind::Unit
+// exprType from sema, so lowerTypeRef already maps them to voidTy via the
+// `ctx_.exprType(*lam.exprBody) != null` branch.
+//
+// Covered patterns:
+//   Console.Write(v)     Console.WriteLine()    Console.WriteLine(v)
+//   Console.Error.Write  Console.Error.WriteLine
+//   Console.Out.Write    Console.Out.WriteLine
+//
+// Collection void mutators (Add, Sort, …) return a sentinel i32(0) from
+// their codegen path, so they do NOT produce `ret void` in an i32 function;
+// they don't need this fallback.
+inline bool isLambdaExprBodyVoidBuiltin(const ast::LambdaExpr& lam) {
+    if (!lam.exprBody) return false;
+    auto* ce = dynamic_cast<const ast::CallExpr*>(lam.exprBody.get());
+    if (!ce || !ce->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+    if (!ma || !ma->target) return false;
+    if (ma->member != "Write" && ma->member != "WriteLine") return false;
+    // Direct Console.Write/WriteLine — callee target is the bare identifier
+    // "Console".
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+        return id->name == "Console";
+    // Console.Error.Write/WriteLine  and  Console.Out.Write/WriteLine.
+    if (auto* inner =
+            dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
+        if ((inner->member == "Error" || inner->member == "Out") &&
+                inner->target) {
+            if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(
+                    inner->target.get()))
+                return id2->name == "Console";
+        }
+    }
+    return false;
+}
+
 // Per-module emitter. Holds the LLVM context/module/builder and lowers the
 // checked AST. Grows one expression/statement kind per codegen slice.
 class Emitter {
