@@ -81,7 +81,21 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 //     that carries an embedded TYPE_BLOCK for the nested type's full declaration.
 //     v3 readers reject v4 blobs. v4 readers reconstruct NestedTypeSymbol so
 //     that `new Outer.Inner()` resolves cross-module.
-inline constexpr std::uint32_t kSchemaVersion = 4;
+//
+// v5 (#662 foundation C): constructor/destructor bodies for imported generic
+// classes.
+//   - MetaMember::ctorBodyText (§14/§22.7): for a Constructor member belonging
+//     to a GENERIC class, the FULL constructor-declaration source text (from
+//     the constructor keyword through `end constructor;`). A second trailing
+//     REC_STRING in MEMBER_BLOCK after valueText. Empty for non-generic types
+//     (they cross the boundary via the external bz$T$ctor ABI) and for any
+//     constructor whose body could not be extracted (degenerate — no span).
+//     v4 readers tolerate the extra string by the finishBlock skip-unknown path.
+//   - MetaTypeDecl::dtorBodyText (§14/§28.3): for a GENERIC class whose
+//     destructor has a non-empty body, the FULL destructor-declaration source
+//     text. A trailing REC_STRING appended to TYPE_BLOCK after the members.
+//     v4 readers tolerate it via finishBlock.
+inline constexpr std::uint32_t kSchemaVersion = 5;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
@@ -233,6 +247,18 @@ struct MetaMember {
     // not render (the importer then falls back to no value, as before the fix).
     std::string valueText;            // §22.12 const value, textual
 
+    // §14 / §22.7 (#662 foundation C, schema v5): for a Constructor member
+    // belonging to a GENERIC class, the FULL constructor-declaration source text
+    // extracted from the exporter's source (span-based slice). Non-empty only
+    // when the class has generic parameters AND the constructor has a body that
+    // could be span-extracted. The importer re-parses this to obtain a live
+    // ast::ConstructorDecl, runs the minimal sema passes, and attaches it to the
+    // reconstructed ConstructorSymbol so the inline-ctor path (inlineCtorBody)
+    // can emit the body with genericSubst_ active (§14.1 monomorphization).
+    // Empty for non-generic types (they use the external bz$T$ctor ABI) and for
+    // any constructor whose body was absent or could not be extracted.
+    std::string ctorBodyText;         // §14/#662c: ctor source text for generics
+
     // Method / Constructor / Indexer:
     std::vector<MetaGenericParam> genericParams; // §14 (methods only)
     std::vector<MetaParam> params;
@@ -280,6 +306,16 @@ struct MetaTypeDecl {
     // importer can reconstruct TypeSymbol::hasPositionalFields, which the
     // §9.2 auto-equality check reads when there is no ast::TypeDecl.
     bool hasPositionalFields = false;
+
+    // §14 / §28.3 (#662 foundation C, schema v5): for a GENERIC class whose
+    // destructor has a user-written body, the FULL destructor-declaration source
+    // text extracted from the exporter's source (span-based slice). Non-empty
+    // only when the class has generic parameters AND the destructor body is
+    // non-empty AND span extraction succeeded. The importer re-parses this to
+    // obtain a live ast::DestructorDecl and attaches it to the reconstructed
+    // TypeSymbol's destructor slot so the §28.3 disposal path can run the body.
+    // Empty means "no user destructor body" (structural disposal still runs).
+    std::string dtorBodyText;         // §14/#662c: dtor source text for generics
 
     bool operator==(const MetaTypeDecl&) const;
 };

@@ -695,6 +695,13 @@ std::unique_ptr<ast::Type> Parser::parseType() {
 }
 
 std::unique_ptr<ast::Member> Parser::parseMember() {
+    // #662c: record the start offset of the member's first token (visibility
+    // keyword or modifier or `constructor`/`destructor`) so that the builder
+    // can extract source text for cross-module ctor/dtor body export.  The
+    // offset is stamped onto ConstructorDecl/DestructorDecl nodes before
+    // returning; all other member kinds leave their span at 0 (existing behaviour).
+    const SourceLocation memberStart = current_.location;
+
     // §13: most members declare their visibility explicitly. Destructors
     // (no visibility per A.4) and the static-constructor form are
     // exceptions, so we collect visibility optionally and validate per
@@ -992,11 +999,17 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         // Optional `constructor` label after `end` per §1.6 keyword-labelled
         // termination.
         if (isKeyword("constructor")) advance();
+        // #662c: capture end offset (the `;` + 1 byte) before consuming it so
+        // the builder can slice the full declaration text for cross-module export.
+        SourceLocation memberEnd = current_.location;
+        memberEnd.offset += static_cast<std::uint32_t>(current_.text.size());
         if (!consumePunctuator(";")) {
             diagnostics_.report(
                 Severity::Error, current_.location,
                 "expected ';' after 'end' of constructor");
         }
+        ctor->span.begin = memberStart;
+        ctor->span.end   = memberEnd;
         return std::unique_ptr<ast::Member>(ctor.release());
     }
     if (isKeyword("destructor")) {
@@ -1021,11 +1034,17 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                                 "expected 'end' to close destructor body");
         }
         if (isKeyword("destructor")) advance();
+        // #662c: stamp span for cross-module dtor-body export (same pattern as
+        // ctor above).
+        SourceLocation dtorEnd = current_.location;
+        dtorEnd.offset += static_cast<std::uint32_t>(current_.text.size());
         if (!consumePunctuator(";")) {
             diagnostics_.report(
                 Severity::Error, current_.location,
                 "expected ';' after 'end' of destructor");
         }
+        dtor->span.begin = memberStart;
+        dtor->span.end   = dtorEnd;
         return std::unique_ptr<ast::Member>(dtor.release());
     }
 

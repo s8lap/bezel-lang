@@ -2994,28 +2994,37 @@ void ExprTC::checkImportedNewExprArgs(
     // WITH an explicit constructor body remain gated: the ctor body is not carried
     // in the dependency's metadata (Foundation C / Blocker 3).
     if (!t->genericParams.empty()) {
-        // #662 foundation A: a class with NO explicit constructor uses the zero-
-        // arg implicit path — accept it and let codegen install the vtable.
+        // §14/#662 gate for imported generic CLASS construction.
+        // Foundation A: a class with NO explicit constructor → zero-arg implicit
+        //   path, vtable installed by buildImportedGenericVtable.
+        // Foundation C: a class WITH an explicit constructor whose body text was
+        //   exported and successfully re-parsed → cs->decl is set; the inline-ctor
+        //   codegen path (inlineCtorBody) emits the body with genericSubst_ active.
+        // Still-gated: explicit ctor present but cs->decl is null (body not loaded).
         bool noExplicitCtor = true;
+        const ConstructorSymbol* explicitCs = nullptr;
         for (const Symbol* m : t->members) {
             const auto* cs = dynamic_cast<const ConstructorSymbol*>(m);
-            if (cs && !cs->isStatic) { noExplicitCtor = false; break; }
+            if (cs && !cs->isStatic) {
+                noExplicitCtor = false;
+                if (!explicitCs) explicitCs = cs;
+                break;
+            }
         }
         if (noExplicitCtor && ne.args.empty()) {
-            // Accepted — fall through to the type-check below (no ctor args to
-            // validate since there are no params).
+            // Foundation A: no explicit ctor — fall through.
+        } else if (explicitCs && explicitCs->decl != nullptr) {
+            // Foundation C: ctor body was loaded — fall through to arg-check.
         } else {
-            // Still-gated shape: explicit ctor body needed.
+            // Still-gated shape: explicit ctor present but body not yet loaded.
             ctx_.diagnostics().report(
                 Severity::Error, ne.span.begin,
                 std::string("constructing an imported generic type (`new ") +
                     std::string(t->name) +
-                    "<...>`) is not yet supported: a generic type is "
-                    "monomorphized per-instantiation (\xC2\xA7""14) and its "
-                    "constructor body is not carried in the dependency's "
-                    "metadata, so it cannot be instantiated across a module "
-                    "boundary (\xC2\xA7""2.5); a zero-argument implicit-"
-                    "constructor generic class is accepted (#662 foundation A)");
+                    "<...>`) requires the constructor body to have been exported "
+                    "in the dependency's metadata (\xC2\xA7""14/#662 foundation C); "
+                    "a zero-argument implicit-constructor generic class is accepted "
+                    "(#662 foundation A)");
             return;
         }
     }

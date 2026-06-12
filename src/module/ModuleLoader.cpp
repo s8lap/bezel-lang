@@ -5,10 +5,17 @@
 #include <unordered_map>
 #include <vector>
 
+#include "lexer/Lexer.hpp"
+#include "module/ModuleMetadata.hpp"
 #include "module/ModuleMetadataBuilder.hpp"  // kMetadataSectionName
+#include "parser/Parser.hpp"
+#include "sema/ExprTypecheck.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
+#include "sema/SymbolCollection.hpp"
 #include "sema/TypeRef.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
 
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/ObjectFile.h"
@@ -421,6 +428,313 @@ struct Loader {
     std::unordered_map<const sema::MemberSymbol*, std::string> constValues_;
 };
 
+// --- §14/#662c: imported generic ctor/dtor body re-parsing ------------------
+//
+// For an imported generic CLASS whose ConstructorDecl source text was exported
+// (schema v5, `ctorBodyText`), re-parse the body in a fresh SemaContext, then
+// remap the fresh symbols to the already-reconstructed imported symbols so that
+// `ctx_.exprSymbol(e)` in the MAIN SemaContext returns the imported FieldSymbol
+// or ParameterSymbol — letting inlineCtorBody / implicitFieldAddr work with the
+// per-instantiation genericSubst_ active (§14.1 monomorphization).
+
+// Render a MetaType as Bezel source text for use in a synthetic class source.
+static std::string metaTypeToSourceText(const MetaType& mt) {
+    if (mt.kind == TypeKind::Primitive) {
+        switch (mt.primitive) {
+            case PrimitiveKind::Bool:    return "bool";
+            case PrimitiveKind::Char:    return "char";
+            case PrimitiveKind::String:  return "string";
+            case PrimitiveKind::Byte:    return "byte";
+            case PrimitiveKind::SByte:   return "sbyte";
+            case PrimitiveKind::Short:   return "short";
+            case PrimitiveKind::UShort:  return "ushort";
+            case PrimitiveKind::Int:     return "int";
+            case PrimitiveKind::UInt:    return "uint";
+            case PrimitiveKind::Long:    return "long";
+            case PrimitiveKind::ULong:   return "ulong";
+            case PrimitiveKind::Float:   return "float";
+            case PrimitiveKind::Double:  return "double";
+            case PrimitiveKind::Decimal: return "decimal";
+            case PrimitiveKind::Object:  return "Object";
+            default: return "int";
+        }
+    }
+    if (mt.kind == TypeKind::Named) {
+        std::string s = mt.namedName;
+        if (!mt.genericArgs.empty()) {
+            s += "<";
+            for (std::size_t i = 0; i < mt.genericArgs.size(); ++i) {
+                if (i) s += ", ";
+                s += metaTypeToSourceText(mt.genericArgs[i]);
+            }
+            s += ">";
+        }
+        if (mt.nullable) s += "?";
+        return s;
+    }
+    // Fallback for unsupported shapes (Function, InlineArray): use a placeholder.
+    return "Object";
+}
+
+// Render MetaVisibility as a Bezel visibility keyword.
+static std::string metaVisibilityToKeyword(MetaVisibility v) {
+    switch (v) {
+        case MetaVisibility::Public:    return "public";
+        case MetaVisibility::Private:   return "private";
+        case MetaVisibility::Protected: return "protected";
+        case MetaVisibility::Internal:  return "internal";
+        default:                        return "public";
+    }
+}
+
+// Build a synthetic Bezel source string for a mini class containing only the
+// imported fields and the given ctor body text.  Used to re-parse + sema-check
+// the ctor body with proper symbol bindings so its AST exprs are registered
+// in the fresh SemaContext.  Example output:
+//   module _662c_reparsed_;
+//   public class Box<T>
+//     private _slot : T;
+//     public constructor(v : T) _slot := v; end constructor;
+//   end Box;
+static std::string buildSyntheticClassSource(
+    const MetaTypeDecl& td, const std::string& ctorBodyText) {
+    std::string src = "module _662c_reparsed_;\n";
+    // Class header with visibility and generic params.
+    src += metaVisibilityToKeyword(td.visibility);
+    src += " class ";
+    src += td.name;
+    if (!td.genericParams.empty()) {
+        src += "<";
+        for (std::size_t i = 0; i < td.genericParams.size(); ++i) {
+            if (i) src += ", ";
+            // Variance prefix (in/out) if present.
+            if (!td.genericParams[i].variance.empty() &&
+                td.genericParams[i].variance != "none") {
+                src += td.genericParams[i].variance + " ";
+            }
+            src += td.genericParams[i].name;
+        }
+        src += ">";
+    }
+    src += "\n";
+    // Fields (needed so implicit field references resolve).
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Field) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
+    }
+    // The ctor body (verbatim from the exporter's span extraction).
+    src += "  " + ctorBodyText + "\n";
+    src += "end " + td.name + ";\n";
+    return src;
+}
+
+// Parse ctorBodyText for a constructor of an imported generic class, run the
+// three sema passes in a FRESH SemaContext, then walk the fresh exprSymbols to
+// build remapped entries in the MAIN context (mainCtx):
+//   fresh IdentifierExpr* → fresh FieldSymbol   →  mainCtx[same expr*] = importedFieldSym
+//   fresh IdentifierExpr* → fresh ParamSymbol   →  mainCtx[same expr*] = importedParamSym
+// Attaches the re-parsed ast::ConstructorDecl to `importedCs->decl` and keeps
+// the fresh SourceFile alive via mainCtx.ownImportedAst().
+// Returns false if parsing or sema failed (caller should leave decl=null).
+static bool parseAndAttachCtorBody(
+    const MetaTypeDecl& td,
+    const std::string& ctorBodyText,
+    sema::ConstructorSymbol* importedCs,
+    const sema::TypeSymbol& importedType,
+    sema::SemaContext& mainCtx) {
+    std::string source = buildSyntheticClassSource(td, ctorBodyText);
+
+    // Fresh diagnostics/lexer/parser for the mini class.
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(source, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf || freshDiag.hasErrors()) return false;
+
+    // Run the three sema passes in a fresh SemaContext.
+    DiagnosticEngine semaDiag;
+    sema::SemaContext freshCtx(semaDiag);
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag.hasErrors()) return false;
+    sema::resolveTypes(*sf, freshCtx);
+    if (semaDiag.hasErrors()) return false;
+    sema::typecheckExpressions(*sf, freshCtx);
+    // Note: sema may emit errors for unsupported constructs (e.g. `base(...)`
+    // chain on unknown base); tolerate those — we only need the exprSymbols.
+    // A hard parse failure is caught above; sema errors here are usually
+    // benign for the subset we're interested in (field assign + param refs).
+
+    // Locate the fresh TypeSymbol and ConstructorSymbol in the fresh module.
+    sema::TypeSymbol* freshType = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+            if (ts && std::string(ts->name) == td.name) {
+                freshType = ts;
+                break;
+            }
+        }
+    }
+    if (!freshType) return false;
+
+    sema::ConstructorSymbol* freshCs = nullptr;
+    for (sema::Symbol* m : freshType->members) {
+        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+        if (cs && !cs->isStatic) { freshCs = cs; break; }
+    }
+    if (!freshCs) return false;
+
+    // Locate the ast::ConstructorDecl — it is the `decl` pointer of freshCs.
+    auto* parsedCd = dynamic_cast<const ast::ConstructorDecl*>(freshCs->decl);
+    if (!parsedCd) return false;
+
+    // Build name→FieldSymbol map for the imported type so we can remap quickly.
+    std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+    for (sema::Symbol* m : importedType.members) {
+        if (dynamic_cast<sema::FieldSymbol*>(m) && !m->name.empty())
+            importedFields[m->name] = m;
+    }
+
+    // Build index→ParameterSymbol map for the imported ctor.
+    const std::vector<sema::Symbol*>& importedParams = importedCs->params;
+
+    // Walk fresh context's exprSymbols and remap into mainCtx.
+    for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+        if (!expr || !freshSym) continue;
+        if (auto* ff = dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+            // Field reference: find same-named field in importedType.
+            auto it = importedFields.find(freshSym->name);
+            if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // Param reference: find by position in freshCs.params.
+            for (std::size_t pi = 0; pi < freshCs->params.size(); ++pi) {
+                if (freshCs->params[pi] == freshSym &&
+                    pi < importedParams.size()) {
+                    mainCtx.setExprSymbol(expr, importedParams[pi]);
+                    break;
+                }
+            }
+        }
+        // Other symbols (TypeSymbol for type refs, etc.) are not remapped;
+        // they are not needed by inlineCtorBody / implicitFieldAddr.
+    }
+
+    // Attach the parsed ConstructorDecl and keep the AST alive.
+    // Keep the backing source string alive too: all string_view fields in the
+    // re-parsed AST (IdentifierExpr::name, AssignmentStmt::op, …) point into
+    // it — if it were destroyed on function return they would dangle.
+    importedCs->decl = parsedCd;
+    mainCtx.ownImportedSource(std::move(source));
+    mainCtx.ownImportedAst(std::move(sf));
+    return true;
+}
+
+// Similarly for the destructor body.
+static std::string buildSyntheticDtorSource(
+    const MetaTypeDecl& td, const std::string& dtorBodyText) {
+    // Reuse the class-source builder but replace the ctor slot with dtor text.
+    std::string src = "module _662c_reparsed_dtor_;\n";
+    src += metaVisibilityToKeyword(td.visibility);
+    src += " class ";
+    src += td.name;
+    if (!td.genericParams.empty()) {
+        src += "<";
+        for (std::size_t i = 0; i < td.genericParams.size(); ++i) {
+            if (i) src += ", ";
+            if (!td.genericParams[i].variance.empty() &&
+                td.genericParams[i].variance != "none")
+                src += td.genericParams[i].variance + " ";
+            src += td.genericParams[i].name;
+        }
+        src += ">";
+    }
+    src += "\n";
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Field) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
+    }
+    src += "  " + dtorBodyText + "\n";
+    src += "end " + td.name + ";\n";
+    return src;
+}
+
+static bool parseAndAttachDtorBody(
+    const MetaTypeDecl& td,
+    const std::string& dtorBodyText,
+    sema::TypeSymbol& importedType,
+    sema::SemaContext& mainCtx) {
+    std::string source = buildSyntheticDtorSource(td, dtorBodyText);
+
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(source, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf || freshDiag.hasErrors()) return false;
+
+    DiagnosticEngine semaDiag;
+    sema::SemaContext freshCtx(semaDiag);
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag.hasErrors()) return false;
+    sema::resolveTypes(*sf, freshCtx);
+    sema::typecheckExpressions(*sf, freshCtx);
+
+    // Locate fresh TypeSymbol.
+    sema::TypeSymbol* freshType = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+            if (ts && std::string(ts->name) == td.name) { freshType = ts; break; }
+        }
+    }
+    if (!freshType) return false;
+
+    // Locate fresh DestructorSymbol.
+    sema::DestructorSymbol* freshDs = nullptr;
+    for (sema::Symbol* m : freshType->members) {
+        if (auto* ds = dynamic_cast<sema::DestructorSymbol*>(m)) { freshDs = ds; break; }
+    }
+    if (!freshDs) return false;
+
+    auto* parsedDd = dynamic_cast<const ast::DestructorDecl*>(freshDs->decl);
+    if (!parsedDd) return false;
+
+    // Build field remap map.
+    std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+    for (sema::Symbol* m : importedType.members) {
+        if (dynamic_cast<sema::FieldSymbol*>(m) && !m->name.empty())
+            importedFields[m->name] = m;
+    }
+
+    // Remap exprSymbols.
+    for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+        if (!expr || !freshSym) continue;
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+            auto it = importedFields.find(freshSym->name);
+            if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        }
+    }
+
+    // Create a DestructorSymbol on the imported type and attach the parsed decl.
+    auto* importedDs = mainCtx.makeImportedSymbol<sema::DestructorSymbol>();
+    importedDs->name = mainCtx.internString("destructor");
+    importedDs->parent = &importedType;
+    importedDs->scope = mainCtx.newScope();
+    importedDs->decl = parsedDd;
+    importedType.members.push_back(importedDs);
+
+    // Keep the backing synthetic source string alive (string_view fields in the
+    // re-parsed AST point into it) and the SourceFile itself.
+    mainCtx.ownImportedSource(std::move(source));
+    mainCtx.ownImportedAst(std::move(sf));
+    return true;
+}
+
 }  // namespace
 
 bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
@@ -465,6 +779,44 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
                 t->members.push_back(m);
         }
         ctx.registerImportedType(md.moduleName, t);
+    }
+
+    // Pass 3 (§14/#662c, schema v5): for imported generic CLASSES, re-parse
+    // exported ctor/dtor body text and attach ast::ConstructorDecl /
+    // ast::DestructorDecl to the reconstructed symbols so inlineCtorBody can
+    // emit the body with the per-instantiation genericSubst_ active.
+    for (std::size_t i = 0; i < md.types.size(); ++i) {
+        const MetaTypeDecl& td = md.types[i];
+        sema::TypeSymbol* t = created[i];
+        // Only generic classes carry exported bodies.
+        if (t->kind != ast::TypeDeclKind::Class || td.genericParams.empty())
+            continue;
+
+        // Ctor bodies: find each Constructor member with non-empty ctorBodyText.
+        for (const MetaMember& mm : td.members) {
+            if (mm.kind != MetaMemberKind::Constructor || mm.ctorBodyText.empty())
+                continue;
+            // Locate the matching ConstructorSymbol in t->members.
+            sema::ConstructorSymbol* importedCs = nullptr;
+            for (sema::Symbol* m : t->members) {
+                auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+                if (!cs || cs->isStatic) continue;
+                // Match by params count (conservative; one explicit ctor is the
+                // common case and the most important for the ctor-body path).
+                if (cs->params.size() == mm.params.size()) {
+                    importedCs = cs;
+                    break;
+                }
+            }
+            if (importedCs) {
+                parseAndAttachCtorBody(td, mm.ctorBodyText, importedCs, *t, ctx);
+            }
+        }
+
+        // Dtor body: the dtorBodyText is on the MetaTypeDecl itself.
+        if (!td.dtorBodyText.empty()) {
+            parseAndAttachDtorBody(td, td.dtorBodyText, *t, ctx);
+        }
     }
 
     // Publish the loader's member-type side tables into the SemaContext so the

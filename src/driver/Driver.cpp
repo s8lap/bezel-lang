@@ -157,7 +157,9 @@ CompileResult Driver::compileFile(const std::string& path,
             // resolution (§2.5) can read this module's interface without its
             // sources. Single call into the builder/emit helper (#328 inc 2).
             if (module) {
-                bezel::module::embedModuleMetadata(*module, semaCtx);
+                // §14 / #662c: pass `source` so ctor/dtor bodies for generic
+                // classes are span-extracted into the metadata (Foundation C).
+                bezel::module::embedModuleMetadata(*module, semaCtx, source);
             }
             std::string objectPath = outputPath + ".o";
             std::string err;
@@ -244,7 +246,8 @@ CompileResult Driver::compileObject(const std::string& path,
             auto module = codegen::emitModule(*unit, semaCtx, llvmCtx);
             // §2.6 step 4: embed the public-interface metadata so an importer's
             // loader can read this object's interface (issue #328 inc 1/2/3).
-            if (module) bezel::module::embedModuleMetadata(*module, semaCtx);
+            // §14 / #662c: pass `source` for ctor/dtor body export.
+            if (module) bezel::module::embedModuleMetadata(*module, semaCtx, source);
             std::string err;
             if (!module || !codegen::emitObjectFile(*module, objectPath, err)) {
                 // Print codegen diagnostics (e.g. "not yet implemented") before
