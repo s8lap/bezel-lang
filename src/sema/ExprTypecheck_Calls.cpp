@@ -2815,34 +2815,44 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
 void ExprTC::checkImportedNewExprArgs(
     const ast::NewExpr& ne, TypeSymbol* t,
     const std::vector<ConstructorSymbol*>& ctors) {
-    // §14.1 / §2.5 / §2.6 (issue #328 FINDING [2]; #428): constructing an
-    // IMPORTED GENERIC type is not yet supported. Generics are monomorphized
-    // per-instantiation (§14), so a generic template exports NO stable
-    // `bz$<Type>$init`/`$ctor` symbol the importer could link against; the
-    // importer would have to monomorphize the generic at each
-    // `new ImportedGeneric<Args>(...)` use site exactly as it does a LOCAL
-    // `new T<Args>(...)`. Sound construction needs importer-side per-instantiation
-    // infrastructure that does not yet exist for imports — a generic CLASS always
-    // carries a §28.3 disposal obligation dispatched through a vtable the importer
-    // would have to emit locally; a generic RECORD needs per-instantiation
-    // record-struct specialization (absent even single-module, so a non-`int`
-    // field would silently miscompile). Both are larger features, deferred to a
-    // follow-up (see #428). Reject the construction here with an honest diagnostic
-    // instead of letting codegen emit a dangling external `bz$<Type>$init`
-    // reference (a cryptic link error). (Imported generic STATIC METHODS and LOCAL
-    // generic instantiation are unaffected — only imported generic-type `new`.)
-    // The generic-RECORD case is gated separately at the NewExpr typecheck, since
-    // records are not routed through this constructor check.
+    // §14.1 / §2.5 / §2.6 (issue #328 FINDING [2]; #428 / #662 foundation A):
+    // constructing an IMPORTED GENERIC type requires importer-side
+    // per-instantiation infrastructure (vtable + disposer). Foundation A (#662)
+    // delivers that machinery for the ZERO-EXPLICIT-CONSTRUCTOR subset:
+    //   — no explicit constructor in the class body (implicit default zero-arg
+    //     construction; the spec §22.7 implicit constructor)
+    //   — no field initializers (calloc zero-initializes fields; the importer
+    //     cannot run field initializer expressions from the exporter's AST)
+    // For this subset, `lowerNew` calls buildImportedGenericVtable to install the
+    // per-instantiation vtable (with specialized Dispose) and returns the calloced
+    // object with zero-initialized fields and the correct vtable pointer.  Classes
+    // WITH an explicit constructor body remain gated: the ctor body is not carried
+    // in the dependency's metadata (Foundation C / Blocker 3).
     if (!t->genericParams.empty()) {
-        ctx_.diagnostics().report(
-            Severity::Error, ne.span.begin,
-            std::string("constructing an imported generic type (`new ") +
-                std::string(t->name) +
-                "<...>`) is not yet supported: a generic type is monomorphized "
-                "per-instantiation (\xC2\xA7""14) and its body is not carried in "
-                "the dependency's metadata, so it cannot be instantiated across "
-                "a module boundary (\xC2\xA7""2.5)");
-        return;
+        // #662 foundation A: a class with NO explicit constructor uses the zero-
+        // arg implicit path — accept it and let codegen install the vtable.
+        bool noExplicitCtor = true;
+        for (const Symbol* m : t->members) {
+            const auto* cs = dynamic_cast<const ConstructorSymbol*>(m);
+            if (cs && !cs->isStatic) { noExplicitCtor = false; break; }
+        }
+        if (noExplicitCtor && ne.args.empty()) {
+            // Accepted — fall through to the type-check below (no ctor args to
+            // validate since there are no params).
+        } else {
+            // Still-gated shape: explicit ctor body needed.
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                std::string("constructing an imported generic type (`new ") +
+                    std::string(t->name) +
+                    "<...>`) is not yet supported: a generic type is "
+                    "monomorphized per-instantiation (\xC2\xA7""14) and its "
+                    "constructor body is not carried in the dependency's "
+                    "metadata, so it cannot be instantiated across a module "
+                    "boundary (\xC2\xA7""2.5); a zero-argument implicit-"
+                    "constructor generic class is accepted (#662 foundation A)");
+            return;
+        }
     }
     if (ctors.empty()) {
         // §22.7: no declared ctor → implicit default takes zero arguments.

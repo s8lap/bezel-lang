@@ -2484,6 +2484,23 @@ private:
     llvm::Function* emitSpecializedDisposer(const sema::TypeSymbol* ts,
                                             const std::string& suffix);
 
+    // §28.5 / §14.1 / §2.5 (#662 foundation A): build (and cache) the
+    // complete per-instantiation vtable for an IMPORTED generic class, using
+    // the currently active `genericSubst_`.  Unlike `specializedVtableFor`
+    // (which patches an existing shared vtable), this builds a fresh vtable
+    // from scratch because the exporter emits NO shared `vt$<Type>` for a
+    // generic template (§2.5: only public non-generic types export their
+    // vtable).  The vtable carries:
+    //   [0] per-instantiation descriptor (td$<Type>$specN — [self, null])
+    //   [1] empty itmap (imported generics implement no interfaces here)
+    //   [2] specialized Dispose (emitSpecializedDisposer, honoring owned T)
+    //   [3] ToString thunk (type-name default or user override if in metadata)
+    //   [4+] virtual method slots from methodFns_ where bodies exist
+    // disposerCoreFns_[ts] is also populated (blocker-4 residue from B).
+    // Cached in specializedVtables_[ts][specFieldTys].  Returns null if
+    // something critical is missing (ts not a class, no active subst).
+    llvm::GlobalVariable* buildImportedGenericVtable(const sema::TypeSymbol* ts);
+
     // specializedVtables_[ts][substituted field types] = cached per-
     // instantiation vtable global (slot 1 = specialized Dispose). Keyed by the
     // same field-type vector as specializedStructs_ so distinct instantiations

@@ -2247,6 +2247,132 @@ llvm::Function* Emitter::emitSpecializedDisposer(const sema::TypeSymbol* ts,
 }
 
 
+// §28.5 / §14.1 / §2.5 (#662 foundation A): build (or return the cached)
+// per-instantiation vtable for an IMPORTED generic class using the currently
+// active genericSubst_.  Unlike specializedVtableFor (which patches an
+// existing shared `vt$<T>`), this builds a FRESH vtable from scratch because
+// the exporter emits NO shared `vt$<T>` for a generic class (§2.5: only
+// public non-generic types export their vtable).
+//
+// Layout (matches declareVtables Pass D):
+//   [0] per-instantiation descriptor  (td$<Type>$specN  = [self, null])
+//   [1] per-instantiation itmap       (null-terminated, no interfaces yet)
+//   [2] specialized Dispose           (via emitSpecializedDisposer)
+//   [3] ToString thunk                (type-name default or methodFns_ entry)
+//   [4+] virtual method slots         (methodFns_ entries where bodies exist)
+//
+// Also populates disposerCoreFns_[ts] (blocker-4 residue from foundation B:
+// emitBaseDisposeChain needs the core fn for any derived class that inherits
+// this imported generic base).
+//
+// Cached in specializedVtables_[ts][specFieldTys] so Box<int> and Box<string>
+// get distinct vtables.
+llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
+    const sema::TypeSymbol* ts) {
+    if (!ts || ts->kind != ast::TypeDeclKind::Class) return nullptr;
+    if (genericSubst_.empty()) return nullptr;
+
+    // Cache key: same spec-field-types vector as specializedStructs_ /
+    // specializedVtables_ so each concrete instantiation gets exactly one vtable.
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(ts, storage);
+    std::vector<llvm::Type*> specFieldTys;
+    specFieldTys.push_back(ptrTy());           // [0] vtable ptr
+    if (hasBuiltinExceptionBase(ts))
+        specFieldTys.push_back(ptrTy());       // [1] message ptr (rare for generics)
+    specFieldTys.push_back(disposedFlagTy());  // [1 or 2] disposed flag
+    for (const sema::Symbol* m : storage)
+        specFieldTys.push_back(storageType(m));
+
+    auto& specMap = specializedVtables_[ts];
+    auto sit = specMap.find(specFieldTys);
+    if (sit != specMap.end()) return sit->second;
+
+    // Suffix for de-duplicating names (Box$spec0, Box$spec1, …).
+    std::string suffix = "$spec" + std::to_string(specMap.size());
+    std::string tsName = std::string(ts->name);
+
+    // --- (a) Per-instantiation descriptor: [self, null] ---
+    // A minimal descriptor that lets emitIsA / type tests recognize the object.
+    // We use a 2-element array [selfDesc, null] (no base entries — the imported
+    // generic class has no known base TypeSymbol here; Foundation C can extend
+    // this when base-chain information is available cross-module).
+    auto* descArrTy = llvm::ArrayType::get(ptrTy(), 2);
+    auto* descGV = new llvm::GlobalVariable(
+        *module_, descArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, /*init=*/nullptr,
+        "td$" + tsName + suffix);
+    // Self-referential initializer: [self, null].
+    std::vector<llvm::Constant*> descElems = {
+        llvm::cast<llvm::Constant>(descGV),
+        llvm::ConstantPointerNull::get(ptrTy()),
+    };
+    descGV->setInitializer(
+        llvm::ConstantArray::get(descArrTy, descElems));
+
+    // --- (b) Per-instantiation itmap: [null] (no interfaces) ---
+    auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), 1);
+    auto* itmapGV = new llvm::GlobalVariable(
+        *module_, itmapArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(itmapArrTy,
+                                 {llvm::ConstantPointerNull::get(ptrTy())}),
+        "itmap$" + tsName + suffix);
+
+    // --- (c) Specialized disposer ---
+    // emitSpecializedDisposer builds BOTH the public Dispose (run-once flag
+    // guard) AND the DisposeCore (destructor body + owned-field disposal +
+    // base chain) with genericSubst_ active, so owned T fields are classified
+    // by their concrete substituted type.
+    llvm::Function* specDispose = emitSpecializedDisposer(ts, suffix);
+
+    // Blocker-4 residue from foundation B: emitBaseDisposeChain looks up
+    // disposerCoreFns_[base].  If `ts` is used as a base by a local class,
+    // this population makes the chain work. The core fn is the second function
+    // created by emitSpecializedDisposer (named bz$<T>$DisposeCore<suffix>).
+    // We reach it by walking the module's function list — or, more robustly,
+    // by looking it up by name.
+    {
+        std::string coreName = "bz$" + tsName + "$DisposeCore" + suffix;
+        if (llvm::Function* coreFn = module_->getFunction(coreName))
+            if (!disposerCoreFns_.count(ts))
+                disposerCoreFns_[ts] = coreFn;
+    }
+
+    // --- (d) Virtual method slots (from methodFns_ for any imported methods
+    //         that were resolved and stored by declareImportedFunctions) ---
+    const auto& slots = vtableMethods_[ts];  // filled by declareVtables Pass A
+    std::vector<llvm::Constant*> elems(
+        kToStringSlot + 1 + slots.size(),
+        llvm::ConstantPointerNull::get(ptrTy()));
+    elems[0] = llvm::cast<llvm::Constant>(descGV);
+    elems[1] = llvm::ConstantExpr::getPointerCast(itmapGV, ptrTy());
+    elems[2] = llvm::cast<llvm::Constant>(specDispose);
+    elems[kToStringSlot] = classToStringThunk(ts);
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        const VSlot& vs = slots[i];
+        if (vs.method) {
+            auto mit = methodFns_.find(vs.method);
+            if (mit != methodFns_.end())
+                elems[kToStringSlot + 1 + i] =
+                    llvm::cast<llvm::Constant>(mit->second);
+        }
+        // Property accessor slots for imported generics: not yet supported
+        // (their bodies are also in the exporter) — slots stay null.
+    }
+
+    auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
+    auto* init  = llvm::ConstantArray::get(arrTy, elems);
+    auto* gv = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, init,
+        "vt$" + tsName + suffix);
+    allVtables_.push_back(gv);  // §8.6 #417: string discriminator
+    specMap[specFieldTys] = gv;
+    return gv;
+}
+
+
 // §28.5: the per-instantiation vtable to install in a freshly-constructed
 // instance of the active monomorphization of `ts`, in place of the shared
 // `vt$<T>`. Identical to the shared vtable except slot 2 (Dispose) is a
@@ -3230,6 +3356,21 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
     // substituted type, §28.4 step 2 / §28.5). specializedVtableFor falls back
     // to the shared vtable when no specialization is needed. genericSubst_ is
     // active here when called from lowerNew for a generic instantiation.
+    //
+    // §14.1 / §2.5 (#662 foundation A): for an IMPORTED generic class the
+    // exporter emits no shared vt$<T>, so specializedVtableFor returns null
+    // (vtableOf finds nothing). Call buildImportedGenericVtable instead, which
+    // builds the per-instantiation vtable from scratch (descriptor + itmap +
+    // specialized disposer + virtual slots). The result is cached in
+    // specializedVtables_ so repeated `new Box<int>()` sites share one vtable.
+    if (ctx_.isImported(t) && !t->genericParams.empty() &&
+        !genericSubst_.empty()) {
+        if (llvm::GlobalVariable* vt = buildImportedGenericVtable(t))
+            builder_.CreateStore(vt, builder_.CreateStructGEP(st, obj, 0));
+        // Imported generic fields have no AST initializers — calloc already
+        // zeroed them.  No field-init loop is needed.
+        return;
+    }
     if (llvm::GlobalVariable* vt = specializedVtableFor(t)) {
         builder_.CreateStore(vt, builder_.CreateStructGEP(st, obj, 0));
     }
