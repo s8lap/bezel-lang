@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.136 — June 2026**
+**Companion to the Bezel Language Specification, v0.137 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6687,6 +6687,45 @@ None. Amendments 1–2 specify previously-unspecified surface; 3–5 codify the 
 #### Editorial note
 
 The `linkify_refs.py` toolchain was not re-run; edits are localized and all new cross-references were verified against existing anchors (`sec-guards`, `sec-throw`, `sec-dictionaryk-v`, `sec-sett-and-ownedsett`).
+
+---
+
+### v0.137 changelog (v0.136 → v0.137)
+
+Two small rulings, both settling questions the implementation surfaced (#670, #655).
+
+#### Amendment 1 — `Decimal.Parse` rejects surrounding whitespace (stdlib §9.3; closes #670)
+
+§9.3 was silent; the implementation rejected. Now specified: optional sign, digits, at most one
+`.`, **no surrounding whitespace** (`FormatException`), out-of-range → `OverflowException`,
+`TryParse` returns `false` wherever `Parse` raises. *Declined: leading/trailing trim* — the
+strict-fault model adopted for `Encoding` in v0.136 applies for the same reason: silently
+tolerated padding hides upstream data problems, and an explicit `Trim()` is one call.
+
+#### Amendment 2 — `await` is a compile error inside an async iterator's `finally` (spec §30.7; settles #655)
+
+When a consumer abandons iteration, pending `finally` blocks run synchronously inside
+`Dispose` (§29.7) — no async driver exists at that point, so a suspension there has nowhere
+to resume. The implementation's observed behavior (continuation silently discarded, #655) was
+a bug, not a semantic. *Declined: an async disposal driver (DisposeAsync-style protocol)* —
+it adds a second disposal contract to §28 for one construct; revisit only if real programs
+need awaited cleanup that cannot hoist before the first `yield`. *Declined: defined
+"continuation discarded" semantics* — silent partial execution of cleanup code is the exact
+failure mode the defined-fault philosophy exists to prevent. The rule mirrors v0.136's
+catch-guard ruling: positions evaluated during synchronous unwinding or dispatch are
+synchronous. Ordinary `async` methods are unaffected (§30.9).
+
+#### Touched
+
+- **Spec §30.7** — the `await`-in-`finally` paragraph (cross-refs §29.6, §29.7, §30.9).
+- **Stdlib §9.3** — the `Parse`/`TryParse` semantics paragraph.
+- **Rationale** — this changelog entry.
+
+#### Migration
+
+Programs that awaited inside an async iterator's `finally` were already broken (silently
+skipped cleanup on early disposal); they now fail to compile with a remedy in the message.
+No other program changes meaning.
 
 ---
 

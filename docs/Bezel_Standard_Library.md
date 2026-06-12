@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.136 — June 2026**
+**Companion to the Bezel Language Specification, v0.137 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3468,6 +3468,8 @@ public record Decimal: IComparable<decimal>, IEquatable<decimal>
   public method Round(digits: int): decimal;
 end Decimal;
 ```
+
+`Parse` accepts an optional leading sign (`+`/`-`) followed by decimal digits with at most one `.`; **surrounding whitespace is not accepted** and raises `FormatException` (specified in v0.137 — the strict-fault model of `Encoding` ([§3.2](#sec-encoding)) applies: silent tolerance hides data problems; a caller that means to accept padded input trims explicitly). A value outside the representable range raises `OverflowException`. `TryParse` returns `false` in every case where `Parse` would raise.
 
 <a id="sec-boolean"></a>
 ### 9.4 `Boolean`
