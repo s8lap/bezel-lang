@@ -591,6 +591,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                          tt->astNode && tt->astNode->name &&
                          !tt->astNode->name->parts.empty()) {
                     std::string_view cn = tt->astNode->name->parts[0];
+                    // issue #545: Buffer<T>[i] → T (genericArgs[0]).
+                    if (cn == "Buffer" && !tt->genericArgs.empty() &&
+                        tt->genericArgs[0]) {
+                        ctx_.setExprType(&e, tt->genericArgs[0]);
+                    }
                     bool isArrLike =
                         cn == "Array" || cn == "OwnedArray" ||
                         // issue #401: list interfaces are array-backed; their
@@ -990,6 +995,39 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             "T is not eligible. For bool, char, IntPtr, or UIntPtr "
                             "atomics, use Atomic<T> and CompareExchange directly. "
                             "(stdlib \xC2\xA7""6.4, #647)");
+                    }
+                }
+                // issue #545: `new Buffer<T>(n)` — T-restriction check.
+                // Buffer<T> requires T to be a value-type primitive in this revision:
+                // {bool, char, byte, sbyte, short, ushort, int, uint, long, ulong,
+                //  float, double, decimal}.  Class, record, string, and interface
+                // elements re-open the §5.20 borrow-storing / zeroed-slot-disposal
+                // questions; they are explicitly out of scope for this slice.
+                // Diagnostic: "Buffer<T> requires a value-type element in this
+                // revision; class elements await the §5.20 design (#545)."
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->astNode->name->parts[0] == "Buffer") {
+                    bool tOk = false;
+                    if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
+                        const TypeRef* ta = rt->genericArgs[0];
+                        // Accept only primitive value types.
+                        tOk = (ta->kind == TypeRef::Kind::Primitive);
+                        // string is PrimitiveType::String — REJECT (runtime-managed).
+                        if (tOk && ta->primitive == sema::PrimitiveType::String)
+                            tOk = false;
+                    } else {
+                        // No type arg — arity error reported elsewhere; suppress
+                        // the redundant restriction diagnostic.
+                        tOk = true;
+                    }
+                    if (!tOk) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ne->span.begin,
+                            "Buffer<T> requires a value-type element in this "
+                            "revision; class elements await the \xC2\xA7""5.20 "
+                            "design (#545)");
                     }
                 }
                 // §2.15 / issue #631: `new BinaryDeserializer(arg)` requires

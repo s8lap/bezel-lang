@@ -1545,6 +1545,37 @@ uint64_t bz_atomic_compare_exchange(void* atom, uint64_t expected,
 uint64_t bz_atomic_add(void* atom, int64_t delta, int signed_,
                        int cell_size, void* ove_vtable);
 
+// ---------------------------------------------------------------------------
+// Buffer<T> — fixed-capacity compiler-intrinsic primitive (issue #545).
+//
+// Used as the low-level backing store for self-hosted collections.
+// Value-type elements only (this revision): int/byte/short/long/double/
+// decimal/char/bool.  Class-element Buffer is the §5.20 design pass (#545).
+//
+// Layout: 16-byte header {int64 len, int64 elem_size} + inline calloc'd payload.
+//   len:       number of elements (fixed at construction).
+//   elem_size: size of one element in bytes.
+//
+// bz_buffer_new(len, elem_size)  — calloc a zero-initialised Buffer<T>.
+//   Returns a pointer to the 16-byte header; payload immediately follows.
+// bz_buffer_get_ptr(buf, idx)    — return a pointer to element [idx] in the
+//   payload.  NO bounds check (caller emits §16 bounds check before calling).
+// bz_buffer_free(buf)            — free the buffer (header + inline payload).
+//   Idempotent (null-safe); plain free — value elements have no disposal.
+// ---------------------------------------------------------------------------
+
+// Allocate a zero-initialised Buffer<T> for `len` elements of `elem_size` bytes.
+// Calls calloc so every slot starts as zero-bytes (type zero value).
+void* bz_buffer_new(int64_t len, int64_t elem_size);
+
+// Return a pointer to the element at index `idx` inside the buffer payload.
+// The caller is responsible for bounds-checking idx before calling this.
+void* bz_buffer_get_ptr(void* buf, int64_t idx);
+
+// Free the buffer.  Null-safe (no-op on null).  Plain free — value elements
+// carry no ownership, so no per-element disposal is performed.
+void  bz_buffer_free(void* buf);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

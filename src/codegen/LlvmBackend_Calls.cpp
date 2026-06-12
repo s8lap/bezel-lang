@@ -7969,6 +7969,30 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         return nullptr;
                     }
                 }
+                // issue #545: Buffer<T>.Dispose() — free via bz_buffer_free.
+                // bz_buffer_free is null-safe (no-op on null); value elements carry
+                // no ownership obligation so no per-element callback is needed.
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        builtinTypeName(recvTy) == "Buffer") {
+                        llvm::Value* buf = lowerExpr(*ma->target);
+                        if (buf && buf->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_buffer_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {buf});
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
                 // §8.1 / issue #646: Stopwatch.Dispose() — free the bz_stopwatch_t
                 // heap object via bz_stopwatch_free.  Called by `using var` scope
                 // exit (§28.2 exactly-once rule).

@@ -93,6 +93,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // Both are generic compiler-intrinsic classes; T is restricted by the compiler
     // (see ExprTypecheck_Exprs.cpp).
     if (n == "Atomic" || n == "AtomicInteger") return 1;
+    // issue #545: Buffer<T> — fixed-capacity compiler-intrinsic primitive (arity 1).
+    // T restricted to value-type primitives (int/byte/short/long/double/decimal/
+    // char/bool) in this revision; class-element Buffer is the §5.20 design pass.
+    if (n == "Buffer") return 1;
     // §6.2 / issue #647: Mutex and Lock — synchronization primitives.
     // Mutex has a public constructor(). Lock has NO public constructor (obtained
     // only from Mutex.Acquire / TryAcquire); both are nullary class types.

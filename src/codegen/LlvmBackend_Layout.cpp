@@ -457,7 +457,12 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
                     // heap-pointer builtins (bz_atomic_t*).  Same ptrTy treatment as
                     // Mutex/Semaphore so lowerTypeRef returns ptrTy() not i32.
-                    n == "Atomic" || n == "AtomicInteger") {
+                    n == "Atomic" || n == "AtomicInteger" ||
+                    // issue #545: Buffer<T> is a compiler-known heap-pointer builtin
+                    // (bz_buffer_hdr_t* with inline payload).  Without this entry
+                    // lowerTypeRef would fall through to the i32 default → GEP /
+                    // load type mismatches at every Buffer<T> use site.
+                    n == "Buffer") {
                     return ptrTy();
                 }
             }
@@ -529,7 +534,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §6.3 / #647: imported Semaphore / SemaphoreToken.
                     n == "Semaphore" || n == "SemaphoreToken" ||
                     // §6.4 / #647: imported Atomic<T> and AtomicInteger<T>.
-                    n == "Atomic" || n == "AtomicInteger") {
+                    n == "Atomic" || n == "AtomicInteger" ||
+                    // issue #545: imported Buffer<T> (bz_buffer_hdr_t*).
+                    n == "Buffer") {
                     return ptrTy();
                 }
             }
