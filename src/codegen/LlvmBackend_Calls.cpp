@@ -364,6 +364,10 @@ std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
         if (rt->astNode && rt->astNode->name &&
             !rt->astNode->name->parts.empty())
             return rt->astNode->name->parts[0];
+        // #662 foundation B: for IMPORTED fields the TypeRef has no astNode;
+        // the loader stores the raw type name in importedName when lookupNamed
+        // returns null (see ModuleLoader.cpp convert(), §2.5).
+        if (!rt->importedName.empty()) return rt->importedName;
         return {};
     }
     // builtinClassSym — non-null declaration, null decl (no user TypeDecl).
@@ -375,9 +379,8 @@ std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
 bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
-    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
-        return false;
-    auto n = rt->astNode->name->parts[0];
+    std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
+    if (n.empty()) return false;
     // per §4.6/§4.7: LinkedList/OwnedLinkedList are NOT array-backed — they
     // use bz_llist_t. Exclude them here so they route through their own
     // tryLowerLinkedListInstanceCall handler rather than the bz_array_* paths.
@@ -394,9 +397,8 @@ bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
 bool Emitter::isLinkedListTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
-    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
-        return false;
-    auto n = rt->astNode->name->parts[0];
+    std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
+    if (n.empty()) return false;
     return n == "LinkedList" || n == "OwnedLinkedList";
 }
 
@@ -404,9 +406,8 @@ bool Emitter::isLinkedListTypeName(const sema::TypeRef* rt) {
 bool Emitter::isDictTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
-    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
-        return false;
-    auto n = rt->astNode->name->parts[0];
+    std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
+    if (n.empty()) return false;
     return n == "Dictionary" || n == "OwnedDictionary";
 }
 
