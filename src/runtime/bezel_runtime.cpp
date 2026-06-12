@@ -1862,6 +1862,62 @@ extern "C" double bz_decimal_to_double(const bz_decimal_t* a) {
     return dec_sign(a) ? -result : result;
 }
 
+// Conversion to int64 (explicit per §5.2).
+// §5.2: truncates toward zero; raises OverflowException when the truncated
+// integer value does not fit in int64.
+extern "C" int64_t bz_decimal_to_int64(const bz_decimal_t* a, void* ove_vtable) {
+    // Compute |mantissa| / 10^scale (truncation toward zero).
+    __uint128_t m = dec_mantissa(a);
+    uint32_t s = dec_scale(a);
+    // Divide mantissa by 10^scale.
+    static const __uint128_t pow10_128[29] = {
+        (uint64_t)1, (uint64_t)10, (uint64_t)100, (uint64_t)1000,
+        (uint64_t)10000, (uint64_t)100000, (uint64_t)1000000,
+        (uint64_t)10000000, (uint64_t)100000000, (uint64_t)1000000000,
+        (uint64_t)10000000000ULL, (uint64_t)100000000000ULL,
+        (uint64_t)1000000000000ULL, (uint64_t)10000000000000ULL,
+        (uint64_t)100000000000000ULL, (uint64_t)1000000000000000ULL,
+        (uint64_t)10000000000000000ULL, (uint64_t)100000000000000000ULL,
+        (uint64_t)1000000000000000000ULL,
+        (__uint128_t)10000000000000000000ULL,
+        (__uint128_t)10000000000000000000ULL * 10,
+        (__uint128_t)10000000000000000000ULL * 100,
+        (__uint128_t)10000000000000000000ULL * 1000,
+        (__uint128_t)10000000000000000000ULL * 10000,
+        (__uint128_t)10000000000000000000ULL * 100000,
+        (__uint128_t)10000000000000000000ULL * 1000000,
+        (__uint128_t)10000000000000000000ULL * 10000000,
+        (__uint128_t)10000000000000000000ULL * 100000000,
+        (__uint128_t)10000000000000000000ULL * 1000000000,
+    };
+    if (s >= 29) {
+        // Any decimal with scale >= 29 has integer part = 0.
+        return 0;
+    }
+    __uint128_t trunc = m / pow10_128[s];
+    // Overflow check: truncated value must fit in int64.
+    if (trunc > (__uint128_t)(uint64_t)INT64_MAX) {
+        bz_set_exc(ove_vtable);
+        return 0;
+    }
+    int64_t v = (int64_t)trunc;
+    return dec_sign(a) ? -v : v;
+}
+
+// Conversion to int32 (explicit per §5.2).
+// §5.2: truncates toward zero; raises OverflowException when the truncated
+// value is outside int32 range.
+extern "C" int32_t bz_decimal_to_int32(const bz_decimal_t* a, void* ove_vtable) {
+    int64_t v = bz_decimal_to_int64(a, ove_vtable);
+    if (bz_exc) return 0;  // OverflowException already set by to_int64
+    // Narrowing check: value must fit in int32.
+    if (v < (int64_t)INT32_MIN || v > (int64_t)INT32_MAX) {
+        bz_set_exc(ove_vtable);
+        return 0;
+    }
+    return (int32_t)v;
+}
+
 // Parse from C string (null-terminated).
 // per fix #521 / §6.4: FormatException (malformed) stored via fe_vtable;
 // OverflowException (out-of-range) stored via ove_vtable.  Either may be

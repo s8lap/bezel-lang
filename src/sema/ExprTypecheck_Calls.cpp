@@ -1023,13 +1023,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     TypeRef* srcElem = recvTy->genericArgs[0];
                     if (m == "Any" || m == "All")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
-                    else if (m == "Count" || m == "Sum" || m == "Min" || m == "Max")
+                    else if (m == "Count")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
-                    // stdlib §5/§5.1: Average returns double (the int/long/double
-                    // selector overloads and the per-type no-selector form all
-                    // produce double; decimal is the lone exception, not modeled).
-                    else if (m == "Average")
-                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                    // fix #666 / stdlib §5/§5.1: Sum/Min/Max/Average on a lazy
+                    // IEnumerable<decimal> return decimal, not int/double.
+                    else if (m == "Sum" || m == "Min" || m == "Max") {
+                        bool elemIsDecimal =
+                            srcElem &&
+                            srcElem->kind == TypeRef::Kind::Primitive &&
+                            srcElem->primitive == P::Decimal;
+                        if (!elemIsDecimal && !ce.args.empty() &&
+                            ce.args[0].value) {
+                            if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                if (lt->kind == TypeRef::Kind::Function &&
+                                    lt->funcReturn &&
+                                    lt->funcReturn->kind == TypeRef::Kind::Primitive &&
+                                    lt->funcReturn->primitive == P::Decimal)
+                                    elemIsDecimal = true;
+                        }
+                        ctx_.setExprType(&ce,
+                            elemIsDecimal
+                                ? ctx_.primitiveTypeRef(P::Decimal)
+                                : ctx_.primitiveTypeRef(P::Int));
+                    }
+                    // stdlib §5/§5.1: Average → double (int/long/double forms)
+                    // or → decimal for IEnumerable<decimal>.
+                    else if (m == "Average") {
+                        bool elemIsDecimal =
+                            srcElem &&
+                            srcElem->kind == TypeRef::Kind::Primitive &&
+                            srcElem->primitive == P::Decimal;
+                        if (!elemIsDecimal && !ce.args.empty() &&
+                            ce.args[0].value) {
+                            if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                if (lt->kind == TypeRef::Kind::Function &&
+                                    lt->funcReturn &&
+                                    lt->funcReturn->kind == TypeRef::Kind::Primitive &&
+                                    lt->funcReturn->primitive == P::Decimal)
+                                    elemIsDecimal = true;
+                        }
+                        ctx_.setExprType(&ce,
+                            elemIsDecimal
+                                ? ctx_.primitiveTypeRef(P::Decimal)
+                                : ctx_.primitiveTypeRef(P::Double));
+                    }
                     // stdlib §5 Aggregation: Aggregate(seed, fold) returns the
                     // accumulator type TAccum — the static type of the seed arg.
                     else if (m == "Aggregate" && !ce.args.empty() && ce.args[0].value) {
@@ -1164,11 +1201,58 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "Count" && !ce.args.empty())
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
-                        else if (m == "Sum" || m == "Min" || m == "Max")
-                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
-                        // stdlib §5/§5.1: Average → double (int/long/double forms).
-                        else if (m == "Average")
-                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                        // fix #666 / stdlib §5/§5.1: Sum/Min/Max/Average on
+                        // Array<decimal> return decimal, not int/double.
+                        // For the selector forms (Sum(fn), Average(fn)) check
+                        // whether the selector lambda returns decimal; otherwise
+                        // the element type drives the result.
+                        else if (m == "Sum" || m == "Min" || m == "Max") {
+                            bool elemIsDecimal =
+                                recvTy && !recvTy->genericArgs.empty() &&
+                                recvTy->genericArgs[0] &&
+                                recvTy->genericArgs[0]->kind ==
+                                    TypeRef::Kind::Primitive &&
+                                recvTy->genericArgs[0]->primitive == P::Decimal;
+                            // Check selector return type (if a lambda arg).
+                            if (!elemIsDecimal && !ce.args.empty() &&
+                                ce.args[0].value) {
+                                if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                    if (lt->kind == TypeRef::Kind::Function &&
+                                        lt->funcReturn &&
+                                        lt->funcReturn->kind ==
+                                            TypeRef::Kind::Primitive &&
+                                        lt->funcReturn->primitive == P::Decimal)
+                                        elemIsDecimal = true;
+                            }
+                            ctx_.setExprType(&ce,
+                                elemIsDecimal
+                                    ? ctx_.primitiveTypeRef(P::Decimal)
+                                    : ctx_.primitiveTypeRef(P::Int));
+                        }
+                        // stdlib §5/§5.1: Average → double (int/long/double forms)
+                        // or → decimal for Array<decimal>.Average() / selector-decimal.
+                        else if (m == "Average") {
+                            bool elemIsDecimal =
+                                recvTy && !recvTy->genericArgs.empty() &&
+                                recvTy->genericArgs[0] &&
+                                recvTy->genericArgs[0]->kind ==
+                                    TypeRef::Kind::Primitive &&
+                                recvTy->genericArgs[0]->primitive == P::Decimal;
+                            if (!elemIsDecimal && !ce.args.empty() &&
+                                ce.args[0].value) {
+                                if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                    if (lt->kind == TypeRef::Kind::Function &&
+                                        lt->funcReturn &&
+                                        lt->funcReturn->kind ==
+                                            TypeRef::Kind::Primitive &&
+                                        lt->funcReturn->primitive == P::Decimal)
+                                        elemIsDecimal = true;
+                            }
+                            ctx_.setExprType(&ce,
+                                elemIsDecimal
+                                    ? ctx_.primitiveTypeRef(P::Decimal)
+                                    : ctx_.primitiveTypeRef(P::Double));
+                        }
                         // stdlib §5 Aggregation: Aggregate(seed, fold) returns the
                         // accumulator type TAccum = the static type of the seed.
                         else if (m == "Aggregate" && !ce.args.empty() && ce.args[0].value) {
