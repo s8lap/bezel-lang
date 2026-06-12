@@ -224,3 +224,25 @@ BEZEL_TEST(sema_serialization_550, hand_written_serialize_suppresses_synthesis_s
         "end R;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ─── §2.15 v0.139 / issue #675: `serialized "$..."` rename is a compile error ─
+
+// §2.15 v0.139: a positional record field with a `serialized "$xxx"` rename is
+// a compile error — `$`-initial wire names are reserved for JSON graph-identity.
+// Syntax: `Name: Type serialized "wireName"` (SerializedClause follows the type).
+BEZEL_TEST(sema_serialization_550,
+           dollar_rename_positional_field_is_error_spec_2_15_v0139) {
+    auto r = parseSema(
+        "module M; "
+        "record R(X: int serialized \"$foo\"): ISerializable, IDeserializable;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §2.15 v0.139: a non-`$` rename is still accepted (no regression).
+BEZEL_TEST(sema_serialization_550,
+           non_dollar_rename_positional_field_is_ok_spec_2_15_v0139) {
+    auto r = parseSema(
+        "module M; "
+        "record R(X: int serialized \"myField\"): ISerializable, IDeserializable;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

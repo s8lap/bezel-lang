@@ -7308,6 +7308,11 @@ struct bz_binser_t {
     void**   tag_ptrs;
     int32_t  tag_count;  // number of assigned tags (= tag_ptrs size in use)
     int32_t  tag_cap;    // allocated capacity of tag_ptrs
+
+    // §2.15 v0.139 JSON: pending inline tag_id to emit as `"$id":n` at the start
+    // of the next begin_object call.  write_inline_tag stores the id here; zero
+    // means no pending tag.  This defers the emission until after `{` is written.
+    int32_t  json_pending_tag_id;
 };
 
 static void bz_binser_ensure(bz_binser_t* s, int64_t need) {
@@ -7780,6 +7785,15 @@ void bz_binser_begin_object(void* serp, int32_t field_count) {
         bz_jser_cstr(s, "{");
         int nd = ++s->json.depth;
         if (nd < BZ_JSER_MAX_DEPTH) s->json.needs_comma[nd] = false;
+        // §2.15 v0.139: if write_inline_tag left a pending tag, inject
+        // `"$id":n` as the first (virtual) field inside this object.
+        if (s->json_pending_tag_id > 0) {
+            char buf[32];
+            int n = snprintf(buf, sizeof(buf), "\"$id\":%d", s->json_pending_tag_id);
+            bz_jser_raw(s, buf, n);
+            if (nd < BZ_JSER_MAX_DEPTH) s->json.needs_comma[nd] = true;
+            s->json_pending_tag_id = 0;
+        }
         return;
     }
     bz_binser_write_le32_impl(s, (uint32_t)field_count);
@@ -7872,15 +7886,49 @@ int32_t bz_binser_graph_assign_tag(void* serp, void* ptr) {
 }
 
 // Write BZ_SER_INLINE (0x01) + LE32 tag_id.  Precedes the inline object body.
+// §2.15 v0.139 JSON form: emit `"$id":n,` as the first field inside the
+// already-opened object (BeginObject was called just before this).
+// The JSON depth/comma state is already pushed; we write the pseudo-field
+// and set needs_comma so the first real field gets a comma.
 void bz_binser_write_inline_tag(void* serp, int32_t tag_id) {
     auto* s = static_cast<bz_binser_t*>(serp);
+    if (s->kind == 1) {
+        // §2.15 v0.139 JSON: defer emission of `"$id":n` until begin_object is
+        // called (which writes `{` first).  Storing here; begin_object injects it
+        // as the first virtual field.  Writing here would precede `{` and produce
+        // malformed JSON.
+        s->json_pending_tag_id = tag_id;
+        return;
+    }
     bz_binser_write_byte_impl(s, BZ_SER_INLINE);
     bz_binser_write_le32_impl(s, (uint32_t)tag_id);
 }
 
 // Write BZ_SER_REF (0x02) + LE32 tag_id.  Used for back-edge / aliased references.
+// §2.15 v0.139 JSON form: emit `{"$ref":n}` as a complete object value in place
+// of the back-reference.  This is written at value position (after a field name
+// or in an array), so we must handle the surrounding comma state.
+//
+// §9.8 cycle detection: tag_id=0 means the back-edge target was never registered
+// as an owned component — it is the root object or an external object that forms
+// a cycle.  Raise SerializationException instead of emitting a dangling $ref.
 void bz_binser_write_ref_tag(void* serp, int32_t tag_id) {
     auto* s = static_cast<bz_binser_t*>(serp);
+    if (tag_id <= 0) {
+        bz_ser_throw("Cycle detected in serialized graph/cyclic object (§9.8)", nullptr);
+        return;
+    }
+    if (s->kind == 1) {
+        // JSON: {"$ref":n}
+        // bz_jser_maybe_comma writes comma if needed at current depth;
+        // bz_jser_mark_comma tells the parent a value was written.
+        bz_jser_maybe_comma(s);
+        char buf[40];
+        int n = snprintf(buf, sizeof(buf), "{\"$ref\":%d}", tag_id);
+        bz_jser_raw(s, buf, n);
+        bz_jser_mark_comma(s);
+        return;
+    }
     bz_binser_write_byte_impl(s, BZ_SER_REF);
     bz_binser_write_le32_impl(s, (uint32_t)tag_id);
 }
@@ -7902,6 +7950,12 @@ struct bz_binder_t {
     int32_t        fields_remaining;
     bool           in_object;
     int8_t         kind;  // 0 = binary, 1 = JSON
+
+    // §2.15 v0.139 JSON graph-identity: set to 1 when bz_binder_read_graph_marker
+    // has already consumed the opening `{` of an inline object (and the `"$id":n,`
+    // pseudo-field).  bz_binder_begin_object checks this flag and, when set,
+    // skips re-reading `{` and starts the field count from the current position.
+    int8_t  json_obj_preread;
 
     // §9.8 tier-3: identity-tag→object table for `serialized graph` deserialize.
     // tag_ptrs[i]        = the constructed object pointer for tag_id (i+1).
@@ -8594,6 +8648,17 @@ int32_t bz_binder_begin_object(void* derp) {
         // §2.15: for JSON we pre-count fields so the synthesized for-loop runs
         // the right number of times.  The loop is: idx in [0, fieldCount), and
         // each iteration calls ReadFieldName + dispatch + SkipValue/ReadXxx.
+        //
+        // §2.15 v0.139 graph-identity: bz_binder_read_graph_marker may have
+        // already consumed the `{` and the `"$id":n,` pseudo-field, leaving the
+        // position just after the comma.  In that case json_obj_preread=1 and we
+        // must NOT read `{` again; we just count the remaining real fields.
+        if (d->json_obj_preread) {
+            d->json_obj_preread = 0;
+            d->in_object = true;
+            int32_t cnt = bz_jder_count_object_fields(d);
+            return cnt;
+        }
         bz_jder_skip_ws(d);
         if (d->pos >= d->len || d->data[d->pos] != '{') {
             bz_ser_throw("Expected '{' in JSON object (§2.15)", nullptr);
@@ -8785,8 +8850,86 @@ static void bz_binder_graph_ensure_slot(bz_binder_t* d, int32_t tag_id) {
 //   BZ_SER_INLINE (1) → inline object; *out_tag set to the tag_id
 //   BZ_SER_REF    (2) → back-edge ref; *out_tag set to the tag_id
 //   0             → truncated / unexpected input
+//
+// §2.15 v0.139 JSON form:
+//   INLINE: the next JSON value is an object whose first field is `"$id":n`.
+//     We consume `{` + `"$id":n` and optionally the trailing `,`.  Set
+//     json_obj_preread=1 so bz_binder_begin_object skips re-reading `{`.
+//     Returns BZ_SER_INLINE; *out_tag = n.
+//   REF: the next JSON value is `{"$ref":n}`.
+//     We consume the entire object.  Returns BZ_SER_REF; *out_tag = n.
+//   Malformed / missing: returns 0, *out_tag = 0.
 int32_t bz_binder_read_graph_marker(void* derp, int32_t* out_tag) {
     auto* d = static_cast<bz_binder_t*>(derp);
+    *out_tag = 0;
+
+    if (d->kind >= 1) {
+        // JSON path — per §2.15 v0.139.
+        bz_jder_skip_ws(d);
+        if (d->pos >= d->len || d->data[d->pos] != '{') {
+            bz_ser_throw("Expected '{' for JSON graph-identity token (§2.15 v0.139)",
+                         nullptr);
+            return 0;
+        }
+        ++d->pos;  // consume '{'
+
+        // Parse the first field name (must be "$id" or "$ref").
+        bz_jder_skip_ws(d);
+        if (d->pos >= d->len || d->data[d->pos] != '"') {
+            bz_ser_throw("Expected '\"' in JSON graph-identity object (§2.15 v0.139)",
+                         nullptr);
+            return 0;
+        }
+        // Read the key without allocating: find the closing '"'.
+        ++d->pos;  // skip opening '"'
+        // Collect key bytes up to the closing '"' (no escape handling needed for
+        // the reserved "$id"/"$ref" keys which contain only ASCII).
+        const int64_t keyStart = d->pos;
+        while (d->pos < d->len && d->data[d->pos] != '"') ++d->pos;
+        const int64_t keyLen = d->pos - keyStart;
+        if (d->pos < d->len) ++d->pos;  // skip closing '"'
+
+        // Determine which token this is.
+        bool isId  = (keyLen == 3 &&
+                      d->data[keyStart+0] == '$' &&
+                      d->data[keyStart+1] == 'i' &&
+                      d->data[keyStart+2] == 'd');
+        bool isRef = (keyLen == 4 &&
+                      d->data[keyStart+0] == '$' &&
+                      d->data[keyStart+1] == 'r' &&
+                      d->data[keyStart+2] == 'e' &&
+                      d->data[keyStart+3] == 'f');
+
+        if (!isId && !isRef) {
+            bz_ser_throw("Expected \"$id\" or \"$ref\" as first field in JSON "
+                         "graph-identity object (§2.15 v0.139)", nullptr);
+            return 0;
+        }
+
+        // Skip ':' between key and value.
+        if (!bz_jder_expect_char(d, ':')) return 0;
+
+        // Parse the integer tag_id.
+        int64_t tag_id = bz_jder_parse_int(d);
+        *out_tag = (int32_t)tag_id;
+
+        if (isRef) {
+            // Ref: consume the closing '}' (the entire {"$ref":n} object).
+            bz_jder_skip_ws(d);
+            if (d->pos < d->len && d->data[d->pos] == '}') ++d->pos;
+            return BZ_SER_REF;
+        }
+
+        // Inline ("$id"):  the object continues with real fields.
+        // Consume optional ',' after the "$id":n entry.
+        bz_jder_skip_ws(d);
+        if (d->pos < d->len && d->data[d->pos] == ',') ++d->pos;
+        // Mark that begin_object must skip reading '{' (already consumed).
+        d->json_obj_preread = 1;
+        return BZ_SER_INLINE;
+    }
+
+    // Binary path (original implementation).
     uint8_t marker = 0;
     if (!bz_binder_read_byte_impl(d, &marker)) { *out_tag = 0; return 0; }
     uint32_t tag_id = 0;
