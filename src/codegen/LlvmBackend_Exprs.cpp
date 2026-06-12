@@ -5693,21 +5693,49 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // allocate a control block and store the owned object pointer.
             // bz_shared_new(value: ptr, dispose_value: fn) → ptr (control block).
             // The dispose_value callback is the class element disposer thunk
-            // (vtable Dispose + free), so the inner T is disposed exactly once
-            // when the last strong handle is released (§28.13).
+            // (vtable Dispose + free) for user-defined class T, so the inner T
+            // is disposed exactly once when the last strong handle is released
+            // (§28.13).
+            //
+            // §28.13 v0.140 / #689: For compiler-known internally-synchronized
+            // types (Mutex, Atomic<T>, AtomicInteger<T>, Semaphore) there is no
+            // vtable — they use dedicated C dispose functions. Select the correct
+            // disposer based on T's name.
             if (colName == "Shared" && ne.args.size() == 1 && ne.args[0].value) {
                 llvm::Value* val = lowerExpr(*ne.args[0].value);
                 if (!val) return nullptr;
-                // Get the element disposer thunk for T (the inner class type).
-                // #602 batch 4 / §28.11 v0.135 / §28.13: Shared<T>'s inner T is
-                // always a class type (sema-enforced); ClassOwned row → vtable-
-                // dispatch disposer thunk. elementDisposerThunk() is the shared
-                // void(void*) shim (vtable slot 2 Dispose + free); it is also
-                // what elementPolicyFor returns for ClassOwned, so using it here
-                // is policy-consistent (same thunk used for OwnedArray<T> disposal).
-                llvm::Function* dispFn = elementDisposerThunk();
+                // Determine the disposer function for the inner type T.
+                llvm::Function* dispFn = nullptr;
+                const sema::TypeRef* innerTy =
+                    (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
+                std::string_view tname = innerTy ? builtinTypeName(innerTy) : "";
+                if (tname == "Mutex") {
+                    // §6.2 / #647 / #689: Mutex has no vtable; uses bz_mutex_dispose.
+                    dispFn = declareC("bz_mutex_dispose",
+                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                } else if (tname == "Atomic" || tname == "AtomicInteger") {
+                    // §6.4 / #689 / §28.13 v0.140: Atomic<T>/AtomicInteger<T>
+                    // are compiler-known sync types.  Their dispose functions will
+                    // be declared when those types land; for now we use null (no
+                    // dispose needed for zero-cost atomics — no heap allocation).
+                    // TODO: wire up when Atomic<T>/AtomicInteger<T> are implemented.
+                    dispFn = nullptr;
+                } else if (tname == "Semaphore") {
+                    // §6.3 / #689 / §28.13 v0.140: Semaphore has a dedicated
+                    // dispose function.  Wire up when Semaphore is implemented.
+                    // TODO: wire up when Semaphore is implemented.
+                    dispFn = nullptr;
+                } else {
+                    // User-defined class T or unrecognized builtin: vtable-dispatch
+                    // disposer thunk (vtable slot Dispose + free). Same as before.
+                    // #602 batch 4 / §28.11 v0.135 / §28.13: ClassOwned row.
+                    dispFn = elementDisposerThunk();
+                }
+                llvm::Value* dispArg = dispFn
+                    ? llvm::cast<llvm::Value>(dispFn)
+                    : llvm::ConstantPointerNull::get(ptrTy());
                 auto* newFn = declareC("bz_shared_new", ptrTy(), {ptrTy(), ptrTy()});
-                return builder_.CreateCall(newFn, {val, dispFn}, "shared.new");
+                return builder_.CreateCall(newFn, {val, dispArg}, "shared.new");
             }
             // §30.15 (#600 phase c): new Channel<T>() — allocate a bz_channel_t.
             // The dispose_elem callback is derived from elementPolicyFor:

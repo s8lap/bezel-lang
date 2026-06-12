@@ -2968,19 +2968,24 @@ char* bz_path_absolute(const char* path) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared<T> / Weak<T> — domain-local shared ownership (§28.13 / stdlib §2.16)
+// Shared<T> / Weak<T> — shared ownership (§28.13 / stdlib §2.16)
 //
-// Control block layout: { void* value; long strong; long weak;
+// Control block layout: { void* value; atomic<long> strong; atomic<long> weak;
 //                          void (*dispose_value)(void*); bool disposed }
 // Handles (strong and weak) are both pointers to this struct; the compiler
-// passes them as `ptr` and calls the functions below.  Everything is
-// unsynchronised (domain-local per §28.13 / §30.14 — not sendable).
+// passes them as `ptr` and calls the functions below.
+//
+// v0.140 / #689: strong and weak counts are now atomic so that Shared<T> for
+// internally-synchronized T (Mutex, Atomic<T>, AtomicInteger<T>, Semaphore)
+// can be cloned and sent across domains (§28.13 sendability rule).  The domain-
+// local path pays no extra cost beyond the single-CPU-ordering that acq_rel
+// already provides; the cross-domain path gets the required atomicity.
 // ---------------------------------------------------------------------------
 
 struct bz_shared_t {
     void*  value;
-    long   strong;
-    long   weak;
+    std::atomic<long> strong;   // per #689 / §28.13 v0.140: was plain long
+    std::atomic<long> weak;     // per #689 / §28.13 v0.140: was plain long
     void (*dispose_value)(void*);
     int    value_disposed;   // 1 after the value has been disposed (idempotent guard)
     // §28.2 v0.135 / issue #627: checked-disposal-mode quarantine flag.
@@ -2994,19 +2999,22 @@ struct bz_shared_t {
 // Allocate a new control block.  strong=1, weak=0. per §28.13 constructor.
 void* bz_shared_new(void* value, void (*dispose_value)(void*)) {
     bz_shared_t* cb = (bz_shared_t*)calloc(1, sizeof(bz_shared_t));
+    // placement-new the atomics into the calloc'd memory (calloc zeroes first).
+    new (&cb->strong) std::atomic<long>(1);
+    new (&cb->weak)   std::atomic<long>(0);
     cb->value = value;
-    cb->strong = 1;
-    cb->weak = 0;
     cb->dispose_value = dispose_value;
     cb->value_disposed = 0;
     return (void*)cb;
 }
 
 // Increment the strong count and return the same handle (a new alias). §28.13 Clone.
+// per #689 / §28.13 v0.140: atomic fetch_add with acq_rel so a cross-domain
+// clone sees a consistent strong count.
 void* bz_shared_clone(void* handle) {
     bz_shared_t* cb = (bz_shared_t*)handle;
     if (!cb) return nullptr;
-    cb->strong++;
+    cb->strong.fetch_add(1, std::memory_order_acq_rel);
     return handle;
 }
 
@@ -3029,14 +3037,13 @@ void bz_shared_mark_disposed(void* handle) {
     bz_shared_t* cb = (bz_shared_t*)handle;
     if (cb->handle_disposed) return;  // idempotent
     cb->handle_disposed = 1;
-    if (cb->strong > 0) {
-        cb->strong--;
-        if (cb->strong == 0 && !cb->value_disposed) {
-            cb->value_disposed = 1;
-            if (cb->dispose_value && cb->value)
-                cb->dispose_value(cb->value);
-            cb->value = nullptr;
-        }
+    // per #689: use atomic fetch_sub; then check the new value.
+    long prev = cb->strong.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1 && !cb->value_disposed) {
+        cb->value_disposed = 1;
+        if (cb->dispose_value && cb->value)
+            cb->dispose_value(cb->value);
+        cb->value = nullptr;
     }
     // Do NOT free(cb) — block stays alive for the disposed-flag guard.
 }
@@ -3049,24 +3056,41 @@ int8_t bz_shared_is_disposed(void* handle) {
 }
 
 // Mint a Weak handle (same control block, weak count +1). §28.13 Downgrade.
+// per #689: atomic fetch_add for cross-domain safety.
 void* bz_shared_downgrade(void* handle) {
     bz_shared_t* cb = (bz_shared_t*)handle;
     if (!cb) return nullptr;
-    cb->weak++;
+    cb->weak.fetch_add(1, std::memory_order_acq_rel);
     return handle;   // same block; bz_weak_t* aliases bz_shared_t*
 }
 
 // TryUpgrade: produce a new strong handle if the value is still alive. §28.13.
 // Returns 1 on success (strong count was > 0), 0 if the value is gone.
+//
+// per #689 / §28.13 v0.140: CAS loop that atomically increments strong ONLY
+// when its current value is > 0.  This closes the upgrade-vs-last-drop race:
+// a concurrent bz_shared_release that brings strong to 0 is not beaten by a
+// non-atomic read+increment pair (the classic Arc<T>::upgrade race).
+//
+// Loop:   read strong; if 0 → value gone, return 0.
+//         CAS strong(expected, expected+1) with acq_rel.
+//         On spurious failure retry (compare_exchange_weak).
 int bz_weak_try_upgrade(void* weak_handle, void** out_handle) {
     bz_shared_t* cb = (bz_shared_t*)weak_handle;
-    if (!cb || cb->strong == 0) {
-        if (out_handle) *out_handle = nullptr;
-        return 0;
+    if (!cb) { if (out_handle) *out_handle = nullptr; return 0; }
+    long expected = cb->strong.load(std::memory_order_acquire);
+    while (expected > 0) {
+        if (cb->strong.compare_exchange_weak(expected, expected + 1,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+            if (out_handle) *out_handle = weak_handle;
+            return 1;
+        }
+        // expected has been refreshed by compare_exchange_weak on failure; retry.
     }
-    cb->strong++;
-    if (out_handle) *out_handle = weak_handle;
-    return 1;
+    // strong == 0: value already gone.
+    if (out_handle) *out_handle = nullptr;
+    return 0;
 }
 
 // Release one strong reference.  When the count hits 0, dispose the value;
@@ -3074,34 +3098,40 @@ int bz_weak_try_upgrade(void* weak_handle, void** out_handle) {
 // §28.2 v0.135 / issue #627: in checked-disposal builds, bz_shared_mark_disposed
 // quarantines the handle (handle_disposed=1, block NOT freed). A subsequent
 // scope-end bz_shared_release call must be a no-op — skip if already quarantined.
+// per #689 / §28.13 v0.140: atomic fetch_sub; dispose/free only when the
+// decremented-to value reaches 0 (unique "last releaser" wins the disposal).
 void bz_shared_release(void* handle) {
     bz_shared_t* cb = (bz_shared_t*)handle;
     if (!cb) return;
     // Skip if already quarantined by bz_shared_mark_disposed (checked mode).
     if (cb->handle_disposed) return;
-    cb->strong--;
-    if (cb->strong == 0 && !cb->value_disposed) {
+    long prev = cb->strong.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 1 && !cb->value_disposed) {
         cb->value_disposed = 1;
         if (cb->dispose_value && cb->value)
             cb->dispose_value(cb->value);
         cb->value = nullptr;
         // Free the block only when there are no outstanding weak handles.
-        if (cb->weak == 0)
+        if (cb->weak.load(std::memory_order_acquire) == 0)
             free(cb);
     }
 }
 
 // Release one weak reference.  Free the block when both counts are 0. §28.13.
+// per #689 / §28.13 v0.140: atomic fetch_sub; free only when the unique last
+// weak releaser brings weak to 0 AND strong is already 0.
 void bz_weak_release(void* weak_handle) {
     bz_shared_t* cb = (bz_shared_t*)weak_handle;
     if (!cb) return;
-    cb->weak--;
+    long prev = cb->weak.fetch_sub(1, std::memory_order_acq_rel);
     // The value was already disposed (strong == 0 got here first).
     // Free the block only when this was the last weak handle.
     // §28.2 v0.135 / issue #627: do NOT free if handle_disposed is set —
     // the block was quarantined by bz_shared_mark_disposed (checked builds)
     // and must remain alive for the scope-end bz_shared_release no-op check.
-    if (cb->strong == 0 && cb->weak == 0 && !cb->handle_disposed)
+    if (prev == 1 &&
+        cb->strong.load(std::memory_order_acquire) == 0 &&
+        !cb->handle_disposed)
         free(cb);
 }
 
