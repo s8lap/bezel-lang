@@ -1,17 +1,24 @@
-public class Channel<T>: IDisposable                       // the receiving end; class T form
-  public constructor();                                    // unbounded
+public static class Domain
+  // No result.
+  public static method Spawn(entry: () -> ()): owned Task;
+  public static method Spawn<A>(entry: (owned A) -> (), owned arg: A): owned Task
+      where A: class;                                      // A sendable (compiler-checked)
+  public static method Spawn<A>(entry: (A) -> (), arg: A): owned Task
+      where A: notnull;                                    // A sendable value type or string
 
-  public readonly property Count: int;                     // items currently buffered
-  public readonly property IsClosed: bool;                 // true once closed (see below)
+  // Class-typed result: ownership transfers to the awaiter (Pattern B).
+  public static method Spawn<R>(entry: () -> owned R): owned OwnedTask<R>
+      where R: class;                                      // R sendable (compiler-checked)
+  public static method Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwnedTask<R>
+      where A: class, R: class;
+  public static method Spawn<A, R>(entry: (A) -> owned R, arg: A): owned OwnedTask<R>
+      where A: notnull, R: class;
 
-  public method NewSender(): owned ChannelSender<T>;       // mint a sender endpoint
-
-  public method Receive(): OwnedTask<T>;                   // await transfers ownership of one item
-  public method TryReceive(out owned item: T?): bool;      // non-blocking; false when none available
-end Channel;
-
-public class ChannelSender<T>: IDisposable                 // class T form
-  public method Send(owned item: T);                       // transfers ownership into the channel;
-                                                           //   never blocks (unbounded);
-                                                           //   ChannelClosedException if closed
-end ChannelSender;
+  // Value-typed or string result (Pattern A).
+  public static method Spawn<R>(entry: () -> R): owned Task<R>
+      where R: notnull;                                    // R sendable value type or string
+  public static method Spawn<A, R>(entry: (owned A) -> R, owned arg: A): owned Task<R>
+      where A: class, R: notnull;
+  public static method Spawn<A, R>(entry: (A) -> R, arg: A): owned Task<R>
+      where A: notnull, R: notnull;
+end Domain;

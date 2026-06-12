@@ -1,12 +1,20 @@
-/// Compiler-intrinsic; T restricted to integer types and char.
-public record Range<T>: IEnumerable<T>
-  public readonly property Start: T?;              // null if open-ended on the lower side
-  public readonly property End: T?;                // null if open-ended on the upper side
-  public readonly property Step: long;             // default 1; signed to support descending
-  public readonly property IsEndInclusive: bool;   // true for `..`, false for `..<`
-  public readonly property IsOpenEnded: bool;      // true if Start or End is null
-  public readonly property IsEmpty: bool;          // true if the range contains no values
+/// Compiler-intrinsic; aliased by the keyword `char`.
+public record Char: IComparable<char>, IEquatable<char>
+  public static const MinValue: char;             // U+0000
+  public static const MaxValue: char;             // U+10FFFF (excluding surrogates)
 
-  public method Contains(value: T): bool;
-  public method GetEnumerator(): owned IEnumerator<T>;
-end Range;
+  public static method IsDigit(c: char): bool;
+  public static method IsLetter(c: char): bool;
+  public static method IsLetterOrDigit(c: char): bool;
+  public static method IsWhiteSpace(c: char): bool;
+  public static method IsUpper(c: char): bool;
+  public static method IsLower(c: char): bool;
+  public static method IsControl(c: char): bool;
+  public static method IsPunctuation(c: char): bool;
+
+  public static method ToUpper(c: char): char;
+  public static method ToLower(c: char): char;
+
+  public method ToString(): string;
+  public method CompareTo(other: char): int;
+end Char;

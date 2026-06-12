@@ -1,2 +1,5 @@
-using var guard := mutex.Acquire();
-// critical section; guard disposed at scope end -> mutex released.
+public class TimeoutException: Exception
+  public constructor();
+  public constructor(message: string);
+  public constructor(message: string, inner: Exception);
+end TimeoutException;

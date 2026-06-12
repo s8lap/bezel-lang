@@ -1,12 +1,21 @@
-public class Mutex
-  public constructor();
-  public method Acquire(): owned Lock;
-  public method TryAcquire(timeout: TimeSpan): owned Lock?;
-  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwnedTask<Lock>;
-  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwnedTask<Lock?>;
-end Mutex;
+public record CancellationToken
+  public static readonly property None: CancellationToken;
+  public readonly property IsCancellationRequested: bool;
+  public method ThrowIfCancellationRequested();
+  public method Register(callback: () -> ()): owned Subscription;
+end CancellationToken;
 
-public class Lock
-  // No public constructor; obtained from Mutex.Acquire / TryAcquire.
-  destructor;       // releases the held lock
-end Lock;
+public class CancellationTokenSource
+  public constructor();
+
+  public static method WithCancelAfter(delay: TimeSpan): owned CancellationTokenSource;
+
+  public readonly property Token: CancellationToken;
+  public readonly property IsCancellationRequested: bool;
+
+  public method Cancel();
+  public method CancelAfter(delay: TimeSpan);
+
+  destructor;       // signals cancellation to any tokens still observing,
+                           // then releases the registered-callback list
+end CancellationTokenSource;

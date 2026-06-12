@@ -1,12 +1,13 @@
-/// Compiler-intrinsic; T restricted to cell-sized primitive types.
-public class Atomic<T> where T: value
-  public constructor(initial: T);
+public class Semaphore
+  public constructor(initialCount: int);
+  public constructor(initialCount: int, maxCount: int);
 
-  public property Value: T
-    get;       // hardware-atomic read
-    set;       // hardware-atomic write
-  end Value;
+  public method Acquire(): owned SemaphoreToken;
+  public method TryAcquire(timeout: TimeSpan): owned SemaphoreToken?;
+  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwnedTask<SemaphoreToken>;
+  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwnedTask<SemaphoreToken?>;
+end Semaphore;
 
-  public method Exchange(value: T): T;
-  public method CompareExchange(expected: T, replacement: T): T;
-end Atomic;
+public class SemaphoreToken
+  destructor;       // releases the held permit
+end SemaphoreToken;

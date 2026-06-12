@@ -1,26 +1,17 @@
-public abstract class Stream
-  public abstract readonly property CanRead: bool;
-  public abstract readonly property CanWrite: bool;
-  public abstract readonly property CanSeek: bool;
+public class Channel<T>: IDisposable                       // the receiving end; class T form
+  public constructor();                                    // unbounded
 
-  public abstract method Read(buffer: Array<byte>, offset: int, count: int): int;
-  public abstract method Write(buffer: Array<byte>, offset: int, count: int);
-  public abstract method Flush();
+  public readonly property Count: int;                     // items currently buffered
+  public readonly property IsClosed: bool;                 // true once closed (see below)
 
-  public abstract method Seek(offset: long, origin: SeekOrigin): long;
-  public abstract readonly property Length: long;
-  public abstract property Position: long;
+  public method NewSender(): owned ChannelSender<T>;       // mint a sender endpoint
 
-  public async method ReadAsync(buffer: Array<byte>, offset: int, count: int,
-                                 token: CancellationToken := CancellationToken.None): Task<int>;
-  public async method WriteAsync(buffer: Array<byte>, offset: int, count: int,
-                                  token: CancellationToken := CancellationToken.None): Task;
+  public method Receive(): OwnedTask<T>;                   // await transfers ownership of one item
+  public method TryReceive(out owned item: T?): bool;      // non-blocking; false when none available
+end Channel;
 
-  // Convenience methods
-  public method ReadAll(): owned Array<byte>;            // reads from current position to end
-  public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwnedTask<Array<byte>>;
-end Stream;
-
-public enum SeekOrigin: byte
-  Begin, Current, End;
-end SeekOrigin;
+public class ChannelSender<T>: IDisposable                 // class T form
+  public method Send(owned item: T);                       // transfers ownership into the channel;
+                                                           //   never blocks (unbounded);
+                                                           //   ChannelClosedException if closed
+end ChannelSender;

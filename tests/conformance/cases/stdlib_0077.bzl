@@ -1,13 +1,5 @@
-public class Semaphore
-  public constructor(initialCount: int);
-  public constructor(initialCount: int, maxCount: int);
-
-  public method Acquire(): owned SemaphoreToken;
-  public method TryAcquire(timeout: TimeSpan): owned SemaphoreToken?;
-  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwnedTask<SemaphoreToken>;
-  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwnedTask<SemaphoreToken?>;
-end Semaphore;
-
-public class SemaphoreToken
-  destructor;       // releases the held permit
-end SemaphoreToken;
+using var guard := mutex.TryAcquire(TimeSpan.FromSeconds(5));
+if guard <> null then
+  // critical section; guard non-null in this branch (narrowing)
+end;
+// At scope end: guard disposed if non-null, releasing the lock; null is a no-op.

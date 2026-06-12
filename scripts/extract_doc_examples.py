@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Extract fenced code blocks from the four Bezel docs.
+Version 2 — re-extraction for v0.138 docs.
 
 Produces:
   tests/conformance/cases/<doc-tag>_<seq>.bzl  — one per block
@@ -13,6 +14,19 @@ Classification logic:
               or other non-runnable content
   program  — has a 'method Main' at top level
   fragment — everything else (needs wrapper)
+
+v2 improvements over v1:
+  1. skip:elided — blocks containing '...' pseudo-code (e.g. `method X() ... end;`
+     or `class Foo ... end Foo;`) are skipped rather than sent to the compiler as
+     broken syntax.  This is distinct from `...` inside a string literal
+     ("Connection(...)") or purely inside a comment line (// ...).
+  2. Context-chaining — for each fragment/error case, the extractor inspects
+     earlier blocks in the SAME SECTION of the SAME DOC.  If those earlier blocks
+     define types (class/record/interface) that the current block references, they
+     are prepended to the .bzl file so the block has its full context.  Chained
+     cases are annotated with "chained:<n>" in the manifest notes column where <n>
+     is the number of prepended blocks.
+  3. Re-extracted from the current docs (v0.138).
 
 Usage:
   python3 scripts/extract_doc_examples.py [repo-root]
@@ -63,16 +77,81 @@ CLOSE_ERROR_RE = re.compile(
 # Markers inside the code block itself that flag it as an error case
 INLINE_ERROR_RE = re.compile(r'//\s*(ERROR|error)\b')
 
-# Heuristics to classify as skip
-SKIP_HINTS = [
-    re.compile(r'^\s*[A-Za-z_][A-Za-z0-9_]*\s*::='),   # EBNF rule
-    re.compile(r'^\s*[A-Za-z_][A-Za-z0-9_]*\s*:'),       # signature-style
-]
-
 # Grammar keywords that strongly suggest a runnable file
 HAS_MODULE_RE  = re.compile(r'^\s*module\s+\w', re.MULTILINE)
 HAS_CLASS_RE   = re.compile(r'^\s*(public\s+|private\s+|internal\s+)?(static\s+)?class\s+\w', re.MULTILINE)
-HAS_METHOD_MAIN_RE = re.compile(r'\bmethod\s+Main\b', re.MULTILINE)
+
+# Type declaration pattern — used to identify context-defining blocks
+TYPE_DECL_RE = re.compile(
+    r'^\s*(public\s+|private\s+|internal\s+)?(sealed\s+|abstract\s+|static\s+)*'
+    r'(class|record|interface)\s+([A-Z]\w*)',
+    re.MULTILINE
+)
+
+# Identifier pattern for extracting referenced type names (PascalCase)
+PASCAL_REF_RE = re.compile(r'\b([A-Z][A-Za-z0-9_]*)\b')
+
+
+def has_pseudo_elision(code):
+    """
+    Return True if the code block uses '...' as pseudo-code (a placeholder for
+    omitted implementation), NOT merely inside a string literal or comment.
+
+    Elision patterns that indicate skippable pseudo-code:
+      - `method M() ... end;`  (abbreviated method body)
+      - `class Foo ... end Foo;`  (abbreviated class body)
+      - `do ... end`  (abbreviated block)
+      - standalone line consisting only of `...` or `...;`
+      - EBNF-style / syntax diagram that uses `...` to mean "more syntax"
+      - `- var name := expression; ...; name.Dispose();`  (spec prose pattern)
+
+    Non-elision uses of '...' that must NOT trigger skip:
+      - Inside a string literal: `new Connection("...")`
+      - Purely inside a line comment: `// ...`
+      - Open-ended range expressions (but these use `10..` not `...`)
+    """
+    lines = code.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        # Skip blank lines and pure comment lines
+        if not stripped or stripped.startswith('//'):
+            continue
+        # Remove string literals (naive but sufficient)
+        no_strings = re.sub(r'"[^"]*"', '""', stripped)
+        no_strings = re.sub(r"'[^']*'", "''", no_strings)
+        # Remove the comment tail
+        no_strings = re.sub(r'//.*$', '', no_strings)
+
+        if '...' not in no_strings:
+            continue
+
+        # Pattern 1: `... end` or `... end X` — abbreviated body
+        if re.search(r'\.\.\.\s*(end\b|;)', no_strings):
+            return True
+        # Pattern 2: standalone line is just `...` or `...;`
+        if re.match(r'^\s*\.\.\.;?\s*$', stripped):
+            return True
+        # Pattern 3: EBNF / syntax diagram header with ...
+        if re.search(r'^visibility\s+', stripped):
+            return True
+        # Pattern 4: list item pseudo-code pattern `- ... ; name.Method()`
+        if re.match(r'^\s*-\s+', stripped) and '...' in no_strings:
+            return True
+        # Pattern 5: class/method/interface header line ending in ...
+        if re.search(r'(class|method|interface|record)\s+\w.*\.\.\.\s*$', no_strings):
+            return True
+
+    return False
+
+
+def _types_defined_in(code):
+    """Return the set of PascalCase type names defined (class/record/interface) in code."""
+    return {m.group(4) for m in TYPE_DECL_RE.finditer(code)}
+
+
+def _types_referenced_in(code):
+    """Return the set of PascalCase identifiers referenced in code."""
+    return set(PASCAL_REF_RE.findall(code))
 
 
 def classify_block(code, lang, prev_prose, notes_out):
@@ -93,22 +172,22 @@ def classify_block(code, lang, prev_prose, notes_out):
     if ebnf_count > len(lines) * 0.4:
         return 'skip', 'n/a', 'ebnf-grammar'
 
-    # 4. Pure signature listing (stdlib): class with only method/property/const declarations
-    # Detect: block has no method bodies (no `end <name>` or `begin`/statement inside body)
-    # A rough heuristic: starts with `public ... class` or `public ... interface` and
-    # has no statements (assignments, calls, control flow) outside of signatures.
+    # 4. skip:elided — pseudo-code blocks with '...' elision (v2)
+    if has_pseudo_elision(code):
+        return 'skip', 'n/a', 'skip:elided'
+
+    # 5. Pure signature listing (stdlib): class with only method/property/const declarations
     is_sig = _is_signature_block(code)
     if is_sig:
         return 'skip', 'n/a', 'skip:signature'
 
-    # 5. Error?
+    # 6. Error?
     # Inline // ERROR or // error marker is the most reliable signal.
     inline_has_error = bool(INLINE_ERROR_RE.search(code))
     # Prose: only the LAST non-empty line immediately before the block.
     prose_lines_list = [l for l in (prev_prose or '').splitlines() if l.strip()]
     last_prose_line = prose_lines_list[-1] if prose_lines_list else ''
     # Only trigger on prose if the very last line says "is rejected:" / "is a compile error:"
-    # i.e. the code block IS the example of the rejected thing
     prose_has_close_error = bool(CLOSE_ERROR_RE.search(last_prose_line))
     # Also check for ✗/✘ symbols in last_prose_line
     prose_has_symbol = bool(re.search(r'[✗✘]', last_prose_line))
@@ -117,12 +196,11 @@ def classify_block(code, lang, prev_prose, notes_out):
     if is_error:
         return 'error', 'diagnose', ''
 
-    # 6. Program vs fragment
+    # 7. Program vs fragment
     has_module = bool(HAS_MODULE_RE.search(code))
     has_class = bool(HAS_CLASS_RE.search(code))
 
     # Only classify as program if it has a module + class + Main body
-    # (not just a list of Main signatures)
     has_main_body = bool(re.search(
         r'\bmethod\s+Main\b(?:.*?\n)+?.*?\bend\s+Main\b',
         code, re.DOTALL
@@ -143,7 +221,7 @@ def _is_signature_block(code):
 
     Criteria: starts with a class/interface declaration, has many declaration
     lines (method/property/const stubs), and no executable statements or
-    constructor/method *bodies* (i.e. no 'end <method-name>;' closing body lines).
+    constructor/method *bodies*.
     """
     lines = [l for l in code.splitlines() if l.strip() and not l.strip().startswith('//')]
     if not lines:
@@ -183,8 +261,7 @@ def _is_signature_block(code):
     body_assign_count = sum(1 for l in lines if assign_re.match(l))
 
     # Expression-bodied methods with non-trivial bodies (=> <something non-trivial>)
-    # These indicate actual implementation, not just signatures
-    expr_body_re = re.compile(r'=>\s*.{5,}')   # => followed by 5+ chars of content
+    expr_body_re = re.compile(r'=>\s*.{5,}')
     expr_body_count = sum(1 for l in lines if expr_body_re.search(l)
                          and not l.strip().startswith('//'))
 
@@ -260,7 +337,7 @@ def parse_doc(doc_path, doc_tag):
                 # Fence close
                 in_fence = False
                 code = '\n'.join(fence_lines)
-                prev_prose = '\n'.join(prose_lines)  # all prose since last heading or prior block
+                prev_prose = '\n'.join(prose_lines)
                 results.append({
                     'idx': block_idx,
                     'heading': current_heading,
@@ -281,6 +358,70 @@ def parse_doc(doc_path, doc_tag):
 
 
 # ---------------------------------------------------------------------------
+# Context-chaining (v2)
+# ---------------------------------------------------------------------------
+
+def build_section_context(blocks):
+    """
+    For each block in the list, compute a 'context_prefix' — the concatenation
+    of earlier blocks in the same section that define types referenced by this
+    block.
+
+    Returns a parallel list of (context_code, chain_count) tuples:
+      context_code  — string to prepend (empty if no chaining needed)
+      chain_count   — number of blocks prepended (0 if none)
+
+    Algorithm:
+      - Iterate blocks in document order.
+      - Maintain a per-section list of (code, defined_types) for non-skipped
+        blocks that define at least one PascalCase type.
+      - For each block, check which PascalCase identifiers it references.
+        Collect ALL earlier type-defining blocks in the same section whose
+        exported types overlap with the references.
+      - Prepend those blocks' code (in order) to form the context prefix.
+    """
+    # Map: heading -> list of (idx, code, defined_types_set)
+    # We only track blocks that define at least one type (non-elided, non-skip source)
+    section_type_providers = {}  # heading -> [(block_idx, code, types_set)]
+
+    chain_info = []  # parallel to blocks: (context_code, chain_count)
+
+    for b in blocks:
+        heading = b['heading']
+        code = b['code']
+
+        # What types does THIS block define?
+        my_types = _types_defined_in(code)
+        # What types does THIS block reference?
+        my_refs = _types_referenced_in(code)
+
+        # Look up earlier providers in same section
+        providers = section_type_providers.get(heading, [])
+
+        # Find which providers supply types that THIS block references
+        needed_providers = []
+        for (pidx, pcode, ptypes) in providers:
+            if ptypes & my_refs:
+                needed_providers.append((pidx, pcode))
+
+        if needed_providers:
+            # Sort by block index (they should already be in order, but be safe)
+            needed_providers.sort(key=lambda x: x[0])
+            ctx_code = '\n\n'.join(c for _, c in needed_providers)
+            chain_info.append((ctx_code, len(needed_providers)))
+        else:
+            chain_info.append(('', 0))
+
+        # Register this block as a type provider for its section (if it defines types)
+        if my_types:
+            if heading not in section_type_providers:
+                section_type_providers[heading] = []
+            section_type_providers[heading].append((b['idx'], code, my_types))
+
+    return chain_info
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -295,7 +436,10 @@ for doc_tag, doc_rel in DOCS:
     blocks = parse_doc(doc_path, doc_tag)
     print(f"{doc_tag}: {len(blocks)} blocks", file=sys.stderr)
 
-    for b in blocks:
+    # Compute context chains for the whole doc at once
+    chain_info = build_section_context(blocks)
+
+    for b, (ctx_code, chain_count) in zip(blocks, chain_info):
         seq = f"{b['idx']:04d}"
         case_id = f"{doc_tag}_{seq}"
         notes_acc = []
@@ -310,11 +454,22 @@ for doc_tag, doc_rel in DOCS:
 
         heading_slug = slugify_heading(b['heading'])
 
+        # Build the .bzl content.
+        # For non-skip blocks that have a context chain, prepend the context.
+        if cls != 'skip' and ctx_code:
+            # Prepend context, separated by a blank line
+            file_content = ctx_code.rstrip('\n') + '\n\n' + b['code']
+            if chain_count:
+                chain_note = f"chained:{chain_count}"
+                notes = (notes + '; ' + chain_note) if notes else chain_note
+        else:
+            file_content = b['code']
+
         # Write .bzl file
         case_path = os.path.join(CASES_DIR, f"{case_id}.bzl")
         with open(case_path, 'w', encoding='utf-8') as f:
-            f.write(b['code'])
-            if not b['code'].endswith('\n'):
+            f.write(file_content)
+            if not file_content.endswith('\n'):
                 f.write('\n')
 
         manifest_rows.append((case_id, doc_tag, heading_slug, cls, expectation, notes))
@@ -334,3 +489,8 @@ counts = Counter(r[3] for r in manifest_rows)
 print("Classification summary:", file=sys.stderr)
 for cls, cnt in sorted(counts.items()):
     print(f"  {cls}: {cnt}", file=sys.stderr)
+
+chained_count = sum(1 for r in manifest_rows if 'chained:' in r[5])
+elided_count = sum(1 for r in manifest_rows if 'skip:elided' in r[5])
+print(f"  chained cases: {chained_count}", file=sys.stderr)
+print(f"  skip:elided cases: {elided_count}", file=sys.stderr)

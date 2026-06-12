@@ -1,13 +1,7 @@
-public async method OpenFiles(paths: Array<string>): OwnedAsyncEnumerable<FileStream>
+public async method LoadAllConfigs(paths: Array<string>): OwnedTask<OwnedArray<Config>>
+  var tasks := new OwnedArray<OwnedTask<Config>>();
   for var path in paths do
-    yield return await OpenFileAsync(path);
+    tasks.Add(LoadConfigAsync(path));    // each task is OwnedTask<Config>; transfers in
   end;
-end OpenFiles;
-
-// Consumer takes ownership of each FileStream:
-public async method ProcessAll(paths: Array<string>): Task
-  await for var file in OpenFiles(paths) do
-    using var f := file;      // discharge on entry — covers all exit edges
-    await ProcessAsync(f);
-  end;
-end ProcessAll;
+  return await Task.WhenAllOwned(tasks); // tasks consumed; returned array owns the configs
+end LoadAllConfigs;

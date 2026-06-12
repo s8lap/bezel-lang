@@ -1,7 +1,2 @@
-using var guard := await mutex.AcquireAsync();
-// critical section; guard disposed at scope end.
-
-using var maybe := await mutex.TryAcquireAsync(TimeSpan.FromSeconds(5));
-if maybe <> null then
-  // critical section
-end;
+using var guard := mutex.Acquire();
+// critical section; guard disposed at scope end -> mutex released.

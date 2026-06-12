@@ -1,3 +1,11 @@
+public interface IEvent<out T>
+  method Subscribe(handler: (T) -> ()): owned Subscription;
+end IEvent;
+
+public interface IAsyncEvent<out T>
+  method Subscribe(handler: (T) -> Task): owned Subscription;
+end IAsyncEvent;
+
 public class EventSource<T>: IEvent<T>
   // No public constructor; obtained via event declaration.
   public method Subscribe(handler: (T) -> ()): owned Subscription;

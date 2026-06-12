@@ -1,9 +1,15 @@
-public class WString
-  // No public constructor; obtained via factory methods.
+/// Compiler-intrinsic; pointer-sized integer (32 or 64 bits depending on target).
+public record IntPtr
+  public static const Zero: IntPtr;
 
-  public static method From(s: string): owned WString;
+  public static method operator =(a: IntPtr, b: IntPtr): bool;
+  public static method operator <>(a: IntPtr, b: IntPtr): bool;
+end IntPtr;
 
-  public readonly property Length: int;       // length in UTF-16 code units, excluding the null terminator
+/// Compiler-intrinsic; unsigned pointer-sized integer.
+public record UIntPtr
+  public static const Zero: UIntPtr;
 
-  destructor;       // releases the underlying buffer
-end WString;
+  public static method operator =(a: UIntPtr, b: UIntPtr): bool;
+  public static method operator <>(a: UIntPtr, b: UIntPtr): bool;
+end UIntPtr;
