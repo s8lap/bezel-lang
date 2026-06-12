@@ -728,6 +728,35 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 ta->declaration &&
                                 ta->declaration->kind == ast::TypeDeclKind::Class) {
                                 argIsClass = true;
+                            } else if (ta->kind == TypeRef::Kind::Named &&
+                                       !ta->declaration &&
+                                       ta->astNode && ta->astNode->name &&
+                                       !ta->astNode->name->parts.empty()) {
+                                // §28.13 v0.140 / #689: compiler-known stdlib class types
+                                // (Mutex, Atomic<T>, AtomicInteger<T>, Semaphore, Channel<T>,
+                                // ChannelSender<T>, and other compiler-known classes like Lock,
+                                // OwnedArray<T>, etc.) have no user TypeDecl but are classes.
+                                // Accept all builtin named types here; the Shared<T> sendability
+                                // rule in isSendable (ExprTypecheck_Calls.cpp) further restricts
+                                // which of these are sendable across domains.
+                                std::string_view taname = ta->astNode->name->parts[0];
+                                // The full set of compiler-known class types (not value types,
+                                // not records/enums/interfaces): Mutex, Lock, Atomic<T>,
+                                // AtomicInteger<T>, Semaphore, Channel<T>, ChannelSender<T>,
+                                // Task, OwnedTask, OwnedArray, OwnedStack, OwnedQueue,
+                                // OwnedSet, OwnedLinkedList, OwnedDictionary, Array, Stack,
+                                // Queue, Set, LinkedList, Dictionary, EventSource,
+                                // AsyncEventSource, Shared, Weak.
+                                // Excluded: string (primitive), Object (primitive), int etc.
+                                // For simplicity: if the type arg is a Named builtin (no decl)
+                                // and is not a primitive, treat it as a class type.
+                                // The "T must be a class" guard's purpose is to exclude
+                                // primitives, records, enums, interfaces, and functions —
+                                // all of which either have no heap-allocated class disposal
+                                // obligation or are represented differently.
+                                // Builtin named types without a user decl are all class-like
+                                // (heap-allocated, runtime-managed, disposable).
+                                argIsClass = true;
                             } else {
                                 // Produce a human-readable type name for the diagnostic.
                                 if (ta->kind == TypeRef::Kind::Primitive) {

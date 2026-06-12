@@ -5556,9 +5556,16 @@ bool ExprTC::isSendable(const TypeRef* rt,
         if (!bname.empty()) {
             // §30.14 stdlib table: NOT sendable (domain-local or borrow-carrying).
             //   Task<T>, OwnedTask<T>, Task (bare): domain-local.
-            //   Shared<T>, Weak<T>: ref-count not synchronized (§28.13).
+            //   Weak<T>: v0.140 lifted Shared<T> handles but NOT Weak<T> — a
+            //     Weak<T> across domains leaves TryUpgrade racing with the last
+            //     strong drop on another domain; the CAS in TryUpgrade is safe
+            //     but the spec text was conservative: only handles (Shared<T>)
+            //     were lifted, not weak handles.  Weak stays domain-local.
             //   EventSource<T>, AsyncEventSource<T>: domain-local.
             //   Semaphore: domain-local synchronization primitive.
+            //     NOTE: Semaphore IS in the internally-synchronized set for
+            //     Shared<Semaphore> purposes (§28.13 v0.140) but a raw Semaphore
+            //     handle is NOT itself sendable (domain-local; stdlib §6.3).
             //   Lock: held guard is domain-local; must be released in the acquiring
             //     domain (stdlib §6.2 v0.138 / #647).
             //   CancellationTokenSource, CancellationToken: borrow-bearing record.
@@ -5566,7 +5573,7 @@ bool ExprTC::isSendable(const TypeRef* rt,
             //   / #647: Mutex is internally synchronized, like Channel<T>, and may
             //   be reached by multiple domains simultaneously.
             if (bname == "Task" || bname == "OwnedTask" ||
-                bname == "Shared" || bname == "Weak" ||
+                bname == "Weak" ||
                 bname == "EventSource" || bname == "AsyncEventSource" ||
                 bname == "Semaphore" ||
                 bname == "Lock" ||
@@ -5576,6 +5583,25 @@ bool ExprTC::isSendable(const TypeRef* rt,
             // ("CancellationToken is a borrow-bearing record and therefore
             //  not sendable by the value-type rule").
             if (bname == "CancellationToken") return false;
+
+            // §28.13 v0.140 / #689: Shared<T> is sendable iff T is sendable AND
+            // internally synchronized (compiler-known set: Mutex, Atomic<T>,
+            // AtomicInteger<T>, Semaphore — per spec §28.13 sendability rule).
+            // Shared<string>/Shared<UserClass>/etc. remain domain-local.
+            // Prerequisite: the control block counts are now atomic (§689 stage 1).
+            if (bname == "Shared") {
+                if (rt->genericArgs.empty() || !rt->genericArgs[0])
+                    return false;
+                const TypeRef* T = rt->genericArgs[0];
+                // T must be in the compiler-known internally-synchronized set.
+                std::string_view tname = builtinTypeName(T);
+                if (tname == "Mutex")           return true;
+                if (tname == "Atomic")          return true;
+                if (tname == "AtomicInteger")   return true;
+                if (tname == "Semaphore")       return true;
+                // All other T: domain-local, not sendable.
+                return false;
+            }
 
             // §30.14 stdlib table: sendable iff element sendable.
             //   OwnedArray<T>, OwnedStack<T>, OwnedQueue<T>, OwnedSet<T>,
