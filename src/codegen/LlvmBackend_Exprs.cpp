@@ -6017,13 +6017,30 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     const bool importedGenericNoBody =
         importedGeneric && t->kind == ast::TypeDeclKind::Class &&
         !hasAnyConstructor(t);
+    // #662 foundation C: imported generic class WITH a loaded ctor body.
+    // The ctor body was re-parsed + sema'd in the loader; cs->decl is set.
+    // We install the per-instantiation vtable via emitInstanceInit (same as
+    // Foundation A), then fall through to the inline-ctor path below.
+    const sema::ConstructorSymbol* importedGenericExplicitCs = nullptr;
+    if (importedGeneric && !importedGenericNoBody &&
+        t->kind == ast::TypeDeclKind::Class) {
+        for (sema::Symbol* m : t->members) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+            if (cs && !cs->isStatic && cs->decl != nullptr) {
+                importedGenericExplicitCs = cs;
+                break;
+            }
+        }
+    }
+    const bool importedGenericWithBody =
+        importedGenericExplicitCs != nullptr;
     if (ctx_.isImported(t) && !importedGeneric) {
         llvm::Function* initFn = declareImportedInit(t);
         builder_.CreateCall(initFn, {obj});
-    } else if (importedGenericNoBody) {
-        // Use emitInstanceInit (which routes to buildImportedGenericVtable)
-        // to install the per-instantiation vtable.  Imported fields have no
-        // AST initializers → calloc already zeroed them.
+    } else if (importedGenericNoBody || importedGenericWithBody) {
+        // Foundation A: no explicit ctor — install vtable, no ctor body.
+        // Foundation C: explicit ctor with loaded body — install vtable first,
+        // then fall through to the inline-ctor path (hasAnyConstructor guard).
         emitInstanceInit(t, obj, st);
     } else if (!ctx_.isImported(t)) {
         // §22.10 / §22.8 (#478): a class with primary-constructor parameters
@@ -6081,12 +6098,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         emitInstanceInit(t, obj, st);
         currentThis_ = savedThisForInit;
     }
-    if (importedGeneric && !importedGenericNoBody) {
-        // Still-gated shape (has ctor body / field inits): return as-is.
+    if (importedGeneric && !importedGenericNoBody && !importedGenericWithBody) {
+        // Still-gated shape (explicit ctor but body not loaded): return as-is.
         // The backstop prevents codegen from emitting a dangling external
         // bz$<Type>$init / bz$<Type>$ctor reference (the FINDING [2] link
-        // failure).  importedGenericNoBody shapes fall through below so that
-        // the hasAnyConstructor guard chain (implicit-base call) runs.
+        // failure).  Foundation A+C shapes fall through below so that
+        // the hasAnyConstructor guard chain (inline-ctor call) runs.
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         return obj;  // decline: no dangling per-type symbol for a generic import
@@ -6112,6 +6129,66 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // check (cross-module ctor overloads + by-ref binding are deferred); an
     // imported type cannot be generic-substituted in this path (its struct is
     // built from reconstructed field types, not a live template).
+    // §14/#662 Foundation C: imported generic CLASS with a loaded ctor body.
+    // Inline the ctor body (same inline path as local generics) with
+    // genericSubst_ active so field GEPs use the spec struct layout and
+    // parameter stores use the concrete types.  The vtable was already installed
+    // by emitInstanceInit above (importedGenericWithBody branch).
+    if (importedGenericWithBody) {
+        auto* cs = const_cast<sema::ConstructorSymbol*>(importedGenericExplicitCs);
+        // Build arg list: lower under the OUTER subst (savedSubst) — the args are
+        // caller-scope expressions — then restore the new type's subst for
+        // the inline body, matching the local-generic path (#597).
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (cd) {
+            std::vector<llvm::Value*> args;
+            args.push_back(obj);
+            auto ctorArgSubst = genericSubst_;
+            auto ctorArgSemaTy = genericSubstSemaTy_;
+            genericSubst_ = savedSubst;
+            genericSubstSemaTy_ = savedSemaTy;
+            std::vector<const ast::Expr*> ctorArgExprs;
+            bool builtArgs = buildOrderedArgs(cd->params, ne.args, args, &ctorArgExprs);
+            genericSubst_ = std::move(ctorArgSubst);
+            genericSubstSemaTy_ = std::move(ctorArgSemaTy);
+            if (builtArgs && args.size() == cs->params.size() + 1) {
+                llvm::Value* savedThis = currentThis_;
+                auto savedLocals = locals_;
+                auto savedParams = paramSlots_;
+                llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
+                std::size_t savedUnwindDepth = unwindScopeDepth_;
+                currentThis_ = obj;
+                locals_.clear();
+                paramSlots_.clear();
+                // Bind ctor params to the lowered arg values.
+                for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
+                    auto* slot = entryAlloca(args[pi + 1]->getType());
+                    builder_.CreateStore(args[pi + 1], slot);
+                    paramSlots_[cs->params[pi]] = slot;
+                }
+                inlineCtorBody(cs, obj);
+                unwindTarget_ = savedUnwindTarget;
+                unwindScopeDepth_ = savedUnwindDepth;
+                currentThis_ = savedThis;
+                locals_ = std::move(savedLocals);
+                paramSlots_ = std::move(savedParams);
+                // Release any +1 string producer ctor args after body completes.
+                if (!diverged_) {
+                    for (std::size_t ai = 1;
+                         ai < args.size() && ai < ctorArgExprs.size() + 1; ++ai) {
+                        if (ctorArgExprs[ai - 1] &&
+                            isPlusOneStringProducer(ctorArgExprs[ai - 1]))
+                            emitStringRelease(args[ai]);
+                    }
+                }
+            }
+        }
+        emitNewPendingCheck(obj);
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        return obj;
+    }
+
     if (ctx_.isImported(t)) {
         bool allPositional = true;
         for (const auto& a : ne.args)

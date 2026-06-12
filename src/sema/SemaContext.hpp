@@ -107,6 +107,11 @@ public:
         auto it = exprSymbols_.find(&e);
         return it == exprSymbols_.end() ? nullptr : it->second;
     }
+    // §14/#662c: iterate all expr→symbol entries (used by ModuleLoader to
+    // remap fresh-context symbols to imported symbols after re-parsing a ctor body).
+    const std::unordered_map<const ast::Expr*, Symbol*>& allExprSymbols() const {
+        return exprSymbols_;
+    }
 
     // A small primitive-type cache: looking up the same primitive shape
     // (Int, Bool, String, …) should return the same TypeRef so equality
@@ -167,6 +172,21 @@ public:
     // §2.1 dotted name. One module may export many types.
     void registerImportedType(const std::string& moduleName, TypeSymbol* t) {
         importedByModule_[moduleName].push_back(t);
+    }
+
+    // §14 / #662c: take ownership of a re-parsed SourceFile that holds
+    // ctor/dtor AST nodes for imported generic classes.  The SourceFile's
+    // lifetime is tied to this SemaContext so that symbol decl pointers
+    // remain valid through codegen.
+    void ownImportedAst(std::unique_ptr<ast::SourceFile> sf) {
+        importedCtorAst_.push_back(std::move(sf));
+    }
+
+    // §14 / #662c: keep the synthetic source string alive so that all
+    // std::string_view fields in the re-parsed AST (IdentifierExpr::name,
+    // AssignmentStmt::op, etc.) remain valid for the lifetime of this context.
+    void ownImportedSource(std::string src) {
+        importedSources_.push_back(std::move(src));
     }
 
     // The exported types of a loaded module, or null if the module was never
@@ -263,6 +283,16 @@ private:
     std::unordered_map<const Symbol*, TypeRef*> importedMemberTypes_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
+    // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor
+    // AST nodes for imported generic classes.  The re-parsed AST carries
+    // ConstructorDecl / DestructorDecl nodes whose decl pointers are attached
+    // to the reconstructed ConstructorSymbol / DestructorSymbol; the SourceFile
+    // must stay alive for the lifetime of this SemaContext so those pointers
+    // remain valid.  Completely independent of the importer's own SourceFile.
+    std::vector<std::unique_ptr<ast::SourceFile>> importedCtorAst_;
+    // Backing storage for synthetic source strings whose string_view fields
+    // are referenced by re-parsed AST nodes in importedCtorAst_.
+    std::vector<std::string> importedSources_;
     ModuleSymbol* module_ = nullptr;
     // Scope IDs are assigned in DFS order. `kModuleScope` (=1) is the
     // initial module scope; everything nested gets a fresh ID > 1.

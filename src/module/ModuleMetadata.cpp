@@ -131,6 +131,8 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashBool(h, m.hasEnumValue);
     hashU64(h, static_cast<std::uint64_t>(m.enumValue));
     hashStr(h, m.valueText);  // §22.12 const value (issue #328 FINDING [3] BUG A)
+    // §14 / #662c (schema v5): ctor body source text for generic classes.
+    hashStr(h, m.ctorBodyText);
     // §11.3 (issue #502): hash nested type when present.
     hashBool(h, m.nestedType != nullptr);
     if (m.nestedType) hashTypeDecl(h, *m.nestedType);
@@ -150,6 +152,8 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
     for (const MetaMember& m : ty.members) hashMember(h, m);
     // §9.2 (issue #501): include the positional-record flag.
     hashBool(h, ty.hasPositionalFields);
+    // §14 / #662c (schema v5): destructor body source text for generic classes.
+    hashStr(h, ty.dtorBodyText);
 }
 
 } // namespace
@@ -220,6 +224,7 @@ bool MetaParam::operator==(const MetaParam& o) const {
 MetaMember::MetaMember(const MetaMember& o)
     : kind(o.kind), name(o.name), visibility(o.visibility),
       modifiers(o.modifiers), type(o.type), valueText(o.valueText),
+      ctorBodyText(o.ctorBodyText),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -231,6 +236,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
     if (this != &o) {
         kind = o.kind; name = o.name; visibility = o.visibility;
         modifiers = o.modifiers; type = o.type; valueText = o.valueText;
+        ctorBodyText = o.ctorBodyText;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
@@ -250,14 +256,16 @@ bool MetaMember::operator==(const MetaMember& o) const {
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
-           valueText == o.valueText && nestedEq;
+           valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
+           nestedEq;
 }
 
 bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
     return name == o.name && kind == o.kind && visibility == o.visibility &&
            modifiers == o.modifiers && genericParams == o.genericParams &&
            baseTypes == o.baseTypes && members == o.members &&
-           hasPositionalFields == o.hasPositionalFields;
+           hasPositionalFields == o.hasPositionalFields &&
+           dtorBodyText == o.dtorBodyText;
 }
 
 bool MetaFunction::operator==(const MetaFunction& o) const {
@@ -369,6 +377,14 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // REC_STRING after the params. A v1 reader skips it (skip-unknown); a v2
     // reader reads it tolerantly and an absent record yields "" (a v1 blob).
     emitString(w, m.valueText);
+    // §14 / #662c (schema v5): for a Constructor member, a second trailing
+    // REC_STRING carries the ctor body source text for imported generic classes.
+    // A v4 reader hits finishBlockImpl which skips all trailing content after
+    // valueText, so the extra string is silently ignored (tolerant skip-unknown).
+    // An empty ctorBodyText is still emitted for Constructor members (a zero-
+    // length REC_STRING) so readMemberBody can capture it predictably.
+    if (m.kind == MetaMemberKind::Constructor)
+        emitString(w, m.ctorBodyText);
     // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
     // type's full declaration as an embedded TYPE_BLOCK. The trailing
     // finishBlockImpl in readMemberBody skips it for v3 readers (they never
@@ -398,6 +414,12 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     for (const MetaGenericParam& g : ty.genericParams) emitGeneric(w, g);
     for (const MetaType& b : ty.baseTypes) emitType(w, b);
     for (const MetaMember& m : ty.members) emitMember(w, m);
+    // §14 / #662c (schema v5): for a GENERIC class, a trailing REC_STRING after
+    // the members carries the destructor body source text (empty = no user body).
+    // v4 readers encounter finishBlock which skips all trailing content, so this
+    // is silently ignored (tolerant skip-unknown). Only emit for generic classes.
+    if (!ty.genericParams.empty())
+        emitString(w, ty.dtorBodyText);
     w.ExitBlock();
 }
 
@@ -802,8 +824,43 @@ bool readMemberBody(Reader& r, MetaMember& m) {
             return false;  // Error
         }
     }
-    // Non-NestedType: use the original tolerant REC_STRING capture path.
-    return finishBlockImpl(r, &m.valueText);
+    // Non-NestedType: scan trailing REC_STRINGs.
+    // - First REC_STRING → valueText  (schema v2+)
+    // - Second REC_STRING → ctorBodyText for Constructor  (#662c schema v5)
+    // A v4 or earlier blob has at most one trailing REC_STRING; the second
+    // capture is simply never reached.
+    {
+        std::string* caps[2] = { &m.valueText, nullptr };
+        if (m.kind == MetaMemberKind::Constructor)
+            caps[1] = &m.ctorBodyText;
+        int capIdx = 0;
+        while (true) {
+            unsigned id = 0;
+            Next n = nextEntry(r, id);
+            if (n == Next::EndBlock) {
+                r.cursor.ReadBlockEnd();
+                return true;
+            }
+            if (n == Next::Record) {
+                llvm::SmallVector<std::uint64_t, 32> vals;
+                auto got = r.cursor.readRecord(id, vals);
+                if (!got) { llvm::consumeError(got.takeError()); return false; }
+                if (got.get() == REC_STRING && capIdx < 2 && caps[capIdx]) {
+                    caps[capIdx]->clear();
+                    caps[capIdx]->reserve(vals.size());
+                    for (std::uint64_t v : vals)
+                        caps[capIdx]->push_back(static_cast<char>(v & 0xFF));
+                    ++capIdx;
+                }
+                continue;
+            }
+            if (n == Next::SubBlock) {
+                if (r.cursor.SkipBlock()) return false;
+                continue;
+            }
+            return false;  // Error
+        }
+    }
 }
 
 bool readMember(Reader& r, MetaMember& m) {
@@ -836,7 +893,11 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     for (std::uint64_t i = 0; i < nMembers; ++i) {
         if (!readMember(r, ty.members[i])) return false;
     }
-    return finishBlock(r);
+    // §14 / #662c (schema v5): trailing REC_STRING = dtorBodyText for generic
+    // classes.  A v4 reader's finishBlock already skips all trailing content,
+    // so this is safe.  Capture the first trailing REC_STRING as dtorBodyText.
+    return finishBlockImpl(r, !ty.genericParams.empty() ? &ty.dtorBodyText
+                                                        : nullptr);
 }
 
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty) {

@@ -33,6 +33,7 @@
 // look for the section is unaffected.
 
 #include <cstddef>
+#include <string_view>
 
 #include "module/ModuleMetadata.hpp"
 
@@ -60,13 +61,22 @@ inline constexpr const char* kMetadataGlobalName = "__bezel_module_metadata";
 // compiled). Walks ctx.module()'s children, including only the §13 public
 // surface (see the file header). Returns an empty-but-named metadata when the
 // module has no exported declarations. Pure: touches no LLVM state.
-ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx);
+//
+// `source` — optional view of the original source text. When non-empty, generic
+// class constructors and destructors with bodies have their source text extracted
+// (via AST span offsets) and stored in ctorBodyText / dtorBodyText (#662c).
+// When empty, those fields stay empty and the §14 gate is not lifted.
+ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
+                                   std::string_view source = {});
 
 // Emit hook (§2.6 step 4): build the metadata from `ctx`, serialize it
 // (Increment 1's LLVM bitstream), and embed the bytes into `module` as a
 // constant global in the `.bezel.meta` object section. Called by the AOT driver
 // after the LLVM module is built and before the object file is written. Returns
 // the byte length of the embedded blob.
-std::size_t embedModuleMetadata(llvm::Module& module, sema::SemaContext& ctx);
+//
+// `source` — see buildModuleMetadata.
+std::size_t embedModuleMetadata(llvm::Module& module, sema::SemaContext& ctx,
+                                std::string_view source = {});
 
 }  // namespace bezel::module

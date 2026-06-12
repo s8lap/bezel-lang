@@ -320,13 +320,17 @@ std::vector<MetaGenericParam> convertGenericParams(
 
 // Forward declaration — defined after appendEnumConstants (§11.3, issue #502):
 // convertMember needs to call convertTypeDecl for nested types.
-MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx);
+MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
+                              std::string_view source);
 
 // Convert a single exported member. Returns false to skip (kind not part of the
 // exported surface — e.g. a destructor, which §13.3 notes is not user-callable;
 // its public face is Dispose()).
+// `isGenericType` — true when the owning type has generic parameters (§14);
+// only then are ctor/dtor body texts extracted for Foundation C.
 bool convertMember(const sema::MemberSymbol& m, bool inInterface,
-                   sema::SemaContext& ctx, MetaMember& out) {
+                   sema::SemaContext& ctx, MetaMember& out,
+                   bool isGenericType, std::string_view source) {
     out.visibility = toMetaVisibility(m.visibility, inInterface);
     out.modifiers = toStrings(m.modifiers);
     out.name = std::string(m.name);
@@ -383,8 +387,20 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
     if (auto* ctor = dynamic_cast<const sema::ConstructorSymbol*>(&m)) {
         out.kind = MetaMemberKind::Constructor;
         out.params = convertParams(ctor->params, ctx);
-        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.decl))
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.decl)) {
             fillParamDefaults(out.params, cd->params);
+            // §14 / #662c: for a GENERIC class, export the full constructor
+            // declaration source text (extracted via AST span) so the importer
+            // can re-parse and inline it with genericSubst_ active.  The span
+            // is stamped by parseMember (#662c change); skip if zero (no span).
+            if (isGenericType && !source.empty() &&
+                cd->span.begin.offset < cd->span.end.offset &&
+                cd->span.end.offset <= source.size()) {
+                out.ctorBodyText = std::string(
+                    source.substr(cd->span.begin.offset,
+                                  cd->span.end.offset - cd->span.begin.offset));
+            }
+        }
         return true;
     }
     if (auto* prop = dynamic_cast<const sema::PropertySymbol*>(&m)) {
@@ -430,7 +446,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         // set above (out.name = mm.name, out.visibility = ..., out.modifiers = ...).
         // Emit the inner TypeSymbol's full declaration as `nestedType`.
         out.nestedType = std::make_unique<MetaTypeDecl>(
-            convertTypeDecl(*nts->type, ctx));
+            convertTypeDecl(*nts->type, ctx, source));
         return true;
     }
     return false;
@@ -473,7 +489,8 @@ void appendEnumConstants(const ast::TypeDecl& td, MetaTypeDecl& out) {
 
 // --- types ------------------------------------------------------------------
 
-MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx) {
+MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
+                              std::string_view source) {
     MetaTypeDecl out;
     out.name = std::string(t.name);
     out.kind = toMetaTypeDeclKind(t.kind);
@@ -485,6 +502,8 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx) 
     out.hasPositionalFields = t.hasPositionalFields;
 
     const bool inInterface = (t.kind == ast::TypeDeclKind::Interface);
+    const bool isGenericClass = !t.genericParams.empty() &&
+                                t.kind == ast::TypeDeclKind::Class;
 
     // §14 generic params + their §14.2 constraints (from the TypeDecl AST).
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl)) {
@@ -502,7 +521,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx) 
         if (member == nullptr) continue;
         if (!isExportedMember(member->visibility, inInterface)) continue;
         MetaMember mm;
-        if (convertMember(*member, inInterface, ctx, mm))
+        if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source))
             out.members.push_back(std::move(mm));
     }
 
@@ -516,6 +535,28 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx) 
             // (EnumConstantSymbol is a MemberSymbol; convertMember returns
             // false for it, so it was filtered out — re-add here with values.)
             appendEnumConstants(*td, out);
+        }
+    }
+
+    // §14 / #662c: for a GENERIC class, extract the destructor body source text
+    // so the importer can run user destructor side-effects (#662 foundation C).
+    // The destructor is skipped by convertMember (§13.3 not user-callable), so
+    // we walk members here to find a DestructorDecl with a non-empty body.
+    if (isGenericClass && !source.empty()) {
+        for (sema::Symbol* ms : t.members) {
+            const auto* ds = dynamic_cast<const sema::DestructorSymbol*>(ms);
+            if (!ds) continue;
+            if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(ds->decl)) {
+                if (!dd->body.empty() &&
+                    dd->span.begin.offset < dd->span.end.offset &&
+                    dd->span.end.offset <= source.size()) {
+                    out.dtorBodyText = std::string(
+                        source.substr(dd->span.begin.offset,
+                                      dd->span.end.offset -
+                                          dd->span.begin.offset));
+                }
+            }
+            break;  // at most one destructor per class
         }
     }
 
@@ -552,7 +593,8 @@ void pinInLlvmUsed(llvm::Module& module, llvm::GlobalVariable* gv) {
 
 }  // namespace
 
-ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx) {
+ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
+                                    std::string_view source) {
     ModuleMetadata md;
     sema::ModuleSymbol* mod = ctx.module();
     if (mod == nullptr) return md;  // no module (front-end error path)
@@ -578,7 +620,7 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(child);
         if (ts == nullptr) continue;  // aliases/extensions/externs: see note
         if (!isExportedType(*ts)) continue;  // §13.2 internal types not exported
-        md.types.push_back(convertTypeDecl(*ts, ctx));
+        md.types.push_back(convertTypeDecl(*ts, ctx, source));
         md.exports.push_back(std::string(ts->name));  // §2.4 exported name
     }
 
@@ -593,11 +635,12 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx) {
     return md;
 }
 
-std::size_t embedModuleMetadata(llvm::Module& module, sema::SemaContext& ctx) {
+std::size_t embedModuleMetadata(llvm::Module& module, sema::SemaContext& ctx,
+                                std::string_view source) {
     // §2.6 step 4: build → serialize → embed. Build the by-value metadata for
     // the just-compiled module and serialize it with Increment 1's bitstream
     // codec.
-    ModuleMetadata md = buildModuleMetadata(ctx);
+    ModuleMetadata md = buildModuleMetadata(ctx, source);
     std::vector<std::uint8_t> bytes = serialize(md);
 
     llvm::LLVMContext& llvm = module.getContext();

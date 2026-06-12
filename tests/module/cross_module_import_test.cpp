@@ -62,7 +62,8 @@ ModuleMetadata buildMetaFor(std::string_view source) {
     sema::collectSymbols(*sf, ctx);
     sema::resolveTypes(*sf, ctx);
     sema::typecheckExpressions(*sf, ctx);
-    return buildModuleMetadata(ctx);
+    // #662c: pass source so ctor/dtor body texts are extracted for generic classes.
+    return buildModuleMetadata(ctx, source);
 }
 
 // Run the importer front-end (`importerSource`) against a dependency's metadata
@@ -1124,7 +1125,10 @@ BEZEL_TEST(cross_module_import, imported_enum_implicit_values_spec_10_1) {
 // `bz$Box$init` reference that no object defined → `undefined reference to
 // bz$Box$init` at link time. After: sema rejects the construction up front with
 // a diagnostic that names the limitation.
-BEZEL_TEST(cross_module_import, imported_generic_new_rejected_spec_14) {
+// §14/#662 Foundation C: imported generic class WITH a ctor body is now ACCEPTED
+// (ctor body text is exported in schema v5 metadata and re-parsed on import).
+// Previously gated; now compiles clean — no §14 error.
+BEZEL_TEST(cross_module_import, imported_generic_new_accepted_spec_14_662c) {
     ModuleMetadata dep = buildMetaFor(
         "module BoxLib; "
         "public class Box<T> "
@@ -1142,16 +1146,8 @@ BEZEL_TEST(cross_module_import, imported_generic_new_rejected_spec_14) {
         "    return b.value; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_TRUE(r->hadErrors);
-    // The diagnostic must name the imported-generic-construction limitation, so
-    // the failure is an honest compile error rather than a cryptic linker error.
-    bool sawLimitation = false;
-    for (const Diagnostic& d : r->diags.diagnostics()) {
-        if (d.message.find("imported generic") != std::string::npos &&
-            d.message.find("\xC2\xA7""14") != std::string::npos)
-            sawLimitation = true;
-    }
-    BEZEL_EXPECT_TRUE(sawLimitation);
+    // Foundation C: ctor body text exported + re-parsed → no §14 error.
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
 // §14 / §2.5 (FINDING [2]): a NON-generic imported `new` is unaffected by the
@@ -1183,10 +1179,13 @@ BEZEL_TEST(cross_module_import, imported_nongeneric_new_still_ok_spec_2_5) {
 // a confusing linker error or a crash. The library compiles fine (a generic
 // template's `bz$<Type>$ctor`/`$Dispose` are emitted; its per-instantiation init
 // is not a stable symbol); the importer's compile fails at sema before any
-// dangling `bz$<Type>$init` reference is emitted.
-BEZEL_TEST(cross_module_import, imported_generic_new_native_clean_failure_spec_14) {
+// §14/#662 Foundation C: imported generic class with explicit ctor body now
+// COMPILES AND LINKS (ctor body text exported in metadata, re-parsed on import,
+// inlined at the `new` site with genericSubst_ active). Returns b.value = 42
+// (the ctor stored the argument into `value`).
+BEZEL_TEST(cross_module_import, imported_generic_ctor_body_native_spec_14_662c) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_genbox_" + std::to_string(std::rand());
+    std::string stem = "bezel_xm_genbox662c_" + std::to_string(std::rand());
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1205,12 +1204,11 @@ BEZEL_TEST(cross_module_import, imported_generic_new_native_clean_failure_spec_1
         "public class Program "
         "  public static method Main(): int "
         "    using var b := new Box<int>(42); "
-        "    return b.value; "
+        "    return b.value; "  // ctor stored 42 into value
         "  end Main; "
         "end Program;");
 
     bezel::Driver driver;
-    // The library compiles (a generic template is emittable single-module).
     bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
     BEZEL_EXPECT_TRUE(ra.success);
     if (!ra.success) return;
@@ -1220,11 +1218,15 @@ BEZEL_TEST(cross_module_import, imported_generic_new_native_clean_failure_spec_1
     d.metadataPath = aObj.path;
     d.objectPath = aObj.path;
     deps.push_back(d);
-    // The importer must FAIL CLEANLY (a compile error from sema), not link.
+    // Foundation C: compile + link succeeds (no §14 error; ctor body inlined).
     bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
-    BEZEL_EXPECT_TRUE(!rb.success);
-    // No executable should have been produced (the build aborted before link).
-    BEZEL_EXPECT_TRUE(!std::filesystem::exists(bExe.path));
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Run: ctor stored 42 → value; Main returns value = 42.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);
 }
 
 // §14 / §2.5 (FINDING [2]): an imported generic STATIC method with type
@@ -1972,9 +1974,9 @@ BEZEL_TEST(cross_module_import, imported_generic_field_init_class_diagnosed_spec
     BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
-// (9) NEGATIVE — §14 deferred: imported generic CLASS with an explicit constructor
-// BODY must still produce the clean §14 diagnostic.
-BEZEL_TEST(cross_module_import, imported_generic_ctor_body_still_diagnosed_spec_14) {
+// (9) §14/#662 Foundation C: imported generic CLASS with explicit ctor body is
+// now ACCEPTED — ctor body text exported in schema v5 and re-parsed on import.
+BEZEL_TEST(cross_module_import, imported_generic_ctor_body_accepted_spec_14_662c) {
     ModuleMetadata dep = buildMetaFor(
         "module GenLib4; "
         "public class Wrapper<T> "
@@ -1988,12 +1990,12 @@ BEZEL_TEST(cross_module_import, imported_generic_ctor_body_still_diagnosed_spec_
         "import GenLib4; "
         "public class Program "
         "  public static method Main(): int "
-        "    using var w := new Wrapper<int>(3); "  // ctor BODY not yet supported
+        "    using var w := new Wrapper<int>(3); "  // Foundation C: ctor body loaded
         "    return 0; "
         "  end Main; "
         "end Program;");
-    // The construction must be rejected (a diagnostic), not silently miscompiled.
-    BEZEL_EXPECT_TRUE(r->hadErrors);
+    // Foundation C: ctor body exported + re-parsed → accepted with no §14 error.
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
 // === #428 phase B — sema member-type substitution ============================
@@ -2399,12 +2401,11 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
-// (20) §28.4 / §28.5 (#662 foundation B): sema-level check — an imported GENERIC
-// class with an `owned T` field is still §14-gated in the importer (the gate
-// stays until Phase A resolves Blocker 1: vtable for imported generic classes).
-// This is a NEGATIVE test: the importer must NOT accept `new Box<string>(...)`.
+// (20) §28.4 / §28.5 / §14 (#662 foundation C): imported GENERIC class with
+// `owned T` field — Foundation C: ctor body exported + re-parsed → accepted.
+// sema-level check: `new Box<string>("hi")` now compiles without a §14 error.
 BEZEL_TEST(cross_module_import,
-           imported_generic_class_owned_tparam_field_still_gated_spec_14_662b) {
+           imported_generic_class_owned_tparam_field_accepted_spec_14_662c) {
     ModuleMetadata dep = buildMetaFor(
         "module BoxLib; "
         "public class Box<T> "
@@ -2420,13 +2421,12 @@ BEZEL_TEST(cross_module_import,
         "import BoxLib; "
         "public class Program "
         "  public static method Main(): int "
-        "    using var b := new Box<string>(\"hi\"); "  // §14-gated (Blocker 1 open)
+        "    using var b := new Box<string>(\"hi\"); "  // Foundation C: accepted
         "    return 1; "
         "  end Main; "
         "end Program;");
-    // Must diagnose — imported generic CLASS construction is §14-gated until
-    // Phase A (buildImportedGenericVtable) is implemented (Blocker 1).
-    BEZEL_EXPECT_TRUE(r->hadErrors);
+    // Foundation C: ctor body exported + re-parsed → accepted with no §14 error.
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
 // === #662 foundation A — importer-side vtable + disposer for imported generic ===
@@ -2580,11 +2580,11 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
-// (24) §14 (#662 foundation A): imported generic class WITH an explicit ctor
-// body remains §14-gated. The narrowed gate accepts zero-arg-no-body but
-// must still reject classes with explicit constructors.
+// (24) §14/#662 Foundation C: imported generic class WITH an explicit ctor body
+// is now ACCEPTED (schema v5 exports ctor body text; loader re-parses and attaches
+// the ast::ConstructorDecl; gate accepts cs->decl != nullptr).
 BEZEL_TEST(cross_module_import,
-           imported_generic_class_with_ctor_body_still_gated_spec_14_662a) {
+           imported_generic_class_with_ctor_body_accepted_spec_14_662c) {
     ModuleMetadata dep = buildMetaFor(
         "module BoxWithCtorLib; "
         "public class Box<T> "
@@ -2600,18 +2600,293 @@ BEZEL_TEST(cross_module_import,
         "import BoxWithCtorLib; "
         "public class Program "
         "  public static method Main(): int "
-        "    using var b := new Box<int>(42); "  // has ctor → still gated
+        "    using var b := new Box<int>(42); "  // Foundation C: ctor body loaded
         "    return 0; "
         "  end Main; "
         "end Program;");
+    // Foundation C: ctor body exported + re-parsed → accepted with no §14 error.
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// === #662 Foundation C — AOT tests ===========================================
+//
+// Foundation C: imported generic class WITH constructor/destructor bodies.
+// The ctor body text is exported in schema v5 metadata, re-parsed on import
+// with a mini synthetic class source, sema typechecked in a fresh context,
+// expr→symbol mappings remapped to the imported symbols in the main context,
+// and the re-parsed ConstructorDecl attached to the ConstructorSymbol so
+// inlineCtorBody can emit the body with genericSubst_ active (§14.1).
+
+// (25) §14/#662 Foundation C: imported generic class — int field, ctor stores
+// argument into field. `new Box<int>(42)` → `b.value` == 42. Proves the basic
+// ctor-body inline path end to end for an int type-parameter.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_ctor_int_field_native_spec_14_662c) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_662c_int_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module BoxLib; "
+        "public class Box<T> "
+        "  public value: T; "
+        "  public constructor(v: T) value := v; end constructor; "
+        "  destructor end destructor; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import BoxLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(42); "
+        "    return b.value; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // ctor stored 42 → value; b.value == 42.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// (26) §14/#662 Foundation C: two distinct instantiations of the same imported
+// generic class — Box<int>(21) and Box<int>(7). Two independent monomorphizations
+// of the inlined ctor body; both store the right value.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_ctor_two_instantiations_native_spec_14_662c) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_662c_two_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module BoxLib; "
+        "public class Box<T> "
+        "  public value: T; "
+        "  public constructor(v: T) value := v; end constructor; "
+        "  destructor end destructor; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import BoxLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var a := new Box<int>(21); "
+        "    using var b := new Box<int>(7); "
+        "    return a.value + b.value; "  // 21 + 7 == 28
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 28);
+}
+
+// (27) §14/#662 Foundation C: ctor body with arithmetic on params — `counter(a, b)`
+// stores `a * 2 + b` into `n`. Proves the ctor body can contain computed exprs,
+// not just plain field-store assignments.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_ctor_arithmetic_native_spec_14_662c) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_662c_arith_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module CounterLib; "
+        "public class Counter<T> "
+        "  public n: int; "
+        "  public constructor(a: int, b: int) n := a * 2 + b; end constructor; "
+        "  destructor end destructor; "
+        "end Counter;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import CounterLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var c := new Counter<int>(10, 5); "
+        "    return c.n; "  // 10 * 2 + 5 == 25
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 25);
+}
+
+// (28) §14/#28.4/#662 Foundation C: destructor body on imported generic class —
+// the dtor body text is exported in schema v5 (dtorBodyText on MetaTypeDecl),
+// re-parsed and attached to a DestructorSymbol in the imported type. The
+// emitSpecializedDisposer path calls findDestructor + lowerScopedBlock with
+// genericSubst_ active. Simple correctness test: ctor body stores 42 → value,
+// dtor body resets n := 0 (non-trivial body, safe int store). Main returns
+// b.value = 42 (ctor ran); no crash proves dtor body ran safely in the
+// specialized disposer.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_dtor_body_native_spec_14_662c) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_662c_dtor_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module BoxDtorLib; "
+        "public class Box<T> "
+        "  public value: T; "
+        "  public n: int; "
+        "  public constructor(v: T) value := v; n := 1; end constructor; "
+        "  destructor n := 0; end destructor; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import BoxDtorLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(42); "
+        "    return b.value; "  // ctor stored 42; dtor runs at end of using
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Main returns b.value = 42 (ctor ran). No crash = dtor body ran safely.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// (29) §14/#662 Foundation C NEGATIVE: imported generic class WITH explicit ctor
+// whose ctorBodyText was NOT exported (simulates a v4-format metadata blob — the
+// MetaMember::ctorBodyText field is left empty so parseAndAttachCtorBody is never
+// called and cs->decl remains null). The sema gate must still fire and produce the
+// clean §14 diagnostic rather than silently miscompiling.
+// This exercises the "still-gated shape: explicit ctor present but body not loaded"
+// arm in ExprTypecheck_Calls.cpp checkImportedNewExprArgs.
+BEZEL_TEST(cross_module_import,
+           imported_generic_class_ctor_no_body_text_still_gated_spec_14_662c) {
+    // Manually craft a MetaTypeDecl with a Constructor member but empty
+    // ctorBodyText (the v4 schema had no ctor body text field).
+    MetaTypeDecl td;
+    td.name = "Box";
+    td.kind = MetaTypeDeclKind::Class;
+    td.visibility = MetaVisibility::Public;
+    // One generic param T.
+    MetaGenericParam gp;
+    gp.name = "T";
+    gp.variance = "none";
+    td.genericParams.push_back(gp);
+    // A field `value: T`.
+    MetaMember fld;
+    fld.kind = MetaMemberKind::Field;
+    fld.name = "value";
+    fld.visibility = MetaVisibility::Public;
+    fld.type.kind = TypeKind::Named;
+    fld.type.namedName = "T";
+    td.members.push_back(std::move(fld));
+    // A constructor(v: T) with NO ctorBodyText (empty = not exported).
+    MetaMember ctor;
+    ctor.kind = MetaMemberKind::Constructor;
+    ctor.name = "constructor";
+    ctor.visibility = MetaVisibility::Public;
+    MetaParam p;
+    p.name = "v";
+    p.type.kind = TypeKind::Named;
+    p.type.namedName = "T";
+    ctor.params.push_back(std::move(p));
+    // ctorBodyText intentionally left empty (no body text — v4 schema shape).
+    td.members.push_back(std::move(ctor));
+
+    // The ctorBodyText is left empty (default) — simulates a v4-format metadata
+    // blob that was serialized before schema v5 added ctorBodyText export.
+    ModuleMetadata dep;
+    dep.moduleName = "BoxLibV4";
+    dep.exports.push_back("Box");
+    dep.types.push_back(std::move(td));
+
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import BoxLibV4; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var b := new Box<int>(42); "  // ctor body not loaded → gated
+        "    return b.value; "
+        "  end Main; "
+        "end Program;");
+    // Must diagnose: explicit ctor present but cs->decl is null (body not loaded).
     BEZEL_EXPECT_TRUE(r->hadErrors);
-    bool sawLimitation = false;
+    bool sawGateDiag = false;
     for (const Diagnostic& d : r->diags.diagnostics()) {
         if (d.message.find("constructor body") != std::string::npos ||
-            d.message.find("imported generic") != std::string::npos)
-            sawLimitation = true;
+            d.message.find("imported generic") != std::string::npos ||
+            d.message.find("foundation C") != std::string::npos ||
+            d.message.find("metadata") != std::string::npos)
+            sawGateDiag = true;
     }
-    BEZEL_EXPECT_TRUE(sawLimitation);
+    BEZEL_EXPECT_TRUE(sawGateDiag);
 }
 
 }  // namespace bezel::module
