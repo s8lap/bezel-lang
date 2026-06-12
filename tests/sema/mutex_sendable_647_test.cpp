@@ -140,3 +140,49 @@ BEZEL_TEST(mutex_sendable_647,
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasNotSendableDiag(r));
 }
+
+// ---------------------------------------------------------------------------
+// §6.2 / #647 / v0.139: AcquireAsync / TryAcquireAsync are now implemented.
+//
+// These tests confirm that the "not yet implemented" diagnostic is no longer
+// emitted, and that the returned types are correct:
+//   AcquireAsync()        → OwnedTask<Lock>  (await yields Lock)
+//   TryAcquireAsync(ts)   → OwnedTask<Lock?> (await yields Lock?)
+// ---------------------------------------------------------------------------
+
+// §6.2 / #647 / v0.139: AcquireAsync in an async method produces no error.
+// The "not yet implemented (#647 async acquire)" message must NOT appear.
+BEZEL_TEST(mutex_sendable_647,
+           acquire_async_no_longer_not_implemented_6_2_v0139) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Go(): Task "
+        "    using var mutex := new Mutex(); "
+        "    using var guard := await mutex.AcquireAsync(); "
+        "  end Go; "
+        "end C;");
+    // No "not yet implemented" error — AcquireAsync is now live.
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        BEZEL_EXPECT_TRUE(d.message.find("not yet implemented") == std::string::npos);
+    }
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §6.2 / #647 / v0.139: TryAcquireAsync in an async method produces no error.
+BEZEL_TEST(mutex_sendable_647,
+           try_acquire_async_no_longer_not_implemented_6_2_v0139) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static async method Go(): Task "
+        "    using var mutex := new Mutex(); "
+        "    using var guard := await mutex.TryAcquireAsync("
+        "        TimeSpan.FromSeconds(5)); "
+        "  end Go; "
+        "end C;");
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        BEZEL_EXPECT_TRUE(d.message.find("not yet implemented") == std::string::npos);
+    }
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

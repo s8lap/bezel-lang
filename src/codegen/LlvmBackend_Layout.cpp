@@ -434,7 +434,15 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     n == "Channel" || n == "ChannelSender" ||
                     // stdlib §5 (#651): IGrouping<TKey, T> is a compiler-known
                     // pointer (bz_grouping_t*) produced by GroupBy(...).ToArray().
-                    n == "IGrouping") {
+                    n == "IGrouping" ||
+                    // §6.2 / #647: Mutex (bz_mutex_t*) and Lock (bz_lock_t*) are
+                    // compiler-known heap-pointer builtins. Without these entries
+                    // lowerTypeRef fell through to the i32 default →
+                    // `await mutex.AcquireAsync()` returned type Lock was lowered
+                    // to i32, making CreateLoad(i32, resPtr) load 4 bytes from an
+                    // 8-byte result buffer; the loaded i32 was then used as a
+                    // pointer by using-var disposal → segfault / IR mismatch.
+                    n == "Mutex" || n == "Lock") {
                     return ptrTy();
                 }
             }
@@ -500,7 +508,9 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // §30.14/§30.15 (#600 phase c): imported Channel<T>/ChannelSender<T>.
                     n == "Channel" || n == "ChannelSender" ||
                     // stdlib §5 (#651): imported IGrouping<TKey, T>.
-                    n == "IGrouping") {
+                    n == "IGrouping" ||
+                    // §6.2 / #647: imported Mutex (bz_mutex_t*) and Lock (bz_lock_t*).
+                    n == "Mutex" || n == "Lock") {
                     return ptrTy();
                 }
             }

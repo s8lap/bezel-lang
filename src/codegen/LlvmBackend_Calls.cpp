@@ -11955,9 +11955,10 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
 // ---------------------------------------------------------------------------
 // §6.2 / issue #647: Mutex instance methods.
 //
-//   Acquire()                 → bz_mutex_acquire(mx)          → ptr (owned Lock)
-//   TryAcquire(timeout: ts)   → bz_mutex_try_acquire(mx, ms)  → ptr? (owned Lock?)
-//   AcquireAsync / TryAcquireAsync → compile error (not yet implemented)
+//   Acquire()                 → bz_mutex_acquire(mx)             → ptr (owned Lock)
+//   TryAcquire(timeout: ts)   → bz_mutex_try_acquire(mx, ms)     → ptr? (owned Lock?)
+//   AcquireAsync(token?)      → bz_mutex_acquire_async(mx,t,oce) → ptr (OwnedTask<Lock>)
+//   TryAcquireAsync(ts,tok?)  → bz_mutex_try_acquire_async(...)  → ptr (OwnedTask<Lock?>)
 //   Dispose()                 → handled in the explicit-Dispose block above.
 //
 // TryAcquire lowers the TimeSpan argument to milliseconds (i64) using
@@ -12006,11 +12007,71 @@ llvm::Value* Emitter::tryLowerMutexLockCall(const ast::CallExpr& call) {
         return builder_.CreateCall(fn, {mx, msI64}, "mx.tryacq");
     }
 
-    // AcquireAsync / TryAcquireAsync: not yet implemented.
-    // Diagnostic is emitted by sema; codegen returns null so the JIT does not crash.
-    // (The sema error prevents code from reaching codegen, but be defensive.)
-    if (mname == "AcquireAsync" || mname == "TryAcquireAsync") {
-        return nullptr;
+    // §6.2 / #647 / v0.139: AcquireAsync / TryAcquireAsync.
+    //
+    // AcquireAsync(token := CancellationToken.None): OwnedTask<Lock>
+    //   → bz_mutex_acquire_async(mx, token, oce_vtable)
+    // TryAcquireAsync(timeout: TimeSpan,
+    //                  token := CancellationToken.None): OwnedTask<Lock?>
+    //   → bz_mutex_try_acquire_async(mx, timeout_ms, token, oce_vtable)
+    //
+    // token is the last argument (optional with default CancellationToken.None).
+    // If the argument is absent or the runtime default applies, emit a null ptr
+    // (CancellationToken.None = null per §6.1 runtime convention).
+    //
+    // oce_vtable: retrieve from builtinVtable_ for OperationCanceledException;
+    // fall back to null (disables OCE object construction, fault still fires).
+
+    // Helper: retrieve the OCE vtable value (same as in tryLowerStaticCall /
+    // Task.Delay cancelable path).
+    auto getOceVtable = [&]() -> llvm::Value* {
+        auto vit = builtinVtable_.find("OperationCanceledException");
+        if (vit != builtinVtable_.end())
+            return builder_.CreateBitCast(vit->second, ptrTy());
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+
+    // Helper: extract the token argument (last arg, optional).
+    // If not provided or evaluates to a null-typed expr, return null ptr
+    // (CancellationToken.None).
+    auto getTokenArg = [&](size_t argIdx) -> llvm::Value* {
+        if (argIdx < call.args.size() && call.args[argIdx].value) {
+            llvm::Value* tok = lowerExpr(*call.args[argIdx].value);
+            if (tok) return tok;
+        }
+        // Default: CancellationToken.None = null ptr.
+        return llvm::ConstantPointerNull::get(ptrTy());
+    };
+
+    if (mname == "AcquireAsync") {
+        // AcquireAsync(token := CancellationToken.None)
+        // token is args[0] if provided; otherwise null.
+        llvm::Value* token = getTokenArg(0);
+        llvm::Value* oceVtable = getOceVtable();
+        auto* fn = declareC("bz_mutex_acquire_async",
+                             ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {mx, token, oceVtable}, "mx.acq.async");
+    }
+
+    if (mname == "TryAcquireAsync" && !call.args.empty() && call.args[0].value) {
+        // TryAcquireAsync(timeout: TimeSpan,
+        //                  token := CancellationToken.None)
+        // timeout is args[0]; token is args[1] if present.
+        llvm::Value* tsVal = lowerExpr(*call.args[0].value);
+        if (!tsVal) return nullptr;
+        // Convert TimeSpan (i64 ticks, 100-ns units) to milliseconds.
+        if (!tsVal->getType()->isIntegerTy(64))
+            tsVal = builder_.CreateSExtOrTrunc(tsVal, i64(), "ts.i64");
+        auto* msFn = declareC("bz_timespan_total_milliseconds",
+                               llvm::Type::getDoubleTy(llvm_), {i64()});
+        llvm::Value* msDouble = builder_.CreateCall(msFn, {tsVal}, "ts.ms");
+        llvm::Value* msI64 = builder_.CreateFPToSI(msDouble, i64(), "ts.ms.i64");
+        llvm::Value* token = getTokenArg(1);
+        llvm::Value* oceVtable = getOceVtable();
+        auto* fn = declareC("bz_mutex_try_acquire_async",
+                             ptrTy(), {ptrTy(), i64(), ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn,
+            {mx, msI64, token, oceVtable}, "mx.tryacq.async");
     }
 
     return nullptr;
