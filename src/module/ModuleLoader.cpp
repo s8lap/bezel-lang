@@ -476,6 +476,185 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
     return "Object";
 }
 
+// §14/#705: canonical type text for a MetaType, used as a signature key for
+// overload-safe matching (not for source-code generation — that is
+// metaTypeToSourceText).  Uses ',' without space for generic args, and omits
+// the nullable '?' suffix: stubs do not reliably preserve nullability for
+// primitive types, and nullable-vs-non-nullable overloads are rare; the key's
+// purpose is to distinguish base types, not nullability.
+static std::string metaTypeSigText(const MetaType& mt) {
+    if (mt.kind == TypeKind::Primitive) {
+        switch (mt.primitive) {
+            case PrimitiveKind::Bool:    return "bool";
+            case PrimitiveKind::Char:    return "char";
+            case PrimitiveKind::String:  return "string";
+            case PrimitiveKind::Byte:    return "byte";
+            case PrimitiveKind::SByte:   return "sbyte";
+            case PrimitiveKind::Short:   return "short";
+            case PrimitiveKind::UShort:  return "ushort";
+            case PrimitiveKind::Int:     return "int";
+            case PrimitiveKind::UInt:    return "uint";
+            case PrimitiveKind::Long:    return "long";
+            case PrimitiveKind::ULong:   return "ulong";
+            case PrimitiveKind::Float:   return "float";
+            case PrimitiveKind::Double:  return "double";
+            case PrimitiveKind::Decimal: return "decimal";
+            case PrimitiveKind::Object:  return "Object";
+            default:                     return "?";
+        }
+    }
+    if (mt.kind == TypeKind::Named) {
+        std::string s = mt.namedName;
+        if (!mt.genericArgs.empty()) {
+            s += '<';
+            for (std::size_t i = 0; i < mt.genericArgs.size(); ++i) {
+                if (i) s += ',';
+                s += metaTypeSigText(mt.genericArgs[i]);
+            }
+            s += '>';
+        }
+        // Nullable omitted intentionally (see comment above).
+        return s;
+    }
+    return "?";  // Unit, Function, InlineArray: placeholder
+}
+
+// §14/#705: canonical signature key for a MetaMember method or constructor:
+// "name(type0,type1,...)" where typeN = metaTypeSigText(params[i].type).
+// Used as the map key in importedMethods / ctor-matching to distinguish
+// same-name overloads (§22.6 / §22.7).
+static std::string metaMemberSigKey(std::string_view name,
+                                    const std::vector<MetaParam>& params) {
+    std::string key(name);
+    key += '(';
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        if (i) key += ',';
+        key += metaTypeSigText(params[i].type);
+    }
+    key += ')';
+    return key;
+}
+
+// §14/#705: canonical type text from an ast::Type node produced by re-parsing
+// a synthetic stub.  Mirrors metaTypeSigText so that a fresh MethodSymbol's
+// param type produces the same key as the MetaParam it was generated from.
+// Only Named (which covers both user-declared names and primitive keywords)
+// is handled; other shapes return "?" (a no-match sentinel).
+static std::string astTypeToSigText(const ast::Type* t) {
+    if (!t) return "?";
+    if (t->kind == ast::TypeKind::Unit) return "()";
+    if (t->kind == ast::TypeKind::Named && t->name &&
+        !t->name->parts.empty()) {
+        // In Bezel's grammar, primitive keywords (int, bool, string, …) parse
+        // as a single-part NamedType, so parts.back() gives the same spelling
+        // that metaTypeSigText uses.
+        std::string s;
+        for (std::size_t i = 0; i < t->name->parts.size(); ++i) {
+            if (i) s += '.';
+            s += std::string(t->name->parts[i]);
+        }
+        if (!t->genericArgs.empty()) {
+            s += '<';
+            for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                if (i) s += ',';
+                s += astTypeToSigText(t->genericArgs[i].get());
+            }
+            s += '>';
+        }
+        // Nullable omitted (mirrors metaTypeSigText).
+        return s;
+    }
+    return "?";
+}
+
+// §14/#705: canonical signature key from a fresh re-parsed MethodSymbol.
+// Uses astTypeToSigText for each param's declType (the AST type from the
+// synthetic stub).  Must produce the same key as metaMemberSigKey for the
+// MetaMember that generated the stub, so the importedMethods lookup succeeds.
+static std::string freshMethodSigKey(const sema::MethodSymbol* ms) {
+    std::string key(ms->name);
+    key += '(';
+    for (std::size_t i = 0; i < ms->params.size(); ++i) {
+        if (i) key += ',';
+        const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(ms->params[i]);
+        key += astTypeToSigText(ps ? ps->declType : nullptr);
+    }
+    key += ')';
+    return key;
+}
+
+// §14/#705: canonical type text from a reconstructed TypeRef (an imported
+// ParameterSymbol's resolvedDeclType).  Mirrors metaTypeSigText so the same
+// signature key is produced for a MetaParam and its corresponding
+// ParameterSymbol (used for ctor-body attachment matching in facet b).
+static std::string typeRefSigText(const sema::TypeRef* tr) {
+    if (!tr) return "?";
+    switch (tr->kind) {
+        case sema::TypeRef::Kind::Unit:
+            return "()";
+        case sema::TypeRef::Kind::Primitive: {
+            using P = sema::PrimitiveType;
+            switch (tr->primitive) {
+                case P::Bool:    return "bool";
+                case P::Char:    return "char";
+                case P::String:  return "string";
+                case P::Byte:    return "byte";
+                case P::SByte:   return "sbyte";
+                case P::Short:   return "short";
+                case P::UShort:  return "ushort";
+                case P::Int:     return "int";
+                case P::UInt:    return "uint";
+                case P::Long:    return "long";
+                case P::ULong:   return "ulong";
+                case P::Float:   return "float";
+                case P::Double:  return "double";
+                case P::Decimal: return "decimal";
+                case P::Object:  return "Object";
+                default:         return "?";
+            }
+        }
+        case sema::TypeRef::Kind::Named: {
+            std::string s;
+            if (tr->declaration)
+                s = std::string(tr->declaration->name);
+            else if (!tr->importedName.empty())
+                s = std::string(tr->importedName);
+            else
+                return "?";
+            if (!tr->genericArgs.empty()) {
+                s += '<';
+                for (std::size_t i = 0; i < tr->genericArgs.size(); ++i) {
+                    if (i) s += ',';
+                    s += typeRefSigText(tr->genericArgs[i]);
+                }
+                s += '>';
+            }
+            // Nullable omitted (mirrors metaTypeSigText).
+            return s;
+        }
+        default:
+            return "?";  // Error, InlineArray, Function: placeholder
+    }
+}
+
+// §14/#705 (facet b): true when convertMember (in the Loader struct) returns
+// a non-null sema::Symbol* for a given MetaMember.  Used to sync-walk
+// td.members and importedType.members in pass-3 helper functions.
+static bool metaMemberProducesSymbol(const MetaMember& mm) {
+    if (mm.kind == MetaMemberKind::NestedType) return mm.nestedType != nullptr;
+    switch (mm.kind) {
+        case MetaMemberKind::Method:
+        case MetaMemberKind::Field:
+        case MetaMemberKind::Const:
+        case MetaMemberKind::EnumConstant:
+        case MetaMemberKind::Constructor:
+        case MetaMemberKind::Property:
+            return true;
+        default:
+            return false;  // Indexer (3), Event (5), and any future default
+    }
+}
+
 // Render MetaVisibility as a Bezel visibility keyword.
 static std::string metaVisibilityToKeyword(MetaVisibility v) {
     switch (v) {
@@ -675,15 +854,26 @@ static bool parseAndAttachCtorBody(
             importedFields[m->name] = m;
     }
 
-    // §14/#662c / issue #695: build name→MethodSymbol map for the imported type
-    // so self-method calls inside the ctor body (e.g. `computed := computeConst()`)
-    // remap to the real imported MethodSymbol.  Without this, lowerCall cannot find
-    // the MethodSymbol in the main context (the fresh symbol is not registered there)
-    // and returns nullptr, silently storing zero into the target field.
-    std::unordered_map<std::string_view, sema::Symbol*> importedMethods;
-    for (sema::Symbol* m : importedType.members) {
-        if (dynamic_cast<sema::MethodSymbol*>(m) && !m->name.empty())
-            importedMethods[m->name] = m;
+    // §14/#662c / #695 / #705 (facet a): build signature-key → MethodSymbol map
+    // for the imported type so self-method calls inside the ctor body remap to
+    // the CORRECT overload.  The prior name-only map (issue #695) overwrote the
+    // first overload when two methods shared a name (§22.6); keying by
+    // name+param-types selects the right one.  We sync-walk td.members and
+    // importedType.members (both in insertion order from loadMetadata pass 2) to
+    // pair each MetaMember's param MetaTypes (for key-building) with the
+    // corresponding imported MethodSymbol.
+    std::unordered_map<std::string, sema::Symbol*> importedMethods;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (!metaMemberProducesSymbol(mmItem)) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind == MetaMemberKind::Method && !mmItem.isOperator) {
+                importedMethods[metaMemberSigKey(mmItem.name, mmItem.params)] =
+                    sym;
+            }
+        }
     }
 
     // Build index→ParameterSymbol map for the imported ctor.
@@ -706,11 +896,11 @@ static bool parseAndAttachCtorBody(
                     break;
                 }
             }
-        } else if (dynamic_cast<sema::MethodSymbol*>(freshSym)) {
-            // §14/#662c / #695: method call inside the ctor body — remap the
-            // fresh context's MethodSymbol to the imported type's same-named
-            // method so lowerCall resolves the callee via methodFns_.
-            auto it = importedMethods.find(freshSym->name);
+        } else if (auto* freshMs = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            // §14/#662c / #695 / #705 (facet a): method call inside the ctor
+            // body — look up by full signature key (name + param types) so the
+            // correct overload is selected, not just any same-named method.
+            auto it = importedMethods.find(freshMethodSigKey(freshMs));
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
         }
@@ -814,11 +1004,21 @@ static bool parseAndAttachDtorBody(
             importedFields[m->name] = m;
     }
 
-    // §14/#662c / issue #695: build method remap map (dtor body may call own methods).
-    std::unordered_map<std::string_view, sema::Symbol*> importedMethods;
-    for (sema::Symbol* m : importedType.members) {
-        if (dynamic_cast<sema::MethodSymbol*>(m) && !m->name.empty())
-            importedMethods[m->name] = m;
+    // §14/#662c / #695 / #705 (facet a): build signature-key → MethodSymbol map
+    // for the imported type so self-method calls inside the dtor body remap to
+    // the CORRECT overload (same fix as parseAndAttachCtorBody).
+    std::unordered_map<std::string, sema::Symbol*> importedMethods;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (!metaMemberProducesSymbol(mmItem)) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind == MetaMemberKind::Method && !mmItem.isOperator) {
+                importedMethods[metaMemberSigKey(mmItem.name, mmItem.params)] =
+                    sym;
+            }
+        }
     }
 
     // Remap exprSymbols.
@@ -828,9 +1028,9 @@ static bool parseAndAttachDtorBody(
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
-        } else if (dynamic_cast<sema::MethodSymbol*>(freshSym)) {
-            // §14/#662c / #695: method call inside the dtor body.
-            auto it = importedMethods.find(freshSym->name);
+        } else if (auto* freshMs = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            // §14/#662c / #695 / #705 (facet a): look up by full signature key.
+            auto it = importedMethods.find(freshMethodSigKey(freshMs));
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
         }
@@ -913,15 +1113,33 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
             if (mm.kind != MetaMemberKind::Constructor || mm.ctorBodyText.empty())
                 continue;
             // Locate the matching ConstructorSymbol in t->members.
+            // §14/#705 (facet b): match by full parameter-type signature, not
+            // just arity.  Two ctors may share param count but differ in types
+            // (§22.7 ctor overloads); arity-only matching attaches the wrong
+            // body.  We compare each param pair using metaTypeSigText (MetaParam
+            // side) and typeRefSigText (imported ParameterSymbol side); both
+            // produce the same canonical text for the same underlying type.
             sema::ConstructorSymbol* importedCs = nullptr;
-            for (sema::Symbol* m : t->members) {
-                auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-                if (!cs || cs->isStatic) continue;
-                // Match by params count (conservative; one explicit ctor is the
-                // common case and the most important for the ctor-body path).
-                if (cs->params.size() == mm.params.size()) {
-                    importedCs = cs;
-                    break;
+            {
+                const std::string mmSig = metaMemberSigKey("", mm.params);
+                for (sema::Symbol* m : t->members) {
+                    auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic) continue;
+                    if (cs->params.size() != mm.params.size()) continue;
+                    // Build sig key from imported ctor params.
+                    std::string csSig;
+                    csSig += '(';
+                    for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
+                        if (pi) csSig += ',';
+                        const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
+                            cs->params[pi]);
+                        csSig += typeRefSigText(ps ? ps->resolvedDeclType : nullptr);
+                    }
+                    csSig += ')';
+                    if (csSig == mmSig) {
+                        importedCs = cs;
+                        break;
+                    }
                 }
             }
             if (importedCs) {
