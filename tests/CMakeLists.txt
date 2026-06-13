@@ -441,6 +441,7 @@ set(BEZEL_TEST_SOURCES
     codegen/sorted_comparer_record_533_test.cpp
     codegen/generic_static_520_test.cpp
     codegen/generic_static_state_536_test.cpp
+    codegen/generic_static_local_direct_697_test.cpp
     codegen/lifted_operators_486_test.cpp
     codegen/dict_literal_534_test.cpp
     codegen/stringbuilder_ctor_531_test.cpp
