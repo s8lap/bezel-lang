@@ -3434,10 +3434,17 @@ static BzScheduler* g_scheduler = nullptr;
 // Lifetime: domain_drain acquires a refcount on entry and releases on exit,
 // per fix #632 (UAF: entry_cont deleted the child_domain then domain_drain
 // looped back and re-locked dom->mtx on freed memory).
+//
+// fix #708 — final release must happen AFTER the lock_guard is destroyed:
+// The drain's refcount release (which may delete dom, including dom->mtx) must
+// not fire while any lock_guard on dom->mtx is alive.  A `done` flag is set
+// under the lock (preserving the active=false-under-lock invariant) and the
+// actual domain_release call happens after the lock_guard scope closes.
 static void domain_drain(bz_domain_t* dom) {
     domain_ref(dom);  // per fix #632: drain holds a ref for its entire run
     for (;;) {
         bz_domain_t::Cont c;
+        bool done = false;
         {
             std::lock_guard<std::mutex> lk(dom->mtx);
             if (dom->queue.empty()) {
@@ -3446,14 +3453,25 @@ static void domain_drain(bz_domain_t* dom) {
                 // see active=false, will set active=true, and will submit a
                 // new drain — so no items are lost.
                 dom->active = false;
-                domain_release(dom);  // per fix #632: release drain ref on exit
-                return;
+                done = true;
+                // Do NOT call domain_release here — dom->mtx is still locked
+                // by this lock_guard.  If this drain holds the last ref,
+                // domain_release would delete dom (and dom->mtx); the
+                // lock_guard dtor would then unlock a freed mutex (UAF, #708).
+                // We break out so the lock_guard destructs first, then release
+                // after the mutex is fully unlocked.  per fix #708.
+            } else {
+                c = dom->queue.front();
+                dom->queue.pop_front();
+                // c is popped under the lock while active=true.  Any concurrent
+                // enqueue sees active=true and pushes to the back of the queue;
+                // the next iteration of this loop will pick it up.
             }
-            c = dom->queue.front();
-            dom->queue.pop_front();
-            // c is popped under the lock while active=true.  Any concurrent
-            // enqueue sees active=true and pushes to the back of the queue;
-            // the next iteration of this loop will pick it up.
+        }  // lock_guard destroyed here — dom->mtx is fully unlocked before any
+           // domain_release that might delete dom.  per fix #708.
+        if (done) {
+            domain_release(dom);  // per fix #632: release drain ref on exit
+            return;               // safe: dom->mtx is already unlocked above
         }
         // Run the continuation WITHOUT holding the domain mutex so timer
         // completions, WhenAll/WhenAny callbacks, and bz_task_then calls can
