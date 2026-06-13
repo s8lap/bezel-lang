@@ -627,8 +627,25 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             }
         }
 
-        // Only redirect if we found at least one bound parent type param.
-        if (!substTypes.empty()) {
+        // Only redirect if we found at least one bound parent type param AND
+        // every type argument is a concrete (resolved) type — not an unresolved
+        // generic type parameter.  An unresolved parameter produces a null
+        // substId (typeRefIdentityToken returns nullptr when the TypeRef has
+        // kind==Named but declaration==nullptr, which is exactly how a
+        // GenericParamSymbol is encoded: GenericParamSymbol is not a TypeSymbol,
+        // so TypeRef::declaration is left null).
+        //
+        // This guards against the #715 bug: inside a generic class's sfinit
+        // body (emitStaticConstructorBody), a self-qualified access such as
+        // `Registry<T>.seed` reaches Path (B) above with T still an unresolved
+        // param.  Without this guard, a spurious per-instantiation global
+        // `bz$Registry$t$seed` is created with zero-init and is never stored
+        // into, producing the stale-zero read.  The template-level global
+        // (returned by the fall-through below) IS correctly initialised first
+        // in the sfinit sequence, so reading it is safe.  Per §22.12 / #715.
+        bool allConcrete = std::all_of(substIds.begin(), substIds.end(),
+                                       [](const void* id) { return id != nullptr; });
+        if (!substTypes.empty() && allConcrete) {
             auto key = std::make_pair(static_cast<const sema::Symbol*>(fs),
                                       std::make_pair(substTypes, substIds));
             auto git = genericInstStaticGlobals_.find(key);
