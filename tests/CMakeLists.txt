@@ -558,6 +558,7 @@ set(BEZEL_TEST_SOURCES
     module/xmod_owned_class_return_707_test.cpp
 
     runtime/event_subscription_test.cpp
+    runtime/concurrent_dispose_706_test.cpp
 
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
