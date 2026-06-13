@@ -3340,4 +3340,164 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_EQ(code, 42);
 }
 
+// §14/#705 facet-a regression tests
+// ---------------------------------------------------------------------------
+// Root cause: parseAndAttachCtorBody / parseAndAttachDtorBody keyed the
+// imported-method remap map by name only (std::string_view), so the SECOND
+// same-named overload silently overwrote the first in the map.  A call inside
+// the ctor/dtor body that sema resolved to the FIRST overload was then
+// remapped to the SECOND imported MethodSymbol (wrong ABI / wrong body).
+//
+// Fix: key the map by "name(type0,type1,...)" using metaMemberSigKey /
+// freshMethodSigKey, so each overload has a unique key.
+// ---------------------------------------------------------------------------
+
+// (35) §14/#705 facet-a: imported generic class whose ctor calls TWO same-name
+// method overloads that differ only in param type (int vs string).  Each call
+// must dispatch to the correct overload so the two result fields carry the
+// expected per-overload values.
+//
+// Repro shape: Dual<T> has
+//   compute(x: int): int => 10       (int overload)
+//   compute(x: string): int => 20    (string overload)
+//   constructor(a: int, b: string)
+//     ri := compute(a)               // should call int overload → 10
+//     rs := compute(b)               // should call string overload → 20
+//   end constructor
+//
+// Before fix: the name-only map stored only one "compute" entry (whichever was
+// last in importedType.members).  Both calls remapped to that single symbol,
+// so one of them called the wrong overload and the result field held the wrong
+// value.  Main returns ri + rs * 3; with the fix that is 10 + 60 = 70.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_method_overload_dispatch_native_spec_14_705) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_705_overload_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module DualLib; "
+        "public class Dual<T> "
+        "  public ri: int; "
+        "  public rs: int; "
+        "  public constructor(a: int, b: string) "
+        "    ri := compute(a); "
+        "    rs := compute(b); "
+        "  end constructor; "
+        "  destructor end destructor; "
+        "  private method compute(x: int): int => 10; "
+        "  private method compute(x: string): int => 20; "
+        "end Dual;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import DualLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var d := new Dual<int>(0, \"\"); "
+        "    return d.ri + d.rs * 3; "  // 10 + 20*3 = 70
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // ri = compute(a) with a:int  → int overload → 10
+    // rs = compute(b) with b:string → string overload → 20
+    // Main returns 10 + 20 * 3 = 70.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 70);
+}
+
+// §14/#705 facet-b regression tests
+// ---------------------------------------------------------------------------
+// Root cause: the ctor-body attach loop (loadMetadata pass 3) matched a
+// MetaMember ctor to an imported ConstructorSymbol by ARITY ONLY
+// (cs->params.size() == mm.params.size()), breaking on the first match.
+// Two ctors of the same arity but different param types → the body text for
+// the second ctor was attached to the first ConstructorSymbol (and the first
+// ctor's body was attached to the second).
+//
+// Fix: compare each param pair by full type signature using metaTypeSigText
+// (MetaParam side) vs typeRefSigText (imported ParameterSymbol side).
+// ---------------------------------------------------------------------------
+
+// (36) §14/#705 facet-b: imported generic class with TWO equal-arity
+// constructors each with a DISTINCT body.  Constructing with each must run
+// the correct body so the `n` field holds the expected per-ctor value.
+//
+// Repro shape: Picker<T> has
+//   constructor(v: int)  n := v + 1;     // body A: add 1
+//   constructor(v: string)  n := 99;     // body B: constant 99
+//
+// Before fix: the first ctor (int) would get body B attached (n := 99) and the
+// second (string) would get body A (n := v+1 → type mismatch or zero).
+// new Picker<int>(5) would thus set n=99, not 6.
+// After fix: new Picker<int>(5) → n=6; the method returns n.  Main returns n.
+BEZEL_TEST(cross_module_import,
+           imported_generic_equal_arity_ctor_body_attach_native_spec_14_705) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_705_ctorb_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module PickerLib; "
+        "public class Picker<T> "
+        "  public n: int; "
+        "  public constructor(v: int) "
+        "    n := v + 1; "
+        "  end constructor; "
+        "  public constructor(v: string) "
+        "    n := 99; "
+        "  end constructor; "
+        "  destructor end destructor; "
+        "end Picker;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import PickerLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var p := new Picker<int>(5); "
+        "    return p.n; "  // int ctor: n = 5 + 1 = 6
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Picker<int>(5) runs the int ctor: n = 5 + 1 = 6.
+    // Before fix: int ctor got string body attached → n = 99 (wrong).
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 6);
+}
+
 }  // namespace bezel::module
