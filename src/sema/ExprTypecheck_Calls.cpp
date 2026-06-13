@@ -1122,6 +1122,53 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
                     else if (typeLinqOperator(srcElem)) { /* typed */ }
                 }
+                // §26.4 / fix #699: a method call on an `IEnumerable<T>`
+                // receiver that is NOT the lazy LINQ sentinel — e.g.
+                // `this.ToArray()` / `this.Count()` inside a generic
+                // `extension IEnumerable<T>` body.  Here `this`'s TypeRef is
+                // Named with declaration=null but a real astNode whose name is
+                // "IEnumerable" and genericArgs[0]=T (the block-level type
+                // parameter).  isLazyEnumerableType excludes this shape (astNode
+                // != null), and the lazy-receiver block above requires the
+                // no-astNode sentinel, so the LINQ materializers/aggregators are
+                // otherwise left untyped — `ctx_.exprType(this.ToArray())` is
+                // null.  The codegen inferred-local slot-type fix (#490) then
+                // cannot pick a slot type, so `var items := this.ToArray()`
+                // defaults to an i32 slot and `return items` emits `ret i32`
+                // into the function's `ptr` (Array<T>) return type → LLVM
+                // IR-verification failure.  Typing the common materializer and
+                // aggregator methods on this receiver (exactly as on the lazy
+                // sentinel) gives the inferred local its correct slot type.
+                //
+                // This makes the UNSPECIALIZED template body type-correct (a
+                // dead-but-valid stub — §26.5 dispatches every real call to a
+                // per-receiver-type instantiation), with NO codegen IR backstop.
+                // It is equally correct for any future per-call-site
+                // monomorphization, where the receiver carries the same
+                // IEnumerable<concreteT> shape.
+                bool ienumRecv =
+                    recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    !recvTy->genericArgs.empty() && recvTy->astNode &&
+                    recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    recvTy->astNode->name->parts[0] == "IEnumerable";
+                if (ienumRecv) {
+                    TypeRef* srcElem2 = recvTy->genericArgs[0];
+                    if ((m == "ToArray" || m == "ToSet") && ce.args.empty())
+                        ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                            m == "ToSet" ? "Set" : "Array", srcElem2));
+                    else if ((m == "Any" || m == "All") && ce.args.size() <= 1)
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                    else if (m == "Count")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    else if (m == "First" || m == "Last" || m == "Single" ||
+                             m == "ElementAt")
+                        ctx_.setExprType(&ce, srcElem2);
+                    else if (m == "Sum" || m == "Min" || m == "Max")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    else if (m == "Average")
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
+                }
                 // stdlib §3.2: a method call on an `Encoding` receiver
                 // (`Encoding.Utf8.GetBytes(s)` / `.GetString(b[,i,c])` / `.Name`).
                 // The receiver's type is the Encoding TypeSymbol (set in
