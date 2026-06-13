@@ -5847,6 +5847,22 @@ extern "C" void* bz_str_split_str(const void* self_p, const void* delim_p) {
     return arr;
 }
 
+// §9.6 / issue #654: string.ToCharArray(): owned Array<char>.
+// Returns a fresh bz_array_t* with elem_size=4 (char = i32 code point).
+// Each element is the i32 Unicode code point at the corresponding position.
+// The returned array is owned: callers must dispose it (bz_array_dispose).
+extern "C" void* bz_str_to_char_array(const void* self_p) {
+    // elem_size=4: each char slot holds a 32-bit code point (int32_t).
+    void* arr = bz_array_alloc(4, 0);
+    if (!self_p) return arr;  // null string → empty array
+    const auto* s = (const bz_string_struct*)self_p;
+    for (int64_t i = 0; i < s->len; ++i) {
+        int32_t cp = (int32_t)bz_str_cp(s, i);
+        bz_array_add(arr, &cp, 4);
+    }
+    return arr;
+}
+
 void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || arr->count == 0) {

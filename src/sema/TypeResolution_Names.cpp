@@ -106,6 +106,12 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // maxCount); SemaphoreToken has NO public constructor (obtained only from
     // Semaphore.Acquire / TryAcquire); both are nullary class types here.
     if (n == "Semaphore" || n == "SemaphoreToken") return 0;
+    // §9.4 / issue #654: Boolean — builtin record aliased by `bool`; zero-arity.
+    // Registered so `Boolean.TryParse(...)` resolves without "unresolved type".
+    if (n == "Boolean") return 0;
+    // §2.12 / issue #654: BitConverter — static class for IEEE 754
+    // bit-reinterpretation; zero-arity, auto-imported.
+    if (n == "BitConverter") return 0;
     // §3 nullary stdlib classes:
     if (n == "StringBuilder" || n == "Random" ||
         n == "DateTime" || n == "TimeSpan" ||

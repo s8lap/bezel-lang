@@ -5055,6 +5055,84 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     }
 
     // ---------------------------------------------------------------------------
+    // stdlib §2.12 / issue #654: BitConverter static methods.
+    // Pure bit-reinterpretation via LLVM bitcast — no runtime calls needed.
+    //   FloatToInt32Bits(float):  bitcast f32 → i32
+    //   Int32BitsToFloat(int):    bitcast i32 → f32
+    //   DoubleToInt64Bits(double): bitcast f64 → i64
+    //   Int64BitsToDouble(long):  bitcast i64 → f64
+    // ---------------------------------------------------------------------------
+    if (cls == "BitConverter") {
+        if (call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* arg = lowerExpr(*call.args[0].value);
+            if (!arg) return nullptr;
+            if (m == "FloatToInt32Bits") {
+                // Ensure arg is f32.
+                if (!arg->getType()->isFloatTy())
+                    arg = builder_.CreateFPTrunc(arg, llvm::Type::getFloatTy(llvm_), "bc.f32");
+                return builder_.CreateBitCast(arg, i32(), "bc.f2i");
+            }
+            if (m == "Int32BitsToFloat") {
+                // Ensure arg is i32.
+                if (!arg->getType()->isIntegerTy(32))
+                    arg = builder_.CreateTrunc(arg, i32(), "bc.i32");
+                return builder_.CreateBitCast(arg, llvm::Type::getFloatTy(llvm_), "bc.i2f");
+            }
+            if (m == "DoubleToInt64Bits") {
+                // Ensure arg is f64.
+                if (!arg->getType()->isDoubleTy())
+                    arg = builder_.CreateFPExt(arg, llvm::Type::getDoubleTy(llvm_), "bc.f64");
+                return builder_.CreateBitCast(arg, i64(), "bc.d2l");
+            }
+            if (m == "Int64BitsToDouble") {
+                // Ensure arg is i64.
+                if (!arg->getType()->isIntegerTy(64))
+                    arg = builder_.CreateSExt(arg, i64(), "bc.i64");
+                return builder_.CreateBitCast(arg, llvm::Type::getDoubleTy(llvm_), "bc.l2d");
+            }
+        }
+        return nullptr;
+    }
+
+    // ---------------------------------------------------------------------------
+    // stdlib §9.4 / issue #654: Boolean static methods.
+    // Reached when the receiver is the `Boolean` class name (the keyword alias
+    // `bool` is handled by tryLowerPrimitiveStaticCall via primitiveFromName).
+    // ---------------------------------------------------------------------------
+    if (cls == "Boolean") {
+        // Boolean.TryParse(s: string, out result: bool): bool
+        // Accepts "true"/"false" case-insensitively; everything else → false.
+        if (m == "TryParse" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            llvm::Value* strData = loadStringData(strVal);
+            llvm::Type* et = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+            if (!outAddr) return nullptr;
+            auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
+            llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
+            unsigned tid = stringLiteralIdx_++;
+            auto* trueGV = new llvm::GlobalVariable(*module_, trueStr->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, trueStr,
+                ".bz.btpc.true." + std::to_string(tid));
+            llvm::Constant* falseStr = llvm::ConstantDataArray::getString(llvm_, "false", true);
+            auto* falseGV = new llvm::GlobalVariable(*module_, falseStr->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, falseStr,
+                ".bz.btpc.false." + std::to_string(tid));
+            llvm::Value* cmpTrue = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcasecmpFn, {strData, trueGV}),
+                builder_.getInt32(0), "btpc.isTrue");
+            llvm::Value* cmpFalse = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcasecmpFn, {strData, falseGV}),
+                builder_.getInt32(0), "btpc.isFalse");
+            llvm::Value* ok = builder_.CreateOr(cmpTrue, cmpFalse, "btpc.ok");
+            builder_.CreateStore(cmpTrue, outAddr);
+            return ok;
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // stdlib §2.6: Guid — static members and methods via bz_guid_* runtime.
     // Guid is a 128-bit value type stored as { i64 lo, i64 hi }.  All runtime
     // functions take a bz_guid_t* (ptr) so the value is passed by reference.
@@ -6375,6 +6453,41 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return ok;
     }
 
+    // §9.4 / issue #654: bool.TryParse(s: string, out result: bool): bool.
+    // Accepts "true"/"false" case-insensitively; everything else → false, ok=false.
+    // Unlike Convert.ToBoolean, "1" is NOT accepted (only the two canonical words).
+    if (pt == P::Bool && m == "TryParse" && call.args.size() == 2 &&
+        call.args[0].value && call.args[1].value) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        llvm::Value* strData = loadStringData(strVal);
+        llvm::Type* et = nullptr;
+        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
+        if (!outAddr) return nullptr;
+        auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
+        // Build "true" and "false" constant C-strings.
+        llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
+        unsigned tid = stringLiteralIdx_++;
+        auto* trueGV = new llvm::GlobalVariable(*module_, trueStr->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, trueStr, ".bz.btp.true." + std::to_string(tid));
+        llvm::Constant* falseStr = llvm::ConstantDataArray::getString(llvm_, "false", true);
+        auto* falseGV = new llvm::GlobalVariable(*module_, falseStr->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, falseStr, ".bz.btp.false." + std::to_string(tid));
+        // cmpTrue = (strcasecmp(strData, "true") == 0)
+        llvm::Value* cmpTrue = builder_.CreateICmpEQ(
+            builder_.CreateCall(strcasecmpFn, {strData, trueGV}),
+            builder_.getInt32(0), "btp.isTrue");
+        // cmpFalse = (strcasecmp(strData, "false") == 0)
+        llvm::Value* cmpFalse = builder_.CreateICmpEQ(
+            builder_.CreateCall(strcasecmpFn, {strData, falseGV}),
+            builder_.getInt32(0), "btp.isFalse");
+        // ok = cmpTrue || cmpFalse
+        llvm::Value* ok = builder_.CreateOr(cmpTrue, cmpFalse, "btp.ok");
+        // result = cmpTrue (true iff "true"; false for "false" or garbage)
+        builder_.CreateStore(cmpTrue, outAddr);
+        return ok;
+    }
+
     // int.Parse(s) / long.Parse(s) / double.Parse(s) etc.
     if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
@@ -6437,6 +6550,12 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             if (callPrimTy == sema::PrimitiveType::None) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
                     callPrimTy = sema::primitiveFromName(id->name);
+                    // §9.4 / issue #654: `Boolean` is not handled by
+                    // primitiveFromName (only `bool` is). Map it explicitly so
+                    // Boolean.TryParse's out-slot gets the correct i1 type.
+                    if (callPrimTy == sema::PrimitiveType::None &&
+                        id->name == "Boolean")
+                        callPrimTy = sema::PrimitiveType::Bool;
                 }
             }
         }
@@ -6506,6 +6625,8 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             if (callPrimTy == P::Double) slotTy = llvm::Type::getDoubleTy(llvm_);
             else if (callPrimTy == P::Float) slotTy = llvm::Type::getFloatTy(llvm_);
             else if (callPrimTy == P::Long || callPrimTy == P::ULong) slotTy = i64();
+            // §9.4 / issue #654: bool.TryParse out-slot is i1 (Bool lowers to i1).
+            else if (callPrimTy == P::Bool) slotTy = i1();
             else slotTy = i32();
         } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             // §3: collection instance calls (e.g. dict.TryGetValue).

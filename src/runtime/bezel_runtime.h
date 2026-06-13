@@ -948,6 +948,8 @@ void*   bz_str_replace(const void* self, const void* old_str, const void* new_st
 void*   bz_str_split_cp(const void* self, int32_t sep);
 // Split(sep: string): fresh Array<string> split at every occurrence of sep.
 void*   bz_str_split_str(const void* self, const void* sep);
+// §9.6 / issue #654: ToCharArray(): owned Array<char> (elem_size=4, i32 code points).
+void*   bz_str_to_char_array(const void* self);
 
 // StringBuilder helper — concatenates an array of bz.string pointers.
 // Caller must free *out_data with free() after use.

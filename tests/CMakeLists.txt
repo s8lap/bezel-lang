@@ -377,6 +377,7 @@ set(BEZEL_TEST_SOURCES
     codegen/datetime_timespan_test.cpp
     codegen/stdlib_wave1_648_649_652_test.cpp
     codegen/stdlib_wave2_test.cpp
+    codegen/stdlib_654_bool_bitconv_tochararray_test.cpp  # issue #654: bool.TryParse §9.4, BitConverter §2.12, string.ToCharArray §9.6
     codegen/timespan_encoding_525_526_test.cpp
     codegen/decimal_521_test.cpp
     codegen/decimal_nullable_663_test.cpp

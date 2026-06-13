@@ -298,6 +298,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    id->name == "DateTime" || id->name == "TimeSpan" ||
                    // stdlib §2.6: Guid is auto-imported (a builtin value type).
                    id->name == "Guid" ||
+                   // stdlib §9.4 / issue #654: Boolean is auto-imported (a builtin
+                   // record type, alias `bool`).  Needed for Boolean.TryParse.
+                   id->name == "Boolean" ||
+                   // stdlib §2.12 / issue #654: BitConverter — static class for
+                   // IEEE 754 bit-reinterpretation (FloatToInt32Bits etc.).
+                   id->name == "BitConverter" ||
                    // stdlib §9.3: Decimal is auto-imported (a builtin value type).
                    // fix #521: needed for Decimal.Parse, Decimal.Zero, etc.
                    id->name == "Decimal" || id->name == "decimal" ||
