@@ -487,13 +487,76 @@ static std::string metaVisibilityToKeyword(MetaVisibility v) {
     }
 }
 
+// §14/#662c / #695: build a stub declaration for an instance method whose body
+// is not available.  The stub only carries the signature (enough for sema to
+// register a MethodSymbol and resolve calls to it inside the ctor/dtor body).
+// Limitations: operators, abstract methods, and methods with `Function`/
+// `InlineArray` return types receive an `=> 0`-style stub; they should not
+// normally be called from a ctor/dtor body, but we emit stubs anyway so that
+// any call to them is at least resolved (rather than silently returning zero).
+static std::string buildMethodStub(const MetaMember& mm) {
+    std::string s;
+    // Visibility and non-body modifiers (skip abstract — it suppresses the body).
+    bool isAbstract = false;
+    for (const std::string& mod : mm.modifiers)
+        if (mod == "abstract") isAbstract = true;
+    if (isAbstract) return s;  // abstract methods have no body; skip stub
+    s += "  " + metaVisibilityToKeyword(mm.visibility);
+    // Emit only the modifiers the parser accepts before `method`.
+    for (const std::string& mod : mm.modifiers) {
+        if (mod == "virtual" || mod == "override" || mod == "sealed" ||
+            mod == "static" || mod == "async" || mod == "new")
+            s += " " + mod;
+        // Skip "readonly" (§22.8) — not a method modifier in Bezel syntax.
+        // Skip "abstract" — guarded above.
+    }
+    s += " method ";
+    s += std::string(mm.name.empty() ? "unknown" : mm.name);
+    // Generic type params (method-level `<T>`).
+    if (!mm.genericParams.empty()) {
+        s += "<";
+        for (std::size_t i = 0; i < mm.genericParams.size(); ++i) {
+            if (i) s += ", ";
+            s += mm.genericParams[i].name;
+        }
+        s += ">";
+    }
+    s += "(";
+    for (std::size_t i = 0; i < mm.params.size(); ++i) {
+        if (i) s += ", ";
+        s += mm.params[i].name + ": " + metaTypeToSourceText(mm.params[i].type);
+    }
+    s += ")";
+    // Return type (omit for void / Unit).
+    bool hasReturnType = mm.type.kind != TypeKind::Unit &&
+                         mm.type.kind != TypeKind::Error;
+    if (hasReturnType) s += ": " + metaTypeToSourceText(mm.type);
+    // Minimal expression body.  Use a literal that matches the return type so
+    // the stub compiles without type errors.  For pointer-sized types that
+    // sema would flag as missing, fall back to `0`.
+    if (hasReturnType) {
+        std::string retText = metaTypeToSourceText(mm.type);
+        bool isBool = (mm.type.kind == TypeKind::Primitive &&
+                       mm.type.primitive == PrimitiveKind::Bool);
+        s += " => " + std::string(isBool ? "false" : "0") + ";";
+    } else {
+        s += " end " + std::string(mm.name.empty() ? "unknown" : mm.name) + ";";
+    }
+    return s;
+}
+
 // Build a synthetic Bezel source string for a mini class containing only the
-// imported fields and the given ctor body text.  Used to re-parse + sema-check
-// the ctor body with proper symbol bindings so its AST exprs are registered
-// in the fresh SemaContext.  Example output:
+// imported fields, stub method declarations (for self-call resolution), and the
+// given ctor body text.  Used to re-parse + sema-check the ctor body with proper
+// symbol bindings so its AST exprs are registered in the fresh SemaContext.
+// §14/#662c / #695: method stubs are required so that self-method calls inside
+// the ctor body (e.g. `computed := computeConst()`) can be resolved to a fresh
+// MethodSymbol by sema, which is then remapped to the imported MethodSymbol by
+// the caller.  Example output:
 //   module _662c_reparsed_;
 //   public class Box<T>
 //     private _slot : T;
+//     private method computeConst(): int => 0;
 //     public constructor(v : T) _slot := v; end constructor;
 //   end Box;
 static std::string buildSyntheticClassSource(
@@ -523,6 +586,17 @@ static std::string buildSyntheticClassSource(
         src += "  " + metaVisibilityToKeyword(mm.visibility);
         for (const std::string& mod : mm.modifiers) src += " " + mod;
         src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
+    }
+    // §14/#662c / #695: stub method declarations so self-calls in the ctor body
+    // resolve to a MethodSymbol in the fresh context (remapped to the imported
+    // MethodSymbol by parseAndAttachCtorBody).  Operator methods are skipped —
+    // they use a different declaration syntax; they are unlikely to be called
+    // explicitly from a ctor body and do not need stub resolution.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Method) continue;
+        if (mm.isOperator) continue;
+        std::string stub = buildMethodStub(mm);
+        if (!stub.empty()) src += stub + "\n";
     }
     // The ctor body (verbatim from the exporter's span extraction).
     src += "  " + ctorBodyText + "\n";
@@ -565,6 +639,10 @@ static bool parseAndAttachCtorBody(
     // chain on unknown base); tolerate those — we only need the exprSymbols.
     // A hard parse failure is caught above; sema errors here are usually
     // benign for the subset we're interested in (field assign + param refs).
+    // Note: sema may emit errors for unsupported constructs (e.g. `base(...)`
+    // chain on unknown base); tolerate those — we only need the exprSymbols.
+    // A hard parse failure is caught above; sema errors here are usually
+    // benign for the subset we're interested in (field assign + param refs).
 
     // Locate the fresh TypeSymbol and ConstructorSymbol in the fresh module.
     sema::TypeSymbol* freshType = nullptr;
@@ -597,13 +675,24 @@ static bool parseAndAttachCtorBody(
             importedFields[m->name] = m;
     }
 
+    // §14/#662c / issue #695: build name→MethodSymbol map for the imported type
+    // so self-method calls inside the ctor body (e.g. `computed := computeConst()`)
+    // remap to the real imported MethodSymbol.  Without this, lowerCall cannot find
+    // the MethodSymbol in the main context (the fresh symbol is not registered there)
+    // and returns nullptr, silently storing zero into the target field.
+    std::unordered_map<std::string_view, sema::Symbol*> importedMethods;
+    for (sema::Symbol* m : importedType.members) {
+        if (dynamic_cast<sema::MethodSymbol*>(m) && !m->name.empty())
+            importedMethods[m->name] = m;
+    }
+
     // Build index→ParameterSymbol map for the imported ctor.
     const std::vector<sema::Symbol*>& importedParams = importedCs->params;
 
     // Walk fresh context's exprSymbols and remap into mainCtx.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
-        if (auto* ff = dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             // Field reference: find same-named field in importedType.
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
@@ -617,6 +706,13 @@ static bool parseAndAttachCtorBody(
                     break;
                 }
             }
+        } else if (dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            // §14/#662c / #695: method call inside the ctor body — remap the
+            // fresh context's MethodSymbol to the imported type's same-named
+            // method so lowerCall resolves the callee via methodFns_.
+            auto it = importedMethods.find(freshSym->name);
+            if (it != importedMethods.end())
+                mainCtx.setExprSymbol(expr, it->second);
         }
         // Other symbols (TypeSymbol for type refs, etc.) are not remapped;
         // they are not needed by inlineCtorBody / implicitFieldAddr.
@@ -657,6 +753,14 @@ static std::string buildSyntheticDtorSource(
         src += "  " + metaVisibilityToKeyword(mm.visibility);
         for (const std::string& mod : mm.modifiers) src += " " + mod;
         src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
+    }
+    // §14/#662c / #695: stub method declarations for self-call resolution in the
+    // dtor body (same discipline as the ctor-body path in buildSyntheticClassSource).
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Method) continue;
+        if (mm.isOperator) continue;
+        std::string stub = buildMethodStub(mm);
+        if (!stub.empty()) src += stub + "\n";
     }
     src += "  " + dtorBodyText + "\n";
     src += "end " + td.name + ";\n";
@@ -710,12 +814,24 @@ static bool parseAndAttachDtorBody(
             importedFields[m->name] = m;
     }
 
+    // §14/#662c / issue #695: build method remap map (dtor body may call own methods).
+    std::unordered_map<std::string_view, sema::Symbol*> importedMethods;
+    for (sema::Symbol* m : importedType.members) {
+        if (dynamic_cast<sema::MethodSymbol*>(m) && !m->name.empty())
+            importedMethods[m->name] = m;
+    }
+
     // Remap exprSymbols.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
         if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            // §14/#662c / #695: method call inside the dtor body.
+            auto it = importedMethods.find(freshSym->name);
+            if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
         }
     }

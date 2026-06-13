@@ -515,11 +515,26 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     for (sema::TypeRef* baseRef : t.baseTypeRefs)
         out.baseTypes.push_back(convertType(baseRef));
 
-    // Members — only the §13 exported surface.
+    // Members — the §13 exported surface (public/protected).
+    // §14/#662c / #695: for generic classes, also include private METHOD
+    // signatures so the importer can reconstruct stubs for re-parsing the
+    // ctor/dtor body source text (which may call private methods).  Only
+    // signatures are exported — no body text, no different ABI — so the
+    // private-member contract (not callable by downstream code outside the
+    // class) is preserved; the stubs are used solely for sema name-resolution
+    // inside the re-parsed ctor/dtor body.
     for (sema::Symbol* ms : t.members) {
         auto* member = dynamic_cast<const sema::MemberSymbol*>(ms);
         if (member == nullptr) continue;
-        if (!isExportedMember(member->visibility, inInterface)) continue;
+        bool isMethod = dynamic_cast<const sema::MethodSymbol*>(ms) != nullptr;
+        bool exported = isExportedMember(member->visibility, inInterface);
+        // For generic classes, also include private/internal METHODS so the
+        // importer's ctor/dtor body re-parsing can resolve self-calls (#695).
+        bool includeForCtorBody = isGenericClass && isMethod &&
+            !exported &&
+            (member->visibility == ast::Visibility::Private ||
+             member->visibility == ast::Visibility::Internal);
+        if (!exported && !includeForCtorBody) continue;
         MetaMember mm;
         if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source))
             out.members.push_back(std::move(mm));
