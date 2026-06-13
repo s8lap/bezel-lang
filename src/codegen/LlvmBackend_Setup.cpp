@@ -489,24 +489,23 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
     auto* fs = dynamic_cast<sema::FieldSymbol*>(sym_raw);
     if (!fs) return nullptr;
 
-    // §22.12 / #536 / #697: each distinct instantiation of a generic class must
-    // use its own static-field global (per §22.12: "each distinct instantiation
-    // has its own static state"). The base declareStatics() global is named
-    // `bz$Counter$n` and is shared — redirect to a per-instantiation global
-    // named `bz$Counter$int$n` / `bz$Counter$string$n` etc.
+    // §22.12 / #536 / #697 / #701: each distinct instantiation of a generic class
+    // must use its own static-field global (per §22.12: "each distinct
+    // instantiation has its own static state"). The base declareStatics() global
+    // is named `bz$Counter$n` and is shared — redirect to a per-instantiation
+    // global named `bz$Counter$int$n` / `bz$Counter$string$n` etc.
     //
-    // Two sources of type-argument information (both produce identical keys):
-    //   (A) genericSubst_ is active — we are inside a monomorphized body of a
-    //       generic method/class; type params are resolved via genericSubst_ and
-    //       genericSubstSemaTy_.
-    //   (B) genericSubst_ is empty — we are in a non-generic context (e.g. a
-    //       static Main); the access is `Counter<int>.n` (a MemberAccessExpr
-    //       whose target IdentifierExpr carries the concrete type args). Sema
-    //       has built an instantiated TypeRef (kind=Named, genericArgs populated)
-    //       and stored it as exprType on the target; extract it from there.
-    //       (§22.12 / #697 fix: this path was the missing piece — LOCAL generic
-    //       statics collapsed to the template-level global because genericSubst_
-    //       was empty, violating per-instantiation isolation.)
+    // Two sources of type-argument information (tried in priority order):
+    //   (B) The access is a MemberAccessExpr whose target carries CONCRETE type
+    //       args in its sema-resolved TypeRef (kind=Named, genericArgs
+    //       populated). Extract them FIRST, regardless of genericSubst_ state.
+    //       This handles: non-generic context (#697), AND a generic method body
+    //       that accesses a DIFFERENT generic class's static (e.g. Wrapper<U>
+    //       accessing Counter<int>.n: param "T" ∉ genericSubst_{U→…}).  #701.
+    //   (A) Fallback (only when B found nothing): genericSubst_ is active and
+    //       the access is bare (unqualified, inside the owning class's own
+    //       method body, e.g. `_count` from Counter<T>.Inc()).  Resolve via
+    //       genericSubst_ param-name lookup.  Per §22.12 / #536.
     if (fs->parent && !fs->parent->genericParams.empty()) {
         // Collect (llvmType, identityToken, mangleName) for each of the parent
         // class's generic params, from whichever source is active.
@@ -550,9 +549,41 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             }
         };
 
-        if (!genericSubst_.empty()) {
-            // Path (A): inside a monomorphized generic method/class body.
-            // Resolve each of the parent's type params via genericSubst_.
+        // Path (B): §22.12 / #697 / #701: the access is a MemberAccessExpr
+        // whose target IdentifierExpr carries CONCRETE type args in its
+        // sema-resolved TypeRef (kind=Named, genericArgs populated).  Extract
+        // those first — unconditionally, regardless of whether genericSubst_ is
+        // active.  This covers:
+        //   • non-generic context (e.g. static Main): Counter<int>.n → #697.
+        //   • generic method body with DIFFERENT param names (e.g. Wrapper<U>
+        //     accessing Counter<int>.n): Path (A) would miss because "T" ∉
+        //     genericSubst_{U→string} — #701 fix.
+        // The extraction is identical to the original #697 path; only the guard
+        // `!genericSubst_.empty()` has been removed so it is reachable in both
+        // contexts.
+        {
+            const sema::TypeRef* targetTR = nullptr;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+                if (ma->target)
+                    targetTR = ctx_.exprType(*ma->target);
+            }
+            if (targetTR && targetTR->kind == sema::TypeRef::Kind::Named &&
+                    targetTR->declaration == fs->parent &&
+                    targetTR->genericArgs.size() ==
+                        fs->parent->genericParams.size()) {
+                for (std::size_t i = 0; i < fs->parent->genericParams.size(); ++i)
+                    appendTypeArg(targetTR->genericArgs[i]);
+            }
+        }
+
+        if (substTypes.empty() && !genericSubst_.empty()) {
+            // Path (A): fallback — inside a monomorphized generic method/class
+            // body, and the access is bare (no MemberAccessExpr target, e.g.
+            // `_count` from inside Counter<T>'s own method body).  Resolve each
+            // of the parent's type params via genericSubst_.  This path is only
+            // reached when Path (B) found nothing, which happens exactly when the
+            // access does NOT carry its own concrete type args (bare unqualified
+            // access inheriting the enclosing instantiation).  Per §22.12 / #536.
             for (const sema::Symbol* gp : fs->parent->genericParams) {
                 auto sit = genericSubst_.find(gp->name);
                 if (sit == genericSubst_.end()) continue;
@@ -593,24 +624,6 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
                 } else {
                     typeArgMangle += "t";
                 }
-            }
-        } else {
-            // Path (B): §22.12 / #697: non-generic context (e.g. static Main).
-            // The access is `Counter<int>.n` — a MemberAccessExpr whose target
-            // carries the concrete type args in its sema-resolved TypeRef
-            // (kind=Named, genericArgs=[TypeRef for int, ...]).  Extract them
-            // in genericParams declaration order.
-            const sema::TypeRef* targetTR = nullptr;
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-                if (ma->target)
-                    targetTR = ctx_.exprType(*ma->target);
-            }
-            if (targetTR && targetTR->kind == sema::TypeRef::Kind::Named &&
-                    targetTR->declaration == fs->parent &&
-                    targetTR->genericArgs.size() ==
-                        fs->parent->genericParams.size()) {
-                for (std::size_t i = 0; i < fs->parent->genericParams.size(); ++i)
-                    appendTypeArg(targetTR->genericArgs[i]);
             }
         }
 
