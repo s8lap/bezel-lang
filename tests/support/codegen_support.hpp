@@ -24,7 +24,9 @@
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace bezel::test {
 
@@ -114,6 +116,44 @@ inline JitResult runJitChecked(std::string_view source) {
     codegen::CodegenOptions opts;
     opts.checkedDisposal = true;
     return runJitWithOptions(source, opts);
+}
+
+struct EmitResult {
+    DiagnosticEngine diagnostics;
+    bool lowered = false;       // true once a module was produced (no FE errors)
+    bool verifies = false;      // true if llvm::verifyModule found NO errors
+};
+
+// Lex + parse + sema + lower, then run llvm::verifyModule on the emitted module
+// WITHOUT requiring a `main` (so a declaration-only library fragment — e.g. a
+// top-level `extension` block — can be checked). `verifies` is true only when
+// the module is structurally valid IR. Used to assert that a function body
+// emits well-typed IR (e.g. a generic-extension template stub returning the
+// correct LLVM type, not `ret i32` into a `ptr` function — issue #699 / §26.4).
+inline EmitResult emitAndVerify(std::string_view source) {
+    ensureNativeTargetInitialized();
+    EmitResult r;
+
+    Lexer lexer(source, r.diagnostics);
+    Parser parser(lexer, r.diagnostics);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return r;
+
+    sema::SemaContext ctx(r.diagnostics);
+    sema::collectSymbols(*unit, ctx);
+    sema::resolveTypes(*unit, ctx);
+    sema::typecheckExpressions(*unit, ctx);
+    if (r.diagnostics.hasErrors()) return r;
+
+    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
+    auto module = codegen::emitModule(*unit, ctx, *llvmCtx,
+                                      codegen::CodegenOptions{});
+    if (!module) return r;
+    r.lowered = true;
+
+    // llvm::verifyModule returns TRUE when the module is BROKEN; invert it.
+    r.verifies = !llvm::verifyModule(*module, &llvm::errs());
+    return r;
 }
 
 }  // namespace bezel::test

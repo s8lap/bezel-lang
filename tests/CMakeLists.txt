@@ -404,6 +404,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_record_this_with_method_test.cpp
     codegen/iterator_native_test.cpp
     codegen/extension_method_test.cpp
+    codegen/generic_extension_ir_699_test.cpp
     codegen/bug_457_458_test.cpp
     codegen/bug_464_test.cpp
     codegen/bug_465_test.cpp
