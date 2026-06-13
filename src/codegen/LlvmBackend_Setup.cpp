@@ -6265,20 +6265,29 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
 
 // #429 (closure RETURN category) / §28.9 / §28.3: see the declaration in
 // LlvmBackend_impl.hpp. Recognize a CallExpr whose resolved callee is a
-// USER-DEFINED, LOCALLY-COMPILED MethodSymbol (backed by an ast::MethodDecl,
-// not imported, not an operator) whose declared return type is a function type
-// (Kind::Function). Such a call goes through THIS module's ReturnStmt
-// lowering, which mints exactly +1 for the returned closure cell — so the
-// caller owns that single reference. Cross-module imported methods (their
-// callee does NOT run our ReturnStmt minting) are excluded. Parallel to
-// isUserMethodStringReturnCall for strings.
+// USER-DEFINED MethodSymbol (backed by an ast::MethodDecl, not an operator)
+// whose declared return type is a function type (Kind::Function). Such a call
+// mints exactly +1 for the returned closure cell — so the caller owns that
+// single reference. Cross-module imported methods are now also recognized as
+// +1 producers when they declare a non-nullable function return type: their
+// ReturnStmt in the exporter module ran the same closure-retain minting logic,
+// so the caller receives exactly +1 and must release at scope end without an
+// extra borrow-retain. (#712 / §28.9 — mirror of #694 for strings.) Parallel
+// to isUserMethodStringReturnCall for strings.
 bool Emitter::isUserMethodClosureReturnCall(const ast::Expr* init) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(init);
     if (!call || !call->callee) return false;
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
     if (!ms) return false;
     if (ms->isOperator) return false;
-    if (ctx_.isImported(ms)) return false;
+    if (ctx_.isImported(ms)) {
+        // §28.9 / #712: an imported method whose declared return type is a
+        // function type already ran ReturnStmt closure-retain minting in the
+        // exporter. The caller receives +1 and must release at scope end, not
+        // borrow-retain. Treat it as a +1 producer. (Mirror of #694 for strings.)
+        const sema::TypeRef* rt = ctx_.importedReturnType(ms);
+        return rt && rt->kind == sema::TypeRef::Kind::Function;
+    }
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || !md->returnType) return false;
     const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
