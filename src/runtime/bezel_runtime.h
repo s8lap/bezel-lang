@@ -1098,15 +1098,26 @@ _Noreturn
 #endif
 void bz_unhandled_exception(void);
 
-// fix #492 / §31.1 / §2.6: the in-flight exception pointer shared across ALL
-// separately-compiled modules. Codegen emits an ExternalLinkage reference to
-// the symbol "bz_exc" in every module (library or main); the linker resolves
-// them all to this single runtime definition. Before the fix each module had
-// its own InternalLinkage (BSS) copy under the name "bz$exc", so a cross-module
-// `throw` wrote one copy while the caller's pending-check read a different,
-// still-null copy. The symbol is now renamed "bz_exc" (a valid C identifier).
-// Null means "no exception in flight"; non-null is the heap-allocated object.
-extern void* bz_exc;
+// fix #492 / §31.1 / §2.6: the per-thread in-flight exception pointer.
+// Made thread_local by fix #704 (see below).
+// fix #704: bz_exc is now thread_local so each domain worker thread has its
+// own slot.  Direct extern references to a thread_local symbol are not
+// compatible with LLVM's ORC JIT (the JIT generates emulated-TLS code that
+// looks for "__emutls_v.bz_exc", a different symbol from the real TLS "bz_exc"
+// the host process exports).  Codegen therefore accesses the slot through the
+// accessor pair bz_exc_addr() / bz_exc_set() which are plain functions that the
+// JIT resolves correctly via DynamicLibrarySearchGenerator.
+//
+// Usage from the runtime: read/write bz_exc directly (same TU as definition).
+// Usage from codegen (JIT + AOT): call bz_exc_addr() to get &bz_exc for the
+//   current thread, then load/store through the returned pointer.
+extern thread_local void* bz_exc;
+
+// bz_exc_addr() — return a pointer to the calling thread's bz_exc TLS slot.
+// Codegen emits `call ptr @bz_exc_addr()` then load/stores through the result.
+// The function is in the same TU as bz_exc, so it accesses the real TLS slot;
+// the JIT resolves the symbol via the host process's dynamic symbol table.
+extern void** bz_exc_addr();
 
 // ---------------------------------------------------------------------------
 // Shared<T> / Weak<T> — domain-local shared ownership (§28.13 / stdlib §2.16)

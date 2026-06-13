@@ -799,7 +799,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 stateStructTy, self, OUTER_TASK_FIELD);
             llvm::Value* outerTask = builder_.CreateLoad(ptrTy(), otField);
             llvm::Value* excObj =
-                builder_.CreateLoad(ptrTy(), excGlobal(), "async.fault.exc");
+                builder_.CreateLoad(ptrTy(), emitExcSlot(), "async.fault.exc");
             auto* completeErrObjFn = declareC("bz_task_complete_error_obj",
                                               llvm::Type::getVoidTy(llvm_),
                                               {ptrTy(), ptrTy()});
@@ -808,7 +808,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // awaiter (or the unhandled boundary); clear bz$exc so it is not
             // double-handled if this resume activation continues elsewhere.
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                                 excGlobal());
+                                 emitExcSlot());
             // §30.5: the frame is dead on this terminal (fault) path — free it.
             // §30.13 (#439-followup): free the cross-suspend spill area first (if
             // any) — it is a side allocation pointed to from the frame.
@@ -1167,13 +1167,13 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
                 stateStructTy, self, OUTER_TASK_FIELD);
             llvm::Value* outerTask = builder_.CreateLoad(ptrTy(), otField);
             llvm::Value* excObj =
-                builder_.CreateLoad(ptrTy(), excGlobal(), "asynclam.fault.exc");
+                builder_.CreateLoad(ptrTy(), emitExcSlot(), "asynclam.fault.exc");
             auto* completeErrObjFn = declareC("bz_task_complete_error_obj",
                                               llvm::Type::getVoidTy(llvm_),
                                               {ptrTy(), ptrTy()});
             builder_.CreateCall(completeErrObjFn, {outerTask, excObj});
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                                 excGlobal());
+                                 emitExcSlot());
             emitFreeSpillArea(self);
             auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_),
                                      {ptrTy()});
@@ -1495,13 +1495,13 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                 stateStructTy, self, PER_ADVANCE_TASK_FIELD);
             llvm::Value* task = builder_.CreateLoad(ptrTy(), taskField);
             llvm::Value* excObj = builder_.CreateLoad(
-                ptrTy(), excGlobal(), "asynciter.fault.exc");
+                ptrTy(), emitExcSlot(), "asynciter.fault.exc");
             auto* completeErrObjFn = declareC(
                 "bz_task_complete_error_obj", llvm::Type::getVoidTy(llvm_),
                 {ptrTy(), ptrTy()});
             builder_.CreateCall(completeErrObjFn, {task, excObj});
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                                 excGlobal());
+                                 emitExcSlot());
             // Stay exhausted on any later advance.
             builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRetVoid();
@@ -1788,7 +1788,7 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         auto* errObjFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
         llvm::Value* excObj =
             builder_.CreateCall(errObjFn, {awaitedTask}, "await.errobj");
-        builder_.CreateStore(excObj, excGlobal());
+        builder_.CreateStore(excObj, emitExcSlot());
         // §30.5: reclaim the awaited task here when it is an anonymous producer
         // result (`await Producer()`) — a single-use task with no other owner.
         // bz_task_free frees the task struct + its result/message buffers but NOT

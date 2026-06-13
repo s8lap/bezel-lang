@@ -1823,7 +1823,7 @@ void Emitter::emitThrowBuiltin(const char* name) {
     llvm::Value* obj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), builder_.getInt64(16)});
     builder_.CreateStore(vit->second, obj);
-    builder_.CreateStore(obj, excGlobal());
+    builder_.CreateStore(obj, emitExcSlot());
     emitUnwindDisposals();
     builder_.CreateBr(unwindBB());
 }
@@ -1865,11 +1865,11 @@ void Emitter::emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst) {
             // safe and fixes the #387 / #397 residual leak.
             emitDisposeAndReclaim(currentCaughtExc_);
         }
-        builder_.CreateStore(excVal, excGlobal());
+        builder_.CreateStore(excVal, emitExcSlot());
     } else if (currentCaughtExc_) {
         // Bare `throw` re-raises the arm's caught exception (the global
         // was cleared when the arm was entered).
-        builder_.CreateStore(currentCaughtExc_, excGlobal());
+        builder_.CreateStore(currentCaughtExc_, emitExcSlot());
     }
     emitUnwindDisposals();  // CG21: dispose unwound using-vars
     builder_.CreateBr(unwindBB());
@@ -2542,6 +2542,12 @@ llvm::GlobalVariable* Emitter::excGlobal() {
         // (Renamed from "bz$exc" — a `$` in an external symbol name is a
         // clang-only extension that triggers -Wdollar-in-identifier-extension in
         // code that declares it in a header. "bz_exc" is a valid C identifier.)
+        //
+        // fix #704: bz_exc is now thread_local in the runtime, but generated
+        // code accesses it via emitExcSlot() → call bz_exc_addr() → load/store
+        // through the returned pointer.  This GlobalVariable is kept only as an
+        // anchor (it is no longer referenced by any load/store in generated IR);
+        // emitExcSlot() is the sole code path that touches the slot at runtime.
         excGlobal_ = new llvm::GlobalVariable(
             *module_, ptrTy(), /*isConstant=*/false,
             llvm::GlobalValue::ExternalLinkage,
@@ -2549,6 +2555,29 @@ llvm::GlobalVariable* Emitter::excGlobal() {
             "bz_exc");
     }
     return excGlobal_;
+}
+
+
+llvm::Value* Emitter::emitExcSlot() {
+    // fix #704 / §30.14: return a ptr to the calling thread's bz_exc slot by
+    // calling bz_exc_addr().  Using a plain extern "C" function (not a TLS
+    // GlobalVariable) lets the LLVM ORC JIT resolve the symbol via
+    // DynamicLibrarySearchGenerator — the host process exports "bz_exc_addr"
+    // as a regular function, whereas a TLS GlobalVariable would require the
+    // JIT to emit __emutls_v.bz_exc references which are NOT exported by the
+    // host process (the host uses real, not emulated, TLS).
+    // Per-call (not cached): each load/store gets a fresh call so the slot
+    // address is always current (required when called from a thread-pool
+    // worker that may switch stacks).
+    if (!excAddrFn_) {
+        // Declare: ptr bz_exc_addr() — returns &bz_exc for the current thread
+        auto* fnTy = llvm::FunctionType::get(ptrTy(),
+                                             llvm::ArrayRef<llvm::Type*>{},
+                                             /*isVarArg=*/false);
+        excAddrFn_ = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, "bz_exc_addr", module_.get());
+    }
+    return builder_.CreateCall(excAddrFn_, {}, "exc.slot");
 }
 
 
@@ -2623,7 +2652,7 @@ void Emitter::emitUnwindDisposalsInRange(std::size_t lo, std::size_t hi) {
 
 
 void Emitter::emitPendingCheck() {
-    llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
+    llvm::Value* exc = builder_.CreateLoad(ptrTy(), emitExcSlot());
     llvm::Value* pending = builder_.CreateICmpNE(
         exc, llvm::ConstantPointerNull::get(ptrTy()));
     auto* unwind =
@@ -2645,7 +2674,7 @@ void Emitter::emitNewPendingCheck(llvm::Value* obj) {
     // allocating site — reclaims it exactly once. This branch is taken only when
     // the ctor set the pending exception, so the free never reaches a normally-
     // constructed object (which is reclaimed later by its owning slot).
-    llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
+    llvm::Value* exc = builder_.CreateLoad(ptrTy(), emitExcSlot());
     llvm::Value* pending = builder_.CreateICmpNE(
         exc, llvm::ConstantPointerNull::get(ptrTy()));
     auto* unwind =
@@ -3285,7 +3314,7 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
         // Temporarily switch to the propagate block to emit its body.
         auto* savedInsert = builder_.GetInsertBlock();
         builder_.SetInsertPoint(propagateBB_);
-        llvm::Value* origExc = builder_.CreateLoad(ptrTy(), excGlobal());
+        llvm::Value* origExc = builder_.CreateLoad(ptrTy(), emitExcSlot());
         auto vit = builtinVtable_.find("TypeInitializationException");
         if (vit != builtinVtable_.end()) {
             llvm::Value* tie = builder_.CreateCall(
@@ -3298,7 +3327,7 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             llvm::Value* innerSlot =
                 builder_.CreateGEP(i8Ty, tie, builder_.getInt64(16));
             builder_.CreateStore(origExc, innerSlot);
-            builder_.CreateStore(tie, excGlobal());
+            builder_.CreateStore(tie, emitExcSlot());
         }
         builder_.CreateRetVoid();
         builder_.SetInsertPoint(savedInsert);

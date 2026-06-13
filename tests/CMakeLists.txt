@@ -215,6 +215,7 @@ set(BEZEL_TEST_SOURCES
     codegen/native_exe_test.cpp
     codegen/async_test.cpp
     codegen/async_618_domain_serial_test.cpp
+    codegen/tsan_704_bz_exc_threadlocal_test.cpp
     codegen/async_lambda_488_test.cpp
     codegen/task_combinators_test.cpp
     codegen/instances_test.cpp

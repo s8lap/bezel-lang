@@ -1143,7 +1143,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
 
     // Catch dispatch: test arms in order against the in-flight exception.
     builder_.SetInsertPoint(dispatchBB);
-    llvm::Value* exc = builder_.CreateLoad(ptrTy(), excGlobal());
+    llvm::Value* exc = builder_.CreateLoad(ptrTy(), emitExcSlot());
     for (const auto& arm : trys.catches) {
         // §30.9 / §31.2 (#438): does THIS arm suspend on an `await` (guard or
         // body)? If so its handler-context allocas must survive a cross-thread
@@ -1195,7 +1195,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
 
         builder_.SetInsertPoint(armBB);
         builder_.CreateStore(
-            llvm::ConstantPointerNull::get(ptrTy()), excGlobal());
+            llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
         llvm::Value* savedCaught = currentCaughtExc_;
         std::string_view savedCaughtName = currentCaughtName_;
         currentCaughtExc_ = exc;
@@ -1339,18 +1339,18 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             // of the finally, then restore it before re-propagating to the outer
             // handler — which expects to read the original object from bz$exc.
             llvm::AllocaInst* pendingExcSlot = entryAlloca(ptrTy());
-            llvm::Value* inflight = builder_.CreateLoad(ptrTy(), excGlobal());
+            llvm::Value* inflight = builder_.CreateLoad(ptrTy(), emitExcSlot());
             builder_.CreateStore(inflight, pendingExcSlot);
             asyncHandlerSpillSlots_.push_back(pendingExcSlot);
             builder_.CreateStore(
-                llvm::ConstantPointerNull::get(ptrTy()), excGlobal());
+                llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
             bool finUTerm = lowerScopedBlock(trys.finallyBody);
             if (!finUTerm) {
                 // Restore the captured in-flight exception and re-propagate. If
                 // the finally itself threw (set bz$exc non-null), that NEW
                 // exception supersedes the original (§31.2 finally-throws
                 // semantics); keep it. Otherwise restore the original.
-                llvm::Value* afterFin = builder_.CreateLoad(ptrTy(), excGlobal());
+                llvm::Value* afterFin = builder_.CreateLoad(ptrTy(), emitExcSlot());
                 llvm::Value* finThrew = builder_.CreateICmpNE(
                     afterFin, llvm::ConstantPointerNull::get(ptrTy()),
                     "fin.threw");
@@ -1361,7 +1361,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 builder_.CreateCondBr(finThrew, propBB, restoreBB);
                 builder_.SetInsertPoint(restoreBB);
                 llvm::Value* orig = builder_.CreateLoad(ptrTy(), pendingExcSlot);
-                builder_.CreateStore(orig, excGlobal());
+                builder_.CreateStore(orig, emitExcSlot());
                 builder_.CreateBr(propBB);
                 builder_.SetInsertPoint(propBB);
                 // #467 / §28.3: same intervening-scope discharge as the

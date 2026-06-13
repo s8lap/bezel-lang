@@ -786,7 +786,8 @@ private:
     // unwind target — the enclosing try's catch dispatch, or (when none)
     // the function's propagate block, which returns so the caller's
     // post-call check unwinds further.
-    llvm::GlobalVariable* excGlobal_ = nullptr;
+    llvm::GlobalVariable* excGlobal_ = nullptr;   // kept for compat; unused after #704
+    llvm::Function*       excAddrFn_ = nullptr;   // fix #704: cached bz_exc_addr decl
     llvm::BasicBlock* unwindTarget_ = nullptr;   // innermost catch dispatch
     llvm::BasicBlock* propagateBB_ = nullptr;    // per-function, lazy
     // CG20: the exception value caught by the enclosing catch arm, so a
@@ -2712,8 +2713,15 @@ private:
     // CG18: call an object's Dispose dynamically — load its vtable pointer
     // (instance slot 0), load vtable slot 0 (Dispose), and call it. The
     // object must be non-null. Resolves to the runtime class's Dispose.
-    // CG20: the module global holding the in-flight exception (lazy).
+    // CG20: lazy declaration of bz_exc_addr() (returns &bz_exc for this thread).
     llvm::GlobalVariable* excGlobal();
+    // CG20 / fix #704: emit a call to bz_exc_addr() and return the resulting
+    // ptr — the address of the calling thread's bz_exc slot.  Use this
+    // instead of excGlobal() for all load/store of the exception slot.
+    // bz_exc_addr() is a plain extern "C" function so the JIT resolves it via
+    // DynamicLibrarySearchGenerator (unlike a TLS GlobalVariable which the JIT
+    // would lower via __emutls_v.bz_exc — a symbol not in the host dylib).
+    llvm::Value* emitExcSlot();
 
     // CG20: the per-function propagate block — entered when an exception
     // is pending and not caught here. It returns a dummy value so the
