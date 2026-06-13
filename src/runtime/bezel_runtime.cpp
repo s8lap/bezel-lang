@@ -3582,40 +3582,41 @@ void* bz_task_delay(int64_t milliseconds) {
     return task;
 }
 
-static void task_notify(bz_task_t* task) {
-    // §30.13 (#439 / #618): wake any sync-awaiter FIRST, then enqueue
-    // continuations to the task's DOMAIN queue (not directly to the pool).
-    //
-    // Ordering is load-bearing for cross-thread safety. A continuation may FREE
-    // the task (the await-resume that fired it frees an anonymous producer task —
-    // e.g. `await Task.Delay(...)` — via bz_task_free). Once a continuation is
-    // enqueued to the domain, a worker can run it and free `task` at any moment,
-    // so task_notify must not touch `task` (its mutex / cv) AFTER the enqueue.
-    // We therefore: (1) snapshot the continuation list and domain pointer, and
-    // (2) notify the cv INSIDE the lock, then (3) enqueue the continuations (and
-    // never touch `task` or its fields again) after releasing the lock.
-    //
-    // notify_all() must be called while holding task->mtx (#445 / §30.5 race fix):
-    // a sync-awaiter (bz_task_await_sync) may call bz_task_free immediately on
-    // waking, which destroys the condition_variable. Holding the mutex during
-    // notify_all ensures the awaiter cannot re-acquire the mutex and proceed to
-    // free the task until AFTER notify_all returns.
-    std::vector<bz_task_t::Cont> conts;
-    bz_domain_t* dom;
-    {
-        std::lock_guard<std::mutex> lk(task->mtx);
-        conts = task->continuations;
-        dom   = task->domain;
-        task->cv.notify_all();
-    }
-    // task may be freed by a woken sync-awaiter from this point on; do not
-    // touch task->mtx or task->cv again.
+// per #700: post-unlock dispatch helper. Receives a pre-snapshotted continuation
+// list, domain, and opaque task pointer. The caller has already:
+//   (1) set the task's result/error fields and done=true,
+//   (2) snapshotted continuations and domain,
+//   (3) called cv.notify_all(), and
+//   (4) released task->mtx.
+// This function ONLY loops domain_enqueue. It must NEVER acquire task->mtx or
+// dereference task as bz_task_t* — the task may be freed by a domain worker
+// as soon as the first continuation is enqueued. task is passed through as an
+// opaque void* to domain_enqueue (which itself treats it as opaque state).
+//
+// §30.13 (#439 / #618): continuations are routed to the task's DOMAIN queue so
+// that run-to-completion serialization is preserved within the domain.
+//
+// notify_all() is called INSIDE the caller's lock (#445 / §30.5): a
+// sync-awaiter (bz_task_await_sync) may call bz_task_free immediately on
+// waking, destroying the condition_variable. Holding the mutex during
+// notify_all() ensures the awaiter cannot proceed to free the task until AFTER
+// notify_all() returns.
+static void task_dispatch(bz_domain_t* dom,
+                          std::vector<bz_task_t::Cont> conts,
+                          void* task_opaque) {
+    // task_opaque is passed as opaque state to each continuation; do NOT cast it.
     for (auto& c : conts)
-        domain_enqueue(dom, c.fn, task, c.state);
+        domain_enqueue(dom, c.fn, task_opaque, c.state);
 }
 
 void bz_task_complete(void* tp, const void* result, int64_t result_size) {
+    // per #700: snapshot continuations + domain and call notify_all INSIDE the
+    // same critical section that sets done=true, eliminating the unlock→re-lock
+    // gap that let a concurrent bz_task_then fast-path free the task before
+    // task_notify could re-acquire task->mtx.
     auto* task = (bz_task_t*)tp;
+    std::vector<bz_task_t::Cont> conts;
+    bz_domain_t* dom;
     {
         std::lock_guard<std::mutex> lk(task->mtx);
         if (result_size > 0 && result) {
@@ -3624,17 +3625,30 @@ void bz_task_complete(void* tp, const void* result, int64_t result_size) {
             task->result_size = result_size;
         }
         task->done = true;
+        conts = task->continuations;
+        dom   = task->domain;
+        task->cv.notify_all();
     }
-    task_notify(task);
+    // task may be freed by a woken sync-awaiter or domain worker from this point;
+    // do not touch task->mtx or task->cv again.
+    task_dispatch(dom, std::move(conts), tp);
 }
 
 void bz_task_complete_error(void* tp, const char* error_msg) {
+    // per #700: same merged-lock fix as bz_task_complete.
     auto* task = (bz_task_t*)tp;
-    { std::lock_guard<std::mutex> lk(task->mtx);
-      task->error_msg = strdup(error_msg);
-      task->is_error = true;
-      task->done = true; }
-    task_notify(task);
+    std::vector<bz_task_t::Cont> conts;
+    bz_domain_t* dom;
+    {
+        std::lock_guard<std::mutex> lk(task->mtx);
+        task->error_msg = strdup(error_msg);
+        task->is_error = true;
+        task->done = true;
+        conts = task->continuations;
+        dom   = task->domain;
+        task->cv.notify_all();
+    }
+    task_dispatch(dom, std::move(conts), tp);
 }
 
 // §30.9: fault the task with the ORIGINAL exception object (a Bezel heap object).
@@ -3643,12 +3657,20 @@ void bz_task_complete_error(void* tp, const char* error_msg) {
 // object (see bz_task_t::error_obj); ownership stays with the exception itself,
 // transferring to the catching handler / unhandled boundary.
 void bz_task_complete_error_obj(void* tp, void* error_obj) {
+    // per #700: same merged-lock fix as bz_task_complete.
     auto* task = (bz_task_t*)tp;
-    { std::lock_guard<std::mutex> lk(task->mtx);
-      task->error_obj = error_obj;
-      task->is_error = true;
-      task->done = true; }
-    task_notify(task);
+    std::vector<bz_task_t::Cont> conts;
+    bz_domain_t* dom;
+    {
+        std::lock_guard<std::mutex> lk(task->mtx);
+        task->error_obj = error_obj;
+        task->is_error = true;
+        task->done = true;
+        conts = task->continuations;
+        dom   = task->domain;
+        task->cv.notify_all();
+    }
+    task_dispatch(dom, std::move(conts), tp);
 }
 
 // §30.9: retrieve the original exception object (valid after bz_task_is_error).
@@ -3674,15 +3696,16 @@ bool bz_task_is_error(void* tp) {
 // completes.  This function is NOT a domain continuation: the main thread is
 // not a domain runner, holds no domain mutex while waiting, and just parks on
 // the task's condition variable.  Pool workers running domain drains eventually
-// complete the task (via bz_task_complete -> task_notify), which calls
-// notify_all on the task cv, waking this thread.  No deadlock is possible:
+// complete the task (via bz_task_complete -> task_dispatch), which calls
+// notify_all on the task cv (inside the completer's lock, per #445/#700), waking
+// this thread.  No deadlock is possible:
 //   - The main thread holds only task->mtx during cv.wait (released atomically
 //     by wait; re-acquired only for the predicate check, then released before
 //     returning).
 //   - Domain drains hold only dom->mtx while manipulating the deque, never
 //     while running continuations.
-//   - Lock ordering is always task->mtx then dom->mtx (in task_notify/
-//     domain_enqueue), never reversed.
+//   - Lock ordering is always task->mtx then dom->mtx (in the completers /
+//     task_dispatch / domain_enqueue), never reversed.
 void* bz_task_await_sync(void* tp) {
     auto* task = (bz_task_t*)tp;
     std::unique_lock<std::mutex> lk(task->mtx);
