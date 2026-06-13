@@ -489,49 +489,57 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
     auto* fs = dynamic_cast<sema::FieldSymbol*>(sym_raw);
     if (!fs) return nullptr;
 
-    // §22.12 / #536: when genericSubst_ is active and the field's parent class
-    // has generic parameters, each distinct instantiation must use its own
-    // static-field global (per §22.12: "each distinct instantiation has its own
-    // static state"). The base declareStatics() global is named
-    // `bz$Counter$count` and is shared — redirect to a per-instantiation global
-    // named `bz$Counter$int$count` / `bz$Counter$string$count` etc.
-    if (!genericSubst_.empty() && fs->parent && !fs->parent->genericParams.empty()) {
-        // Build a substitution key limited to the parent class's type parameters
-        // (not method-level type params).  Use (llvm::Type*, identity_token) pairs
-        // in parameter-declaration order so that the key is stable across calls.
+    // §22.12 / #536 / #697: each distinct instantiation of a generic class must
+    // use its own static-field global (per §22.12: "each distinct instantiation
+    // has its own static state"). The base declareStatics() global is named
+    // `bz$Counter$n` and is shared — redirect to a per-instantiation global
+    // named `bz$Counter$int$n` / `bz$Counter$string$n` etc.
+    //
+    // Two sources of type-argument information (both produce identical keys):
+    //   (A) genericSubst_ is active — we are inside a monomorphized body of a
+    //       generic method/class; type params are resolved via genericSubst_ and
+    //       genericSubstSemaTy_.
+    //   (B) genericSubst_ is empty — we are in a non-generic context (e.g. a
+    //       static Main); the access is `Counter<int>.n` (a MemberAccessExpr
+    //       whose target IdentifierExpr carries the concrete type args). Sema
+    //       has built an instantiated TypeRef (kind=Named, genericArgs populated)
+    //       and stored it as exprType on the target; extract it from there.
+    //       (§22.12 / #697 fix: this path was the missing piece — LOCAL generic
+    //       statics collapsed to the template-level global because genericSubst_
+    //       was empty, violating per-instantiation isolation.)
+    if (fs->parent && !fs->parent->genericParams.empty()) {
+        // Collect (llvmType, identityToken, mangleName) for each of the parent
+        // class's generic params, from whichever source is active.
         std::vector<llvm::Type*> substTypes;
         std::vector<const void*> substIds;
         std::string typeArgMangle;
-        for (const sema::Symbol* gp : fs->parent->genericParams) {
-            auto sit = genericSubst_.find(gp->name);
-            if (sit == genericSubst_.end()) continue;
-            substTypes.push_back(sit->second);
-            auto semaSit = genericSubstSemaTy_.find(gp->name);
-            const sema::TypeRef* semaTy =
-                (semaSit != genericSubstSemaTy_.end()) ? semaSit->second : nullptr;
+
+        // Helper: append one type argument (semaTy) to the three key vectors.
+        auto appendTypeArg = [&](const sema::TypeRef* semaTy) {
+            llvm::Type* llTy = semaTy ? lowerTypeRef(semaTy) : i32();
+            substTypes.push_back(llTy);
             substIds.push_back(typeRefIdentityToken(semaTy));
-            // Build the human-readable mangle suffix for the global's name.
             if (!typeArgMangle.empty()) typeArgMangle += "_";
             if (semaTy) {
                 if (semaTy->kind == sema::TypeRef::Kind::Named &&
-                    semaTy->declaration)
+                        semaTy->declaration)
                     typeArgMangle += std::string(semaTy->declaration->name);
                 else if (semaTy->kind == sema::TypeRef::Kind::Primitive) {
                     switch (semaTy->primitive) {
-                        case sema::PrimitiveType::Bool:   typeArgMangle += "bool"; break;
-                        case sema::PrimitiveType::Char:   typeArgMangle += "char"; break;
-                        case sema::PrimitiveType::String: typeArgMangle += "string"; break;
-                        case sema::PrimitiveType::Byte:   typeArgMangle += "byte"; break;
-                        case sema::PrimitiveType::SByte:  typeArgMangle += "sbyte"; break;
-                        case sema::PrimitiveType::Short:  typeArgMangle += "short"; break;
-                        case sema::PrimitiveType::UShort: typeArgMangle += "ushort"; break;
-                        case sema::PrimitiveType::Int:    typeArgMangle += "int"; break;
-                        case sema::PrimitiveType::UInt:   typeArgMangle += "uint"; break;
-                        case sema::PrimitiveType::Long:   typeArgMangle += "long"; break;
-                        case sema::PrimitiveType::ULong:  typeArgMangle += "ulong"; break;
-                        case sema::PrimitiveType::Float:  typeArgMangle += "float"; break;
-                        case sema::PrimitiveType::Double: typeArgMangle += "double"; break;
-                        case sema::PrimitiveType::Decimal:typeArgMangle += "decimal"; break;
+                        case sema::PrimitiveType::Bool:    typeArgMangle += "bool"; break;
+                        case sema::PrimitiveType::Char:    typeArgMangle += "char"; break;
+                        case sema::PrimitiveType::String:  typeArgMangle += "string"; break;
+                        case sema::PrimitiveType::Byte:    typeArgMangle += "byte"; break;
+                        case sema::PrimitiveType::SByte:   typeArgMangle += "sbyte"; break;
+                        case sema::PrimitiveType::Short:   typeArgMangle += "short"; break;
+                        case sema::PrimitiveType::UShort:  typeArgMangle += "ushort"; break;
+                        case sema::PrimitiveType::Int:     typeArgMangle += "int"; break;
+                        case sema::PrimitiveType::UInt:    typeArgMangle += "uint"; break;
+                        case sema::PrimitiveType::Long:    typeArgMangle += "long"; break;
+                        case sema::PrimitiveType::ULong:   typeArgMangle += "ulong"; break;
+                        case sema::PrimitiveType::Float:   typeArgMangle += "float"; break;
+                        case sema::PrimitiveType::Double:  typeArgMangle += "double"; break;
+                        case sema::PrimitiveType::Decimal: typeArgMangle += "decimal"; break;
                         default: typeArgMangle += "prim"; break;
                     }
                 } else {
@@ -540,7 +548,72 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             } else {
                 typeArgMangle += "t";
             }
+        };
+
+        if (!genericSubst_.empty()) {
+            // Path (A): inside a monomorphized generic method/class body.
+            // Resolve each of the parent's type params via genericSubst_.
+            for (const sema::Symbol* gp : fs->parent->genericParams) {
+                auto sit = genericSubst_.find(gp->name);
+                if (sit == genericSubst_.end()) continue;
+                auto semaSit = genericSubstSemaTy_.find(gp->name);
+                const sema::TypeRef* semaTy =
+                    (semaSit != genericSubstSemaTy_.end())
+                        ? semaSit->second : nullptr;
+                // Override llvmType from genericSubst_ (not lowerTypeRef) to
+                // match the original per-instantiation key scheme.
+                substTypes.push_back(sit->second);
+                substIds.push_back(typeRefIdentityToken(semaTy));
+                if (!typeArgMangle.empty()) typeArgMangle += "_";
+                if (semaTy) {
+                    if (semaTy->kind == sema::TypeRef::Kind::Named &&
+                            semaTy->declaration)
+                        typeArgMangle += std::string(semaTy->declaration->name);
+                    else if (semaTy->kind == sema::TypeRef::Kind::Primitive) {
+                        switch (semaTy->primitive) {
+                            case sema::PrimitiveType::Bool:    typeArgMangle += "bool"; break;
+                            case sema::PrimitiveType::Char:    typeArgMangle += "char"; break;
+                            case sema::PrimitiveType::String:  typeArgMangle += "string"; break;
+                            case sema::PrimitiveType::Byte:    typeArgMangle += "byte"; break;
+                            case sema::PrimitiveType::SByte:   typeArgMangle += "sbyte"; break;
+                            case sema::PrimitiveType::Short:   typeArgMangle += "short"; break;
+                            case sema::PrimitiveType::UShort:  typeArgMangle += "ushort"; break;
+                            case sema::PrimitiveType::Int:     typeArgMangle += "int"; break;
+                            case sema::PrimitiveType::UInt:    typeArgMangle += "uint"; break;
+                            case sema::PrimitiveType::Long:    typeArgMangle += "long"; break;
+                            case sema::PrimitiveType::ULong:   typeArgMangle += "ulong"; break;
+                            case sema::PrimitiveType::Float:   typeArgMangle += "float"; break;
+                            case sema::PrimitiveType::Double:  typeArgMangle += "double"; break;
+                            case sema::PrimitiveType::Decimal: typeArgMangle += "decimal"; break;
+                            default: typeArgMangle += "prim"; break;
+                        }
+                    } else {
+                        typeArgMangle += "t";
+                    }
+                } else {
+                    typeArgMangle += "t";
+                }
+            }
+        } else {
+            // Path (B): §22.12 / #697: non-generic context (e.g. static Main).
+            // The access is `Counter<int>.n` — a MemberAccessExpr whose target
+            // carries the concrete type args in its sema-resolved TypeRef
+            // (kind=Named, genericArgs=[TypeRef for int, ...]).  Extract them
+            // in genericParams declaration order.
+            const sema::TypeRef* targetTR = nullptr;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+                if (ma->target)
+                    targetTR = ctx_.exprType(*ma->target);
+            }
+            if (targetTR && targetTR->kind == sema::TypeRef::Kind::Named &&
+                    targetTR->declaration == fs->parent &&
+                    targetTR->genericArgs.size() ==
+                        fs->parent->genericParams.size()) {
+                for (std::size_t i = 0; i < fs->parent->genericParams.size(); ++i)
+                    appendTypeArg(targetTR->genericArgs[i]);
+            }
         }
+
         // Only redirect if we found at least one bound parent type param.
         if (!substTypes.empty()) {
             auto key = std::make_pair(static_cast<const sema::Symbol*>(fs),
@@ -555,7 +628,7 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             if (baseIt == staticGlobals_.end()) return nullptr;
             llvm::GlobalVariable* base = baseIt->second;
 
-            // Name: bz$Counter$int$count — insert the type-arg mangle between
+            // Name: bz$Counter$int$n — insert the type-arg mangle between
             // the class name and the field name.
             std::string cls = fs->parent ? std::string(fs->parent->name) : "";
             std::string fname = std::string(fs->name);
