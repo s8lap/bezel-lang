@@ -15,19 +15,12 @@
 //       Under the pre-fix single-global, one exception could be swallowed,
 //       yielding a wrong return code.
 //
-//   (b) TSan no-bz_exc-race: compile and run with -fsanitize=thread, using a
-//       TSan suppression to skip the pre-existing domain_drain heap-UAF (a
-//       separate, known issue unrelated to #704).  The output must contain no
-//       mention of "bz_exc" or "bz_exc_addr" in any data-race report.
-//
-// NOTE on the pre-existing domain_drain UAF: both the pre-fix and post-fix
-// runtime have a heap-use-after-free in domain_drain (a domain is deleted by
-// domain_release inside domain_drain while domain_drain still holds the
-// domain's lock, then domain_drain tries to unlock the freed mutex).  This is
-// a pre-existing unrelated issue (separate from #704); it causes TSan to exit
-// with code 99 for the concurrent-fault scenario in both old and new code.
-// We suppress it by examining the TSan output text for "bz_exc" races instead
-// of relying solely on the exit code.
+//   (b) TSan no-bz_exc-race: compile and run with -fsanitize=thread.
+//       Fix #704 eliminates the bz_exc data race; fix #708 eliminates the
+//       pre-existing domain_drain heap-UAF (domain_release fired while
+//       lock_guard still alive, freed dom->mtx before ~lock_guard unlocked it).
+//       Post-#708 the binary must be fully TSan-clean: no TSan error in the
+//       output AND exit code must not be 99.
 //
 // Spec derivation: §30.14 (v0.141) — concurrent domain workers; §31.1 bz_exc.
 
@@ -90,7 +83,11 @@ int compileAndRun(const std::string& source) {
 
 // Compile with -fsanitize=thread and capture the full TSan output (stderr).
 // Returns the combined stderr output, or "" on infrastructure failure.
-std::string runUnderTSanCaptureOutput(const std::string& source) {
+// Sets *exitCode (if non-null) to the program's exit code (TSan uses 99 on
+// error when TSAN_OPTIONS=exitcode=99; set to -1 on infrastructure failure).
+std::string runUnderTSanCaptureOutput(const std::string& source,
+                                      int* exitCode = nullptr) {
+    if (exitCode) *exitCode = -1;
     if (std::system("clang++ --version > /dev/null 2>&1") != 0) return "";
 
     static int counter = 0;
@@ -138,11 +135,13 @@ std::string runUnderTSanCaptureOutput(const std::string& source) {
         " -lm -lpthread -lstdc++ -o " + exe + " > /dev/null 2>&1";
     if (std::system(linkCmd.c_str()) != 0) { cleanup(); return ""; }
 
-    // Capture TSan output (stderr) to a file; don't use exitcode trick since
-    // we want the text to check for specific symbols.
+    // Run with TSAN_OPTIONS=exitcode=99 so TSan sets exit 99 on any error;
+    // capture stderr (TSan output) to a file.
     std::string runCmd =
-        "TSAN_OPTIONS=exitcode=0 " + exe + " > /dev/null 2> " + outFile;
-    std::system(runCmd.c_str());
+        "TSAN_OPTIONS=exitcode=99 " + exe + " > /dev/null 2> " + outFile;
+    int status = std::system(runCmd.c_str());
+    if (exitCode && status != -1 && WIFEXITED(status))
+        *exitCode = WEXITSTATUS(status);
 
     // Read captured output
     std::ifstream f(outFile);
@@ -209,30 +208,34 @@ BEZEL_TEST(tsan_704_bz_exc, concurrent_faults_both_surface_correctly) {
 }
 
 // ---------------------------------------------------------------------------
-// §30.14 / fix #704: TSan probe — no data races on bz_exc.
+// §30.14 / fix #704 + fix #708: TSan probe — fully clean binary.
 //
-// Compile with -fsanitize=thread and run; capture TSan output and verify it
-// contains NO mention of "bz_exc" or "bz_exc_addr" in any data-race report.
-//
-// NOTE: a pre-existing heap-use-after-free in domain_drain (present in both
-// pre-fix and post-fix code, unrelated to #704) causes TSan to report an
-// error in this scenario.  We check specifically that bz_exc is NOT involved
-// in any TSan-detected race — the pre-existing UAF (on a domain mutex) is a
-// separate issue tracked independently.
+// Compile with -fsanitize=thread and run; verify:
+//   1. No mention of "bz_exc" / "bz_exc_addr" in TSan output (fix #704).
+//   2. TSan reports no error at all — exit code must not be 99 (fix #708:
+//      the domain_drain heap-UAF that caused exit=99 is now resolved).
 // ---------------------------------------------------------------------------
 BEZEL_TEST(tsan_704_bz_exc, tsan_no_bz_exc_race_in_output) {
-    std::string tsanOutput = runUnderTSanCaptureOutput(kConcurrentFaultSource);
-    if (tsanOutput.empty()) return;  // clang unavailable, skip gracefully
+    int tsanExitCode = -1;
+    std::string tsanOutput = runUnderTSanCaptureOutput(kConcurrentFaultSource,
+                                                        &tsanExitCode);
+    if (tsanOutput.empty() && tsanExitCode == -1) return;  // clang unavailable
 
-    // Check that neither "bz_exc" nor "bz_exc_addr" appear in any TSan race
-    // report.  With fix #704 (thread_local), each worker has its own slot; no
-    // concurrent access to a shared bz_exc is possible.
+    // Fix #704: no bz_exc data race.
     bool hasBzExcRace = (tsanOutput.find("bz_exc") != std::string::npos);
     if (hasBzExcRace) {
-        // Print what TSan reported for debugging.
-        // (Only prints if the test fails.)
         std::fprintf(stderr, "TSan output contained bz_exc:\n%s\n",
                      tsanOutput.c_str());
     }
     BEZEL_EXPECT_TRUE(!hasBzExcRace);
+
+    // Fix #708: domain_drain UAF resolved — binary must be fully TSan-clean
+    // (TSan exits 99 on any sanitizer error; 42 = correct program result).
+    if (tsanExitCode != -1) {
+        if (tsanExitCode == 99) {
+            std::fprintf(stderr, "TSan reported an error (exit=99):\n%s\n",
+                         tsanOutput.c_str());
+        }
+        BEZEL_EXPECT_EQ(tsanExitCode, 42);
+    }
 }
