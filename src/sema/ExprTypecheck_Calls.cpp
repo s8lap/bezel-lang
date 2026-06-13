@@ -4248,6 +4248,34 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // type name, so look the member up on that type. (The
                 // static-vs-instance correctness of the member is
                 // enforced by the static-context checks, not here.)
+                //
+                // §22.12 / #696: a generic class's static members must be
+                // accessed with explicit type arguments on the type name
+                // (e.g. `Counter<int>.n`, not bare `Counter.n`).  Each
+                // distinct instantiation has its own static state, so an
+                // unqualified name is ambiguous and ill-formed.
+                //
+                // Exception: inside the generic class's OWN body (ts ==
+                // currentType_) the bare name is the self-reference form
+                // (implicitly Tag<T>.field for the current instantiation)
+                // — that idiom is accepted and resolves correctly in
+                // codegen when genericSubst_ is active.
+                if (!ts->genericParams.empty() && ts != currentType_) {
+                    auto* tid =
+                        dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
+                    if (tid && tid->typeArgs.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("generic type `") +
+                            std::string(ts->name) +
+                            "` requires type arguments when accessing its "
+                            "static members from outside the class body — "
+                            "use `" + std::string(ts->name) +
+                            "<T>.` with the concrete type arguments "
+                            "(§22.12)");
+                        return;
+                    }
+                }
                 targetType = ts;
             } else if (auto* nts = dynamic_cast<NestedTypeSymbol*>(sym)) {
                 // §11.3 / #482 fix B: a NestedTypeSymbol (e.g. `Container.Status`
