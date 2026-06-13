@@ -552,6 +552,7 @@ set(BEZEL_TEST_SOURCES
     module/cross_module_iterator_test.cpp
     module/xmod_property_503_test.cpp
     module/xmod_record_nested_501_502_test.cpp
+    module/xmod_string_refcount_694_test.cpp
 
     runtime/event_subscription_test.cpp
 

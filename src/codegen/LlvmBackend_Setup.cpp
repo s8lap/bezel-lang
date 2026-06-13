@@ -3178,6 +3178,23 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             if (v && currentReturnTypeNode_)
                 v = boxForTarget(v, ctx_.resolvedType(*currentReturnTypeNode_),
                                  ci.exprBody);
+            // #694 residue-1 / §4.6 / §28.9 / §28.3: an arrow-body (`=> expr`)
+            // string-returning method must mint EXACTLY +1 just like the explicit
+            // ReturnStmt path (LlvmBackend_Stmts.cpp line ~750). Without this,
+            // a `=> fieldRef` or `=> param` body returns a raw borrow (rc stays 0
+            // above what the caller expects), so the caller's release under-counts.
+            // Mirror the ReturnStmt logic exactly: TRANSFER if `ci.exprBody` is
+            // already a +1 producer or a returned-local-owns-plus-one; else RETAIN.
+            if (v && currentReturnTypeNode_ && v->getType()->isPointerTy()) {
+                const sema::TypeRef* declRet =
+                    ctx_.resolvedType(*currentReturnTypeNode_);
+                if (declRet && !declRet->nullable &&
+                    declRet->kind == sema::TypeRef::Kind::Primitive &&
+                    declRet->primitive == sema::PrimitiveType::String &&
+                    !isPlusOneStringProducer(ci.exprBody) &&
+                    !returnedStringLocalOwnsPlusOne(ci.exprBody))
+                    emitStringRetain(v);
+            }
             terminated = emitReturn(fn, v);
         }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
@@ -5655,17 +5672,29 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
 // imported, not an operator) and whose declared return type is (non-nullable)
 // `string`. Such a call goes through THIS module's ReturnStmt lowering, which
 // mints exactly +1 for the returned string — so the caller owns that single
-// reference. Cross-module imported methods (their callee does NOT run our
-// ReturnStmt minting) and builtin stdlib string methods (no resolved
-// MethodSymbol — matched structurally in tryLowerStringMethod) are excluded,
-// keeping their prior borrow-with-leak handling untouched.
+// reference. Builtin stdlib string methods (no resolved MethodSymbol — matched
+// structurally in tryLowerStringMethod) are excluded. Cross-module imported
+// methods are now recognized as +1 producers when they declare a non-nullable
+// string return type: their ReturnStmt in the exporter module ran the same
+// string-retain minting logic, so the caller receives exactly +1 and must
+// release at scope end without an extra borrow-retain. (#694 residue-1 / §4.6
+// / §28.9.)
 bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(init);
     if (!call || !call->callee) return false;
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
     if (!ms) return false;                         // builtin string method / not a method
     if (ms->isOperator) return false;              // operator overloads excluded
-    if (ctx_.isImported(ms)) return false;         // cross-module: deferred (no local mint)
+    if (ctx_.isImported(ms)) {
+        // §4.6 / §28.9 / #694 residue-1: an imported method whose declared
+        // return type is non-nullable string already ran ReturnStmt string-retain
+        // minting in the exporter. The caller receives +1 and must release at
+        // scope end, not borrow-retain. Treat it as a +1 producer.
+        const sema::TypeRef* rt = ctx_.importedReturnType(ms);
+        return rt && !rt->nullable &&
+               rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
     // Must be a locally-compiled body — backed by an ast::MethodDecl whose body
     // codegen lowers (so its ReturnStmt runs the +1 mint). An abstract/interface
     // method's runtime target is some override that IS compiled here and also
