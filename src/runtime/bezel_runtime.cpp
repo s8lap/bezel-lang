@@ -9820,9 +9820,10 @@ struct bz_mutex_t {
     // per #647 (mirrors #634): refcount — Mutex object holds +1, each Lock holds +1.
     // Last release (core_refs → 0) calls pthread_mutex_destroy and deletes.
     std::atomic<int>    core_refs{1};
-    // disposed flag: set by bz_mutex_dispose so the object slot can be nulled
-    // safely (idempotent disposal per §28.2).
-    bool                disposed{false};
+    // disposed flag: set atomically by bz_mutex_dispose so concurrent Dispose
+    // calls from two domains are safe (§28.2 / fix #706 — TOCTOU double-free).
+    // exchange(true) ensures exactly one caller proceeds to core_release.
+    std::atomic<bool>   disposed{false};
 };
 
 struct bz_lock_t {
@@ -9921,11 +9922,13 @@ void bz_lock_release(void* lkp) {
 // and releases the Mutex object's core ref.  The pthread_mutex is destroyed only
 // when the last Lock is also released (via mutex_core_release → core_refs → 0).
 // Idempotent: calling twice is a no-op on the second call.
+// fix #706: exchange(true) is atomic — concurrent Dispose calls from two domains
+// cannot both proceed to core_release (only the first caller, which sees false,
+// drops the core ref; the second sees true and returns immediately).
 void bz_mutex_dispose(void* mp) {
     if (!mp) return;
     auto* m = (bz_mutex_t*)mp;
-    if (m->disposed) return;
-    m->disposed = true;
+    if (m->disposed.exchange(true)) return;  // already disposed → no-op (fix #706)
     mutex_core_release(m);  // drop the Mutex object's own ref
 }
 
@@ -10197,7 +10200,9 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
 struct bz_semaphore_t {
     sem_t                sem;
     std::atomic<int>    core_refs{1};
-    bool                disposed{false};
+    // fix #706: atomic so concurrent Dispose from two domains cannot both
+    // reach semaphore_core_release (exchange(true) ensures exactly one caller).
+    std::atomic<bool>   disposed{false};
     // maxCount cap: stored but enforced only at release time via a mutex+cond
     // in the full implementation.  For the current runtime (no hard maxCount
     // enforcement beyond not exceeding POSIX sem count), maxCount is advisory.
@@ -10330,11 +10335,12 @@ void bz_semaphore_token_release(void* tokp) {
 // idempotency) and releases the Semaphore object's core ref.  The sem_t is
 // destroyed only when the last SemaphoreToken is also released (via
 // semaphore_core_release → core_refs → 0).  Idempotent: second call is no-op.
+// fix #706: exchange(true) is atomic — concurrent Dispose from two domains
+// cannot both proceed to semaphore_core_release.
 void bz_semaphore_dispose(void* sp) {
     if (!sp) return;
     auto* s = (bz_semaphore_t*)sp;
-    if (s->disposed) return;
-    s->disposed = true;
+    if (s->disposed.exchange(true)) return;  // already disposed → no-op (fix #706)
     semaphore_core_release(s);  // drop the Semaphore object's own ref
 }
 
@@ -10504,8 +10510,10 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
 // ---------------------------------------------------------------------------
 
 struct bz_atomic_t {
-    std::atomic<int> core_refs{1};
-    bool             disposed{false};
+    std::atomic<int>  core_refs{1};
+    // fix #706: atomic so concurrent Dispose from two domains cannot both
+    // reach atomic_core_release (exchange(true) ensures exactly one caller).
+    std::atomic<bool> disposed{false};
     int              cell_size;       // 1, 2, or 4 for short T; 8 for long T
     // Value payload: 8-byte aligned buffer; cell_size bytes are used.
     alignas(8) uint8_t cell[8];
@@ -10540,11 +10548,12 @@ void* bz_atomic_new(int cell_size, uint64_t initial) {
 }
 
 // bz_atomic_dispose — idempotent dispose (§28.2); drops the core ref.
+// fix #706: exchange(true) is atomic — concurrent Dispose from two domains
+// cannot both proceed to atomic_core_release.
 void bz_atomic_dispose(void* ptr) {
     if (!ptr) return;
     auto* a = static_cast<bz_atomic_t*>(ptr);
-    if (a->disposed) return;
-    a->disposed = true;
+    if (a->disposed.exchange(true)) return;  // already disposed → no-op (fix #706)
     atomic_core_release(a);
 }
 
