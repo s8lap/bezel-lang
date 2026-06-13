@@ -150,6 +150,7 @@ set(BEZEL_TEST_SOURCES
     sema/definite_return_test.cpp
     sema/generic_constraints_test.cpp
     sema/generic_return_inference_test.cpp
+    sema/generic_static_observe_696_test.cpp
     sema/extern_ffi_type_test.cpp
     sema/entry_point_test.cpp
     sema/flow_narrowing_test.cpp
