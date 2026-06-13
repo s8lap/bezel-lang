@@ -3251,6 +3251,19 @@ struct bz_domain_t {
 
 static bz_domain_t* g_main_domain = nullptr;
 
+// fix #713: track the domain currently being drained on this thread so that
+// async primitives invoked from inside a spawned domain route their
+// await-continuations back to the caller's domain rather than always to
+// g_main_domain (§30.13 run-to-completion isolation).
+//
+// Invariant: g_current_domain is set to the draining domain immediately before
+// each c.fn(c.task, c.state) call in domain_drain, and restored afterwards
+// (save/restore for correct nesting, mirroring bz_exc's save/restore in
+// bz_domain_spawn).  On the main thread (not draining any domain) it is nullptr;
+// the nullptr fallback at each allocation site means main-thread callers still
+// get g_main_domain — zero behavior change for the common path.
+static thread_local bz_domain_t* g_current_domain = nullptr;
+
 // ---------------------------------------------------------------------------
 // domain_ref / domain_release — refcount helpers (fix #632)
 // ---------------------------------------------------------------------------
@@ -3479,7 +3492,18 @@ static void domain_drain(bz_domain_t* dom) {
         // active=true holds for the entire duration of c.fn(), so any such
         // concurrent enqueue always appends to the queue (and never triggers
         // a second domain_drain submission).
-        c.fn(c.task, c.state);
+        //
+        // fix #713: set g_current_domain to the draining domain so any async
+        // primitive invoked from inside this continuation routes its new task
+        // back to this domain (§30.13 run-to-completion isolation).
+        // Save/restore for correct nesting (a continuation may itself drain
+        // another domain, e.g. via bz_task_await_sync on a sub-task).
+        {
+            bz_domain_t* prev_cd = g_current_domain;
+            g_current_domain = dom;
+            c.fn(c.task, c.state);
+            g_current_domain = prev_cd;
+        }
     }
 }
 
@@ -3562,8 +3586,10 @@ void bz_scheduler_shutdown(void) {
 void* bz_task_alloc(void) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route to the caller's domain (g_current_domain when inside a
+    // spawned domain drain), falling back to g_main_domain on the main thread.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     return task;
 }
 
@@ -3589,8 +3615,9 @@ void* bz_task_delay(int64_t milliseconds) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     if (!g_scheduler) bz_scheduler_init(4);   // ensure a pool exists
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     int64_t ms = milliseconds < 0 ? 0 : milliseconds;
     g_scheduler->submit([task, ms]() {
         if (ms > 0)
@@ -3777,8 +3804,9 @@ void bz_task_free(void* tp) {
 void* bz_task_from_result(const void* result, int64_t result_size) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     if (result_size > 0 && result) {
         task->result = malloc((size_t)result_size);
         memcpy(task->result, result, (size_t)result_size);
@@ -3821,8 +3849,9 @@ void* bz_task_when_all(void* task_arr) {
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
-    aggregate->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route aggregate to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      aggregate->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     if (n == 0) {
         aggregate->done = true;
         return aggregate;
@@ -3901,8 +3930,9 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
-    aggregate->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route aggregate to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      aggregate->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     if (n == 0) {
         // Empty array: complete immediately with an empty Array<T>.
         void* emptyArr = bz_array_alloc(elem_size, 0);
@@ -4005,8 +4035,9 @@ void* bz_task_when_all_owned(void* task_arr) {
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
-    aggregate->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route aggregate to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      aggregate->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     if (n == 0) {
         // Empty array: complete immediately with an empty OwnedArray<T>.
         void* emptyArr = bz_array_alloc(sizeof(void*), 0);
@@ -4115,8 +4146,9 @@ void* bz_task_when_any(void* task_arr) {
     auto* arr = (bz_array_t*)task_arr;
     int64_t n = bz_array_len(arr);
     auto* aggregate = new bz_task_t();
-    aggregate->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route aggregate to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      aggregate->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     if (n == 0) {
         aggregate->done = true;
         return aggregate;
@@ -6792,6 +6824,13 @@ extern "C" thread_local void* bz_exc = nullptr;
 // which then accesses the real TLS slot directly.
 extern "C" void** bz_exc_addr() { return &bz_exc; }
 
+// fix #713: return the g_current_domain value for the calling thread.
+// Used by tests to verify domain_drain sets the tracker; not called from
+// generated code.  Returns a void* (opaque handle) — tests compare with
+// domain pointers obtained from bz_domain_spawn's join_task->domain, but
+// more directly we expose it as void* to avoid exposing bz_domain_t.
+extern "C" void* bz_current_domain_ptr() { return (void*)g_current_domain; }
+
 // ---------------------------------------------------------------------------
 // CancellationToken / CancellationTokenSource — stdlib §6.1 / spec §30.8.
 //
@@ -6988,8 +7027,9 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* s = (bz_cancel_state_t*)token;
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
     // Pre-check: if already cancelled, fault immediately.
     // #716: acquire load so we see any release-store from bz_cts_cancel.
     if (s && s->cancelled.load(std::memory_order_acquire)) {
@@ -7223,8 +7263,9 @@ void* bz_channel_receive(void* chp, void* cce_vtable) {
     auto* ch = (bz_channel_t*)chp;
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
 
     void* item = nullptr;
     bool  have_item = false;
@@ -7405,8 +7446,9 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
     // Allocate the join task -- the caller awaits this.
     auto* join_task = new bz_task_t();
     // The join task belongs to the CALLER's domain (main or current domain).
-    join_task->domain = g_main_domain;
-    domain_ref(g_main_domain);  // per fix #632: join_task holds a ref on its domain
+    // fix #713: use g_current_domain when called from inside a spawned domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      join_task->domain = d; domain_ref(d); }  // per fix #632: join_task holds a ref on its domain
 
     // Allocate a FRESH domain for the spawned entry (§30.13 isolation).
     // per fix #632: start with refs=0; domain_drain and SpawnCtx each add their own.
@@ -10026,8 +10068,9 @@ void bz_mutex_dispose(void* mp) {
 static bz_task_t* mutex_make_done_task(void* result_ptr) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
     // Store the pointer as the task's result (sizeof(void*) bytes).
     task->result = malloc(sizeof(void*));
     memcpy(task->result, &result_ptr, sizeof(void*));
@@ -10040,8 +10083,9 @@ static bz_task_t* mutex_make_done_task(void* result_ptr) {
 static bz_task_t* mutex_make_faulted_task(void* oce_vtable) {
     bz_main_domain_get();
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
     task->error_obj = bz_task_make_oce(oce_vtable);
     task->is_error = true;
     task->done = true;
@@ -10075,8 +10119,9 @@ void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
     if (!g_scheduler) bz_scheduler_init(4);
     bz_main_domain_get();
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
 
     // The worker holds a core ref so the mutex core cannot be destroyed while
     // the pool thread is blocking inside pthread_mutex_lock.
@@ -10148,8 +10193,9 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
         void* nullPtr = nullptr;
         bz_main_domain_get();
         auto* task = new bz_task_t();
-        task->domain = g_main_domain;
-        domain_ref(g_main_domain);
+        // fix #713: route to the caller's domain.
+        { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+          task->domain = d; domain_ref(d); }
         task->result = malloc(sizeof(void*));
         memcpy(task->result, &nullPtr, sizeof(void*));
         task->result_size = (int64_t)sizeof(void*);
@@ -10161,8 +10207,9 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
     if (!g_scheduler) bz_scheduler_init(4);
     bz_main_domain_get();
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
 
     // Worker holds a core ref across the blocking timedlock.
     mutex_core_ref(m);
@@ -10284,8 +10331,9 @@ static void semaphore_core_release(bz_semaphore_t* s) {
 static bz_task_t* semaphore_make_done_task(void* result_ptr) {
     bz_main_domain_get();
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
     task->result = malloc(sizeof(void*));
     memcpy(task->result, &result_ptr, sizeof(void*));
     task->result_size = (int64_t)sizeof(void*);
@@ -10298,8 +10346,9 @@ static bz_task_t* semaphore_make_done_task(void* result_ptr) {
 static bz_task_t* semaphore_make_faulted_task(void* oce_vtable) {
     bz_main_domain_get();
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
     task->error_obj = bz_task_make_oce(oce_vtable);
     task->is_error = true;
     task->done = true;
@@ -10430,8 +10479,9 @@ void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
     if (!g_scheduler) bz_scheduler_init(4);
     bz_main_domain_get();
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
 
     // Worker holds a core ref so the semaphore core cannot be destroyed while
     // the pool thread is blocking inside sem_wait.
@@ -10490,8 +10540,9 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
         void* nullPtr = nullptr;
         bz_main_domain_get();
         auto* task2 = new bz_task_t();
-        task2->domain = g_main_domain;
-        domain_ref(g_main_domain);
+        // fix #713: route to the caller's domain.
+        { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+          task2->domain = d; domain_ref(d); }
         task2->result = malloc(sizeof(void*));
         memcpy(task2->result, &nullPtr, sizeof(void*));
         task2->result_size = (int64_t)sizeof(void*);
@@ -10503,8 +10554,9 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
     if (!g_scheduler) bz_scheduler_init(4);
     bz_main_domain_get();
     auto* task = new bz_task_t();
-    task->domain = g_main_domain;
-    domain_ref(g_main_domain);
+    // fix #713: route to the caller's domain.
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
 
     semaphore_core_ref(s);
     int64_t tms = timeout_ms;
