@@ -1128,6 +1128,11 @@ extern thread_local void* bz_exc;
 // the JIT resolves the symbol via the host process's dynamic symbol table.
 extern void** bz_exc_addr();
 
+// fix #713: bz_current_domain_ptr() — return the current g_current_domain value
+// for the calling thread.  Used by tests to verify that domain_drain sets the
+// tracker correctly; not called from generated code.
+extern void* bz_current_domain_ptr();
+
 // ---------------------------------------------------------------------------
 // Shared<T> / Weak<T> — domain-local shared ownership (§28.13 / stdlib §2.16)
 //

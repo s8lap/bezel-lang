@@ -564,6 +564,7 @@ set(BEZEL_TEST_SOURCES
     runtime/event_subscription_test.cpp
     runtime/concurrent_dispose_706_test.cpp
     runtime/atomic_cancelstate_716_test.cpp
+    runtime/current_domain_713_test.cpp
 
     ownership/linear_owned_test.cpp
     ownership/read_after_move_test.cpp
