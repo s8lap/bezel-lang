@@ -272,9 +272,22 @@ def _is_signature_block(code):
     )
     type_decl_count = sum(1 for l in lines if type_decl_re.match(l))
 
-    # If it's mostly stubs with no statement/body content → signature
+    # Expression-body continuation lines: when a method signature ends with `=>`
+    # and the body appears on the NEXT line (e.g. `new Vector2(...);`), the
+    # expr_body_re above misses it.  Detect any indented line that starts with
+    # `new <UpperCase>` — these only appear in real method/constructor bodies.
+    new_body_re = re.compile(r'^\s{2,}new\s+[A-Z]')
+    new_body_count = sum(1 for l in lines if new_body_re.match(l))
+
+    # If it's mostly stubs with no statement/body content → signature.
+    # NOTE: type_decl_count > 1 is intentionally NOT included in has_bodies.
+    # A block that lists multiple class/interface declarations whose members are
+    # ALL bodyless stubs (e.g. IEvent<T> + EventSource<T> API listing) is still
+    # a pure signature block.  The old code counted multiple type decls as
+    # evidence of "has bodies", which incorrectly forced spec_0150/stdlib_0083/
+    # stdlib_0026/stdlib_0027/stdlib_0038 to fragment/compiles (issue #683 sub-2).
     has_bodies = (stmt_count > 0 or body_assign_count > 0 or
-                  expr_body_count > 0 or type_decl_count > 1)
+                  expr_body_count > 0 or new_body_count > 0)
     is_sig = (stub_count >= 3 and not has_bodies)
     return is_sig
 

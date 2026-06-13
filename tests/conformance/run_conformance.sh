@@ -92,6 +92,24 @@ wrap_fragment() {
         return
     fi
 
+    # Extension block at module level (§26.x)?
+    # A fragment whose first non-blank line is `extension ...` is a top-level
+    # extension declaration — it must live at module scope, not inside a class or
+    # Main.  Wrap it library-style (prepend `module Conf;`, compile with -c).
+    # NOTE: spec_0167 mixes extension blocks with trailing var/call statements;
+    # that mixed shape is NOT handled here and will fall through to the stmt
+    # wrapper, which will fail (no module-level statements allowed outside a class).
+    # That case should be classified skip:mixed in the manifest.
+    if echo "$first_nonblank" | grep -qE '^\s*extension\b'; then
+        {
+            printf 'module Conf;\n\n'
+            cat "$src_file"
+        } > "$wrap_file"
+        echo "lib"
+        echo "$wrap_file"
+        return
+    fi
+
     # Import statement?
     if echo "$first_nonblank" | grep -qE '^\s*import\s+'; then
         {

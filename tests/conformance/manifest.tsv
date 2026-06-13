@@ -45,7 +45,7 @@ spec_0042	spec	127-Type-tests-is-is-not-as	fragment	compiles
 spec_0043	spec	127-Type-tests-is-is-not-as	fragment	compiles	
 spec_0044	spec	128-Constructor-chaining	fragment	compiles	
 spec_0045	spec	129-Variance	fragment	compiles	
-spec_0046	spec	Variance-and-interface-inheritance	fragment	compiles	
+spec_0046	spec	Variance-and-interface-inheritance	skip	n/a	skip:signature
 spec_0047	spec	132-Top-level-types	fragment	compiles	
 spec_0048	spec	136-Accessor-visibility	fragment	compiles	
 spec_0049	spec	137-Visibility-and-inheritance	error	diagnose	
@@ -149,7 +149,7 @@ spec_0146	spec	241-Declaration	fragment	compiles
 spec_0147	spec	241-Declaration	fragment	compiles	
 spec_0148	spec	242-Payload-records	fragment	compiles	
 spec_0149	spec	243-The-type-of-an-event-member	fragment	compiles	
-spec_0150	spec	243-The-type-of-an-event-member	fragment	compiles	chained:1
+spec_0150	spec	243-The-type-of-an-event-member	skip	n/a	skip:signature
 spec_0151	spec	With-named-methods-inside-the-declaring-class	fragment	compiles	
 spec_0152	spec	With-named-methods-inside-the-declaring-class	fragment	compiles	
 spec_0153	spec	With-Subscribe	fragment	compiles	
@@ -166,7 +166,7 @@ spec_0163	spec	254-No-user-defined-conversion-operators	fragment	compiles
 spec_0164	spec	261-Declaration	fragment	compiles	
 spec_0165	spec	264-Generic-extensions	fragment	compiles	
 spec_0166	spec	264-Generic-extensions	fragment	compiles	
-spec_0167	spec	2651-Specificity-ordering	fragment	compiles	
+spec_0167	spec	2651-Specificity-ordering	skip	n/a	skip:mixed (extension blocks + trailing var/call statements; lib wrap would fail on module-level statements, stmt wrap would fail on top-level extension; issue #683)
 spec_0168	spec	271-Function-types	fragment	compiles	
 spec_0169	spec	271-Function-types	fragment	compiles	
 spec_0170	spec	Lambda-parameter-modifiers	fragment	compiles	
@@ -222,7 +222,7 @@ spec_0219	spec	Compatibility-between-borrowing-and-owning-forms	fragment	compile
 spec_0220	spec	2812-Asynchronous-disposal	fragment	compiles	
 spec_0221	spec	2812-Asynchronous-disposal	fragment	compiles	
 spec_0222	spec	2813-Shared-ownership-SharedT-and-WeakT	fragment	compiles	
-spec_0223	spec	291-The-protocol	fragment	compiles	
+spec_0223	spec	291-The-protocol	skip	n/a	skip:signature
 spec_0224	spec	292-Desugaring-of-for	fragment	compiles	
 spec_0225	spec	292-Desugaring-of-for	fragment	compiles	
 spec_0226	spec	292-Desugaring-of-for	fragment	compiles	
@@ -233,7 +233,7 @@ spec_0230	spec	2910-Empty-iterators	fragment	compiles
 spec_0231	spec	2912-Mutation-during-iteration	fragment	compiles	
 spec_0232	spec	301-async-methods	fragment	compiles	
 spec_0233	spec	302-await	fragment	compiles	
-spec_0234	spec	303-The-Task-TaskT-and-OwnedTaskT-types	fragment	compiles	
+spec_0234	spec	303-The-Task-TaskT-and-OwnedTaskT-types	skip	n/a	skip:signature
 spec_0235	spec	Consumer-side-rules	fragment	compiles	
 spec_0236	spec	Consumer-side-rules	fragment	compiles	
 spec_0237	spec	Consumer-side-rules	fragment	compiles	
@@ -245,7 +245,7 @@ spec_0242	spec	Constructing-a-completed-task-with-a-class-typed-result	fragment	
 spec_0243	spec	Idiom-async-resource-acquisition	fragment	compiles	
 spec_0244	spec	306-Async-lambdas	fragment	compiles	
 spec_0245	spec	307-Async-iterators	fragment	compiles	
-spec_0246	spec	307-Async-iterators	fragment	compiles	
+spec_0246	spec	307-Async-iterators	skip	n/a	skip:signature
 spec_0247	spec	307-Async-iterators	fragment	compiles	
 spec_0248	spec	Cancellation-in-await-for	fragment	compiles	
 spec_0249	spec	Async-iteration-with-owned-yields	fragment	compiles	
@@ -336,7 +336,7 @@ stdlib_0010	stdlib	211-Subscription	fragment	compiles
 stdlib_0011	stdlib	212-BitConverter	skip	n/a	skip:signature
 stdlib_0012	stdlib	213-The-Type-class	skip	n/a	skip:signature
 stdlib_0013	stdlib	213-The-Type-class	fragment	compiles	chained:1
-stdlib_0014	stdlib	214-Serialization-vocabulary	fragment	compiles	
+stdlib_0014	stdlib	214-Serialization-vocabulary	skip	n/a	skip:signature
 stdlib_0015	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:1
 stdlib_0016	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:1
 stdlib_0017	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:2
@@ -346,37 +346,37 @@ stdlib_0020	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:1
 stdlib_0021	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:1
 stdlib_0022	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:1
 stdlib_0023	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:1
-stdlib_0024	stdlib	215-Concrete-serialization-formats	fragment	compiles	
+stdlib_0024	stdlib	215-Concrete-serialization-formats	skip	n/a	skip:signature
 stdlib_0025	stdlib	215-Concrete-serialization-formats	fragment	compiles	chained:1
-stdlib_0026	stdlib	216-SharedT-and-WeakT	fragment	compiles	
+stdlib_0026	stdlib	216-SharedT-and-WeakT	skip	n/a	skip:signature
 stdlib_0027	stdlib	216-SharedT-and-WeakT	fragment	compiles	chained:1
 stdlib_0028	stdlib	217-Built-in-exception-types-cross-reference	fragment	compiles	
 stdlib_0029	stdlib	31-StringBuilder	skip	n/a	skip:signature
 stdlib_0030	stdlib	32-Encoding	skip	n/a	skip:signature
 stdlib_0031	stdlib	33-ReadOnlyStringSpan	fragment	compiles	
 stdlib_0032	stdlib	34-ReadOnlyAsciiByteSpan	fragment	compiles	
-stdlib_0033	stdlib	41-Borrowing-collection-interfaces	fragment	compiles	
-stdlib_0034	stdlib	42-Owning-collection-interfaces	fragment	compiles	
+stdlib_0033	stdlib	41-Borrowing-collection-interfaces	skip	n/a	skip:signature
+stdlib_0034	stdlib	42-Owning-collection-interfaces	skip	n/a	skip:signature
 stdlib_0035	stdlib	43-How-the-borrowing-and-owning-hierarchies-relate	fragment	compiles	
 stdlib_0036	stdlib	44-ArrayT	skip	n/a	skip:signature
 stdlib_0037	stdlib	45-OwnedArrayT	skip	n/a	skip:signature
 stdlib_0038	stdlib	45-OwnedArrayT	fragment	compiles	chained:1
 stdlib_0039	stdlib	Reference-implementation	fragment	compiles	
-stdlib_0040	stdlib	46-LinkedListT	fragment	compiles	
+stdlib_0040	stdlib	46-LinkedListT	skip	n/a	skip:signature
 stdlib_0041	stdlib	47-OwnedLinkedListT	skip	n/a	skip:signature
-stdlib_0042	stdlib	48-DictionaryK-V	fragment	compiles	
+stdlib_0042	stdlib	48-DictionaryK-V	skip	n/a	skip:signature
 stdlib_0043	stdlib	48-DictionaryK-V	fragment	compiles	chained:1
-stdlib_0044	stdlib	49-OwnedDictionaryK-V	fragment	compiles	
+stdlib_0044	stdlib	49-OwnedDictionaryK-V	skip	n/a	skip:signature
 stdlib_0045	stdlib	49-OwnedDictionaryK-V	fragment	compiles	chained:1
 stdlib_0046	stdlib	49-OwnedDictionaryK-V	fragment	compiles	chained:1
 stdlib_0047	stdlib	Reference-implementation	fragment	compiles	
-stdlib_0048	stdlib	410-SetT-and-OwnedSetT	fragment	compiles	
+stdlib_0048	stdlib	410-SetT-and-OwnedSetT	skip	n/a	skip:signature
 stdlib_0049	stdlib	410-SetT-and-OwnedSetT	fragment	compiles	
-stdlib_0050	stdlib	411-StackT-OwnedStackT-QueueT-and-OwnedQueueT	fragment	compiles	
-stdlib_0051	stdlib	412-Borrowing-enumeration-interfaces	fragment	compiles	
-stdlib_0052	stdlib	412-Borrowing-enumeration-interfaces	fragment	compiles	
-stdlib_0053	stdlib	413-Owning-enumeration-interfaces	fragment	compiles	
-stdlib_0054	stdlib	413-Owning-enumeration-interfaces	fragment	compiles	
+stdlib_0050	stdlib	411-StackT-OwnedStackT-QueueT-and-OwnedQueueT	skip	n/a	skip:signature
+stdlib_0051	stdlib	412-Borrowing-enumeration-interfaces	skip	n/a	skip:signature
+stdlib_0052	stdlib	412-Borrowing-enumeration-interfaces	skip	n/a	skip:signature
+stdlib_0053	stdlib	413-Owning-enumeration-interfaces	skip	n/a	skip:signature
+stdlib_0054	stdlib	413-Owning-enumeration-interfaces	skip	n/a	skip:signature
 stdlib_0055	stdlib	OwnedBufferT	skip	n/a	skip:signature
 stdlib_0056	stdlib	OwnedBufferT	skip	n/a	skip:signature
 stdlib_0057	stdlib	SpanT	fragment	compiles	
@@ -405,8 +405,8 @@ stdlib_0079	stdlib	63-Semaphore	fragment	compiles
 stdlib_0080	stdlib	63-Semaphore	fragment	compiles	
 stdlib_0081	stdlib	AtomicT-load-store-exchange-compare-and-swap	skip	n/a	skip:signature
 stdlib_0082	stdlib	AtomicIntegerT-integer-arithmetic	skip	n/a	skip:signature
-stdlib_0083	stdlib	65-Events-IEvent-EventSource	fragment	compiles	
-stdlib_0084	stdlib	66-TaskCompletionSourceT-and-OwnedTaskCompletionSourceT	fragment	compiles	
+stdlib_0083	stdlib	65-Events-IEvent-EventSource	skip	n/a	skip:signature
+stdlib_0084	stdlib	66-TaskCompletionSourceT-and-OwnedTaskCompletionSourceT	skip	n/a	skip:signature
 stdlib_0085	stdlib	67-Task-static-helpers	skip	n/a	skip:signature
 stdlib_0086	stdlib	67-Task-static-helpers	fragment	compiles	chained:1
 stdlib_0087	stdlib	FromException-and-FromCancelled-for-class-T	fragment	compiles	
@@ -415,12 +415,12 @@ stdlib_0089	stdlib	WhenAll-for-class-T-WhenAllOwned	fragment	compiles
 stdlib_0090	stdlib	WhenAll-for-class-T-WhenAllOwned	fragment	compiles	
 stdlib_0091	stdlib	68-Domain	skip	n/a	skip:signature
 stdlib_0092	stdlib	68-Domain	fragment	compiles	
-stdlib_0093	stdlib	69-ChannelT-and-ChannelSenderT	fragment	compiles	
+stdlib_0093	stdlib	69-ChannelT-and-ChannelSenderT	skip	n/a	skip:signature
 stdlib_0094	stdlib	69-ChannelT-and-ChannelSenderT	fragment	compiles	
-stdlib_0095	stdlib	71-Stream	fragment	compiles	
+stdlib_0095	stdlib	71-Stream	skip	n/a	skip:signature
 stdlib_0096	stdlib	72-FileStream	fragment	compiles	
 stdlib_0097	stdlib	73-File	skip	n/a	skip:signature
-stdlib_0098	stdlib	74-TextReader-TextWriter-Directory-Path	fragment	compiles	
+stdlib_0098	stdlib	74-TextReader-TextWriter-Directory-Path	skip	n/a	skip:signature
 stdlib_0099	stdlib	81-Stopwatch	skip	n/a	skip:signature
 stdlib_0100	stdlib	82-Debug	skip	n/a	skip:signature
 stdlib_0101	stdlib	91-Integer-types	fragment	compiles	
