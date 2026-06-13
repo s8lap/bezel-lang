@@ -4943,6 +4943,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, tr);
                         return;
                     }
+                    // fix #702 / §26.5: before reporting "not yet supported",
+                    // try a user-defined extension method on string.  The
+                    // generic extension-lookup block below (line ~5043) runs
+                    // AFTER this block and would never be reached for an
+                    // unrecognised string member because the error here used to
+                    // stop sema cleanly — but the error itself suppressed valid
+                    // §26.5 extension calls.  Attempt the lookup first; if a
+                    // user extension resolves it, type the member access from
+                    // the extension's signature and return without error.  Only
+                    // emit the diagnostic when no user extension matches.
+                    if (Symbol* ext = lookupExtensionMember(tt, ma.member)) {
+                        resolveExtensionMember(ma, ext);
+                        return;
+                    }
                     // Emit a diagnostic for unrecognized string members.
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,

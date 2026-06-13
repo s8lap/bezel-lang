@@ -227,3 +227,69 @@ BEZEL_TEST(codegen_extension, no_extension_program_unaffected) {
         "  return f.Get(); "
         "end Main; end P;"), 42);
 }
+
+// ===========================================================================
+// BUG #702 / §26.5 — user-defined extension method on the `string` primitive.
+//
+// Before fix #702 the string-member ladder emitted a hard "not yet supported"
+// error for every unrecognised string member BEFORE the generic extension-
+// lookup block was reached (line ~5043 of ExprTypecheck_Calls.cpp).  A valid
+// §26.5 `extension string` method was therefore always rejected.
+//
+// Fix: attempt lookupExtensionMember first; emit the error only when no user
+// extension resolves the member.
+// ===========================================================================
+
+// §26.5 / #702: basic repro — extension on string compiles and returns correctly.
+// IsBlank() returns 1 (true → int via conditional) when the string is empty.
+BEZEL_TEST(codegen_extension, method_on_string_isblank_spec_26_5_702) {
+    // IsBlank: returns 1 when Length = 0, 0 otherwise.
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension string "
+        "  public method IsBlank(): bool => this.Length = 0; "
+        "end; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var s := \"hello\"; "
+        "    var b := s.IsBlank(); "
+        "    if b then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 0);
+}
+
+// §26.5 / #702: empty string → IsBlank() returns true.
+BEZEL_TEST(codegen_extension, method_on_string_isblank_empty_spec_26_5_702) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension string "
+        "  public method IsBlank(): bool => this.Length = 0; "
+        "end; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var s := \"\"; "
+        "    var b := s.IsBlank(); "
+        "    if b then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
+
+// §26.5 / #702: extension method on string that takes an argument and uses
+// the result of a built-in string method (Length) inside the body.
+BEZEL_TEST(codegen_extension, method_on_string_longer_than_spec_26_5_702) {
+    // LongerThan(n): returns 1 if Length > n, else 0 — used as return value.
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension string "
+        "  public method LongerThan(n: int): bool => this.Length > n; "
+        "end; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var s := \"hello\"; "
+        "    if s.LongerThan(3) then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"), 1);
+}
