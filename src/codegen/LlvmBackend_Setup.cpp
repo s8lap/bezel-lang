@@ -5290,7 +5290,14 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                 ctx_.exprSymbol(*call->callee));
             if (ms) {
                 auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-                if (md && md->returnOwned &&
+                // §28.10 / #707: for imported methods ms->decl is null (the
+                // ModuleLoader attaches no AST MethodDecl); the owned-return
+                // flag lives in SemaContext::importedReturnOwned_.  Fall back
+                // to that when md is absent — but ONLY when importedReturnOwned
+                // is true (a borrow return must NOT be disposed).
+                bool isOwned = (md && md->returnOwned) ||
+                               (!md && ctx_.importedReturnOwned(ms));
+                if (isOwned &&
                     isClassOrInterfaceRef(ctx_.exprType(*ld->initializer))) {
                     // Use the resolved class when available (for the disposer
                     // map); dispatch is dynamic in emitDisposals regardless.
@@ -7809,11 +7816,18 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
             if (call->callee) {
                 // (b1) User method with returnOwned: the MethodSymbol exists and
                 // its MethodDecl declares `owned` on the return.
+                // §28.10 / #707: for imported methods ms->decl is null (the
+                // ModuleLoader attaches no AST MethodDecl); the owned-return
+                // flag lives in SemaContext::importedReturnOwned_.  Fall back
+                // to that when md is absent — but ONLY when importedReturnOwned
+                // is true (a borrow return must NOT be disposed).
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(
                     ctx_.exprSymbol(*call->callee));
                 if (ms) {
                     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-                    if (md && md->returnOwned &&
+                    bool isOwned = (md && md->returnOwned) ||
+                                   (!md && ctx_.importedReturnOwned(ms));
+                    if (isOwned &&
                         isClassOrInterfaceRef(ctx_.exprType(*ld->initializer)))
                         return true;
                 }
