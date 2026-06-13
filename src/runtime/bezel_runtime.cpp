@@ -1458,7 +1458,7 @@ static void bz_set_exc(void* vtable) {
     if (!vtable) return;
     void** obj = static_cast<void**>(calloc(1, 16));
     memcpy(obj, &vtable, sizeof(void*));
-    extern void* bz_exc;
+    extern thread_local void* bz_exc;
     bz_exc = obj;
 }
 
@@ -2088,7 +2088,7 @@ extern "C" int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out) {
     }
     if (!has_digit) return 0;
     // Pass null vtables: on overflow bz_exc is NOT set (TryParse returns false).
-    extern void* bz_exc;
+    extern thread_local void* bz_exc;
     void* prev_exc = bz_exc;
     bz_exc = nullptr;
     bz_decimal_parse_cstr(buf, out, nullptr, nullptr);
@@ -6742,7 +6742,7 @@ extern "C" void bz_unhandled_exception(void) {
     exit(70);
 }
 
-// fix #492 / §31.1 / §2.6: the single process-wide in-flight exception pointer.
+// fix #492 / §31.1 / §2.6: the per-thread in-flight exception pointer.
 // Codegen emits ExternalLinkage references to "bz_exc" in every compiled module
 // (library and main); the linker merges them all to this one definition.
 // Null = no exception in flight; non-null = heap-allocated exception object.
@@ -6750,7 +6750,29 @@ extern "C" void bz_unhandled_exception(void) {
 // C++ name mangling). The previous per-module name "bz$exc" was InternalLinkage
 // (BSS) — the $ was invisible externally and is dropped now that the symbol is
 // external.
-extern "C" void* bz_exc = nullptr;
+//
+// fix #704 / §30.14: made thread_local so each domain worker thread has its own
+// independent exception slot.  Before this fix, two concurrent Domain.Spawn
+// workers racing on the single process-wide slot could clobber each other's
+// in-flight exception: one worker's "bz_exc = nullptr" cleared the other's
+// just-thrown exception, causing lost faults or incorrect fault detection.
+// C++ allows extern "C" thread_local; the symbol name "bz_exc" is preserved so
+// generated-code references that go through bz_exc_addr() still access the
+// correct per-thread slot.  Single-domain / single-thread programs are
+// unaffected: one TLS slot per thread behaves identically to the old single
+// global in the one-thread case.
+extern "C" thread_local void* bz_exc = nullptr;
+
+// fix #704: bz_exc_addr() returns a pointer to the calling thread's bz_exc TLS
+// slot.  Codegen emits `call ptr @bz_exc_addr()` followed by a load or store
+// through the returned pointer, rather than referencing bz_exc as a TLS
+// GlobalVariable.  This avoids the LLVM ORC JIT incompatibility: the JIT
+// generates emulated-TLS code (looking for "__emutls_v.bz_exc") for any
+// thread_local GlobalVariable, but the host process only exports the real TLS
+// symbol "bz_exc".  Since bz_exc_addr() is a plain extern "C" function, the
+// JIT resolves it via DynamicLibrarySearchGenerator and calls into the runtime,
+// which then accesses the real TLS slot directly.
+extern "C" void** bz_exc_addr() { return &bz_exc; }
 
 // ---------------------------------------------------------------------------
 // CancellationToken / CancellationTokenSource — stdlib §6.1 / spec §30.8.
@@ -7095,7 +7117,7 @@ void bz_channel_send(void* chp, void* item, void* cce_vtable) {
             if (cce_vtable) {
                 void* excObj = calloc(1, 16);
                 memcpy(excObj, &cce_vtable, sizeof(void*));
-                extern void* bz_exc;
+                extern thread_local void* bz_exc;
                 bz_exc = excObj;
             }
             return;
@@ -7343,7 +7365,7 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
         // Per D-c5: call entry; detect fault via bz_exc.
         // Save and clear bz_exc so a fault in the caller domain doesn't
         // confuse the fault check.
-        extern void* bz_exc;
+        extern thread_local void* bz_exc;
         void* prev_exc = bz_exc;
         bz_exc = nullptr;
         void* result = sc->entry_fn(sc->arg_ptr);
@@ -9549,7 +9571,7 @@ void bz_ser_throw(const char* msg, void* /*ser_exn_vtable*/) {
     str->width = 1;
     // str->rc is already 0 from memset; bz_str_contains does not touch rc.
 
-    extern void* bz_exc;
+    extern thread_local void* bz_exc;
     bz_exc = block;
 }
 
