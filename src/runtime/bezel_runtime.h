@@ -1059,6 +1059,15 @@ void bz_cts_cancel(void* src);
 // long as they need the token.
 void bz_cts_dispose(void* src);
 
+// #716: token-level retain / release.  A token handle (void* == bz_cancel_state_t*)
+// can be retained by async slow-paths (bz_task_delay_cancelable, mutex/semaphore
+// acquire_async) to extend the state cell's lifetime across the pool-worker
+// boundary.  These two helpers wrap the atomic rc operations so callers outside
+// the runtime .cpp (including runtime unit tests) can drive the same paths.
+// token == null → no-op.
+void bz_cts_retain(void* token);
+void bz_cts_release(void* token);
+
 // Read IsCancellationRequested on a token handle.
 // token == null  → false  (CancellationToken.None never cancels, §6.1).
 int32_t bz_ctoken_is_cancelled(void* token);

@@ -6811,9 +6811,25 @@ extern "C" void** bz_exc_addr() { return &bz_exc; }
 // CancellationToken.None  = null pointer.
 // ---------------------------------------------------------------------------
 
+// #716: Both fields are std::atomic<int32_t>.
+//
+// `rc` is retained on the domain thread and released on pool-worker threads
+// (bz_task_delay_cancelable, bz_mutex_acquire_async, bz_semaphore_acquire_async).
+// A plain int32_t rc causes lost-decrement / double-free / torn-UAF races.
+//
+// `cancelled` is a one-way 0→1 latch written by the domain thread
+// (bz_cts_cancel / bz_cts_dispose) and read by pool workers before/after the
+// sleep / blocking acquire.  A plain int32_t cross-thread flag is technically
+// data-race undefined behaviour under C++20.
+//
+// Layout: std::atomic<int32_t> is guaranteed to have the SAME size and
+// alignment as int32_t (4 bytes each, total struct = 8 bytes) per [atomics.types.generic]
+// p1. Codegen only touches bz_cancel_state_t through opaque function calls
+// (bz_ctoken_is_cancelled, bz_cts_is_cancelled, bz_cts_cancel, etc.) — no
+// direct GEP offsets — so the layout change is transparent to codegen.
 struct bz_cancel_state_t {
-    int32_t cancelled;   // 0 = live, 1 = cancelled
-    int32_t rc;          // reference count (source + outstanding tokens)
+    std::atomic<int32_t> cancelled;  // 0 = live, 1 = cancelled; one-way latch
+    std::atomic<int32_t> rc;         // reference count (source + outstanding tokens)
 };
 
 struct bz_cancel_source_t {
@@ -6822,19 +6838,26 @@ struct bz_cancel_source_t {
 };
 
 // Internal helpers — not exported.
+// retain: relaxed is sufficient — the retained pointer is already known to the
+//   caller (it was acquired while the count was >0), so no acquire is needed.
+// release: acq_rel is required — the decrement must acquire all prior stores
+//   (from the worker path) before the last-decrement caller frees the cell.
+//   fetch_sub returns the OLD value; free when it was 1 (now 0).
 static void bz_cancel_state_retain(bz_cancel_state_t* s) {
-    if (s) s->rc++;
+    if (s) s->rc.fetch_add(1, std::memory_order_relaxed);
 }
 static void bz_cancel_state_release(bz_cancel_state_t* s) {
     if (!s) return;
-    if (--s->rc <= 0) free(s);
+    // #716: use `delete` to match the `new` in bz_cts_alloc.
+    if (s->rc.fetch_sub(1, std::memory_order_acq_rel) == 1) delete s;
 }
 
 extern "C" void* bz_cts_alloc(void) {
-    auto* src = (bz_cancel_source_t*)calloc(1, sizeof(bz_cancel_source_t));
-    src->state = (bz_cancel_state_t*)calloc(1, sizeof(bz_cancel_state_t));
-    src->state->cancelled = 0;
-    src->state->rc = 1;  // source holds one reference
+    // Use `new` (not calloc) so that std::atomic constructors run.
+    auto* src = new bz_cancel_source_t();
+    src->state = new bz_cancel_state_t();
+    src->state->cancelled.store(0, std::memory_order_relaxed);
+    src->state->rc.store(1, std::memory_order_relaxed);  // source holds one reference
     src->disposed = false;
     return src;
 }
@@ -6851,16 +6874,32 @@ extern "C" void* bz_cts_token(void* srcp) {
     return src->state;   // CancellationToken handle (borrowed, not retained)
 }
 
+// #716: public wrappers for token-level retain / release.
+// These expose bz_cancel_state_retain / bz_cancel_state_release (which are
+// static helpers) as extern "C" functions so that runtime unit tests and any
+// future public caller can exercise the same atomic paths used by the scheduler's
+// async slow-paths.  token == null → no-op (mirrors the static helpers).
+extern "C" void bz_cts_retain(void* token) {
+    bz_cancel_state_retain((bz_cancel_state_t*)token);
+}
+extern "C" void bz_cts_release(void* token) {
+    bz_cancel_state_release((bz_cancel_state_t*)token);
+}
+
 extern "C" int32_t bz_cts_is_cancelled(void* srcp) {
     auto* src = (bz_cancel_source_t*)srcp;
     if (!src || !src->state) return 0;
-    return src->state->cancelled;
+    // #716: relaxed load — the flag is a one-way latch; monotonicity is enough
+    // for a single-domain query from the same thread that may call Cancel().
+    return src->state->cancelled.load(std::memory_order_relaxed);
 }
 
 extern "C" void bz_cts_cancel(void* srcp) {
     auto* src = (bz_cancel_source_t*)srcp;
     if (!src || !src->state) return;
-    src->state->cancelled = 1;  // idempotent: already 1 → no-op
+    // #716: release store so workers that load with acquire see the flag.
+    // Idempotent: storing 1 when already 1 is harmless.
+    src->state->cancelled.store(1, std::memory_order_release);
 }
 
 extern "C" void bz_cts_dispose(void* srcp) {
@@ -6872,17 +6911,21 @@ extern "C" void bz_cts_dispose(void* srcp) {
     // still observing.  Outstanding token handles retain the state cell via
     // the rc, so reads after dispose stay safe.
     if (src->state) {
-        src->state->cancelled = 1;
+        // #716: release store so workers observing with acquire-load see cancelled=1.
+        src->state->cancelled.store(1, std::memory_order_release);
         bz_cancel_state_release(src->state);  // drop the source's reference
         src->state = nullptr;
     }
-    free(src);
+    // Use `delete` to match the `new` in bz_cts_alloc (#716).
+    delete src;
 }
 
 extern "C" int32_t bz_ctoken_is_cancelled(void* token) {
     auto* s = (bz_cancel_state_t*)token;
     if (!s) return 0;  // CancellationToken.None never cancels
-    return s->cancelled;
+    // #716: acquire load — ensures the worker sees stores made before the
+    // release-store in bz_cts_cancel / bz_cts_dispose.
+    return s->cancelled.load(std::memory_order_acquire);
 }
 
 // Shared OperationCanceledException vtable for ThrowIfCancellationRequested.
@@ -6914,7 +6957,8 @@ extern "C" int32_t bz_ctoken_is_cancelled(void* token) {
 extern "C" int32_t bz_ctoken_throw_if_cancelled(void* token) {
     auto* s = (bz_cancel_state_t*)token;
     if (!s) return 0;   // None — never cancels
-    return s->cancelled ? 1 : 0;
+    // #716: acquire load — same reasoning as bz_ctoken_is_cancelled.
+    return s->cancelled.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 // stdlib §6.7 / spec §30.8: task helpers for CancellationToken-aware Delay.
@@ -6947,7 +6991,8 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
     task->domain = g_main_domain;
     domain_ref(g_main_domain);  // per fix #632: task holds a ref on its domain
     // Pre-check: if already cancelled, fault immediately.
-    if (s && s->cancelled) {
+    // #716: acquire load so we see any release-store from bz_cts_cancel.
+    if (s && s->cancelled.load(std::memory_order_acquire)) {
         void* excObj = bz_task_make_oce(oce_vtable);
         { std::lock_guard<std::mutex> lk(task->mtx);
           task->error_obj = excObj;
@@ -6965,7 +7010,8 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
         if (ms > 0)
             std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         // Post-sleep check: if token was cancelled while sleeping, fault.
-        if (s && s->cancelled) {
+        // #716: acquire load — synchronizes-with the release-store in bz_cts_cancel.
+        if (s && s->cancelled.load(std::memory_order_acquire)) {
             void* excObj = bz_task_make_oce(oce_vtable);
             bz_cancel_state_release(s);  // release the worker's token ref
             bz_task_complete_error_obj(task, excObj);
@@ -10011,7 +10057,8 @@ void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
     auto* s = (bz_cancel_state_t*)token;
 
     // Pre-cancel check.
-    if (s && s->cancelled) {
+    // #716: acquire load — synchronizes-with release-store in bz_cts_cancel/dispose.
+    if (s && s->cancelled.load(std::memory_order_acquire)) {
         return mutex_make_faulted_task(oce_vtable);
     }
 
@@ -10043,7 +10090,8 @@ void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
     g_scheduler->submit([task, m, s, oce_vtable]() {
         pthread_mutex_lock(&m->mtx);
         // Check cancel AFTER acquiring (the brief hold is released if cancelled).
-        if (s && s->cancelled) {
+        // #716: acquire load — synchronizes-with release-store in bz_cts_cancel.
+        if (s && s->cancelled.load(std::memory_order_acquire)) {
             pthread_mutex_unlock(&m->mtx);
             mutex_core_release(m);  // release the worker's extra core ref
             bz_cancel_state_release(s);  // release the worker's token ref
@@ -10071,7 +10119,8 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
     auto* s = (bz_cancel_state_t*)token;
 
     // Pre-cancel check (takes priority over timeout).
-    if (s && s->cancelled) {
+    // #716: acquire load — synchronizes-with release-store in bz_cts_cancel/dispose.
+    if (s && s->cancelled.load(std::memory_order_acquire)) {
         return mutex_make_faulted_task(oce_vtable);
     }
 
@@ -10142,7 +10191,8 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
             return;
         }
         // Acquired: check cancellation post-acquire.
-        if (s && s->cancelled) {
+        // #716: acquire load — synchronizes-with release-store in bz_cts_cancel.
+        if (s && s->cancelled.load(std::memory_order_acquire)) {
             pthread_mutex_unlock(&m->mtx);
             mutex_core_release(m);
             bz_cancel_state_release(s);  // release the worker's token ref
@@ -10363,7 +10413,8 @@ void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
     auto* cs = (bz_cancel_state_t*)token;
 
     // Pre-cancel check.
-    if (cs && cs->cancelled) {
+    // #716: acquire load — synchronizes-with release-store in bz_cts_cancel/dispose.
+    if (cs && cs->cancelled.load(std::memory_order_acquire)) {
         return semaphore_make_faulted_task(oce_vtable);
     }
 
@@ -10393,7 +10444,8 @@ void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
         int rc2;
         do { rc2 = sem_wait(&s->sem); } while (rc2 == -1 && errno == EINTR);
         // Check cancel AFTER acquiring (the brief hold is released if cancelled).
-        if (cs && cs->cancelled) {
+        // #716: acquire load — synchronizes-with release-store in bz_cts_cancel.
+        if (cs && cs->cancelled.load(std::memory_order_acquire)) {
             sem_post(&s->sem);              // give the permit back
             semaphore_core_release(s);       // release the worker's extra core ref
             bz_cancel_state_release(cs);
@@ -10420,7 +10472,8 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
     auto* cs = (bz_cancel_state_t*)token;
 
     // Pre-cancel check (takes priority over timeout).
-    if (cs && cs->cancelled) {
+    // #716: acquire load — synchronizes-with release-store in bz_cts_cancel/dispose.
+    if (cs && cs->cancelled.load(std::memory_order_acquire)) {
         return semaphore_make_faulted_task(oce_vtable);
     }
 
@@ -10479,7 +10532,8 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
             return;
         }
         // Acquired: check cancellation post-acquire.
-        if (cs && cs->cancelled) {
+        // #716: acquire load — synchronizes-with release-store in bz_cts_cancel.
+        if (cs && cs->cancelled.load(std::memory_order_acquire)) {
             sem_post(&s->sem);
             semaphore_core_release(s);
             bz_cancel_state_release(cs);
