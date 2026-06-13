@@ -172,6 +172,29 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
                    dynamic_cast<const ast::ExtensionDecl*>(&decl)) {
         Scope extScope;
         extScope.parent = parent;
+        // §26.4: a generic extension `extension Foo<T>` introduces T as a
+        // type parameter scoped to the entire extension body (member
+        // signatures, return types, param types, body locals, and
+        // where-constraints). The grammar stores the generic args as part of
+        // the target type (ast::Type::genericArgs), not in a separate
+        // genericParams list. Bind each single-part generic arg (a bare name
+        // like `T`) into extScope as a nullptr marker — the same sentinel
+        // that resolveTypeDecl uses for TypeDecl::genericParams — so that
+        // resolveNamed's "is this name a generic param?" walk finds it.
+        // This must be done BEFORE resolving the target type so that T is
+        // already in scope when the targetType itself is processed (e.g.
+        // `IEnumerable<T>` must not error on T while resolving the `T` arg).
+        if (ext->targetType) {
+            for (const auto& ga : ext->targetType->genericArgs) {
+                if (!ga) continue;
+                if (ga->kind == ast::TypeKind::Named &&
+                    ga->name && ga->name->parts.size() == 1 &&
+                    !ga->nullable) {
+                    // Single-part bare name: treat as a type parameter.
+                    extScope.names[ga->name->parts[0]] = nullptr;
+                }
+            }
+        }
         if (ext->targetType) resolveType(*ext->targetType, &extScope);
         for (const auto& gc : ext->genericConstraints) {
             for (const auto& item : gc.items) {

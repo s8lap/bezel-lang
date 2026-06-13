@@ -158,6 +158,7 @@ set(BEZEL_TEST_SOURCES
     sema/unknown_primitive_method_test.cpp
     sema/method_ref_type_test.cpp
     sema/extension_resolution_test.cpp
+    sema/generic_extension_698_test.cpp
     sema/variance_position_test.cpp
     sema/return_in_finally_test.cpp
     sema/untyped_collection_literal_test.cpp
