@@ -12091,11 +12091,20 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             if (mfIt == methodFns_.end()) return nullptr;
             llvm::Function* origFn = mfIt->second;
 
+            // Compute the number of extra arguments (args beyond pos 0).
+            // Each extra arg is owned-transferred into the spawned domain.
+            // §30.14 / #693: all args at pos >= 1 are owned-consumed.
+            std::size_t nExtra = call.args.size() > 1 ? call.args.size() - 1 : 0;
+            std::size_t nOrigParams = origFn->arg_size();
+
             // Build the adapter: `void* adapter(void* arg)`.
             // The adapter's body:
-            //   - If entry has 1 param: call origFn(arg)
-            //   - If entry has 0 params: call origFn()
-            //   - Return value: origFn's result cast to void* (or null for void)
+            //   - N==0 params: call origFn(), ignore arg.
+            //   - N==1 param:  call origFn(arg) — arg IS the single param value.
+            //   - N>=2 params: arg is a malloc'd void*[N] array; unpack each slot,
+            //     free the array, then call origFn(p0, p1, …).
+            // Return value: origFn's result cast to void* (or null for void).
+            // per §30.14 / #693
             static std::atomic<unsigned> spawnAdaptCtr{0};
             std::string adaptName = "spawn.adapter$" +
                 std::to_string(spawnAdaptCtr.fetch_add(1));
@@ -12117,25 +12126,44 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
 
                 llvm::Value* argParam = adapter->getArg(0);  // void* arg
 
-                std::vector<llvm::Value*> callArgs;
-                std::size_t nArgs = origFn->arg_size();
-                if (nArgs == 1) {
-                    // Entry takes one argument: interpret arg as the param type.
-                    llvm::Type* paramTy = origFn->getArg(0)->getType();
-                    llvm::Value* typedArg;
-                    if (paramTy->isPointerTy()) {
-                        typedArg = argParam;
-                    } else if (paramTy->isIntegerTy(64)) {
-                        typedArg = builder_.CreatePtrToInt(argParam, i64());
-                    } else if (paramTy->isIntegerTy(32)) {
-                        llvm::Value* i = builder_.CreatePtrToInt(argParam, i64());
-                        typedArg = builder_.CreateTrunc(i, i32());
-                    } else {
-                        typedArg = builder_.CreatePtrToInt(argParam, i64());
+                // Helper: cast a void* to the expected param type.
+                auto castToParamTy = [&](llvm::Value* voidPtr,
+                                         llvm::Type*  paramTy) -> llvm::Value* {
+                    if (paramTy->isPointerTy()) return voidPtr;
+                    if (paramTy->isIntegerTy(64))
+                        return builder_.CreatePtrToInt(voidPtr, i64());
+                    if (paramTy->isIntegerTy(32)) {
+                        llvm::Value* w = builder_.CreatePtrToInt(voidPtr, i64());
+                        return builder_.CreateTrunc(w, i32());
                     }
-                    callArgs.push_back(typedArg);
+                    return builder_.CreatePtrToInt(voidPtr, i64());
+                };
+
+                std::vector<llvm::Value*> callArgs;
+                if (nOrigParams == 1) {
+                    // Single-argument entry: arg IS the param value (single void*).
+                    callArgs.push_back(castToParamTy(
+                        argParam, origFn->getArg(0)->getType()));
+                } else if (nOrigParams >= 2) {
+                    // Multi-argument entry: arg is a void*[N] malloc'd array.
+                    // Unpack each slot from the array, then free it.
+                    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy()});
+                    for (std::size_t i = 0; i < nOrigParams; ++i) {
+                        // GEP into the void*[] at index i.
+                        llvm::Value* slotPtr = builder_.CreateInBoundsGEP(
+                            ptrTy(), argParam,
+                            builder_.getInt64(static_cast<uint64_t>(i)),
+                            "spawn.slot" + std::to_string(i));
+                        llvm::Value* slotVal = builder_.CreateLoad(
+                            ptrTy(), slotPtr, "spawn.val" + std::to_string(i));
+                        callArgs.push_back(castToParamTy(
+                            slotVal, origFn->getArg(i)->getType()));
+                    }
+                    // Free the packed-arg array after unpacking.
+                    builder_.CreateCall(freeFn, {argParam});
                 }
-                // else: nArgs == 0 — no-arg entry, no call args.
+                // else: nOrigParams == 0 — no-arg entry, no call args.
 
                 llvm::Value* ret = builder_.CreateCall(origFn, callArgs);
                 if (origFn->getReturnType()->isVoidTy()) {
@@ -12157,9 +12185,14 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 if (savedBB) builder_.SetInsertPoint(savedBB);
             }
 
-            // Lower the optional argument to bz_domain_spawn.
+            // Lower the argument(s) to pass to bz_domain_spawn.
+            // N==0: null.
+            // N==1: the single extra arg as void*.
+            // N>=2: malloc a void*[N] array, store each arg, pass the array.
+            // per §30.14 / #693
             llvm::Value* argVal = llvm::ConstantPointerNull::get(ptrTy());
-            if (call.args.size() >= 2 && call.args[1].value) {
+            if (nExtra == 1 && call.args[1].value) {
+                // Single extra arg — existing single-ptr path.
                 llvm::Value* argExprV = lowerExpr(*call.args[1].value);
                 if (argExprV) {
                     if (argExprV->getType()->isPointerTy()) {
@@ -12177,6 +12210,39 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                             "spawn.arg.cast");
                     }
                 }
+            } else if (nExtra >= 2) {
+                // Multi-arg: malloc a void*[nExtra] array and store each arg.
+                // The adapter will free the array after unpacking.
+                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                llvm::Value* arrSize = builder_.getInt64(
+                    static_cast<uint64_t>(nExtra) * 8u);  // nExtra * sizeof(void*)
+                llvm::Value* arr = builder_.CreateCall(mallocFn, {arrSize},
+                                                       "spawn.argpack");
+                for (std::size_t i = 0; i < nExtra; ++i) {
+                    const auto& a = call.args[i + 1];
+                    if (!a.value) continue;
+                    llvm::Value* val = lowerExpr(*a.value);
+                    if (!val) continue;
+                    // Cast to void* if needed.
+                    llvm::Value* asPtr;
+                    if (val->getType()->isPointerTy()) {
+                        asPtr = val;
+                    } else if (val->getType()->isIntegerTy(64)) {
+                        asPtr = builder_.CreateIntToPtr(val, ptrTy());
+                    } else if (val->getType()->isIntegerTy()) {
+                        asPtr = builder_.CreateIntToPtr(
+                            builder_.CreateZExt(val, i64()), ptrTy());
+                    } else {
+                        asPtr = builder_.CreateIntToPtr(
+                            builder_.CreateBitCast(val, i64()), ptrTy());
+                    }
+                    llvm::Value* slotPtr = builder_.CreateInBoundsGEP(
+                        ptrTy(), arr,
+                        builder_.getInt64(static_cast<uint64_t>(i)),
+                        "spawn.slot" + std::to_string(i));
+                    builder_.CreateStore(asPtr, slotPtr);
+                }
+                argVal = arr;
             }
 
             auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
