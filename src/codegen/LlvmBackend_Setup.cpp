@@ -3367,6 +3367,27 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             llvm::Value* val = lowerExpr(*initExpr);
             if (!val) continue;
             builder_.CreateStore(val, gvIt->second);
+            // fix #709 / §22.12: also store into every per-instantiation global
+            // for this field that was created lazily by staticFieldGlobal().
+            // Per-instantiation globals are created on FIRST ACCESS (method body
+            // emission, which precedes static-ctor body emission in emitModule),
+            // so by the time we arrive here, genericInstStaticGlobals_ already
+            // contains all instantiations referenced in this compilation unit.
+            // The template-level store above handles the (unreachable) template
+            // path; every concrete instantiation needs its own runtime store.
+            // Note: this only covers T-independent initializers — expressions
+            // that depend on T would need per-instantiation emit, which requires
+            // larger machinery tracked separately.  The getValueType() guard
+            // keeps that "unchanged behavior" literally true: if a field's TYPE
+            // depends on T (e.g. `static x: T`), its per-instantiation globals
+            // have differing LLVM types, so storing this single (placeholder-
+            // typed) val would emit malformed IR — skip those, leaving them as
+            // before rather than miscompiling.
+            for (auto& [key, instGV] : genericInstStaticGlobals_) {
+                if (key.first == static_cast<const sema::Symbol*>(fs) &&
+                    instGV->getValueType() == val->getType())
+                    builder_.CreateStore(val, instGV);
+            }
         }
     }
 
