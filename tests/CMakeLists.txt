@@ -447,6 +447,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_static_local_direct_697_test.cpp
     codegen/generic_static_cross_named_701_test.cpp
     codegen/generic_static_nonconst_init_709_test.cpp
+    codegen/generic_static_sameclass_715_test.cpp
     codegen/lifted_operators_486_test.cpp
     codegen/dict_literal_534_test.cpp
     codegen/stringbuilder_ctor_531_test.cpp
