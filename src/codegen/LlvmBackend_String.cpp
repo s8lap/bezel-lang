@@ -1840,6 +1840,15 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         return builder_.CreateCall(fn, {self, delim}, "split.result");
     }
 
+    // §9.6 / issue #654: ToCharArray(): owned Array<char>.
+    // Returns a fresh bz_array_t* (elem_size=4; each slot is an i32 code point).
+    // The result is owned by the caller and must be disposed via bz_array_dispose;
+    // callers should bind it with `using var` so the automatic disposal path fires.
+    if (method == "ToCharArray" && call.args.empty()) {
+        auto* fn = declareC("bz_str_to_char_array", ptrTy(), {ptrTy()});
+        return builder_.CreateCall(fn, {self}, "tochararray.result");
+    }
+
     return nullptr;  // method not recognised
 }
 

@@ -4003,6 +4003,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                 }
+                // §9.4: bool/Boolean static methods — TryParse → bool, Parse → bool.
+                if (pt == PrimitiveType::Bool) {
+                    if (mbr == "TryParse") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    }
+                    if (mbr == "Parse") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    }
+                }
                 // int static methods → int or bool.
                 if (pt == PrimitiveType::Int || pt == PrimitiveType::Long ||
                     pt == PrimitiveType::Byte || pt == PrimitiveType::SByte ||
@@ -4882,6 +4893,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, tr);
                         return;
                     }
+                    // §9.6 / issue #654: ToCharArray() returns owned Array<char>.
+                    // The return type is Array<char> so downstream element accesses
+                    // (.Count / .Get(i)) resolve correctly.  The result is an owned
+                    // value that callers discharge with `using var` per §28.
+                    if (ma.member == "ToCharArray") {
+                        static const ast::Type* kCharArrayAstNode = []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("Array");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = kCharArrayAstNode;
+                        tr->genericArgs.push_back(
+                            ctx_.primitiveTypeRef(PrimitiveType::Char));
+                        ctx_.setExprType(&ma, tr);
+                        return;
+                    }
                     // Emit a diagnostic for unrecognized string members.
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
@@ -5079,6 +5112,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                 } else if (m == "Equals") {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                }
+            }
+            // stdlib §9.4 / issue #654: Boolean static member types.
+            // Reached when the receiver is the `Boolean` class identifier
+            // (the keyword alias `bool` is handled via primitiveFromName above).
+            if (cls == "Boolean") {
+                if (m == "TryParse") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                } else if (m == "Parse") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                }
+            }
+            // stdlib §2.12 / issue #654: BitConverter static methods.
+            // FloatToInt32Bits(float)→int, Int32BitsToFloat(int)→float,
+            // DoubleToInt64Bits(double)→long, Int64BitsToDouble(long)→double.
+            if (cls == "BitConverter") {
+                if (m == "FloatToInt32Bits") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                } else if (m == "Int32BitsToFloat") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Float));
+                } else if (m == "DoubleToInt64Bits") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
+                } else if (m == "Int64BitsToDouble") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double));
                 }
             }
             // stdlib §9.3 / fix #521: Decimal static member types.
