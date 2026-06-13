@@ -283,3 +283,124 @@ BEZEL_TEST(channel_spawn_sink_692_693,
         "end Program;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// #693 residual — move-of-Clone-bound-local at pos 1 (§30.14 / §28.13)
+// ---------------------------------------------------------------------------
+// The root cause of the residual: `var clone := sm.Clone()` was classified
+// Borrowed because producerState did not recognise Shared<T>.Clone() (a
+// builtin owned-returning call with no MethodDecl) as an owned producer.
+// When the local entered Domain.Spawn as `move clone`, ownedArgSourceIsBorrow
+// found state==Borrowed and falsely fired the owned-sink diagnostic.
+
+// §30.14 / §28.13: Domain.Spawn(entry, move clone, ch.NewSender())
+//   pos 1: move clone — clone was bound from sm.Clone() (owned Shared<T>)
+//   pos 2: ch.NewSender() — owned-returning call
+// Both must be accepted; this is the exact shm1.bzl repro shape.
+BEZEL_TEST(channel_spawn_sink_692_693,
+           spawn_move_of_clone_bound_local_pos1_then_new_sender_pos2_accepted_30_14) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Worker "
+        "  public static method Run("
+        "      owned sm: Shared<Mutex>, "
+        "      owned tx: ChannelSender<int>) "
+        "    using var s := sm; "
+        "    using var sender := tx; "
+        "    sender.Send(1); "
+        "  end Run; "
+        "end Worker; "
+        "class Program "
+        "  public static async method Main(): Task<int> "
+        "    using var ch := new Channel<int>(); "
+        "    using var sm := new Shared<Mutex>(new Mutex()); "
+        "    var clone := sm.Clone(); "
+        "    using var w := Domain.Spawn(Worker.Run, move clone, ch.NewSender()); "
+        "    await w; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §30.14 / §28.13: move-of-clone-bound-local at pos 1 + another clone at pos 2.
+// Confirms the fix generalises: both clone-bound locals are accepted as owned
+// producers when each feeds a separate owned entry parameter.
+BEZEL_TEST(channel_spawn_sink_692_693,
+           spawn_move_of_clone_pos1_clone_at_pos2_accepted_30_14) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Worker "
+        "  public static method Run("
+        "      owned sm1: Shared<Mutex>, "
+        "      owned sm2: Shared<Mutex>) "
+        "    using var s1 := sm1; "
+        "    using var s2 := sm2; "
+        "  end Run; "
+        "end Worker; "
+        "class Program "
+        "  public static async method Main(): Task<int> "
+        "    using var sm := new Shared<Mutex>(new Mutex()); "
+        "    var c1 := sm.Clone(); "
+        "    var c2 := sm.Clone(); "
+        "    using var w := Domain.Spawn(Worker.Run, move c1, move c2); "
+        "    await w; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §30.14 NEGATIVE: a borrow at pos 2 when pos 1 is move-of-clone-bound-local.
+// The move at pos 1 must NOT suppress the owned-sink check at pos 2.
+BEZEL_TEST(channel_spawn_sink_692_693,
+           spawn_move_of_clone_pos1_borrow_at_pos2_rejected_30_14) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Worker "
+        "  public static method Run("
+        "      owned sm: Shared<Mutex>, "
+        "      owned tx: ChannelSender<int>) "
+        "    using var s := sm; "
+        "    using var sender := tx; "
+        "  end Run; "
+        "end Worker; "
+        "class Program "
+        "  public static async method Main("
+        "      b: ChannelSender<int>): Task<int> "
+        "    using var sm := new Shared<Mutex>(new Mutex()); "
+        "    var clone := sm.Clone(); "
+        "    using var w := Domain.Spawn(Worker.Run, move clone, b); "  // b borrow → rejected
+        "    await w; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §30.14 / §28.3 NEGATIVE: re-moving a moved-from clone after Spawn must be
+// rejected. Confirms the move is recorded and use-after-move is diagnosed.
+// Uses `var c2 := move clone` after the spawn — the `move` form always goes
+// through checkRead, which catches the moved-from state (§28.3).
+BEZEL_TEST(channel_spawn_sink_692_693,
+           spawn_remov_of_clone_after_spawn_rejected_28_3) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Worker "
+        "  public static method Run(owned sm: Shared<Mutex>) "
+        "    using var s := sm; "
+        "  end Run; "
+        "end Worker; "
+        "class Program "
+        "  public static async method Main(): Task<int> "
+        "    using var sm := new Shared<Mutex>(new Mutex()); "
+        "    var clone := sm.Clone(); "
+        "    using var w := Domain.Spawn(Worker.Run, move clone); "
+        "    var c2 := move clone; "  // clone moved → use-after-move → error
+        "    await w; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+

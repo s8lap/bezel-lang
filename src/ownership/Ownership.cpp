@@ -744,7 +744,8 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // produces an Owned value. The callee MethodSymbol resolution
     // comes from sema; we look at its MethodDecl::returnOwned to
     // decide. A null callee symbol (overload not yet pickable, or
-    // a call on a value with no symbol) falls through to Borrowed.
+    // a call on a value with no symbol) falls through to the builtin
+    // name-head check below. // per §28.3 / §30.14
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (ce->callee) {
             if (auto* sym = ctx_.exprSymbol(*ce->callee)) {
@@ -754,6 +755,34 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     if (md && md->returnOwned) {
                         return OwnershipState::Owned;
                     }
+                }
+            }
+        }
+        // Slice O13 / §28.13 / §30.14 (#693): builtin owned-returning calls.
+        // Several stdlib builtin methods return `owned T` but have no user
+        // MethodDecl (so returnOwned is unavailable): Shared<T>.Clone(),
+        // Shared<T>.Downgrade(), Channel<T>.NewSender(), and the owning-
+        // collection factory/drain methods (GetBytes, PopLast, PopFirst, etc.).
+        // Mirror the awaitTaskKind pattern: dispatch by the resolved return
+        // type's name-head.  A Named TypeRef with no declaration (builtin) or
+        // with a Class/Interface declaration whose name-head is one of the
+        // always-owned handle types signals an owned-producing call.
+        // This is the correct classification for `var clone := sm.Clone()`
+        // (Shared<T>), `var sender := ch.NewSender()` (ChannelSender<T>),
+        // `var cts := CancellationTokenSource.New()`, etc. // per §28.13, §30.14
+        if (const sema::TypeRef* retTy = ctx_.exprType(e)) {
+            if (retTy->kind == sema::TypeRef::Kind::Named &&
+                retTy->astNode && retTy->astNode->name &&
+                !retTy->astNode->name->parts.empty()) {
+                std::string_view head = retTy->astNode->name->parts.front();
+                if (head == "Shared"          || head == "Weak"            ||
+                    head == "ChannelSender"    || head == "OwnedTask"       ||
+                    head == "OwnedArray"       || head == "OwnedDictionary" ||
+                    head == "OwnedSet"         || head == "OwnedStack"      ||
+                    head == "OwnedQueue"       || head == "OwnedLinkedList" ||
+                    head == "OwnedEnumerable"  ||
+                    head == "CancellationTokenSource") {
+                    return OwnershipState::Owned;
                 }
             }
         }
