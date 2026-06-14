@@ -217,19 +217,24 @@ static bool isSharedOrWeakComponentType(const sema::TypeRef* tr) {
 // identity participant of the type-driven model: its tag keys on the underlying
 // value (bz_shared_get) on serialize, and on deserialize the tag table holds the
 // constructed HANDLE so aliases share one control block (bz_shared_clone).
+// A nullable Shared<C>? is handled too (a null handle writes/reads the null
+// marker; see the fty->nullable gating in the serialize/deserialize branches).
 // Cases NOT yet handled (return nullptr → still caught by the codegen guard):
-// Weak<T>, nullable Shared<C>?, Shared<non-class>, Shared<class-without-clause>.
+// Weak<T> (handled separately), Shared<non-class>, Shared<class-without-clause>.
 static const TypeSymbol* handledSharedElementClass(const sema::TypeRef* tr) {
-    if (!tr || tr->nullable) return nullptr;
-    if (tr->kind != sema::TypeRef::Kind::Named || tr->declaration) return nullptr;
+    if (!tr) return nullptr;
+    const sema::TypeRef* t = tr;
+    sema::TypeRef peeled;
+    if (t->nullable) { peeled = *t; peeled.nullable = false; t = &peeled; }
+    if (t->kind != sema::TypeRef::Kind::Named || t->declaration) return nullptr;
     std::string_view name;
-    if (tr->astNode && tr->astNode->name && !tr->astNode->name->parts.empty())
-        name = tr->astNode->name->parts[0];
-    else if (!tr->importedName.empty())
-        name = tr->importedName;
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        name = t->astNode->name->parts[0];
+    else if (!t->importedName.empty())
+        name = t->importedName;
     if (name != "Shared") return nullptr;
-    if (tr->genericArgs.empty() || !tr->genericArgs[0]) return nullptr;
-    const sema::TypeRef* el = tr->genericArgs[0];
+    if (t->genericArgs.empty() || !t->genericArgs[0]) return nullptr;
+    const sema::TypeRef* el = t->genericArgs[0];
     if (el->kind != sema::TypeRef::Kind::Named || !el->declaration) return nullptr;
     if (el->declaration->kind != ast::TypeDeclKind::Class) return nullptr;
     const auto* td = dynamic_cast<const ast::TypeDecl*>(el->declaration->decl);
@@ -1647,6 +1652,27 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
                 auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
                                              {ptrTy(), ptrTy()});
                 builder_.CreateCall(writeNameFn, {serPtr, nameStr});
+                auto* shDoneBB =
+                    llvm::BasicBlock::Create(llvm_, "cser.sh.done", currentFn_);
+                // §9.8 v0.141 / #703 slice S4: a nullable Shared<C>? whose handle
+                // is null writes the null marker; otherwise fall through to the
+                // identity logic below.
+                if (fty->nullable) {
+                    auto* writeNullFn =
+                        declareC("bz_binser_write_null", voidTy, {ptrTy()});
+                    llvm::Value* hNull = builder_.CreateICmpEQ(
+                        handle, llvm::ConstantPointerNull::get(ptrTy()),
+                        "cser.sh.hnull");
+                    auto* shNullBB = llvm::BasicBlock::Create(
+                        llvm_, "cser.sh.hnullw", currentFn_);
+                    auto* shLiveBB = llvm::BasicBlock::Create(
+                        llvm_, "cser.sh.live", currentFn_);
+                    builder_.CreateCondBr(hNull, shNullBB, shLiveBB);
+                    builder_.SetInsertPoint(shNullBB);
+                    builder_.CreateCall(writeNullFn, {serPtr});
+                    builder_.CreateBr(shDoneBB);
+                    builder_.SetInsertPoint(shLiveBB);
+                }
                 // Identity key = bz_shared_get(handle) (the inner value ptr).
                 auto* getFn = declareC("bz_shared_get", ptrTy(), {ptrTy()});
                 llvm::Value* val =
@@ -1661,8 +1687,6 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
                     llvm::BasicBlock::Create(llvm_, "cser.sh.inline", currentFn_);
                 auto* shRefBB =
                     llvm::BasicBlock::Create(llvm_, "cser.sh.ref", currentFn_);
-                auto* shDoneBB =
-                    llvm::BasicBlock::Create(llvm_, "cser.sh.done", currentFn_);
                 builder_.CreateCondBr(isNew, shInlineBB, shRefBB);
                 // First encounter: assign tag, write inline marker + body.
                 builder_.SetInsertPoint(shInlineBB);
@@ -2114,6 +2138,28 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
             // in via the constructor, so refcounts balance to a single disposal.
             if (const TypeSymbol* shElemTs =
                     (isGraphMode ? handledSharedElementClass(comp.ty) : nullptr)) {
+                auto* shMrgBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.sh.mrg", currentFn_);
+                // §9.8 v0.141 / #703 slice S4: a nullable Shared<C>? whose wire
+                // value is the null marker reads back as a null handle.
+                llvm::BasicBlock* shNullEndBB = nullptr;
+                if (comp.ty->nullable) {
+                    auto* tryNullFn =
+                        declareC("bz_binder_try_read_null", i8(), {ptrTy()});
+                    llvm::Value* wasNull = builder_.CreateCall(
+                        tryNullFn, {derPtr}, "cdeser.sh.wasnull");
+                    llvm::Value* wasNullB = builder_.CreateICmpNE(
+                        wasNull, builder_.getInt8(0), "cdeser.sh.isnull");
+                    auto* shNullBB = llvm::BasicBlock::Create(
+                        llvm_, "cdeser.sh.null", currentFn_);
+                    auto* shNotNullBB = llvm::BasicBlock::Create(
+                        llvm_, "cdeser.sh.notnull", currentFn_);
+                    builder_.CreateCondBr(wasNullB, shNullBB, shNotNullBB);
+                    builder_.SetInsertPoint(shNullBB);
+                    shNullEndBB = builder_.GetInsertBlock();
+                    builder_.CreateBr(shMrgBB);
+                    builder_.SetInsertPoint(shNotNullBB);
+                }
                 llvm::AllocaInst* tagSlot = entryAlloca(i32());
                 builder_.CreateStore(builder_.getInt32(0), tagSlot);
                 auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
@@ -2129,8 +2175,6 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                     llvm::BasicBlock::Create(llvm_, "cdeser.sh.inl", currentFn_);
                 auto* shRefBB =
                     llvm::BasicBlock::Create(llvm_, "cdeser.sh.ref", currentFn_);
-                auto* shMrgBB =
-                    llvm::BasicBlock::Create(llvm_, "cdeser.sh.mrg", currentFn_);
                 builder_.CreateCondBr(isInline, shInlBB, shRefBB);
                 // Inline: mark in-progress, construct element, wrap, register.
                 builder_.SetInsertPoint(shInlBB);
@@ -2174,12 +2218,15 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                     cloneFn, {resolved}, "cdeser.sh.clone");
                 llvm::BasicBlock* refEndBB = builder_.GetInsertBlock();
                 builder_.CreateBr(shMrgBB);
-                // Merge: fv = phi(inline handle | cloned handle).
+                // Merge: fv = phi(inline handle | cloned handle | null).
                 builder_.SetInsertPoint(shMrgBB);
-                llvm::PHINode* shPhi =
-                    builder_.CreatePHI(ptrTy(), 2, "cdeser.sh.fv");
+                llvm::PHINode* shPhi = builder_.CreatePHI(
+                    ptrTy(), shNullEndBB ? 3 : 2, "cdeser.sh.fv");
                 shPhi->addIncoming(inlHandle, inlEndBB);
                 shPhi->addIncoming(refHandle, refEndBB);
+                if (shNullEndBB)
+                    shPhi->addIncoming(
+                        llvm::ConstantPointerNull::get(ptrTy()), shNullEndBB);
                 fv = shPhi;
             } else if (const TypeSymbol* wElemTs =
                            (isGraphMode && comp.isOwned)

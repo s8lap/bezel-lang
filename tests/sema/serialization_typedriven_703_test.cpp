@@ -381,3 +381,59 @@ BEZEL_TEST(serialization_typedriven_703,
         "end Main; end C;",
         84);
 }
+
+// ===========================================================================
+// S4: nullable Shared<class>? participant (§9.8 v0.141, #703)
+// ===========================================================================
+
+// §9.8 v0.141: a nullable owned Shared<Inner>? field holding a value round-trips
+// like the non-nullable case (the null marker path is not taken). Exit = 42.
+BEZEL_TEST(serialization_typedriven_703,
+           s4_nullable_shared_present_roundtrip_spec_9_8_v0141) {
+    expectLeakFree(
+        std::string(kImport) + kEligibleInner +
+        "class Box serialized graph : ISerializable, IDeserializable "
+        "  public owned Item: Shared<Inner>?; "
+        "  public constructor(owned item: Shared<Inner>?) "
+        "    Item := item; "
+        "  end constructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var inner := new Inner(42); "
+        "  using var sh := new Shared<Inner>(inner); "
+        "  using var b := new Box(sh.Clone()); "
+        "  using var s := new BinarySerializer(); "
+        "  b.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var b2 := Box.Deserialize(d); "
+        "  if b2.Item <> null then return b2.Item!.Get().V; end; "
+        "  return -1; "
+        "end Main; end C;",
+        42);
+}
+
+// §9.8 v0.141: a nullable owned Shared<Inner>? field that is NULL writes/reads
+// the null marker and round-trips as null. Returns 7 via the null branch.
+BEZEL_TEST(serialization_typedriven_703,
+           s4_nullable_shared_null_roundtrip_spec_9_8_v0141) {
+    expectLeakFree(
+        std::string(kImport) + kEligibleInner +
+        "class Box serialized graph : ISerializable, IDeserializable "
+        "  public owned Item: Shared<Inner>?; "
+        "  public constructor(owned item: Shared<Inner>?) "
+        "    Item := item; "
+        "  end constructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box(null); "
+        "  using var s := new BinarySerializer(); "
+        "  b.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var b2 := Box.Deserialize(d); "
+        "  if b2.Item = null then return 7; end; "
+        "  return -1; "
+        "end Main; end C;",
+        7);
+}
