@@ -115,8 +115,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // Literal part: process escape sequences (e.g. \n → newline,
                 // \t → tab) that were stored as raw chars by splitInterpolation.
                 // Wrap in quotes so processStringText's strip-quotes logic works.
-                std::string content = processStringText(
-                    "\"" + part.literal + "\"", false);
+                // R36/#733: for a VERBATIM interpolated string (`$@"..."`, §18.7)
+                // the literal parts must NOT have escapes decoded — the splitter
+                // already kept the raw backslash. Thread isVerbatim through AND
+                // wrap with the matching `@"` delimiter so processStringCodePoints'
+                // verbatim strip (start = verbatim ? 2 : 1) lines up exactly as the
+                // plain @"..." path does; otherwise `$@"x\ny"` decoded `\n` → LF.
+                std::string wrapped =
+                    (is->isVerbatim ? std::string("@\"") : std::string("\"")) +
+                    part.literal + "\"";
+                std::string content =
+                    processStringText(wrapped, is->isVerbatim);
                 llvm::Constant* dataArr = llvm::ConstantDataArray::getString(
                     llvm_, content, /*AddNull=*/true);
                 unsigned id = stringLiteralIdx_++;

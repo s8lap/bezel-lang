@@ -139,4 +139,30 @@ BEZEL_TEST(codegen_cg27d, null_nullable_class_renders_null_r35) {
         "end Main; end C;"), 6);
 }
 
+// R36 / §18.7 / #733: a verbatim interpolated string `$@"..."` keeps escapes
+// LITERAL (the @ was previously ignored, so `\t`/`\n` were decoded). Verbatim
+// `$@"a\tb"` must equal plain `@"a\tb"` and differ from interpolated `$"a\tb"`.
+BEZEL_TEST(codegen_cg27d, verbatim_interpolated_keeps_escapes_literal_r36) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var v := $@\"a\\tb\"; "
+        "  var plain := @\"a\\tb\"; "
+        "  var interp := $\"a\\tb\"; "
+        "  var ok := 0; "
+        "  if v = plain then ok := ok + 1; end; "
+        "  if v <> interp then ok := ok + 1; end; "
+        "  return ok; "  // expect 2
+        "end Main; end C;"), 2);
+}
+
+// R36 / §18.7: the interpolation hole still substitutes inside a verbatim string.
+BEZEL_TEST(codegen_cg27d, verbatim_interpolated_hole_still_substitutes_r36) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var n := 7; "
+        "  var s := $@\"x{n}y\"; "
+        "  return (1 if s = \"x7y\" else 0); "
+        "end Main; end C;"), 1);
+}
+
 }  // namespace
