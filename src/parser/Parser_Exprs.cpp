@@ -818,14 +818,19 @@ std::unique_ptr<ast::Pattern> Parser::parsePattern(bool inPositional) {
         rop->expr = parseExpression();
         return std::unique_ptr<ast::Pattern>(rop.release());
     }
-    // Open-ended range patterns (`..`, `..<EXPR`, `..EXPR`) are not in this
-    // slice. The with-lower-bound forms (`a..b`, `a..<b`) are detected in
-    // the catch-all below.
+    // §16.2 / §19.3 (#726): a TRAILING-open range pattern (`31..`) is handled by
+    // the catch-all below (the leading expression is parsed, then `..` makes it a
+    // RangeExpr with an absent upper bound; codegen now matches the open bound).
+    // A LEADING-open range pattern (`..<EXPR`) cannot be parsed unambiguously
+    // here: in the scrutinee form `case x ..<10` the scrutinee parser greedily
+    // consumes `x ..< 10` as a range expression. Use the equivalent relational
+    // pattern (`< EXPR` / `<= EXPR`), which is supported, instead.
     if (isPunctuator("..") || isPunctuator("..<")) {
         diagnostics_.report(
             Severity::Error, current_.location,
-            "open-ended range patterns are not yet supported "
-            "(only `a..b` / `a..<b` for now)");
+            "leading-open range pattern (`..<x` / `..x`) is not supported as a "
+            "case pattern (it is ambiguous with a `scrutinee..hi` range); use "
+            "the equivalent relational pattern `< x` / `<= x` (§19.3)");
         advance();
         return nullptr;
     }

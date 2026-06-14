@@ -783,3 +783,28 @@ BEZEL_TEST(codegen_cg28, relational_pattern_ge_lt_variable_726) {
         "  end; "
         "return r;"), 7);  // 3 < 10
 }
+
+// #726 / §16.2 / §19.3: a TRAILING-open range pattern (`31..` matches values at
+// or above 31). Previously IR-failed — codegen's range-pattern handler required
+// both bounds; it now matches an absent upper (or lower) bound. (Leading-open
+// `..<x` is ambiguous with a `scrutinee..hi` range; use the relational `< x`.)
+BEZEL_TEST(codegen_cg28, trailing_open_range_pattern_726) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 80; "
+        "var r := case x "
+        "    80.. => 2, "
+        "    _ => 0 "
+        "  end; "
+        "return r;"), 2);  // 80 >= 80
+}
+
+// #726: the trailing-open lower bound is inclusive (`31..` matches 31).
+BEZEL_TEST(codegen_cg28, trailing_open_range_boundary_726) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 31; "
+        "var r := case x "
+        "    31.. => 9, "
+        "    _ => 0 "
+        "  end; "
+        "return r;"), 9);
+}

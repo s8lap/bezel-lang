@@ -7833,19 +7833,31 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     if (auto* rp = dynamic_cast<const ast::RangePattern*>(pat)) {
         auto* range = dynamic_cast<const ast::RangeExpr*>(
             rp->rangeExpr.get());
-        if (range && range->lo && range->hi && !range->step) {
-            llvm::Value* lo = lowerExpr(*range->lo);
-            llvm::Value* hi = lowerExpr(*range->hi);
-            if (!lo || !hi) return nullptr;
+        // §16.2 / §19.3 (#726): support OPEN-ENDED range patterns (`31..`,
+        // `..<10`, `..b`) in addition to closed `a..b`/`a..<b`. One bound may be
+        // absent: an absent lower bound matches everything below the upper
+        // (geL = true), an absent upper bound matches everything at/above the
+        // lower (leH = true). A `..`-only pattern reduces to true.
+        if (range && !range->step && (range->lo || range->hi)) {
             bool fp = scrut->getType()->isFloatingPointTy();
             // §19.3: range patterns — use FP comparisons for float scrutinees.
-            llvm::Value* geL = fp ? builder_.CreateFCmpOGE(scrut, lo)
-                                  : builder_.CreateICmpSGE(scrut, lo);
-            llvm::Value* leH = fp
-                ? (range->inclusive ? builder_.CreateFCmpOLE(scrut, hi)
-                                    : builder_.CreateFCmpOLT(scrut, hi))
-                : (range->inclusive ? builder_.CreateICmpSLE(scrut, hi)
-                                    : builder_.CreateICmpSLT(scrut, hi));
+            llvm::Value* geL = builder_.getInt1(true);
+            if (range->lo) {
+                llvm::Value* lo = lowerExpr(*range->lo);
+                if (!lo) return nullptr;
+                geL = fp ? builder_.CreateFCmpOGE(scrut, lo)
+                         : builder_.CreateICmpSGE(scrut, lo);
+            }
+            llvm::Value* leH = builder_.getInt1(true);
+            if (range->hi) {
+                llvm::Value* hi = lowerExpr(*range->hi);
+                if (!hi) return nullptr;
+                leH = fp
+                    ? (range->inclusive ? builder_.CreateFCmpOLE(scrut, hi)
+                                        : builder_.CreateFCmpOLT(scrut, hi))
+                    : (range->inclusive ? builder_.CreateICmpSLE(scrut, hi)
+                                        : builder_.CreateICmpSLT(scrut, hi));
+            }
             return builder_.CreateAnd(geL, leH);
         }
     }
