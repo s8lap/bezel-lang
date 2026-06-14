@@ -3401,7 +3401,18 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
 
 
 bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
-    if (!cs.scrutinee) return false;  // scrutinee-less form deferred
+    if (!cs.scrutinee) {
+        // R34: the scrutinee-less `case` form is valid grammar (§19 / §A) but
+        // not yet lowered. Silently returning false skipped the whole statement
+        // (its arms never ran). Emit a clean diagnostic instead of a silent
+        // no-op until the form is implemented. Mirrors lowerCaseExpr.
+        ctx_.diagnostics().report(
+            Severity::Error, cs.span.begin,
+            "not yet implemented: scrutinee-less `case` (the boolean-condition "
+            "form `case cond => ... end` with no scrutinee, §19); use an "
+            "`if`/`elif` chain, or a `case` with an explicit scrutinee");
+        return false;  // not diverged; the Error already fails compilation
+    }
     llvm::Value* scrut = lowerExpr(*cs.scrutinee);
     if (!scrut) return false;
     const sema::TypeSymbol* enumTy = enumTypeOf(*cs.scrutinee);

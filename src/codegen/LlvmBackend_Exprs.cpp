@@ -7298,7 +7298,21 @@ llvm::Value* Emitter::buildRecordValue(
 
 
 llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
-    if (!ce.scrutinee) return nullptr;  // scrutinee-less form deferred
+    if (!ce.scrutinee) {
+        // R34: the scrutinee-less `case` form (grammar `case Expression?`, each
+        // arm a bool condition — spec §19 / §A, line "case (in scrutinee-less
+        // form) require bool") is a VALID but not-yet-lowered form. Returning
+        // null here previously left the result an uninitialized poison, so a
+        // `var r := case ... end` read back RANDOM GARBAGE at runtime (a silent
+        // miscompile). Emit a clean diagnostic instead until the form is
+        // implemented.
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "not yet implemented: scrutinee-less `case` (the boolean-condition "
+            "form `case cond => ... end` with no scrutinee, §19); use an "
+            "`if`/`elif` chain, or a `case` with an explicit scrutinee");
+        return nullptr;
+    }
     llvm::Value* scrut = lowerExpr(*ce.scrutinee);
     if (!scrut) return nullptr;
     const sema::TypeSymbol* enumTy = enumTypeOf(*ce.scrutinee);

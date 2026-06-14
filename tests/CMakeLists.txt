@@ -502,6 +502,7 @@ set(BEZEL_TEST_SOURCES
     codegen/async_iter_await_finally_655_test.cpp  # fix #655: await-in-async-iterator-finally rejected (§30.7 v0.137)
     codegen/iter_finally_dispose_623_test.cpp
     codegen/sync_iter_yield_restrictions_r33_test.cpp  # R33: §29.6 yield-placement for sync iterators
+    codegen/scrutineeless_case_r34_test.cpp  # R34: scrutinee-less case → clean diagnostic (not silent garbage)
     codegen/iterator_exception_630_test.cpp
     codegen/codegen_unimplemented_hard_error_628_test.cpp
     codegen/owned_dict_drain_628_test.cpp
