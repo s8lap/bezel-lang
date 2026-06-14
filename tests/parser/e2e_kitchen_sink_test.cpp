@@ -41,12 +41,12 @@ end IRepository;
 
 public record Point(x: int serialized "X", y: int serialized "Y");
 
-public class Service<T> serialized graph
-  polymorphic("user": UserService, "admin": AdminService):
+public class Service<T> :
   IDisposable
 where T: class
 where T is owned
 
+  polymorphic("user": UserService, "admin": AdminService);
   private owned _store: IRepository<T>;
   private readonly _name: string;
 

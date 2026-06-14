@@ -239,23 +239,23 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
             }
             out += '>';
         }
-        if (td->serializedClass) {
-            out += " serialized ";
-            out += std::string(td->serializedClass->shape);
-            if (!td->serializedClass->polyCases.empty()) {
-                out += " polymorphic(";
-                for (std::size_t i = 0;
-                     i < td->serializedClass->polyCases.size(); ++i) {
-                    if (i > 0) out += ", ";
-                    const auto& pc = td->serializedClass->polyCases[i];
-                    out += '"';
-                    out += std::string(pc.discriminator);
-                    out += "\": ";
-                    out += pc.type ? typeToString(*pc.type)
-                                   : std::string("<null>");
-                }
-                out += ')';
+        // §9.8 v0.141: the `serialized tree/graph/cyclic` header clause was
+        // retired. At parse time, serializedClass is set only by a class-body
+        // `polymorphic(...)` member clause (its polyCases; the wire shape is
+        // derived later by sema). Render that registry.
+        if (td->serializedClass && !td->serializedClass->polyCases.empty()) {
+            out += " polymorphic(";
+            for (std::size_t i = 0;
+                 i < td->serializedClass->polyCases.size(); ++i) {
+                if (i > 0) out += ", ";
+                const auto& pc = td->serializedClass->polyCases[i];
+                out += '"';
+                out += std::string(pc.discriminator);
+                out += "\": ";
+                out += pc.type ? typeToString(*pc.type)
+                               : std::string("<null>");
             }
+            out += ')';
         }
         if (!td->baseTypes.empty()) {
             out += ": ";

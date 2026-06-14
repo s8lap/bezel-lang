@@ -147,12 +147,6 @@ private:
     // first — `serialized` is contextual so we identify by text.
     bool isSerializedClauseStart() const;
     std::unique_ptr<ast::SerializedClause> parseSerializedClause();
-    // Slice 42: parse `serialized ("tree"|"graph"|"cyclic") PolymorphicClause?`
-    // (A.3 SerializedClassClause). The "serialized" Identifier check
-    // overlaps with isSerializedClauseStart, but the disambiguator is what
-    // follows: tree/graph/cyclic vs. skip/string/optional. Used by
-    // parseTypeOrInterfaceDecl on the class/record path.
-    std::unique_ptr<ast::SerializedClassClause> parseSerializedClassClause();
     // §9.8 v0.141 (P6): class-body `polymorphic("disc": Type, ...);` member
     // clause — populates decl.serializedClass->polyCases.
     void parsePolymorphicMember(ast::TypeDecl& decl);

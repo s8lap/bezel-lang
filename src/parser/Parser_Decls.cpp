@@ -270,22 +270,13 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                     "expected ')' to close positional / primary-ctor list");
             }
         }
-        // SerializedClassClause sits between PrimaryCtorParams and Inheritance
-        // per A.3. The grammar only puts it on ClassDecl, but RecordDecl
-        // shares the same syntactic shape at this position; we accept it on
-        // both kinds and let sema enforce kind-specific restrictions.
-        if (current_.kind == TokenKind::Identifier &&
-            current_.text == "serialized") {
-            // Disambiguate from A.4 SerializedClause (on positional fields):
-            // class-level shape keywords are tree/graph/cyclic, never skip
-            // or optional or a string. peekAt(1) tells us which form.
-            const Token& nxt = peekAt(1);
-            if (nxt.kind == TokenKind::Identifier &&
-                (nxt.text == "tree" || nxt.text == "graph" ||
-                 nxt.text == "cyclic")) {
-                decl->serializedClass = parseSerializedClassClause();
-            }
-        }
+        // §9.8 v0.141 (#703): the `serialized tree/graph/cyclic` class-header
+        // clause was retired. A class participates in serialization synthesis by
+        // DECLARING `: ISerializable`/`: IDeserializable`; field types drive the
+        // wire shape (sema synthesizes the shape). A polymorphic registry is now
+        // a class-BODY `polymorphic(...);` member clause (parseMember path). The
+        // field-level `serialized skip`/`serialized "name"`/`serialized optional`
+        // clauses are unaffected (parseSerializedClause, still parsed below).
         decl->baseTypes = parseInheritance();
         decl->genericConstraints = parseGenericConstraints();
     }
@@ -1445,69 +1436,6 @@ std::unique_ptr<ast::SerializedClause> Parser::parseSerializedClause() {
             "(A.4 SerializedClause)");
     }
     return sc;
-}
-
-std::unique_ptr<ast::SerializedClassClause>
-Parser::parseSerializedClassClause() {
-    // A.3 `serialized ("tree"|"graph"|"cyclic") PolymorphicClause?`. All
-    // four words are contextual. Caller checked the leading "serialized"
-    // and the shape word.
-    advance(); // past `serialized`
-    auto scc = std::make_unique<ast::SerializedClassClause>();
-    if (current_.kind == TokenKind::Identifier &&
-        (current_.text == "tree" || current_.text == "graph" ||
-         current_.text == "cyclic")) {
-        scc->shape = current_.text;
-        advance();
-    } else {
-        diagnostics_.report(
-            Severity::Error, current_.location,
-            "expected `tree`, `graph`, or `cyclic` after `serialized`");
-    }
-    // PolymorphicClause: `polymorphic ( "name" : Type ("," "name" : Type)* )`.
-    if (current_.kind == TokenKind::Identifier &&
-        current_.text == "polymorphic") {
-        advance();
-        if (!consumePunctuator("(")) {
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "expected '(' to begin PolymorphicClause registry");
-        }
-        auto parseOne = [&]() {
-            ast::PolyCase pc;
-            if (current_.kind != TokenKind::StringLiteral) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected discriminator string in PolyCase");
-            } else {
-                std::string_view txt = current_.text;
-                if (txt.size() >= 2 && txt.front() == '"' &&
-                    txt.back() == '"') {
-                    pc.discriminator = txt.substr(1, txt.size() - 2);
-                } else {
-                    pc.discriminator = txt;
-                }
-                advance();
-            }
-            if (!consumePunctuator(":")) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected ':' between PolyCase discriminator and type");
-            }
-            pc.type = parseType();
-            return pc;
-        };
-        scc->polyCases.push_back(parseOne());
-        while (consumePunctuator(",")) {
-            scc->polyCases.push_back(parseOne());
-        }
-        if (!consumePunctuator(")")) {
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "expected ')' to close PolymorphicClause registry");
-        }
-    }
-    return scc;
 }
 
 // §9.8 v0.141 (P6): class-body member clause
