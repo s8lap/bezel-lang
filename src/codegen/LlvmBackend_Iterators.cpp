@@ -300,6 +300,36 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     if (!ci.stmts) return;
     smKind_ = SuspendKind::Yield;
 
+    // §29.6: a SYNCHRONOUS iterator (returning IEnumerable<T>/IEnumerator<T>)
+    // is subject to the same forbidden-`yield`-position rules as an async one
+    // (emitAsyncIteratorMethod already enforces these). The forbidden positions
+    // are: `yield` inside a `try` body whose surrounding statement has a `catch`,
+    // `yield` inside a catch arm body, and `yield` inside a `finally` block
+    // (`yield` in a `try` body with only a `finally` is allowed). Without this
+    // check a `yield` in a `finally` reached codegen and produced malformed IR
+    // ("Terminator found in the middle of a basic block"), and a `yield` in a
+    // try-with-catch was accepted unsoundly. suspendInTryPosition detects all
+    // three (it only looks for yields here — a sync iterator has no awaits).
+    // A diagnostic error suppresses executable emission, so a trivial valid
+    // factory body is enough to keep the module well-formed for verification.
+    if (suspendInTryPosition(*ci.stmts)) {
+        ctx_.diagnostics().report(
+            Severity::Error,
+            ms->decl ? ms->decl->span.begin : SourceLocation{},
+            "forbidden by §29.6: `yield` inside a `try` body with catch arms, "
+            "`yield` inside a catch arm body, or `yield` inside a `finally` "
+            "block in an iterator (`yield` in a `try` body with only a "
+            "`finally` is allowed)");
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+        builder_.SetInsertPoint(entry);
+        llvm::Type* rt = fn->getReturnType();
+        if (rt->isVoidTy())
+            builder_.CreateRetVoid();
+        else
+            builder_.CreateRet(llvm::Constant::getNullValue(rt));
+        return;
+    }
+
     // Determine element type T from the return type's generic arg.
     llvm::Type* elemTy = i32();  // default
     if (ci.returnType) {
