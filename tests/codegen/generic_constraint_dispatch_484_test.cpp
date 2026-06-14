@@ -190,3 +190,24 @@ BEZEL_TEST(generic_constraint_dispatch_484, two_constrained_type_params_spec_14_
         "  return Utils.Sum(a, b); "
         "end Main; end C;"), 42);
 }
+
+// #730 / §14: an int-returning interface method called via a generic constraint
+// `where T: IComparable<T>` with T=int. int is a primitive with no vtable, so
+// `a.CompareTo(b)` is lowered through the primitive comparison — but the
+// receiver was a bare type-param, so the primitive path was skipped and the
+// dispatch returned 0. The receiver type is now resolved to its concrete
+// primitive via the active substitution. CompareTo gives proper -1/0/+1.
+BEZEL_TEST(generic_constraint_dispatch_484, primitive_compareto_via_constraint_730) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method GetComp<T>(a: T, b: T): int where T: IComparable<T> "
+        "    return a.CompareTo(b); "
+        "  end GetComp; "
+        "  public static method Main(): int "
+        "    var lt := GetComp<int>(1, 10); "
+        "    var gt := GetComp<int>(10, 1); "
+        "    var eq := GetComp<int>(5, 5); "
+        "    return (1 if (lt < 0 and gt > 0 and eq = 0) else 0); "
+        "  end Main; "
+        "end C;"), 1);
+}

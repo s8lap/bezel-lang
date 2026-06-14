@@ -548,6 +548,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         }
                     }
                     auto* tt = ctx_.exprType(*ma->target);
+                    // #730: a receiver of bare type-parameter type (`a: T` in a
+                    // monomorphized generic body, e.g. `where T: IComparable<T>`
+                    // with T=int calling `a.CompareTo(b)`) resolves to its
+                    // concrete type via the active substitution. When the param
+                    // binds to a PRIMITIVE, substitute it so the primitive-method
+                    // paths below (CompareTo, etc.) fire — instead of falling
+                    // through to an interface dispatch that returned 0.
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        !tt->declaration && !genericSubstSemaTy_.empty() &&
+                        tt->astNode && tt->astNode->name &&
+                        tt->astNode->name->parts.size() == 1) {
+                        auto it = genericSubstSemaTy_.find(
+                            tt->astNode->name->parts[0]);
+                        if (it != genericSubstSemaTy_.end() && it->second &&
+                            it->second->kind == sema::TypeRef::Kind::Primitive)
+                            tt = const_cast<sema::TypeRef*>(it->second);
+                    }
                     // fix #499 / §9.8: Range<T>.Contains(x) inside the
                     // CallExpr dispatch path (ma->target has Range type).
                     if (isRangeType(tt) && ma->member == "Contains" &&
