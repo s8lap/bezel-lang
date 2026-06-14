@@ -3216,6 +3216,20 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     if (!isStaticMethod(ms) && ms->parent &&
         ms->parent->kind == ast::TypeDeclKind::Enum)
         currentEnumMethod_ = ms->parent;
+    // R36: an extension method ON an enum (`extension Color ... method ToInt()`)
+    // needs the same wiring so a `case this` over the enum's constants resolves.
+    // An extension method has NO parent type (functionName names it after its
+    // target), so the check above misses it; consult the resolved target type.
+    // Without this, enumTypeOf(this) returns null, the enum-constant arms never
+    // match, patternMatches bails, and lowerCaseExpr leaves `case.end`
+    // unterminated → an IR-verify failure in `bz$ext$<Enum>$<method>`.
+    else if (isExtensionMethod(ms) && ms->extensionDecl &&
+             ms->extensionDecl->targetType) {
+        if (auto* rt = ctx_.resolvedType(*ms->extensionDecl->targetType))
+            if (rt->declaration &&
+                rt->declaration->kind == ast::TypeDeclKind::Enum)
+                currentEnumMethod_ = rt->declaration;
+    }
 
     bool terminated = false;
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {

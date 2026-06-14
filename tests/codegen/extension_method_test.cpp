@@ -136,6 +136,31 @@ BEZEL_TEST(codegen_extension, method_on_enum_value_receiver_spec_26_2) {
         "end Main; end P;"), 7);
 }
 
+// R36 / §26 / CG30: a `case this` over the enum's own constants inside an enum
+// EXTENSION method. The extension body has no parent type, so enumTypeOf(this)
+// previously returned null, the enum-constant arms never matched, and codegen
+// left `case.end` unterminated → an IR-verify failure. Now resolves the enum
+// from the extension's target type. Color.Green => 20.
+BEZEL_TEST(codegen_extension, case_this_over_enum_in_extension_method_r36) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "extension Color "
+        "  public method ToInt(): int "
+        "    return case this "
+        "      Color.Red => 10, "
+        "      Color.Green => 20, "
+        "      Color.Blue => 30, "
+        "      _ => -1 "
+        "    end; "
+        "  end ToInt; "
+        "end; "
+        "class P public static method Main(): int "
+        "  var c := Color.Green; "
+        "  return c.ToInt(); "
+        "end Main; end P;"), 20);
+}
+
 // ===========================================================================
 // §26.5 NO-SHADOW — "Adding a real method to a type silently takes priority
 // over an extension with the same name — by design." The INSTANCE member must
