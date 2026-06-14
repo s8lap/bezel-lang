@@ -426,3 +426,17 @@ BEZEL_TEST(codegen_cg60, lambda_body_no_throw_returns_value_719) {
         "  return fn(); "
         "end Main; end C;"), 42);
 }
+
+// #731 / §A.7: a nested lambda (a lambda returning a lambda) under an explicit
+// higher-order function-type annotation. The inner lambda must see ITS expected
+// return type (the outer's funcReturn), not the outer's full type. Previously
+// IR-failed (ret i32 vs ptr). lowerLambda now descends expectedFunctionType_ to
+// funcReturn before body emit. The curried application f(10)(5) = 15.
+BEZEL_TEST(codegen_cg60, nested_higher_order_lambda_annotation_731) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var f: (int) -> (int) -> int := (x: int) => (y: int) => x + y; "
+        "  var g := f(10); "
+        "  return g(5); "  // 15
+        "end Main; end C;"), 15);
+}

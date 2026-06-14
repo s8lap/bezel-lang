@@ -5062,6 +5062,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
     // Save state (needed for capture slot access and restoration).
     auto savedLambdaParamHints = lambdaParamTypeHint_;  // restore after body
+    // #731: this lambda's own retTy/params were just derived from
+    // expectedFunctionType_. If the body is itself a lambda (a nested
+    // higher-order lambda, `(x) => (y) => x` under a `(int)->(int)->int`
+    // annotation), the INNER lambda must see ITS expected type — the outer's
+    // funcReturn — not the outer's full type. Descend before body emission so a
+    // nested body-lambda derives the right return type; otherwise the inner
+    // lambda's body was typed against the wrong expected type → `ret i32` vs ptr.
+    const sema::TypeRef* savedExpectedFT = expectedFunctionType_;
+    if (expectedFunctionType_ && expectedFunctionType_->funcReturn &&
+        expectedFunctionType_->funcReturn->kind == sema::TypeRef::Kind::Function)
+        expectedFunctionType_ = expectedFunctionType_->funcReturn;
     llvm::Function* savedFn = currentFn_;
     llvm::Value* savedThis = currentThis_;
     llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
@@ -5494,6 +5505,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     }
 
     // --- Restore emitter state ---
+    expectedFunctionType_ = savedExpectedFT;  // #731
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
     currentFn_ = savedFn;
     currentThis_ = savedThis;
