@@ -354,3 +354,46 @@ BEZEL_TEST(collections_r9_524, set_string_in_operator_spec_17_5) {
         "  return 1; "
         "end Main; end C;"), 1);
 }
+
+// #725 / §4.11: Stack<T>.TryPop(out item): bool — true + writes the top + pops
+// on non-empty, false + no-op on empty. (Previously unimplemented: the bool
+// result IR-failed in an `if` and the out param was never written.)
+BEZEL_TEST(collections_r9, stack_trypop_725) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var s := new Stack<int>(); "
+        "  s.Push(42); s.Push(99); "
+        "  var popped := 0; "
+        "  var ok := s.TryPop(out popped); "        // ok=true, popped=99
+        "  var r := 0; "
+        "  if ok then r := r + popped; end; "       // +99
+        "  using var e := new Stack<int>(); "
+        "  var x := 0; "
+        "  if e.TryPop(out x) then r := r + 1000; end; "  // empty → false
+        "  return r + s.Count; "                    // 99 + 1 = 100
+        "end Main; end C;"), 100);
+}
+
+// #725 / §4.12: Queue<T>.TryDequeue(out item): bool — dequeues the FRONT.
+BEZEL_TEST(collections_r9, queue_trydequeue_725) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var q := new Queue<int>(); "
+        "  q.Enqueue(5); q.Enqueue(7); "
+        "  var item := 0; "
+        "  var ok := q.TryDequeue(out item); "      // front=5
+        "  return (1 if (ok and item = 5 and q.Count = 1) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// #725: TryPeek reads the top (Stack) / front (Queue) WITHOUT removing.
+BEZEL_TEST(collections_r9, stack_queue_trypeek_no_removal_725) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var s := new Stack<int>(); s.Push(10); s.Push(20); "
+        "  var top := 0; var ok := s.TryPeek(out top); "          // top=20, kept
+        "  using var q := new Queue<int>(); q.Enqueue(3); q.Enqueue(4); "
+        "  var front := 0; var ok2 := q.TryPeek(out front); "     // front=3, kept
+        "  return (1 if (top = 20 and s.Count = 2 and front = 3 and q.Count = 2) else 0); "
+        "end Main; end C;"), 1);
+}

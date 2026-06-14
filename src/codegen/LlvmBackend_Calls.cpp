@@ -2832,6 +2832,62 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(remFn, {recv, idx, builder_.getInt64(esz)});
             return builder_.CreateLoad(retTy, out, "arr.pop");
         }
+        // §4.11/§4.12 (#725): Stack.TryPop/TryPeek, Queue.TryDequeue/TryPeek
+        // (out item: T): bool. On a non-empty collection, write the top (Stack)
+        // or front (Queue) element to the out param and — for TryPop/TryDequeue
+        // — remove it, returning true; on empty, return false and leave the out
+        // param unchanged. The removal is NON-disposing: the element transfers to
+        // the out param (a borrow for a borrowing collection, an owned value for
+        // an Owned* collection). TryPeek never removes. Modeled on Pop/Dequeue +
+        // the TryGetValue out-write; bz_array_len/get/remove_at already exist.
+        if ((m == "TryPop" || m == "TryDequeue" || m == "TryPeek") &&
+            call.args.size() == 1 && call.args[0].value) {
+            llvm::Type* outTy = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
+            if (!outAddr) return nullptr;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "trypop.len");
+            llvm::Value* nonEmpty = builder_.CreateICmpNE(
+                len, builder_.getInt64(0), "trypop.ne");
+            auto* foundBB =
+                llvm::BasicBlock::Create(llvm_, "trypop.found", currentFn_);
+            auto* endBB =
+                llvm::BasicBlock::Create(llvm_, "trypop.end", currentFn_);
+            llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+            builder_.CreateCondBr(nonEmpty, foundBB, endBB);
+            builder_.SetInsertPoint(foundBB);
+            // top (Stack) vs front (Queue): TryPop → Stack top (len-1);
+            // TryDequeue → Queue front (0); TryPeek → by the receiver kind.
+            std::string_view cn =
+                (recvTy && recvTy->astNode && recvTy->astNode->name &&
+                 !recvTy->astNode->name->parts.empty())
+                    ? recvTy->astNode->name->parts[0]
+                    : std::string_view{};
+            bool isStack = cn.find("Stack") != std::string_view::npos;
+            bool front = (m == "TryDequeue") ? true
+                       : (m == "TryPop")     ? false
+                                             : !isStack;  // TryPeek
+            llvm::Value* idx = front
+                ? builder_.getInt64(0)
+                : builder_.CreateSub(len, builder_.getInt64(1), "trypop.idx");
+            auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(getFn,
+                                {recv, idx, outAddr, builder_.getInt64(esz)});
+            if (m != "TryPeek") {
+                auto* remFn = declareC("bz_array_remove_at",
+                                       llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), i64(), i64()});
+                builder_.CreateCall(remFn,
+                                    {recv, idx, builder_.getInt64(esz)});
+            }
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 2, "trypop.r");
+            phi->addIncoming(builder_.getTrue(), foundBB);
+            phi->addIncoming(builder_.getFalse(), preBB);
+            return phi;
+        }
         // fix #642 / stdlib §4.5: .PopAt(index): owned T / .PopLast(): owned T /
         // .PopFirst(): owned T  — remove and return the element at the given slot,
         // transferring ownership to the caller.  Unlike Pop/Dequeue (Stack/Queue),

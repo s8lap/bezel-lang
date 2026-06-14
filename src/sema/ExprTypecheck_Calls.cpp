@@ -1239,7 +1239,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // per §3: Contains → bool, IndexOf → int
                         // per §4.10 stdlib: TryAdd(item: T): bool
-                        else if (m == "Contains" || m == "TryAdd")
+                        // §4.11/§4.12 (#725): Stack.TryPop/TryPeek,
+                        // Queue.TryDequeue/TryPeek (out item: T): bool.
+                        else if (m == "Contains" || m == "TryAdd" ||
+                                 m == "TryPop" || m == "TryDequeue" ||
+                                 m == "TryPeek")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "IndexOf")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
