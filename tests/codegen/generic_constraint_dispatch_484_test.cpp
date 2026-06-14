@@ -211,3 +211,42 @@ BEZEL_TEST(generic_constraint_dispatch_484, primitive_compareto_via_constraint_7
         "  end Main; "
         "end C;"), 1);
 }
+
+// #729 / §14.2: a generic method's `where T: I` constraint is enforced at the
+// CALL SITE. A non-conforming type arg was accepted then SIGSEGV'd via a bad
+// vtable dispatch; it is now a clean compile error. (Full-pipeline runJit test:
+// the constraint bound resolution differs in the sema-only harness.)
+BEZEL_TEST(generic_constraint_dispatch_484, method_constraint_non_conforming_rejected_729) {
+    bezel::test::JitResult r = runJit(
+        "module M; "
+        "interface IFoo method Compute(): int; end IFoo; "
+        "class NotIFoo end NotIFoo; "
+        "class C "
+        "  public static method DoIt<T>(t: T): int where T: IFoo "
+        "    return t.Compute(); "
+        "  end DoIt; "
+        "  public static method Main(): int "
+        "    using var b := new NotIFoo(); "
+        "    return DoIt<NotIFoo>(b); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #729: a CONFORMING type arg compiles and runs.
+BEZEL_TEST(generic_constraint_dispatch_484, method_constraint_conforming_ok_729) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IFoo method Compute(): int; end IFoo; "
+        "class YesFoo: IFoo public method Compute(): int => 42; end YesFoo; "
+        "class C "
+        "  public static method DoIt<T>(t: T): int where T: IFoo "
+        "    return t.Compute(); "
+        "  end DoIt; "
+        "  public static method Main(): int "
+        "    using var y := new YesFoo(); "
+        "    return DoIt<YesFoo>(y); "
+        "  end Main; "
+        "end C;"), 42);
+}
