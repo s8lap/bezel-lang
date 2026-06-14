@@ -378,6 +378,17 @@ BEZEL_TEST(bug474_string_slice, regression_char_index_equals_474) {
         "end Main; end C;"), 1);
 }
 
+// §4.1 / §4.6 / §31.2 (R33): a far out-of-range single-int string index raised
+// no bounds check and SEGFAULTed; it must raise IndexOutOfRangeException.
+BEZEL_TEST(bug474_string_slice, single_char_index_out_of_range_throws_r33) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hi\"; "
+        "  try var c := s[1000000]; return 1; "
+        "  catch IndexOutOfRangeException => return 55; end; "
+        "end Main; end C;"), 55);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // #474 allocation correctness — native build + LeakSanitizer.
 //

@@ -1096,6 +1096,18 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 if (!strPtr || !idx) return nullptr;
                 llvm::Value* idx64 = idx->getType() == i64() ? idx
                     : builder_.CreateSExt(idx, i64(), "str.idx64");
+                // §4.1 / §4.6 / §31.2 (R33): bounds-check the index. Without
+                // this `s[1000000]` (or a negative index) read out of bounds and
+                // SEGFAULTed; the spec requires IndexOutOfRangeException. Use an
+                // unsigned compare so a sign-extended negative index (a huge
+                // unsigned value) is rejected too — mirrors the inline-array and
+                // slice paths.
+                {
+                    llvm::Value* slen = loadStringLen(strPtr);
+                    llvm::Value* oor =
+                        builder_.CreateICmpUGE(idx64, slen, "str.oor");
+                    emitGuardThrow(oor, "IndexOutOfRangeException");
+                }
                 return loadCodePoint(strPtr, idx64);
             }
         }
