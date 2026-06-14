@@ -6953,9 +6953,19 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
     }
 
     // isRaise — per §24.5: invoke each subscribed handler with the payload.
+    // #737: gate payload lowering on the event's payload TYPE, not on the call
+    // args being non-empty. For a no-payload event the explicit `Raise(())`
+    // form passes the unit literal `()` as an arg — non-empty, but lowerExpr
+    // has no case for a UnitExpr and returns null, so the old `!call.args.empty`
+    // check then bailed BEFORE emitEventRaise and silently dropped the entire
+    // dispatch (the Subscribe side already builds a `void(env)` handler for unit
+    // events). §24.5: `Raise()` and `Raise(())` are equivalent and must dispatch
+    // identically.
+    const sema::TypeRef* evPt = eventPayloadType(es);
+    const bool hasPayload = evPt && evPt->kind != sema::TypeRef::Kind::Unit;
     llvm::Value* payloadLL = nullptr;
     llvm::Type* payloadTy = nullptr;
-    if (!call.args.empty() && call.args[0].value) {
+    if (hasPayload && !call.args.empty() && call.args[0].value) {
         payloadLL = lowerExpr(*call.args[0].value);
         if (!payloadLL) return std::optional<llvm::Value*>(nullptr);
         payloadTy = payloadLL->getType();

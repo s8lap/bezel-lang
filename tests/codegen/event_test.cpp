@@ -353,3 +353,39 @@ BEZEL_TEST(codegen_events_24, dispose_size1_inline_array_subscription_element) {
         "b.Fire(40); "                          // handler gone — no-op
         "return box.V; ")), 3);
 }
+
+// #737 / §24.5: a no-payload (unit `()`) STATIC event raised via the explicit
+// `Raise(())` form must dispatch its handlers — `Raise()` and `Raise(())` are
+// equivalent. Previously the unit literal `()` (a non-empty arg) made codegen
+// lower a UnitExpr (→ null) and bail before emitEventRaise, silently dropping
+// the whole dispatch (returned 0). Now gated on the payload TYPE.
+BEZEL_TEST(codegen_events, unit_static_event_raise_unit_literal_737) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class App "
+        "  public static count: int := 0; "
+        "  public static event Tick; "
+        "  public static method Fire() Tick.Raise(()); end Fire; "
+        "end App; "
+        "class C public static method Main(): int "
+        "  var sub := App.Tick.Subscribe((_) => do App.count := App.count + 1; end); "
+        "  App.Fire(); App.Fire(); "
+        "  return App.count; "  // 2
+        "end Main; end C;"), 2);
+}
+
+// #737 regression: the bare `Raise()` no-arg form still dispatches (2).
+BEZEL_TEST(codegen_events, unit_static_event_raise_no_arg_737) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class App "
+        "  public static count: int := 0; "
+        "  public static event Tick; "
+        "  public static method Fire() Tick.Raise(); end Fire; "
+        "end App; "
+        "class C public static method Main(): int "
+        "  var sub := App.Tick.Subscribe((_) => do App.count := App.count + 1; end); "
+        "  App.Fire(); App.Fire(); "
+        "  return App.count; "  // 2
+        "end Main; end C;"), 2);
+}
