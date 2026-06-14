@@ -2255,6 +2255,35 @@ static bool positionalFieldIsSkip(const ast::Param& pf) {
 
 void Resolver::checkSerializationEligibility() {
     if (!ctx_.module()) return;
+
+    // §9.8 v0.141 (#703): PRE-PASS — synthesize a graph-shape
+    // SerializedClassClause for every class that declares
+    // `: ISerializable`/`: IDeserializable` without a keyword clause (and without
+    // hand-written Serialize/Deserialize, which suppresses synthesis on that
+    // side). The keyword clause was retired; a declaration drives synthesis, and
+    // field types drive the wire shape. This MUST run before the eligibility
+    // checks below: a class-typed component (owned, or a borrow back-edge) whose
+    // target is ANOTHER keyword-less serializable class needs that target's
+    // clause already set, regardless of declaration order (forward references).
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (!td || td->serializedClass) continue;  // real keyword clause: leave it
+        bool wantsIS = declaredConformance(*td, "ISerializable");
+        bool wantsID = declaredConformance(*td, "IDeserializable");
+        if (!wantsIS && !wantsID) continue;
+        bool hwS = typeHasHandWrittenMethod(t, "Serialize");
+        bool hwD = typeHasHandWrittenMethod(t, "Deserialize");
+        bool needsSer   = wantsIS && !hwS;
+        bool needsDeser = wantsID && !hwD;
+        if (!needsSer && !needsDeser) continue;  // fully hand-written
+        static const std::string kSyntheticGraphShape = "graph";
+        auto* mutTd = const_cast<ast::TypeDecl*>(td);
+        mutTd->serializedClass = std::make_unique<ast::SerializedClassClause>();
+        mutTd->serializedClass->shape = kSyntheticGraphShape;
+    }
+
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t) continue;
@@ -2281,30 +2310,11 @@ void Resolver::checkSerializationEligibility() {
         // Classes: §9.8 tier-2 eligibility checking.
         if (isClass) {
             if (!td->serializedClass) {
-                // §9.8 v0.141: the `serialized tree`/`graph`/`cyclic` keyword
-                // clause was retired. A class participates in serialization
-                // synthesis by DECLARING `: ISerializable`/`: IDeserializable`;
-                // its wire shape is driven by field types (owned/value → inline,
-                // Shared<T> → identity $id/$ref, Weak<T>/borrow → back-reference).
-                // Synthesize a graph-shape clause so the existing synthesis
-                // machinery — now Shared/Weak-aware (slices S1-S5) — applies; the
-                // component-eligibility checks below then validate the type-driven
-                // components. Hand-written Serialize/Deserialize still suppresses
-                // synthesis on that side (no synthesis when fully hand-written).
-                bool hwS = typeHasHandWrittenMethod(t, "Serialize");
-                bool hwD = typeHasHandWrittenMethod(t, "Deserialize");
-                bool needsSer   = wantsIS && !hwS;
-                bool needsDeser = wantsID && !hwD;
-                if (!needsSer && !needsDeser) {
-                    continue;  // fully hand-written → no synthesis
-                }
-                static const std::string kSyntheticGraphShape = "graph";
-                auto* mutTd = const_cast<ast::TypeDecl*>(td);
-                mutTd->serializedClass =
-                    std::make_unique<ast::SerializedClassClause>();
-                mutTd->serializedClass->shape = kSyntheticGraphShape;
-                // Fall through to the component-eligibility checks below, which
-                // now see the synthetic clause.
+                // §9.8 v0.141: after the synthesis pre-pass at the top of this
+                // function, a class with no clause here is fully hand-written
+                // (Serialize + Deserialize) — it satisfies the conformance
+                // without synthesis, so there is nothing to check.
+                continue;
             }
 
             // Class has a serialized-class clause. §9.8: eligibility requires
