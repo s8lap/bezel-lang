@@ -179,6 +179,7 @@ set(BEZEL_TEST_SOURCES
     sema/shared_weak_instantiation_603_test.cpp
     sema/serialization_synthesis_550_sema_test.cpp
     sema/serialization_import_gate_631_sema_test.cpp
+    sema/serialization_typedriven_703_test.cpp       # #703: type-driven serialization — Shared<T>/Weak<T> component eligibility (§9.8 v0.141)
     # --- #600 contract tests (sendability + Domain.Spawn + channels, §30.14/§30.15) ---
     # These tests are the spec-derived CONTRACT for issue #600 phases 2-3.
     # They are RED against current main: sema has no knowledge of Channel<T>,

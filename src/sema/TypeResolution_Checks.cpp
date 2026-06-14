@@ -2057,6 +2057,9 @@ void Resolver::checkVariancePositions() {
 //     declares ISerializable/IDeserializable (recursive eligibility)
 //   - A class with a `serialized tree`/`graph`/`cyclic` clause (§9.8 v0.136)
 //   - A nullable T? whose T is an eligible component type
+//   - A Shared<T> or Weak<T> whose element T is an eligible component type
+//     (§9.8 v0.141): Shared<T> serializes as an identity participant
+//     ($id/$ref), Weak<T> as a back-reference ($ref)
 // NOT eligible:
 //   - A class without a `serialized tree`/`graph`/`cyclic` clause
 //   - A record that does not itself declare ISerializable/IDeserializable
@@ -2099,6 +2102,28 @@ static bool isSerializationEligibleType(
         }
     }
     if (tr->kind != K::Named) return false;
+
+    // §9.8 (v0.141): Shared<T> and Weak<T> are serialization-eligible component
+    // types when their element type T is eligible.  Shared<T> serializes as an
+    // identity participant ($id on first encounter, $ref on aliases, keyed on
+    // the underlying value); Weak<T> serializes as a back-reference ($ref).
+    // Both are builtin Named types: `declaration` is null and the type name is
+    // carried in `astNode->name` (locally) or `importedName` (cross-module
+    // metadata).  Recurse on the element type argument (genericArgs[0]).
+    if (!tr->declaration) {
+        std::string_view bname;
+        if (tr->astNode && tr->astNode->name &&
+            !tr->astNode->name->parts.empty()) {
+            bname = tr->astNode->name->parts[0];
+        } else if (!tr->importedName.empty()) {
+            bname = tr->importedName;
+        }
+        if ((bname == "Shared" || bname == "Weak") &&
+            !tr->genericArgs.empty() && tr->genericArgs[0]) {
+            return isSerializationEligibleType(tr->genericArgs[0], visited);
+        }
+    }
+
     const TypeSymbol* ts = tr->declaration;
     if (!ts) return false;
 

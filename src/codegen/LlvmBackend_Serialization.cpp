@@ -188,6 +188,28 @@ static void collectClassComponents(
     }
 }
 
+// §9.8 v0.141 / #703: is this component type a builtin Shared<T> or Weak<T>?
+// These are admitted to serialization eligibility by sema slice S1, but their
+// type-driven wire codegen (Shared<T> → identity $id/$ref; Weak<T> → back-
+// reference $ref) lands in a later slice. Shared/Weak are builtin handles with
+// no class declaration, so emitting an owning-component body for them would
+// miscompile; emitClassSerialize/Deserialize guard on this and report a clean
+// "not yet implemented" error instead. The name lives in astNode (locally) or
+// importedName (cross-module metadata).
+static bool isSharedOrWeakComponentType(const sema::TypeRef* tr) {
+    if (!tr) return false;
+    const sema::TypeRef* t = tr;
+    sema::TypeRef peeled;
+    if (t->nullable) { peeled = *t; peeled.nullable = false; t = &peeled; }
+    if (t->kind != sema::TypeRef::Kind::Named || t->declaration) return false;
+    std::string_view name;
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        name = t->astNode->name->parts[0];
+    else if (!t->importedName.empty())
+        name = t->importedName;
+    return name == "Shared" || name == "Weak";
+}
+
 // ---------------------------------------------------------------------------
 // Emitter::emitRecordSerialize
 //
@@ -1367,6 +1389,24 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
     std::vector<ClassComponent> comps;
     collectClassComponents(ts, storage, fieldIndex_, ctx_, comps, isGraphMode);
 
+    // §9.8 v0.141 / #703: Shared<T>/Weak<T> components are eligibility-accepted
+    // (sema slice S1) but their type-driven wire codegen is not yet emitted.
+    // Report a clean error rather than miscompiling a builtin handle as an
+    // owning class component.
+    for (const auto& comp : comps) {
+        if (comp.isSkip) continue;
+        if (isSharedOrWeakComponentType(comp.ty)) {
+            ctx_.diagnostics().report(
+                Severity::Error, ts->declLoc,
+                "class `" + std::string(ts->name) + "`: serialization of a "
+                "`Shared<T>`/`Weak<T>` component (field `" + comp.declName +
+                "`) is not yet implemented in codegen (\xC2\xA7""9.8 v0.141, "
+                "issue #703 \xE2\x80\x94 type-driven Shared/Weak wire codegen "
+                "lands in a later slice)");
+            return;
+        }
+    }
+
     llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
 
     // Determine field count for BeginObject.  Non-skip, non-optional fields are
@@ -1649,6 +1689,23 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
 
     std::vector<ClassComponent> comps;
     collectClassComponents(ts, storage, fieldIndex_, ctx_, comps, isGraphMode);
+
+    // §9.8 v0.141 / #703: Shared<T>/Weak<T> components are eligibility-accepted
+    // (sema slice S1) but their type-driven wire codegen is not yet emitted.
+    // Report a clean error rather than miscompiling a builtin handle.
+    for (const auto& comp : comps) {
+        if (comp.isSkip) continue;
+        if (isSharedOrWeakComponentType(comp.ty)) {
+            ctx_.diagnostics().report(
+                Severity::Error, ts->declLoc,
+                "class `" + std::string(ts->name) + "`: deserialization of a "
+                "`Shared<T>`/`Weak<T>` component (field `" + comp.declName +
+                "`) is not yet implemented in codegen (\xC2\xA7""9.8 v0.141, "
+                "issue #703 \xE2\x80\x94 type-driven Shared/Weak wire codegen "
+                "lands in a later slice)");
+            return llvm::ConstantPointerNull::get(ptrTy());
+        }
+    }
 
     // Allocate local slots for each non-skip component.
     // fix #669: null-init stores must be in the entry block, not the current
