@@ -174,3 +174,39 @@ BEZEL_TEST(codegen_577_var_destructure, const_then_var_binding_no_match_spec_19_
         "  end; "
         "end Main; end C;"), -1);
 }
+
+// #726 / §19.3: NESTED record destructuring in a case arm binds the inner name.
+// `Outer(Inner(v), b)` was rejected with "unresolved identifier `v`" — sema did
+// not recurse into a nested DestructuringPattern sub-pattern (codegen already
+// bound the value). Both case-expr and case-stmt handlers now recurse.
+BEZEL_TEST(codegen_577_var_destructure, nested_destructuring_case_expr_726) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Inner(V: int); "
+        "record Outer(A: Inner, B: int); "
+        "class C public static method Main(): int "
+        "  var o := new Outer(new Inner(7), 3); "
+        "  var r := case o "
+        "    Outer(Inner(v), b) => v + b, "
+        "    _ => 0 "
+        "  end; "
+        "  return r; "  // 7 + 3 = 10
+        "end Main; end C;"), 10);
+}
+
+// #726: nested destructuring in a case STATEMENT arm.
+BEZEL_TEST(codegen_577_var_destructure, nested_destructuring_case_stmt_726) {
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "record Inner(V: int); "
+        "record Outer(A: Inner, B: int); "
+        "class C public static method Main(): int "
+        "  var o := new Outer(new Inner(8), 4); "
+        "  var r := 0; "
+        "  case o "
+        "    Outer(Inner(v), b) => do r := v * b; end, "
+        "    _ => do r := 99; end, "
+        "  end; "
+        "  return r; "  // 8 * 4 = 32
+        "end Main; end C;"), 32);
+}

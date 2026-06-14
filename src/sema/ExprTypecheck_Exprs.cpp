@@ -2103,6 +2103,49 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         armScope.names[vbp->name] = lsym;
                     }
                 }
+                // #726 / §19.3: also bind the names inside NESTED destructuring
+                // sub-patterns (`Outer(Inner(v), b)`). The top-level loop above
+                // only handles naked/`var` binds; a nested DestructuringPattern
+                // sub-pattern was skipped, so `v` never entered armScope and the
+                // body's identifier resolution failed. Walk a worklist of nested
+                // patterns and register their binds (best-effort declType —
+                // resolution only needs the name; codegen binds the value, keyed
+                // on the same inner sub-pattern pointer).
+                {
+                    std::vector<const ast::DestructuringPattern*> nestedWork;
+                    for (const auto& sp : dp->subPatterns)
+                        if (sp.nakedBinding.empty())
+                            if (auto* nd = dynamic_cast<
+                                    const ast::DestructuringPattern*>(
+                                    sp.pattern.get()))
+                                nestedWork.push_back(nd);
+                    while (!nestedWork.empty()) {
+                        const ast::DestructuringPattern* nd = nestedWork.back();
+                        nestedWork.pop_back();
+                        for (const auto& s : nd->subPatterns) {
+                            if (!s.nakedBinding.empty()) {
+                                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                                lsym->name = s.nakedBinding;
+                                lsym->decl =
+                                    reinterpret_cast<const ast::Node*>(&s);
+                                armScope.names[s.nakedBinding] = lsym;
+                            } else if (auto* vbp =
+                                           dynamic_cast<const ast::BindingPattern*>(
+                                               s.pattern.get())) {
+                                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                                lsym->name = vbp->name;
+                                lsym->decl = vbp;
+                                lsym->declType = vbp->type
+                                    ? ctx_.resolvedType(*vbp->type) : nullptr;
+                                armScope.names[vbp->name] = lsym;
+                            } else if (auto* deeper = dynamic_cast<
+                                           const ast::DestructuringPattern*>(
+                                           s.pattern.get())) {
+                                nestedWork.push_back(deeper);
+                            }
+                        }
+                    }
+                }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
                 if (arm.guard) visitExpr(*arm.guard);
