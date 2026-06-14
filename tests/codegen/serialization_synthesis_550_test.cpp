@@ -12,9 +12,9 @@
 //
 // Scope: tier 1 only — records (primitives, string, enums, nullable T?,
 // nested records), enums, `serialized` field clauses. Classes without the
-// `serialized tree`/`graph`/`cyclic` clause are NOT synthesized; a call to
-// Serialize/Deserialize on such a class without a hand-written method is a
-// normal no-such-member error, not specially diagnosed here.
+// `: ISerializable`/`: IDeserializable` conformance are NOT synthesized; a call
+// to Serialize/Deserialize on such a class without a hand-written method is a
+// normal no-such-member error, not specially diagnosed here (type-driven, v0.141).
 //
 // The spec states (§2.14) that BinarySerializer/BinaryDeserializer require
 // `import System.Serialization`. JsonSerializer/JsonDeserializer are deferred
@@ -280,8 +280,8 @@ BEZEL_TEST(codegen_serialization_550, no_conformance_no_synthesis_spec_9_8) {
 }
 
 // ===========================================================================
-// §9.8 / §2.15: classes without serialized-class clause cannot use synthesis
-// (a codegen-level "not yet implemented" error for class ISerializable).
+// §9.8 / §2.15: classes declaring `: ISerializable` use type-driven synthesis
+// (v0.141, keyword clause retired). No hand-written method required.
 // ===========================================================================
 
 // §9.8 v0.141 (#703 migration): the keyword clause was retired — a class that

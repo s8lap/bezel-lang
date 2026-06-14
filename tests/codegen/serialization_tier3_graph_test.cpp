@@ -137,11 +137,11 @@ BEZEL_TEST(codegen_serialization_t3_graph,
            graph_back_edge_nullable_round_trip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport3 +
-        "class Slot serialized graph : ISerializable, IDeserializable "
+        "class Slot : ISerializable, IDeserializable"
         "  public property Name: string; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
-        "class Hub serialized graph : ISerializable, IDeserializable "
+        "class Hub : ISerializable, IDeserializable"
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "
         "  public constructor(owned target: Slot, alias: Slot?) "
@@ -176,11 +176,11 @@ BEZEL_TEST(codegen_serialization_t3_graph,
            graph_null_back_edge_round_trip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport3 +
-        "class Slot serialized graph : ISerializable, IDeserializable "
+        "class Slot : ISerializable, IDeserializable"
         "  public property Name: string; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
-        "class Hub serialized graph : ISerializable, IDeserializable "
+        "class Hub : ISerializable, IDeserializable"
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "
         "  public constructor(owned target: Slot, alias: Slot?) "
@@ -215,11 +215,11 @@ BEZEL_TEST(codegen_serialization_t3_graph,
            graph_two_back_edges_round_trip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport3 +
-        "class Slot serialized graph : ISerializable, IDeserializable "
+        "class Slot : ISerializable, IDeserializable"
         "  public property Name: string; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
-        "class Rack serialized graph : ISerializable, IDeserializable "
+        "class Rack : ISerializable, IDeserializable"
         "  public owned NodeA: Slot; "
         "  public owned NodeB: Slot; "
         "  public PrimaryRef: Slot?; "
@@ -250,34 +250,35 @@ BEZEL_TEST(codegen_serialization_t3_graph,
 }
 
 // ===========================================================================
-// §9.8 `serialized tree` back-edge rejection.
+// §9.8 v0.141 (#703 migration): borrow back-edge is now ACCEPTED.
 //
-// "serialized tree asserts the class's serialized object graph is a tree:
-// along the serialized edges, no two references alias the same object, and
-// there are no cycles."  Per the updated sema check (§9.8 tier 3):
-// a non-owned class-typed field is a back-edge; under `serialized tree`, this
-// is a compile error (aliasing violates the tree assertion).
+// The keyword clause — and with it the `serialized tree` "no aliasing/cycles"
+// assertion — was retired. Wire shape is driven by field types: a borrow
+// (non-owned class-typed) field is a back-reference ($ref). A class holding both
+// an owned component and a borrow back-edge is serialization-eligible (was a
+// compile error under `serialized tree`). Round-trip behavior of borrow
+// back-edges is covered by graph_back_edge_nullable_round_trip above.
 // ===========================================================================
 
-// §9.8: `serialized tree` with a non-owned class-typed field (back-edge) is
-// a compile error — `serialized tree` forbids aliasing.
+// §9.8 v0.141: a keyword-less class with an owned component AND a borrow
+// back-edge field is serialization-eligible (compiles), where it was rejected
+// under `serialized tree`.
 BEZEL_TEST(codegen_serialization_t3_graph,
-           tree_class_back_edge_field_is_error_spec_9_8) {
-    BEZEL_EXPECT_TRUE(compileFails(
+           keyword_less_class_with_borrow_back_edge_is_eligible_spec_9_8_v0141) {
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport3 +
-        "class Slot serialized tree : ISerializable, IDeserializable "
+        "class Slot : ISerializable, IDeserializable "
         "  public property Name: string; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
-        // TreeHolder uses `serialized tree` but has a back-edge — compile error.
-        "class TreeHolder serialized tree : ISerializable, IDeserializable "
+        "class Holder : ISerializable, IDeserializable "
         "  public owned Data: Slot; "
-        "  public Mirror: Slot; "  // non-owned class-typed: back-edge → error under tree
-        "  public constructor(owned data: Slot, mirror: Slot) "
+        "  public Mirror: Slot?; "  // borrow back-edge — now a valid $ref
+        "  public constructor(owned data: Slot, mirror: Slot?) "
         "    Data := move data; Mirror := mirror; "
         "  end constructor; "
-        "end TreeHolder; "
-        "class C public static method Main(): int return 0; end Main; end C;"));
+        "end Holder; "
+        "class C public static method Main(): int return 0; end Main; end C;"), 0);
 }
 
 // ===========================================================================
@@ -297,11 +298,11 @@ BEZEL_TEST(codegen_serialization_t3_graph,
            graph_back_edge_asan_clean_spec_9_8) {
     const std::string src =
         std::string("module M; ") + kImport3 +
-        "class Slot serialized graph : ISerializable, IDeserializable "
+        "class Slot : ISerializable, IDeserializable"
         "  public property Name: string; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
-        "class Hub serialized graph : ISerializable, IDeserializable "
+        "class Hub : ISerializable, IDeserializable"
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "
         "  public constructor(owned target: Slot, alias: Slot?) "
@@ -349,11 +350,11 @@ BEZEL_TEST(codegen_serialization_t3_graph,
     // all allocas via the disposeStack).  The sanitizer checks no leaks occur.
     const std::string src =
         std::string("module M; ") + kImport3 +
-        "class Slot serialized graph : ISerializable, IDeserializable "
+        "class Slot : ISerializable, IDeserializable"
         "  public property Name: string; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
-        "class Hub serialized graph : ISerializable, IDeserializable "
+        "class Hub : ISerializable, IDeserializable"
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "
         "  public constructor(owned target: Slot, alias: Slot?) "

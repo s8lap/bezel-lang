@@ -195,7 +195,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  public constructor(x: int) X := x; end constructor; "
         "end NoClause; "
         // Parent declares serialized tree but references ineligible NoClause.
-        "class Parent serialized tree : ISerializable, IDeserializable "
+        "class Parent : ISerializable, IDeserializable "
         "  public owned Child: NoClause; "
         "  public constructor(owned c: NoClause) "
         "    Child := move c; "
@@ -237,7 +237,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_single_int_property_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Box serialized tree : ISerializable, IDeserializable "
+        "class Box : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Box; "
@@ -260,7 +260,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_string_int_properties_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Person serialized tree : ISerializable, IDeserializable "
+        "class Person : ISerializable, IDeserializable "
         "  public property Name: string; "
         "  public property Age: int; "
         "  public constructor(name: string, age: int) "
@@ -284,7 +284,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_bool_double_properties_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Config serialized tree : ISerializable, IDeserializable "
+        "class Config : ISerializable, IDeserializable "
         "  public property Enabled: bool; "
         "  public property Ratio: double; "
         "  public constructor(enabled: bool, ratio: double) "
@@ -318,11 +318,11 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_owning_child_class_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Inner serialized tree : ISerializable, IDeserializable "
+        "class Inner : ISerializable, IDeserializable "
         "  public property X: int; "
         "  public constructor(x: int) X := x; end constructor; "
         "end Inner; "
-        "class Outer serialized tree : ISerializable, IDeserializable "
+        "class Outer : ISerializable, IDeserializable "
         "  public owned Child: Inner; "
         "  public property Tag: string; "
         "  public constructor(owned child: Inner, tag: string) "
@@ -347,18 +347,18 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            depth3_tree_class_nested_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Leaf serialized tree : ISerializable, IDeserializable "
+        "class Leaf : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Leaf; "
-        "class Middle serialized tree : ISerializable, IDeserializable "
+        "class Middle : ISerializable, IDeserializable "
         "  public owned L: Leaf; "
         "  public property N: int; "
         "  public constructor(owned l: Leaf, n: int) "
         "    L := move l; N := n; "
         "  end constructor; "
         "end Middle; "
-        "class Root serialized tree : ISerializable, IDeserializable "
+        "class Root : ISerializable, IDeserializable "
         "  public owned M: Middle; "
         "  public property Name: string; "
         "  public constructor(owned m: Middle, name: string) "
@@ -394,7 +394,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
         "record Point(X: int, Y: int): ISerializable, IDeserializable; "
-        "class Shape serialized tree : ISerializable, IDeserializable "
+        "class Shape : ISerializable, IDeserializable "
         "  public property Center: Point; "
         "  public property Label: string; "
         "  public constructor(center: Point, label: string) "
@@ -421,7 +421,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
         "enum Status: ISerializable, IDeserializable Active, Inactive; end Status; "
-        "class Item serialized tree : ISerializable, IDeserializable "
+        "class Item : ISerializable, IDeserializable "
         "  public property Name: string; "
         "  public property St: Status; "
         "  public constructor(name: string, st: Status) "
@@ -475,11 +475,11 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_nullable_owned_child_nonnull_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Child serialized tree : ISerializable, IDeserializable "
+        "class Child : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Child; "
-        "class Parent serialized tree : ISerializable, IDeserializable "
+        "class Parent : ISerializable, IDeserializable "
         "  public property Tag: int; "
         "  public owned OptChild: Child?; "
         "  public constructor(tag: int, owned optChild: Child?) "
@@ -505,11 +505,11 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_nullable_owned_child_null_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Child serialized tree : ISerializable, IDeserializable "
+        "class Child : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Child; "
-        "class Parent serialized tree : ISerializable, IDeserializable "
+        "class Parent : ISerializable, IDeserializable "
         "  public property Tag: int; "
         "  public owned OptChild: Child?; "
         "  public constructor(tag: int, owned optChild: Child?) "
@@ -542,7 +542,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_field_name_customization_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class User serialized tree : ISerializable, IDeserializable "
+        "class User : ISerializable, IDeserializable "
         "  public property Id: int; "
         "  public property FirstName: string serialized \"first_name\"; "
         "  public constructor(id: int, firstName: string) "
@@ -567,7 +567,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_serialized_skip_clause_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Widget serialized tree : ISerializable, IDeserializable "
+        "class Widget : ISerializable, IDeserializable "
         "  public property X: int; "
         "  public property Secret: int serialized skip; "
         "  public constructor(x: int, secret: int) "
@@ -593,7 +593,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_serialized_optional_null_omitted_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Meta serialized tree : ISerializable, IDeserializable "
+        "class Meta : ISerializable, IDeserializable "
         "  public property Code: int; "
         "  public property Note: string? serialized optional; "
         "  public constructor(code: int, note: string?) "
@@ -627,7 +627,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            graph_class_basic_tree_data_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public property Label: string; "
         "  public property Count: int; "
         "  public constructor(label: string, count: int) "
@@ -677,14 +677,14 @@ BEZEL_TEST(codegen_serialization_t2_classes,
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
         // Slot: a simple graph-serializable class.
-        "class Slot serialized graph : ISerializable, IDeserializable "
+        "class Slot : ISerializable, IDeserializable "
         "  public property Name: string; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
         // Hub: owns Target, has a nullable back-edge Alias pointing to Target.
         // Constructor params (target, alias) match field names (Target, Alias)
         // case-insensitively per §9.8 v0.136.
-        "class Hub serialized graph : ISerializable, IDeserializable "
+        "class Hub : ISerializable, IDeserializable "
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "  // nullable back-edge
         "  public constructor(owned target: Slot, alias: Slot?) "
@@ -821,19 +821,19 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  public abstract method Kind(): int; "
         "end Shape; "
         // Circle: concrete subtype of Shape; re-declares ISerializable for synthesis.
-        "class Circle serialized tree : Shape, ISerializable, IDeserializable "
+        "class Circle : Shape, ISerializable, IDeserializable "
         "  public property Radius: double; "
         "  public constructor(radius: double) Radius := radius; end constructor; "
         "  public override method Kind(): int return 1; end Kind; "
         "end Circle; "
         // Square: concrete subtype of Shape; re-declares ISerializable for synthesis.
-        "class Square serialized tree : Shape, ISerializable, IDeserializable "
+        "class Square : Shape, ISerializable, IDeserializable "
         "  public property Side: double; "
         "  public constructor(side: double) Side := side; end constructor; "
         "  public override method Kind(): int return 2; end Kind; "
         "end Square; "
         // Container: owns a Shape field — triggers polymorphic ser/deser.
-        "class Container serialized tree : ISerializable, IDeserializable "
+        "class Container : ISerializable, IDeserializable "
         "  public owned S: Shape; "
         "  public constructor(owned s: Shape) S := move s; end constructor; "
         "end Container; "
@@ -864,17 +864,17 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  : ISerializable, IDeserializable "
         "  public abstract method Kind(): int; "
         "end Shape; "
-        "class Circle serialized tree : Shape, ISerializable, IDeserializable "
+        "class Circle : Shape, ISerializable, IDeserializable "
         "  public property Radius: double; "
         "  public constructor(radius: double) Radius := radius; end constructor; "
         "  public override method Kind(): int return 1; end Kind; "
         "end Circle; "
-        "class Square serialized tree : Shape, ISerializable, IDeserializable "
+        "class Square : Shape, ISerializable, IDeserializable "
         "  public property Side: double; "
         "  public constructor(side: double) Side := side; end constructor; "
         "  public override method Kind(): int return 2; end Kind; "
         "end Square; "
-        "class Container serialized tree : ISerializable, IDeserializable "
+        "class Container : ISerializable, IDeserializable "
         "  public owned S: Shape; "
         "  public constructor(owned s: Shape) S := move s; end constructor; "
         "end Container; "
@@ -922,7 +922,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            deserialized_class_is_owned_spec_9_8_sec28_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Counter serialized tree : ISerializable, IDeserializable "
+        "class Counter : ISerializable, IDeserializable "
         "  public property Count: int; "
         "  public constructor(count: int) Count := count; end constructor; "
         "end Counter; "
@@ -951,7 +951,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            sealed_serialized_tree_class_roundtrip_spec_9_8_sec12) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "sealed class Token serialized tree : ISerializable, IDeserializable "
+        "sealed class Token : ISerializable, IDeserializable "
         "  public property Value: int; "
         "  public constructor(value: int) Value := value; end constructor; "
         "end Token; "
@@ -982,7 +982,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            tree_class_hand_written_serialize_suppresses_synthesis_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Box serialized tree : ISerializable "
+        "class Box : ISerializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         // Hand-written Serialize suppresses synthesis for this direction.
@@ -1048,19 +1048,19 @@ BEZEL_TEST(codegen_serialization_t2_classes,
     BEZEL_EXPECT_EQ(run(
         std::string("module V; ") + kImport +
         // Leaf: fields Tag, N — ctor (tag, n) — same order (control)
-        "class Leaf serialized tree : ISerializable, IDeserializable "
+        "class Leaf : ISerializable, IDeserializable "
         "  public Tag: string := \"\"; "
         "  public N: int := 0; "
         "  public constructor(tag: string, n: int) Tag := tag; N := n; end constructor; "
         "end Leaf; "
         // Mid: fields L, Name — ctor (name, l) — reversed order
-        "class Mid serialized tree : ISerializable, IDeserializable "
+        "class Mid : ISerializable, IDeserializable "
         "  public owned L: Leaf; "
         "  public Name: string := \"\"; "
         "  public constructor(name: string, owned l: Leaf) Name := name; L := move l; end constructor; "
         "end Mid; "
         // Root: fields M, Id — ctor (id, m) — reversed order (the repro shape)
-        "class Root serialized tree : ISerializable, IDeserializable "
+        "class Root : ISerializable, IDeserializable "
         "  public owned M: Mid; "
         "  public Id: int := 0; "
         "  public constructor(id: int, owned m: Mid) Id := id; M := move m; end constructor; "
@@ -1092,7 +1092,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            ctor_params_scrambled_three_fields_roundtrip_spec_9_8_v0136) {
     BEZEL_EXPECT_EQ(run(
         std::string("module V; ") + kImport +
-        "class Triple serialized tree : ISerializable, IDeserializable "
+        "class Triple : ISerializable, IDeserializable "
         "  public A: int := 0; "
         "  public B: string := \"\"; "
         "  public C: int := 0; "
@@ -1126,7 +1126,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            ctor_param_name_no_match_is_compile_error_spec_9_8_v0136) {
     BEZEL_EXPECT_TRUE(compileFails(
         std::string("module V; ") + kImport +
-        "class Foo serialized tree : IDeserializable "
+        "class Foo : IDeserializable "
         "  public V: int := 0; "
         // Param name `x` does not match field name `V` → no ctor matches
         "  public constructor(x: int) V := x; end constructor; "
@@ -1148,7 +1148,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            two_ctors_both_match_is_compile_error_spec_9_8_v0136) {
     BEZEL_EXPECT_TRUE(compileFails(
         std::string("module V; ") + kImport +
-        "class Bar serialized tree : IDeserializable "
+        "class Bar : IDeserializable "
         "  public A: int := 0; "
         "  public B: string := \"\"; "
         "  public constructor(a: int, b: string) A := a; B := b; end constructor; "
@@ -1179,17 +1179,17 @@ namespace {
 const char* kTruncatedInput3Level =
     "module V; "
     "import System.Serialization; "
-    "class Leaf serialized tree : ISerializable, IDeserializable "
+    "class Leaf : ISerializable, IDeserializable "
     "  public Tag: string := \"\"; "
     "  public N: int := 0; "
     "  public constructor(tag: string, n: int) Tag := tag; N := n; end constructor; "
     "end Leaf; "
-    "class Mid serialized tree : ISerializable, IDeserializable "
+    "class Mid : ISerializable, IDeserializable "
     "  public owned L: Leaf; "
     "  public Name: string := \"\"; "
     "  public constructor(name: string, owned l: Leaf) Name := name; L := move l; end constructor; "
     "end Mid; "
-    "class Root serialized tree : ISerializable, IDeserializable "
+    "class Root : ISerializable, IDeserializable "
     "  public owned M: Mid; "
     "  public Id: int := 0; "
     "  public constructor(id: int, owned m: Mid) Id := id; M := move m; end constructor; "

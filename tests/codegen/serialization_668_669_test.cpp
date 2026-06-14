@@ -155,12 +155,12 @@ BEZEL_TEST(codegen_serialization_668,
            missing_required_field_class_raises_spec_9_8_2_15) {
     BEZEL_EXPECT_EQ(run(
         std::string("module V; ") + kImport +
-        "class TwoField serialized tree : ISerializable, IDeserializable "
+        "class TwoField : ISerializable, IDeserializable "
         "  public A: int := 0; "
         "  public B: int := 0; "
         "  public constructor(a: int, b: int) A := a; B := b; end constructor; "
         "end TwoField; "
-        "class ThreeField serialized tree : ISerializable, IDeserializable "
+        "class ThreeField : ISerializable, IDeserializable "
         "  public A: int := 0; "
         "  public B: int := 0; "
         "  public C: int := 0; "
@@ -218,12 +218,12 @@ BEZEL_TEST(codegen_serialization_668,
            missing_optional_field_defaults_not_raises_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module V; ") + kImport +
-        "class Base serialized tree : ISerializable, IDeserializable "
+        "class Base : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Base; "
         // Extended has an extra optional nullable string property (uses property keyword).
-        "class Extended serialized tree : ISerializable, IDeserializable "
+        "class Extended : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public property Note: string? serialized optional; "
         "  public constructor(v: int, note: string?) V := v; Note := note; end constructor; "
@@ -255,12 +255,12 @@ BEZEL_TEST(codegen_serialization_668,
            missing_nullable_required_field_raises_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module V; ") + kImport +
-        "class NoTag serialized tree : ISerializable, IDeserializable "
+        "class NoTag : ISerializable, IDeserializable "
         "  public V: int := 0; "
         "  public constructor(v: int) V := v; end constructor; "
         "end NoTag; "
         // HasTag has an extra required nullable property.
-        "class HasTag serialized tree : ISerializable, IDeserializable "
+        "class HasTag : ISerializable, IDeserializable "
         "  public V: int := 0; "
         "  public Tag: string? := null; "
         "  public constructor(v: int, tag: string?) V := v; Tag := tag; end constructor; "
@@ -302,11 +302,11 @@ BEZEL_TEST(codegen_serialization_669,
            aot_null_nullable_class_field_no_sigsegv_spec_9_8) {
     const std::string src =
         std::string("module M; ") + kImport +
-        "class Child serialized tree : ISerializable, IDeserializable "
+        "class Child : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Child; "
-        "class Parent serialized tree : ISerializable, IDeserializable "
+        "class Parent : ISerializable, IDeserializable "
         "  public property Tag: int; "
         "  public owned OptChild: Child?; "
         "  public constructor(tag: int, owned optChild: Child?) "
@@ -335,11 +335,11 @@ BEZEL_TEST(codegen_serialization_669,
            aot_nonnull_nullable_class_field_roundtrip_spec_9_8) {
     const std::string src =
         std::string("module M; ") + kImport +
-        "class Child serialized tree : ISerializable, IDeserializable "
+        "class Child : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Child; "
-        "class Parent serialized tree : ISerializable, IDeserializable "
+        "class Parent : ISerializable, IDeserializable "
         "  public property Tag: int; "
         "  public owned OptChild: Child?; "
         "  public constructor(tag: int, owned optChild: Child?) "
@@ -368,11 +368,11 @@ BEZEL_TEST(codegen_serialization_669,
            asan_null_nullable_class_field_no_leak_spec_9_8) {
     const std::string src =
         std::string("module M; ") + kImport +
-        "class Child serialized tree : ISerializable, IDeserializable "
+        "class Child : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Child; "
-        "class Parent serialized tree : ISerializable, IDeserializable "
+        "class Parent : ISerializable, IDeserializable "
         "  public property Tag: int; "
         "  public owned OptChild: Child?; "
         "  public constructor(tag: int, owned optChild: Child?) "
@@ -405,11 +405,11 @@ BEZEL_TEST(codegen_serialization_669,
     // Should raise SerializationException (caught → 42), no leak.
     const std::string src =
         std::string("module M; ") + kImport +
-        "class Child serialized tree : ISerializable, IDeserializable "
+        "class Child : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Child; "
-        "class Parent serialized tree : ISerializable, IDeserializable "
+        "class Parent : ISerializable, IDeserializable "
         "  public property Tag: int; "
         "  public owned OptChild: Child?; "
         "  public constructor(tag: int, owned optChild: Child?) "

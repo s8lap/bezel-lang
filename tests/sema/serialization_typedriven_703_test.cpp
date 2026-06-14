@@ -9,12 +9,11 @@
 // back-reference ($ref). The eligibility rule (§9.8) is the structural gate: a
 // component of type `Shared<T>`/`Weak<T>` is serialization-eligible iff T is.
 //
-// Migration sequencing: slices S1–S8 are ADDITIVE — the keyword path
-// (`serialized tree`/`graph`/`cyclic`) stays active (the parser still accepts
-// it) until S9 removes it. These tests therefore exercise the eligibility
-// FUNCTION through the still-active keyword path (a `serialized graph` class
-// with a `Shared<T>`/`Weak<T>` field), which is the smallest vehicle that
-// reaches `isSerializationEligibleType` for those component types.
+// These tests use the KEYWORD-LESS form (`: ISerializable`/`: IDeserializable`,
+// no `serialized` clause) — the v0.141 type-driven form. A sema pre-pass
+// synthesizes the wire shape from field types (graph when a Shared<T>/Weak<T>/
+// borrow component is present, tree otherwise), so these classes reach the
+// Shared/Weak identity codegen without any keyword.
 //
 // SCOPE ISOLATION: a `serialized` clause synthesizes BOTH directions, so the
 // IDeserializable constructor-selection rule (§9.8 v0.136 — every component must
@@ -158,7 +157,7 @@ bool guardedAtCodegen(std::string_view src) {
 
 // An eligible leaf class: a `serialized tree` class with a single int field.
 const char* kEligibleInner =
-    "class Inner serialized tree : ISerializable, IDeserializable "
+    "class Inner : ISerializable, IDeserializable "
     "  public property V: int; "
     "  public constructor(v: int) V := v; end constructor; "
     "end Inner; ";
@@ -261,7 +260,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s1_shared_field_of_eligible_class_accepted_spec_9_8_v0141) {
     BEZEL_EXPECT_TRUE(semaAccepts(
         std::string(kImport) + kEligibleInner +
-        "class Holder serialized graph : ISerializable, IDeserializable "
+        "class Holder : ISerializable, IDeserializable "
         "  public owned Handle: Shared<Inner>; "
         "  public constructor(owned handle: Shared<Inner>) "
         "    Handle := handle; "
@@ -276,7 +275,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s1_shared_field_of_ineligible_class_rejected_spec_9_8_v0141) {
     BEZEL_EXPECT_TRUE(rejectsAsIneligible(
         std::string(kImport) + kPlainInner +
-        "class Holder serialized graph : ISerializable, IDeserializable "
+        "class Holder : ISerializable, IDeserializable "
         "  public owned Handle: Shared<Plain>; "
         "  public constructor(owned handle: Shared<Plain>) "
         "    Handle := handle; "
@@ -295,7 +294,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s1_weak_field_of_eligible_class_accepted_spec_9_8_v0141) {
     BEZEL_EXPECT_TRUE(semaAccepts(
         std::string(kImport) + kEligibleInner +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public Back: Weak<Inner>?; "
         "  public constructor(v: int, back: Weak<Inner>?) "
@@ -311,7 +310,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s1_weak_field_of_ineligible_class_rejected_spec_9_8_v0141) {
     BEZEL_EXPECT_TRUE(rejectsAsIneligible(
         std::string(kImport) + kPlainInner +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public Back: Weak<Plain>?; "
         "  public constructor(v: int, back: Weak<Plain>?) "
@@ -333,7 +332,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s2_weak_component_serialize_codegen_guarded_703) {
     BEZEL_EXPECT_TRUE(guardedAtCodegen(
         std::string(kImport) + kEligibleInner +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public Back: Weak<Inner>?; "
         "  public constructor(v: int, back: Weak<Inner>?) "
@@ -363,7 +362,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s2_shared_field_roundtrip_value_preserved_spec_9_8_v0141) {
     expectLeakFree(
         std::string(kImport) + kEligibleInner +
-        "class Holder serialized graph : ISerializable, IDeserializable "
+        "class Holder : ISerializable, IDeserializable "
         "  public owned Handle: Shared<Inner>; "
         "  public constructor(owned handle: Shared<Inner>) "
         "    Handle := handle; "
@@ -394,7 +393,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s2_shared_alias_identity_preserved_spec_9_8_v0141) {
     expectLeakFree(
         std::string(kImport) + kEligibleInner +
-        "class Pair serialized graph : ISerializable, IDeserializable "
+        "class Pair : ISerializable, IDeserializable "
         "  public owned First: Shared<Inner>; "
         "  public owned Second: Shared<Inner>; "
         "  public constructor(owned first: Shared<Inner>, "
@@ -432,7 +431,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s3_owned_weak_backref_dag_roundtrip_spec_9_8_v0141) {
     expectLeakFree(
         std::string(kImport) + kEligibleInner +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public owned Strong: Shared<Inner>; "
         "  public owned Weakref: Weak<Inner>; "
         "  public constructor(owned strong: Shared<Inner>, "
@@ -467,7 +466,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s4_nullable_shared_present_roundtrip_spec_9_8_v0141) {
     expectLeakFree(
         std::string(kImport) + kEligibleInner +
-        "class Box serialized graph : ISerializable, IDeserializable "
+        "class Box : ISerializable, IDeserializable "
         "  public owned Item: Shared<Inner>?; "
         "  public constructor(owned item: Shared<Inner>?) "
         "    Item := item; "
@@ -494,7 +493,7 @@ BEZEL_TEST(serialization_typedriven_703,
            s4_nullable_shared_null_roundtrip_spec_9_8_v0141) {
     expectLeakFree(
         std::string(kImport) + kEligibleInner +
-        "class Box serialized graph : ISerializable, IDeserializable "
+        "class Box : ISerializable, IDeserializable "
         "  public owned Item: Shared<Inner>?; "
         "  public constructor(owned item: Shared<Inner>?) "
         "    Item := item; "
@@ -563,14 +562,14 @@ BEZEL_TEST(serialization_typedriven_703,
            s5_cyclic_self_weak_back_edge_roundtrip_spec_9_8_v0141) {
     expectLeakFree(
         std::string(kImport) +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public owned Back: Weak<Node>?; "
         "  public constructor(v: int, owned back: Weak<Node>?) "
         "    V := v; Back := back; "
         "  end constructor; "
         "end Node; "
-        "class Holder serialized graph : ISerializable, IDeserializable "
+        "class Holder : ISerializable, IDeserializable "
         "  public owned Root: Shared<Node>; "
         "  public constructor(owned root: Shared<Node>) "
         "    Root := root; "
@@ -603,14 +602,14 @@ BEZEL_TEST(serialization_typedriven_703,
            s5_recursive_shared_type_codegen_guarded_703) {
     BEZEL_EXPECT_TRUE(guardedAtCodegen(
         std::string(kImport) +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public property V: int; "
         "  public owned Next: Shared<Node>?; "
         "  public constructor(v: int, owned next: Shared<Node>?) "
         "    V := v; Next := next; "
         "  end constructor; "
         "end Node; "
-        "class Holder serialized graph : ISerializable, IDeserializable "
+        "class Holder : ISerializable, IDeserializable "
         "  public owned Root: Shared<Node>; "
         "  public constructor(owned root: Shared<Node>) "
         "    Root := root; "

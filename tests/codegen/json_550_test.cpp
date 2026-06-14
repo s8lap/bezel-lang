@@ -355,11 +355,11 @@ BEZEL_TEST(codegen_json_550, nullable_nonnull_roundtrip_spec_2_15) {
 }
 
 // §9.8 / §2.15: tree-class round-trip via JsonSerializer/JsonDeserializer.
-// `serialized tree` clause enables synthesis for the class.
+// Type-driven (v0.141): ISerializable/IDeserializable conformance drives synthesis.
 BEZEL_TEST(codegen_json_550, tree_class_roundtrip_spec_2_15_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Node serialized tree: ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public constructor(val: int) "
         "    this.Val := val; "
         "  end constructor; "
@@ -568,18 +568,18 @@ BEZEL_TEST(codegen_json_550, asan_malformed_json_no_leaks_spec_2_15) {
 // resolves it.  Field names beginning with `$` are reserved.
 // ===========================================================================
 
-// §2.15 v0.139: JSON `serialized graph` diamond round-trip — identity preserved.
+// §2.15 v0.139: JSON graph diamond round-trip — identity preserved.
 // Topology: Diamond owns Node (Shared), borrows the same Node (Alias).
 // After round-trip: mutating Shared.Val through one alias is visible via Alias.
 // Wire must contain "$id" and "$ref" fields (verified separately below).
 BEZEL_TEST(codegen_json_675, graph_diamond_roundtrip_spec_2_15_v0139) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public Val: int := 0; "
         "  public constructor(val: int) Val := val; end constructor; "
         "end Node; "
-        "class Diamond serialized graph : ISerializable, IDeserializable "
+        "class Diamond : ISerializable, IDeserializable "
         "  public owned Shared: Node; "
         "  public Alias: Node?; "
         "  public constructor(owned shared: Node, alias: Node?) "
@@ -607,11 +607,11 @@ BEZEL_TEST(codegen_json_675, graph_diamond_roundtrip_spec_2_15_v0139) {
 BEZEL_TEST(codegen_json_675, graph_wire_text_contains_id_and_ref_spec_2_15_v0139) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public Val: int := 0; "
         "  public constructor(val: int) Val := val; end constructor; "
         "end Node; "
-        "class Hub serialized graph : ISerializable, IDeserializable "
+        "class Hub : ISerializable, IDeserializable "
         "  public owned Target: Node; "
         "  public Alias: Node?; "
         "  public constructor(owned target: Node, alias: Node?) "
@@ -637,11 +637,11 @@ BEZEL_TEST(codegen_json_675, graph_wire_text_contains_id_and_ref_spec_2_15_v0139
 BEZEL_TEST(codegen_json_675, graph_null_back_edge_json_spec_2_15_v0139) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Slot serialized graph : ISerializable, IDeserializable "
+        "class Slot : ISerializable, IDeserializable "
         "  public Name: string := \"\"; "
         "  public constructor(name: string) Name := name; end constructor; "
         "end Slot; "
-        "class Hub serialized graph : ISerializable, IDeserializable "
+        "class Hub : ISerializable, IDeserializable "
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "
         "  public constructor(owned target: Slot, alias: Slot?) "
@@ -688,15 +688,15 @@ BEZEL_TEST(codegen_json_675, graph_json_cycle_raises_spec_2_15_v0139) {
 }
 
 // §2.15 v0.139: tree-mode JSON is UNCHANGED — no $id/$ref fields appear for
-// `serialized tree` classes.  The tree JSON round-trip still returns 42.
+// type-driven (v0.141) tree classes.  The tree JSON round-trip still returns 42.
 BEZEL_TEST(codegen_json_675, tree_json_unchanged_spec_2_15_v0139) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Leaf serialized tree : ISerializable, IDeserializable "
+        "class Leaf : ISerializable, IDeserializable "
         "  public N: int := 0; "
         "  public constructor(n: int) N := n; end constructor; "
         "end Leaf; "
-        "class Root serialized tree : ISerializable, IDeserializable "
+        "class Root : ISerializable, IDeserializable "
         "  public owned L: Leaf; "
         "  public Id: int := 0; "
         "  public constructor(id: int, owned l: Leaf) Id := id; L := move l; end constructor; "
@@ -735,11 +735,11 @@ BEZEL_TEST(codegen_json_675,
            asan_graph_diamond_roundtrip_no_leaks_spec_2_15_v0139) {
     int rc = runUnderLeakSanitizerJson(
         std::string("module M; ") + kImport +
-        "class Node serialized graph : ISerializable, IDeserializable "
+        "class Node : ISerializable, IDeserializable "
         "  public Val: int := 0; "
         "  public constructor(val: int) Val := val; end constructor; "
         "end Node; "
-        "class Diamond serialized graph : ISerializable, IDeserializable "
+        "class Diamond : ISerializable, IDeserializable "
         "  public owned Shared: Node; "
         "  public Alias: Node?; "
         "  public constructor(owned shared: Node, alias: Node?) "

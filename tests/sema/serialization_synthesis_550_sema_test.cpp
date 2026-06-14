@@ -19,12 +19,11 @@
 //   - A field marked `serialized skip` is excluded from the component set,
 //     so it does not disqualify the type even if its type is ineligible.
 //
-// What is NOT (tier 1 — classes without serialized-class clause still rejected):
+// What is NOT (tier 1 — classes without ISerializable/IDeserializable still rejected):
 //   - A positional record with a borrow-bearing (class-typed) field whose
-//     type does not declare a serialized-class clause → ineligible.
-//   - A class type without a `serialized tree`/`graph`/`cyclic` clause
-//     is NOT serialization-eligible (§9.8: "a serialization-eligible
-//     synthesized class" requires the clause).
+//     type does not declare ISerializable/IDeserializable → ineligible.
+//   - A class type without `: ISerializable`/`: IDeserializable` is NOT
+//     serialization-eligible (§9.8: type-driven, v0.141).
 //
 // ISerializable / IDeserializable are auto-imported with System (stdlib §2.14);
 // BinarySerializer/BinaryDeserializer live in System.Serialization (§2.15,
@@ -153,9 +152,9 @@ BEZEL_TEST(sema_serialization_550, body_record_auto_props_eligible_spec_9_8) {
 
 // ─── Ineligible: class-typed field without serialized-class clause ────────────
 
-// §9.8: a positional record with a CLASS-typed field (not a serialized-class)
-// is NOT serialization-eligible. A class without a `serialized tree`/`graph`/
-// `cyclic` clause is not a "serialization-eligible synthesized class" (§9.8).
+// §9.8: a positional record with a CLASS-typed field (not a serializable class)
+// is NOT serialization-eligible. A class without `: ISerializable`/`: IDeserializable`
+// is not a "serialization-eligible synthesized class" (§9.8, type-driven v0.141).
 BEZEL_TEST(sema_serialization_550, positional_record_class_field_ineligible_spec_9_8) {
     auto r = parseSema(
         "module M; "

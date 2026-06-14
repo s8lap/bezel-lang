@@ -60,6 +60,6 @@ public abstract class Shape serialized graph
     : ISerializable, IDeserializable
 end Shape;
 
-public class Circle(radius: double) serialized tree : Shape
+public class Circle(radius: double) : Shape
   public readonly property Radius: double => radius;
 end Circle;

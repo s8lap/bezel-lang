@@ -2278,10 +2278,49 @@ void Resolver::checkSerializationEligibility() {
         bool needsSer   = wantsIS && !hwS;
         bool needsDeser = wantsID && !hwD;
         if (!needsSer && !needsDeser) continue;  // fully hand-written
-        static const std::string kSyntheticGraphShape = "graph";
+
+        // §9.8 v0.141: the wire shape is driven by field types. "graph" when the
+        // class has an identity participant (Shared<T>) or a back-reference
+        // (Weak<T>, or a non-owned class-typed borrow field) — those need the
+        // identity-tag machinery. "tree" otherwise (all owned/value components
+        // serialize inline, which is null-safe for nullable owned children;
+        // graph-mode owned-tagging is not). This matches the legacy keyword
+        // behavior per component kind without a user-written clause.
+        bool needsGraph = false;
+        for (const Symbol* m : t->members) {
+            auto* fs = dynamic_cast<const FieldSymbol*>(m);
+            if (!fs || !fs->decl) continue;
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) continue;
+            bool isStatic = false, isOwned = false;
+            for (auto mod : fd->modifiers) {
+                if (mod == "static") isStatic = true;
+                if (mod == "owned")  isOwned  = true;
+            }
+            if (isStatic) continue;
+            const TypeRef* tr = ctx_.resolvedType(*fd->type);
+            if (!tr) continue;
+            const TypeRef* inner = tr;
+            TypeRef peeled;
+            if (inner->nullable) { peeled = *inner; peeled.nullable = false; inner = &peeled; }
+            if (inner->kind != TypeRef::Kind::Named) continue;
+            // Shared<T>/Weak<T>: builtin Named (declaration null), name in astNode.
+            if (!inner->declaration && inner->astNode && inner->astNode->name &&
+                !inner->astNode->name->parts.empty()) {
+                auto n = inner->astNode->name->parts[0];
+                if (n == "Shared" || n == "Weak") { needsGraph = true; break; }
+            }
+            // Non-owned class-typed field = borrow back-edge.
+            if (inner->declaration &&
+                inner->declaration->kind == ast::TypeDeclKind::Class && !isOwned) {
+                needsGraph = true; break;
+            }
+        }
+        static const std::string kGraphShape = "graph";
+        static const std::string kTreeShape  = "tree";
         auto* mutTd = const_cast<ast::TypeDecl*>(td);
         mutTd->serializedClass = std::make_unique<ast::SerializedClassClause>();
-        mutTd->serializedClass->shape = kSyntheticGraphShape;
+        mutTd->serializedClass->shape = needsGraph ? kGraphShape : kTreeShape;
     }
 
     for (Symbol* child : ctx_.module()->children) {

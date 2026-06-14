@@ -55,7 +55,7 @@ end ISerializable;
 public interface IDeserializable
 end IDeserializable;
 
-public class Invoice(number: string) serialized graph : ISerializable, IDeserializable
+public class Invoice(number: string) : ISerializable, IDeserializable
   public owned Seller: Company;           // owned: in the owning spanning tree
   public owned Buyer: Company;            // owned
   public AccountManager: Employee;        // borrow: a back-edge, e.g. an
