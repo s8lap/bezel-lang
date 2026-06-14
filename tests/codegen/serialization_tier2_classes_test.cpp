@@ -813,9 +813,8 @@ BEZEL_TEST(codegen_serialization_t2_classes,
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
         // Shape: abstract polymorphic base.
-        "abstract class Shape serialized graph "
-        "  polymorphic(\"circle\": Circle, \"square\": Square) "
-        "  : ISerializable, IDeserializable "
+        "abstract class Shape : ISerializable, IDeserializable "
+        "  polymorphic(\"circle\": Circle, \"square\": Square); "
         "  public abstract method Kind(): int; "
         "end Shape; "
         // Circle: concrete subtype of Shape; re-declares ISerializable for synthesis.
@@ -857,9 +856,8 @@ BEZEL_TEST(codegen_serialization_t2_classes,
     // §9.8 tier 4: polymorphic discriminator dispatch — Square branch.
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "abstract class Shape serialized graph "
-        "  polymorphic(\"circle\": Circle, \"square\": Square) "
-        "  : ISerializable, IDeserializable "
+        "abstract class Shape : ISerializable, IDeserializable "
+        "  polymorphic(\"circle\": Circle, \"square\": Square); "
         "  public abstract method Kind(): int; "
         "end Shape; "
         "class Circle : Shape, ISerializable, IDeserializable "
@@ -899,9 +897,8 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "class BadChild "
         "  public constructor() end constructor; "
         "end BadChild; "
-        "class Base serialized graph "
-        "  polymorphic(\"bad\": BadChild) "
-        "  : ISerializable, IDeserializable "
+        "class Base : ISerializable, IDeserializable "
+        "  polymorphic(\"bad\": BadChild); "
         "end Base; "
         "class C public static method Main(): int return 0; end Main; end C;"));
 }

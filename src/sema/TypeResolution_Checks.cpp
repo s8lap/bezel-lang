@@ -2269,7 +2269,12 @@ void Resolver::checkSerializationEligibility() {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Class) continue;
         auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
-        if (!td || td->serializedClass) continue;  // real keyword clause: leave it
+        if (!td) continue;
+        // A clause with a shape already set (a real keyword clause during the
+        // additive transition) is left alone. A clause with only polyCases (set
+        // by the `polymorphic` member clause, no shape) still needs its shape
+        // derived below.
+        if (td->serializedClass && !td->serializedClass->shape.empty()) continue;
         bool wantsIS = declaredConformance(*td, "ISerializable");
         bool wantsID = declaredConformance(*td, "IDeserializable");
         if (!wantsIS && !wantsID) continue;
@@ -2286,7 +2291,9 @@ void Resolver::checkSerializationEligibility() {
         // serialize inline, which is null-safe for nullable owned children;
         // graph-mode owned-tagging is not). This matches the legacy keyword
         // behavior per component kind without a user-written clause.
-        bool needsGraph = false;
+        // A polymorphic registry (P6 member clause) also implies the graph shape.
+        bool needsGraph = td->serializedClass &&
+                          !td->serializedClass->polyCases.empty();
         for (const Symbol* m : t->members) {
             auto* fs = dynamic_cast<const FieldSymbol*>(m);
             if (!fs || !fs->decl) continue;
@@ -2319,7 +2326,11 @@ void Resolver::checkSerializationEligibility() {
         static const std::string kGraphShape = "graph";
         static const std::string kTreeShape  = "tree";
         auto* mutTd = const_cast<ast::TypeDecl*>(td);
-        mutTd->serializedClass = std::make_unique<ast::SerializedClassClause>();
+        if (!mutTd->serializedClass) {
+            // No clause yet (no `polymorphic` member): synthesize one.
+            mutTd->serializedClass = std::make_unique<ast::SerializedClassClause>();
+        }
+        // Set the derived shape (the member clause leaves it empty).
         mutTd->serializedClass->shape = needsGraph ? kGraphShape : kTreeShape;
     }
 

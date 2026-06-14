@@ -153,6 +153,9 @@ private:
     // follows: tree/graph/cyclic vs. skip/string/optional. Used by
     // parseTypeOrInterfaceDecl on the class/record path.
     std::unique_ptr<ast::SerializedClassClause> parseSerializedClassClause();
+    // §9.8 v0.141 (P6): class-body `polymorphic("disc": Type, ...);` member
+    // clause — populates decl.serializedClass->polyCases.
+    void parsePolymorphicMember(ast::TypeDecl& decl);
     // Slice 36: peeks the matching `)` for the `(` at peekAt(startK) and
     // returns true iff a `=>` follows. Used to distinguish
     // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.

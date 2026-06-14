@@ -314,6 +314,16 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                decl->kind == ast::TypeDeclKind::Record) {
         while (!isKeyword("end") &&
                current_.kind != TokenKind::EndOfFile) {
+            // §9.8 v0.141 (P6): class-body `polymorphic("disc": Type, ...);`
+            // member clause declares the serialization polymorphic registry.
+            // `polymorphic` is contextual: only a member clause when followed by
+            // `(` (otherwise it is an ordinary identifier, e.g. a field name).
+            if (current_.kind == TokenKind::Identifier &&
+                current_.text == "polymorphic" &&
+                peekAt(1).text == "(") {
+                parsePolymorphicMember(*decl);
+                continue;
+            }
             auto member = parseMember();
             if (member) {
                 decl->members.push_back(std::move(member));
@@ -1498,6 +1508,57 @@ Parser::parseSerializedClassClause() {
         }
     }
     return scc;
+}
+
+// §9.8 v0.141 (P6): class-body member clause
+//   `polymorphic ( "disc" : Type ("," "disc" : Type)* ) ;`
+// Declares the serialization polymorphic registry on the class. Populates
+// decl.serializedClass->polyCases (creating the clause if absent); the wire
+// shape is derived later by the sema synthesis pre-pass (a registry implies the
+// graph shape). Sema/codegen read polyCases identically to the retired header
+// `polymorphic(...)` clause, so no sema/codegen change is needed.
+void Parser::parsePolymorphicMember(ast::TypeDecl& decl) {
+    advance();  // past `polymorphic`
+    if (!consumePunctuator("(")) {
+        diagnostics_.report(Severity::Error, current_.location,
+            "expected '(' to begin `polymorphic` member registry");
+    }
+    if (!decl.serializedClass) {
+        decl.serializedClass = std::make_unique<ast::SerializedClassClause>();
+    }
+    auto parseOne = [&]() {
+        ast::PolyCase pc;
+        if (current_.kind != TokenKind::StringLiteral) {
+            diagnostics_.report(Severity::Error, current_.location,
+                "expected discriminator string in `polymorphic` case");
+        } else {
+            std::string_view txt = current_.text;
+            if (txt.size() >= 2 && txt.front() == '"' && txt.back() == '"') {
+                pc.discriminator = txt.substr(1, txt.size() - 2);
+            } else {
+                pc.discriminator = txt;
+            }
+            advance();
+        }
+        if (!consumePunctuator(":")) {
+            diagnostics_.report(Severity::Error, current_.location,
+                "expected ':' between `polymorphic` discriminator and type");
+        }
+        pc.type = parseType();
+        return pc;
+    };
+    decl.serializedClass->polyCases.push_back(parseOne());
+    while (consumePunctuator(",")) {
+        decl.serializedClass->polyCases.push_back(parseOne());
+    }
+    if (!consumePunctuator(")")) {
+        diagnostics_.report(Severity::Error, current_.location,
+            "expected ')' to close `polymorphic` member registry");
+    }
+    if (!consumePunctuator(";")) {
+        diagnostics_.report(Severity::Error, current_.location,
+            "expected ';' after the `polymorphic` member clause");
+    }
 }
 
 
