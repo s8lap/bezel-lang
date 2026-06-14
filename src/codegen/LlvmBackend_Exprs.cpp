@@ -182,6 +182,41 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     phi->addIncoming(vStr, valEnd);
                     phi->addIncoming(nStr, nullEnd);
                     pv = phi;
+                } else if (rt && isNullableRefTy(rt) &&
+                           ev->getType()->isPointerTy()) {
+                    // R35: a nullable REFERENCE part (`string?`, `Object?`,
+                    // nullable class/interface) is a plain ptr with a real null.
+                    // Interpolating null must render the literal "null", not
+                    // dereference it (the `string?` path fell into the Primitive
+                    // branch below and emitPrimitiveToString read a null string's
+                    // header → SIGSEGV; a `class?` reached the ToString path and
+                    // called a method on null). Mirror emitValueToString's
+                    // null-ref handling: null → "null"; non-null → format by the
+                    // non-nullable rule.
+                    llvm::Value* isNull = builder_.CreateICmpEQ(
+                        ev, llvm::ConstantPointerNull::get(ptrTy()), "ip.null");
+                    auto* liveBB =
+                        llvm::BasicBlock::Create(llvm_, "ip.live", currentFn_);
+                    auto* nullBB =
+                        llvm::BasicBlock::Create(llvm_, "ip.nullstr", currentFn_);
+                    auto* endBB =
+                        llvm::BasicBlock::Create(llvm_, "ip.end", currentFn_);
+                    builder_.CreateCondBr(isNull, nullBB, liveBB);
+                    builder_.SetInsertPoint(liveBB);
+                    sema::TypeRef liveTy = *rt;
+                    liveTy.nullable = false;
+                    llvm::Value* liveStr = emitValueToString(ev, &liveTy);
+                    auto* liveEnd = builder_.GetInsertBlock();
+                    builder_.CreateBr(endBB);
+                    builder_.SetInsertPoint(nullBB);
+                    llvm::Value* nullStr = lowerStringLiteral("\"null\"", false);
+                    auto* nullEnd = builder_.GetInsertBlock();
+                    builder_.CreateBr(endBB);
+                    builder_.SetInsertPoint(endBB);
+                    auto* phi = builder_.CreatePHI(ptrTy(), 2);
+                    phi->addIncoming(liveStr, liveEnd);
+                    phi->addIncoming(nullStr, nullEnd);
+                    pv = phi;
                 } else if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
                     pv = emitPrimitiveToString(ev, rt->primitive);
                 } else if (rt && rt->kind == sema::TypeRef::Kind::Named &&

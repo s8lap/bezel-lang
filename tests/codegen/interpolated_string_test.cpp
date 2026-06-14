@@ -104,4 +104,39 @@ BEZEL_TEST(codegen_cg27d, interpolated_concat) {
         "end Main; end C;"), 5);  // "(3,4)" has length 5
 }
 
+// R35 / §18 / §8.3: interpolating a NULL `string?` renders the literal "null"
+// (the same rendering nullable value types use), NOT a SIGSEGV from
+// dereferencing the null. Previously crashed (the `string?` part fell into the
+// primitive-ToString path on a null pointer).
+BEZEL_TEST(codegen_cg27d, null_nullable_string_renders_null_r35) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := null; "
+        "  var result := $\"val={s}\"; "
+        "  return (1 if result = \"val=null\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// R35: a non-null `string?` interpolates its value normally.
+BEZEL_TEST(codegen_cg27d, nonnull_nullable_string_renders_value_r35) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := \"hi\"; "
+        "  var r := $\"v={s}\"; "
+        "  return (1 if r = \"v=hi\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// R35: interpolating a NULL nullable CLASS reference also renders "null"
+// (was a SIGSEGV from calling ToString on null). "x=null" has length 6.
+BEZEL_TEST(codegen_cg27d, null_nullable_class_renders_null_r35) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Simple end Simple; "
+        "class C public static method Main(): int "
+        "  var x: Simple? := null; "
+        "  var s := $\"x={x}\"; "
+        "  return s.Length; "
+        "end Main; end C;"), 6);
+}
+
 }  // namespace
