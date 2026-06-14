@@ -340,3 +340,44 @@ BEZEL_TEST(serialization_typedriven_703,
         "end Main; end C;",
         84);
 }
+
+// ===========================================================================
+// S3: owned Weak<class> back-reference round-trip (DAG, §9.8 v0.141, #703)
+// ===========================================================================
+
+// §9.8 v0.141: a class with an owned Shared<Inner> participant AND an owned
+// Weak<Inner> back-reference to the SAME value. On serialize the Shared writes
+// inline+$id and the Weak writes $ref to that tag (keyed on bz_shared_get). On
+// deserialize the Shared constructs+wraps+registers the handle and the Weak
+// resolves the tag and bz_shared_downgrade's it — so the deserialized Weak
+// upgrades back to the same live Inner. Returns Strong.V + upgraded-weak.V (84),
+// proving the weak resolved to the right object; disposal is leak-free (the weak
+// release + strong release balance to one disposal of the deserialized Inner).
+BEZEL_TEST(serialization_typedriven_703,
+           s3_owned_weak_backref_dag_roundtrip_spec_9_8_v0141) {
+    expectLeakFree(
+        std::string(kImport) + kEligibleInner +
+        "class Node serialized graph : ISerializable, IDeserializable "
+        "  public owned Strong: Shared<Inner>; "
+        "  public owned Weakref: Weak<Inner>; "
+        "  public constructor(owned strong: Shared<Inner>, "
+        "                     owned weakref: Weak<Inner>) "
+        "    Strong := strong; Weakref := weakref; "
+        "  end constructor; "
+        "end Node; "
+        "class C public static method Main(): int "
+        "  var inner := new Inner(42); "
+        "  using var sh := new Shared<Inner>(inner); "
+        "  using var n := new Node(sh.Clone(), sh.Downgrade()); "
+        "  using var s := new BinarySerializer(); "
+        "  n.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var n2 := Node.Deserialize(d); "
+        "  if n2.Weakref.TryUpgrade(out using var up) then "
+        "    return n2.Strong.Get().V + up.Get().V; "
+        "  end; "
+        "  return -1; "
+        "end Main; end C;",
+        84);
+}

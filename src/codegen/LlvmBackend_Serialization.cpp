@@ -237,6 +237,46 @@ static const TypeSymbol* handledSharedElementClass(const sema::TypeRef* tr) {
     return el->declaration;
 }
 
+// §9.8 v0.141 / #703 slice S3: if `tr` is a Weak<C> component whose element C is
+// a serialization-eligible class, return C's TypeSymbol; else nullptr. Weak<C>
+// is a back-reference: it serializes as a $ref to the tag of the Shared<C>
+// participant that owns C, and on deserialize it bz_shared_downgrade's that
+// participant's handle. Nullable Weak<C>? is allowed (a null weak writes null).
+// The FIELD must additionally be `owned` for the weak count to be released on
+// disposal (checked at the call site via comp.isOwned).
+static const TypeSymbol* handledWeakElementClass(const sema::TypeRef* tr) {
+    if (!tr) return nullptr;
+    const sema::TypeRef* t = tr;
+    sema::TypeRef peeled;
+    if (t->nullable) { peeled = *t; peeled.nullable = false; t = &peeled; }
+    if (t->kind != sema::TypeRef::Kind::Named || t->declaration) return nullptr;
+    std::string_view name;
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        name = t->astNode->name->parts[0];
+    else if (!t->importedName.empty())
+        name = t->importedName;
+    if (name != "Weak") return nullptr;
+    if (t->genericArgs.empty() || !t->genericArgs[0]) return nullptr;
+    const sema::TypeRef* el = t->genericArgs[0];
+    if (el->kind != sema::TypeRef::Kind::Named || !el->declaration) return nullptr;
+    if (el->declaration->kind != ast::TypeDeclKind::Class) return nullptr;
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(el->declaration->decl);
+    if (!td || !td->serializedClass) return nullptr;
+    return el->declaration;
+}
+
+// §9.8 v0.141 / #703: is `comp` a Shared/Weak component whose type-driven wire
+// codegen IS implemented (so the guard should NOT fire for it)? Shared<class>
+// (non-nullable) and `owned` Weak<class> are handled; everything else Shared/Weak
+// (nullable Shared?, Shared<non-class>, non-owned Weak, Weak<non-class>) is not.
+static bool isHandledTypeDrivenComponent(const ClassComponent& comp,
+                                         bool isGraphMode) {
+    if (!isGraphMode) return false;
+    if (handledSharedElementClass(comp.ty)) return true;
+    if (comp.isOwned && handledWeakElementClass(comp.ty)) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Emitter::emitRecordSerialize
 //
@@ -1424,7 +1464,7 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
     for (const auto& comp : comps) {
         if (comp.isSkip) continue;
         if (isSharedOrWeakComponentType(comp.ty) &&
-            !(isGraphMode && handledSharedElementClass(comp.ty))) {
+            !isHandledTypeDrivenComponent(comp, isGraphMode)) {
             ctx_.diagnostics().report(
                 Severity::Error, ts->declLoc,
                 "class `" + std::string(ts->name) + "`: serialization of this "
@@ -1648,6 +1688,65 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
                 builder_.SetInsertPoint(shDoneBB);
                 continue;
             }
+            // §9.8 v0.141 / #703 slice S3: owned Weak<C> back-reference. Write a
+            // $ref to the tag of the Shared<C> participant that owns the same
+            // value (keyed on bz_shared_get of the weak handle). A null weak —
+            // or one whose target was not serialized as a participant (untagged)
+            // — writes the null marker (read back as a null weak; the strict P5
+            // ordering backstop, throw-on-untagged, is a refinement deferred to a
+            // later slice).
+            if (comp.isOwned && handledWeakElementClass(fty)) {
+                llvm::Value* wh =
+                    builder_.CreateLoad(ptrTy(), fieldPtr, "cser.wk.h");
+                llvm::Value* nameStr = lowerStringLiteral(
+                    "\"" + comp.wireName + "\"", false);
+                auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
+                                             {ptrTy(), ptrTy()});
+                builder_.CreateCall(writeNameFn, {serPtr, nameStr});
+                auto* writeNullFn =
+                    declareC("bz_binser_write_null", voidTy, {ptrTy()});
+                llvm::Value* whNull = builder_.CreateICmpEQ(
+                    wh, llvm::ConstantPointerNull::get(ptrTy()), "cser.wk.isnull");
+                auto* wkNullBB =
+                    llvm::BasicBlock::Create(llvm_, "cser.wk.null", currentFn_);
+                auto* wkLiveBB =
+                    llvm::BasicBlock::Create(llvm_, "cser.wk.live", currentFn_);
+                auto* wkDoneBB =
+                    llvm::BasicBlock::Create(llvm_, "cser.wk.done", currentFn_);
+                builder_.CreateCondBr(whNull, wkNullBB, wkLiveBB);
+                // Null weak.
+                builder_.SetInsertPoint(wkNullBB);
+                builder_.CreateCall(writeNullFn, {serPtr});
+                builder_.CreateBr(wkDoneBB);
+                // Live weak: look up the participant tag of its value.
+                builder_.SetInsertPoint(wkLiveBB);
+                {
+                    auto* getFn = declareC("bz_shared_get", ptrTy(), {ptrTy()});
+                    llvm::Value* wv =
+                        builder_.CreateCall(getFn, {wh}, "cser.wk.val");
+                    auto* getTagFn = declareC("bz_binser_graph_get_tag", i32(),
+                                              {ptrTy(), ptrTy()});
+                    llvm::Value* wtag = builder_.CreateCall(
+                        getTagFn, {serPtr, wv}, "cser.wk.tag");
+                    llvm::Value* untagged = builder_.CreateICmpEQ(
+                        wtag, builder_.getInt32(0), "cser.wk.untagged");
+                    auto* wkUntagBB = llvm::BasicBlock::Create(
+                        llvm_, "cser.wk.untag", currentFn_);
+                    auto* wkRefBB = llvm::BasicBlock::Create(
+                        llvm_, "cser.wk.ref", currentFn_);
+                    builder_.CreateCondBr(untagged, wkUntagBB, wkRefBB);
+                    builder_.SetInsertPoint(wkUntagBB);
+                    builder_.CreateCall(writeNullFn, {serPtr});
+                    builder_.CreateBr(wkDoneBB);
+                    builder_.SetInsertPoint(wkRefBB);
+                    auto* writeRefFn = declareC("bz_binser_write_ref_tag", voidTy,
+                                                {ptrTy(), i32()});
+                    builder_.CreateCall(writeRefFn, {serPtr, wtag});
+                    builder_.CreateBr(wkDoneBB);
+                }
+                builder_.SetInsertPoint(wkDoneBB);
+                continue;
+            }
         }
 
         // Handle `serialized optional`: on write, omit null nullable fields.
@@ -1784,7 +1883,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     for (const auto& comp : comps) {
         if (comp.isSkip) continue;
         if (isSharedOrWeakComponentType(comp.ty) &&
-            !(isGraphMode && handledSharedElementClass(comp.ty))) {
+            !isHandledTypeDrivenComponent(comp, isGraphMode)) {
             ctx_.diagnostics().report(
                 Severity::Error, ts->declLoc,
                 "class `" + std::string(ts->name) + "`: deserialization of this "
@@ -2082,6 +2181,69 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 shPhi->addIncoming(inlHandle, inlEndBB);
                 shPhi->addIncoming(refHandle, refEndBB);
                 fv = shPhi;
+            } else if (const TypeSymbol* wElemTs =
+                           (isGraphMode && comp.isOwned)
+                               ? handledWeakElementClass(comp.ty) : nullptr) {
+                // §9.8 v0.141 / #703 slice S3: owned Weak<C> back-reference.
+                // A null marker → null weak. A $ref → resolve the participant
+                // handle and bz_shared_downgrade it (weak count +1; the field's
+                // disposal releases it via bz_weak_release). A null resolve means
+                // the tag is in-progress (a cycle) or unknown — not handled by
+                // the DAG slice → SerializationException.
+                (void)wElemTs;
+                auto* tryNullFn = declareC("bz_binder_try_read_null", i8(), {ptrTy()});
+                llvm::Value* wasNull =
+                    builder_.CreateCall(tryNullFn, {derPtr}, "cdeser.wk.wasnull");
+                llvm::Value* wasNullB = builder_.CreateICmpNE(
+                    wasNull, builder_.getInt8(0), "cdeser.wk.isnull");
+                auto* wkNullBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.wk.null", currentFn_);
+                auto* wkRefBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.wk.ref", currentFn_);
+                auto* wkMrgBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.wk.mrg", currentFn_);
+                builder_.CreateCondBr(wasNullB, wkNullBB, wkRefBB);
+                builder_.SetInsertPoint(wkNullBB);
+                llvm::BasicBlock* wkNullEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(wkMrgBB);
+                builder_.SetInsertPoint(wkRefBB);
+                llvm::AllocaInst* wkTagSlot = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt32(0), wkTagSlot);
+                auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
+                                              i32(), {ptrTy(), ptrTy()});
+                builder_.CreateCall(readMarkerFn, {derPtr, wkTagSlot});
+                llvm::Value* wkTag =
+                    builder_.CreateLoad(i32(), wkTagSlot, "cdeser.wk.tag");
+                auto* wkResolveFn = declareC("bz_binder_graph_resolve_tag",
+                                             ptrTy(), {ptrTy(), i32()});
+                llvm::Value* wkResolved = builder_.CreateCall(
+                    wkResolveFn, {derPtr, wkTag}, "cdeser.wk.res");
+                llvm::Value* wkNullR = builder_.CreateICmpEQ(
+                    wkResolved, llvm::ConstantPointerNull::get(ptrTy()),
+                    "cdeser.wk.resnull");
+                auto* wkCycBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.wk.cyc", currentFn_);
+                auto* wkOkBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.wk.ok", currentFn_);
+                builder_.CreateCondBr(wkNullR, wkCycBB, wkOkBB);
+                builder_.SetInsertPoint(wkCycBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(wkOkBB);
+                auto* downFn =
+                    declareC("bz_shared_downgrade", ptrTy(), {ptrTy()});
+                llvm::Value* wkHandle = builder_.CreateCall(
+                    downFn, {wkResolved}, "cdeser.wk.down");
+                llvm::BasicBlock* wkOkEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(wkMrgBB);
+                builder_.SetInsertPoint(wkMrgBB);
+                llvm::PHINode* wkPhi =
+                    builder_.CreatePHI(ptrTy(), 2, "cdeser.wk.fv");
+                wkPhi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()),
+                                   wkNullEnd);
+                wkPhi->addIncoming(wkHandle, wkOkEnd);
+                fv = wkPhi;
             } else if (isGraphMode && comp.isBackEdge && isClassComp) {
                 // §9.8 tier 3: back-edge field.
                 // The wire format for a back-edge is one of:
