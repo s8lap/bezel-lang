@@ -3009,6 +3009,19 @@ void* bz_shared_new(void* value, void (*dispose_value)(void*)) {
     return (void*)cb;
 }
 
+// §9.8 v0.141 / #703: fill the value of a Shared control block created as a
+// placeholder (bz_shared_new(nullptr, disposer)). Used by CYCLIC deserialization:
+// the handle is registered under its identity tag BEFORE its object body exists,
+// so a Weak back-reference (or Shared alias) encountered while constructing that
+// body can resolve and bz_shared_downgrade / bz_shared_clone it. Once the body is
+// constructed this sets the value. The caller guarantees the value is set before
+// any release, so the disposer never runs on a null value.
+extern "C" void bz_shared_set_value(void* handle, void* value) {
+    bz_shared_t* cb = (bz_shared_t*)handle;
+    if (!cb) return;
+    cb->value = value;
+}
+
 // Increment the strong count and return the same handle (a new alias). §28.13 Clone.
 // per #689 / §28.13 v0.140: atomic fetch_add with acq_rel so a cross-domain
 // clone sees a consistent strong count.

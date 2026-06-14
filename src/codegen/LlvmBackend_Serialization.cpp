@@ -2176,21 +2176,29 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 auto* shRefBB =
                     llvm::BasicBlock::Create(llvm_, "cdeser.sh.ref", currentFn_);
                 builder_.CreateCondBr(isInline, shInlBB, shRefBB);
-                // Inline: mark in-progress, construct element, wrap, register.
+                // Inline (slice S5, cyclic-safe): create a PLACEHOLDER handle
+                // (value=null) and register it under the tag BEFORE constructing
+                // the element body, so a Weak back-reference (or Shared alias)
+                // encountered while building that body resolves and downgrades/
+                // clones THIS handle (closing cycles). Then construct the body and
+                // fill the value (bz_shared_set_value). For acyclic data this is
+                // equivalent to the earlier construct-then-wrap order.
                 builder_.SetInsertPoint(shInlBB);
-                auto* markFn = declareC("bz_binder_graph_mark_in_progress",
-                                        voidTy, {ptrTy(), i32()});
-                builder_.CreateCall(markFn, {derPtr, tagId});
-                llvm::Value* childVal = emitClassDeserialize(shElemTs, derPtr);
                 auto* newShFn =
                     declareC("bz_shared_new", ptrTy(), {ptrTy(), ptrTy()});
                 llvm::Value* dispArg =
                     llvm::cast<llvm::Value>(elementDisposerThunk());
                 llvm::Value* inlHandle = builder_.CreateCall(
-                    newShFn, {childVal, dispArg}, "cdeser.sh.new");
+                    newShFn,
+                    {llvm::ConstantPointerNull::get(ptrTy()), dispArg},
+                    "cdeser.sh.placeholder");
                 auto* regFn = declareC("bz_binder_graph_register_tag",
                                        voidTy, {ptrTy(), i32(), ptrTy()});
                 builder_.CreateCall(regFn, {derPtr, tagId, inlHandle});
+                llvm::Value* childVal = emitClassDeserialize(shElemTs, derPtr);
+                auto* setValFn = declareC("bz_shared_set_value", voidTy,
+                                          {ptrTy(), ptrTy()});
+                builder_.CreateCall(setValFn, {inlHandle, childVal});
                 llvm::BasicBlock* inlEndBB = builder_.GetInsertBlock();
                 builder_.CreateBr(shMrgBB);
                 // Ref: resolve handle (null → cycle/unknown → throw), clone it.

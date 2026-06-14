@@ -470,3 +470,51 @@ BEZEL_TEST(serialization_typedriven_703,
     int lsan = runUnderLeakSanitizer(src);
     BEZEL_EXPECT_EQ(lsan, 0);
 }
+
+// ===========================================================================
+// S5: CYCLIC round-trip — Shared spine + Weak self-back-edge (§9.8 v0.141, #703)
+// ===========================================================================
+
+// §9.8 v0.141 — the headline cyclic capability. A Node is a Shared participant
+// (reached via Holder.Root) and holds a Weak<Node> back-edge to ITSELF. On
+// serialize the participant's tag is assigned before its body, so the weak-back
+// inside the body writes a $ref to that tag. On deserialize the placeholder
+// handle is registered under the tag BEFORE the body is constructed, so the
+// weak-back resolves it (in-progress) and downgrades it; the value is filled
+// after construction (bz_shared_set_value). The reconstructed node's weak-back
+// therefore upgrades to the node itself (42 + 42 = 84). Disposal of the
+// sole-owned cycle is leak-free thanks to the bz_shared_release temp-weak fix.
+BEZEL_TEST(serialization_typedriven_703,
+           s5_cyclic_self_weak_back_edge_roundtrip_spec_9_8_v0141) {
+    expectLeakFree(
+        std::string(kImport) +
+        "class Node serialized graph : ISerializable, IDeserializable "
+        "  public property V: int; "
+        "  public owned Back: Weak<Node>?; "
+        "  public constructor(v: int, owned back: Weak<Node>?) "
+        "    V := v; Back := back; "
+        "  end constructor; "
+        "end Node; "
+        "class Holder serialized graph : ISerializable, IDeserializable "
+        "  public owned Root: Shared<Node>; "
+        "  public constructor(owned root: Shared<Node>) "
+        "    Root := root; "
+        "  end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  var node := new Node(42, null); "
+        "  using var sh := new Shared<Node>(node); "
+        "  sh.Get().Back := sh.Downgrade(); "
+        "  using var holder := new Holder(sh.Clone()); "
+        "  using var s := new BinarySerializer(); "
+        "  holder.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var holder2 := Holder.Deserialize(d); "
+        "  if holder2.Root.Get().Back!.TryUpgrade(out using var up) then "
+        "    return holder2.Root.Get().V + up.Get().V; "
+        "  end; "
+        "  return -1; "
+        "end Main; end C;",
+        84);
+}
