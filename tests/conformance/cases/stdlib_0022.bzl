@@ -55,9 +55,8 @@ end ISerializable;
 public interface IDeserializable
 end IDeserializable;
 
-public abstract class Shape serialized graph
-    polymorphic ("circle": Circle, "square": Square)
-    : ISerializable, IDeserializable
+public abstract class Shape : ISerializable, IDeserializable
+  polymorphic("circle": Circle, "square": Square);
 end Shape;
 
 public class Circle(radius: double) : Shape

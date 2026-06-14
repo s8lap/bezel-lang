@@ -119,9 +119,9 @@ const char* kImport = "import System.Serialization; ";
 
 // Shared hierarchy used by several tests:
 //
-//   Shape — abstract polymorphic base (`abstract serialized graph polymorphic`)
-//   Circle : Shape — `serialized tree`, Radius: double, Kind() → 1
-//   Square : Shape — `serialized tree`, Side: double,   Kind() → 2
+//   Shape — abstract polymorphic base (`: ISerializable` with `polymorphic` member clause)
+//   Circle : Shape — Radius: double, Kind() → 1
+//   Square : Shape — Side: double,   Kind() → 2
 //
 // Shape is `abstract` (cannot be instantiated; no constructor on Shape itself).
 // Shape.Kind() is abstract; each concrete subtype overrides it.
@@ -129,8 +129,8 @@ const char* kImport = "import System.Serialization; ";
 //
 // §9.8: "each named type must be assignable to the declaring class" — Circle
 // and Square both inherit from Shape, satisfying this requirement.
-// §9.8: "each registered type must itself carry a graph-shape clause" — both
-// have `serialized tree`.
+// §9.8: "each registered type must itself carry a serialization eligibility
+// clause" — both Circle and Square carry `: ISerializable, IDeserializable`.
 // §9.8: "The declaring base class may be abstract (it registers none for
 // itself; an input discriminator naming the base is then a SerializationException)."
 //
@@ -139,17 +139,16 @@ const char* kImport = "import System.Serialization; ";
 // (ISerializable is inherited from Shape, but explicit re-declaration is
 // needed for synthesis recognition in the current implementation.)
 const char* kHierarchy =
-    "abstract class Shape serialized graph "
-    "  polymorphic(\"circle\": Circle, \"square\": Square) "
-    "  : ISerializable, IDeserializable "
+    "abstract class Shape : ISerializable, IDeserializable "
+    "  polymorphic(\"circle\": Circle, \"square\": Square); "
     "  public abstract method Kind(): int; "
     "end Shape; "
-    "class Circle serialized tree : Shape, ISerializable, IDeserializable "
+    "class Circle : Shape, ISerializable, IDeserializable "
     "  public property Radius: double; "
     "  public constructor(radius: double) Radius := radius; end constructor; "
     "  public override method Kind(): int return 1; end Kind; "
     "end Circle; "
-    "class Square serialized tree : Shape, ISerializable, IDeserializable "
+    "class Square : Shape, ISerializable, IDeserializable "
     "  public property Side: double; "
     "  public constructor(side: double) Side := side; end constructor; "
     "  public override method Kind(): int return 2; end Kind; "
@@ -170,7 +169,7 @@ const char* kHierarchy =
 // Note: Shape is abstract, so Container.S must be passed as an owned Circle
 // or Square argument to the constructor.
 const char* kContainer =
-    "class Container serialized tree : ISerializable, IDeserializable "
+    "class Container : ISerializable, IDeserializable "
     "  public owned S: Shape; "
     "  public constructor(owned s: Shape) S := move s; end constructor; "
     "end Container; ";
@@ -267,7 +266,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport + kHierarchy +
         // Container owns a Shape field (polymorphic — concrete is Circle or Square).
-        "class Container serialized tree : ISerializable, IDeserializable "
+        "class Container : ISerializable, IDeserializable "
         "  public owned S: Shape; "
         "  public Tag: int; "
         "  public constructor(owned s: Shape, tag: int) "
@@ -303,7 +302,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport + kHierarchy + kContainer +
         // Rogue extends Shape but is not in the registry.
-        "class Rogue serialized tree : Shape, ISerializable, IDeserializable "
+        "class Rogue : Shape, ISerializable, IDeserializable "
         "  public constructor() end constructor; "
         "  public override method Kind(): int return 99; end Kind; "
         "end Rogue; "
@@ -389,7 +388,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
 // body."
 // ===========================================================================
 
-// §9.8 × §9.8 back-ref: a `serialized graph` Container holds an owned Shape
+// §9.8 × §9.8 back-ref: a graph-shape Container holds an owned Shape
 // (polymorphic) and a borrow to the same Shape (back-edge).  Serialize writes
 // the Shape's $type + $id on first occurrence; the back-edge writes only $ref.
 // Deserialize reconstructs the Container with both fields pointing to the
@@ -399,7 +398,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport + kHierarchy +
         // Hub: owns a Shape (polymorphic) and borrows the same via Alias.
-        "class Hub serialized graph : ISerializable, IDeserializable "
+        "class Hub : ISerializable, IDeserializable "
         "  public owned Primary: Shape; "
         "  public Alias: Shape?; "  // nullable back-edge
         "  public constructor(owned primary: Shape, alias: Shape?) "
@@ -457,7 +456,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
     const std::string src =
         std::string("module M; ") + kImport + kHierarchy + kContainer +
         // Rogue: in registry? No — only Circle and Square are registered.
-        "class Rogue serialized tree : Shape, ISerializable, IDeserializable "
+        "class Rogue : Shape, ISerializable, IDeserializable "
         "  public constructor() end constructor; "
         "  public override method Kind(): int return 99; end Kind; "
         "end Rogue; "
@@ -489,13 +488,12 @@ BEZEL_TEST(codegen_serialization_t4_poly,
            poly_duplicate_discriminator_is_error_spec_9_8) {
     BEZEL_EXPECT_TRUE(compileFails(
         std::string("module M; ") + kImport +
-        // Parent: abstract polymorphic base.
-        "abstract class Parent serialized graph "
-        "  polymorphic(\"dup\": Child, \"dup\": Child) "
-        "  : ISerializable, IDeserializable "
+        // Parent: abstract polymorphic base (member-clause form).
+        "abstract class Parent : ISerializable, IDeserializable "
+        "  polymorphic(\"dup\": Child, \"dup\": Child); "
         "end Parent; "
-        // Child: subtype of Parent with its own serialized clause.
-        "class Child serialized tree : Parent, ISerializable, IDeserializable "
+        // Child: subtype of Parent.
+        "class Child : Parent, ISerializable, IDeserializable "
         "  public constructor() end constructor; "
         "end Child; "
         "class C public static method Main(): int return 0; end Main; end C;"));
@@ -507,13 +505,12 @@ BEZEL_TEST(codegen_serialization_t4_poly,
            poly_non_subtype_registered_type_is_error_spec_9_8) {
     BEZEL_EXPECT_TRUE(compileFails(
         std::string("module M; ") + kImport +
-        // Unrelated: has a serialized tree clause but does NOT extend Base.
-        "class Unrelated serialized tree : ISerializable, IDeserializable "
+        // Unrelated: serialization-eligible but does NOT extend Base.
+        "class Unrelated : ISerializable, IDeserializable "
         "  public constructor() end constructor; "
         "end Unrelated; "
-        "class Base serialized graph "
-        "  polymorphic(\"x\": Unrelated) "
-        "  : ISerializable, IDeserializable "
+        "class Base : ISerializable, IDeserializable "
+        "  polymorphic(\"x\": Unrelated); "
         "end Base; "
         "class C public static method Main(): int return 0; end Main; end C;"));
 }
@@ -528,13 +525,12 @@ BEZEL_TEST(codegen_serialization_t4_poly,
            poly_ineligible_registered_type_is_error_spec_9_8) {
     BEZEL_EXPECT_TRUE(compileFails(
         std::string("module M; ") + kImport +
-        // BadChild inherits from Base but has no `serialized` clause.
+        // BadChild inherits from Base but carries no ISerializable/IDeserializable.
         "class BadChild : Base "
         "  public constructor() end constructor; "
         "end BadChild; "
-        "class Base serialized graph "
-        "  polymorphic(\"bad\": BadChild) "
-        "  : ISerializable, IDeserializable "
+        "class Base : ISerializable, IDeserializable "
+        "  polymorphic(\"bad\": BadChild); "
         "end Base; "
         "class C public static method Main(): int return 0; end Main; end C;"));
 }
