@@ -1574,6 +1574,12 @@ private:
     // IndexOutOfRangeException; an empty range produces the empty string.
     llvm::Value* emitStringRangeSlice(llvm::Value* self,
                                       const ast::RangeExpr& range);
+    // R33: slice a string by a Range *value* (a %bz.range struct in a variable).
+    llvm::Value* emitStringRangeSliceValue(llvm::Value* self,
+                                           llvm::Value* rangeVal);
+    // Shared slice mechanics given the resolved [start64, endExcl) endpoints.
+    llvm::Value* emitStringSliceBytes(llvm::Value* self, llvm::Value* start64,
+                                      llvm::Value* endExcl);
 
     // CG27a: lazily declare an external C function (for memcmp, malloc, memcpy).
     llvm::Function* declareC(const char* name, llvm::Type* ret,

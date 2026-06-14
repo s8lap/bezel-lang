@@ -571,6 +571,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         !ix->indices.empty() && ix->indices[0].value &&
                         dynamic_cast<const ast::RangeExpr*>(
                             ix->indices[0].value.get()) != nullptr;
+                    // R33: also a Range-typed VALUE — `var r := 0..2; s[r]` —
+                    // where the index is a Range<int> variable / call result,
+                    // not a syntactic range literal. Without this the result is
+                    // mistyped `char`, the slice value is coerced away, and the
+                    // codegen range-slice produces an empty string.
+                    if (!rangeIndex && !ix->indices.empty() &&
+                        ix->indices[0].value) {
+                        if (auto* it = ctx_.exprType(*ix->indices[0].value))
+                            if (it->kind == TypeRef::Kind::Named &&
+                                it->declaration == builtinClassSym("Range"))
+                                rangeIndex = true;
+                    }
                     ctx_.setExprType(
                         &e, rangeIndex
                                 ? ctx_.primitiveTypeRef(PrimitiveType::String)

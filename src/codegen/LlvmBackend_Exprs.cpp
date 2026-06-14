@@ -1076,6 +1076,20 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     if (!strPtr) return nullptr;
                     return emitStringRangeSlice(strPtr, *range);
                 }
+                // R33: the index may be a Range *value* (a variable / call
+                // result of type Range) rather than a RangeExpr literal — e.g.
+                // `var r := 0..2; s[r]`. It lowers to the %bz.range struct, so
+                // the single-char path below would sext the whole struct → an
+                // IR-verify failure. Detect the range-typed operand and slice
+                // from the struct fields.
+                if (auto* idxTy = ctx_.exprType(*ix->indices[0].value)) {
+                    if (isRangeType(idxTy)) {
+                        llvm::Value* strPtr = lowerExpr(*ix->target);
+                        llvm::Value* rv = lowerExpr(*ix->indices[0].value);
+                        if (!strPtr || !rv) return nullptr;
+                        return emitStringRangeSliceValue(strPtr, rv);
+                    }
+                }
                 // §4.6: a single int index `s[i]` returns the i-th char.
                 llvm::Value* strPtr = lowerExpr(*ix->target);
                 llvm::Value* idx = lowerExpr(*ix->indices[0].value);

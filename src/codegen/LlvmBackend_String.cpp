@@ -39,10 +39,7 @@ llvm::Value* Emitter::loadCodePoint(llvm::Value* strPtr, llvm::Value* idx) {
 // `width * length` bytes so multi-byte strings slice correctly.
 llvm::Value* Emitter::emitStringRangeSlice(llvm::Value* self,
                                            const ast::RangeExpr& range) {
-    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
     llvm::Value* selfLen = loadStringLen(self);                          // i64
-    llvm::Value* width   = builder_.CreateZExt(loadStringWidth(self),    // i64
-                                               i64(), "slc.w");
 
     // start64: the lower endpoint (0 when open on the low side).
     llvm::Value* start64 = builder_.getInt64(0);
@@ -70,6 +67,58 @@ llvm::Value* Emitter::emitStringRangeSlice(llvm::Value* self,
                                            "slc.endexcl")
                       : hi64;
     }
+    return emitStringSliceBytes(self, start64, endExcl);
+}
+
+// fix R33 / §3.4: slice a string by a Range *value* (a `%bz.range` struct held
+// in a variable), e.g. `var r := 0..2; s[r]`. The range-literal form `s[0..2]`
+// is intercepted as a RangeExpr (emitStringRangeSlice above); a Range-typed
+// operand instead lowers to the struct { i64 start, i64 end, i64 step, i8 flags }
+// and previously fell through to the single-char path, which sext'd the whole
+// struct → "SExt only operates on integer" IR-verify failure. Extract the
+// endpoints and the open/inclusive flags (bit 0 = inclusive, bit 1 = startOpen,
+// bit 2 = endOpen — matching the RangeExpr lowering) and reuse the shared slice.
+llvm::Value* Emitter::emitStringRangeSliceValue(llvm::Value* self,
+                                                llvm::Value* rangeVal) {
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    llvm::Value* selfLen = loadStringLen(self);
+    llvm::Value* start = builder_.CreateExtractValue(rangeVal, {0u}, "slc.vstart");
+    llvm::Value* end   = builder_.CreateExtractValue(rangeVal, {1u}, "slc.vend");
+    llvm::Value* flags = builder_.CreateExtractValue(rangeVal, {3u}, "slc.vflags");
+
+    auto bitSet = [&](uint8_t mask, const char* nm) -> llvm::Value* {
+        return builder_.CreateICmpNE(
+            builder_.CreateAnd(flags, llvm::ConstantInt::get(i8Ty, mask)),
+            llvm::ConstantInt::get(i8Ty, 0), nm);
+    };
+    llvm::Value* incl      = bitSet(1u, "slc.vincl");
+    llvm::Value* startOpen = bitSet(2u, "slc.vstartopen");
+    llvm::Value* endOpen   = bitSet(4u, "slc.vendopen");
+
+    // start64 = startOpen ? 0 : start (the struct already stores 0 when open,
+    // but select defensively so a hand-built range value still behaves).
+    llvm::Value* start64 = builder_.CreateSelect(
+        startOpen, builder_.getInt64(0), start, "slc.vstart64");
+    // endExcl = endOpen ? selfLen : (incl ? end+1 : end).
+    llvm::Value* endPlus = builder_.CreateAdd(end, builder_.getInt64(1),
+                                              "slc.vendincl");
+    llvm::Value* endClosed = builder_.CreateSelect(incl, endPlus, end,
+                                                   "slc.vendexcl");
+    llvm::Value* endExcl = builder_.CreateSelect(endOpen, selfLen, endClosed,
+                                                 "slc.vend2");
+    return emitStringSliceBytes(self, start64, endExcl);
+}
+
+// Shared slice mechanics (§3.4): copy the code-point range [start64, endExcl)
+// out of `self` into a fresh runtime-managed string. Both the RangeExpr form
+// and the Range-value form funnel here once they have computed the endpoints.
+llvm::Value* Emitter::emitStringSliceBytes(llvm::Value* self,
+                                           llvm::Value* start64,
+                                           llvm::Value* endExcl) {
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    llvm::Value* selfLen = loadStringLen(self);                          // i64
+    llvm::Value* width   = builder_.CreateZExt(loadStringWidth(self),    // i64
+                                               i64(), "slc.w");
 
     // §3.4 bounds checks (out-of-range endpoints raise IndexOutOfRangeException):
     //   * a negative lower endpoint is invalid;

@@ -101,6 +101,65 @@ BEZEL_TEST(bug474_string_slice, assign_slice_to_string_local_474) {
         "end Main; end C;"), 1);
 }
 
+// ── R33: the index is a Range *VARIABLE* (not a syntactic range literal) ─────
+// `var r := a..b; s[r]`. Before the R33 fix this mistyped the result as `char`
+// (sema only recognized a RangeExpr literal as the substring form) AND the
+// codegen single-char path sext'd the whole %bz.range struct → an IR-verify
+// failure ("SExt only operates on integer"). Fix: sema types `s[Range-value]`
+// as `string`, and codegen slices from the struct fields.
+
+// R33: inclusive range value `0..2` → "hel" (len 3). The original repro.
+BEZEL_TEST(bug474_string_slice, range_var_inclusive_length_r33) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; var r := 0..2; "
+        "  var sub := s[r]; "
+        "  return sub.Length; "   // expect 3
+        "end Main; end C;"), 3);
+}
+
+// R33: inclusive range value `1..3` → content equals "ell".
+BEZEL_TEST(bug474_string_slice, range_var_inclusive_content_r33) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; var r := 1..3; "
+        "  if s[r] = \"ell\" then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// R33: half-open range value `1..<3` → "el" (the open/inclusive flag bit is read
+// from the struct, not the AST).
+BEZEL_TEST(bug474_string_slice, range_var_halfopen_content_r33) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; var r := 1..<3; "
+        "  if s[r] = \"el\" then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// R33: open-upper range value `2..` → "llo" (the endOpen flag runs to the end).
+BEZEL_TEST(bug474_string_slice, range_var_open_upper_content_r33) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; var r := 2..; "
+        "  if s[r] = \"llo\" then return 1; end; "
+        "  return 0; "
+        "end Main; end C;"), 1);
+}
+
+// R33: an out-of-range range value raises IndexOutOfRangeException (the bounds
+// check fires on the dynamically-extracted endpoints too).
+BEZEL_TEST(bug474_string_slice, range_var_out_of_range_throws_r33) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hi\"; var r := 0..10; "
+        "  try return s[r].Length; "
+        "  catch IndexOutOfRangeException => return 55; end; "
+        "end Main; end C;"), 55);
+}
+
 // ── #474: half-open vs inclusive bound semantics (spec §16.1) ────────────────
 
 // §3.4 / §16.1 / #474: the half-open form `[1..<3]` EXCLUDES the upper bound →
