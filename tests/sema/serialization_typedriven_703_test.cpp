@@ -437,3 +437,36 @@ BEZEL_TEST(serialization_typedriven_703,
         "end Main; end C;",
         7);
 }
+
+// §28.13 / #703 prerequisite: a Shared/Weak cycle disposed via its SOLE strong
+// owner must not double-free its control block. A owns Shared<B>, B holds a
+// Weak<A> back-edge; releasing A's last strong handle runs A's destructor, which
+// disposes B, whose destructor releases the Weak<A> back-edge — a re-entrant
+// bz_weak_release on A's own control block while bz_shared_release(A) is still on
+// the stack. Before the temp-weak-hold fix this double-freed the block. This is
+// the runtime prerequisite for cyclic serialization (the deserialized graph has
+// exactly this sole-ownership shape).
+BEZEL_TEST(serialization_typedriven_703,
+           shared_weak_cycle_sole_owner_disposal_no_double_free_28_13) {
+    std::string src =
+        "module M; "
+        "class Node "
+        "  public V: int := 0; "
+        "  public owned Peer: Shared<Node>?; "
+        "  public owned Back: Weak<Node>?; "
+        "  public constructor(v: int, owned peer: Shared<Node>?, "
+        "                     owned back: Weak<Node>?) "
+        "    V := v; Peer := peer; Back := back; "
+        "  end constructor; "
+        "end Node; "
+        "class C public static method Main(): int "
+        "  var nodeB := new Node(2, null, null); "
+        "  var nodeA := new Node(1, new Shared<Node>(nodeB), null); "
+        "  using var shA := new Shared<Node>(nodeA); "
+        "  shA.Get().Peer!.Get().Back := shA.Downgrade(); "
+        "  return shA.Get().V; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(src), 1);
+    int lsan = runUnderLeakSanitizer(src);
+    BEZEL_EXPECT_EQ(lsan, 0);
+}

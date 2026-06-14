@@ -3109,11 +3109,24 @@ void bz_shared_release(void* handle) {
     long prev = cb->strong.fetch_sub(1, std::memory_order_acq_rel);
     if (prev == 1 && !cb->value_disposed) {
         cb->value_disposed = 1;
-        if (cb->dispose_value && cb->value)
-            cb->dispose_value(cb->value);
+        // §9.8 v0.141 / #703: the value's destructor may release a Weak<T>
+        // back-edge that points at THIS control block (a Shared/Weak cycle
+        // disposed via its sole strong owner — e.g. A owns Shared<B>, B holds
+        // Weak<A>). That re-entrant bz_weak_release runs while we are still on
+        // the stack here; it would see strong==0, bring weak to 0, and free(cb)
+        // underneath us → use-after-free / double free. Hold a temporary weak
+        // reference across disposal so the weak count cannot reach 0 during
+        // dispose_value; drop it afterwards and free iff we are then the last
+        // outstanding reference.
+        cb->weak.fetch_add(1, std::memory_order_acq_rel);
+        void* val = cb->value;
         cb->value = nullptr;
-        // Free the block only when there are no outstanding weak handles.
-        if (cb->weak.load(std::memory_order_acquire) == 0)
+        if (cb->dispose_value && val)
+            cb->dispose_value(val);
+        long pw = cb->weak.fetch_sub(1, std::memory_order_acq_rel);
+        // pw == 1 means our temporary ref was the last weak handle (no real
+        // weak handle outstanding) → free now that strong is already 0.
+        if (pw == 1 && !cb->handle_disposed)
             free(cb);
     }
 }
