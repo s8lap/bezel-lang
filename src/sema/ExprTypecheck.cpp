@@ -2257,6 +2257,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     for (const auto& c : cp->constants)
                         if (c) visitExpr(*c);
             }
+            // §19.3 (#726): a relational pattern (`> limit`) operand must be
+            // typed so codegen can lower a variable operand.
+            if (auto* rop =
+                    dynamic_cast<const ast::RelOpPattern*>(arm.pattern.get())) {
+                if (rop->expr) visitExpr(*rop->expr);
+            }
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).
             auto* bp =

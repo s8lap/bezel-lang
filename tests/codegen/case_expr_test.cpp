@@ -757,3 +757,29 @@ BEZEL_TEST(codegen_cg28_473, regression_case_statement_type_pattern_still_works)
         "  return r; "
         "end Main; end C;"), 2);
 }
+
+// #726 / §19.3: a relational case pattern with a NON-CONSTANT (variable)
+// operand. Previously the operand wasn't typechecked, so codegen could not
+// lower it and `case.end` was left unterminated (IR-verify failure). The case
+// visitors now visit the RelOpPattern operand. x=7, > limit(5) → 1.
+BEZEL_TEST(codegen_cg28, relational_pattern_variable_operand_726) {
+    BEZEL_EXPECT_EQ(run(
+        "var limit := 5; var x := 7; "
+        "var r := case x "
+        "    > limit => 1, "
+        "    _ => 0 "
+        "  end; "
+        "return r;"), 1);
+}
+
+// #726: >= and < relational patterns with variable operands.
+BEZEL_TEST(codegen_cg28, relational_pattern_ge_lt_variable_726) {
+    BEZEL_EXPECT_EQ(run(
+        "var lo := 10; var x := 3; "
+        "var r := case x "
+        "    >= lo => 100, "
+        "    < lo => 7, "
+        "    _ => 0 "
+        "  end; "
+        "return r;"), 7);  // 3 < 10
+}
