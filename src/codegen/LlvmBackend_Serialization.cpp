@@ -2208,16 +2208,13 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
         // Serialize/Deserialize bodies; the concrete object is always a
         // BinarySerializer* / BinaryDeserializer* at runtime).
         if (rcn == "ISerializer" || rcn == "IDeserializer") return true;
-        // OwnedBuffer<byte>.AsReadOnlySpan() / AsSpan() (all overloads) / .Count.
-        if ((rcn == "OwnedBuffer" || rcn == "Array") &&
-            (mn == "AsReadOnlySpan" || mn == "AsSpan" || mn == "Count" ||
-             mn == "Length")) {
-            bool isByte = !recvTy->genericArgs.empty() &&
-                recvTy->genericArgs[0] &&
-                recvTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
-                recvTy->genericArgs[0]->primitive == sema::PrimitiveType::Byte;
-            if (isByte) return true;
-        }
+        // §4.14 / #636: OwnedBuffer<T>.AsSpan() / AsReadOnlySpan() / Count /
+        // Length are no longer intercepted here.  They are now handled by:
+        //   - AsSpan / AsReadOnlySpan: tryLowerArraySpanCall (same path as
+        //     Array<T>, delegated so both share one element-width–correct path)
+        //   - Count / Length: tryLowerCollectionInstanceCall (bz_array_len)
+        // Removing this block eliminates the duplicate serialization-handler
+        // path that lacked bounds checks and element-width handling.
     }
 
     // Synthesized Serialize on record/enum/class.
@@ -2484,55 +2481,15 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
             return nullptr;
         }
 
-        // OwnedBuffer<byte>.AsReadOnlySpan/AsSpan (0/1/2-arg) and .Length / .Count
-        if (rcn == "OwnedBuffer" || rcn == "Array") {
-            // Only intercept AsReadOnlySpan/AsSpan/Length/Count on byte buffers.
-            bool isByteBuffer = !recvTy->genericArgs.empty() &&
-                recvTy->genericArgs[0] &&
-                recvTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
-                recvTy->genericArgs[0]->primitive == sema::PrimitiveType::Byte;
-            if (isByteBuffer &&
-                (methodName == "AsReadOnlySpan" || methodName == "AsSpan")) {
-                llvm::Value* arr = lowerExpr(*ma->target);
-                if (!arr) return nullptr;
-                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-                llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
-                llvm::Value* count   = builder_.CreateTrunc(count64, i32(), "ob.cnt32");
-                // 0-arg: full buffer [0, count)
-                if (call.args.empty()) {
-                    return buildArraySpan(arr, builder_.getInt32(0), count);
-                }
-                // (start): [start, count)
-                if (call.args.size() == 1 && call.args[0].value) {
-                    llvm::Value* start = lowerExpr(*call.args[0].value);
-                    if (!start) return nullptr;
-                    if (!start->getType()->isIntegerTy(32))
-                        start = builder_.CreateSExtOrTrunc(start, i32());
-                    llvm::Value* len = builder_.CreateSub(count, start, "ob.slen");
-                    return buildArraySpan(arr, start, len);
-                }
-                // (start, length): [start, start+length)
-                if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-                    llvm::Value* start = lowerExpr(*call.args[0].value);
-                    llvm::Value* len   = lowerExpr(*call.args[1].value);
-                    if (!start || !len) return nullptr;
-                    if (!start->getType()->isIntegerTy(32))
-                        start = builder_.CreateSExtOrTrunc(start, i32());
-                    if (!len->getType()->isIntegerTy(32))
-                        len = builder_.CreateSExtOrTrunc(len, i32());
-                    return buildArraySpan(arr, start, len);
-                }
-            }
-            if (isByteBuffer &&
-                (methodName == "Count" || methodName == "Length")) {
-                // OwnedBuffer<byte>.Count / .Length → bz_array_len → i32
-                llvm::Value* arr = lowerExpr(*ma->target);
-                if (!arr) return nullptr;
-                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-                llvm::Value* count64 = builder_.CreateCall(lenFn, {arr}, "ob.count");
-                return builder_.CreateTrunc(count64, i32(), "ob.cnt32");
-            }
-        }
+        // §4.14 / #636: OwnedBuffer<T>.AsSpan() / AsReadOnlySpan() / Count /
+        // Length are no longer handled here — they are delegated to:
+        //   - AsSpan / AsReadOnlySpan: tryLowerArraySpanCall (same lowering
+        //     path as Array<T>; handles all element types with correct
+        //     element-width and bounds checks)
+        //   - Count / Length: tryLowerCollectionInstanceCall (bz_array_len)
+        // Since isSerializationCall no longer flags these calls, this branch
+        // is never reached for OwnedBuffer/Array AsSpan/Count/Length.
+        // The duplicate path has been removed to keep a single lowering path.
     }
 
     // -----------------------------------------------------------------------

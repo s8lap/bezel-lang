@@ -1528,7 +1528,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // Array<T>.AsReadOnlySpan() and overloads → ReadOnlyArraySpan<T>.
                     // Only on Array<T> (the borrowing collection); OwnedArray<T>
                     // does not expose AsSpan (its elements are owned — see §4.5).
-                    if (colName == "Array" && !recvTy->genericArgs.empty() &&
+                    // §4.14 / #636: OwnedBuffer<T>.AsSpan() → ArraySpan<T>;
+                    // OwnedBuffer<T>.AsReadOnlySpan() → ReadOnlyArraySpan<T>.
+                    // OwnedBuffer uses the same bz_array_t* backing as Array, so
+                    // the span struct layout ({ ptr, i32, i32 }) is identical.
+                    // The codegen routes through tryLowerArraySpanCall (same path
+                    // as Array<T>) rather than the serialization handler.
+                    if ((colName == "Array" || colName == "OwnedBuffer") &&
+                        !recvTy->genericArgs.empty() &&
                         recvTy->genericArgs[0] &&
                         (m == "AsSpan" || m == "AsReadOnlySpan") &&
                         (ce.args.size() <= 2)) {

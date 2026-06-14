@@ -11457,8 +11457,16 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 
     // -----------------------------------------------------------------------
     // Array<T>.AsSpan() / AsReadOnlySpan() — construct a span from an array.
+    // §4.14 / #636: OwnedBuffer<T> uses the same bz_array_t* backing as
+    // Array<T>, so OwnedBuffer<T>.AsSpan() / AsReadOnlySpan() lower identically.
+    // The resulting span struct is { ptr source, i32 start, i32 length } —
+    // the same bz.arrayspan used for ArraySpan<T> / ReadOnlyArraySpan<T>.
+    // Previously a duplicate path in tryLowerSerializationCall handled only
+    // the byte-element case and lacked bounds checks; delegating here closes
+    // that gap and gives a single, element-width–correct lowering for all T.
     // -----------------------------------------------------------------------
-    if (rcn == "Array" && (m == "AsSpan" || m == "AsReadOnlySpan")) {
+    if ((rcn == "Array" || rcn == "OwnedBuffer") &&
+        (m == "AsSpan" || m == "AsReadOnlySpan")) {
         // The span element type and size are those of the array (genericArgs[0]).
         llvm::Value* arr = lowerExpr(*ma->target);
         if (!arr) return nullptr;
