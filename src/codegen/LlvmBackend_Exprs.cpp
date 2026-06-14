@@ -4091,6 +4091,28 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 if (auto* rt = ctx_.exprType(*bin.right))
                     if (isNullableValueTy(rt)) { nvExpr = bin.right.get(); nvVal = r; }
             }
+            // R33: a nullable TYPE-PARAMETER field (`T?`) lowers to the
+            // nullable-value struct {i8 hasValue; <T> value} even when T
+            // instantiates to a class; isNullableValueTy is false for the
+            // unresolved param, so the above misses it and `T? = null` would
+            // fall through to struct-equality with a null record type — crashing
+            // with the LLVM checkGEPType assertion.  Detect the nullable-value
+            // struct by its LLVM shape (element 0 is the hasValue tag) so the
+            // null comparison lowers to the hasValue check.
+            if (!nvVal) {
+                llvm::Value* cand =
+                    (bin.left &&
+                     !dynamic_cast<const ast::NullLiteralExpr*>(bin.left.get())) ? l
+                  : (bin.right &&
+                     !dynamic_cast<const ast::NullLiteralExpr*>(bin.right.get())) ? r
+                  : nullptr;
+                if (cand && cand->getType()->isStructTy()) {
+                    auto* st = llvm::cast<llvm::StructType>(cand->getType());
+                    if (st->getNumElements() >= 1 &&
+                        st->getElementType(0) == nullablePrimHasValTy())
+                        nvVal = cand;
+                }
+            }
             if (nvVal && nvVal->getType()->isStructTy()) {
                 // hasValue field (index 0). isNull when hasValue=false.
                 llvm::Value* hasVal = nullablePrimHasValue(nvVal);

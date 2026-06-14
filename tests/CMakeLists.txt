@@ -354,6 +354,7 @@ set(BEZEL_TEST_SOURCES
     codegen/generic_base_field_585_test.cpp
     codegen/generic_second_typeparam_597_test.cpp
     codegen/generic_nullable_typeparam_604_605_test.cpp
+    codegen/generic_nullable_field_r33_test.cpp
     codegen/generic_reversed_params_616_test.cpp
     codegen/generic_concrete_base_617_test.cpp
     codegen/generic_record_field_590_test.cpp
