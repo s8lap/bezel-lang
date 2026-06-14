@@ -210,6 +210,33 @@ static bool isSharedOrWeakComponentType(const sema::TypeRef* tr) {
     return name == "Shared" || name == "Weak";
 }
 
+// §9.8 v0.141 / #703 slice S2: if `tr` is a Shared<C> component that the
+// type-driven wire codegen HANDLES — a non-nullable Shared whose element C is a
+// serialization-eligible CLASS (so emitClassSerialize/Deserialize can write/read
+// its inline body) — return C's TypeSymbol; otherwise nullptr. Shared<C> is the
+// identity participant of the type-driven model: its tag keys on the underlying
+// value (bz_shared_get) on serialize, and on deserialize the tag table holds the
+// constructed HANDLE so aliases share one control block (bz_shared_clone).
+// Cases NOT yet handled (return nullptr → still caught by the codegen guard):
+// Weak<T>, nullable Shared<C>?, Shared<non-class>, Shared<class-without-clause>.
+static const TypeSymbol* handledSharedElementClass(const sema::TypeRef* tr) {
+    if (!tr || tr->nullable) return nullptr;
+    if (tr->kind != sema::TypeRef::Kind::Named || tr->declaration) return nullptr;
+    std::string_view name;
+    if (tr->astNode && tr->astNode->name && !tr->astNode->name->parts.empty())
+        name = tr->astNode->name->parts[0];
+    else if (!tr->importedName.empty())
+        name = tr->importedName;
+    if (name != "Shared") return nullptr;
+    if (tr->genericArgs.empty() || !tr->genericArgs[0]) return nullptr;
+    const sema::TypeRef* el = tr->genericArgs[0];
+    if (el->kind != sema::TypeRef::Kind::Named || !el->declaration) return nullptr;
+    if (el->declaration->kind != ast::TypeDeclKind::Class) return nullptr;
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(el->declaration->decl);
+    if (!td || !td->serializedClass) return nullptr;  // element must be synthesizable
+    return el->declaration;
+}
+
 // ---------------------------------------------------------------------------
 // Emitter::emitRecordSerialize
 //
@@ -1390,19 +1417,22 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
     collectClassComponents(ts, storage, fieldIndex_, ctx_, comps, isGraphMode);
 
     // §9.8 v0.141 / #703: Shared<T>/Weak<T> components are eligibility-accepted
-    // (sema slice S1) but their type-driven wire codegen is not yet emitted.
-    // Report a clean error rather than miscompiling a builtin handle as an
-    // owning class component.
+    // (sema slice S1). Slice S2 emits Shared<C> identity codegen (handled below);
+    // the remaining cases (Weak<T>, nullable Shared<C>?, Shared<non-class>) are
+    // not yet emitted, so guard them with a clean error rather than miscompiling
+    // a builtin handle as an owning class component.
     for (const auto& comp : comps) {
         if (comp.isSkip) continue;
-        if (isSharedOrWeakComponentType(comp.ty)) {
+        if (isSharedOrWeakComponentType(comp.ty) &&
+            !(isGraphMode && handledSharedElementClass(comp.ty))) {
             ctx_.diagnostics().report(
                 Severity::Error, ts->declLoc,
-                "class `" + std::string(ts->name) + "`: serialization of a "
+                "class `" + std::string(ts->name) + "`: serialization of this "
                 "`Shared<T>`/`Weak<T>` component (field `" + comp.declName +
                 "`) is not yet implemented in codegen (\xC2\xA7""9.8 v0.141, "
-                "issue #703 \xE2\x80\x94 type-driven Shared/Weak wire codegen "
-                "lands in a later slice)");
+                "issue #703 \xE2\x80\x94 only non-nullable `Shared<class>` in "
+                "graph mode is supported so far; Weak/nullable/value-element land "
+                "in a later slice)");
             return;
         }
     }
@@ -1562,6 +1592,64 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
             continue;
         }
 
+        // §9.8 v0.141 / #703 slice S2: Shared<C> identity participant.
+        // Key the tag on the underlying VALUE (bz_shared_get) so aliased clones
+        // unify with each other (and with any owned reference to the same value).
+        // First encounter: assign tag, write BZ_SER_INLINE + tag_id, then write
+        // the element's inline object body. Alias: write BZ_SER_REF + tag_id.
+        if (isGraphMode) {
+            if (const TypeSymbol* elemTs = handledSharedElementClass(fty)) {
+                llvm::Value* handle =
+                    builder_.CreateLoad(ptrTy(), fieldPtr, "cser.sh.h");
+                // Field name.
+                llvm::Value* nameStr = lowerStringLiteral(
+                    "\"" + comp.wireName + "\"", false);
+                auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
+                                             {ptrTy(), ptrTy()});
+                builder_.CreateCall(writeNameFn, {serPtr, nameStr});
+                // Identity key = bz_shared_get(handle) (the inner value ptr).
+                auto* getFn = declareC("bz_shared_get", ptrTy(), {ptrTy()});
+                llvm::Value* val =
+                    builder_.CreateCall(getFn, {handle}, "cser.sh.val");
+                auto* getTagFn = declareC("bz_binser_graph_get_tag", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* existingTag = builder_.CreateCall(
+                    getTagFn, {serPtr, val}, "cser.sh.tag");
+                llvm::Value* isNew = builder_.CreateICmpEQ(
+                    existingTag, builder_.getInt32(0), "cser.sh.isnew");
+                auto* shInlineBB =
+                    llvm::BasicBlock::Create(llvm_, "cser.sh.inline", currentFn_);
+                auto* shRefBB =
+                    llvm::BasicBlock::Create(llvm_, "cser.sh.ref", currentFn_);
+                auto* shDoneBB =
+                    llvm::BasicBlock::Create(llvm_, "cser.sh.done", currentFn_);
+                builder_.CreateCondBr(isNew, shInlineBB, shRefBB);
+                // First encounter: assign tag, write inline marker + body.
+                builder_.SetInsertPoint(shInlineBB);
+                {
+                    auto* assignFn = declareC("bz_binser_graph_assign_tag", i32(),
+                                              {ptrTy(), ptrTy()});
+                    llvm::Value* newTag = builder_.CreateCall(
+                        assignFn, {serPtr, val}, "cser.sh.newtag");
+                    auto* writeInlineFn = declareC("bz_binser_write_inline_tag",
+                                                   voidTy, {ptrTy(), i32()});
+                    builder_.CreateCall(writeInlineFn, {serPtr, newTag});
+                    emitClassSerialize(elemTs, val, serPtr);
+                }
+                builder_.CreateBr(shDoneBB);
+                // Alias: write $ref to the existing tag.
+                builder_.SetInsertPoint(shRefBB);
+                {
+                    auto* writeRefFn = declareC("bz_binser_write_ref_tag", voidTy,
+                                                {ptrTy(), i32()});
+                    builder_.CreateCall(writeRefFn, {serPtr, existingTag});
+                }
+                builder_.CreateBr(shDoneBB);
+                builder_.SetInsertPoint(shDoneBB);
+                continue;
+            }
+        }
+
         // Handle `serialized optional`: on write, omit null nullable fields.
         if (comp.isOptional && fty->nullable) {
             // The isNonNull flag was already computed; use it as the write-gate.
@@ -1691,18 +1779,20 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     collectClassComponents(ts, storage, fieldIndex_, ctx_, comps, isGraphMode);
 
     // §9.8 v0.141 / #703: Shared<T>/Weak<T> components are eligibility-accepted
-    // (sema slice S1) but their type-driven wire codegen is not yet emitted.
-    // Report a clean error rather than miscompiling a builtin handle.
+    // (sema slice S1). Slice S2 emits Shared<C> identity codegen (handled below);
+    // guard the remaining cases with a clean error rather than miscompiling.
     for (const auto& comp : comps) {
         if (comp.isSkip) continue;
-        if (isSharedOrWeakComponentType(comp.ty)) {
+        if (isSharedOrWeakComponentType(comp.ty) &&
+            !(isGraphMode && handledSharedElementClass(comp.ty))) {
             ctx_.diagnostics().report(
                 Severity::Error, ts->declLoc,
-                "class `" + std::string(ts->name) + "`: deserialization of a "
+                "class `" + std::string(ts->name) + "`: deserialization of this "
                 "`Shared<T>`/`Weak<T>` component (field `" + comp.declName +
                 "`) is not yet implemented in codegen (\xC2\xA7""9.8 v0.141, "
-                "issue #703 \xE2\x80\x94 type-driven Shared/Weak wire codegen "
-                "lands in a later slice)");
+                "issue #703 \xE2\x80\x94 only non-nullable `Shared<class>` in "
+                "graph mode is supported so far; Weak/nullable/value-element land "
+                "in a later slice)");
             return llvm::ConstantPointerNull::get(ptrTy());
         }
     }
@@ -1916,7 +2006,83 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
 
             llvm::Value* fv = nullptr;
 
-            if (isGraphMode && comp.isBackEdge && isClassComp) {
+            // §9.8 v0.141 / #703 slice S2: Shared<C> identity participant.
+            // Read the marker: BZ_SER_INLINE → construct the element, wrap it in
+            // a NEW Shared control block, and register the HANDLE under the tag
+            // (so aliases share one control block). BZ_SER_REF → resolve the tag
+            // to the registered handle and bz_shared_clone it (strong +1). The
+            // tag table is non-owning; the handle is owned by the field it lands
+            // in via the constructor, so refcounts balance to a single disposal.
+            if (const TypeSymbol* shElemTs =
+                    (isGraphMode ? handledSharedElementClass(comp.ty) : nullptr)) {
+                llvm::AllocaInst* tagSlot = entryAlloca(i32());
+                builder_.CreateStore(builder_.getInt32(0), tagSlot);
+                auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
+                                              i32(), {ptrTy(), ptrTy()});
+                llvm::Value* marker = builder_.CreateCall(
+                    readMarkerFn, {derPtr, tagSlot}, "cdeser.sh.mk");
+                llvm::Value* tagId =
+                    builder_.CreateLoad(i32(), tagSlot, "cdeser.sh.tag");
+                // BZ_SER_INLINE = 0x01, BZ_SER_REF = 0x02 (runtime constants).
+                llvm::Value* isInline = builder_.CreateICmpEQ(
+                    marker, builder_.getInt32(1), "cdeser.sh.isinline");
+                auto* shInlBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.sh.inl", currentFn_);
+                auto* shRefBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.sh.ref", currentFn_);
+                auto* shMrgBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.sh.mrg", currentFn_);
+                builder_.CreateCondBr(isInline, shInlBB, shRefBB);
+                // Inline: mark in-progress, construct element, wrap, register.
+                builder_.SetInsertPoint(shInlBB);
+                auto* markFn = declareC("bz_binder_graph_mark_in_progress",
+                                        voidTy, {ptrTy(), i32()});
+                builder_.CreateCall(markFn, {derPtr, tagId});
+                llvm::Value* childVal = emitClassDeserialize(shElemTs, derPtr);
+                auto* newShFn =
+                    declareC("bz_shared_new", ptrTy(), {ptrTy(), ptrTy()});
+                llvm::Value* dispArg =
+                    llvm::cast<llvm::Value>(elementDisposerThunk());
+                llvm::Value* inlHandle = builder_.CreateCall(
+                    newShFn, {childVal, dispArg}, "cdeser.sh.new");
+                auto* regFn = declareC("bz_binder_graph_register_tag",
+                                       voidTy, {ptrTy(), i32(), ptrTy()});
+                builder_.CreateCall(regFn, {derPtr, tagId, inlHandle});
+                llvm::BasicBlock* inlEndBB = builder_.GetInsertBlock();
+                builder_.CreateBr(shMrgBB);
+                // Ref: resolve handle (null → cycle/unknown → throw), clone it.
+                builder_.SetInsertPoint(shRefBB);
+                auto* resolveFn = declareC("bz_binder_graph_resolve_tag",
+                                           ptrTy(), {ptrTy(), i32()});
+                llvm::Value* resolved = builder_.CreateCall(
+                    resolveFn, {derPtr, tagId}, "cdeser.sh.res");
+                llvm::Value* isNullR = builder_.CreateICmpEQ(
+                    resolved, llvm::ConstantPointerNull::get(ptrTy()),
+                    "cdeser.sh.resnull");
+                auto* shCycBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.sh.cyc", currentFn_);
+                auto* shOkBB =
+                    llvm::BasicBlock::Create(llvm_, "cdeser.sh.ok", currentFn_);
+                builder_.CreateCondBr(isNullR, shCycBB, shOkBB);
+                builder_.SetInsertPoint(shCycBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(shOkBB);
+                auto* cloneFn =
+                    declareC("bz_shared_clone", ptrTy(), {ptrTy()});
+                llvm::Value* refHandle = builder_.CreateCall(
+                    cloneFn, {resolved}, "cdeser.sh.clone");
+                llvm::BasicBlock* refEndBB = builder_.GetInsertBlock();
+                builder_.CreateBr(shMrgBB);
+                // Merge: fv = phi(inline handle | cloned handle).
+                builder_.SetInsertPoint(shMrgBB);
+                llvm::PHINode* shPhi =
+                    builder_.CreatePHI(ptrTy(), 2, "cdeser.sh.fv");
+                shPhi->addIncoming(inlHandle, inlEndBB);
+                shPhi->addIncoming(refHandle, refEndBB);
+                fv = shPhi;
+            } else if (isGraphMode && comp.isBackEdge && isClassComp) {
                 // §9.8 tier 3: back-edge field.
                 // The wire format for a back-edge is one of:
                 //   0x00                       → nullable back-edge was null
