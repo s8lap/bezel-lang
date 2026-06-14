@@ -734,7 +734,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
            cyclic_class_conservative_acyclic_roundtrip_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Entry serialized cyclic : ISerializable, IDeserializable "
+        "class Entry : ISerializable, IDeserializable "
         "  public property Key: string; "
         "  public property Val: int; "
         // Self-contained: assigns own fields from constructor params only.
@@ -755,27 +755,25 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "end Main; end C;"), 42);
 }
 
-// §9.8 `serialized cyclic`: constructor violates self-contained rule by
-// calling an instance method on `this` → compile error at conformance.
-// §9.8: "must NOT: 2. call any instance method on this (directly, or via
-// self, or implicitly)."
-// "A class declared serialized cyclic … whose construction is not
-// self-contained is a compile error at the conformance declaration."
+// §9.8 v0.141 (#703 migration): the `serialized cyclic` "self-contained
+// constructor" rule (no instance-method call on `this` during construction) was
+// retired with the keyword — cycles are now expressed via Shared<T>/Weak<T>,
+// which carry no such constraint. A keyword-less class with a borrow back-edge
+// whose constructor calls an instance method now COMPILES (the rule is gone).
 BEZEL_TEST(codegen_serialization_t2_classes,
-           cyclic_class_ctor_calls_instance_method_is_error_spec_9_8) {
-    BEZEL_EXPECT_TRUE(compileFails(
+           keyword_less_ctor_instance_method_call_is_allowed_spec_9_8_v0141) {
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Bad serialized cyclic : ISerializable, IDeserializable "
+        "class Bad : ISerializable, IDeserializable "
         "  public property Label: string; "
         "  public Parent: Bad?; "
         "  public constructor(label: string, parent: Bad?) "
         "    Parent := parent; "
-        // Violation: calls instance method on this during construction.
-        "    Label := this.ComputeLabel(); "
+        "    Label := this.ComputeLabel(); "  // now allowed (rule retired)
         "  end constructor; "
         "  public method ComputeLabel(): string return \"label\"; end ComputeLabel; "
         "end Bad; "
-        "class C public static method Main(): int return 0; end Main; end C;"));
+        "class C public static method Main(): int return 0; end Main; end C;"), 0);
 }
 
 // ===========================================================================

@@ -55,7 +55,7 @@ end ISerializable;
 public interface IDeserializable
 end IDeserializable;
 
-public class Node(label: string) serialized cyclic : ISerializable, IDeserializable
+public class Node(label: string) : ISerializable, IDeserializable
   public owned Next: Node;          // owned forward edge
   public Parent: Node;              // back-edge: may close a cycle
   public readonly property Label: string => label;

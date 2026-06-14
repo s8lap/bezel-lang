@@ -667,7 +667,7 @@ BEZEL_TEST(codegen_json_675, graph_null_back_edge_json_spec_2_15_v0139) {
 BEZEL_TEST(codegen_json_675, graph_json_cycle_raises_spec_2_15_v0139) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "class Link serialized cyclic : ISerializable, IDeserializable "
+        "class Link : ISerializable, IDeserializable "
         "  public Val: int := 0; "
         "  public Next: Link?; "
         "  public constructor(val: int, next: Link?) "
