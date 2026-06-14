@@ -4389,6 +4389,8 @@ private:
     // the loop variable slot (same anchor `locals_[&fs]`) at the start of
     // each body iteration so `x` in the body resolves to the current element.
     bool lowerArrayFor(const ast::ForStmt& fs);
+    // #728: `for var x in <LinkedList<T>>` — walk the node chain (§4.13).
+    bool lowerLinkedListFor(const ast::ForStmt& fs);
 
     // §4.6 / §29.2: `for var c in s do … end` over a string — iterates
     // each char (i32 code point) in order. For ASCII/UTF-8 strings this

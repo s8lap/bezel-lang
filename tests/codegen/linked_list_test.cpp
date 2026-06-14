@@ -423,3 +423,45 @@ BEZEL_TEST(linked_list_4_6, linq_sum_single_element_spec_5_fix450) {
         "  return l.Sum((x: int) => x); "  // 42
         "end Main; end C;"), 42);
 }
+
+// #728 / §4.13 / §29.2: `for var x in <LinkedList<T>>` iterates the node chain.
+// Previously emitted "not yet implemented: codegen for this for statement"
+// (LinkedList is not array-backed, so lowerArrayFor excluded it). lowerLinkedListFor
+// now walks the runtime node cursor.
+BEZEL_TEST(codegen_linked_list, for_in_sum_728) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var ll := new LinkedList<int>(); "
+        "  ll.AddLast(10); ll.AddLast(20); ll.AddLast(30); "
+        "  var sum := 0; "
+        "  for var x in ll do sum := sum + x; end; "
+        "  return sum; "  // 60
+        "end Main; end C;"), 60);
+}
+
+// #728: break works inside the LinkedList for-in (loopStack_ wired).
+BEZEL_TEST(codegen_linked_list, for_in_break_728) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var ll := new LinkedList<int>(); "
+        "  ll.AddLast(1); ll.AddLast(2); ll.AddLast(3); ll.AddLast(4); "
+        "  var sum := 0; "
+        "  for var x in ll do "
+        "    if x = 3 then break; end; "
+        "    sum := sum + x; "
+        "  end; "
+        "  return sum; "  // 1+2 = 3
+        "end Main; end C;"), 3);
+}
+
+// #728: string-element LinkedList — the loop var binds the element value.
+BEZEL_TEST(codegen_linked_list, for_in_string_elements_728) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var ll := new LinkedList<string>(); "
+        "  ll.AddLast(\"ab\"); ll.AddLast(\"cde\"); "
+        "  var total := 0; "
+        "  for var s in ll do total := total + s.Length; end; "
+        "  return total; "  // 2 + 3 = 5
+        "end Main; end C;"), 5);
+}

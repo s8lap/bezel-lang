@@ -952,6 +952,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (lowerIEnumerableBuiltinFor(*fors)) return false;
         // §29.2 (A): `for var x in obj` over user-defined IEnumerable<T>.
         if (lowerIEnumerableFor(*fors)) return false;
+        // stdlib §4.13 (#728): `for var x in <LinkedList<T>>` — walk the node
+        // chain via the runtime list cursor (not array-backed).
+        if (lowerLinkedListFor(*fors)) return false;
         // Non-range, non-array, non-string, non-IEnumerable iterables.
         ctx_.diagnostics().report(
             Severity::Error, s.span.begin,
@@ -1693,6 +1696,55 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     return true;
 }
 
+
+// stdlib §4.13 / §29.2 (#728): `for var x in <LinkedList<T>>` (and
+// OwnedLinkedList<T>). A linked list is NOT array-backed, so lowerArrayFor's
+// isCollectionTypeName guard excludes it and it would otherwise hit the
+// not-yet-implemented error. Walk the node chain with the runtime cursor
+// (bz_llist_first_node / bz_llist_node_value_ptr / bz_llist_node_next) already
+// used by the First/Last/Find lowering. Mirrors the span/array loop structure
+// (cond/body/inc/end + loopStack_ for break/continue).
+bool Emitter::lowerLinkedListFor(const ast::ForStmt& fs) {
+    if (!fs.iterable) return false;
+    auto* iterTy = ctx_.exprType(*fs.iterable);
+    if (!isLinkedListTypeName(iterTy)) return false;
+    llvm::Value* listObj = lowerExpr(*fs.iterable);
+    if (!listObj) return false;
+    llvm::Type* elemTy = i32();
+    if (iterTy && !iterTy->genericArgs.empty() && iterTy->genericArgs[0])
+        elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+    auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+    auto* valFn = declareC("bz_llist_node_value_ptr", ptrTy(), {ptrTy()});
+    auto* nextFn = declareC("bz_llist_node_next", ptrTy(), {ptrTy()});
+    auto* nodeSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(builder_.CreateCall(firstFn, {listObj}), nodeSlot);
+    auto* varSlot = entryAlloca(elemTy);
+    locals_[&fs] = varSlot;
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "ll.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ll.body", currentFn_);
+    auto* incBB = llvm::BasicBlock::Create(llvm_, "ll.inc", currentFn_);
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "ll.end", currentFn_);
+    builder_.CreateBr(condBB);
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* node = builder_.CreateLoad(ptrTy(), nodeSlot);
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(node, llvm::ConstantPointerNull::get(ptrTy())),
+        bodyBB, endBB);
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* nodeB = builder_.CreateLoad(ptrTy(), nodeSlot);
+    llvm::Value* vp = builder_.CreateCall(valFn, {nodeB});
+    builder_.CreateStore(builder_.CreateLoad(elemTy, vp), varSlot);
+    loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+    bool term = lowerScopedBlock(fs.body);
+    loopStack_.pop_back();
+    if (!term) builder_.CreateBr(incBB);
+    builder_.SetInsertPoint(incBB);
+    llvm::Value* nodeC = builder_.CreateLoad(ptrTy(), nodeSlot);
+    builder_.CreateStore(builder_.CreateCall(nextFn, {nodeC}), nodeSlot);
+    builder_.CreateBr(condBB);
+    builder_.SetInsertPoint(endBB);
+    return true;
+}
 
 bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
