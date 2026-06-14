@@ -537,3 +537,63 @@ BEZEL_TEST(sema_generic_constraints, nested_iface_bound_indirect_satisfied_ok_14
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// #729 / §14.2: a generic METHOD's `where T: Interface` constraint is enforced
+// at the CALL SITE. Previously a non-conforming type arg was accepted, then
+// SIGSEGV'd at runtime via a bad vtable dispatch.
+// ---------------------------------------------------------------------------
+
+// Non-conforming explicit type arg is rejected with the §14.2 diagnostic.
+BEZEL_TEST(sema_generic_constraints, method_explicit_non_conforming_rejected_729) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IFoo method Compute(): int; end IFoo; "
+        "class NotIFoo end NotIFoo; "
+        "class C "
+        "  public static method DoIt<T>(t: T): int where T: IFoo "
+        "    return t.Compute(); "
+        "  end DoIt; "
+        "  public static method Main(): int "
+        "    using var b := new NotIFoo(); "
+        "    return DoIt<NotIFoo>(b); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+// Non-conforming INFERRED type arg (no explicit <...>) is also rejected.
+BEZEL_TEST(sema_generic_constraints, method_inferred_non_conforming_rejected_729) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IFoo method Compute(): int; end IFoo; "
+        "class NotIFoo end NotIFoo; "
+        "class C "
+        "  public static method DoIt<T>(t: T): int where T: IFoo "
+        "    return t.Compute(); "
+        "  end DoIt; "
+        "  public static method Main(): int "
+        "    using var b := new NotIFoo(); "
+        "    return DoIt(b); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasConstraintError(r));
+}
+
+// A CONFORMING type arg compiles with no constraint error.
+BEZEL_TEST(sema_generic_constraints, method_conforming_ok_729) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IFoo method Compute(): int; end IFoo; "
+        "class YesFoo: IFoo public method Compute(): int => 42; end YesFoo; "
+        "class C "
+        "  public static method DoIt<T>(t: T): int where T: IFoo "
+        "    return t.Compute(); "
+        "  end DoIt; "
+        "  public static method Main(): int "
+        "    using var y := new YesFoo(); "
+        "    return DoIt<YesFoo>(y); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasConstraintError(r));
+}

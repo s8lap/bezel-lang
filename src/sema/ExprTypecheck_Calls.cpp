@@ -459,6 +459,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // code only handled bare-param return types; compound returns
                 // like `owned Array<T>` were left unsubstituted because the
                 // guard required `rt` to be the bare param itself.
+                //
+                // §14.2 (#729): enforce a generic METHOD's `where T: I`
+                // constraints at the CALL SITE. A non-conforming type argument
+                // was accepted and then SIGSEGV'd via a bad vtable dispatch;
+                // reject it with a clean diagnostic. Conservative: only the
+                // `type` (interface/class bound) kind, and only when both the
+                // bound and the concrete arg resolve to a declaration — defer
+                // otherwise (built-in / generic-param / unresolved) to avoid
+                // false positives, mirroring Resolver::checkOneConstraint.
+                auto checkMethodGenericConstraints =
+                    [&](const std::unordered_map<std::string_view,
+                                                 TypeRef*>& subst) {
+                        for (const auto& gc : md->genericConstraints) {
+                            auto ai = subst.find(gc.typeParam);
+                            if (ai == subst.end() || !ai->second ||
+                                !ai->second->declaration)
+                                continue;
+                            TypeSymbol* argDecl = ai->second->declaration;
+                            for (const auto& item : gc.items) {
+                                if (item.kind != "type" || !item.typeArg)
+                                    continue;
+                                TypeRef* bound =
+                                    ctx_.resolvedType(*item.typeArg);
+                                if (!bound || !bound->declaration) continue;
+                                if (!isSubtype(argDecl, bound->declaration)) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        std::string("type argument `") +
+                                        std::string(argDecl->name) +
+                                        "` does not satisfy the constraint "
+                                        "`where " + std::string(gc.typeParam) +
+                                        ": " +
+                                        std::string(bound->declaration->name) +
+                                        "` (§14.2)");
+                                }
+                            }
+                        }
+                    };
+                bool hadExplicitTypeArgs = false;
                 if (!md->genericParams.empty()) {
                     // per §14.1 (issue #509/#561): explicit type args may
                     // appear on a MemberAccessExpr callee (`obj.Method<T>(...)`)
@@ -492,6 +531,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 explicitSubst[md->genericParams[gi].name] =
                                     concreteArg;
                         }
+                        // #729: enforce the method's where-constraints on the
+                        // explicit type args before consuming them. This path is
+                        // authoritative when explicit args are present, so the
+                        // argument-inferred check below is suppressed.
+                        hadExplicitTypeArgs = true;
+                        checkMethodGenericConstraints(explicitSubst);
                         // Apply substitution: substituteReturnType handles
                         // both bare-param returns (e.g. `T` → concrete T)
                         // and compound returns (e.g. `Array<T>` → `Array<int>`).
@@ -540,6 +585,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (argTy) { argSubst[gp.name] = argTy; break; }
                         }
                     }
+                    // #729: enforce the method's where-constraints on the
+                    // argument-inferred type args (only when no explicit type
+                    // args were given — else the explicit check already ran).
+                    if (!hadExplicitTypeArgs)
+                        checkMethodGenericConstraints(argSubst);
                     // Apply substitution to the (possibly compound) return type.
                     if (!argSubst.empty())
                         rt = substituteReturnType(rt, argSubst);
