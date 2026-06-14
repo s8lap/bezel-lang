@@ -4657,9 +4657,35 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     if (op == "~") return builder_.CreateNot(v);   // bitwise complement
     if (op == "+") return v;                       // identity
     if (op == "not") return builder_.CreateNot(v); // i1 logical negation
-    // §28.3: `move x` is a compile-time ownership transfer; at runtime
-    // it yields the operand value unchanged (the same reference).
-    if (op == "move") return v;
+    // §28.3: `move x` is a compile-time ownership transfer.  At runtime it
+    // yields the operand value unchanged (the same reference).  For a `move`
+    // of a `using var` LOCAL, null the source alloca slot immediately so the
+    // scope-end disposal (emitDisposals) finds null and skips — preventing a
+    // double-dispose when the moved-out object is freed by its new owner's
+    // Dispose cascade (e.g. `using var b; using var a := new T(move b)`).
+    // This mirrors the collection-slot case handled by lowerMoveFromCollectionSlot.
+    // NOTE: plain `var` locals (isUsing=false) are NOT nulled here: the
+    // programmer may borrow from them after the move (e.g. `new T(move n, n)`),
+    // and plain-var locals are not registered for scope-end disposal.
+    if (op == "move") {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un.operand.get())) {
+            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) {
+                if (loc->isUsing) {
+                    if (llvm::AllocaInst* slotAI = localSlot(*un.operand)) {
+                        llvm::Type* ety = nullptr;
+                        llvm::Value* addr = boxedStorage(slotAI, ety);
+                        if (ety && ety->isPointerTy()) {
+                            // Only null pointer-typed slots (class/interface refs).
+                            // Value-type using-var locals have no owned disposal.
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), addr);
+                        }
+                    }
+                }
+            }
+        }
+        return v;
+    }
     return nullptr;
 }
 

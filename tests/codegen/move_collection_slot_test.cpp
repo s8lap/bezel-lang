@@ -70,6 +70,31 @@ BEZEL_TEST(move_coll_slot_28_8_1, owned_array_move_slot_disposes_once) {
         "return afterX * 10 + R._n;"), 11);   // array skipped the slot -> 11
 }
 
+// §28.8.1 / §28.3: `move` of a `using var` LOCAL into an owning constructor
+// transfers ownership; the moved-from local's scope-end Dispose must SKIP (its
+// slot is nulled at the move) so the object is disposed EXACTLY ONCE by its new
+// owner — no double-dispose. Holder owns the moved-in R; at scope end Holder
+// disposes it (R._n -> 1) and `b` (moved-from) disposes nothing.
+// Before the fix: segfault (b re-freed the object already disposed by Holder).
+BEZEL_TEST(move_coll_slot_28_8_1, move_usingvar_local_into_owning_ctor_disposes_once) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end R; "
+        "class Holder "
+        "  public owned Item: R; "
+        "  public constructor(owned item: R) Item := move item; end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  do "
+        "    using var b := new R(); "
+        "    using var a := new Holder(move b); "
+        "  end; "
+        "  return R._n; "                     // 1 = single dispose (correct)
+        "end Main; end C;"), 1);
+}
+
 // §28.11: after `move arr[i]` the OTHER slots are untouched and still owned by
 // the array; the array's Dispose disposes each of them EXACTLY ONCE. With 3
 // elements, `move a[0]` into x: x disposes 1, the array disposes the remaining 2
