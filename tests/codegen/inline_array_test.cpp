@@ -222,3 +222,47 @@ BEZEL_TEST(codegen_array, for_in_array_expression) {
         "  end Main; "
         "end C;"), 60);
 }
+
+// #736 / §15.1: a whole-array collection-literal ASSIGNMENT `target := [...]` to
+// an inline-array lvalue (a class field, in the constructor) was silently
+// dropped (the field stayed zero-initialized). The assignment statement now
+// special-cases the collection literal like the field-init/local-decl paths.
+BEZEL_TEST(codegen_inline_array, collection_literal_assign_to_field_736) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Holder "
+        "  public _arr: [3]int; "
+        "  public constructor() _arr := [10, 20, 30]; end constructor; "
+        "  public method Sum(): int => _arr[0] + _arr[1] + _arr[2]; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var h := new Holder(); "
+        "  return h.Sum(); "  // 60
+        "end Main; end C;"), 60);
+}
+
+// #736: whole-array reassignment of an inline-array LOCAL via a literal.
+BEZEL_TEST(codegen_inline_array, collection_literal_reassign_local_736) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var arr: [3]int := [1, 2, 3]; "
+        "  arr := [40, 50, 60]; "
+        "  return arr[0] + arr[1] + arr[2]; "  // 150
+        "end Main; end C;"), 150);
+}
+
+// #736: an inline array OF RECORDS assigned by literal in the constructor.
+BEZEL_TEST(codegen_inline_array, collection_literal_record_array_field_736) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class Holder "
+        "  public _pts: [2]Pt; "
+        "  public constructor() _pts := [new Pt(3, 4), new Pt(10, 20)]; end constructor; "
+        "  public method Total(): int => _pts[0].X + _pts[0].Y + _pts[1].X + _pts[1].Y; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var h := new Holder(); "
+        "  return h.Total(); "  // 37
+        "end Main; end C;"), 37);
+}

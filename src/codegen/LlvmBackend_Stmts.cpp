@@ -139,6 +139,55 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = nullptr;
             llvm::Value* rhs = nullptr;
+            // #736: a whole-array collection-literal assignment
+            // `target := [e0, e1, ...]` to an inline-array lvalue (field or
+            // local). A CollectionLiteralExpr is not a general expression value
+            // (lowerExpr returns null for it), so this store was silently dropped
+            // and the array stayed zero-initialized — field-init and local-decl
+            // initializers special-case it, but the assignment statement did not.
+            // Mirror the local-decl element-store loop (LlvmBackend_Setup.cpp
+            // ~4281). Heap collections (Set/Array/Dict) have `ptr` slots, not an
+            // ArrayType elemTy, so the dyn_cast guard excludes them.
+            if (as->op == ":=") {
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        as->value.get())) {
+                    if (!cl->isDict) {
+                        llvm::Type* aelemTy = nullptr;
+                        llvm::Value* aaddr = lvalueAddr(*as->target, aelemTy);
+                        if (auto* aty = aelemTy
+                                ? llvm::dyn_cast<llvm::ArrayType>(aelemTy)
+                                : nullptr) {
+                            if (aaddr) {
+                                llvm::Type* et = aty->getElementType();
+                                for (std::size_t i = 0;
+                                     i < cl->elements.size() &&
+                                     i < aty->getNumElements(); ++i) {
+                                    if (!cl->elements[i]) continue;
+                                    llvm::Value* ev =
+                                        lowerExpr(*cl->elements[i]);
+                                    if (!ev) continue;
+                                    if (ev->getType() != et &&
+                                        ev->getType()->isIntegerTy() &&
+                                        et->isIntegerTy()) {
+                                        unsigned eb =
+                                            ev->getType()->getIntegerBitWidth();
+                                        unsigned db = et->getIntegerBitWidth();
+                                        ev = db > eb
+                                                 ? builder_.CreateSExt(ev, et)
+                                                 : builder_.CreateTrunc(ev, et);
+                                    }
+                                    llvm::Value* gep = builder_.CreateGEP(
+                                        aty, aaddr,
+                                        {builder_.getInt32(0),
+                                         builder_.getInt32((unsigned)i)});
+                                    builder_.CreateStore(ev, gep);
+                                }
+                                return false;  // handled
+                            }
+                        }
+                    }
+                }
+            }
             // #579 / §27.5: a recursive lambda assigned to a local refers to
             // that very local in its body — `counter := (n) => ... counter(n-1)`.
             // Lowering the RHS lambda BOXES the captured `counter` slot: it
