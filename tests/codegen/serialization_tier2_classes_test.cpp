@@ -156,22 +156,29 @@ const char* kImport = "import System.Serialization; ";
 // serialization-eligible is a compile error at the conformance declaration."
 // ===========================================================================
 
-// §9.8: a class with ISerializable but no `serialized tree/graph/cyclic`
-// clause and no hand-written Serialize is a compile error at the conformance.
+// §9.8 v0.141 (#703 migration): the `serialized tree/graph/cyclic` keyword
+// clause was retired. A class participates in serialization synthesis by
+// DECLARING `: ISerializable`/`: IDeserializable`; its wire shape is driven by
+// field types. A keyword-less Box with a single value property round-trips
+// type-driven (was a compile error under the keyword model). Ineligible-component
+// rejection is covered by tree_class_ineligible_owned_child_is_error below.
 BEZEL_TEST(codegen_serialization_t2_classes,
-           class_iserializable_no_graph_clause_is_error_spec_9_8) {
-    BEZEL_EXPECT_TRUE(compileFails(
+           class_iserializable_keyword_less_type_driven_roundtrip_spec_9_8_v0141) {
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
         "class Box: ISerializable, IDeserializable "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
         "end Box; "
         "class C public static method Main(): int "
-        "  using var b := new Box(1); "
+        "  using var b := new Box(7); "
         "  using var s := new BinarySerializer(); "
         "  b.Serialize(s); "
-        "  return 0; "
-        "end Main; end C;"));
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var b2 := Box.Deserialize(d); "
+        "  return b2.V; "
+        "end Main; end C;"), 7);
 }
 
 // §9.8: a `serialized tree` class whose owned child class has no graph-shape

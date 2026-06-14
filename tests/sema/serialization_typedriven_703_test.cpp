@@ -175,6 +175,81 @@ const char* kImport = "module M; import System.Serialization; ";
 } // namespace
 
 // ===========================================================================
+// Keyword-less entry: the pure v0.141 type-driven form (NO keyword clause)
+// ===========================================================================
+
+// §9.8 v0.141: the headline of the migration — a class declares `: ISerializable,
+// IDeserializable` with NO `serialized graph` keyword, and the Shared<Inner>
+// field drives identity serialization purely from its type. Round-trips (42),
+// LSan-clean. This is the form the v0.141 spec describes; the keyword is gone.
+BEZEL_TEST(serialization_typedriven_703,
+           keyword_less_shared_field_roundtrip_spec_9_8_v0141) {
+    expectLeakFree(
+        std::string(kImport) +
+        "class Inner: ISerializable, IDeserializable "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end Inner; "
+        "class Holder: ISerializable, IDeserializable "
+        "  public owned Handle: Shared<Inner>; "
+        "  public constructor(owned handle: Shared<Inner>) "
+        "    Handle := handle; "
+        "  end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  var inner := new Inner(42); "
+        "  using var sh := new Shared<Inner>(inner); "
+        "  using var h := new Holder(sh.Clone()); "
+        "  using var s := new BinarySerializer(); "
+        "  h.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var h2 := Holder.Deserialize(d); "
+        "  return h2.Handle.Get().V; "
+        "end Main; end C;",
+        42);
+}
+
+// §9.8 v0.141: keyword-less self-cycle — a Node declaring `: ISerializable,
+// IDeserializable` (no keyword) with a Weak<Node> self-back-edge round-trips and
+// the weak upgrades back to the node. Proves the cyclic capability works in the
+// pure type-driven form.
+BEZEL_TEST(serialization_typedriven_703,
+           keyword_less_cyclic_self_weak_roundtrip_spec_9_8_v0141) {
+    expectLeakFree(
+        std::string(kImport) +
+        "class Node: ISerializable, IDeserializable "
+        "  public property V: int; "
+        "  public owned Back: Weak<Node>?; "
+        "  public constructor(v: int, owned back: Weak<Node>?) "
+        "    V := v; Back := back; "
+        "  end constructor; "
+        "end Node; "
+        "class Holder: ISerializable, IDeserializable "
+        "  public owned Root: Shared<Node>; "
+        "  public constructor(owned root: Shared<Node>) "
+        "    Root := root; "
+        "  end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  var node := new Node(42, null); "
+        "  using var sh := new Shared<Node>(node); "
+        "  sh.Get().Back := sh.Downgrade(); "
+        "  using var holder := new Holder(sh.Clone()); "
+        "  using var s := new BinarySerializer(); "
+        "  holder.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var holder2 := Holder.Deserialize(d); "
+        "  if holder2.Root.Get().Back!.TryUpgrade(out using var up) then "
+        "    return holder2.Root.Get().V + up.Get().V; "
+        "  end; "
+        "  return -1; "
+        "end Main; end C;",
+        84);
+}
+
+// ===========================================================================
 // S1: Shared<T> component eligibility (§9.8 v0.141)
 // ===========================================================================
 

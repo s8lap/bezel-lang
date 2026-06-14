@@ -2281,30 +2281,30 @@ void Resolver::checkSerializationEligibility() {
         // Classes: §9.8 tier-2 eligibility checking.
         if (isClass) {
             if (!td->serializedClass) {
-                // A class declaring ISerializable/IDeserializable without a
-                // `serialized tree`/`graph`/`cyclic` clause is a compile error
-                // at the conformance declaration (§9.8 — classes outside synthesis
-                // must hand-write Serialize/Deserialize).
-                // Check for hand-written suppression first.
+                // §9.8 v0.141: the `serialized tree`/`graph`/`cyclic` keyword
+                // clause was retired. A class participates in serialization
+                // synthesis by DECLARING `: ISerializable`/`: IDeserializable`;
+                // its wire shape is driven by field types (owned/value → inline,
+                // Shared<T> → identity $id/$ref, Weak<T>/borrow → back-reference).
+                // Synthesize a graph-shape clause so the existing synthesis
+                // machinery — now Shared/Weak-aware (slices S1-S5) — applies; the
+                // component-eligibility checks below then validate the type-driven
+                // components. Hand-written Serialize/Deserialize still suppresses
+                // synthesis on that side (no synthesis when fully hand-written).
                 bool hwS = typeHasHandWrittenMethod(t, "Serialize");
                 bool hwD = typeHasHandWrittenMethod(t, "Deserialize");
-                if (wantsIS && !hwS) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "class `" + std::string(t->name) + "` declares "
-                        "`ISerializable` but has no `serialized tree`/`graph`/"
-                        "`cyclic` clause and no hand-written `Serialize` (§9.8): "
-                        "add a graph-shape clause or hand-write `Serialize`");
+                bool needsSer   = wantsIS && !hwS;
+                bool needsDeser = wantsID && !hwD;
+                if (!needsSer && !needsDeser) {
+                    continue;  // fully hand-written → no synthesis
                 }
-                if (wantsID && !hwD) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "class `" + std::string(t->name) + "` declares "
-                        "`IDeserializable` but has no `serialized tree`/`graph`/"
-                        "`cyclic` clause and no hand-written `Deserialize` (§9.8): "
-                        "add a graph-shape clause or hand-write `Deserialize`");
-                }
-                continue;
+                static const std::string kSyntheticGraphShape = "graph";
+                auto* mutTd = const_cast<ast::TypeDecl*>(td);
+                mutTd->serializedClass =
+                    std::make_unique<ast::SerializedClassClause>();
+                mutTd->serializedClass->shape = kSyntheticGraphShape;
+                // Fall through to the component-eligibility checks below, which
+                // now see the synthetic clause.
             }
 
             // Class has a serialized-class clause. §9.8: eligibility requires

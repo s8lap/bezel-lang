@@ -284,12 +284,13 @@ BEZEL_TEST(codegen_serialization_550, no_conformance_no_synthesis_spec_9_8) {
 // (a codegen-level "not yet implemented" error for class ISerializable).
 // ===========================================================================
 
-// §9.8: a class that declares ISerializable without a `serialized tree`/
-// `graph`/`cyclic` clause but has no hand-written Serialize is a compile error.
-// (The error is emitted at the conformance declaration — either sema or codegen
-// ERROR channel; must produce a hard error and no binary.)
-BEZEL_TEST(codegen_serialization_550, class_no_serialized_clause_hard_error_spec_9_8) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// §9.8 v0.141 (#703 migration): the keyword clause was retired — a class that
+// declares `: ISerializable` (serialize-only, no IDeserializable) without a
+// hand-written Serialize is now type-driven-synthesized, not a compile error.
+// A keyword-less serialize-only Box compiles and serializes its value field.
+BEZEL_TEST(codegen_serialization_550,
+           class_iserializable_only_keyword_less_serializes_spec_9_8_v0141) {
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
         "class Box: ISerializable "
         "  public property V: int; "
@@ -300,5 +301,5 @@ BEZEL_TEST(codegen_serialization_550, class_no_serialized_clause_hard_error_spec
         "  using var s := new BinarySerializer(); "
         "  b.Serialize(s); "
         "  return 0; "
-        "end Main; end C;"));
+        "end Main; end C;"), 0);
 }
