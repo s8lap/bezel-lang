@@ -2333,6 +2333,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
+                // §19.3 / Appendix C: the positional-binding count must match
+                // the record's positional-field count (mirrors the CaseExpr
+                // handler). An over-/under-bound pattern was accepted and then
+                // crashed codegen with malformed IR.
+                if (recTy && !fields.empty() &&
+                    dp->subPatterns.size() != fields.size()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, dp->span.begin,
+                        "record-destructuring pattern `" + std::string(lastName) +
+                        "(...)` binds " + std::to_string(dp->subPatterns.size()) +
+                        " value(s) but record `" + std::string(lastName) +
+                        "` has " + std::to_string(fields.size()) +
+                        " positional field(s); the binding count must match "
+                        "(§19.3)");
+                }
                 Scope armScope;
                 armScope.parent = currentScope_;
                 for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {

@@ -116,6 +116,76 @@ BEZEL_TEST(sema_class_destruct, class_positional_pattern_in_case_stmt_spec_19_3)
     BEZEL_EXPECT_TRUE(hasClassDestructDiag(r));
 }
 
+// ── §19.3 / Appendix C: record-destructuring binding count must match the ────
+//    record's positional-field count (R34). An over-/under-bound pattern was
+//    accepted, then crashed codegen with malformed IR ("case.end no terminator")
+//    in expression position and silently mis-took an arm in statement position.
+
+namespace {
+bool hasArityDiag(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("binding count must match") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+}  // namespace
+
+// R34: over-binding `Pt(x, y, z)` on a 2-field record (case EXPRESSION) — was
+// IR_FAIL; now a clean §19.3 arity diagnostic.
+BEZEL_TEST(sema_class_destruct, record_destructure_over_binding_expr_r34) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(3, 4); "
+        "  return case p Pt(x, y, z) => 1, _ => 0 end; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasArityDiag(r));
+}
+
+// R34: over-binding in a case STATEMENT — was silently accepted (took the `_`
+// arm); now a clean §19.3 arity diagnostic.
+BEZEL_TEST(sema_class_destruct, record_destructure_over_binding_stmt_r34) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(3, 4); var r := 0; "
+        "  case p Pt(x, y, z) => r := 1 end; "
+        "  return r; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasArityDiag(r));
+}
+
+// R34: under-binding `Pt(x)` on a 2-field record is also rejected.
+BEZEL_TEST(sema_class_destruct, record_destructure_under_binding_r34) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(3, 4); "
+        "  return case p Pt(x) => 1, _ => 0 end; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasArityDiag(r));
+}
+
+// R34: the CORRECT arity `Pt(x, y)` must NOT produce an arity diagnostic.
+BEZEL_TEST(sema_class_destruct, record_destructure_correct_arity_ok_r34) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(3, 4); "
+        "  return case p Pt(x, y) => x + y, _ => 0 end; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(!hasArityDiag(r));
+}
+
 // ── §19.3: class type-test patterns (bare name, var binding) still work ──────
 
 // A bare class type-test pattern `Circle` (no parens) is valid. §19.3 says:

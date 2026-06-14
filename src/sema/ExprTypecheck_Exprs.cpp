@@ -2041,6 +2041,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         }
                     }
                 }
+                // §19.3 / Appendix C: "a record-destructuring pattern's
+                // positional-binding count matches the record's positional-
+                // field count." Without this check an over- or under-bound
+                // pattern (`Pt(x, y, z)` on a 2-field record) was accepted, then
+                // codegen's patternMatches could not destructure it and bailed,
+                // leaving malformed IR ("case.end has no terminator").
+                if (recTy && !fields.empty() &&
+                    dp->subPatterns.size() != fields.size()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, dp->span.begin,
+                        "record-destructuring pattern `" + std::string(lastName) +
+                        "(...)` binds " + std::to_string(dp->subPatterns.size()) +
+                        " value(s) but record `" + std::string(lastName) +
+                        "` has " + std::to_string(fields.size()) +
+                        " positional field(s); the binding count must match "
+                        "(§19.3)");
+                }
                 Scope armScope;
                 armScope.parent = currentScope_;
                 for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
