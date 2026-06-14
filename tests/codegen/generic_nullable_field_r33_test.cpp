@@ -53,3 +53,44 @@ BEZEL_TEST(codegen_generic_nullable_field_r33, compare_value_typeparam_nullable_
         "  return (1 if m.IsNull() else 0); "  // _value is null → IsNull true → 1
         "end Main; end C;"), 1);
 }
+
+// R33 (#29, companion to the above): force-unwrap `_v!` of a nullable
+// type-parameter FIELD `_v: T?` (T = int). The field's TypeRef carries a
+// declaration, so the #604 type-param resolution misses it and `return _v!`
+// returned the whole {i8, i32} struct → `ret { i8, i32 }` against an `i32`
+// function (IR-verify failure, bezelc abort). Fix: detect the nullable-value
+// struct by shape and extract the value slot. After Set(7), Get() returns 7.
+BEZEL_TEST(codegen_generic_nullable_field_r33, force_unwrap_value_typeparam_field) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class E end E; "
+        "class Box<T> "
+        "  private _v: T?; "
+        "  public method Set(v: T) _v := v; end Set; "
+        "  public method Get(): T "
+        "    if _v = null then throw new E(); end; "
+        "    return _v!; "
+        "  end Get; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box<int>(); "
+        "  b.Set(7); "
+        "  try return b.Get(); catch E => return 42; end; "
+        "end Main; end C;"), 7);
+}
+
+// R33 (#29): the guard fires when the field IS null — `_v!` on an unset field
+// throws NullReferenceException, exercised through the §17.12 guard.
+BEZEL_TEST(codegen_generic_nullable_field_r33, force_unwrap_null_typeparam_field_throws) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box<T> "
+        "  private _v: T?; "
+        "  public constructor() _v := null; end constructor; "
+        "  public method Get(): T return _v!; end Get; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box<int>(); "
+        "  try return b.Get(); catch NullReferenceException => return 99; end; "
+        "end Main; end C;"), 99);
+}

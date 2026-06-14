@@ -431,6 +431,24 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 }
             }
         }
+        // R33: the operand may already be the nullable-value struct
+        // {i8 hasValue; <T> value} even when both isNullableValueTy and the
+        // #604 type-param resolution above miss it — e.g. a nullable
+        // type-parameter FIELD `_v: T?` (the field's TypeRef carries a
+        // declaration, so the #604 guard `!rt->declaration` does not fire).
+        // Without this, `_v!` returns the whole struct and a `return _v!`
+        // emits `ret { i8, i32 }` against an `i32` function → IR-verify
+        // failure.  Detect by LLVM shape (element 0 is the hasValue tag) and
+        // extract the value slot, exactly as the null-comparison path does.
+        if (v->getType()->isStructTy()) {
+            auto* st = llvm::cast<llvm::StructType>(v->getType());
+            if (st->getNumElements() >= 1 &&
+                st->getElementType(0) == nullablePrimHasValTy()) {
+                emitGuardThrow(builder_.CreateNot(nullablePrimHasValue(v)),
+                               "NullReferenceException");
+                return nullablePrimValue(v);
+            }
+        }
         if (v->getType()->isPointerTy()) {
             emitGuardThrow(builder_.CreateICmpEQ(
                                v, llvm::ConstantPointerNull::get(ptrTy())),
