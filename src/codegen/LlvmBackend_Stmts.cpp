@@ -1423,16 +1423,43 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 emitUnwindDisposalsInRange(savedDepth, thisTryDepth);
                 builder_.CreateBr(outerUnwind);
             }
-        } else if (!lowerScopedBlock(trys.finallyBody)) {
-            // #467 / §28.3 (lines 4914, 4922): the explicit finally has now run;
-            // as the exception unwinds further out to the enclosing handler
-            // (outerUnwind), dispose any owned locals / using-vars that live in
-            // the scopes BETWEEN this try and that handler — the throw site only
-            // disposed scopes down to thisTryDepth, so [savedDepth, thisTryDepth)
-            // is still live. (No-op when this try sits directly in its handler's
-            // scope, i.e. savedDepth == thisTryDepth.)
-            emitUnwindDisposalsInRange(savedDepth, thisTryDepth);
-            builder_.CreateBr(outerUnwind);
+        } else {
+            // #720 / §31.2: the synchronous unwind-path finally. Capture the
+            // in-flight exception and CLEAR bz$exc before running the finally —
+            // otherwise a `new`/call inside the finally body hits
+            // emitNewPendingCheck/emitPendingCheck, sees the still-pending
+            // ORIGINAL exception, and unwinds it immediately, BEFORE the finally's
+            // own `throw` executes — silently swallowing the finally's exception.
+            // After the finally: if it threw (bz$exc non-null), that NEW exception
+            // supersedes (§31.2); otherwise restore the original. Mirrors the
+            // async branch above, minus the cross-thread frame-spill.
+            llvm::AllocaInst* pendingExcSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(builder_.CreateLoad(ptrTy(), emitExcSlot()),
+                                 pendingExcSlot);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
+            if (!lowerScopedBlock(trys.finallyBody)) {
+                llvm::Value* afterFin =
+                    builder_.CreateLoad(ptrTy(), emitExcSlot());
+                llvm::Value* finThrew = builder_.CreateICmpNE(
+                    afterFin, llvm::ConstantPointerNull::get(ptrTy()),
+                    "fin.threw");
+                auto* restoreBB = llvm::BasicBlock::Create(
+                    llvm_, "finally.restore", currentFn_);
+                auto* propBB = llvm::BasicBlock::Create(
+                    llvm_, "finally.reraise", currentFn_);
+                builder_.CreateCondBr(finThrew, propBB, restoreBB);
+                builder_.SetInsertPoint(restoreBB);
+                builder_.CreateStore(
+                    builder_.CreateLoad(ptrTy(), pendingExcSlot), emitExcSlot());
+                builder_.CreateBr(propBB);
+                builder_.SetInsertPoint(propBB);
+                // #467 / §28.3: dispose owned locals/using-vars in the scopes
+                // between this try and the enclosing handler (the throw site
+                // only disposed down to thisTryDepth).
+                emitUnwindDisposalsInRange(savedDepth, thisTryDepth);
+                builder_.CreateBr(outerUnwind);
+            }
         }
     }
 

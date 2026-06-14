@@ -136,3 +136,36 @@ BEZEL_TEST(codegen_cg21b_546, finally_runs_then_function_value_returned) {
         "  end Main; "
         "end C;"), 7);
 }
+
+// #720 / §31.2: a `throw` inside a `finally` that runs during active exception
+// propagation SUPERSEDES the original exception. Previously the original was
+// caught instead — the synchronous finally ran with bz$exc still holding the
+// original, so a `new` in the finally hit emitNewPendingCheck and unwound the
+// original before the finally's own `throw` executed. The finally now runs with
+// a cleared bz$exc and supersedes (or restores) correctly.
+BEZEL_TEST(codegen_cg21b, throw_in_finally_supersedes_original_720) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class AppErr end AppErr; class FinErr end FinErr; "
+        "class C public static method Main(): int "
+        "  try "
+        "    try throw new AppErr(); "
+        "    finally throw new FinErr(); end; "
+        "  catch FinErr => return 99; "
+        "  catch AppErr => return 1; "
+        "  end; "
+        "end Main; end C;"), 99);
+}
+
+// #720 regression: a finally that does NOT throw lets the original propagate.
+BEZEL_TEST(codegen_cg21b, finally_no_throw_original_propagates_720) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class AppErr end AppErr; "
+        "class C public static method Main(): int "
+        "  var ran := 0; "
+        "  try "
+        "    try throw new AppErr(); "
+        "    finally ran := 1; end; "
+        "  catch AppErr => return ran + 40; "
+        "  end; "
+        "end Main; end C;"), 41);
+}
