@@ -7392,29 +7392,25 @@ llvm::Value* Emitter::buildRecordValue(
 
 
 llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
-    if (!ce.scrutinee) {
-        // R34: the scrutinee-less `case` form (grammar `case Expression?`, each
-        // arm a bool condition — spec §19 / §A, line "case (in scrutinee-less
-        // form) require bool") is a VALID but not-yet-lowered form. Returning
-        // null here previously left the result an uninitialized poison, so a
-        // `var r := case ... end` read back RANDOM GARBAGE at runtime (a silent
-        // miscompile). Emit a clean diagnostic instead until the form is
-        // implemented.
-        ctx_.diagnostics().report(
-            Severity::Error, ce.span.begin,
-            "not yet implemented: scrutinee-less `case` (the boolean-condition "
-            "form `case cond => ... end` with no scrutinee, §19); use an "
-            "`if`/`elif` chain, or a `case` with an explicit scrutinee");
-        return nullptr;
+    // §19 / §A (#727): a scrutinee-less `case cond => ... end` is an ordered
+    // boolean-condition chain — each arm's "pattern" is a bool expression and
+    // `_` is the catch-all — evaluated like an if/elif chain. It reuses the same
+    // body/next/guard/result-PHI machinery; only the per-arm test is computed
+    // differently (directly from the condition, not via patternMatches).
+    llvm::Value* scrut = nullptr;
+    const sema::TypeSymbol* enumTy = nullptr;
+    bool isStr = false;
+    const sema::TypeRef* scrutTy = nullptr;
+    if (ce.scrutinee) {
+        scrut = lowerExpr(*ce.scrutinee);
+        if (!scrut) return nullptr;
+        enumTy = enumTypeOf(*ce.scrutinee);
+        isStr = isStringExprType(*ce.scrutinee);
+        // §7 / issue #447: pass the scrutinee's resolved TypeRef so
+        // patternMatches can detect a nullable VALUE type and apply
+        // hasValue-based matching instead of the pointer-based paths.
+        scrutTy = ctx_.exprType(*ce.scrutinee);
     }
-    llvm::Value* scrut = lowerExpr(*ce.scrutinee);
-    if (!scrut) return nullptr;
-    const sema::TypeSymbol* enumTy = enumTypeOf(*ce.scrutinee);
-    bool isStr = isStringExprType(*ce.scrutinee);
-    // §7 / issue #447: pass the scrutinee's resolved TypeRef so patternMatches
-    // can detect a nullable VALUE type ({i8 hasValue; T value} struct) and
-    // apply hasValue-based matching instead of the pointer-based paths.
-    const sema::TypeRef* scrutTy = ctx_.exprType(*ce.scrutinee);
     const sema::TypeRef* resultSemaTy = ctx_.exprType(ce);
     llvm::Type* resultTy = i32();
     if (resultSemaTy) resultTy = lowerTypeRef(resultSemaTy);
@@ -7426,8 +7422,27 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
             !arm.exprBody)
             return nullptr;  // block-body arms deferred
-        llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy,
-                                         isStr, scrutTy);
+        llvm::Value* pm = nullptr;
+        if (!ce.scrutinee) {
+            // #727: scrutinee-less arm. `_` always matches; otherwise the arm's
+            // pattern is one or more bool CONDITION expressions (comma = OR).
+            if (dynamic_cast<const ast::DiscardPattern*>(arm.pattern.get())) {
+                pm = builder_.getInt1(true);
+            } else if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
+                           arm.pattern.get())) {
+                for (const auto& c : cp->constants) {
+                    if (!c) continue;
+                    llvm::Value* cond = lowerExpr(*c);
+                    if (!cond) continue;
+                    if (!cond->getType()->isIntegerTy(1))
+                        cond = builder_.CreateICmpNE(
+                            cond, llvm::ConstantInt::get(cond->getType(), 0));
+                    pm = pm ? builder_.CreateOr(pm, cond) : cond;
+                }
+            }
+        } else {
+            pm = patternMatches(arm.pattern.get(), scrut, enumTy, isStr, scrutTy);
+        }
         // #473: with type-test (`Dog`), primitive-type (`int`), typed-binding
         // (`var x: Dog`/`var v: int`), and the existing constant/range/null/
         // destructure patterns all lowered, the #473 repros no longer reach

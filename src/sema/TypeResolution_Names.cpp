@@ -903,6 +903,15 @@ void Resolver::resolveTypesInPattern(const ast::Pattern& p, Scope* scope) {
         }
         return;
     }
+    // §19 / §A (#727): a ConstantPattern in a SCRUTINEE-LESS `case` holds the
+    // arm's boolean CONDITION expression (e.g. `x > 5`), whose identifiers must
+    // be resolved like any expression. (In the scrutinee form the constants are
+    // literals/enum members, for which this recursion is harmless.)
+    if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(&p)) {
+        for (const auto& c : cp->constants)
+            if (c) resolveTypesInExpr(*c, scope);
+        return;
+    }
 }
 
 void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {

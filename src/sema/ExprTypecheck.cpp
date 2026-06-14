@@ -2249,6 +2249,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         for (const auto& arm : cs->arms) {
+            // §19 / §A (#727): scrutinee-less arm — typecheck the bool CONDITION
+            // expression(s) the ConstantPattern holds.
+            if (!cs->scrutinee) {
+                if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
+                        arm.pattern.get()))
+                    for (const auto& c : cp->constants)
+                        if (c) visitExpr(*c);
+            }
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).
             auto* bp =

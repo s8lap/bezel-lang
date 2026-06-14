@@ -1965,6 +1965,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
         for (const auto& arm : ce->arms) {
+            // §19 / §A (#727): in a SCRUTINEE-LESS `case`, an arm's pattern is a
+            // boolean CONDITION expression (a ConstantPattern) — typecheck its
+            // constants so identifiers resolve and codegen can lower them.
+            if (!ce->scrutinee) {
+                if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
+                        arm.pattern.get()))
+                    for (const auto& c : cp->constants)
+                        if (c) visitExpr(*c);
+            }
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).
             auto* bp =

@@ -3502,31 +3502,44 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
 
 
 bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
-    if (!cs.scrutinee) {
-        // R34: the scrutinee-less `case` form is valid grammar (§19 / §A) but
-        // not yet lowered. Silently returning false skipped the whole statement
-        // (its arms never ran). Emit a clean diagnostic instead of a silent
-        // no-op until the form is implemented. Mirrors lowerCaseExpr.
-        ctx_.diagnostics().report(
-            Severity::Error, cs.span.begin,
-            "not yet implemented: scrutinee-less `case` (the boolean-condition "
-            "form `case cond => ... end` with no scrutinee, §19); use an "
-            "`if`/`elif` chain, or a `case` with an explicit scrutinee");
-        return false;  // not diverged; the Error already fails compilation
+    // §19 / §A (#727): a scrutinee-less `case cond => ... end` statement is an
+    // ordered boolean-condition chain (like if/elif); each arm's pattern is a
+    // bool condition and `_` is the catch-all.
+    llvm::Value* scrut = nullptr;
+    const sema::TypeSymbol* enumTy = nullptr;
+    bool isStr = false;
+    const sema::TypeRef* scrutTy = nullptr;
+    if (cs.scrutinee) {
+        scrut = lowerExpr(*cs.scrutinee);
+        if (!scrut) return false;
+        enumTy = enumTypeOf(*cs.scrutinee);
+        isStr = isStringExprType(*cs.scrutinee);
+        scrutTy = ctx_.exprType(*cs.scrutinee);
     }
-    llvm::Value* scrut = lowerExpr(*cs.scrutinee);
-    if (!scrut) return false;
-    const sema::TypeSymbol* enumTy = enumTypeOf(*cs.scrutinee);
-    bool isStr = isStringExprType(*cs.scrutinee);
-    // §7 / issue #447: pass the scrutinee's resolved TypeRef so patternMatches
-    // can detect a nullable VALUE type ({i8 hasValue; T value} struct) and
-    // apply hasValue-based matching instead of the pointer-based paths.
-    const sema::TypeRef* scrutTy = ctx_.exprType(*cs.scrutinee);
     auto* endBB =
         llvm::BasicBlock::Create(llvm_, "casestmt.end", currentFn_);
     for (const auto& arm : cs.arms) {
-        llvm::Value* pm = patternMatches(arm.pattern.get(), scrut, enumTy,
-                                         isStr, scrutTy);
+        llvm::Value* pm = nullptr;
+        if (!cs.scrutinee) {
+            // #727: scrutinee-less arm — `_` always matches; otherwise the arm's
+            // pattern is one or more bool conditions (comma = OR).
+            if (dynamic_cast<const ast::DiscardPattern*>(arm.pattern.get())) {
+                pm = builder_.getInt1(true);
+            } else if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
+                           arm.pattern.get())) {
+                for (const auto& c : cp->constants) {
+                    if (!c) continue;
+                    llvm::Value* cond = lowerExpr(*c);
+                    if (!cond) continue;
+                    if (!cond->getType()->isIntegerTy(1))
+                        cond = builder_.CreateICmpNE(
+                            cond, llvm::ConstantInt::get(cond->getType(), 0));
+                    pm = pm ? builder_.CreateOr(pm, cond) : cond;
+                }
+            }
+        } else {
+            pm = patternMatches(arm.pattern.get(), scrut, enumTy, isStr, scrutTy);
+        }
         if (!pm) {  // deferred pattern kind — degrade to no-op
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
