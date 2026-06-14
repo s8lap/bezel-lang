@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.140 — June 2026**
+**Companion to the Bezel Language Specification, v0.141 — June 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -547,10 +547,13 @@ public static method Deserialize(d: IDeserializer): T;          // value-type
                                                                 //   enum): no `owned`
 public static method Deserialize(d: IDeserializer): owned T;     // class target:
                                                                 //   `owned` return
-// T = the declaring type, written concretely.
+public static method Deserialize(d: IDeserializer): owned Shared<C>;  // co-owned entry:
+                                                                //   the class is itself
+                                                                //   a shared node
+// T = the declaring type; C = the declaring shared-node class; both written concretely.
 ```
 
-is deserializable. The recognized factory's return type is the declaring type itself, written concretely. The `owned` modifier appears exactly when the declaring type is a class (a class instance is an owned heap value transferred to the caller — language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)); for a value-type target (record or enum, the synthesis-eligible common case) the return is a plain by-value `T` with no `owned` modifier, because `owned` on a non-class return is semantically rejected (language spec [§22.1](Bezel_Language_Spec.md#sec-method-declarations) — the modifier applies only to class-typed returns). Bezel has no `Self` type (that feature is separately deferred), so the return type is spelled with the concrete type name. `IDeserializable` is a *marker* whose presence says "this type provides the recognized `Deserialize` factory," in the same way `: IEquatable<T>` opts a record into synthesized equality without the user writing the comparison. The hand-written form today, for the record (value-type) case:
+is deserializable. The recognized factory's return type is the declaring type itself, written concretely. The `owned` modifier appears exactly when the declaring type is a class (a class instance is an owned heap value transferred to the caller — language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)); for a value-type target (record or enum, the synthesis-eligible common case) the return is a plain by-value `T` with no `owned` modifier, because `owned` on a non-class return is semantically rejected (language spec [§22.1](Bezel_Language_Spec.md#sec-method-declarations) — the modifier applies only to class-typed returns). A class that is itself a *shared node* in its own serialized graph uses the `owned Shared<C>` form — it participates by identity and round-trips as a co-owned handle, and `Shared<C>` is a class so the `owned` modifier applies; the choice is locally decidable — a class that merely *holds* `Shared<T>`/`Weak<T>` fields returns `owned C`, a class that *is* the shared node returns `owned Shared<C>` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis), rationale [§5.22](Bezel_Design_Rationale.md#sec-type-driven-serialization)). Bezel has no `Self` type (that feature is separately deferred), so the return type is spelled with the concrete type name. `IDeserializable` is a *marker* whose presence says "this type provides the recognized `Deserialize` factory," in the same way `: IEquatable<T>` opts a record into synthesized equality without the user writing the comparison. The hand-written form today, for the record (value-type) case:
 
 ```bezel
 public record Point(X: int, Y: int): ISerializable, IDeserializable
@@ -597,11 +600,11 @@ public record User(
 
 The clause has a closed effect vocabulary — `serialized "<name>"` (rename), `serialized skip` (exclude), `serialized optional` (omit-if-null on write, default-if-missing on read), with rename and tolerate combinable as `serialized "<name>" optional` and `skip` mutually exclusive with both — defined normatively in language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis). It is a compiler-recognized declaration modifier, deliberately *not* an attribute system and deliberately not a separate exhaustive key list (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection) explains the design and why it improves on the Swift `CodingKeys` model).
 
-As of v0.119, a **class** can also be synthesized, by declaring `serialized tree` on its header — an explicit assertion that its serialized object graph is a tree (no aliasing among serialized edges, no cycles):
+A **class** can also be synthesized: it declares `: ISerializable`/`: IDeserializable` and the compiler reads its serialized shape from its field types — no header clause. A class whose fields are all `owned` (or value-typed) serializes as a tree:
 
 ```bezel
-public class Order(id: int) serialized tree : ISerializable, IDeserializable
-  public owned Customer: Customer;        // nested owned class, also tree
+public class Order(id: int): ISerializable, IDeserializable
+  public owned Customer: Customer;        // owned: an owning edge, serialized inline
   public owned Lines: OwnedArray<owned LineItem>;
   public readonly property Id: int => id;
   // compiler synthesizes Serialize / Deserialize; each owned child
@@ -609,10 +612,10 @@ public class Order(id: int) serialized tree : ISerializable, IDeserializable
 end Order;
 ```
 
-As of v0.121, a class whose serialized graph *aliases* — the same object reachable by more than one serialized path — declares `serialized graph` instead, asserting a directed acyclic graph (shared references allowed, no cycles):
+A class whose serialized graph *aliases* — the same object reachable by more than one serialized path — expresses the shared edge through its field types: a plain borrowing field is a back-edge into the owning tree, and a `Shared<T>` field is a co-owned identity participant. No header clause:
 
 ```bezel
-public class Invoice(number: string) serialized graph : ISerializable, IDeserializable
+public class Invoice(number: string): ISerializable, IDeserializable
   public owned Seller: Company;           // owned: in the owning spanning tree
   public owned Buyer: Company;            // owned
   public AccountManager: Employee;        // borrow: a back-edge, e.g. an
@@ -621,39 +624,35 @@ public class Invoice(number: string) serialized graph : ISerializable, IDeserial
 end Invoice;
 ```
 
-The synthesized `Deserialize` for a class returns `owned Invoice` (a class instance is an owned heap value transferred to the caller). It reconstructs the owning spanning tree (the `owned` edges) in owner-before-borrower order; each borrowing back-edge (here `AccountManager`) is supplied **as a constructor argument**, resolved against an identity table that already holds the target because a directed acyclic graph always admits such an order. Because every reference field is bound through the constructor, before any constructor body runs, no constructed object ever has an unbound non-nullable reference — definite assignment (language spec [§7.9](Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields)) holds with no nullable relaxation and no observable intermediate state. Graph shape cannot be verified statically, so the synthesized deserializer **enforces it dynamically**: `serialized tree` raises on any repeated object identity; `serialized graph` binds a repeated reference to the already-constructed object (identity preserved, not duplicated — Bezel refuses the silent-duplication failure mode of reference-unaware serializers) but raises `SerializationException` on a **cycle** (a reference whose target is still under construction).
+The synthesized `Deserialize` for a class returns `owned Invoice` (a class instance is an owned heap value transferred to the caller). It reconstructs the owning spanning tree (the `owned` edges) in owner-before-borrower order; each plain borrowing back-edge (here `AccountManager`) is supplied **as a constructor argument**, resolved against an identity table that already holds the target because the owning tree admits such an order. Because every reference field bound through the constructor is set before any constructor body runs, no constructed object ever has an unbound non-nullable reference — definite assignment (language spec [§7.9](Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields)) holds with no nullable relaxation. A `Shared<T>` participant is reconstructed once at its first occurrence and `Clone()`d at each alias; a `Weak<T>` back-edge is `Downgrade()`d from its reconstructed `Shared<T>`. Identity is preserved, never duplicated — Bezel refuses the silent-duplication failure mode of reference-unaware serializers. The one read-side check the field types cannot decide is that a `Weak<T>`'s target is strongly reached somewhere in the graph: a `Weak` reference to a never-strongly-reached target raises `SerializationException`.
 
-As of v0.122, a base class whose components may hold derived instances declares an explicit `polymorphic` registry alongside its graph-shape clause:
+A base class whose components may hold derived instances declares an explicit `polymorphic` registry as a class-body member:
 
 ```bezel
-public abstract class Shape serialized graph
-    polymorphic ("circle": Circle, "square": Square)
-    : ISerializable, IDeserializable
+public abstract class Shape: ISerializable, IDeserializable
+  polymorphic ("circle": Circle, "square": Square);
 end Shape;
 
-public class Circle(radius: double) serialized tree : Shape
+public class Circle(radius: double): Shape, ISerializable, IDeserializable
   public readonly property Radius: double => radius;
 end Circle;
 ```
 
-The registry is a closed, explicitly written map from a wire discriminator to a permitted concrete type — **no reflective subtype discovery** (the design principle of language spec [§5.18](Bezel_Design_Rationale.md#sec-type-identity-not-reflection); this is what prevents a serialized discriminator from becoming an arbitrary-type construction primitive, the defect behind reflective-`$type` remote-code-execution vulnerabilities elsewhere). The synthesized serializer writes the concrete type's discriminator as a leading `$type` field; the synthesized deserializer reads it **first**, looks it up in the registry, and delegates to that type's synthesized `Deserialize`. An unregistered discriminator (read) or an unregistered run-time type (write) raises `SerializationException` — the closed set enforced on both directions. Polymorphic dispatch composes with every graph-shape clause (each registered type reconstructs under its own clause, including `serialized cyclic`).
+The registry is a closed, explicitly written map from a wire discriminator to a permitted concrete type — **no reflective subtype discovery** (the design principle of rationale [§5.18](Bezel_Design_Rationale.md#sec-type-identity-not-reflection); this is what prevents a serialized discriminator from becoming an arbitrary-type construction primitive, the defect behind reflective-`$type` remote-code-execution vulnerabilities elsewhere). The synthesized serializer writes the concrete type's discriminator as a leading `$type` field; the synthesized deserializer reads it **first**, looks it up in the registry, and delegates to that type's synthesized `Deserialize`. An unregistered discriminator (read) or an unregistered run-time type (write) raises `SerializationException` — the closed set enforced on both directions. Polymorphic dispatch composes uniformly with the type-driven model: each registered type reconstructs under whatever shape its own field types describe.
 
-As of v0.124, a class whose serialized graph may contain **cycles** declares `serialized cyclic`:
+A class whose serialized graph may contain **cycles** uses `Shared<T>` for the shared spine and a nullable `Weak<T>?` for each cycle-closing back-edge — both ordinary owned handles, so the cycle is constructed in ownership-valid Bezel and round-trips through the ownership checker:
 
 ```bezel
-public class Node(label: string) serialized cyclic : ISerializable, IDeserializable
-  public owned Next: Node;          // owned forward edge
-  public Parent: Node;              // back-edge: may close a cycle
+public class Node(label: string): ISerializable, IDeserializable
+  public owned Next: Node?;          // owned forward edge (nullable to terminate)
+  public back: Weak<Node>?;          // back-edge: a weak reference that may close a cycle
   public readonly property Label: string => label;
-  // constructor is self-contained: assigns only its own fields,
-  // reads no back-edge, never lets `this` escape — so it is
-  // cyclic-serialization-eligible
 end Node;
 ```
 
-`serialized cyclic` deserializes via a **two-phase construction**: every object in the group is constructed first (back-edge fields not yet bound), then all back-edges are bound through the identity/`$ref` table. This is sound only because every participating class has a **self-contained constructor** — a statically-checked rule (its constructor body, anything it chains to via `this(...)`/`base(...)`, and any field/property initializer that runs during construction may assign its own fields but must not read a back-edge, call an instance method on `this`, let `this` escape, or call a virtual method; the rule is transitive over the whole construction, see language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)). A class in a `serialized cyclic` group whose constructor is not self-contained is a **compile error**, not a runtime fault; such a class hand-writes `Serialize`/`Deserialize` (the only remaining reason to). Definite assignment (language spec [§7.9](Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields)) is preserved unmodified: a non-nullable back-edge is never observed unset, because the only code running between the two phases is self-contained constructors that provably cannot read a back-edge (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis); the design proof is rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)).
+A cycle is built by constructing the `Shared<Node>` spine, then wiring each `Weak<Node>?` back-edge with `Downgrade()` once its target exists — ordinary mutation of a nullable field, so definite assignment (language spec [§7.9](Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields)) is satisfied by the null initializer and no two-phase construction is required. The synthesized `Deserialize` reconstructs the spine and binds each `Weak` `$ref` by `Downgrade()`ing the already-reconstructed `Shared<Node>` its identity tag resolves to. A `Weak<T>` reference whose target is never strongly reached in the graph raises `SerializationException` (the design is rationale [§5.22](Bezel_Design_Rationale.md#sec-type-driven-serialization)).
 
-This completes the serialization stack: every class object graph — tree, DAG, or cyclic — is synthesizable, with polymorphic edges resolved through an explicit registry, the only remaining reason to hand-write `Serialize`/`Deserialize` being a class whose constructor cannot be made self-contained. The concrete format implementations are provided as of v0.115 — see [§2.15](#sec-concrete-serialization-formats). The staging was deliberate: vocabulary (v0.114, the one piece that cannot be retrofitted), then concrete formats (v0.115), record/enum synthesis (v0.116), field-name customization (v0.117), operation-scoped unknown-field tolerance (v0.118), tree-shaped class synthesis (v0.119), the deferred-binding working-out (v0.120, rationale only), shared-reference DAG synthesis (v0.121), polymorphic dispatch (v0.122), the cyclic-case proof discharge (v0.123, rationale only), then cyclic class synthesis (v0.124), each an independent non-breaking addition.
+This is the type-driven serialization model: a class declares `: ISerializable`/`: IDeserializable` and its serialized shape — tree, DAG, or cyclic — follows from its field types (`owned` → owning edge, `Shared<T>` → identity participant, `Weak<T>`/borrow → back-reference), with polymorphic edges resolved through an explicit class-body `polymorphic` registry. The concrete format implementations are provided as of v0.115 — see [§2.15](#sec-concrete-serialization-formats). The migration to type-driven shape (retiring the earlier `serialized tree`/`serialized graph`/`serialized cyclic` keyword clauses in favour of `Shared<T>`/`Weak<T>` ser/des) is recorded in rationale [§5.22](Bezel_Design_Rationale.md#sec-type-driven-serialization).
 
 <a id="sec-concrete-serialization-formats"></a>
 ### 2.15 Concrete serialization formats
@@ -701,7 +700,7 @@ public class BinaryDeserializer: IDeserializer, IDisposable
 end BinaryDeserializer;
 ```
 
-**JSON mapping.** The `ISerializer` token stream maps to JSON as follows. `WriteInt`/`WriteUInt` produce JSON numbers; `WriteFloat` produces a JSON number, with non-finite values (`NaN`, `±Infinity`) raising `SerializationException` (JSON has no representation for them — a binary format is the correct choice when non-finite floats must round-trip). `WriteDecimal` produces a JSON number written without precision loss. `WriteBool` produces `true`/`false`; `WriteString` produces a quoted, escaped JSON string; `WriteChar` produces a one-character JSON string. `WriteNull` produces `null`. `BeginObject`/`WriteFieldName`/`EndObject` produce a JSON object; the `fieldCount` argument to `BeginObject` is advisory (JSON objects are not length-prefixed) and is ignored by `JsonSerializer`. `BeginArray`/`EndArray` produce a JSON array; the `elementCount` argument is likewise advisory. **Identity tokens (specified in v0.139):** the graph-identity operations of the synthesis (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis) — first-occurrence tags and back-references under `serialized graph`/`serialized cyclic`) map to JSON as follows: an object carrying an identity tag is written with a reserved first field `"$id": n` (a positive JSON number, unique per stream); a back-reference is written as the one-field object `{"$ref": n}` in place of the value. On the read side these forms are recognized positionally (an object whose first field is `"$id"` registers the tag; an object whose only field is `"$ref"` resolves it). Field names beginning with `$` are reserved for this mapping: a `serialized "<name>"` rename whose name begins with `$` is a compile error at the conformance declaration. The binary format's tag encoding is internal to it (§9.8's semantics; this paragraph is the JSON wire form only). On the read side, `JsonDeserializer.BeginObject()` and `BeginArray()` return `-1` (JSON does not prefix counts), so consumers use `ReadFieldName()` driven by the object's textual extent and `HasMoreElements()` for arrays. `TryReadNull()` consumes and returns `true` iff the next value is `null`.
+**JSON mapping.** The `ISerializer` token stream maps to JSON as follows. `WriteInt`/`WriteUInt` produce JSON numbers; `WriteFloat` produces a JSON number, with non-finite values (`NaN`, `±Infinity`) raising `SerializationException` (JSON has no representation for them — a binary format is the correct choice when non-finite floats must round-trip). `WriteDecimal` produces a JSON number written without precision loss. `WriteBool` produces `true`/`false`; `WriteString` produces a quoted, escaped JSON string; `WriteChar` produces a one-character JSON string. `WriteNull` produces `null`. `BeginObject`/`WriteFieldName`/`EndObject` produce a JSON object; the `fieldCount` argument to `BeginObject` is advisory (JSON objects are not length-prefixed) and is ignored by `JsonSerializer`. `BeginArray`/`EndArray` produce a JSON array; the `elementCount` argument is likewise advisory. **Identity tokens (specified in v0.139):** the graph-identity operations of the synthesis (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis) — first-occurrence tags for `Shared<T>` identity participants and `$ref` back-references for `Weak<T>` and borrowing fields) map to JSON as follows: an object carrying an identity tag is written with a reserved first field `"$id": n` (a positive JSON number, unique per stream); a back-reference is written as the one-field object `{"$ref": n}` in place of the value. On the read side these forms are recognized positionally (an object whose first field is `"$id"` registers the tag; an object whose only field is `"$ref"` resolves it). Field names beginning with `$` are reserved for this mapping: a `serialized "<name>"` rename whose name begins with `$` is a compile error at the conformance declaration. The binary format's tag encoding is internal to it (§9.8's semantics; this paragraph is the JSON wire form only). On the read side, `JsonDeserializer.BeginObject()` and `BeginArray()` return `-1` (JSON does not prefix counts), so consumers use `ReadFieldName()` driven by the object's textual extent and `HasMoreElements()` for arrays. `TryReadNull()` consumes and returns `true` iff the next value is `null`.
 
 **Binary mapping.** The compact binary format is length-prefixed and self-describing enough to be read back without the schema, but it is *not* a stable interchange format across Bezel versions — it is intended for same-version persistence and IPC, where compactness and speed matter and the producer and consumer share a build. Integers use a variable-length encoding; `BeginObject`/`BeginArray` write the count, so `BinaryDeserializer.BeginObject()` and `BeginArray()` return the actual element count and `HasMoreElements()` is answered from it. Non-finite floats round-trip exactly (the format stores IEEE 754 bit patterns via `BitConverter`, [§2.12](#sec-bitconverter)). Programs needing a documented, version-stable wire format use JSON or an explicit hand-written format; the binary format trades interchange stability for size and speed.
 
