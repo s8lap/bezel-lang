@@ -7541,7 +7541,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
         auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
         if (args.size() != allArgTys.size()) return nullptr;
-        return builder_.CreateCall(fnTy, fnPtr, args);
+        // #719: a lambda body can `throw`; like a normal method call, propagate a
+        // pending exception after the call instead of silently continuing with the
+        // (default) result. Without this, `var fn := () => throw E(); var v := fn();`
+        // swallowed the throw and ran on. emitPendingCheck branches to the unwind
+        // path when the exception slot is set; non-throwing calls just fall through.
+        llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
+        emitPendingCheck();
+        return retTy->isVoidTy() ? nullptr : r;
     };
     if (auto* par = dynamic_cast<sema::ParameterSymbol*>(calleeSym)) {
         sema::TypeRef* rt = par->declType

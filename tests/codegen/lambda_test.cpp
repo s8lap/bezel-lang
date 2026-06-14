@@ -401,3 +401,28 @@ BEZEL_TEST(codegen_cg60, instance_method_ref_passed_as_arg) {
         "  end Main; "
         "end C;"), 7);
 }
+
+// #719 / §31.2: a `throw` inside a lambda body propagates out of the lambda
+// invocation instead of being silently swallowed. The closure-call path now
+// runs emitPendingCheck after the call (like a normal method call).
+BEZEL_TEST(codegen_cg60, lambda_body_throw_is_caught_719) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class AppErr end AppErr; "
+        "class C public static method Main(): int "
+        "  var fn: () -> int := () => throw new AppErr(); "
+        "  try "
+        "    var v := fn(); "
+        "    return v; "
+        "  catch AppErr => return 55; "
+        "  end; "
+        "end Main; end C;"), 55);
+}
+
+// #719: a non-throwing lambda still returns its value normally (no regression).
+BEZEL_TEST(codegen_cg60, lambda_body_no_throw_returns_value_719) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var fn: () -> int := () => 42; "
+        "  return fn(); "
+        "end Main; end C;"), 42);
+}
