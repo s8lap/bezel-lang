@@ -605,6 +605,18 @@ void ExprTC::checkReturnForm(const ast::ReturnStmt& rs) {
             }
             return;
         case ReturnCtx::VoidMethod:
+            // §29.5 (#721): an iterator method cannot use plain `return;` — use
+            // `yield break`. A sync iterator returns IEnumerable<T> (a
+            // ValueMethod ctx) so §21.7 already rejects a bare return; an ASYNC
+            // iterator returns IAsyncEnumerable<T> (this VoidMethod ctx), so
+            // without this the plain return slipped through and HUNG at runtime.
+            if (inIteratorMethod_ && !rs.value) {
+                ctx_.diagnostics().report(
+                    Severity::Error, rs.span.begin,
+                    "an iterator method cannot use plain `return;` — use "
+                    "`yield break;` to end iteration (§29.5)");
+                return;
+            }
             if (rs.value) {
                 ctx_.diagnostics().report(
                     Severity::Error, rs.span.begin,
@@ -1452,13 +1464,19 @@ void ExprTC::visitMember(const ast::Member& m) {
             currentReturnType_ = md->returnType
                 ? ctx_.resolvedType(*md->returnType) : nullptr;
         }
+        // §29.3/§29.5 (#721): a method using `yield` is an iterator. Set the
+        // flag BEFORE visiting the body so checkReturnForm can reject a plain
+        // `return;` (the async iterator case slips past §21.7). Restore after.
+        bool isIteratorMethod = stmts && stmtsContainYield(*stmts);
+        bool saveIter = inIteratorMethod_;
+        inIteratorMethod_ = isIteratorMethod;
         runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));
+        inIteratorMethod_ = saveIter;
         // Slice DR1 (§21.7): a value-returning method with a block
         // body must return (or otherwise abruptly exit) on every
         // path. Abstract / expression bodies are exempt.
         // §29.3: iterator methods (containing yield return/break) are
         // exempt — the compiler synthesizes the return mechanism.
-        bool isIteratorMethod = stmts && stmtsContainYield(*stmts);
         if (stmts && returnCtx_ == ReturnCtx::ValueMethod &&
             !isIteratorMethod &&
             !bodyAlwaysExits(*stmts)) {

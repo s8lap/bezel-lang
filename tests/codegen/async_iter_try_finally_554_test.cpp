@@ -586,3 +586,35 @@ class C
 end C;
 )"), 12);
 }
+
+// #721 / §29.5: a plain `return;` inside an ASYNC iterator (a method that uses
+// `yield`, returning IAsyncEnumerable<T>) must be a compile error — use
+// `yield break`. The async iterator is a VoidMethod return context, so §21.7
+// did not catch the bare return (as it does for a sync iterator); the program
+// compiled and HUNG at runtime. Now rejected with §29.5.
+BEZEL_TEST(async_iter_try_finally_554, async_iterator_plain_return_rejected_721) {
+    BEZEL_EXPECT_TRUE(compileFails(R"(
+module M;
+class C
+  public async static method Gen(): IAsyncEnumerable<int>
+    yield return 1;
+    return;
+  end Gen;
+  public static method Main(): int return 0; end Main;
+end C;
+)"));
+}
+
+// #721: `yield break` is the correct way to end early — must compile.
+BEZEL_TEST(async_iter_try_finally_554, async_iterator_yield_break_ok_721) {
+    BEZEL_EXPECT_FALSE(compileFails(R"(
+module M;
+class C
+  public async static method Gen(): IAsyncEnumerable<int>
+    yield return 1;
+    yield break;
+  end Gen;
+  public static method Main(): int return 0; end Main;
+end C;
+)"));
+}

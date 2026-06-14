@@ -1897,6 +1897,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // regardless of the enclosing method's async-ness.
         bool saveAsync = inAsyncContext_;
         inAsyncContext_ = lam->isAsync;
+        // #721: a lambda inside an iterator method is its own callable, not an
+        // iterator — `return;` in it is governed by the lambda's own rules.
+        bool saveIter = inIteratorMethod_;
+        inIteratorMethod_ = false;
         currentScope_ = &lamScope;
         returnCtx_ = ReturnCtx::None;
         currentReturnType_ = nullptr;
@@ -1908,6 +1912,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         returnCtx_ = saveRet;
         currentReturnType_ = saveRetTy;
         inAsyncContext_ = saveAsync;
+        inIteratorMethod_ = saveIter;
         loopDepth_ = saveLoop;
         catchDepth_ = saveCatch;
         // §A.7: set the lambda's exprType to a Function TypeRef so

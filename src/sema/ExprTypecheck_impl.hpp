@@ -131,6 +131,11 @@ private:
     // constructors are never async, so an `await` there is rejected by this
     // gate without special-casing (Appendix C.6).
     bool inAsyncContext_ = false;
+    // #721/§29.5: true while visiting an iterator method body (sync or async,
+    // i.e. it contains `yield`). A plain `return;` in an iterator is forbidden
+    // (use `yield break`); for an ASYNC iterator §21.7 does not catch it (it is
+    // a VoidMethod ctx), so checkReturnForm consults this flag.
+    bool inIteratorMethod_ = false;
 
     // per §24.3: when about to visit an event-handler lambda argument
     // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this
