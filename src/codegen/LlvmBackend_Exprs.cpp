@@ -6458,21 +6458,42 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     if (!rt->genericArgs.empty() && t->decl) {
         auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
         if (td && td->genericParams.size() == rt->genericArgs.size()) {
+            // #732: if EVERY generic arg is an UNBOUND type parameter (a generic
+            // METHOD template body, e.g. `new Box<T>` inside `Make<T>` where T
+            // is not bound in the active subst), do NOT install a substitution.
+            // Installing one would lowerTypeRef(T) → the i32 fallback and
+            // specialize the record (`record.Box$spec0`), but the function's
+            // declared return type `Box<T>` was emitted UNspecialized
+            // (`record.Box`, via recordStruct's matching allUnbound path), so the
+            // produced value would mismatch the return type → IR-verify failure.
+            // Mirrors the allUnbound test in LlvmBackend_Layout.cpp:594-609.
+            bool allUnbound = true;
+            for (const auto& arg : rt->genericArgs) {
+                if (!arg || arg->kind != sema::TypeRef::Kind::Named ||
+                    arg->declaration || !arg->astNode || !arg->astNode->name ||
+                    arg->astNode->name->parts.size() != 1 ||
+                    genericSubst_.count(arg->astNode->name->parts[0])) {
+                    allUnbound = false;
+                    break;
+                }
+            }
             // Resolve generic args WITH the outer substitution active so
             // that `new Pair<T>` inside a `Pair<string>` method correctly
             // maps T → ptr (string) rather than the i32 fallback.
-            std::unordered_map<std::string_view, llvm::Type*> newSubst;
-            std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-            for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
-                llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
-                std::string_view pname = td->genericParams[gi].name;
-                newSubst[pname] = concrTy;
-                // Record the sema TypeRef for the concrete arg so the
-                // binary `=` handler can distinguish string vs. class ptr.
-                newSema[pname] = rt->genericArgs[gi];
+            if (!allUnbound) {
+                std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+                for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
+                    llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
+                    std::string_view pname = td->genericParams[gi].name;
+                    newSubst[pname] = concrTy;
+                    // Record the sema TypeRef for the concrete arg so the
+                    // binary `=` handler can distinguish string vs. class ptr.
+                    newSema[pname] = rt->genericArgs[gi];
+                }
+                genericSubst_ = std::move(newSubst);
+                genericSubstSemaTy_ = std::move(newSema);
             }
-            genericSubst_ = std::move(newSubst);
-            genericSubstSemaTy_ = std::move(newSema);
         }
     } else if (!rt->genericArgs.empty() && !t->decl &&
                t->genericParams.size() == rt->genericArgs.size()) {

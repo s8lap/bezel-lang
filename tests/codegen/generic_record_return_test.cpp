@@ -242,3 +242,38 @@ BEZEL_TEST(generic_record_return_14_1, control_nongeneric_record_returning_index
         "  return v.A * 1000 + v.B; "          // 10020
         "end Main; end C;"), 10020);
 }
+
+// #732 / §14 / §22.4: a generic METHOD whose declared return type is a generic
+// RECORD (`Make<T>(v: T): Box<T> => new Box<T>(v)`). The method template's
+// declared return type lowers `Box<T>` UNspecialized (record.Box), but lowerNew
+// installed a T→i32 subst and produced the specialized record.Box$spec0 →
+// return-type mismatch / IR-verify failure. lowerNew now skips the substitution
+// when every generic arg is an unbound param, matching the template signature.
+BEZEL_TEST(generic_record_return, generic_method_returns_generic_record_732) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Box<T>(Val: T); "
+        "class C "
+        "  public static method Make<T>(v: T): Box<T> => new Box<T>(v); "
+        "  public static method Main(): int "
+        "    var b := Make<int>(42); "
+        "    return b.Val; "  // 42
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// #732: distinct instantiations (int + string) of the generic-record-returning
+// generic method both work.
+BEZEL_TEST(generic_record_return, generic_method_returns_generic_record_multi_732) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Box<T>(Val: T); "
+        "class C "
+        "  public static method Make<T>(v: T): Box<T> => new Box<T>(v); "
+        "  public static method Main(): int "
+        "    var b := Make<int>(7); "
+        "    var s := Make<string>(\"hi\"); "
+        "    return b.Val + s.Val.Length; "  // 7 + 2 = 9
+        "  end Main; "
+        "end C;"), 9);
+}
