@@ -139,3 +139,47 @@ BEZEL_TEST(generic_concrete_base_617, multiple_int_box_derived_no_crash) {
         "  return b1.GetOne() + b2.GetOne(); "  // 1+1=2
         "end Main; end C;"), 2);
 }
+
+// #722 / §14: a method inherited from a generic base whose return type IS the
+// base's type parameter `T` resolves to the derived type's bound arg (int), not
+// `?`. Previously `h.GetVal()` was typed `?` and `v + 5` failed with "operator
+// + not defined for type ?". substituteMemberType now walks the derived type's
+// base chain to find the bound arg.
+BEZEL_TEST(generic_concrete_base_617, inherited_method_return_type_substituted_722) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Base<T> "
+        "  public _val: T; "
+        "  public constructor(v: T) _val := v; end constructor; "
+        "  public method GetVal(): T return _val; end GetVal; "
+        "  destructor end destructor; "
+        "end Base; "
+        "class IntHolder: Base<int> "
+        "  public constructor(v: int) base(v); end constructor; "
+        "  destructor end destructor; "
+        "end IntHolder; "
+        "class P public static method Main(): int "
+        "  using var h := new IntHolder(10); "
+        "  var v := h.GetVal(); "
+        "  return v + 5; "   // 15
+        "end Main; end P;"), 15);
+}
+
+// #722: the same substitution applies to an inherited FIELD of type T.
+BEZEL_TEST(generic_concrete_base_617, inherited_field_type_substituted_722) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Base<T> "
+        "  public _val: T; "
+        "  public constructor(v: T) _val := v; end constructor; "
+        "  destructor end destructor; "
+        "end Base; "
+        "class IntHolder: Base<int> "
+        "  public constructor(v: int) base(v); end constructor; "
+        "  destructor end destructor; "
+        "end IntHolder; "
+        "class P public static method Main(): int "
+        "  using var h := new IntHolder(20); "
+        "  return h._val + 3; "   // 23
+        "end Main; end P;"), 23);
+}

@@ -3588,6 +3588,27 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
             }
         }
     }
+    // #722: an INHERITED member — the receiver is a DERIVED type that fixes the
+    // generic base's type args (e.g. `IntHolder: Base<int>` calling Base's
+    // `GetVal(): T`). recvTy->declaration is the derived type (not `parent`), so
+    // the direct path above did not match. Walk the derived type's base chain to
+    // find `parent` and substitute recvTy with that base instantiation's TypeRef
+    // (carrying the bound args, e.g. Base<int>) so the classSubst machinery below
+    // resolves `T` to the concrete arg. Mirrors the codegen base-substitution in
+    // LlvmBackend_Layout.cpp:738-765. A single inheritance level (the reported
+    // case) is handled; deeper args-through-args chains can extend this later.
+    if (recvTy && recvTy->declaration && recvTy->declaration != parent) {
+        TypeSymbol* derived = recvTy->declaration;
+        for (std::size_t bi = 0; bi < derived->baseTypes.size(); ++bi) {
+            if (derived->baseTypes[bi] == parent &&
+                bi < derived->baseTypeRefs.size() &&
+                derived->baseTypeRefs[bi] &&
+                !derived->baseTypeRefs[bi]->genericArgs.empty()) {
+                recvTy = derived->baseTypeRefs[bi];
+                break;
+            }
+        }
+    }
     if (!recvTy || recvTy->declaration != parent || recvTy->genericArgs.empty())
         return declared;
     // Build the parent-param-name -> concrete-arg map, positional by index so
