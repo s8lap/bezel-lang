@@ -997,7 +997,16 @@ void Emitter::declareImportedFunctions() {
         llvm::Type* retTy = retRef ? lowerTypeRef(retRef)
                                    : llvm::Type::getVoidTy(llvm_);
         std::vector<llvm::Type*> paramTys;
-        if (!isStaticMethod(ms)) paramTys.push_back(ptrTy());
+        // #735: an imported ENUM instance method's `this` is the enum's
+        // underlying integer (i32), passed BY VALUE — matching the exporter's
+        // CG30 lowering — NOT a pointer. Declaring it as ptr made the importer's
+        // call pass a ptr where the exported `bz$Enum$M(i32)` expects an i32, so
+        // the receiver was read as garbage. Mirror enumTypeOf/CG30.
+        if (!isStaticMethod(ms)) {
+            bool isEnumMethod =
+                ms->parent && ms->parent->kind == ast::TypeDeclKind::Enum;
+            paramTys.push_back(isEnumMethod ? i32() : ptrTy());
+        }
         for (sema::Symbol* p : ms->params) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
             sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
