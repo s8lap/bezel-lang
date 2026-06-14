@@ -261,3 +261,43 @@ BEZEL_TEST(codegen_generic_static_cross_named_701,
         "  end Main; "
         "end Program;"), 21);
 }
+
+// #723 / §22.12: a static qualified by the class's OWN generic param inside its
+// method (`Box<T>.n`) must resolve to the SAME per-instantiation global as an
+// external `Box<int>.n` — not a separate template-level ghost global. Path (B)
+// of staticFieldGlobal now resolves the bare param through the active
+// substitution. IncQualified() writes Box<int>.n via Box<T>.n; the external
+// read sees it: r=1, d=1 → 11.
+BEZEL_TEST(generic_static_cross_named_701, self_type_param_qualified_static_723) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box<T> "
+        "  public static n: int := 0; "
+        "  public static method IncQualified(): int "
+        "    Box<T>.n := Box<T>.n + 1; "
+        "    return Box<T>.n; "
+        "  end IncQualified; "
+        "end Box; "
+        "class Program public static method Main(): int "
+        "  var r := Box<int>.IncQualified(); "
+        "  var d := Box<int>.n; "
+        "  return r * 10 + d; "  // 11
+        "end Main; end Program;"), 11);
+}
+
+// #723: distinct instantiations keep distinct static state (no over-merging).
+// Box<int>.n and Box<string>.n are separate; via both qualified and external.
+BEZEL_TEST(generic_static_cross_named_701, self_type_param_qualified_distinct_723) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box<T> "
+        "  public static n: int := 0; "
+        "  public static method Inc(): int Box<T>.n := Box<T>.n + 1; return Box<T>.n; end Inc; "
+        "end Box; "
+        "class Program public static method Main(): int "
+        "  var a := Box<int>.Inc(); "
+        "  var b := Box<string>.Inc(); "
+        "  Box<int>.n := Box<int>.n + 5; "
+        "  return Box<int>.n * 10 + Box<string>.n; "  // 6*10+1 = 61
+        "end Main; end Program;"), 61);
+}

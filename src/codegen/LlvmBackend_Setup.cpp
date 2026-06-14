@@ -567,12 +567,39 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
                 if (ma->target)
                     targetTR = ctx_.exprType(*ma->target);
             }
+            // #723: a qualified self-type access `Box<T>.n` inside the
+            // monomorphized body carries the UNRESOLVED param `T` (Named,
+            // declaration==nullptr) as the target's genericArg, so appendTypeArg
+            // would see a no-token type and Path (B) would fall through to the
+            // template-level global — distinct from the external `Box<int>.n`'s
+            // per-instantiation global. Resolve a bare param through the active
+            // substitution (genericSubstSemaTy_) first, mirroring
+            // recordMemberTypeResolved; a genuinely unbound param (no active
+            // substitution, e.g. the #715 sfinit case) still falls through.
+            auto resolveArg = [&](const sema::TypeRef* arg) -> const sema::TypeRef* {
+                if (!arg || genericSubstSemaTy_.empty()) return arg;
+                if (arg->kind != sema::TypeRef::Kind::Named || arg->declaration)
+                    return arg;
+                if (arg->astNode && arg->astNode->name &&
+                    arg->astNode->name->parts.size() == 1) {
+                    auto it = genericSubstSemaTy_.find(
+                        arg->astNode->name->parts[0]);
+                    if (it != genericSubstSemaTy_.end() && it->second)
+                        return it->second;
+                }
+                if (!arg->importedName.empty()) {
+                    auto it = genericSubstSemaTy_.find(arg->importedName);
+                    if (it != genericSubstSemaTy_.end() && it->second)
+                        return it->second;
+                }
+                return arg;
+            };
             if (targetTR && targetTR->kind == sema::TypeRef::Kind::Named &&
                     targetTR->declaration == fs->parent &&
                     targetTR->genericArgs.size() ==
                         fs->parent->genericParams.size()) {
                 for (std::size_t i = 0; i < fs->parent->genericParams.size(); ++i)
-                    appendTypeArg(targetTR->genericArgs[i]);
+                    appendTypeArg(resolveArg(targetTR->genericArgs[i]));
             }
         }
 
