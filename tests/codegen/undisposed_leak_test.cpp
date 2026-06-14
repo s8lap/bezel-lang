@@ -474,3 +474,46 @@ BEZEL_TEST(codegen_throw_new_from_catch_397, direct_explicit_rethrow_no_double_f
     // verifies no double-free and no UAF — the cardinal risk of #397.
     expectDisposedAndLeakFree(kDirectExplicitRethrow_FreeOnce, 1);
 }
+
+// #724 / §17.13: discarding a NON-trivial-dispose value (`_ := expr;`) is a
+// compile error — it silently abandons the disposal obligation. Previously
+// accepted (a leak). Conservative reject: a class with an explicit destructor
+// in its class chain, or a move-only owning array.
+BEZEL_TEST(undisposed_leak, discard_class_with_destructor_rejected_724) {
+    auto r = runJit(
+        "module M; "
+        "class R public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; end R; "
+        "class C public static method Main(): int "
+        "  _ := new R(); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// #724: a derived class inheriting a destructor is also non-trivial-dispose.
+BEZEL_TEST(undisposed_leak, discard_derived_inherits_destructor_rejected_724) {
+    auto r = runJit(
+        "module M; "
+        "class Base public constructor() end constructor; "
+        "  destructor end destructor; end Base; "
+        "class Derived: Base public constructor() base(); end constructor; end Derived; "
+        "class C public static method Main(): int "
+        "  _ := new Derived(); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// #724: a TRIVIAL-dispose class (no destructor) and a primitive are still
+// discardable — no over-rejection (§17.13).
+BEZEL_TEST(undisposed_leak, discard_trivial_class_and_int_allowed_724) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Trivial public constructor() end constructor; end Trivial; "
+        "class C public static method Main(): int "
+        "  _ := new Trivial(); "
+        "  _ := 42; "
+        "  return 0; "
+        "end Main; end C;"), 0);
+}

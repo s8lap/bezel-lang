@@ -1962,6 +1962,49 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
         if (ds->value) visitExpr(*ds->value);
+        // §17.13 (#724): a discard `_ := expr;` of a value that REQUIRES disposal
+        // is a compile error — it silently abandons the disposal obligation.
+        // Reject the clear, spec-mandated cases conservatively (never over-reject
+        // a trivial-dispose class like Random/StringBuilder):
+        //   * a move-only OWNING inline array (`[N owned]T`) — §17.13 bullet 2;
+        //   * a CLASS with an explicit destructor anywhere in its single-
+        //     inheritance class chain — definitely non-trivial-dispose
+        //     (§17.13 bullet 4). A class whose only obligation is an owned/
+        //     owning-array FIELD (no explicit destructor) is under-rejected here
+        //     — a safe, narrower follow-up; this never breaks a trivial discard.
+        if (ds->value) {
+            const TypeRef* t = ctx_.exprType(*ds->value);
+            bool reject = false;
+            if (t && t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
+                reject = true;
+            } else if (t && !t->nullable &&
+                       t->kind == TypeRef::Kind::Named && t->declaration &&
+                       t->declaration->kind == ast::TypeDeclKind::Class &&
+                       !t->declaration->isValueBuiltin) {
+                for (TypeSymbol* cur = t->declaration; cur && !reject;) {
+                    for (Symbol* m : cur->members)
+                        if (dynamic_cast<DestructorSymbol*>(m)) {
+                            reject = true;
+                            break;
+                        }
+                    TypeSymbol* nextBase = nullptr;
+                    for (TypeSymbol* b : cur->baseTypes)
+                        if (b && b->kind == ast::TypeDeclKind::Class) {
+                            nextBase = b;
+                            break;
+                        }
+                    cur = nextBase;
+                }
+            }
+            if (reject) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ds->value->span.begin,
+                    "cannot discard a value that requires disposal (a "
+                    "non-trivial-dispose class or a move-only owning array); "
+                    "bind it (`using var _ := expr;`), call `.Dispose()`, or "
+                    "transfer it (`move`/`return`) (§17.13)");
+            }
+        }
         // per §14.1 + §A.7 (issue #391): `_ := Generic.Create();` discards the
         // result, so a return-only type parameter has no target. Diagnose.
         if (ds->value) {
