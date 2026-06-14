@@ -1446,6 +1446,29 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
                                  std::string_view polyDiscriminator) {
     if (!ts || !ts->decl) return;
 
+    // §9.8 v0.141 / #703: guard unbounded inline-emission recursion. A class
+    // reached again through one of its own components (a `Shared<T>` field of its
+    // own type — a linked list or cycle spine, or a recursive owned component)
+    // would re-enter here forever. Report a clean "not yet implemented" error
+    // (supporting it requires a synthesized Serialize FUNCTION, not inlining).
+    if (serializeEmitStack_.count(ts)) {
+        ctx_.diagnostics().report(
+            Severity::Error, ts->declLoc,
+            "class `" + std::string(ts->name) + "`: recursive serialization "
+            "(its type is reached again through a `Shared<T>`/`Weak<T>` or owned "
+            "component \xE2\x80\x94 a linked list or cycle spine) is not yet "
+            "implemented in codegen (\xC2\xA7""9.8 v0.141, issue #703 \xE2\x80\x94 "
+            "inline emission would recurse; a synthesized Serialize function is "
+            "required)");
+        return;
+    }
+    serializeEmitStack_.insert(ts);
+    struct PopSer {
+        std::unordered_set<const sema::TypeSymbol*>& s;
+        const sema::TypeSymbol* t;
+        ~PopSer() { s.erase(t); }
+    } popSer{serializeEmitStack_, ts};
+
     // Detect graph mode: true for `serialized graph` and `serialized cyclic`.
     const auto* td0 = dynamic_cast<const ast::TypeDecl*>(ts->decl);
     bool isGraphMode = td0 && td0->serializedClass &&
@@ -1885,6 +1908,26 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
 llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                                            llvm::Value* derPtr) {
     if (!ts || !ts->decl) return llvm::ConstantPointerNull::get(ptrTy());
+
+    // §9.8 v0.141 / #703: guard unbounded inline-emission recursion (see the
+    // matching guard in emitClassSerialize).
+    if (deserializeEmitStack_.count(ts)) {
+        ctx_.diagnostics().report(
+            Severity::Error, ts->declLoc,
+            "class `" + std::string(ts->name) + "`: recursive deserialization "
+            "(its type is reached again through a `Shared<T>`/`Weak<T>` or owned "
+            "component \xE2\x80\x94 a linked list or cycle spine) is not yet "
+            "implemented in codegen (\xC2\xA7""9.8 v0.141, issue #703 \xE2\x80\x94 "
+            "inline emission would recurse; a synthesized Deserialize function is "
+            "required)");
+        return llvm::ConstantPointerNull::get(ptrTy());
+    }
+    deserializeEmitStack_.insert(ts);
+    struct PopDes {
+        std::unordered_set<const sema::TypeSymbol*>& s;
+        const sema::TypeSymbol* t;
+        ~PopDes() { s.erase(t); }
+    } popDes{deserializeEmitStack_, ts};
 
     // Detect graph mode.
     const auto* td0g = dynamic_cast<const ast::TypeDecl*>(ts->decl);

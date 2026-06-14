@@ -356,6 +356,16 @@ private:
     // suppresses the heap-free (quarantine) so the flag remains readable.
     bool checkedDisposal_ = false;
     llvm::Function* currentFn_ = nullptr;
+    // §9.8 v0.141 / #703: the set of class types whose synthesized Serialize /
+    // Deserialize body is currently being INLINE-emitted. Serialization codegen
+    // inlines an owned/Shared class component's body via a recursive
+    // emitClassSerialize / emitClassDeserialize call; a recursive type (a class
+    // reached through a Shared<T> field of its own type — a linked list, a cycle
+    // spine) would recurse unboundedly. Re-entry on a type already in this set is
+    // detected and reported as a clean "not yet implemented" diagnostic instead
+    // (a synthesized Serialize FUNCTION would be required to support it).
+    std::unordered_set<const sema::TypeSymbol*> serializeEmitStack_;
+    std::unordered_set<const sema::TypeSymbol*> deserializeEmitStack_;
     // §8.6: the declared return-type node of the method currently being
     // emitted, so a `return <value>` whose declared return type is
     // Object/interface boxes the value before returning.

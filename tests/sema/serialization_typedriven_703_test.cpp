@@ -518,3 +518,35 @@ BEZEL_TEST(serialization_typedriven_703,
         "end Main; end C;",
         84);
 }
+
+// §9.8 v0.141 / #703: a RECURSIVE Shared type — Node has a Shared<Node> field —
+// is not yet supported (inline serialize emission would recurse on the element's
+// own Serialize at codegen time; a synthesized Serialize FUNCTION is required).
+// Until that lands, such a class must produce a clean codegen error rather than
+// crashing the compiler with unbounded emitClassSerialize recursion.
+BEZEL_TEST(serialization_typedriven_703,
+           s5_recursive_shared_type_codegen_guarded_703) {
+    BEZEL_EXPECT_TRUE(guardedAtCodegen(
+        std::string(kImport) +
+        "class Node serialized graph : ISerializable, IDeserializable "
+        "  public property V: int; "
+        "  public owned Next: Shared<Node>?; "
+        "  public constructor(v: int, owned next: Shared<Node>?) "
+        "    V := v; Next := next; "
+        "  end constructor; "
+        "end Node; "
+        "class Holder serialized graph : ISerializable, IDeserializable "
+        "  public owned Root: Shared<Node>; "
+        "  public constructor(owned root: Shared<Node>) "
+        "    Root := root; "
+        "  end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  var node := new Node(1, null); "
+        "  using var sh := new Shared<Node>(node); "
+        "  using var holder := new Holder(sh.Clone()); "
+        "  using var s := new BinarySerializer(); "
+        "  holder.Serialize(s); "
+        "  return 0; "
+        "end Main; end C;"));
+}
