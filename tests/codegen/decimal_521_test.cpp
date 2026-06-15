@@ -620,3 +620,42 @@ BEZEL_TEST(codegen_521_overflow, keyword_receiver_statics_agree_spec_5) {
         "  return 3; "
         "end Main; end C;"), 42);
 }
+
+// #743 / §5.2: an UNSIGNED integer above the signed maximum converts to decimal
+// without being reinterpreted as negative. `decimal(uint)` zero-extends to i64
+// before the conversion; `decimal(ulong)` uses the unsigned 64-bit conversion.
+// Previously both used the signed conversion, giving a wrong (negative-derived)
+// value for uint > int.MaxValue and ulong > long.MaxValue.
+BEZEL_TEST(codegen_decimal_521, decimal_from_large_uint_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var u: uint := 3000000000u; var d: decimal := decimal(u); "
+        "  return (1 if d > 2500000000m else 0); "  // 3e9 > 2.5e9 → 1
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_decimal_521, decimal_from_large_ulong_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var u: ulong := 10000000000000000000uL; var d: decimal := decimal(u); "
+        "  return (1 if d > 9300000000000000000m else 0); "  // 1e19 > 9.3e18 → 1
+        "end Main; end C;"), 1);
+}
+
+// Arithmetic widening (§6.2): `uint + decimal` promotes the uint correctly.
+BEZEL_TEST(codegen_decimal_521, large_uint_plus_decimal_widening_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var u: uint := 3000000000u; var r: decimal := u + 0m; "
+        "  return (1 if r > 2500000000m else 0); "  // 1
+        "end Main; end C;"), 1);
+}
+
+// Regression: a signed negative int still converts to a negative decimal.
+BEZEL_TEST(codegen_decimal_521, decimal_from_negative_int_unchanged_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var n: int := -7; var d: decimal := decimal(n); "
+        "  return (1 if d < 0m else 0); "  // 1
+        "end Main; end C;"), 1);
+}

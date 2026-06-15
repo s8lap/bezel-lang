@@ -1868,6 +1868,40 @@ private:
         return llvm::ConstantAggregateZero::get(nullableValueStructTy(rt));
     }
     // Wrap a plain value (primitive or enum integer) into a nullable: {i8 1, v}.
+    // §5.1 / §5.2 (#743): materialize the bz_decimal for an integer source into
+    // `outSlot`, honouring UNSIGNED source types. A `ulong` above long.MaxValue
+    // must use the unsigned 64-bit conversion (not from_int64, which would read
+    // it as negative); a `uint` above int.MaxValue zero-extends to i64 (always
+    // positive) before from_int64. byte/ushort/char are always < int.MaxValue,
+    // so the signed i32 path is exact for them.
+    void emitIntToDecimal(llvm::Value* v, sema::PrimitiveType p,
+                          llvm::Value* outSlot) {
+        using P = sema::PrimitiveType;
+        auto* voidTy = llvm::Type::getVoidTy(llvm_);
+        if (v->getType()->isIntegerTy(64)) {
+            const char* fn = (p == P::ULong) ? "bz_decimal_from_uint64"
+                                             : "bz_decimal_from_int64";
+            builder_.CreateCall(declareC(fn, voidTy, {i64(), ptrTy()}),
+                                {v, outSlot});
+            return;
+        }
+        if (p == P::UInt) {
+            llvm::Value* v64 = builder_.CreateZExt(v, i64());
+            builder_.CreateCall(
+                declareC("bz_decimal_from_int64", voidTy, {i64(), ptrTy()}),
+                {v64, outSlot});
+            return;
+        }
+        llvm::Value* v32 = v;
+        if (!v->getType()->isIntegerTy(32)) {
+            bool uns = (p == P::Byte || p == P::UShort || p == P::Char);
+            v32 = uns ? builder_.CreateZExt(v, i32())
+                      : builder_.CreateSExt(v, i32());
+        }
+        builder_.CreateCall(
+            declareC("bz_decimal_from_int32", voidTy, {i32(), ptrTy()}),
+            {v32, outSlot});
+    }
     llvm::Value* wrapNullableValue(const sema::TypeRef* rt, llvm::Value* val) {
         auto* st = nullableValueStructTy(rt);
         // fix #569 / §14.1 / #460: inside a monomorphized body the value slot may

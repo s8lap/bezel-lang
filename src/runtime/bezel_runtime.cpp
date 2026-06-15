@@ -1870,6 +1870,13 @@ extern "C" void bz_decimal_from_int32(int32_t v, bz_decimal_t* out) {
     bz_decimal_from_int64((int64_t)v, out);
 }
 
+// Conversion from an UNSIGNED 64-bit integer (#743): a ulong above
+// long.MaxValue must NOT be reinterpreted as a negative int64. The full
+// uint64 range (< 2^64) fits in the 96-bit mantissa, so no overflow.
+extern "C" void bz_decimal_from_uint64(uint64_t v, bz_decimal_t* out) {
+    dec_store(out, (__uint128_t)v, 0, /*neg=*/0, nullptr);
+}
+
 // Conversion from double (explicit per §5.2).
 // per fix #521 / §6.4: ove_vtable is stored in bz_exc on overflow; callers
 // call emitPendingCheck() after this function.

@@ -4046,25 +4046,9 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 // Integer widening to decimal (§5.1).
                 llvm::AllocaInst* slot = entryAlloca(dst);
                 if (ty && ty->kind == sema::TypeRef::Kind::Primitive) {
-                    P p = ty->primitive;
-                    llvm::Value* i64v = v;
-                    if (v->getType()->isIntegerTy(64)) {
-                        auto* fn = declareC("bz_decimal_from_int64",
-                                           llvm::Type::getVoidTy(llvm_),
-                                           {i64(), ptrTy()});
-                        builder_.CreateCall(fn, {i64v, slot});
-                    } else {
-                        // Widen to i32 then call from_int32.
-                        if (!v->getType()->isIntegerTy(32))
-                            i64v = (p == P::Byte || p == P::UShort || p == P::UInt ||
-                                    p == P::Char)
-                                       ? builder_.CreateZExt(v, i32())
-                                       : builder_.CreateSExt(v, i32());
-                        auto* fn = declareC("bz_decimal_from_int32",
-                                           llvm::Type::getVoidTy(llvm_),
-                                           {i32(), ptrTy()});
-                        builder_.CreateCall(fn, {i64v, slot});
-                    }
+                    // #743: honour unsigned sources (ulong/uint above the signed
+                    // max) — emitIntToDecimal picks the correct conversion.
+                    emitIntToDecimal(v, ty->primitive, slot);
                 }
                 return builder_.CreateLoad(dst, slot, "dec.promoted");
             };
@@ -7104,26 +7088,9 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
                 // then call the appropriate from_int.  This covers the explicit
                 // decimal(x) cast (§5.2) the same way the implicit §5.1 widening
                 // in lowerBinary does it.
-                llvm::Type* srcTy = src->getType();
-                bool srcUns = isUnsignedPrim(srcPrim) ||
-                              srcPrim == P::Byte || srcPrim == P::UShort ||
-                              srcPrim == P::UInt || srcPrim == P::Char;
-                if (srcTy->isIntegerTy(64)) {
-                    auto* fn = declareC("bz_decimal_from_int64",
-                                       llvm::Type::getVoidTy(llvm_),
-                                       {i64(), ptrTy()});
-                    builder_.CreateCall(fn, {src, outSlot});
-                } else {
-                    // Narrow → i32 (sign- or zero-extend as appropriate).
-                    llvm::Value* v32 = src;
-                    if (!srcTy->isIntegerTy(32))
-                        v32 = srcUns ? builder_.CreateZExt(src, i32())
-                                     : builder_.CreateSExt(src, i32());
-                    auto* fn = declareC("bz_decimal_from_int32",
-                                       llvm::Type::getVoidTy(llvm_),
-                                       {i32(), ptrTy()});
-                    builder_.CreateCall(fn, {v32, outSlot});
-                }
+                // #743: honour unsigned sources (ulong/uint above the signed
+                // max) — emitIntToDecimal picks the correct conversion.
+                emitIntToDecimal(src, srcPrim, outSlot);
             } else {
                 return nullptr;  // unrecognised source — should not occur after sema
             }
