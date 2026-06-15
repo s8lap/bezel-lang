@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.141 — June 2026**
+**Version 0.142 — June 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -4928,7 +4928,7 @@ A borrowed value's lifetime is the lifetime of its *source*. The compiler enforc
 
 - A borrowed local may not be returned from a method whose return type is `owned`.
 - A borrowed local may not be returned from a method at all unless the return type is the same kind of borrow with a clearly-defined source (in this version, that means: receiver-borrows from extension methods, value-typed returns, and runtime-managed returns).
-- A borrowed local may not be assigned to any field of any object — neither owned nor non-owned. Fields hold either owned references or runtime-managed references; class-typed fields that hold a borrow are not expressible in this version.
+- A borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never satisfies this — it is disposed at the end of its scope, which a field of the object outlives — so a borrowed local may not be assigned to any field. A borrow whose source *does* outlive the object **is** admissible: the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (the `_owner: Customer` back-reference of [§28.5](#sec-owned-fields)), where the caller-side source outlives the constructed object. Such a **borrowing class-typed field** — a non-owning class-typed field whose target is owned elsewhere — is the back-edge that serialization synthesis treats specially ([§9.8](#sec-serialization-synthesis)). The field stores a plain reference; the lifetime relationship is the programmer's obligation, checked at each assignment site (a borrowed local fails the check, a constructor-parameter borrow whose source outlives the object passes).
 - A borrowed local may not be captured by a closure that may outlive the borrow's source. For closures that are immediately invoked or whose lifetime is statically bounded by the borrow's source (a `using var` local of function type, an extension method's parameter), capture is permitted.
 - The same capture-and-escape rule applies to **method references** ([§27.6](#sec-method-references)) that bind an instance receiver: `obj.Method` produces a function value whose captured environment includes `obj`. If `obj` is a borrow, the resulting function value is subject to the closure-escape rules above as if `obj` had been captured by an explicit lambda. The function value's runtime-managed status ([§28.9](#sec-runtime-managed-types)) governs the *function value's own* lifetime; it does not relax the lifetime constraints on borrows captured by the function value.
 

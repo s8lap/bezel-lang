@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.141 — June 2026**
+**Companion to the Bezel Language Specification, v0.142 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6858,6 +6858,22 @@ Spec §7.9, §9.8 (class-synthesis subsection rewrite), Appendix A grammar, Appe
 
 #### Migration
 Source-breaking for any class using a `serialized tree`/`serialized graph`/`serialized cyclic` clause or a header-level `polymorphic` registry: drop the clause (shape is now inferred from field types), move any `polymorphic` registry to a class-body member, and express a cyclic back-edge as a nullable `Weak<T>?` on a `Shared<T>` spine. The wire format is unchanged, so previously serialized data round-trips.
+
+---
+
+### v0.142 changelog (v0.141 → v0.142)
+
+**Erratum — borrowing class-typed fields.** §28.3's "Borrow lifetime rules" carried a stale categorical sentence — "class-typed fields that hold a borrow are not expressible in this version" — that contradicted both §28.5 (which ships `private _owner: Customer; // back-reference, not owned` as a worked example) and §9.8 (whose serialization synthesis is built on borrowing back-edge fields), as well as the compiler, which accepts such fields under a lifetime check. Issue #717.
+
+#### What changed
+- The §28.3 bullet is rewritten to state the **lifetime-based** rule the compiler actually enforces: a borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never qualifies (it is disposed at scope end, which the object's field outlives), so a borrowed local may not be assigned to any field — the one case the old prose got right. A borrow whose source outlives the object **is** admissible; the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (a **borrowing class-typed field**), which is exactly the §28.5 `_owner` back-reference and the §9.8 serialization back-edge.
+- No behaviour change: the compiler already enforced the lifetime rule (a borrowed-local-into-field assignment is rejected; a constructor-parameter borrow whose caller-side source outlives the object is accepted). This revision only reconciles the normative prose with the implementation and with §28.5/§9.8.
+
+#### Touched
+Spec §28.3 (one bullet under "Borrow lifetime rules"). No grammar, stdlib, or compiler change.
+
+#### Migration
+None. The amendment narrows no program that previously compiled and admits none that previously did not; it documents existing behaviour.
 
 ---
 
