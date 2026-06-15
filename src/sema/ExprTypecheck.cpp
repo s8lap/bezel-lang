@@ -16,6 +16,22 @@
 
 namespace bezel::sema {
 
+// §5.1 (#738): does the compile-time integer constant `v` fit the range of a
+// narrower integer target type? Used to gate implicit literal/constant
+// narrowing (an out-of-range constant is a §5.1 error, not silent truncation).
+// Returns true for any type that is not one of the gated narrower targets.
+static bool fitsInIntType(long long v, PrimitiveType t) {
+    switch (t) {
+        case PrimitiveType::SByte:  return v >= -128 && v <= 127;
+        case PrimitiveType::Byte:   return v >= 0 && v <= 255;
+        case PrimitiveType::Short:  return v >= -32768 && v <= 32767;
+        case PrimitiveType::UShort: return v >= 0 && v <= 65535;
+        case PrimitiveType::UInt:   return v >= 0 && v <= 4294967295LL;
+        case PrimitiveType::ULong:  return v >= 0;  // any non-neg ll fits ulong
+        default:                    return true;
+    }
+}
+
 // The ExprTC class is declared in ExprTypecheck_impl.hpp; its method
 // definitions live across this and the sibling ExprTypecheck_*.cpp
 // translation units. This file holds the public entry point, the worker's
@@ -1769,13 +1785,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             tgt == PrimitiveType::UShort ||
                             tgt == PrimitiveType::UInt ||
                             tgt == PrimitiveType::ULong;
-                        if (narrowerIntTarget &&
-                            foldIntConstExprTC(*ld->initializer)) {
-                            // Compile-time int constant → re-type to the narrower
-                            // target (§5.1 literal/constant rule).
-                            ctx_.setExprType(ld->initializer.get(),
-                                             lsym->declType);
-                            fromTy = lsym->declType;
+                        if (narrowerIntTarget) {
+                            auto cv = foldIntConstExprTC(*ld->initializer);
+                            // #738 / §5.1: a compile-time int constant re-types to
+                            // the narrower target only when its value FITS — an
+                            // out-of-range constant (e.g. `sbyte := 300`) falls
+                            // through to checkAssignable, which reports the §5.1
+                            // error (no silent truncation). A non-constant value
+                            // never folds and is likewise rejected.
+                            if (cv && fitsInIntType(*cv, tgt)) {
+                                ctx_.setExprType(ld->initializer.get(),
+                                                 lsym->declType);
+                                fromTy = lsym->declType;
+                            }
                         }
                     }
                     checkAssignable(
@@ -2010,9 +2032,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         tgt == PrimitiveType::UShort||
                         tgt == PrimitiveType::UInt  ||
                         tgt == PrimitiveType::ULong;
-                    if (narrowerIntTarget && foldIntConstExprTC(*as->value)) {
-                        ctx_.setExprType(as->value.get(), toTy);
-                        fromTy = toTy;
+                    if (narrowerIntTarget) {
+                        auto cv = foldIntConstExprTC(*as->value);
+                        // #738 / §5.1: retype only an IN-RANGE int constant; an
+                        // out-of-range constant / a non-constant falls through to
+                        // checkAssignable's §5.1 rejection.
+                        if (cv && fitsInIntType(*cv, tgt)) {
+                            ctx_.setExprType(as->value.get(), toTy);
+                            fromTy = toTy;
+                        }
                     }
                 }
                 checkAssignable(

@@ -105,3 +105,28 @@ BEZEL_TEST(sema_assign, int_const_arith_to_byte_still_ok_738) {
     auto r = parseSemaAll(wrap("var b: byte := 10 + 20;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// #738 / §5.1: an int constant that does NOT fit the narrower target is rejected
+// (no silent truncation). `300` does not fit `sbyte` (-128..127) or `byte`
+// (0..255); a negative literal does not fit an unsigned target.
+BEZEL_TEST(sema_assign, int_literal_out_of_range_sbyte_rejected_738) {
+    auto r = parseSemaAll(wrap("var y: sbyte := 300;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_assign, int_literal_out_of_range_byte_rejected_738) {
+    auto r = parseSemaAll(wrap("var b: byte := 300;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_assign, neg_int_literal_to_unsigned_byte_rejected_738) {
+    auto r = parseSemaAll(wrap("var b: byte := -5;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_assign, int_literal_out_of_range_byte_assign_rejected_738) {
+    auto r = parseSemaAll(wrap("var b: byte := 1; b := 300;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+// In-range narrowing (incl. negative within sbyte) stays valid.
+BEZEL_TEST(sema_assign, int_literal_in_range_sbyte_ok_738) {
+    auto r = parseSemaAll(wrap("var y: sbyte := -100; var z: byte := 200;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
