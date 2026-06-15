@@ -1338,17 +1338,56 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 typeName + "` to overload it");
             return;
         }
-        // §17.1: bitwise/shift ops (&, |, ^, <<, >>) require integer operands.
-        // Reject them on string/reference types to prevent IR corruption.
-        if ((op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") && lt) {
-            bool lIsStr = lt->kind == TypeRef::Kind::Primitive &&
-                lt->primitive == PrimitiveType::String;
-            bool lIsRef = lt->kind == TypeRef::Kind::Named;
-            if (lIsStr || lIsRef) {
+        // §6.5 / §6.1 / §17.1: integer-operand operator type checks.
+        //   • Bitwise/shift (`& | ^ << >>`) carry no meaning on FLOATING-POINT
+        //     operands and previously produced garbage; reject them (§6.5). Bool
+        //     is NOT rejected here — §7.11 lifts `&`/`|`/`^` over nullable bool
+        //     (non-short-circuit logical, see lifted_operators_486); `char` is
+        //     left as-is (it yields a defined code-point result).
+        //   • `mod` is defined on integer types and decimal, but NOT on float or
+        //     double (§6.1).
+        // (String/reference bitwise keeps its existing concatenation hint.)
+        {
+            const bool isBitwise = (op == "&" || op == "|" || op == "^" ||
+                                    op == "<<" || op == ">>");
+            TypeRef* rt0 = be.right ? ctx_.exprType(*be.right) : nullptr;
+            auto primOf = [](TypeRef* t) -> PrimitiveType {
+                return (t && t->kind == TypeRef::Kind::Primitive)
+                           ? t->primitive : PrimitiveType::None;
+            };
+            auto isFloatPrim = [](PrimitiveType p) {
+                return p == PrimitiveType::Float || p == PrimitiveType::Double;
+            };
+            // String/reference left operand keeps the concatenation hint.
+            if (isBitwise && lt &&
+                ((lt->kind == TypeRef::Kind::Primitive &&
+                  lt->primitive == PrimitiveType::String) ||
+                 lt->kind == TypeRef::Kind::Named)) {
                 ctx_.diagnostics().report(Severity::Error, be.span.begin,
                     std::string("operator `") + std::string(op) +
                     "` requires integer operands; use `+` for string concatenation");
                 return;
+            }
+            if (isBitwise) {
+                for (TypeRef* o : {lt, rt0}) {
+                    if (isFloatPrim(primOf(o))) {
+                        ctx_.diagnostics().report(Severity::Error, be.span.begin,
+                            std::string("operator `") + std::string(op) +
+                            "` is not valid on floating-point types — bitwise "
+                            "operators require integer operands (§6.5)");
+                        return;
+                    }
+                }
+            }
+            if (op == "mod") {
+                for (TypeRef* o : {lt, rt0}) {
+                    if (isFloatPrim(primOf(o))) {
+                        ctx_.diagnostics().report(Severity::Error, be.span.begin,
+                            "`mod` is not defined on `float` or `double` — use "
+                            "`Math.Fmod` or `Math.IEEERemainder` (§6.1)");
+                        return;
+                    }
+                }
             }
         }
         // §7.11 lifted operators: when EITHER operand is a nullable value

@@ -256,3 +256,48 @@ BEZEL_TEST(sema_missing_op, positional_record_equality_no_error) {
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// #738 / §6.5: bitwise `&`/`|`/`^`/`<<`/`>>` carry no meaning on FLOATING-POINT
+// operands (previously produced garbage). Rejected.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(sema_missing_op, bitwise_on_float_rejected_spec_6_5_738) {
+    auto r = parseSema(
+        "module M; class C public static method M(): int "
+        "  var a: float := 3.0f; var b: float := 7.0f; "
+        "  var c: float := a & b; return 0; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_missing_op, bitwise_on_double_rejected_spec_6_5_738) {
+    auto r = parseSema(
+        "module M; class C public static method M(): int "
+        "  var a: double := 3.0; var b: double := 7.0; "
+        "  var c: double := a | b; return 0; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// #738 / §6.1: `mod` is not defined on float or double.
+BEZEL_TEST(sema_missing_op, mod_on_double_rejected_spec_6_1_738) {
+    auto r = parseSema(
+        "module M; class C public static method M(): int "
+        "  var x: double := 5.0; var y: double := 2.0; "
+        "  var z: double := x mod y; return 0; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// #738 CONTROL: §7.11 lifts `&`/`|`/`^` over bool (non-short-circuit logical),
+// and integer `&` / integer `mod` / `decimal mod` stay valid — these must NOT
+// be rejected by the §6.5/§6.1 guard.
+BEZEL_TEST(sema_missing_op, bitwise_on_bool_and_int_mod_decimal_ok_738) {
+    auto r = parseSema(
+        "module M; class C public static method M(): int "
+        "  var ba: bool := true; var bb: bool := false; var bc := ba & bb; "
+        "  var ia: int := 6; var ic := ia & 3; var im := ia mod 4; "
+        "  var da: decimal := 5m; var dm := da mod 2m; "
+        "  return 0; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
