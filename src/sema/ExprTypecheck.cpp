@@ -775,6 +775,22 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
 void ExprTC::checkConditionIsBool(const ast::Expr& cond, std::string_view ctx) {
     TypeRef* t = ctx_.exprType(cond);
     if (!t) return;
+    // A `bool?` is NOT a valid condition: §21.2 requires the condition to be
+    // `bool`, and §7.11 (no three-valued logic) makes a nullable bool in a
+    // boolean position a compile error. Without this guard a `bool?` condition
+    // (kind=Primitive, primitive=Bool, nullable=true) slipped past the bool
+    // check below and reached codegen, which branched on the whole `{i8,i1}`
+    // nullable struct and emitted IR the verifier rejected (R39).
+    if (t->kind == TypeRef::Kind::Primitive &&
+        t->primitive == PrimitiveType::Bool && t->nullable) {
+        ctx_.diagnostics().report(
+            Severity::Error, cond.span.begin,
+            std::string("the ") + std::string(ctx) +
+            " condition must be `bool`, not `bool?` — a nullable bool cannot be "
+            "used in a boolean position (§21.2, §7.11); test it explicitly "
+            "(e.g. `x = true`) or coalesce it (`x ?? false`)");
+        return;
+    }
     if (t->kind != TypeRef::Kind::Primitive) return;
     if (t->primitive == PrimitiveType::Bool) return;
     ctx_.diagnostics().report(

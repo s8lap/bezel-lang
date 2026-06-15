@@ -74,3 +74,40 @@ BEZEL_TEST(sema_cond, string_condition_diagnoses) {
     auto r = parseSemaAll(wrap("if \"x\" then n := 1; end;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// R39 / §21.2 + §7.11: a `bool?` is not a valid condition (no three-valued
+// logic). Previously it slipped past the bool check and reached codegen, which
+// branched on the whole `{i8,i1}` nullable struct and emitted invalid IR. It
+// must be rejected at sema with a clean diagnostic in every condition position.
+namespace {
+bool mentionsNullableBoolCond(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("not `bool?`") != std::string::npos) return true;
+    return false;
+}
+} // namespace
+
+BEZEL_TEST(sema_cond, if_nullable_bool_condition_diagnoses_r39) {
+    auto r = parseSemaAll(wrap("var b: bool? := null; if b then n := 1; end;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsNullableBoolCond(r));
+}
+
+BEZEL_TEST(sema_cond, while_nullable_bool_condition_diagnoses_r39) {
+    auto r = parseSemaAll(wrap("var b: bool? := null; while b do n := 1; end;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsNullableBoolCond(r));
+}
+
+BEZEL_TEST(sema_cond, if_expression_nullable_bool_condition_diagnoses_r39) {
+    auto r = parseSemaAll(wrap("var b: bool? := null; n := 1 if b else 2;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsNullableBoolCond(r));
+}
+
+// Control: a coalesced `bool?` (`b ?? false`) is a plain `bool` and is fine.
+BEZEL_TEST(sema_cond, coalesced_nullable_bool_condition_ok_r39) {
+    auto r = parseSemaAll(
+        wrap("var b: bool? := null; if (b ?? false) then n := 1; end;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
