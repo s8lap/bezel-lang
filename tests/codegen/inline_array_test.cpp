@@ -266,3 +266,48 @@ BEZEL_TEST(codegen_inline_array, collection_literal_record_array_field_736) {
         "  return h.Total(); "  // 37
         "end Main; end C;"), 37);
 }
+
+// #734: a member-level `const` used as an inline-array size. Previously the
+// size expression was an IdentifierExpr that codegen could not fold, yielding
+// an i32 scalar type and "Invalid indices for GEP" IR failure. Sema now folds
+// the member const to TypeRef::arraySizeValue (§15.1 fixed-size array).
+BEZEL_TEST(codegen_inline_array, member_const_array_size_734) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static const SZ: int := 3; "
+        "  public static method Main(): int "
+        "    var arr: [SZ]int := [10, 20, 30]; "
+        "    return arr[0]; "  // 10
+        "  end Main; "
+        "end C;"), 10);
+}
+
+// #734: member-const size used by a for-in loop and `.Length`.
+BEZEL_TEST(codegen_inline_array, member_const_array_size_length_734) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static const N: int := 4; "
+        "  public static method Main(): int "
+        "    var a: [N]int := [1, 2, 3, 4]; "
+        "    var sum := 0; "
+        "    for var x in a do sum := sum + x; end; "
+        "    return sum + a.Length; "  // 10 + 4 = 14
+        "  end Main; "
+        "end C;"), 14);
+}
+
+// #734 / §15.1: arithmetic on a `const` size — `[BufferSize * 2]byte` is the
+// spec's own example. The size folds to a compile-time value (6 here), so the
+// element store and `.Length` are correct. (Before the fold, `[SZ*2]` produced
+// a flat scalar — `.Length` read 0 and an indexed store hit a malformed GEP.)
+BEZEL_TEST(codegen_inline_array, member_const_array_size_arithmetic_734) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static const SZ: int := 3; "
+        "  public static method Main(): int "
+        "    var arr: [SZ * 2]int; "
+        "    arr[5] := 42; "
+        "    return arr[5] + arr.Length; "  // 42 + 6 = 48
+        "  end Main; "
+        "end C;"), 48);
+}

@@ -13,6 +13,7 @@
 // namespace scope here would be a program-wide ODR clash. As a nested type it
 // cannot collide.
 
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -316,6 +317,16 @@ private:
     void resolveTypesInPattern(const ast::Pattern& p, Scope* scope);
 
     TypeRef* resolveType(const ast::Type& t, Scope* scope);
+
+    // §15.1 (issue #734): fold an inline-array size `N` to a compile-time
+    // integer. N must be a compile-time integer expression: integer literals,
+    // `const` declarations whose value is itself an int-const expression, and
+    // arithmetic on these are all admitted. Returns nullopt when `e` is not a
+    // foldable int-const (e.g. references a not-yet-bound local const, an enum
+    // constant, or a non-integer expression). `depth` guards against cyclic
+    // const references.
+    std::optional<long long> foldIntConstExpr(const ast::Expr& e, Scope* scope,
+                                              int depth);
 
     void resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref);
 

@@ -2023,6 +2023,9 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     int64_t sz = (int64_t)parseIntLiteral(slit->text);
                     return llvm::ConstantInt::get(i32(), sz, true);
                 }
+                if (tt->arraySizeValue >= 0)  // #734: folded member-const size
+                    return llvm::ConstantInt::get(i32(), tt->arraySizeValue,
+                                                  true);
             }
             // Also handle the case where the target is an inline-array lvalue
             // and we can get the array type from the LLVM type.

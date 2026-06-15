@@ -634,14 +634,19 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             return i32();  // other value-kind named (enum) — int
         case sema::TypeRef::Kind::InlineArray: {
             // §15.1: [N]T is an LLVM fixed-size array [N x elemType].
-            // N is stored as an IntLiteralExpr; element type recurses.
+            // N is an IntLiteralExpr, or a folded compile-time size (#734:
+            // arraySizeValue, set by sema for a member-`const` size); element
+            // type recurses.
             if (!rt->arrayElement || !rt->arraySize) return i32();
             llvm::Type* elem = lowerTypeRef(rt->arrayElement);
-            auto* lit =
-                dynamic_cast<const ast::IntLiteralExpr*>(rt->arraySize);
-            if (!lit) return i32();
-            uint64_t n = std::stoull(std::string(lit->text));
-            return llvm::ArrayType::get(elem, n);
+            if (auto* lit =
+                    dynamic_cast<const ast::IntLiteralExpr*>(rt->arraySize))
+                return llvm::ArrayType::get(
+                    elem, std::stoull(std::string(lit->text)));
+            if (rt->arraySizeValue >= 0)  // #734: folded member-const size
+                return llvm::ArrayType::get(
+                    elem, static_cast<uint64_t>(rt->arraySizeValue));
+            return i32();
         }
         case sema::TypeRef::Kind::Function:
             // CG60: a function type `(T1, …) -> R` — stored as an opaque

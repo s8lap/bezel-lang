@@ -61,6 +61,10 @@ struct TypeRef {
 
     // InlineArray:
     const ast::Expr* arraySize = nullptr;   // ConstIntExpr; sema later evaluates
+    // #734: the folded compile-time size (>= 0) when arraySize is a literal or a
+    // member-level `const` whose initializer is an int literal. -1 = not folded
+    // (codegen falls back to the IntLiteralExpr text, or to a scalar default).
+    long long arraySizeValue = -1;
     bool arrayOwned = false;
     TypeRef* arrayElement = nullptr;
 
