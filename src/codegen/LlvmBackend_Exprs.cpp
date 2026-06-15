@@ -7447,12 +7447,24 @@ llvm::Value* Emitter::buildRecordValue(
                 const sema::TypeRef* fty = recordMemberType(fields[i]);
                 if (isNullableValueTy(fty)) {
                     auto* expectedSt = nullableValueStructTy(fty);
+                    llvm::Type* valTy = expectedSt->getElementType(1);
                     if (v->getType() != expectedSt) {
                         if (v->getType()->isPointerTy() &&
                             llvm::isa<llvm::ConstantPointerNull>(v))
                             v = nullableValueNull(fty);
-                        else if (v->getType() == expectedSt->getElementType(1))
+                        else if (v->getType() == valTy)
                             v = wrapNullableValue(fty, v);
+                        else if (v->getType()->isIntegerTy() &&
+                                 valTy->isIntegerTy())
+                            // #743 / §9.1 / §5.1: a NARROW nullable value field
+                            // (byte?/sbyte?/short?/ushort?) has an i8/i16 value
+                            // half, but an int-typed argument (the literal `7`
+                            // lowers to i32) does not match it. Coerce the
+                            // integer to the value half's width before wrapping —
+                            // without this the raw i32 was stored into the
+                            // {i8, i8} slot, corrupting both the tag and value.
+                            v = wrapNullableValue(
+                                fty, builder_.CreateSExtOrTrunc(v, valTy));
                     }
                 }
                 auto idxIt = fieldIndex_.find(fields[i]);

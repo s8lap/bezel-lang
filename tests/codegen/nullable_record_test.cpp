@@ -281,3 +281,60 @@ BEZEL_TEST(codegen_nullable_record, with_one_nullable_field_preserves_others_r40
         "  return b2.n! + b2.m!; "  // 40 + 2 = 42 (m preserved)
         "end Main; end C;"), 42);
 }
+
+// ── #743 §9.1/§5.1: a NARROW nullable positional field coerces its arg width ──
+// `byte?`/`sbyte?`/`short?` have an i8/i16 value half, but an int-typed
+// argument (the literal `7` lowers to i32) must be width-coerced before being
+// wrapped in the {i8, T} tagged struct. Pre-fix the raw i32 was stored into the
+// 2-byte slot — hasValue got the low byte (7) and the value byte got 0.
+
+// §9.1: a byte? positional field constructed with an int literal round-trips.
+BEZEL_TEST(codegen_nullable_record, byte_nullable_positional_field_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: byte?); "
+        "class C public static method Main(): int "
+        "  var b := new Box(7); "
+        "  if b.n = null then return 99; end; "
+        "  return int(b.n!); "  // 7, not 0
+        "end Main; end C;"), 7);
+}
+
+// §9.1: a byte? value above the signed-byte max round-trips unsigned.
+BEZEL_TEST(codegen_nullable_record, byte_nullable_positional_high_value_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: byte?); "
+        "class C public static method Main(): int "
+        "  var b := new Box(200); "
+        "  return int(b.n!); "  // 200
+        "end Main; end C;"), 200);
+}
+
+// §9.1: an sbyte? negative value sign-preserves.
+BEZEL_TEST(codegen_nullable_record, sbyte_nullable_positional_negative_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: sbyte?); "
+        "class C public static method Main(): int "
+        "  var b := new Box(-5); "
+        "  return (1 if int(b.n!) = -5 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.1: a short? positional field round-trips a value above the byte range.
+BEZEL_TEST(codegen_nullable_record, short_nullable_positional_field_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(h: short?); "
+        "class C public static method Main(): int "
+        "  var b := new Box(30000); "
+        "  return (1 if int(b.h!) = 30000 else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.1: `null` still constructs a null narrow-nullable field.
+BEZEL_TEST(codegen_nullable_record, byte_nullable_positional_null_743) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Box(n: byte?); "
+        "class C public static method Main(): int "
+        "  var b := new Box(null); "
+        "  return (1 if b.n = null else 0); "
+        "end Main; end C;"), 1);
+}
