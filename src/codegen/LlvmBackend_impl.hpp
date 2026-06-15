@@ -961,12 +961,15 @@ private:
     // When a static field's parent class has generic params and genericSubst_ is
     // active (during monomorphization of a static method body), the field must
     // resolve to an instantiation-specific global rather than the shared
-    // template-level one.  Keyed by (FieldSymbol*, (llvm_types, identity_tokens))
-    // — same disambiguation as specializedMethods_ (llvm types alone collapse
-    // class/interface to `ptr`; the identity token breaks that collision).
+    // template-level one.  Keyed by (FieldSymbol*, ((llvm_types, identity_tokens),
+    // typeArgMangle)) — the llvm types collapse class/interface to `ptr` and the
+    // identity token is per-DECLARATION (so Box<int> and Box<string> share the
+    // `Box` token); the recursive type-arg mangle string (#738) breaks that
+    // collision for nested generic arguments.
     std::map<std::pair<const sema::Symbol*,
-                       std::pair<std::vector<llvm::Type*>,
-                                 std::vector<const void*>>>,
+                       std::pair<std::pair<std::vector<llvm::Type*>,
+                                           std::vector<const void*>>,
+                                 std::string>>,
              llvm::GlobalVariable*>
         genericInstStaticGlobals_;
 

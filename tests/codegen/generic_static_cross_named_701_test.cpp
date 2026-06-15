@@ -301,3 +301,25 @@ BEZEL_TEST(generic_static_cross_named_701, self_type_param_qualified_distinct_72
         "  return Box<int>.n * 10 + Box<string>.n; "  // 6*10+1 = 61
         "end Main; end Program;"), 61);
 }
+
+// #738 / §22.12: a generic type ARGUMENT that is itself a generic instantiation
+// (`Counter<Box<int>>` vs `Counter<Box<string>>`) must get its OWN per-
+// instantiation static global. Previously the type-arg mangle and identity
+// token both collapsed `Box<int>`/`Box<string>` to `Box` (same llvm `ptr`, same
+// declaration token), so both shared one `bz$Counter$Box$n` global and writes
+// clobbered each other.
+BEZEL_TEST(generic_static_cross_named_701, nested_generic_type_arg_distinct_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box<T> public _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  destructor end destructor; end Box; "
+        "class Counter<T> public static n: int := 0; end Counter; "
+        "class C public static method Main(): int "
+        "  Counter<Box<int>>.n := 1; "
+        "  Counter<Box<string>>.n := 2; "
+        "  Counter<Box<bool>>.n := 3; "
+        "  return Counter<Box<int>>.n * 100 + Counter<Box<string>>.n * 10 "
+        "         + Counter<Box<bool>>.n; "  // 123
+        "end Main; end C;"), 123);
+}

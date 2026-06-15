@@ -513,40 +513,50 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
         std::vector<const void*> substIds;
         std::string typeArgMangle;
 
+        // §22.12 (#738): mangle one type argument to a name fragment. A Named
+        // generic argument must encode its OWN type arguments recursively —
+        // otherwise `Counter<Box<int>>` and `Counter<Box<string>>` both mangle
+        // their arg to "Box" and collide on a single `bz$Counter$Box$n` global,
+        // so writes to one instantiation clobber the other (§22.12: "each
+        // distinct instantiation has its own static state").
+        std::function<std::string(const sema::TypeRef*)> mangleTy =
+            [&](const sema::TypeRef* t) -> std::string {
+            if (!t) return "t";
+            if (t->kind == sema::TypeRef::Kind::Named && t->declaration) {
+                std::string s(t->declaration->name);
+                for (const sema::TypeRef* inner : t->genericArgs)
+                    s += "_" + mangleTy(inner);
+                return s;
+            }
+            if (t->kind == sema::TypeRef::Kind::Primitive) {
+                switch (t->primitive) {
+                    case sema::PrimitiveType::Bool:    return "bool";
+                    case sema::PrimitiveType::Char:    return "char";
+                    case sema::PrimitiveType::String:  return "string";
+                    case sema::PrimitiveType::Byte:    return "byte";
+                    case sema::PrimitiveType::SByte:   return "sbyte";
+                    case sema::PrimitiveType::Short:   return "short";
+                    case sema::PrimitiveType::UShort:  return "ushort";
+                    case sema::PrimitiveType::Int:     return "int";
+                    case sema::PrimitiveType::UInt:    return "uint";
+                    case sema::PrimitiveType::Long:    return "long";
+                    case sema::PrimitiveType::ULong:   return "ulong";
+                    case sema::PrimitiveType::Float:   return "float";
+                    case sema::PrimitiveType::Double:  return "double";
+                    case sema::PrimitiveType::Decimal: return "decimal";
+                    default:                           return "prim";
+                }
+            }
+            return "t";
+        };
+
         // Helper: append one type argument (semaTy) to the three key vectors.
         auto appendTypeArg = [&](const sema::TypeRef* semaTy) {
             llvm::Type* llTy = semaTy ? lowerTypeRef(semaTy) : i32();
             substTypes.push_back(llTy);
             substIds.push_back(typeRefIdentityToken(semaTy));
             if (!typeArgMangle.empty()) typeArgMangle += "_";
-            if (semaTy) {
-                if (semaTy->kind == sema::TypeRef::Kind::Named &&
-                        semaTy->declaration)
-                    typeArgMangle += std::string(semaTy->declaration->name);
-                else if (semaTy->kind == sema::TypeRef::Kind::Primitive) {
-                    switch (semaTy->primitive) {
-                        case sema::PrimitiveType::Bool:    typeArgMangle += "bool"; break;
-                        case sema::PrimitiveType::Char:    typeArgMangle += "char"; break;
-                        case sema::PrimitiveType::String:  typeArgMangle += "string"; break;
-                        case sema::PrimitiveType::Byte:    typeArgMangle += "byte"; break;
-                        case sema::PrimitiveType::SByte:   typeArgMangle += "sbyte"; break;
-                        case sema::PrimitiveType::Short:   typeArgMangle += "short"; break;
-                        case sema::PrimitiveType::UShort:  typeArgMangle += "ushort"; break;
-                        case sema::PrimitiveType::Int:     typeArgMangle += "int"; break;
-                        case sema::PrimitiveType::UInt:    typeArgMangle += "uint"; break;
-                        case sema::PrimitiveType::Long:    typeArgMangle += "long"; break;
-                        case sema::PrimitiveType::ULong:   typeArgMangle += "ulong"; break;
-                        case sema::PrimitiveType::Float:   typeArgMangle += "float"; break;
-                        case sema::PrimitiveType::Double:  typeArgMangle += "double"; break;
-                        case sema::PrimitiveType::Decimal: typeArgMangle += "decimal"; break;
-                        default: typeArgMangle += "prim"; break;
-                    }
-                } else {
-                    typeArgMangle += "t";
-                }
-            } else {
-                typeArgMangle += "t";
-            }
+            typeArgMangle += mangleTy(semaTy);
         };
 
         // Path (B): §22.12 / #697 / #701: the access is a MemberAccessExpr
@@ -623,34 +633,7 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
                 substTypes.push_back(sit->second);
                 substIds.push_back(typeRefIdentityToken(semaTy));
                 if (!typeArgMangle.empty()) typeArgMangle += "_";
-                if (semaTy) {
-                    if (semaTy->kind == sema::TypeRef::Kind::Named &&
-                            semaTy->declaration)
-                        typeArgMangle += std::string(semaTy->declaration->name);
-                    else if (semaTy->kind == sema::TypeRef::Kind::Primitive) {
-                        switch (semaTy->primitive) {
-                            case sema::PrimitiveType::Bool:    typeArgMangle += "bool"; break;
-                            case sema::PrimitiveType::Char:    typeArgMangle += "char"; break;
-                            case sema::PrimitiveType::String:  typeArgMangle += "string"; break;
-                            case sema::PrimitiveType::Byte:    typeArgMangle += "byte"; break;
-                            case sema::PrimitiveType::SByte:   typeArgMangle += "sbyte"; break;
-                            case sema::PrimitiveType::Short:   typeArgMangle += "short"; break;
-                            case sema::PrimitiveType::UShort:  typeArgMangle += "ushort"; break;
-                            case sema::PrimitiveType::Int:     typeArgMangle += "int"; break;
-                            case sema::PrimitiveType::UInt:    typeArgMangle += "uint"; break;
-                            case sema::PrimitiveType::Long:    typeArgMangle += "long"; break;
-                            case sema::PrimitiveType::ULong:   typeArgMangle += "ulong"; break;
-                            case sema::PrimitiveType::Float:   typeArgMangle += "float"; break;
-                            case sema::PrimitiveType::Double:  typeArgMangle += "double"; break;
-                            case sema::PrimitiveType::Decimal: typeArgMangle += "decimal"; break;
-                            default: typeArgMangle += "prim"; break;
-                        }
-                    } else {
-                        typeArgMangle += "t";
-                    }
-                } else {
-                    typeArgMangle += "t";
-                }
+                typeArgMangle += mangleTy(semaTy);  // #738: recursive
             }
         }
 
@@ -673,8 +656,14 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
         bool allConcrete = std::all_of(substIds.begin(), substIds.end(),
                                        [](const void* id) { return id != nullptr; });
         if (!substTypes.empty() && allConcrete) {
-            auto key = std::make_pair(static_cast<const sema::Symbol*>(fs),
-                                      std::make_pair(substTypes, substIds));
+            // #738: include the recursive type-arg mangle in the key so nested
+            // instantiations (Counter<Box<int>> vs Counter<Box<string>>), which
+            // share llvm type `ptr` AND the per-declaration `Box` identity token,
+            // resolve to DISTINCT per-instantiation globals (§22.12).
+            auto key = std::make_pair(
+                static_cast<const sema::Symbol*>(fs),
+                std::make_pair(std::make_pair(substTypes, substIds),
+                               typeArgMangle));
             auto git = genericInstStaticGlobals_.find(key);
             if (git != genericInstStaticGlobals_.end()) return git->second;
 
