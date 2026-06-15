@@ -767,12 +767,18 @@ private:
     // Each active try-with-finally pushes a frame; innermost is at back.
     struct FinallyFrame {
         llvm::BasicBlock* finNormalBB;  // the finally block for normal exits
-        llvm::AllocaInst* exitModSlot;  // i32: 0=fall-through, 1=return, 2=break, 3=cont
+        llvm::AllocaInst* exitModSlot;  // i32: 0=fall-through,1=return,2=break,3=cont,4=yield-break,5=async-return
         llvm::AllocaInst* retValSlot;   // alloca for return value (null if void)
         llvm::Type*       retTy;        // function return type
         llvm::BasicBlock* afterBB;      // continuation after the try
         llvm::BasicBlock* breakBB;      // outer loop break target at try-entry time
         llvm::BasicBlock* contBB;       // outer loop continue target at try-entry time
+        // #721 C1: an async method's `return` exits via emitAsyncComplete, not a
+        // function `ret`, so its unwrapped result value can't ride retValSlot
+        // (typed as the void Resume return). This slot (typed asyncResultTy_)
+        // carries the value across the finally for exit mode 5; null for a
+        // valueless `return` / a `Task` method / a non-async frame.
+        llvm::AllocaInst* asyncRetSlot = nullptr;
     };
     std::vector<FinallyFrame> finallyStack_;
     // §29.7 (#623): parallel to finallyStack_ — holds the finallyBody AST

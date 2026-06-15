@@ -563,6 +563,57 @@ BEZEL_TEST(async_30_9, await_in_try_finally_runs_on_normal) {
         105);
 }
 
+// §30.9 (#721 C1): a `return` exiting a try-with-finally in an ASYNC method must
+// run the finally on the way out. Before the fix the async-return path completed
+// the task and returned from Resume without consulting the finally, so the
+// finally was silently skipped. Valued return (Task<int>): 7 + 1 = 8.
+BEZEL_TEST(async_30_9, async_return_in_try_runs_finally_721) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static ran: int := 0; "
+        "  public static async method DoWork(): Task<int> "
+        "    try return 7; finally C.ran := 1; end; "
+        "  end DoWork; "
+        "  public static async method Main(): Task<int> "
+        "    using var t := DoWork(); var r := await t; "
+        "    return r + C.ran; "
+        "  end Main; end C;",
+        8);
+}
+
+// §30.9 (#721 C1): valueless `return` in a `Task` (no result) method — the
+// finally still runs (no value to carry across). ran = 1.
+BEZEL_TEST(async_30_9, async_valueless_return_in_try_runs_finally_721) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static ran: int := 0; "
+        "  public static async method DoWork(): Task "
+        "    try return; finally C.ran := 1; end; "
+        "  end DoWork; "
+        "  public static async method Main(): Task<int> "
+        "    using var t := DoWork(); await t; "
+        "    return C.ran; "
+        "  end Main; end C;",
+        1);
+}
+
+// §30.9 (#721 C1): a `return` in an inner try runs BOTH the inner and outer
+// finally (exit mode 5 propagates through the outer finally, value preserved).
+BEZEL_TEST(async_30_9, async_return_runs_nested_finally_721) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static a: int := 0; "
+        "  public static b: int := 0; "
+        "  public static async method DoWork(): Task<int> "
+        "    try try return 5; finally C.a := 1; end; finally C.b := 1; end; "
+        "  end DoWork; "
+        "  public static async method Main(): Task<int> "
+        "    using var t := DoWork(); var r := await t; "
+        "    return r + C.a * 10 + C.b * 100; "
+        "  end Main; end C;",
+        115);
+}
+
 // §30.9 / §31.2 (#438): try/catch/finally together with an await in the body —
 // normal completion runs the body and the finally (not the catch). 3 + 50 = 53.
 BEZEL_TEST(async_30_9, await_in_try_catch_finally_normal) {

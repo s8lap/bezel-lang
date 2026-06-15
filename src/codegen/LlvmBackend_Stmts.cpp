@@ -766,6 +766,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // async bodies is deferred; finallyStack_ is empty for the minimal cut.)
         if (smKind_ == SuspendKind::Await && smStateStruct_) {
             emitAllDisposals();
+            // #721 C1 / §30.9: a `return` exiting a try-with-finally must run the
+            // finally first. Stash the unwrapped result and route through the
+            // active finally (exit mode 5); the post-finally dispatch (lowerTry)
+            // performs emitAsyncComplete + RetVoid. Without this the finally is
+            // silently skipped on the async-return edge.
+            if (!finallyStack_.empty()) {
+                auto& fr = finallyStack_.back();
+                if (v && fr.asyncRetSlot)
+                    builder_.CreateStore(v, fr.asyncRetSlot);
+                builder_.CreateStore(builder_.getInt32(5), fr.exitModSlot);
+                builder_.CreateBr(fr.finNormalBB);
+                return true;
+            }
             emitAsyncComplete(v);
             builder_.CreateRetVoid();
             return true;
@@ -1168,14 +1181,22 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         ? nullptr : loopStack_.back().breakTarget;
     llvm::BasicBlock* loopContBB  = loopStack_.empty()
         ? nullptr : loopStack_.back().continueTarget;
+    // #721 C1: in an async method, `return v` completes the OUTER task with the
+    // unwrapped result (asyncResultTy_), not a function `ret`. Allocate a slot of
+    // that type so an async return inside this try can stash its value across the
+    // finally (exit mode 5). Null for a `Task` method (asyncResultTy_ == null).
+    llvm::AllocaInst* asyncRetSlot = nullptr;
     if (hasFin) {
         exitModSlot = entryAlloca(i32());
         builder_.CreateStore(builder_.getInt32(0), exitModSlot);
         if (retTy && !retTy->isVoidTy())
             retValSlot = entryAlloca(retTy);
-        finallyStack_.push_back({finNormalBB, exitModSlot, retValSlot,
-                                 retTy, afterBB,
-                                 loopBreakBB, loopContBB});
+        if (smKind_ == SuspendKind::Await && smStateStruct_ && asyncResultTy_)
+            asyncRetSlot = entryAlloca(asyncResultTy_);
+        FinallyFrame frame{finNormalBB, exitModSlot, retValSlot,
+                           retTy, afterBB, loopBreakBB, loopContBB};
+        frame.asyncRetSlot = asyncRetSlot;
+        finallyStack_.push_back(frame);
         // §29.7 (#623): track the AST finally-body alongside the frame so
         // a yield inside this try can snapshot the chain for Dispose.
         finallyBodyStack_.push_back(&trys.finallyBody);
@@ -1186,6 +1207,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         if (finallyAwaits) {
             asyncHandlerSpillSlots_.push_back(exitModSlot);
             if (retValSlot) asyncHandlerSpillSlots_.push_back(retValSlot);
+            if (asyncRetSlot) asyncHandlerSpillSlots_.push_back(asyncRetSlot);
         }
     }
 
@@ -1403,6 +1425,32 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 } else {
                     builder_.CreateRet(builder_.getFalse());
                 }
+            }
+        }
+
+        // mode=5 (#721 C1): async-method return — run any OUTER finally too, else
+        // complete the outer task with the stashed unwrapped result and ret void
+        // from Resume (the async analogue of mode 1). Only inside an async method
+        // state machine (SuspendKind::Await), the only place mode 5 is produced.
+        if (smKind_ == SuspendKind::Await && smStateStruct_) {
+            auto* arDispBB =
+                llvm::BasicBlock::Create(llvm_, "finally.asyncret", currentFn_);
+            sw->addCase(builder_.getInt32(5), arDispBB);
+            builder_.SetInsertPoint(arDispBB);
+            if (outerFr) {
+                builder_.CreateStore(builder_.getInt32(5), outerFr->exitModSlot);
+                if (asyncRetSlot && outerFr->asyncRetSlot && asyncResultTy_) {
+                    llvm::Value* rv =
+                        builder_.CreateLoad(asyncResultTy_, asyncRetSlot);
+                    builder_.CreateStore(rv, outerFr->asyncRetSlot);
+                }
+                builder_.CreateBr(outerFr->finNormalBB);
+            } else {
+                llvm::Value* rv = (asyncRetSlot && asyncResultTy_)
+                    ? builder_.CreateLoad(asyncResultTy_, asyncRetSlot)
+                    : nullptr;
+                emitAsyncComplete(rv);
+                builder_.CreateRetVoid();
             }
         }
 
