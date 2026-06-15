@@ -14,6 +14,7 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::JitResult;
 using bezel::test::runJit;
 
 namespace {
@@ -455,4 +456,92 @@ BEZEL_TEST(codegen_cg20, when_guard_false_restores_inflight_exception_720) {
         "    return 0; "
         "  end Main; end C;"),
         77);
+}
+
+// ── #739 / §31.1: the thrown value must be an exception (a class instance) ────
+//
+// `throw` constructs and raises an exception class instance (§31.1). Codegen
+// stores the thrown value into the in-flight-exception global as an exception
+// object pointer and dispatches on its runtime type descriptor; a non-class
+// value (primitive, string, record, enum, function) has no such descriptor, so
+// throwing one used to miscompile into a SIGSEGV. Sema now rejects it with a
+// clean diagnostic at the throw site instead of producing a crashing binary.
+
+namespace {
+// True iff at least one diagnostic message mentions the throwable-type rule.
+bool rejectsNonThrowable(const JitResult& r) {
+    if (!r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("must be an exception") != std::string::npos)
+            return true;
+    return false;
+}
+} // namespace
+
+// A primitive (`throw 5;`) is rejected, not compiled into a crash.
+BEZEL_TEST(codegen_cg20, throw_primitive_rejected_739) {
+    JitResult r = runJit(
+        "module M; class C public static method Main(): int "
+        "  throw 5; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(rejectsNonThrowable(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// A string value is likewise not throwable.
+BEZEL_TEST(codegen_cg20, throw_string_rejected_739) {
+    JitResult r = runJit(
+        "module M; class C public static method Main(): int "
+        "  throw \"boom\"; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(rejectsNonThrowable(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// A record is a value type, not a class instance → not throwable.
+BEZEL_TEST(codegen_cg20, throw_record_rejected_739) {
+    JitResult r = runJit(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  throw new Point(1, 2); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(rejectsNonThrowable(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// An enum value is not throwable.
+BEZEL_TEST(codegen_cg20, throw_enum_rejected_739) {
+    JitResult r = runJit(
+        "module M; "
+        "enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  throw Color.Red; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(rejectsNonThrowable(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// CONTROL: throwing a class instance (user exception) still compiles and runs;
+// the caught arm returns 42. Bezel permits throwing any class (§31.1), so a
+// non-`Exception`-derived class is accepted.
+BEZEL_TEST(codegen_cg20, throw_user_class_still_accepted_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppErr end AppErr; "
+        "class C public static method Main(): int "
+        "  try throw new AppErr(); catch AppErr => return 42; end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
+}
+
+// CONTROL: throwing a built-in exception type still compiles and runs.
+BEZEL_TEST(codegen_cg20, throw_builtin_exception_still_accepted_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class C public static method Main(): int "
+        "  try throw new ArgumentException(\"bad\"); "
+        "  catch ArgumentException => return 7; end; "
+        "  return 0; "
+        "end Main; end C;"), 7);
 }

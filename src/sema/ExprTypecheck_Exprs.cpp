@@ -1893,6 +1893,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
         if (th->operand) {
             visitExpr(*th->operand);
+            checkThrowableType(*th->operand);  // §31.1 (#739)
         } else if (catchDepth_ == 0) {
             // Slice S27: bare `throw` expression re-raise is valid
             // only inside a catch arm body (§31.5 / §17.12).

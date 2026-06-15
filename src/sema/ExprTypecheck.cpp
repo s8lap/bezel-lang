@@ -1143,6 +1143,25 @@ Symbol* ExprTC::lookupName(std::string_view name) {
     return nullptr;
 }
 
+void ExprTC::checkThrowableType(const ast::Expr& value) {
+    TypeRef* vt = ctx_.exprType(value);
+    if (!vt) return;  // unresolved type — don't false-positive
+    // Throwable = a CLASS instance (user or builtin exception). A Named type
+    // whose declaration is a RECORD or ENUM is a value type and not throwable;
+    // primitives, strings (Primitive::String), function values, and unit are
+    // likewise not Named-class and not throwable.
+    bool throwable = vt->kind == TypeRef::Kind::Named &&
+                     !(vt->declaration &&
+                       (vt->declaration->kind == ast::TypeDeclKind::Record ||
+                        vt->declaration->kind == ast::TypeDeclKind::Enum));
+    if (!throwable)
+        ctx_.diagnostics().report(
+            Severity::Error, value.span.begin,
+            "the thrown value must be an exception (a class instance) — a "
+            "primitive, string, record, enum, or function value cannot be "
+            "thrown (§31.1)");
+}
+
 void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
     for (std::size_t i = 0; i < arms.size(); ++i) {
         const ast::Pattern* p = arms[i].pattern.get();
@@ -2131,6 +2150,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
     } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
         if (ts->value) {
             visitExpr(*ts->value);
+            checkThrowableType(*ts->value);  // §31.1 (#739)
         } else if (catchDepth_ == 0) {
             // Slice S27 (§21.8 / §31.5): bare `throw;` re-raise is
             // valid only inside a catch arm body.

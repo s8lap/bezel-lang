@@ -332,6 +332,12 @@ private:
     // replace a downstream codegen IR failure / silently-unreachable arms.
     void validateCaseArms(const std::vector<ast::CaseArm>& arms);
 
+    // §31.1 (issue #739): the operand of `throw` must be an exception — a CLASS
+    // instance. A primitive/string/record/enum/function thrown value miscompiles
+    // (codegen treats it as an exception-object pointer → SIGSEGV); reject it
+    // with a clean diagnostic. No-op when the value's type is not yet resolved.
+    void checkThrowableType(const ast::Expr& value);
+
     // §5.1 (issue #738): fold `e` to a compile-time integer constant, resolving
     // `const` identifiers through the typecheck scope. Used to decide whether an
     // int initializer/value may implicitly narrow to a narrower integer target
