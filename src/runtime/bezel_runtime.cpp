@@ -64,6 +64,11 @@ int64_t bz_array_len(void* arrp) {
     return arrp ? ((bz_array_t*)arrp)->count : 0;
 }
 
+// stdlib §4.4/§4.5: the array-backed collection's allocated capacity (#741).
+int64_t bz_array_capacity(void* arrp) {
+    return arrp ? ((bz_array_t*)arrp)->capacity : 0;
+}
+
 // §4.14: allocate a bz_array_t with n pre-filled (zero-initialized) slots.
 // Used by `new OwnedBuffer<T>(n)` so that index-assignment data[i] := v is valid
 // for i in 0..<n without requiring Add() first. All n elements are calloc'd to 0.

@@ -2295,6 +2295,37 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // stdlib §4.4/§4.5/§4.14 (#741): `.Capacity` on a `bz_array_t`-backed type
+    // → bz_array_capacity. The spec declares `Capacity` only on Array/OwnedArray
+    // (and OwnedBuffer exposes it as `Length`), but every bz_array_t-backed
+    // collection has a valid backing capacity; the allowlist mirrors the
+    // construction branch (LlvmBackend_Exprs.cpp ~L6004). LinkedList (bz_llist)
+    // and Dictionary (bz_dict) use different backings and are NOT included. No
+    // codegen case existed, so the read previously returned an uninitialized slot.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target && ma->member == "Capacity") {
+            auto* tt = ctx_.exprType(*ma->target);
+            auto headName = [&](const sema::TypeRef* t) -> std::string_view {
+                return (t && t->astNode && t->astNode->name &&
+                        !t->astNode->name->parts.empty())
+                           ? t->astNode->name->parts[0] : std::string_view{};
+            };
+            std::string_view cn = headName(tt);
+            bool isArrayBacked =
+                cn == "Array" || cn == "OwnedArray" || cn == "OwnedBuffer" ||
+                cn == "Stack" || cn == "OwnedStack" ||
+                cn == "Queue" || cn == "OwnedQueue" ||
+                cn == "Set"   || cn == "OwnedSet";
+            if (isArrayBacked) {
+                llvm::Value* obj = lowerExpr(*ma->target);
+                if (obj) {
+                    auto* fn = declareC("bz_array_capacity", i64(), {ptrTy()});
+                    llvm::Value* cap64 = builder_.CreateCall(fn, {obj});
+                    return builder_.CreateTrunc(cap64, i32(), "col.cap");
+                }
+            }
+        }
+    }
     // per §4.6/§4.7: LinkedList<T>/OwnedLinkedList<T> node-returning properties
     // (FirstNode, LastNode, First, Last) and LinkedListNode<T> accessor
     // properties (Value, Next, Previous).
@@ -5993,7 +6024,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     return builder_.CreateCall(fn,
                         {builder_.getInt64(elemSize), nArg}, "ob.arr");
                 }
+                // stdlib §4.4/§4.5 (#741): the `constructor(capacity: int)` arg
+                // reserves backing slots WITHOUT setting count (an empty array
+                // with room to grow), distinct from OwnedBuffer above which also
+                // sets count=n. Previously the arg was ignored and a constant 16
+                // was always allocated, so `.Capacity` could not reflect the
+                // requested reservation. A non-positive request falls back to 16.
                 auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                if (!ne.args.empty() && ne.args[0].value) {
+                    llvm::Value* capArg = lowerExpr(*ne.args[0].value);
+                    if (capArg) {
+                        if (!capArg->getType()->isIntegerTy(64))
+                            capArg = builder_.CreateSExt(capArg, i64());
+                        // max(capArg, 1) so a 0/negative request still yields a
+                        // usable buffer; matches the OwnedArray reference impl
+                        // (`if capacity > 0 then capacity else 1`, stdlib §4.5).
+                        llvm::Value* one = builder_.getInt64(1);
+                        llvm::Value* useArg = builder_.CreateICmpSGT(capArg, one);
+                        llvm::Value* cap = builder_.CreateSelect(useArg, capArg, one);
+                        return builder_.CreateCall(allocFn,
+                            {builder_.getInt64(elemSize), cap}, "col.cap.init");
+                    }
+                }
                 return builder_.CreateCall(allocFn,
                     {builder_.getInt64(elemSize), builder_.getInt64(16)});
             }

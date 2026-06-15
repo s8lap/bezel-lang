@@ -548,6 +548,9 @@ set(BEZEL_TEST_SOURCES
     # --- fix #690: arr[range] typed as Array<T> per §15.6 ---
     codegen/array_slice_690_test.cpp
     # --- end #690 ---
+    # --- fix #741: Array<T>.Capacity + ctor capacity reservation (§4.4/§4.5) ---
+    codegen/array_capacity_741_test.cpp
+    # --- end #741 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
     codegen/record_method_case_expr_677_test.cpp
     # --- end #677 ---
