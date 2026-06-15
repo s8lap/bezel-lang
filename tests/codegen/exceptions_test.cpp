@@ -389,3 +389,70 @@ BEZEL_TEST(codegen_cg20, type_test_in_interpolated_string) {
         "end Main; end C;"),
         1);
 }
+
+// #720 B2 / §31: a `when` guard that ALLOCATES (or calls a method) must run
+// correctly even though an exception is in flight during catch dispatch. Before
+// the fix the in-flight exception sat in the global slot, so the guard's `new`
+// misfired the pending-exception check (freeing the fresh object, treating the
+// guard's own op as a failure) and the whole construct went unhandled.
+BEZEL_TEST(codegen_cg20, when_guard_allocation_does_not_misfire_720) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppErr end AppErr; "
+        "class Helper public v: int; "
+        "  public constructor(x: int) v := x; end constructor; end Helper; "
+        "class C "
+        "  public static method CheckIt(): bool "
+        "    using var h := new Helper(7); return h.v = 7; "
+        "  end CheckIt; "
+        "  public static method Main(): int "
+        "    try throw new AppErr(); "
+        "    catch AppErr when C.CheckIt() => return 42; "
+        "    catch AppErr => return 99; "
+        "    end; "
+        "    return 0; "
+        "  end Main; end C;"),
+        42);
+}
+
+// #720 B2 / §31: a `throw` from a `when` guard supersedes the in-flight
+// exception and propagates to the ENCLOSING handler (consistent with
+// throw-in-finally, #720 B1). The inner guard throws GuardErr; the outer
+// `catch GuardErr` catches it.
+BEZEL_TEST(codegen_cg20, when_guard_throw_propagates_to_enclosing_720) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppErr end AppErr; "
+        "class GuardErr end GuardErr; "
+        "class C "
+        "  public static method Boom(): bool throw new GuardErr(); end Boom; "
+        "  public static method Main(): int "
+        "    try "
+        "      try throw new AppErr(); "
+        "      catch AppErr when C.Boom() => return 10; "
+        "      end; "
+        "    catch GuardErr => return 20; "
+        "    end; "
+        "    return 0; "
+        "  end Main; end C;"),
+        20);
+}
+
+// #720 B2 / §31: a guard that does NOT match falls through to the next arm with
+// the original in-flight exception intact (the set-aside exception is restored
+// after the guard runs).
+BEZEL_TEST(codegen_cg20, when_guard_false_restores_inflight_exception_720) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class AppErr end AppErr; "
+        "class C "
+        "  public static method No(): bool return false; end No; "
+        "  public static method Main(): int "
+        "    try throw new AppErr(); "
+        "    catch AppErr when C.No() => return 1; "
+        "    catch AppErr => return 77; "  // original AppErr still matches here
+        "    end; "
+        "    return 0; "
+        "  end Main; end C;"),
+        77);
+}

@@ -1269,8 +1269,26 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 if (armAwaits) asyncHandlerSpillSlots_.push_back(slot);
             }
             if (arm.guard) {
+                // §31 (#720 B2): the `when` guard runs DURING catch dispatch,
+                // while the in-flight exception is still in the global slot. Any
+                // `new`/call inside the guard would otherwise misfire the
+                // pending-exception checks — emitNewPendingCheck/emitPendingCheck
+                // see the in-flight exception and treat it as a failure of the
+                // guard's OWN operation (freeing freshly-allocated objects,
+                // short-circuiting the call). Set the in-flight exception aside
+                // for the guard: clear the slot before, restore it on the
+                // not-thrown continuation. A throw FROM the guard sets a NEW
+                // exception that the in-guard pending-checks propagate — it
+                // supersedes the in-flight one (consistent with throw-in-finally,
+                // #720 B1).
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
                 llvm::Value* g = lowerExpr(*arm.guard);
                 if (!g) g = builder_.getInt1(false);
+                // Guard returned normally (did not throw): restore the in-flight
+                // exception so a non-match continues matching / re-propagates
+                // with it. (The matched armBB clears the slot again below.)
+                builder_.CreateStore(exc, emitExcSlot());
                 builder_.CreateCondBr(g, armBB, nextBB);
             } else {
                 builder_.CreateBr(armBB);
