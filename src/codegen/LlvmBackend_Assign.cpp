@@ -1923,11 +1923,20 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         locals_[pd] = slot;
+        // §22.9 (#739): inline the setter body with an accessor-end target so a
+        // `return;` ends the setter rather than the enclosing method.
+        llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
+        auto* accEndBB = llvm::BasicBlock::Create(llvm_, "setter.end", currentFn_);
+        inlinedAccessorEnd_ = accEndBB;
+        bool term = false;
         if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
             setter->exprBody)
             lowerExpr(*setter->exprBody);
         else
-            lowerScopedBlock(setter->stmts);
+            term = lowerScopedBlock(setter->stmts);
+        inlinedAccessorEnd_ = savedAccEnd;
+        if (!term) builder_.CreateBr(accEndBB);
+        builder_.SetInsertPoint(accEndBB);
         return true;
     }
     llvm::Value* recv = currentThis_;
@@ -1940,11 +1949,20 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
     locals_[pd] = slot;
     llvm::Value* savedThis = currentThis_;
     currentThis_ = recv;
+    // §22.9 (#739): accessor-end target — a `return;` ends the setter, not the
+    // enclosing method (the setter body is inlined here).
+    llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
+    auto* accEndBB = llvm::BasicBlock::Create(llvm_, "setter.end", currentFn_);
+    inlinedAccessorEnd_ = accEndBB;
+    bool term = false;
     if (setter->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
         setter->exprBody)
         lowerExpr(*setter->exprBody);
     else
-        lowerScopedBlock(setter->stmts);
+        term = lowerScopedBlock(setter->stmts);
+    inlinedAccessorEnd_ = savedAccEnd;
+    if (!term) builder_.CreateBr(accEndBB);
+    builder_.SetInsertPoint(accEndBB);
     currentThis_ = savedThis;
     return true;
 }

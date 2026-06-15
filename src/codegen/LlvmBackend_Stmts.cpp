@@ -726,6 +726,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return false;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        // §22.9 (#739): a `return;` inside an INLINED property setter body ends
+        // the setter (a void accessor), not the enclosing method — branch to the
+        // accessor-end block rather than emitting a function return. (A setter is
+        // void, so a value-bearing return cannot validly occur here.)
+        if (inlinedAccessorEnd_ && !rs->value) {
+            builder_.CreateBr(inlinedAccessorEnd_);
+            return true;
+        }
         // The return value is evaluated first, then in-scope `using
         // var`s are disposed (§28.3), then control leaves — so the
         // returned value reflects pre-disposal state.

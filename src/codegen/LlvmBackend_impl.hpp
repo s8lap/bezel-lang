@@ -806,6 +806,11 @@ private:
     llvm::Function*       excAddrFn_ = nullptr;   // fix #704: cached bz_exc_addr decl
     llvm::BasicBlock* unwindTarget_ = nullptr;   // innermost catch dispatch
     llvm::BasicBlock* propagateBB_ = nullptr;    // per-function, lazy
+    // §22.9 (#739): when non-null, a property accessor (setter) body is being
+    // INLINED at an assignment site; a `return;` in it ends the accessor by
+    // branching here, NOT by emitting a function return (which would exit the
+    // enclosing method or, unconditionally, leave a malformed block).
+    llvm::BasicBlock* inlinedAccessorEnd_ = nullptr;
     // CG20: the exception value caught by the enclosing catch arm, so a
     // bare `throw;` can re-raise it (the global was cleared on arm entry).
     llvm::Value* currentCaughtExc_ = nullptr;

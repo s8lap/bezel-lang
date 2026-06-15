@@ -109,3 +109,37 @@ BEZEL_TEST(codegen_cg49, compound_assign_times_equals) {
         "  end Main; "
         "end C;"), 24);
 }
+
+// #739 / §22.9: a `return;` in a block-form setter ENDS the setter (it is a void
+// accessor), it does NOT return from the enclosing method. The setter body is
+// inlined at the assignment site, so the return is routed to an accessor-end
+// block. Conditional-return validate-then-set must keep the prior value.
+BEZEL_TEST(codegen_block_setter, conditional_return_ends_setter_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Box "
+        "  public _x: int := 0; "
+        "  public property X: int "
+        "    get => _x; "
+        "    set => do if value < 0 then return; end; _x := value; end; "
+        "  end X; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var b := new Box(); "
+        "  b.X := 5; b.X := -1; b.X := 8; "  // -1 rejected; X = 8
+        "  return b.X; "
+        "end Main; end C;"), 8);
+}
+
+// #739 / §22.9: an UNCONDITIONAL `return;` in a setter previously IR-failed
+// (terminator mid-block). Now it cleanly ends the setter (a no-op setter here).
+BEZEL_TEST(codegen_block_setter, unconditional_return_in_setter_no_irfail_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Box "
+        "  public _x: int := 7; "
+        "  public property X: int get => _x; set => do return; end; end X; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var b := new Box(); b.X := 99; "  // setter is a no-op
+        "  return b.X; "  // still 7
+        "end Main; end C;"), 7);
+}
