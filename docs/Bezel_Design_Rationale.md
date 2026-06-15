@@ -6865,15 +6865,18 @@ Source-breaking for any class using a `serialized tree`/`serialized graph`/`seri
 
 **Erratum — borrowing class-typed fields.** §28.3's "Borrow lifetime rules" carried a stale categorical sentence — "class-typed fields that hold a borrow are not expressible in this version" — that contradicted both §28.5 (which ships `private _owner: Customer; // back-reference, not owned` as a worked example) and §9.8 (whose serialization synthesis is built on borrowing back-edge fields), as well as the compiler, which accepts such fields under a lifetime check. Issue #717.
 
+**Clarification — exceptions in a catch `when` guard (§31.2.1).** §31.2.1 was silent on what happens when a `catch ... when <guard>` evaluates ordinary code (allocations, calls) or itself throws while the matched exception is in flight. Issue #720 (B2). The compiler previously misfired: because the in-flight exception sat in the global slot during guard evaluation, an allocation or call inside the guard tripped the pending-exception check and the whole construct went unhandled. §31.2.1 now states the rule the corrected compiler enforces — a guard runs as ordinary code (the in-flight exception does not interfere), and a `throw` from the guard *supersedes* the in-flight exception and propagates to the enclosing handler, mirroring throw-in-`finally`. The compiler fix sets the in-flight exception aside for the duration of the guard.
+
 #### What changed
 - The §28.3 bullet is rewritten to state the **lifetime-based** rule the compiler actually enforces: a borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never qualifies (it is disposed at scope end, which the object's field outlives), so a borrowed local may not be assigned to any field — the one case the old prose got right. A borrow whose source outlives the object **is** admissible; the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (a **borrowing class-typed field**), which is exactly the §28.5 `_owner` back-reference and the §9.8 serialization back-edge.
-- No behaviour change: the compiler already enforced the lifetime rule (a borrowed-local-into-field assignment is rejected; a constructor-parameter borrow whose caller-side source outlives the object is accepted). This revision only reconciles the normative prose with the implementation and with §28.5/§9.8.
+- §31.2.1 gains a sentence defining catch-guard evaluation and guard-throw (supersede) semantics; no behaviour was ADDED, the compiler fix (#720 B2) makes the implementation match.
+- No behaviour change to §28.3: the compiler already enforced the lifetime rule. The §31.2.1 case WAS a compiler bug, now fixed; the prose documents the corrected, intended behaviour.
 
 #### Touched
-Spec §28.3 (one bullet under "Borrow lifetime rules"). No grammar, stdlib, or compiler change.
+Spec §28.3 (one bullet under "Borrow lifetime rules") and §31.2.1 (one sentence on catch-guard evaluation/throw). No grammar or stdlib change. Compiler: the catch-guard fix (#720 B2) lands separately.
 
 #### Migration
-None. The amendment narrows no program that previously compiled and admits none that previously did not; it documents existing behaviour.
+None. The §28.3 amendment narrows no program that previously compiled and admits none that previously did not. The §31.2.1 clarification documents corrected behaviour: programs whose catch guard allocated or called a method previously failed to compile-to-correct-runtime (went unhandled) and now run as specified.
 
 ---
 
