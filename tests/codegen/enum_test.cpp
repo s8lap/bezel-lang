@@ -145,3 +145,21 @@ BEZEL_TEST(codegen_cg30_iface, record_interface_box_thunk_regression) {
         "  end Main; "
         "end C;").exitCode, 42);
 }
+
+// #739 / §10.2: an explicit NEGATIVE enum value (`B := -5`) must be honored.
+// Previously the value computer only handled a bare IntLiteralExpr, so the
+// unary-minus `-5` was dropped and B got the auto-increment value (6).
+BEZEL_TEST(codegen_enum, negative_explicit_value_739) {
+    BEZEL_EXPECT_EQ(run(
+        "enum E A := 5, B := -5; end E; ",
+        "return (0 if int(E.B) = -5 else int(E.B));"), 0);
+}
+
+// #739 / §10.2: explicit value as ARITHMETIC and a reference to an earlier
+// constant; auto-increment continues from the last explicit value.
+BEZEL_TEST(codegen_enum, arithmetic_and_sibling_value_739) {
+    BEZEL_EXPECT_EQ(run(
+        "enum E A := 10, B, C := A + 100, D := -3; end E; ",
+        // A=10, B=11 (auto), C=110, D=-3 → 10+11+110-(-3) = 134
+        "return int(E.A) + int(E.B) + int(E.C) - int(E.D);"), 134);
+}

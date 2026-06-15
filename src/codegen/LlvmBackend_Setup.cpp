@@ -1,5 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+#include "sema/ConstFold.hpp"
+
 // §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
 extern "C" void bz_decimal_parse_cstr(const char* s, void* out);
 
@@ -109,9 +111,24 @@ void Emitter::populateEnumValuesFromDecl(const sema::TypeSymbol* ts) {
     for (const auto& ec : td->enumConstants) {
         std::int64_t val = running;
         if (ec.value) {
-            if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(
-                    ec.value.get()))
-                val = parseIntLiteral(lit->text);
+            // §10.2 (#739): an explicit value is a compile-time integer constant
+            // — a literal, unary `+ - ~`, arithmetic, or a reference to an
+            // earlier constant of this enum. The old IntLiteralExpr-only check
+            // dropped a NEGATIVE value (`:= -5` is a UnaryExpr) and fell back to
+            // auto-increment. foldIntConst handles all those forms; the resolver
+            // looks up an already-computed sibling constant by name.
+            auto resolveSibling =
+                [&](std::string_view name, int) -> std::optional<long long> {
+                for (const sema::Symbol* m : ts->members)
+                    if (dynamic_cast<const sema::EnumConstantSymbol*>(m) &&
+                        m->name == name) {
+                        auto vit = enumValue_.find(m);
+                        if (vit != enumValue_.end()) return vit->second;
+                    }
+                return std::nullopt;
+            };
+            if (auto folded = sema::foldIntConst(*ec.value, resolveSibling))
+                val = *folded;
         }
         for (const sema::Symbol* m : ts->members) {
             if (dynamic_cast<const sema::EnumConstantSymbol*>(m) &&
