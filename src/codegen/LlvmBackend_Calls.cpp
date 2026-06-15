@@ -4879,6 +4879,45 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                  builder_.getInt64(sz)},
                 "task.from_result");
         }
+        // stdlib §6.7 (line 2986) / §30.10 (#738): Task.FromException<T>(exc):
+        // Task<T> — an already-FAULTED task carrying the exception object.
+        // Awaiting it re-raises the original exception (the await machinery reads
+        // bz_task_error_obj). Allocate a task and fault it with the Exception.
+        if (m == "FromException" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* exc = lowerExpr(*call.args[0].value);
+            if (!exc) return nullptr;
+            auto* allocFn = declareC("bz_task_alloc", ptrTy(), {});
+            llvm::Value* task =
+                builder_.CreateCall(allocFn, {}, "task.fromexc");
+            auto* faultFn = declareC("bz_task_complete_error_obj",
+                                     llvm::Type::getVoidTy(llvm_),
+                                     {ptrTy(), ptrTy()});
+            builder_.CreateCall(faultFn, {task, exc});
+            return task;
+        }
+        // stdlib §6.7 (line 2987) / §30.10 (#738): Task.FromCancelled<T>():
+        // Task<T> — an already-faulted task carrying an
+        // OperationCanceledException. Awaiting it re-raises the OCE. Construct
+        // the OCE inline ({vtable, msg} — same layout as bz_task_make_oce / a
+        // builtin exception) and fault a fresh task with it.
+        if (m == "FromCancelled") {
+            llvm::Value* oceVtable = llvm::ConstantPointerNull::get(ptrTy());
+            auto vit = builtinVtable_.find("OperationCanceledException");
+            if (vit != builtinVtable_.end())
+                oceVtable = builder_.CreateBitCast(vit->second, ptrTy());
+            auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+            llvm::Value* oce = builder_.CreateCall(
+                callocFn, {builder_.getInt64(1), builder_.getInt64(16)}, "oce");
+            builder_.CreateStore(oceVtable, oce);  // slot 0 = vtable
+            auto* allocFn = declareC("bz_task_alloc", ptrTy(), {});
+            llvm::Value* task =
+                builder_.CreateCall(allocFn, {}, "task.fromcancel");
+            auto* faultFn = declareC("bz_task_complete_error_obj",
+                                     llvm::Type::getVoidTy(llvm_),
+                                     {ptrTy(), ptrTy()});
+            builder_.CreateCall(faultFn, {task, oce});
+            return task;
+        }
         // stdlib §6.7 (line 2872): Task.WhenAll(tasks: Array<Task>): Task.
         // stdlib §6.7 (line 2875): Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
         //

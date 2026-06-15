@@ -1998,6 +1998,34 @@ BEZEL_TEST(async_444, await_call_site_type_arg_misparsed_as_comparison_is_error)
         42);
 }
 
+// #738 / stdlib §6.7: Task.FromException<T>(exc) produces an already-faulted
+// Task<T>; awaiting it re-raises the original exception. Previously unimplemented
+// in codegen — the local was typed i32 and `bz_task_is_done` got an i32 (IR_FAIL).
+BEZEL_TEST(async_30_10, from_exception_await_reraises_738) {
+    expectValueLeakFree(
+        "module M; class AppErr end AppErr; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var t := Task.FromException<int>(new AppErr()); "
+        "    try var v := await t; return 99; "
+        "    catch AppErr => return 5; end; "
+        "  end Main; end C;",
+        5);
+}
+
+// #738 / stdlib §6.7: Task.FromCancelled<T>() produces a faulted Task<T> carrying
+// an OperationCanceledException; awaiting re-raises it. (Was sema-typed but had
+// no codegen → the await hung.)
+BEZEL_TEST(async_30_10, from_cancelled_await_reraises_oce_738) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var t := Task.FromCancelled<int>(); "
+        "    try var v := await t; return 99; "
+        "    catch OperationCanceledException => return 8; end; "
+        "  end Main; end C;",
+        8);
+}
+
 // §30.2 / §A.7 (#444): `await` on a plain integer literal is also rejected
 // with a clean error (the general guard for await-of-non-task).
 BEZEL_TEST(async_444, await_int_literal_non_task_is_error) {

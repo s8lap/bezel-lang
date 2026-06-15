@@ -2001,6 +2001,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (argTy) tt->genericArgs.push_back(argTy);
                             ctx_.setExprType(&ce, tt);
                         }
+                        // stdlib §6.7 (line 2986-2987): Task.FromException<T>(exc):
+                        // Task<T> and Task.FromCancelled<T>(): Task<T>. The result
+                        // T comes from the EXPLICIT method type arg (the argument,
+                        // if any, is the Exception — not T). A faulted/cancelled
+                        // task never produces a value; awaiting it re-raises.
+                        if (m == "FromException" || m == "FromCancelled") {
+                            auto* tt = makeTaskTypeRef();
+                            if (!ma->typeArgs.empty() && ma->typeArgs[0])
+                                if (TypeRef* T =
+                                        ctx_.resolvedType(*ma->typeArgs[0]))
+                                    tt->genericArgs.push_back(T);
+                            ctx_.setExprType(&ce, tt);
+                        }
                         // stdlib §6.7 (line 2872): Task.WhenAll(tasks: Array<Task>):
                         // Task. Completes when all input tasks complete; no result
                         // value (bare Task).
