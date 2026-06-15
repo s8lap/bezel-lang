@@ -21,6 +21,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <optional>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -330,6 +331,12 @@ private:
     // catch-all in a non-last arm (§19.6). Both are clean diagnostics that
     // replace a downstream codegen IR failure / silently-unreachable arms.
     void validateCaseArms(const std::vector<ast::CaseArm>& arms);
+
+    // §5.1 (issue #738): fold `e` to a compile-time integer constant, resolving
+    // `const` identifiers through the typecheck scope. Used to decide whether an
+    // int initializer/value may implicitly narrow to a narrower integer target
+    // (a literal/arithmetic/const may; a variable or call result may not).
+    std::optional<long long> foldIntConstExprTC(const ast::Expr& e);
 
     // §15.1 (issue #734): fold a LOCAL-`const` inline-array size onto its
     // resolved TypeRef. Member/module consts are folded earlier (type

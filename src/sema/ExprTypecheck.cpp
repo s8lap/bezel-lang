@@ -1158,6 +1158,22 @@ void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
     }
 }
 
+std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
+    std::function<std::optional<long long>(std::string_view, int)> resolve =
+        [&](std::string_view name, int d) -> std::optional<long long> {
+        Symbol* s = lookupName(name);
+        if (!s) return std::nullopt;
+        const ast::Expr* val = nullptr;
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
+            val = lc->value.get();
+        else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
+            val = cd->value.get();
+        if (!val) return std::nullopt;
+        return foldIntConst(*val, resolve, d + 1);
+    };
+    return foldIntConst(e, resolve, 0);
+}
+
 void ExprTC::foldLocalConstArraySize(TypeRef* declType) {
     if (!declType || declType->kind != TypeRef::Kind::InlineArray) return;
     if (declType->arraySizeValue >= 0) return;  // already folded (literal/member)
@@ -1731,10 +1747,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // Slice T1: when an explicit ascription and an
                 // initializer are both present and both primitive,
                 // check primitive assignability (§5.1).
-                // §5.1 special: an integer literal assigns to any
-                // integer type that can represent its value without
-                // loss — re-type the literal as the target type so
-                // the assignability check passes.
+                // §5.1 special: an integer CONSTANT EXPRESSION assigns to any
+                // integer type that can represent its value — re-type it as the
+                // target type so the assignability check passes. #738: gate on
+                // the initializer actually being a compile-time int constant
+                // (foldIntConst: a literal, arithmetic on literals, or a `const`
+                // reference); a non-constant int value (a variable / call result)
+                // does NOT implicitly narrow and falls through to checkAssignable,
+                // which reports the §5.1 error (`var y: sbyte := someIntVar`).
                 if (ld->initializer) {
                     TypeRef* fromTy = ctx_.exprType(*ld->initializer);
                     if (fromTy && lsym->declType &&
@@ -1742,13 +1762,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         lsym->declType->kind == TypeRef::Kind::Primitive &&
                         fromTy->primitive == PrimitiveType::Int) {
                         PrimitiveType tgt = lsym->declType->primitive;
-                        if (tgt == PrimitiveType::Byte ||
+                        bool narrowerIntTarget =
+                            tgt == PrimitiveType::Byte ||
                             tgt == PrimitiveType::SByte ||
                             tgt == PrimitiveType::Short ||
                             tgt == PrimitiveType::UShort ||
                             tgt == PrimitiveType::UInt ||
-                            tgt == PrimitiveType::ULong) {
-                            // Retype the literal as the narrower type.
+                            tgt == PrimitiveType::ULong;
+                        if (narrowerIntTarget &&
+                            foldIntConstExprTC(*ld->initializer)) {
+                            // Compile-time int constant → re-type to the narrower
+                            // target (§5.1 literal/constant rule).
                             ctx_.setExprType(ld->initializer.get(),
                                              lsym->declType);
                             fromTy = lsym->declType;
@@ -1965,10 +1989,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // operator semantics and are left to a later slice).
             if (as->op == ":=" && as->target && as->value) {
                 // §5.1 special (mirrors LocalDecl init narrowing above):
-                // an int literal on the RHS assigns to any narrower integer
-                // target type without a diagnostic — retype the literal so
+                // an int CONSTANT EXPRESSION on the RHS assigns to a narrower
+                // integer target without a diagnostic — retype it so
                 // checkAssignable sees matching primitive types. This covers
-                // Buffer<byte>[i] := 1, local byte b := 1, etc.
+                // Buffer<byte>[i] := 1, local byte b := 1, etc. #738: gate on the
+                // RHS being a compile-time int constant (foldIntConstExprTC) — a
+                // non-constant int value (`b := someIntVar`) does not implicitly
+                // narrow and is reported by checkAssignable.
                 TypeRef* fromTy = ctx_.exprType(*as->value);
                 TypeRef* toTy   = ctx_.exprType(*as->target);
                 if (fromTy && toTy &&
@@ -1976,12 +2003,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     toTy->kind   == TypeRef::Kind::Primitive &&
                     fromTy->primitive == PrimitiveType::Int) {
                     PrimitiveType tgt = toTy->primitive;
-                    if (tgt == PrimitiveType::Byte  ||
+                    bool narrowerIntTarget =
+                        tgt == PrimitiveType::Byte  ||
                         tgt == PrimitiveType::SByte ||
                         tgt == PrimitiveType::Short ||
                         tgt == PrimitiveType::UShort||
                         tgt == PrimitiveType::UInt  ||
-                        tgt == PrimitiveType::ULong) {
+                        tgt == PrimitiveType::ULong;
+                    if (narrowerIntTarget && foldIntConstExprTC(*as->value)) {
                         ctx_.setExprType(as->value.get(), toTy);
                         fromTy = toTy;
                     }

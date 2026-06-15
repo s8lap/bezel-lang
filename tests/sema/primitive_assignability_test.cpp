@@ -78,3 +78,30 @@ BEZEL_TEST(sema_assign, inferred_local_no_ascription_no_check) {
     auto r = parseSemaAll(wrap("var x := 42;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// #738 / §5.1: an integer LITERAL/constant narrows implicitly (representable);
+// a non-constant int VALUE does not — it needs an explicit cast. Previously the
+// retype-to-narrower applied to ANY int initializer, so `var y: sbyte := x`
+// (x an int variable) was silently accepted and truncated.
+BEZEL_TEST(sema_assign, int_var_to_sbyte_narrowing_rejected_738) {
+    auto r = parseSemaAll(wrap(
+        "var x: int := 300; var y: sbyte := x;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_assign, int_var_to_byte_assign_narrowing_rejected_738) {
+    auto r = parseSemaAll(wrap(
+        "var x: int := 300; var b: byte := 1; b := x;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_assign, int_literal_to_sbyte_still_ok_738) {
+    auto r = parseSemaAll(wrap("var y: sbyte := 100;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_assign, neg_int_literal_to_sbyte_still_ok_738) {
+    auto r = parseSemaAll(wrap("var y: sbyte := -5;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+BEZEL_TEST(sema_assign, int_const_arith_to_byte_still_ok_738) {
+    auto r = parseSemaAll(wrap("var b: byte := 10 + 20;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
