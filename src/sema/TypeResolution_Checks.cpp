@@ -206,6 +206,32 @@ void Resolver::checkTypeStaticNotVirtual(TypeSymbol* t) {
             !dynamic_cast<PropertySymbol*>(m)) {
             continue;
         }
+        // §12.1: `abstract`, `virtual`, `override`, and `sealed override` are
+        // mutually exclusive — at most one inheritance modifier may appear on a
+        // member. Without this check `virtual abstract` / `virtual override` /
+        // `abstract override` were silently accepted, producing ABI-corrupt or
+        // contradictory dispatch (R39). `sealed` is a class-level modifier and
+        // appears on a member only as part of `sealed override`.
+        {
+            int n = (hasMod(mem, "abstract") ? 1 : 0) +
+                    (hasMod(mem, "virtual") ? 1 : 0) +
+                    (hasMod(mem, "override") ? 1 : 0);
+            if (n > 1) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("member `") + std::string(mem->name) +
+                    "` may have at most one of `abstract`, `virtual`, "
+                    "`override`, or `sealed override` — they are mutually "
+                    "exclusive (§12.1)");
+            }
+            if (hasMod(mem, "sealed") && !hasMod(mem, "override")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("member `") + std::string(mem->name) +
+                    "` may not be `sealed` on its own — on a member `sealed` "
+                    "appears only as `sealed override` (§12.1)");
+            }
+        }
         if (!hasMod(mem, "static")) continue;
         if (hasMod(mem, "virtual") || hasMod(mem, "abstract") ||
             hasMod(mem, "override")) {
