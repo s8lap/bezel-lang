@@ -165,4 +165,77 @@ BEZEL_TEST(codegen_cg27d, verbatim_interpolated_hole_still_substitutes_r36) {
         "end Main; end C;"), 1);
 }
 
+// ── §18.5 format specifiers (issue #739, WR9/WR10/WR11) ──────────────────────
+
+// WR9 / §18.5 normative example: `{ratio:P1}` → "85.0%" (multiply by 100,
+// fixed-point to the digit count, append '%'). Previously the P specifier was
+// silently dropped and the raw value printed.
+BEZEL_TEST(codegen_cg27d, percent_format_p1_float_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var ratio: float := 0.85f; var s := $\"{ratio:P1}\"; "
+        "  return (1 if s = \"85.0%\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+BEZEL_TEST(codegen_cg27d, percent_format_p1_double_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var r: double := 0.85; var s := $\"{r:P1}\"; "
+        "  return (1 if s = \"85.0%\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// Bare `P` defaults to two fractional digits: 0.5 → "50.00%".
+BEZEL_TEST(codegen_cg27d, percent_format_default_digits_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var r: double := 0.5; var s := $\"{r:P}\"; "
+        "  return (1 if s = \"50.00%\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// WR10 / §18.5: an uppercase `E` specifier yields an uppercase exponent letter,
+// lowercase `e` yields lowercase — the specifier's case is honoured (mirroring
+// X/x). Previously both produced lowercase `e`.
+BEZEL_TEST(codegen_cg27d, scientific_format_case_honoured_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var v: float := 1.23f; "
+        "  var up := $\"{v:E2}\"; var lo := $\"{v:e2}\"; "
+        "  return (1 if (up.Contains(\"E\") and lo.Contains(\"e\")) else 0); "
+        "end Main; end C;"), 1);
+}
+
+// WR11 / §18.5: a fixed-point specifier applies to an int operand — `{42:F2}`
+// → "42.00" (length 5). Previously F was dropped for int, yielding "42".
+BEZEL_TEST(codegen_cg27d, fixed_point_format_on_int_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var n: int := 42; var s := $\"{n:F2}\"; "
+        "  return s.Length; "  // "42.00" → 5
+        "end Main; end C;"), 5);
+}
+
+BEZEL_TEST(codegen_cg27d, fixed_point_format_on_int_value_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var n: int := 42; var s := $\"{n:F2}\"; "
+        "  return (1 if s = \"42.00\" else 0); "
+        "end Main; end C;"), 1);
+}
+
+// Regression: a fixed-point specifier on a double is unchanged — `{1234.5:F2}`
+// → "1234.50" — and the alignment+format combination still pads correctly.
+BEZEL_TEST(codegen_cg27d, fixed_point_format_double_unchanged_739) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var amount: double := 1234.5; "
+        "  var f := $\"{amount:F2}\"; "
+        "  var aligned := $\"|{amount,12:F2}|\"; "
+        "  var ok := (f = \"1234.50\") and (aligned = \"|     1234.50|\"); "
+        "  return (1 if ok else 0); "
+        "end Main; end C;"), 1);
+}
+
 }  // namespace

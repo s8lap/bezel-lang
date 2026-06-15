@@ -645,7 +645,8 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
             ptrTy(), builder_.CreateStructGEP(stringType(), strVal, 0));
         return emitSnprintfToString(snpFmt, datPtr);
     }
-    char kind = std::toupper(spec[0]);
+    char specCh = spec[0];
+    char kind = std::toupper(static_cast<unsigned char>(specCh));
     int width = (spec.size() > 1) ? std::atoi(spec.c_str() + 1) : -1;
     std::string snprintfFmt;
     bool isFloat = val->getType()->isDoubleTy() ||
@@ -656,15 +657,36 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
     bool isInt = val->getType()->isIntegerTy() ||
                  (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                   !isFloat);
-    if (kind == 'F' && isFloat) {
+    bool numeric = isFloat || isInt;
+    // F/E/G/P (§18.5) format a numeric value as a real number, so they apply to
+    // both floating and integer operands (an int operand is widened to double
+    // first — `{42:F2}` → "42.00", issue #739/WR11). X/D apply to integers
+    // only. The case of the specifier letter is preserved for E/G/X so an
+    // uppercase specifier yields uppercase output (issue #739/WR10, mirroring
+    // the existing X/x handling).
+    bool useFloatEmit = false;
+    double scale = 1.0;  // P (percent) multiplies the value by 100
+    if (kind == 'F' && numeric) {
         snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + "f";
-    } else if (kind == 'E' && isFloat) {
-        snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + "e";
-    } else if ((kind == 'G') && isFloat) {
-        snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + "g";
+        useFloatEmit = true;
+    } else if (kind == 'E' && numeric) {
+        char ech = (specCh == 'e') ? 'e' : 'E';
+        snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + ech;
+        useFloatEmit = true;
+    } else if (kind == 'G' && numeric) {
+        char gch = (specCh == 'g') ? 'g' : 'G';
+        snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "6") + gch;
+        useFloatEmit = true;
+    } else if (kind == 'P' && numeric) {
+        // §18.5 normative example: `{ratio:P1}` → "85.0%". Scale by 100, format
+        // fixed-point to the requested digit count (default 2), append a
+        // literal '%' (snprintf renders "%%" as one '%'). Issue #739/WR9.
+        snprintfFmt = "%." + (width >= 0 ? std::to_string(width) : "2") + "f%%";
+        useFloatEmit = true;
+        scale = 100.0;
     } else if (kind == 'X' && isInt) {
         // §18.5 X[n]: zero-padded hex to n digits minimum.
-        char xch = (spec[0] == 'x') ? 'x' : 'X';
+        char xch = (specCh == 'x') ? 'x' : 'X';
         snprintfFmt = width >= 0
             ? ("%0" + std::to_string(width) + xch)
             : (std::string("%") + xch);
@@ -677,10 +699,23 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
         return nullptr;  // unknown format spec
     }
     // Emit snprintf call.
-    if (isFloat) {
-        llvm::Value* dv = val->getType()->isFloatTy()
-            ? builder_.CreateFPExt(val, llvm::Type::getDoubleTy(llvm_))
-            : val;
+    if (useFloatEmit) {
+        llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
+        llvm::Value* dv;
+        if (val->getType()->isFloatTy()) {
+            dv = builder_.CreateFPExt(val, dblTy);
+        } else if (val->getType()->isDoubleTy()) {
+            dv = val;
+        } else if (val->getType()->isIntegerTy()) {
+            bool uns = rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                       isUnsignedPrim(rt->primitive);
+            dv = uns ? builder_.CreateUIToFP(val, dblTy)
+                     : builder_.CreateSIToFP(val, dblTy);
+        } else {
+            return nullptr;
+        }
+        if (scale != 1.0)
+            dv = builder_.CreateFMul(dv, llvm::ConstantFP::get(dblTy, scale));
         return emitSnprintfToString(snprintfFmt, dv);
     } else {
         llvm::Value* iv = val->getType()->isIntegerTy(64) ? val
