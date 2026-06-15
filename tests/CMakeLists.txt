@@ -554,6 +554,9 @@ set(BEZEL_TEST_SOURCES
     # --- fix #741: Array<T>.Capacity + ctor capacity reservation (§4.4/§4.5) ---
     codegen/array_capacity_741_test.cpp
     # --- end #741 ---
+    # --- fix #743: static auto-property backing global (§23.1) ---
+    codegen/static_auto_property_743_test.cpp
+    # --- end #743 ---
     # --- fix #677: record method case-expr with `_ => this` arm (PHI type mismatch) ---
     codegen/record_method_case_expr_677_test.cpp
     # --- end #677 ---

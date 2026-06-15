@@ -358,6 +358,26 @@ void Emitter::declareStatics() {
         staticGlobals_[fs] = gv;
     }
 
+    // §23.1 (#743): a STATIC auto-property's backing storage is a module-level
+    // global (instance auto-properties use field storage). Without it the
+    // implicit get/set had nowhere to read/write — the getter returned 0 and
+    // the setter was discarded. Allocate one global per static auto-property
+    // (keyed on the PropertySymbol); the implicit get/set route to it via
+    // staticFieldGlobal, exactly like a static field.
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ps = dynamic_cast<const sema::PropertySymbol*>(sym.get());
+        if (!ps || !isStaticAutoProperty(ps)) continue;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        llvm::Type* ty = (pd && pd->type) ? lowerType(pd->type.get()) : i32();
+        std::string cls = ps->parent ? std::string(ps->parent->name) : "";
+        auto* gv = new llvm::GlobalVariable(
+            *module_, ty, /*isConstant=*/false,
+            llvm::GlobalValue::ExternalLinkage,
+            llvm::Constant::getNullValue(ty),
+            "bz$" + cls + "$" + std::string(ps->name) + "$prop");
+        staticGlobals_[ps] = gv;
+    }
+
     // §24.1 (#477 B6): a STATIC event's backing EventSource<T> is a static
     // owned field — give it a `ptr` global, null until program start. It is
     // allocated (bz_event_source_new) in Main's prologue alongside the static
@@ -507,6 +527,14 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
     // staticGlobals_, so an instance field's FieldSymbol misses here
     // (and is handled by fieldAddr instead).
     auto* sym_raw = ctx_.exprSymbol(e);
+    // §23.1 (#743): a static auto-property reads/writes its backing global
+    // (keyed on the PropertySymbol), exactly like a static field. No generic
+    // per-instantiation handling here (a generic static auto-property is a
+    // separate, rarer case — the FieldSymbol path below covers generic fields).
+    if (isStaticAutoProperty(sym_raw)) {
+        auto it = staticGlobals_.find(sym_raw);
+        return it == staticGlobals_.end() ? nullptr : it->second;
+    }
     auto* fs = dynamic_cast<sema::FieldSymbol*>(sym_raw);
     if (!fs) return nullptr;
 

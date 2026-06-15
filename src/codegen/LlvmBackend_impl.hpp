@@ -2059,6 +2059,22 @@ private:
         return true;
     }
 
+    // §23.1 (#743): a STATIC auto-property — like isAutoProperty but for the
+    // `static` form. Its backing storage is a module-level global (instance
+    // auto-properties use field storage); declareStatics allocates it and
+    // staticFieldGlobal routes the implicit get/set there.
+    bool isStaticAutoProperty(const sema::Symbol* m) {
+        auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
+        if (!ps || ps->isIndexer) return false;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->isIndexer ||
+            pd->bodyKind != ast::PropertyBodyKind::Auto)
+            return false;
+        for (auto mod : ps->modifiers)
+            if (mod == "static") return true;
+        return false;
+    }
+
     // CG33b: the arrow-getter expression of a computed property, or null
     // (auto-properties, indexers, and block/explicit-accessor getters
     // are not arrow getters).
