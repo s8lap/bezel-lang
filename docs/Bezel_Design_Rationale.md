@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.142 — June 2026**
+**Companion to the Bezel Language Specification, v0.143 — June 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -6877,6 +6877,21 @@ Spec §28.3 (one bullet under "Borrow lifetime rules") and §31.2.1 (one sentenc
 
 #### Migration
 None. The §28.3 amendment narrows no program that previously compiled and admits none that previously did not. The §31.2.1 clarification documents corrected behaviour: programs whose catch guard allocated or called a method previously failed to compile-to-correct-runtime (went unhandled) and now run as specified.
+
+---
+
+### v0.143 changelog (v0.142 → v0.143)
+
+**Clarification — bitwise/shift operators do not lift to `bool?`/`char?` (§7.11).** §7.11's "Arithmetic, bitwise, and shift operators" paragraph listed `&`, `|`, `^`, `<<`, `>>`, `~` among the lifting operators without restating that they apply only to the integer types §6.5 defines them on. Read in isolation, that admitted a lifted `bool? & bool?`, contradicting both §6.5 ("not valid on `bool`, `char`, or floating-point types … Boolean operations use `and`/`or`/`not`") and §7.11's own opening rule that an operator lifts only when its underlying type `T` is "a primitive on which a built-in operator … is defined." The compiler had drifted accordingly — the nullable-lifting path treated `bool?` as an `i1` integer and accepted `bool? & bool?`. §7.11 now states explicitly that the bitwise and shift operators do not lift to `bool?`/`char?`, mirroring the *No three-valued logic* rule already stated for `bool?` `and`/`or`/`not`. Resolves the §6.5-vs-§7.11 reading raised by the R39 sweep (issue #741); owner decision 2026-06-15.
+
+#### What changed
+- §7.11's bitwise/shift paragraph gains one sentence: an operator lifts only where defined on `T`, so the bitwise and shift operators do not lift to `bool?`/`char?`. No new rule — this restates §6.5 and §7.11's opening sentence in the place a reader of the lift list would look.
+
+#### Touched
+Spec §7.11 (one sentence). No grammar or stdlib change. Compiler: bitwise/shift on `bool`/`char` — binary `&`/`|`/`^`/`<<`/`>>`, unary `~`, the compound forms (`&=` etc.), and their nullable forms — is now a §6.5 error; the previously-accepted `bool? & bool?` is removed.
+
+#### Migration
+A program that applied a bitwise or shift operator to a `bool` or `char` operand (including the lifted `bool? & bool?`) no longer compiles; rewrite boolean combinations with `and`/`or`/`not`. No program that was already §6.5-conformant is affected.
 
 ---
 
