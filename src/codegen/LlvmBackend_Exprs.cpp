@@ -7470,9 +7470,22 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         // (pattern-test) block, before we branch to the guard or body.
         if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
                            arm.pattern.get())) {
-            llvm::AllocaInst* slot = entryAlloca(scrut->getType());
-            builder_.CreateStore(scrut, slot);
-            locals_[bp] = slot;
+            // #738 / §19.5: a typed binding `var n: T` over a nullable VALUE
+            // scrutinee `T?` binds the UNWRAPPED value (the {hasValue,T} struct's
+            // T field), not the struct — the bound name has type T. (The match
+            // condition, hasValue, is computed in patternMatches.) An
+            // unconstrained `var x` keeps the whole nullable value.
+            if (bp->type && scrutTy && isNullableValueTy(scrutTy) &&
+                scrut->getType()->isStructTy()) {
+                llvm::Value* inner = nullablePrimValue(scrut);
+                llvm::AllocaInst* slot = entryAlloca(inner->getType());
+                builder_.CreateStore(inner, slot);
+                locals_[bp] = slot;
+            } else {
+                llvm::AllocaInst* slot = entryAlloca(scrut->getType());
+                builder_.CreateStore(scrut, slot);
+                locals_[bp] = slot;
+            }
         }
         if (arm.guard) {
             auto* guardBB =
@@ -7745,6 +7758,49 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 any = builder_.CreateOr(any, match);
             }
             return any;
+        }
+
+        // §19.3 / §19.5 (#738): a typed BindingPattern `var n: T` on a nullable
+        // value `T?` matches only when the value is present (hasValue) — §19.5:
+        // typed bindings never match null. The bound name is the UNWRAPPED value
+        // (lowerCaseExpr stores innerVal into the value-typed slot). An
+        // unconstrained `var x` binds the whole nullable value (incl. null) and
+        // always matches.
+        if (auto* bp = dynamic_cast<const ast::BindingPattern*>(pat)) {
+            if (bp->type) return hasVal;
+            return builder_.getInt1(true);
+        }
+
+        // §19.3 (#738): a RangePattern on a nullable value — hasValue AND the
+        // unwrapped value is in range. Mirrors the non-nullable range logic
+        // below, applied to innerVal. (Open-ended forms: an absent bound is
+        // vacuously satisfied.)
+        if (auto* rp = dynamic_cast<const ast::RangePattern*>(pat)) {
+            auto* range =
+                dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get());
+            if (range && !range->step && (range->lo || range->hi)) {
+                bool fp = innerVal->getType()->isFloatingPointTy();
+                llvm::Value* geL = builder_.getInt1(true);
+                if (range->lo) {
+                    llvm::Value* lo = lowerExpr(*range->lo);
+                    if (!lo) return nullptr;
+                    geL = fp ? builder_.CreateFCmpOGE(innerVal, lo)
+                             : builder_.CreateICmpSGE(innerVal, lo);
+                }
+                llvm::Value* leH = builder_.getInt1(true);
+                if (range->hi) {
+                    llvm::Value* hi = lowerExpr(*range->hi);
+                    if (!hi) return nullptr;
+                    leH = fp
+                        ? (range->inclusive ? builder_.CreateFCmpOLE(innerVal, hi)
+                                            : builder_.CreateFCmpOLT(innerVal, hi))
+                        : (range->inclusive ? builder_.CreateICmpSLE(innerVal, hi)
+                                            : builder_.CreateICmpSLT(innerVal, hi));
+                }
+                llvm::Value* inRange = builder_.CreateAnd(geL, leH);
+                return builder_.CreateAnd(hasVal, inRange, "nv.range.match");
+            }
+            return nullptr;
         }
 
         // Other pattern kinds on a nullable value are deferred.

@@ -852,3 +852,35 @@ BEZEL_TEST(codegen_cg28, guarded_discard_before_last_ok_738) {
         "var r := case x _ when x > 100 => 0, 5 => 5, _ => 9 end; "
         "return r;"), 5);
 }
+
+// #738 / §19.3+§19.5: a typed binding pattern `var n: int` over an `int?`
+// scrutinee. Previously IR-failed (nullable-value path deferred BindingPattern);
+// now it matches only the non-null value and binds the UNWRAPPED int.
+BEZEL_TEST(codegen_cg28, typed_binding_over_nullable_value_738) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := 5; "
+        "var r := case x var n: int => n, _ => 99 end; "
+        "return r;"), 5);  // present → bound unwrapped
+}
+BEZEL_TEST(codegen_cg28, typed_binding_over_nullable_value_null_738) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := null; "
+        "var r := case x var n: int => n, _ => 99 end; "
+        "return r;"), 99);  // §19.5: typed binding never matches null
+}
+
+// #738 / §19.3: a range pattern over an `int?` scrutinee (alongside a null arm).
+// Previously IR-failed (nullable-value path deferred RangePattern); now matches
+// hasValue AND in-range.
+BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_738) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := 5; "
+        "var r := case x null => 0, 5..10 => 1, _ => 2 end; "
+        "return r;"), 1);
+}
+BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_null_738) {
+    BEZEL_EXPECT_EQ(run(
+        "var x: int? := null; "
+        "var r := case x null => 0, 5..10 => 1, _ => 2 end; "
+        "return r;"), 0);  // null arm wins
+}
