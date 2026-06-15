@@ -3437,7 +3437,24 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             // Non-constant initializer: evaluate it and store into the global.
             auto gvIt = staticGlobals_.find(fs);
             if (gvIt == staticGlobals_.end()) continue;  // no backing global
-            llvm::Value* val = lowerExpr(*initExpr);
+            llvm::Value* val = nullptr;
+            // R40 / #743 / §15.4: a COLLECTION-LITERAL static initializer
+            // (`static All: Array<T> := [a, b, c]`, or a dict literal) — lowerExpr
+            // returns null for a CollectionLiteralExpr, so without this the store
+            // was skipped and the static global stayed null → null deref on first
+            // access (`Type.All.Length` → SIGSEGV). Materialize the heap collection
+            // against the field's declared type, exactly as the instance-field and
+            // local-decl init paths do (materializeHeapCollectionLiteral also
+            // delegates an empty `[]` with a dict target to the dict materializer).
+            if (auto* cl =
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(initExpr)) {
+                const sema::TypeRef* fty =
+                    fd->type ? ctx_.resolvedType(*fd->type) : nullptr;
+                if (fty)
+                    val = cl->isDict ? materializeHeapDictLiteral(cl, fty)
+                                     : materializeHeapCollectionLiteral(cl, fty);
+            }
+            if (!val) val = lowerExpr(*initExpr);
             if (!val) continue;
             builder_.CreateStore(val, gvIt->second);
             // fix #709 / §22.12: also store into every per-instantiation global

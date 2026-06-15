@@ -119,3 +119,36 @@ BEZEL_TEST(codegen_cg12, cross_class_static_read) {
         "class C public static method Main(): int => N.V; "
         "end C;"), 42);
 }
+
+// R40 / #743 / §15.4 + §22.13: a static field initialized with a COLLECTION
+// LITERAL must materialize the heap collection in the static-init path and store
+// it into the global. Previously lowerExpr returned null for the collection
+// literal, so the store was skipped and the global stayed null → null deref on
+// first access (`Type.All.Length` → SIGSEGV).
+BEZEL_TEST(codegen_cg12, static_array_literal_field_743) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class H public static readonly Nums: Array<int> := [10, 20, 30]; end H; "
+        "class C public static method Main(): int "
+        "  return H.Nums.Length * 100 + H.Nums.Get(0) + H.Nums.Get(2); "  // 3*100+10+30 = 340
+        "end Main; end C;"), 340);
+}
+
+// On an ENUM (the original repro): a static array of the enum's values.
+BEZEL_TEST(codegen_cg12, enum_static_array_literal_field_743) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; "
+        "enum Color Red, Green, Blue; "
+        "  public static readonly All: Array<Color> := [Red, Green, Blue]; "
+        "end Color; "
+        "class C public static method Main(): int return Color.All.Length; end Main; "  // 3
+        "end C;"), 3);
+}
+
+// A static field initialized with a DICTIONARY literal.
+BEZEL_TEST(codegen_cg12, static_dict_literal_field_743) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class H public static readonly M2: Dictionary<string, int> := [\"a\": 1, \"b\": 2]; end H; "
+        "class C public static method Main(): int "
+        "  return H.M2.Count * 10 + H.M2[\"a\"] + H.M2[\"b\"]; "  // 2*10+1+2 = 23
+        "end Main; end C;"), 23);
+}
