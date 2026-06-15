@@ -465,3 +465,41 @@ BEZEL_TEST(codegen_linked_list, for_in_string_elements_728) {
         "  return total; "  // 2 + 3 = 5
         "end Main; end C;"), 5);
 }
+
+// #738 / §4.6 / §15.4: a LinkedList<T> COLLECTION LITERAL. LinkedList is
+// bz_llist_t-backed (not bz_array_t), and isCollectionTypeName excludes it, so
+// the literal previously fell through to the inline-array path — the EMPTY `[]`
+// crashed (free() of an invalid pointer) and a non-empty literal IR-failed.
+// materializeHeapCollectionLiteral now builds it via bz_llist_alloc/add_last.
+BEZEL_TEST(codegen_linked_list, empty_literal_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var ll: LinkedList<int> := []; "
+        "  return ll.Count; "  // 0, no crash
+        "end Main; end C;"), 0);
+}
+BEZEL_TEST(codegen_linked_list, nonempty_literal_count_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var ll: LinkedList<int> := [42]; "
+        "  return ll.Count; "  // 1
+        "end Main; end C;"), 1);
+}
+BEZEL_TEST(codegen_linked_list, literal_iterates_in_order_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var ll: LinkedList<int> := [10, 20, 30]; "
+        "  var s := 0; "
+        "  for var x in ll do s := s + x; end; "
+        "  return s + ll.Count; "  // 60 + 3 = 63
+        "end Main; end C;"), 63);
+}
+BEZEL_TEST(codegen_linked_list, owned_literal_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var ll: OwnedLinkedList<int> := [5, 7]; "
+        "  var s := 0; "
+        "  for var x in ll do s := s + x; end; "
+        "  return s + ll.Count; "  // 12 + 2 = 14
+        "end Main; end C;"), 14);
+}

@@ -8072,6 +8072,50 @@ const sema::TypeRef* Emitter::collectionTypeOfLocal(const ast::LocalDecl* ld) {
 llvm::Value* Emitter::materializeHeapCollectionLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy) {
     if (!cl || cl->isDict || !collTy) return nullptr;
+
+    // §4.6/§4.7 (#738): LinkedList<T>/OwnedLinkedList<T> are bz_llist_t-backed,
+    // not bz_array_t — and isCollectionTypeName deliberately EXCLUDES them, so
+    // handle the literal here (before that guard) via bz_llist_alloc +
+    // bz_llist_add_last, exactly what `new LinkedList<T>()` + `.AddLast(e)` emit.
+    // Otherwise the literal fell through to the inline-array GEP path and the
+    // LinkedList consumers (.Count, scope-end disposal) misread a bz_array_t* as
+    // a bz_llist_t* — a runtime free() of an invalid pointer (empty `[]`) or a
+    // malformed element GEP (non-empty). Like `.AddLast`, no string-retain.
+    if (isLinkedListTypeName(collTy)) {
+        const sema::TypeRef* er =
+            (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
+        llvm::Type* elTy = er ? lowerTypeRef(er) : i32();
+        int64_t es = collectionElemSize(collTy);
+        auto* allocFn = declareC("bz_llist_alloc", ptrTy(), {i64()});
+        llvm::Value* ll =
+            builder_.CreateCall(allocFn, {builder_.getInt64(es)}, "clit.ll");
+        auto* addFn = declareC("bz_llist_add_last", ptrTy(),
+                               {ptrTy(), ptrTy(), i64()});
+        for (const auto& elemPtr : cl->elements) {
+            if (!elemPtr) continue;
+            llvm::Value* ev = nullptr;
+            if (auto* nested = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    elemPtr.get())) {
+                if (!nested->isDict && er)
+                    ev = materializeHeapCollectionLiteral(nested, er);
+            }
+            if (!ev) ev = lowerExpr(*elemPtr);
+            if (!ev) continue;
+            if (er && isNullableValueTy(er)) {
+                llvm::StructType* expected = nullableValueStructTy(er);
+                if (expected && ev->getType() != expected)
+                    ev = ev->getType()->isPointerTy() ? nullableValueNull(er)
+                                                       : wrapNullableValue(er, ev);
+            } else if (ev->getType() != elTy) {
+                ev = coerceNumericToType(ev, elTy, isUnsignedTargetExpr(*elemPtr));
+            }
+            llvm::AllocaInst* slot = entryAlloca(ev->getType());
+            builder_.CreateStore(ev, slot);
+            builder_.CreateCall(addFn, {ll, slot, builder_.getInt64(es)});
+        }
+        return ll;
+    }
+
     if (!isCollectionTypeName(collTy)) return nullptr;
     // Dispatch Set/OwnedSet to the dedicated hash-backed materializer (they use
     // bz_dict_alloc_generic + bz_dict_set_gen, not the array path below).
