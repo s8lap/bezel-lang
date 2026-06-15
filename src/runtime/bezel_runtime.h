@@ -31,6 +31,9 @@ int64_t bz_array_len(void* arr);
 // stdlib §4.4/§4.5 (#741): the array-backed collection's allocated capacity.
 int64_t bz_array_capacity(void* arr);
 
+// stdlib §9.6 (#741): 1 iff every code point of the string is < 128.
+int32_t bz_string_is_ascii(const void* s);
+
 // §4.14: allocate with n pre-filled (zero-initialized) slots; count == capacity == n.
 // Used by `new OwnedBuffer<T>(n)`.
 void* bz_array_alloc_count_n(int64_t elem_size, int64_t n);

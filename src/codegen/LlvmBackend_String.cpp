@@ -1418,6 +1418,17 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
 
     // §9.6: Trim/TrimStart/TrimEnd — remove leading/trailing ASCII whitespace.
     if (method == "Trim" || method == "TrimStart" || method == "TrimEnd") {
+        // stdlib §9.6 (#741): Trim(chars: IEnumerable<char>) strips leading and
+        // trailing code points in the given set (passed as Array<char>). No case
+        // existed → the call emitted nothing, so `t` stayed at its null alloca
+        // and `.Length` dereferenced null. (TrimStart/TrimEnd char-set overloads
+        // are analogous but not yet wired; only Trim(set) is handled here.)
+        if (method == "Trim" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* chars = lowerExpr(*call.args[0].value);
+            if (!chars) return nullptr;
+            auto* fn = declareC("bz_str_trim_chars", ptrTy(), {ptrTy(), ptrTy()});
+            return builder_.CreateCall(fn, {self, chars}, "trim.chars.result");
+        }
         if (!call.args.empty()) return nullptr;
         // Implement via stripping bytes that match isspace.
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
@@ -1911,6 +1922,17 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 sepCh = builder_.CreateSExt(sepCh, i32());
             auto* fn = declareC("bz_str_split_cp", ptrTy(), {ptrTy(), i32()});
             return builder_.CreateCall(fn, {self, sepCh}, "split.char.result");
+        }
+
+        // stdlib §9.6 (#741): Split(separators: Array<char>) — split on ANY of
+        // the separator chars. The arg is a char collection (lowers to a
+        // bz_array_t*). No case existed → the call emitted nothing and the
+        // uninitialized result array crashed on Count/dispose.
+        if (argTy && argTy->kind == sema::TypeRef::Kind::Named) {
+            llvm::Value* seps = lowerExpr(*call.args[0].value);
+            if (!seps) return nullptr;
+            auto* fn = declareC("bz_str_split_chars", ptrTy(), {ptrTy(), ptrTy()});
+            return builder_.CreateCall(fn, {self, seps}, "split.chars.result");
         }
 
         // Split(separator: string) — pass self + the delimiter bz_string*.

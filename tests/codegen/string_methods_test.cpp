@@ -252,4 +252,95 @@ BEZEL_TEST(codegen_string_repeat_spec_9_6, repeat_zero_is_empty) {
         "end Main; end C;"), 0);
 }
 
+// ── #741 stdlib §9.6: IsAscii, Split(Array<char>), Trim(IEnumerable<char>) ───
+// Each emitted no code pre-fix: IsAscii read an uninitialized i1 (always false);
+// Split(Array<char>) / Trim(set) fell through, leaving the result null →
+// SIGSEGV / SIGABRT / wrong count.
+
+// §9.6: IsAscii is true iff every code point < 128.
+BEZEL_TEST(codegen_string_741, is_ascii_true_for_ascii) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  return (1 if \"Hello\".IsAscii else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.6: a string with a code point ≥ 128 is not ASCII.
+BEZEL_TEST(codegen_string_741, is_ascii_false_for_latin1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  return (1 if \"H\\u00e9llo\".IsAscii else 0); "  // é = U+00E9
+        "end Main; end C;"), 0);
+}
+
+// §9.6: the empty string is ASCII.
+BEZEL_TEST(codegen_string_741, is_ascii_empty_is_true) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  return (1 if \"\".IsAscii else 0); "
+        "end Main; end C;"), 1);
+}
+
+// §9.6: Split(separators: Array<char>) splits on ANY of the chars.
+BEZEL_TEST(codegen_string_741, split_array_of_chars_count) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var seps := new Array<char>(); "
+        "  seps.Add(','); seps.Add(';'); "
+        "  using var parts := \"a,b;c\".Split(seps); "
+        "  return parts.Count; "  // 3
+        "end Main; end C;"), 3);
+}
+
+// §9.6: the split segments carry the correct content.
+BEZEL_TEST(codegen_string_741, split_array_of_chars_content) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var seps := new Array<char>(); "
+        "  seps.Add(','); seps.Add(';'); "
+        "  using var parts := \"a,b;c\".Split(seps); "
+        "  if parts[0] <> \"a\" then return 1; end; "
+        "  if parts[1] <> \"b\" then return 2; end; "
+        "  if parts[2] <> \"c\" then return 3; end; "
+        "  return 0; "
+        "end Main; end C;"), 0);
+}
+
+// §9.6: an empty separator set returns the whole string as one segment.
+BEZEL_TEST(codegen_string_741, split_empty_set_is_whole_string) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var seps := new Array<char>(); "
+        "  using var parts := \"abc\".Split(seps); "
+        "  return parts.Count; "  // 1
+        "end Main; end C;"), 1);
+}
+
+// §9.6: Trim(chars) strips leading/trailing code points in the set.
+BEZEL_TEST(codegen_string_741, trim_char_set) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var chars := new Array<char>(); "
+        "  chars.Add('x'); "
+        "  var t := \"xxHelloxx\".Trim(chars); "
+        "  return t.Length; "  // "Hello" = 5
+        "end Main; end C;"), 5);
+}
+
+// §9.6: Trim(set) with multiple members strips any of them from both ends.
+BEZEL_TEST(codegen_string_741, trim_char_set_content) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; "
+        "class C public static method Main(): int "
+        "  using var chars := new Array<char>(); "
+        "  chars.Add('_'); chars.Add('-'); "
+        "  var t := \"_-mid-_\".Trim(chars); "
+        "  return (1 if t = \"mid\" else 0); "
+        "end Main; end C;"), 1);
+}
+
 }  // namespace

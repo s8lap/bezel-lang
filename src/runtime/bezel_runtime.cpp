@@ -5647,6 +5647,20 @@ static inline uint32_t bz_str_cp(const bz_string_struct* s, int64_t i) {
     return ((const uint32_t*)s->data)[i];
 }
 
+// stdlib §9.6: IsAscii — 1 iff every code point < 128. A width≥2 string holds
+// at least one code point ≥ 256, so it is never ASCII (the O(1) case); a width-1
+// string is Latin-1 (code points ≤ 255), so a byte in [128,255] still defeats
+// ASCII — scan for one. (#741)
+int32_t bz_string_is_ascii(const void* sp) {
+    const bz_string_struct* s = (const bz_string_struct*)sp;
+    if (!s || s->len == 0) return 1;            // empty string is ASCII
+    if (s->width != 1) return 0;                // ≥2-byte code points ⇒ not ASCII
+    const uint8_t* d = (const uint8_t*)s->data;
+    for (int64_t i = 0; i < s->len; ++i)
+        if (d[i] >= 128) return 0;
+    return 1;
+}
+
 // Helper: build a fresh +1 bz_string from a sub-range [start, start+count) of
 // source string `s`. The result uses the NARROWEST width that fits all its code
 // points (§4.6 adaptive-width storage). This allows comparing a substring of
@@ -5967,6 +5981,63 @@ extern "C" void* bz_str_split_str(const void* self_p, const void* delim_p) {
     void* seg = bz_str_slice_cp(s, start, s->len - start);
     bz_array_add(arr, &seg, 8);
     return arr;
+}
+
+// stdlib §9.6 (#741): is a code point in the char-set array? `set` is an
+// Array<char> (bz_array_t of i32 code points). A null/empty set matches nothing.
+static inline bool bz_cp_in_set(const bz_array_t* set, int32_t cp) {
+    if (!set || !set->data) return false;
+    const int32_t* d = (const int32_t*)set->data;
+    for (int64_t i = 0; i < set->count; ++i)
+        if (d[i] == cp) return true;
+    return false;
+}
+
+// stdlib §9.6 (#741): Split(separators: Array<char>) — split at ANY code point
+// in `seps`. Mirrors bz_str_split_cp but tests set membership. An empty/null
+// separator set yields the whole string as one segment. Owned Array<string>.
+extern "C" void* bz_str_split_chars(const void* self_p, const void* seps_p) {
+    void* arr = bz_array_alloc(8, 8);
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* seps = (const bz_array_t*)seps_p;
+    if (!s) {
+        void* e = bz_str_substring(nullptr, 0, 0);
+        bz_array_add(arr, &e, 8);
+        return arr;
+    }
+    if (!seps || seps->count == 0) {
+        void* seg = bz_str_slice_cp(s, 0, s->len);
+        bz_array_add(arr, &seg, 8);
+        return arr;
+    }
+    int64_t start = 0;
+    for (int64_t i = 0; i < s->len; ++i) {
+        if (bz_cp_in_set(seps, (int32_t)bz_str_cp(s, i))) {
+            void* seg = bz_str_slice_cp(s, start, i - start);
+            bz_array_add(arr, &seg, 8);
+            start = i + 1;
+        }
+    }
+    void* seg = bz_str_slice_cp(s, start, s->len - start);
+    bz_array_add(arr, &seg, 8);
+    return arr;
+}
+
+// stdlib §9.6 (#741): Trim(chars: IEnumerable<char>) — strip leading & trailing
+// code points that are in the `chars` set (passed as Array<char>). Returns a
+// fresh bz_string. A null/empty set returns the whole string unchanged.
+extern "C" void* bz_str_trim_chars(const void* self_p, const void* chars_p) {
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* set = (const bz_array_t*)chars_p;
+    if (!s) return bz_str_substring(nullptr, 0, 0);
+    int64_t start = 0, end = s->len;
+    if (set && set->count > 0) {
+        while (start < end &&
+               bz_cp_in_set(set, (int32_t)bz_str_cp(s, start))) ++start;
+        while (end > start &&
+               bz_cp_in_set(set, (int32_t)bz_str_cp(s, end - 1))) --end;
+    }
+    return bz_str_slice_cp(s, start, end - start);
 }
 
 // §9.6 / issue #654: string.ToCharArray(): owned Array<char>.

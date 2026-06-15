@@ -1693,6 +1693,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         emitStringRelease(strPtr);
                     return builder_.CreateTrunc(len64, i32(), "str.len.i32");
                 }
+                // stdlib §9.6 (#741): IsAscii — true iff every code point < 128.
+                // No codegen case existed, so the read returned an uninitialized
+                // i1 slot (always false). Scan via bz_string_is_ascii.
+                if (ma->member == "IsAscii") {
+                    auto* fn = declareC("bz_string_is_ascii", i32(), {ptrTy()});
+                    llvm::Value* r = builder_.CreateCall(fn, {strPtr}, "str.ascii");
+                    if (isPlusOneStringProducer(ma->target.get()))
+                        emitStringRelease(strPtr);
+                    return builder_.CreateICmpNE(r, builder_.getInt32(0),
+                                                 "str.isascii");
+                }
                 // Other string members deferred — sema would have flagged
                 // any unknown member already.
                 return nullptr;
