@@ -1043,6 +1043,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             }
 
             if (ys->isBreak) {
+                // §29.7 / §30.9 (#721 C2): a `yield break` exiting a
+                // try-with-finally must run the finally on its way out — just
+                // like return/break/continue. Route through the active finally
+                // (exit mode 4); the post-finally dispatch (lowerTry) performs
+                // the terminal state=-1 + ret. Without this the finally is
+                // silently skipped on the yield-break edge.
+                if (!finallyStack_.empty()) {
+                    auto& fr = finallyStack_.back();
+                    builder_.CreateStore(builder_.getInt32(4), fr.exitModSlot);
+                    builder_.CreateBr(fr.finNormalBB);
+                    return true;
+                }
                 // yield break: set state=-1; sync → ret false, async → complete
                 // the per-advance task with false (exhausted) + ret void.
                 builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
@@ -1364,6 +1376,33 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
                 builder_.CreateBr(loopContBB);
+            }
+        }
+
+        // mode=4 (#721 C2): yield break — run any OUTER finally too, else
+        // perform the terminal iterator exit the yield-break statement deferred
+        // so the finally could run first (state=-1; sync → ret false, async →
+        // complete with false + ret void). Added only inside an ITERATOR state
+        // machine (Yield/AsyncYield) — the only place mode 4 is produced. A
+        // plain async METHOD (SuspendKind::Await) also has smStateGEP_ set but
+        // returns void, so emitting the iterator return here would be malformed.
+        if (smStateGEP_ && (smKind_ == SuspendKind::Yield ||
+                            smKind_ == SuspendKind::AsyncYield)) {
+            auto* ybDispBB =
+                llvm::BasicBlock::Create(llvm_, "finally.yieldbrk", currentFn_);
+            sw->addCase(builder_.getInt32(4), ybDispBB);
+            builder_.SetInsertPoint(ybDispBB);
+            if (outerFr) {
+                builder_.CreateStore(builder_.getInt32(4), outerFr->exitModSlot);
+                builder_.CreateBr(outerFr->finNormalBB);
+            } else {
+                builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
+                if (smKind_ == SuspendKind::AsyncYield) {
+                    emitAsyncIterComplete(/*hasValue=*/false);
+                    builder_.CreateRetVoid();
+                } else {
+                    builder_.CreateRet(builder_.getFalse());
+                }
             }
         }
 

@@ -618,3 +618,103 @@ class C
 end C;
 )"));
 }
+
+// #721 C2 / §29.7 / §30.9: a `yield break` exiting a try-with-finally must run
+// the finally on its way out (it was silently skipped before). SYNC iterator.
+BEZEL_TEST(async_iter_try_finally_554, sync_yield_break_runs_finally_721) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static ran: int := 0;
+  public static method Gen(): IEnumerable<int>
+    try
+      yield return 1;
+      yield break;
+    finally
+      C.ran := 1;
+    end;
+  end Gen;
+  public static method Main(): int
+    var sum := 0;
+    for var x in C.Gen() do sum := sum + x; end;
+    return sum + C.ran;
+  end Main;
+end C;
+)"), 2);  // 1 yielded + finally ran
+}
+
+// #721 C2: `yield break` as the FIRST statement of a try-with-finally — finally
+// still runs (no prior yield).
+BEZEL_TEST(async_iter_try_finally_554, sync_yield_break_first_runs_finally_721) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static ran: int := 0;
+  public static method Gen(): IEnumerable<int>
+    try
+      yield break;
+    finally
+      C.ran := 1;
+    end;
+  end Gen;
+  public static method Main(): int
+    var sum := 0;
+    for var x in C.Gen() do sum := sum + x; end;
+    return sum + C.ran;
+  end Main;
+end C;
+)"), 1);  // nothing yielded + finally ran
+}
+
+// #721 C2: a `yield break` in an inner try runs BOTH the inner and outer
+// finally (exit mode 4 propagates through the outer finally frame).
+BEZEL_TEST(async_iter_try_finally_554, sync_yield_break_runs_nested_finally_721) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static a: int := 0;
+  public static b: int := 0;
+  public static method Gen(): IEnumerable<int>
+    try
+      try
+        yield return 1;
+        yield break;
+      finally
+        C.a := 1;
+      end;
+    finally
+      C.b := 1;
+    end;
+  end Gen;
+  public static method Main(): int
+    var sum := 0;
+    for var x in C.Gen() do sum := sum + x; end;
+    return sum + C.a * 10 + C.b * 100;
+  end Main;
+end C;
+)"), 111);  // 1 yielded + both finallys ran
+}
+
+// #721 C2: ASYNC iterator `yield break` exiting a try-with-finally runs the
+// finally (the async state-machine path uses the same exit-mode-4 dispatch).
+BEZEL_TEST(async_iter_try_finally_554, async_yield_break_runs_finally_721) {
+    BEZEL_EXPECT_EQ(compileAndRun(R"(
+module M;
+class C
+  public static ran: int := 0;
+  public async static method Gen(): IAsyncEnumerable<int>
+    try
+      yield return 1;
+      yield break;
+    finally
+      C.ran := 1;
+    end;
+  end Gen;
+  public static async method Main(): Task<int>
+    var sum := 0;
+    await for var x in Gen() do sum := sum + x; end;
+    return sum + C.ran;
+  end Main;
+end C;
+)"), 2);  // 1 yielded + finally ran
+}
