@@ -162,3 +162,38 @@ BEZEL_TEST(codegen_cg35_itable, is_interface_check_still_works) {
         "  return (1 if s is Square else 0); "
         "end Main; end C;"), 1);
 }
+
+// #742 / §11.2 / §13: when the implementing class has MULTIPLE overloads of the
+// interface method name, interface dispatch must bind the overload whose
+// signature matches the interface member — not the first by name. Previously
+// the itable slot was filled by name only, so `i.Run(5)` dispatched the
+// arity-0 `Run()` (returning 0, ignoring the argument).
+BEZEL_TEST(codegen_cg35_itable, overloaded_impl_binds_matching_arity_742) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IGo method Run(x: int): int; end IGo; "
+        "class Impl : IGo "
+        "  public method Run(): int return 0; end Run; "
+        "  public method Run(x: int): int return x * 2; end Run; "
+        "end Impl; "
+        "class C public static method Main(): int "
+        "  using var im: Impl := new Impl(); var i: IGo := im; "
+        "  return i.Run(5); "  // 10, not 0
+        "end Main; end C;"), 10);
+}
+
+// Order-independent: the matching overload is bound even when it is declared
+// before the non-matching one.
+BEZEL_TEST(codegen_cg35_itable, overloaded_impl_binds_matching_arity_reversed_742) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "interface IGo method Run(x: int): int; end IGo; "
+        "class Impl : IGo "
+        "  public method Run(x: int): int return x * 2; end Run; "
+        "  public method Run(): int return 99; end Run; "
+        "end Impl; "
+        "class C public static method Main(): int "
+        "  using var im: Impl := new Impl(); var i: IGo := im; "
+        "  return i.Run(5); "  // 10, not 99
+        "end Main; end C;"), 10);
+}

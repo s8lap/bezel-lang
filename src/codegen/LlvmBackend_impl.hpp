@@ -2350,6 +2350,35 @@ private:
         return nullptr;
     }
 
+    // #742 / §11.2 / §13: the class method that implements a specific interface
+    // method `iface` for v/itable binding. findMethodByName matches by name
+    // ONLY, so when the class has multiple overloads of the interface method
+    // name it binds the WRONG overload into the itable slot (e.g. `Run()` for
+    // an interface `Run(x: int)` → dispatch ignores the argument). Prefer the
+    // overload whose parameter COUNT matches `iface` (sema already guarantees
+    // one exists — see the arity-conformance check in TypeResolution_Checks).
+    // Scans most-derived class first so an override wins. Falls back to a
+    // name-only match (single-overload cases are unchanged). NOTE: among
+    // same-arity overloads it still takes the first in declaration order;
+    // full parameter-TYPE disambiguation is a follow-up.
+    sema::MethodSymbol* findInterfaceImpl(const sema::TypeSymbol* cls,
+                                          const sema::MethodSymbol* iface) {
+        if (!iface) return nullptr;
+        sema::MethodSymbol* nameOnly = nullptr;
+        for (const sema::TypeSymbol* t = cls; t;) {
+            for (sema::Symbol* m : t->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (!ms || isStaticMethod(ms) || ms->name != iface->name ||
+                    !methodFns_.count(ms))
+                    continue;
+                if (ms->params.size() == iface->params.size()) return ms;
+                if (!nameOnly) nameOnly = ms;  // remember first name match
+            }
+            t = baseClassOf(t);
+        }
+        return nameOnly;
+    }
+
     // #481 / §13 / §23: the (non-static, non-indexer) PropertySymbol named
     // `name` declared on `cls` or an inherited base — the concrete property an
     // interface property or an inherited virtual property resolves to on the

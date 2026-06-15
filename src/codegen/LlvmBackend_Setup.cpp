@@ -1532,7 +1532,7 @@ void Emitter::declareVtables() {
             std::vector<llvm::Constant*> itabElems;
             for (sema::MethodSymbol* im : ifaceMethods) {
                 llvm::Constant* fp = llvm::ConstantPointerNull::get(ptrTy());
-                if (sema::MethodSymbol* impl = findMethodByName(ts, im->name)) {
+                if (sema::MethodSymbol* impl = findInterfaceImpl(ts, im)) {
                     auto mit = methodFns_.find(impl);
                     if (mit != methodFns_.end())
                         fp = llvm::cast<llvm::Constant>(mit->second);
@@ -9513,7 +9513,7 @@ void Emitter::setupBoxDescriptors() {
             std::vector<llvm::Constant*> itabElems;
             for (sema::MethodSymbol* im : ifaceMethods) {
                 llvm::Constant* fp = llvm::ConstantPointerNull::get(ptrTy());
-                sema::MethodSymbol* impl = findMethodByName(ts, im->name);
+                sema::MethodSymbol* impl = findInterfaceImpl(ts, im);
                 if (impl) {
                     auto mit = methodFns_.find(impl);
                     if (mit != methodFns_.end()) {
