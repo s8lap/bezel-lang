@@ -324,6 +324,13 @@ private:
 
     Symbol* lookupName(std::string_view name);
 
+    // §16.4 / §19.6 (issue #738): per-`case` pattern legality checks shared by
+    // the expression and statement case forms — reject `step` in a range
+    // pattern (stride has no membership meaning, §16.4) and an unguarded `_`
+    // catch-all in a non-last arm (§19.6). Both are clean diagnostics that
+    // replace a downstream codegen IR failure / silently-unreachable arms.
+    void validateCaseArms(const std::vector<ast::CaseArm>& arms);
+
     // §15.1 (issue #734): fold a LOCAL-`const` inline-array size onto its
     // resolved TypeRef. Member/module consts are folded earlier (type
     // resolution); a local const is only in scope during this pass, so when a

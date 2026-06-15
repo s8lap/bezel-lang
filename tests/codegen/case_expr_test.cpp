@@ -808,3 +808,47 @@ BEZEL_TEST(codegen_cg28, trailing_open_range_boundary_726) {
         "  end; "
         "return r;"), 9);
 }
+
+// #738 / §16.4: `step` is not legal in a `case` range pattern (a pattern tests
+// membership; a stride has no meaning). Previously this reached codegen and
+// emitted malformed IR (unterminated case.end); now it is a clean diagnostic.
+BEZEL_TEST(codegen_cg28, step_in_range_pattern_rejected_738) {
+    JitResult r = runJit(
+        "module M; class C public static method Main(): int "
+        "  var x := 4; "
+        "  var r := case x 0..10 step 2 => 1, _ => 0 end; "
+        "  return r; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #738 / §16.4: a `step` in a for-in range is NOT a pattern and stays legal.
+BEZEL_TEST(codegen_cg28, step_in_for_in_range_still_ok_738) {
+    BEZEL_EXPECT_EQ(run(
+        "var s := 0; "
+        "for var i in 0..10 step 2 do s := s + i; end; "
+        "return s;"), 30);  // 0+2+4+6+8+10
+}
+
+// #738 / §19.6: an unguarded `_` catch-all must be the last arm; an earlier one
+// makes the following arms unreachable — now a clean diagnostic.
+BEZEL_TEST(codegen_cg28, discard_not_last_arm_rejected_738) {
+    JitResult r = runJit(
+        "module M; class C public static method Main(): int "
+        "  var x := 5; "
+        "  var r := case x _ => 0, 1 => 1, 5 => 5 end; "
+        "  return r; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #738 / §19.6: a GUARDED `_ when g` is conditional, not a catch-all, so it may
+// appear before the last arm.
+BEZEL_TEST(codegen_cg28, guarded_discard_before_last_ok_738) {
+    BEZEL_EXPECT_EQ(run(
+        "var x := 5; "
+        "var r := case x _ when x > 100 => 0, 5 => 5, _ => 9 end; "
+        "return r;"), 5);
+}

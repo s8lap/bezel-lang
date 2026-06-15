@@ -1127,6 +1127,37 @@ Symbol* ExprTC::lookupName(std::string_view name) {
     return nullptr;
 }
 
+void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
+    for (std::size_t i = 0; i < arms.size(); ++i) {
+        const ast::Pattern* p = arms[i].pattern.get();
+        if (!p) continue;
+        // §16.4: `step` is not legal in a `case` range pattern — patterns test
+        // membership and a stride has no meaning. Reject cleanly; codegen has no
+        // lowering for a stepped range pattern and otherwise emits malformed IR
+        // (an unterminated case.end block, issue #738).
+        if (auto* rp = dynamic_cast<const ast::RangePattern*>(p)) {
+            if (auto* re =
+                    dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get()))
+                if (re->step)
+                    ctx_.diagnostics().report(
+                        Severity::Error, p->span.begin,
+                        "`step` is not legal in a `case` range pattern — a "
+                        "pattern tests membership and a stride has no meaning "
+                        "(§16.4)");
+        }
+        // §19.3 / §19.6: an unguarded `_` is a catch-all and must be the last
+        // arm; an earlier one makes every following arm unreachable. (A guarded
+        // `_ when g` is conditional, so it may appear earlier.)
+        if (!arms[i].guard &&
+            dynamic_cast<const ast::DiscardPattern*>(p) &&
+            i + 1 < arms.size())
+            ctx_.diagnostics().report(
+                Severity::Error, p->span.begin,
+                "the `_` discard pattern must be the last arm of a `case` — "
+                "arms after an unguarded `_` are unreachable (§19.6)");
+    }
+}
+
 void ExprTC::foldLocalConstArraySize(TypeRef* declType) {
     if (!declType || declType->kind != TypeRef::Kind::InlineArray) return;
     if (declType->arraySizeValue >= 0) return;  // already folded (literal/member)
@@ -2335,6 +2366,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (is->target) visitExpr(*is->target);
     } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
         if (cs->scrutinee) visitExpr(*cs->scrutinee);
+        validateCaseArms(cs->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         for (const auto& arm : cs->arms) {

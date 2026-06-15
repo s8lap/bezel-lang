@@ -1967,6 +1967,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         }
     } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
         if (ce->scrutinee) visitExpr(*ce->scrutinee);
+        validateCaseArms(ce->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
         for (const auto& arm : ce->arms) {
