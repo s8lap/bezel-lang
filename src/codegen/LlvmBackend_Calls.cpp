@@ -10014,12 +10014,13 @@ llvm::FunctionType* Emitter::methodFnType(const sema::MethodSymbol* ms) {
         llvm::Type* retTy = retRef ? lowerTypeRef(retRef)
                                    : llvm::Type::getVoidTy(llvm_);
         std::vector<llvm::Type*> paramTys;
-        // #735: an imported ENUM instance method's `this` is the underlying
-        // integer (i32) by value, matching the exporter (CG30) — not a ptr.
+        // #735 / §10.3 (#740): an ENUM instance method's `this` is the underlying
+        // integer by value (default i32), matching the exporter (CG30) — not a ptr.
         if (!isStaticMethod(const_cast<sema::MethodSymbol*>(ms))) {
             bool isEnumMethod =
                 ms->parent && ms->parent->kind == ast::TypeDeclKind::Enum;
-            paramTys.push_back(isEnumMethod ? i32() : ptrTy());
+            paramTys.push_back(
+                isEnumMethod ? enumLlvmType(ms->parent) : ptrTy());
         }
         for (sema::Symbol* p : ms->params) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);

@@ -308,6 +308,9 @@ set(BEZEL_TEST_SOURCES
     codegen/conditional_member_test.cpp
     codegen/enum_case_test.cpp
     codegen/enum_property_case_574_test.cpp
+    # --- fix #740: non-int enum underlying types (§10.3/§5.4) ---
+    codegen/enum_underlying_type_740_test.cpp
+    # --- end #740 ---
     codegen/expr_result_member_test.cpp
     codegen/conversion_test.cpp
     codegen/numeric_conversion_test.cpp

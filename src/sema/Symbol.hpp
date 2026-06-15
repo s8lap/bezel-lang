@@ -96,6 +96,13 @@ struct TypeSymbol : Symbol {
     // or falls back to the ast::TypeDecl; for IMPORTED records only this
     // flag is available.
     bool hasPositionalFields = false;
+    // §10.3 (#740): for an ENUM, the resolved underlying-type TypeRef from the
+    // `: byte|short|int|long|...` annotation. Null means the default `int`.
+    // A primitive base type does not become a `baseTypes` entry (those hold
+    // TypeSymbol* declarations only), so the underlying width/signedness is
+    // recorded here for codegen to lower the enum to the correct integer type
+    // instead of the hardcoded i32.
+    TypeRef* enumUnderlyingType = nullptr;
 };
 
 // A.2 TypeAliasDecl — its target type is resolved by Type Resolution.

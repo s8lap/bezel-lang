@@ -631,7 +631,12 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 }
                 return recordStruct(rt->declaration);
             }
-            return i32();  // other value-kind named (enum) — int
+            // §10.3 (#740): an enum lowers to its underlying integer type
+            // (default i32; `: byte|short|long|...` widen/narrow accordingly).
+            if (rt->declaration &&
+                rt->declaration->kind == ast::TypeDeclKind::Enum)
+                return enumLlvmType(rt->declaration);
+            return i32();  // other value-kind named — int
         case sema::TypeRef::Kind::InlineArray: {
             // §15.1: [N]T is an LLVM fixed-size array [N x elemType].
             // N is an IntLiteralExpr, or a folded compile-time size (#734:
@@ -993,7 +998,10 @@ const sema::TypeRef* Emitter::recordMemberTypeResolved(const sema::Symbol* m) {
 // header) because the record case needs recordStruct.
 llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
     if (isNullableEnumTy(rt))
-        return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), i32()});
+        // §10.3 (#740): the nullable-enum payload slot is the enum's underlying
+        // integer width (default i32), matching the non-nullable enum lowering.
+        return llvm::StructType::get(
+            llvm_, {nullablePrimHasValTy(), enumLlvmType(rt->declaration)});
     // per §7.2 / §8.6 / issue #416: a nullable record's payload is the bare
     // record struct, so the tag distinguishes null from any record value.
     // issue #462 / §14.1: a nullable GENERIC record (`Box<int>?` / `Box<string>?`)

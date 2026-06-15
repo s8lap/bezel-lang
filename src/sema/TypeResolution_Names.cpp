@@ -318,6 +318,14 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     for (const auto& bt : td.baseTypes) {
         if (!bt) continue;
         TypeRef* ref = resolveType(*bt, &typeScope);
+        // §10.3 (#740): an enum's base type is its underlying integer type
+        // (a primitive, e.g. `: long`), which does NOT resolve to a TypeSymbol
+        // declaration and so is not a `baseTypes` entry. Record it on the enum's
+        // TypeSymbol so codegen lowers the enum to the right integer width.
+        if (tsym && td.kind == ast::TypeDeclKind::Enum && ref &&
+            ref->kind == TypeRef::Kind::Primitive) {
+            tsym->enumUnderlyingType = ref;
+        }
         if (tsym && ref && ref->kind == TypeRef::Kind::Named &&
             ref->declaration) {
             tsym->baseTypes.push_back(ref->declaration);

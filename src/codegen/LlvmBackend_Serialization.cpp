@@ -596,10 +596,13 @@ void Emitter::emitEnumSerialize(const TypeSymbol* ts,
     if (!td) return;
     llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
 
-    // Extend enum to i32 for comparison.
+    // §10.3 (#740): compare at the enum's underlying width — truncating a
+    // `: long` enum to i32 would mis-match (or collide) members whose values
+    // differ only above bit 31.
+    llvm::Type* uTy = enumLlvmType(ts);
     llvm::Value* ev = enumVal;
-    if (!ev->getType()->isIntegerTy(32))
-        ev = builder_.CreateSExtOrTrunc(ev, i32(), "enum.ev");
+    if (ev->getType() != uTy)
+        ev = builder_.CreateSExtOrTrunc(ev, uTy, "enum.ev");
 
     // Build a chain of comparisons, one per declared constant.
     // If a constant matches, write its wire name and branch to end.
@@ -610,20 +613,24 @@ void Emitter::emitEnumSerialize(const TypeSymbol* ts,
     for (const auto& ec : td->enumConstants) {
         // Determine the constant's integer value using enumValue_ (populated by
         // computeEnumValues(), which handles both local and imported enums).
-        int32_t ordinal = -1;
+        // §10.3 (#740): keep the full 64-bit value (a `: long` member exceeds
+        // i32); `found` distinguishes a real 0/-1 value from "not found".
+        int64_t ordinal = 0;
+        bool found = false;
         for (const Symbol* m : ts->members) {
             if (m->name == ec.name) {
                 if (dynamic_cast<const EnumConstantSymbol*>(m)) {
                     auto it = enumValue_.find(m);
-                    if (it != enumValue_.end()) ordinal = (int32_t)it->second;
+                    if (it != enumValue_.end()) { ordinal = it->second; found = true; }
                 }
                 break;
             }
         }
-        if (ordinal < 0) continue;  // not found — skip
+        if (!found) continue;  // not found — skip
 
         std::string wireName = std::string(enumConstWireName(ec));
-        llvm::Value* cmpVal  = builder_.getInt32(ordinal);
+        llvm::Value* cmpVal  = llvm::ConstantInt::get(
+            uTy, static_cast<std::uint64_t>(ordinal), /*isSigned=*/true);
         llvm::Value* matches = builder_.CreateICmpEQ(ev, cmpVal, "enum.eq");
 
         auto* writeBB = llvm::BasicBlock::Create(llvm_, "enum.ser.write", currentFn_);
@@ -1127,9 +1134,11 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
     auto* readFn = declareC("bz_binder_read_string", ptrTy(), {ptrTy()});
     llvm::Value* namePtr = builder_.CreateCall(readFn, {derPtr}, "deser.ename");
 
-    // Alloca for the result enum value.
-    llvm::AllocaInst* resultSlot = entryAlloca(i32());
-    builder_.CreateStore(builder_.getInt32(0), resultSlot);
+    // §10.3 (#740): the result enum value at the enum's underlying width, so a
+    // deserialized `: long` member keeps all 64 bits.
+    llvm::Type* uTy = enumLlvmType(ts);
+    llvm::AllocaInst* resultSlot = entryAlloca(uTy);
+    builder_.CreateStore(llvm::ConstantInt::get(uTy, 0), resultSlot);
 
     auto* endBB   = llvm::BasicBlock::Create(llvm_, "enum.deser.end",   currentFn_);
     auto* throwBB = llvm::BasicBlock::Create(llvm_, "enum.deser.throw", currentFn_);
@@ -1138,17 +1147,18 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
                            {ptrTy(), i64(), ptrTy(), i64(), i32()});
 
     for (const auto& ec : td->enumConstants) {
-        int32_t ordinal = -1;
+        int64_t ordinal = 0;
+        bool found = false;
         for (const Symbol* m : ts->members) {
             if (m->name == ec.name) {
                 if (dynamic_cast<const EnumConstantSymbol*>(m)) {
                     auto it = enumValue_.find(m);
-                    if (it != enumValue_.end()) ordinal = (int32_t)it->second;
+                    if (it != enumValue_.end()) { ordinal = it->second; found = true; }
                 }
                 break;
             }
         }
-        if (ordinal < 0) continue;
+        if (!found) continue;
 
         std::string wireName = std::string(enumConstWireName(ec));
         llvm::Value* litStr  = lowerStringLiteral(
@@ -1176,7 +1186,10 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isMatch, matchBB, nextBB);
 
         builder_.SetInsertPoint(matchBB);
-        builder_.CreateStore(builder_.getInt32(ordinal), resultSlot);
+        builder_.CreateStore(
+            llvm::ConstantInt::get(uTy, static_cast<std::uint64_t>(ordinal),
+                                   /*isSigned=*/true),
+            resultSlot);
         // Release namePtr.
         auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
         builder_.CreateCall(relFn, {namePtr});
@@ -1202,7 +1215,7 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
     builder_.CreateBr(endBB);
 
     builder_.SetInsertPoint(endBB);
-    return builder_.CreateLoad(i32(), resultSlot, "enum.deser.v");
+    return builder_.CreateLoad(uTy, resultSlot, "enum.deser.v");
 }
 
 // ---------------------------------------------------------------------------
@@ -3006,8 +3019,11 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                         recv = builder_.CreateLoad(st, recv);
                     emitRecordSerialize(ts, recv, serArg);
                 } else if (isEnum) {
-                    if (!recv->getType()->isIntegerTy(32))
-                        recv = builder_.CreateSExtOrTrunc(recv, i32(), "enum.v");
+                    // §10.3 (#740): hand emitEnumSerialize the value at the
+                    // enum's underlying width (it now compares at that width).
+                    llvm::Type* uTy = enumLlvmType(ts);
+                    if (recv->getType() != uTy)
+                        recv = builder_.CreateSExtOrTrunc(recv, uTy, "enum.v");
                     emitEnumSerialize(ts, recv, serArg);
                 } else {
                     // Class: recv is a ptr to the class instance.

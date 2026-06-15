@@ -1243,6 +1243,28 @@ private:
     // Double→f64; the integer types are all i32 until CG25 widens them.
     llvm::Type* lowerPrimitive(sema::PrimitiveType p);
 
+    // §10.3 (#740): an enum's underlying-type primitive (default `int`) and the
+    // matching LLVM integer type / signedness. The enum representation is the
+    // underlying integer; these route every enum-value site to the correct
+    // width instead of the historical hardcoded i32.
+    sema::PrimitiveType enumUnderlyingPrim(const sema::TypeSymbol* enumTy) {
+        if (enumTy && enumTy->enumUnderlyingType)
+            return enumTy->enumUnderlyingType->primitive;
+        return sema::PrimitiveType::Int;
+    }
+    llvm::Type* enumLlvmType(const sema::TypeSymbol* enumTy) {
+        return lowerPrimitive(enumUnderlyingPrim(enumTy));
+    }
+    bool enumIsUnsigned(const sema::TypeSymbol* enumTy) {
+        return isUnsignedPrim(enumUnderlyingPrim(enumTy));
+    }
+    // The owning enum TypeSymbol of an enum-constant symbol, or null.
+    const sema::TypeSymbol* enumOfConstant(const sema::Symbol* m) {
+        if (auto* ec = dynamic_cast<const sema::EnumConstantSymbol*>(m))
+            return ec->parent;
+        return nullptr;
+    }
+
     // §4.6: lazily get (or create) the %bz_string struct type.
     // Layout: { ptr data, i64 length, i8 width, i64 rc }
     //   data  : pointer to the code-point array (elements are width bytes each)

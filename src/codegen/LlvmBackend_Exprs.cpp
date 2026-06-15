@@ -7252,6 +7252,13 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
     bool srcFP = srcTy->isFloatingPointTy();
     bool dstUns = isUnsignedPrim(target);
     bool srcUns = isUnsignedTargetExpr(argE);
+    // §10.3 / §5.4 (#740): when the source is an enum, its signedness is that of
+    // its underlying type — so `int(byteEnum)` zero-extends an unsigned byte
+    // value rather than sign-corrupting it.
+    if (auto* st = ctx_.exprType(argE))
+        if (st->kind == sema::TypeRef::Kind::Named && st->declaration &&
+            st->declaration->kind == ast::TypeDeclKind::Enum)
+            srcUns = enumIsUnsigned(st->declaration);
     if (srcFP && dstFP) {
         return srcTy->getPrimitiveSizeInBits() <
                        dstTy->getPrimitiveSizeInBits()
@@ -7322,10 +7329,20 @@ llvm::Value* Emitter::lowerEnumCast(const ast::CallExpr& call) {
     if (call.args.size() != 1 || !call.args[0].value) return nullptr;
     llvm::Value* src = lowerExpr(*call.args[0].value);
     if (!src || !src->getType()->isIntegerTy()) return nullptr;
-    unsigned sb = src->getType()->getIntegerBitWidth();
-    if (sb < 32) return builder_.CreateSExt(src, i32());
-    if (sb > 32) return builder_.CreateTrunc(src, i32());
-    return src;
+    // §10.3 / §5.4 (#740): the enum is its underlying integer; width-adjust the
+    // source integer to that width (default i32). Choose sign- vs zero-extension
+    // by the SOURCE's signedness so a value from an unsigned source widens
+    // without sign corruption.
+    const sema::TypeSymbol* enumTy = nullptr;
+    if (auto* rt = ctx_.exprType(call))
+        if (rt->kind == sema::TypeRef::Kind::Named) enumTy = rt->declaration;
+    llvm::Type* uTy = enumLlvmType(enumTy);
+    bool srcUnsigned = false;
+    if (auto* st = ctx_.exprType(*call.args[0].value))
+        if (st->kind == sema::TypeRef::Kind::Primitive)
+            srcUnsigned = isUnsignedPrim(st->primitive);
+    return srcUnsigned ? builder_.CreateZExtOrTrunc(src, uTy, "enum.cast")
+                       : builder_.CreateSExtOrTrunc(src, uTy, "enum.cast");
 }
 
 

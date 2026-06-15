@@ -188,8 +188,11 @@ llvm::Value* Emitter::enumConstant(const ast::Expr& e) {
     if (!dynamic_cast<sema::EnumConstantSymbol*>(sym)) return nullptr;
     auto it = enumValue_.find(sym);
     if (it == enumValue_.end()) return nullptr;
+    // §10.3 (#740): materialize at the enum's underlying width (default i32),
+    // so a `: long` enum constant keeps all 64 bits instead of truncating.
     return llvm::ConstantInt::get(
-        i32(), static_cast<std::uint64_t>(it->second), /*isSigned=*/true);
+        enumLlvmType(enumOfConstant(sym)),
+        static_cast<std::uint64_t>(it->second), /*isSigned=*/true);
 }
 
 
@@ -234,8 +237,9 @@ llvm::Value* Emitter::enumConstantByName(const sema::TypeSymbol* enumTy,
         if (!dynamic_cast<const sema::EnumConstantSymbol*>(m)) continue;
         auto it = enumValue_.find(m);
         if (it == enumValue_.end()) return nullptr;
+        // §10.3 (#740): materialize at the enum's underlying width.
         return llvm::ConstantInt::get(
-            i32(), static_cast<std::uint64_t>(it->second),
+            enumLlvmType(enumTy), static_cast<std::uint64_t>(it->second),
             /*isSigned=*/true);
     }
     return nullptr;
@@ -758,11 +762,13 @@ void Emitter::declareFunctions() {
                 llvm::Type* thisTy = extensionThisType(ms, /*byPointer=*/nullptr);
                 paramTys.push_back(thisTy ? thisTy : ptrTy());
             } else {
-                // CG30: enum instance methods take the enum value (i32) as
-                // `this`, not a pointer — enums are value types.
+                // CG30 / §10.3 (#740): enum instance methods take the enum value
+                // (its underlying integer, default i32) as `this`, not a pointer
+                // — enums are value types.
                 bool isEnumMethod = ms->parent &&
                     ms->parent->kind == ast::TypeDeclKind::Enum;
-                paramTys.push_back(isEnumMethod ? i32() : ptrTy());
+                paramTys.push_back(
+                    isEnumMethod ? enumLlvmType(ms->parent) : ptrTy());
             }
         }
         // fix #633 / §33.4: Main(args: Array<string>) must match the C ABI
@@ -1009,9 +1015,12 @@ void Emitter::declareImportedFunctions() {
         // call pass a ptr where the exported `bz$Enum$M(i32)` expects an i32, so
         // the receiver was read as garbage. Mirror enumTypeOf/CG30.
         if (!isStaticMethod(ms)) {
+            // §10.3 (#740): the enum's underlying width (default i32, and i32 for
+            // an imported enum whose metadata does not carry the underlying type).
             bool isEnumMethod =
                 ms->parent && ms->parent->kind == ast::TypeDeclKind::Enum;
-            paramTys.push_back(isEnumMethod ? i32() : ptrTy());
+            paramTys.push_back(
+                isEnumMethod ? enumLlvmType(ms->parent) : ptrTy());
         }
         for (sema::Symbol* p : ms->params) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
@@ -9585,10 +9594,11 @@ void Emitter::setupBoxDescriptors() {
                             ptrTy(), &*ai,
                             {llvm::ConstantInt::get(i32(), 2)}, "box.valptr");
                         if (isEnumImpl) {
-                            // §10 / #435: enum `this` is i32 by value —
-                            // load it from the box's value slot.
+                            // §10 / §10.3 / #435 (#740): enum `this` is its
+                            // underlying integer by value (default i32) — load it
+                            // from the box's value slot at that width.
                             llvm::Value* enumVal = tb.CreateLoad(
-                                i32(), valSlot, "box.enumval");
+                                enumLlvmType(ts), valSlot, "box.enumval");
                             callArgs.push_back(enumVal);
                         } else {
                             // Record: pass the pointer to the value slot
