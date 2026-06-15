@@ -139,3 +139,64 @@ BEZEL_TEST(dict_literal_534, array_literal_unaffected) {
         "  return int(a.Length = 3 and a.Get(0) = 10 and a.Get(2) = 30); "
         "end Main; end C;"), 1);
 }
+
+// ── §15.4 (R39): empty `[]` with a Dictionary target → empty dictionary ──────
+// The empty literal parses as a NON-dict CollectionLiteralExpr; with a
+// Dictionary target it must construct an empty dict, not leave the slot
+// uninitialized. Pre-fix `using var d: Dictionary<…> := []` free()d a garbage
+// pointer at scope end → SIGABRT.
+
+BEZEL_TEST(dict_literal_534, empty_dict_literal_local_count_zero_r39) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d: Dictionary<string, int> := []; "
+        "  return d.Count; "  // 0, and no crash at scope end
+        "end Main; end C;"), 0);
+}
+
+BEZEL_TEST(dict_literal_534, empty_dict_literal_then_add_r39) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d: Dictionary<string, int> := []; "
+        "  d.Add(\"a\", 5); d.Add(\"b\", 7); "
+        "  return d[\"a\"] + d[\"b\"] + d.Count; "  // 5+7+2 = 14
+        "end Main; end C;"), 14);
+}
+
+BEZEL_TEST(dict_literal_534, empty_dict_literal_int_key_r39) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var d: Dictionary<int, int> := []; "
+        "  d.Add(1, 100); return d[1] + d.Count; "  // 100 + 1
+        "end Main; end C;"), 101);
+}
+
+// Empty `[]` returned where a Dictionary is expected (return path delegates
+// through the same helper).
+BEZEL_TEST(dict_literal_534, empty_dict_literal_return_r39) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Make(): Dictionary<string, int> return []; end Make; "
+        "  public static method Main(): int "
+        "    using var d := Make(); return d.Count; "  // 0
+        "  end Main; "
+        "end C;"), 0);
+}
+
+// Empty `[]` as a Dictionary FIELD initializer.
+BEZEL_TEST(dict_literal_534, empty_dict_literal_field_r39) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Box public m: Dictionary<string, int> := []; end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box(); b.m.Add(\"x\", 3); return b.m[\"x\"]; "  // 3
+        "end Main; end C;"), 3);
+}
+
+// Regression: an empty `[]` with an Array target is still an empty array.
+BEZEL_TEST(dict_literal_534, empty_array_literal_still_array_r39) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a: Array<int> := []; a.Add(9); "
+        "  return a.Get(0) + a.Length; "  // 9 + 1
+        "end Main; end C;"), 10);
+}

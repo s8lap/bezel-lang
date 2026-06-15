@@ -8079,6 +8079,18 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy) {
     if (!cl || cl->isDict || !collTy) return nullptr;
 
+    // §15.4 (R39): the empty literal `[]` parses as a NON-dict
+    // CollectionLiteralExpr (the empty form is syntactically ambiguous), but
+    // with a Dictionary<K,V>/OwnedDictionary<K,V> target it must construct an
+    // empty dictionary. Delegate to the dict materializer. Without this the
+    // ordered-collection path below returns null for a dict target (it is not
+    // an isCollectionTypeName), leaving the local/field slot uninitialized — a
+    // `using var d: Dictionary<…> := []` then free()s a garbage pointer
+    // (SIGABRT). Every empty-`[]` site calls this helper first, so this single
+    // delegation also covers field initializers and `return []`.
+    if (cl->elements.empty() && cl->keys.empty() && isDictTypeName(collTy))
+        return materializeHeapDictLiteral(cl, collTy);
+
     // §4.6/§4.7 (#738): LinkedList<T>/OwnedLinkedList<T> are bz_llist_t-backed,
     // not bz_array_t — and isCollectionTypeName deliberately EXCLUDES them, so
     // handle the literal here (before that guard) via bz_llist_alloc +
@@ -8315,8 +8327,14 @@ llvm::Value* Emitter::materializeHeapSetLiteral(
 // recognized Dictionary/OwnedDictionary TypeRef.
 llvm::Value* Emitter::materializeHeapDictLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* dictTy) {
-    if (!cl || !cl->isDict || !dictTy) return nullptr;
+    if (!cl || !dictTy) return nullptr;
     if (!isDictTypeName(dictTy)) return nullptr;
+    // §15.4 (R39): the empty literal `[]` parses with isDict=false; with a
+    // Dictionary target it still constructs an empty dictionary (the populate
+    // loop below is then a no-op). A NON-empty non-dict literal is a list, not
+    // a dict — reject it so a list literal never lands on a dict target.
+    bool emptyLiteral = cl->keys.empty() && cl->elements.empty();
+    if (!cl->isDict && !emptyLiteral) return nullptr;
     if (cl->keys.size() != cl->elements.size()) return nullptr;  // malformed AST
 
     // Key type analysis (mirrors lowerNew Dictionary branch and .Add branch).
