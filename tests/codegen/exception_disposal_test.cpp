@@ -543,7 +543,11 @@ const char* kCtorThrowResultDropped =
     "end Holder; "
     "class C "
     "  public static method Use() "
-    "    new Holder(); "
+    // §21.9 (#743): a bare `new Holder();` discarding the owned (non-trivial-
+    // dispose) result is now a hard error; the spec-prescribed discard form is
+    // `using var _ := expression;`. On a ctor throw the bind never completes, so
+    // this exercises the SAME ctor-unwind cleanup of the partial object.
+    "    using var _ := new Holder(); "
     "  end Use; "
     "  public static method Main(): int "
     "    try "
@@ -554,8 +558,9 @@ const char* kCtorThrowResultDropped =
     "end C;";
 
 BEZEL_TEST(codegen_excdisp_04, ctor_throw_result_dropped_still_cleaned) {
-    // The dropped `new Holder()` whose ctor throws still disposes its assigned
-    // owned field (count == 1) on the unwind.
+    // The discarded `new Holder()` whose ctor throws still disposes its assigned
+    // owned field (count == 1) on the unwind. (§21.9: the discard is written
+    // `using var _ := …`; on a ctor throw the bind never completes.)
     BEZEL_EXPECT_EQ(run(kCtorThrowResultDropped), 1);
 }
 

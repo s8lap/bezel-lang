@@ -1944,6 +1944,62 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     dynamic_cast<const ast::CallExpr*>(es->expr.get()))
                 reportNoTargetInferenceIfNeeded(*exCall);
         }
+        // §21.9 (#743): a bare expression statement that DISCARDS a freshly
+        // OWNED value requiring disposal silently abandons the disposal
+        // obligation — a leak. For a non-trivial-dispose class (a destructor
+        // anywhere in its chain) or a move-only owning array, this is a hard
+        // error. GATE on the value being owned-PRODUCED here — `new T()` or a
+        // call whose method returns `owned T` — so the ubiquitous borrowed-
+        // return statement `obj.Foo();` is never false-rejected (the caller
+        // does not own a borrowed result). Mirrors the §17.13 discard check.
+        if (es->expr) {
+            bool ownedProduced = false;
+            if (dynamic_cast<const ast::NewExpr*>(es->expr.get())) {
+                ownedProduced = true;
+            } else if (auto* ce =
+                           dynamic_cast<const ast::CallExpr*>(es->expr.get())) {
+                if (ce->callee)
+                    if (auto* sym = ctx_.exprSymbol(*ce->callee))
+                        if (auto* ms = dynamic_cast<MethodSymbol*>(sym))
+                            if (auto* md = dynamic_cast<const ast::MethodDecl*>(
+                                    ms->decl))
+                                ownedProduced = md->returnOwned;
+            }
+            if (ownedProduced) {
+                const TypeRef* t = ctx_.exprType(*es->expr);
+                bool reject = false;
+                if (t && t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
+                    reject = true;
+                } else if (t && !t->nullable &&
+                           t->kind == TypeRef::Kind::Named && t->declaration &&
+                           t->declaration->kind == ast::TypeDeclKind::Class &&
+                           !t->declaration->isValueBuiltin) {
+                    for (TypeSymbol* cur = t->declaration; cur && !reject;) {
+                        for (Symbol* m : cur->members)
+                            if (dynamic_cast<DestructorSymbol*>(m)) {
+                                reject = true;
+                                break;
+                            }
+                        TypeSymbol* nextBase = nullptr;
+                        for (TypeSymbol* b : cur->baseTypes)
+                            if (b && b->kind == ast::TypeDeclKind::Class) {
+                                nextBase = b;
+                                break;
+                            }
+                        cur = nextBase;
+                    }
+                }
+                if (reject) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, es->expr->span.begin,
+                        "this expression produces an owned value that requires "
+                        "disposal (a non-trivial-dispose class or a move-only "
+                        "owning array); discarding it as a statement leaks the "
+                        "resource — bind it (`using var _ := expression;`), call "
+                        "`.Dispose()`, or transfer it (`move`/`return`) (§21.9)");
+                }
+            }
+        }
     } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         // §12.7: "Reassignment within the controlled block invalidates the
         // narrowing." If the assignment target is the narrowed variable, drop

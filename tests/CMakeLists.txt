@@ -80,6 +80,9 @@ set(BEZEL_TEST_SOURCES
     sema/symbol_collection_test.cpp
     sema/type_resolution_test.cpp
     sema/expr_literal_types_test.cpp
+    # --- fix #743: §21.9 owned-value discard-as-statement is an error ---
+    sema/owned_discard_stmt_743_test.cpp
+    # --- end #743 ---
     sema/expr_identifier_resolution_test.cpp
     sema/expr_operator_types_test.cpp
     sema/member_access_resolution_test.cpp
