@@ -1680,10 +1680,20 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         llvm::Value* hi   = builder_.CreateTrunc(hi64, i32(), "rfv.hi32");
         llvm::Value* step = builder_.CreateTrunc(step64, i32(), "rfv.step32");
 
-        // Determine direction from step sign (use the i32 form).
-        bool descending = false;
-        if (auto* cs = llvm::dyn_cast<llvm::ConstantInt>(step))
-            descending = cs->getValue().isNegative();
+        // §16.4: the iteration direction is determined by the step's SIGN.
+        // Unlike the inline-literal path below (where the step is a compile-time
+        // constant), the step here is loaded from the Range struct and is
+        // generally NOT a ConstantInt, so direction must be decided at RUNTIME.
+        // A range whose bounds-direction disagrees with its step sign produces
+        // an empty iteration — this falls out naturally from selecting the
+        // step-sign-derived comparison against the (unchanged) bounds: e.g.
+        // `1..5 step -1` takes the descending branch and `1 >= 5` is false on
+        // entry, so the body never runs. (The prior code only ever set
+        // `descending` for a constant step, so a Range variable always used the
+        // ascending comparison — both miscompiling `5..1 step -1` into an empty
+        // loop and turning `1..5 step -1` into a non-terminating descent.)
+        llvm::Value* stepNeg =
+            builder_.CreateICmpSLT(step, builder_.getInt32(0), "rfv.desc");
 
         llvm::AllocaInst* slot = entryAlloca(i32());
         locals_[&fs] = slot;
@@ -1697,17 +1707,16 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
 
         builder_.SetInsertPoint(condBB);
         llvm::Value* cur = builder_.CreateLoad(i32(), slot);
-        // Direction-aware bound check using the incl flag from the struct.
-        llvm::Value* cond;
-        if (descending) {
-            llvm::Value* geLE = builder_.CreateICmpSGE(cur, hi);
-            llvm::Value* geLT = builder_.CreateICmpSGT(cur, hi);
-            cond = builder_.CreateSelect(incl, geLE, geLT, "rfv.cond");
-        } else {
-            llvm::Value* leLE = builder_.CreateICmpSLE(cur, hi);
-            llvm::Value* leLT = builder_.CreateICmpSLT(cur, hi);
-            cond = builder_.CreateSelect(incl, leLE, leLT, "rfv.cond");
-        }
+        // Direction-aware bound check: pick the ascending (cur <=/< hi) or
+        // descending (cur >=/> hi) comparison by the runtime step sign, using
+        // the incl flag from the struct for the </<= vs <=/>= choice.
+        llvm::Value* ascLE  = builder_.CreateICmpSLE(cur, hi);
+        llvm::Value* ascLT  = builder_.CreateICmpSLT(cur, hi);
+        llvm::Value* asc    = builder_.CreateSelect(incl, ascLE, ascLT);
+        llvm::Value* descGE = builder_.CreateICmpSGE(cur, hi);
+        llvm::Value* descGT = builder_.CreateICmpSGT(cur, hi);
+        llvm::Value* desc   = builder_.CreateSelect(incl, descGE, descGT);
+        llvm::Value* cond   = builder_.CreateSelect(stepNeg, desc, asc, "rfv.cond");
         builder_.CreateCondBr(cond, bodyBB, endBB);
 
         builder_.SetInsertPoint(bodyBB);

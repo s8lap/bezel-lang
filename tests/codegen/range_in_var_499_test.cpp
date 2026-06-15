@@ -208,3 +208,59 @@ BEZEL_TEST(codegen_range_in_var_499, range_var_cross_use) {
         "  return count; "
         "end Main; end C;"), 10);
 }
+
+// ── #741/#743 §16.4: direction is decided by the step's SIGN at runtime ──────
+// Pre-fix, the Range-variable `for` path only derived direction from a
+// compile-time-constant step; a step loaded from the struct always took the
+// ascending comparison. That both threw / failed to terminate for a
+// sign-mismatched ascending range and silently emptied a legitimate
+// descending range. These tests pin all four bounds/step-sign combinations.
+
+// §16.4: ascending bounds + negative step → EMPTY iteration (not an exception).
+BEZEL_TEST(codegen_range_in_var_499, step_sign_mismatch_ascending_is_empty_16_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var count := 0; "
+        "  var r := 1..5 step -1; "
+        "  for var i in r do count := count + 1; end; "
+        "  return count; "
+        "end Main; end C;"), 0);
+}
+
+// §16.4: descending bounds + negative step → iterates 5,4,3,2,1 (inclusive) = 5.
+// (Pre-fix this wrongly produced an empty loop because direction defaulted up.)
+BEZEL_TEST(codegen_range_in_var_499, descending_negative_step_iterates_16_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var count := 0; "
+        "  var r := 5..1 step -1; "
+        "  for var i in r do count := count + 1; end; "
+        "  return count; "
+        "end Main; end C;"), 5);
+}
+
+// §16.4: descending bounds + positive step → EMPTY iteration.
+BEZEL_TEST(codegen_range_in_var_499, step_sign_mismatch_descending_is_empty_16_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var count := 0; "
+        "  var r := 5..1 step 1; "
+        "  for var i in r do count := count + 1; end; "
+        "  return count; "
+        "end Main; end C;"), 0);
+}
+
+// §16.4: a Range variable agrees with the inline-literal form for the same
+// sign-mismatched range (both empty), confirming path consistency.
+BEZEL_TEST(codegen_range_in_var_499, literal_and_var_agree_on_descending_16_4) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var lit := 0; "
+        "  for var i in 5..1 step -1 do lit := lit + 1; end; "
+        "  var vc := 0; "
+        "  var r := 5..1 step -1; "
+        "  for var j in r do vc := vc + 1; end; "
+        "  if lit <> vc then return 99; end; "
+        "  return lit; "  // both iterate 5,4,3,2,1
+        "end Main; end C;"), 5);
+}
