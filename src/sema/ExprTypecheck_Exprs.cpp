@@ -1855,6 +1855,20 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         for (const auto& a : nc->args) {
             if (a.value) visitExpr(*a.value);
         }
+        // §27.7 (#738): `f?(args)` invokes the nullable function value `f` when
+        // non-null, else is a no-op; the result is the function's return type
+        // made NULLABLE (null when f is null). Type it so an inferred local /
+        // null check / arithmetic on the result resolves (previously untyped →
+        // codegen produced a wrong value).
+        if (nc->callee) {
+            if (TypeRef* ft = ctx_.exprType(*nc->callee))
+                if (ft->kind == TypeRef::Kind::Function && ft->funcReturn) {
+                    TypeRef* r = ctx_.makeTypeRef();
+                    *r = *ft->funcReturn;
+                    r->nullable = true;
+                    ctx_.setExprType(&e, r);
+                }
+        }
     } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (ix->target) visitExpr(*ix->target);
         for (const auto& a : ix->indices) {

@@ -1221,6 +1221,66 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         return lowerLambda(*lam);
     }
+    // §27.7 (#738): null-conditional invocation `f?(args)`. Invoke the nullable
+    // function value when non-null, else skip; the result is the function's
+    // return type made NULLABLE (null when f was null). Was unimplemented
+    // (NullCondCallExpr produced a wrong value).
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        const sema::TypeRef* fnRt =
+            nc->callee ? ctx_.exprType(*nc->callee) : nullptr;
+        if (!fnRt || fnRt->kind != sema::TypeRef::Kind::Function ||
+            !fnRt->funcReturn)
+            return nullptr;
+        llvm::Value* closurePtr = lowerExpr(*nc->callee);
+        if (!closurePtr || !closurePtr->getType()->isPointerTy()) return nullptr;
+        llvm::Type* rTy = lowerTypeRef(fnRt->funcReturn);  // R
+        bool refResult = rTy->isPointerTy();
+        // Result type R?: ptr for a reference R, tagged {i8 hasValue; R} struct
+        // for a value R (matches lowerTypeRef of the sema-set R? result).
+        llvm::Type* resTy = refResult
+            ? static_cast<llvm::Type*>(ptrTy())
+            : static_cast<llvm::Type*>(
+                  llvm::StructType::get(llvm_, {nullablePrimHasValTy(), rTy}));
+        auto* entryBB = builder_.GetInsertBlock();
+        auto* callBB = llvm::BasicBlock::Create(llvm_, "nccall.do", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "nccall.end", currentFn_);
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            closurePtr, llvm::ConstantPointerNull::get(ptrTy()));
+        builder_.CreateCondBr(isNull, endBB, callBB);
+
+        builder_.SetInsertPoint(callBB);
+        // Closure ABI { ptr fn, ptr env }: call fn(env, user args...).
+        llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
+        llvm::Value* envSlot =
+            builder_.CreateGEP(ptrTy(), closurePtr, {builder_.getInt32(1)});
+        llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot);
+        std::vector<llvm::Value*> args;
+        args.push_back(envPtr);
+        for (const auto& a : nc->args) {
+            if (!a.value) return nullptr;
+            llvm::Value* v = lowerExpr(*a.value);
+            if (!v) return nullptr;
+            args.push_back(v);
+        }
+        std::vector<llvm::Type*> argTys;
+        for (auto* v : args) argTys.push_back(v->getType());
+        auto* fnTy = llvm::FunctionType::get(rTy, argTys, false);
+        llvm::Value* callRes =
+            builder_.CreateCall(fnTy, fnPtr, args, "nccall.ret");
+        llvm::Value* wrapped =
+            refResult ? callRes : wrapNullableValue(fnRt->funcReturn, callRes);
+        auto* callEndBB = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(resTy, 2);
+        llvm::Value* nullVal = refResult
+            ? static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptrTy()))
+            : nullableValueNull(fnRt->funcReturn);
+        phi->addIncoming(nullVal, entryBB);
+        phi->addIncoming(wrapped, callEndBB);
+        return phi;
+    }
     // CG41: null-conditional member access `x?.M` (§7.5). Evaluate the
     // target; if null, the result is null, otherwise read the member.
     // The result is always nullable. Reference-typed storage members

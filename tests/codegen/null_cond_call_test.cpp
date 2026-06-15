@@ -138,3 +138,36 @@ BEZEL_TEST(codegen_cg42, value_bool_returning_call_non_null) {
         "  if x = null then return 0; elif x! then return 1; else return 2; end; "
         "end Main; end C;"), 1);
 }
+
+// #738 / §27.7: null-conditional INVOCATION of a nullable FUNCTION VALUE
+// `f?(args)`. When f is non-null it is invoked and the result is the return
+// type made nullable; when null the call is skipped and the result is null.
+// Previously NullCondCallExpr was unimplemented (produced a wrong value).
+BEZEL_TEST(null_cond_call, function_value_present_invokes_738) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C public static method Main(): int "
+        "  var f: ((int) -> int)? := (x: int) => x * 2; "
+        "  var r := f?(5); "  // 10, as int?
+        "  if r is null then return 2; end; "
+        "  if r = 10 then return 0; end; "
+        "  return 1; "
+        "end Main; end C;"), 0);
+}
+BEZEL_TEST(null_cond_call, function_value_null_skips_738) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C public static method Main(): int "
+        "  var f: ((int) -> int)? := null; "
+        "  var r := f?(5); "
+        "  if r is null then return 7; end; "
+        "  return 1; "
+        "end Main; end C;"), 7);
+}
+BEZEL_TEST(null_cond_call, function_value_reference_return_738) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C public static method Main(): int "
+        "  var f: ((int) -> string)? := (x: int) => \"v\"; "
+        "  var r := f?(3); "
+        "  if r is null then return 2; end; "
+        "  return r!.Length; "  // 'v'.Length = 1
+        "end Main; end C;"), 1);
+}
