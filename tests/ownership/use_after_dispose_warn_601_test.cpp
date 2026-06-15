@@ -230,17 +230,24 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_dispose_then_use_in_loop_bo
 }
 
 
-// ── Case 10: double-Dispose is a separate ERROR, not a use-after-dispose warn
+// ── Case 10: double-Dispose is a WARNING, not an error (§28.2) ───────────────
 
-// §28.3 idempotency note: the second explicit Dispose() on a known-disposed
-// local triggers the ownership checker's "already disposed" ERROR (re-calling
-// Dispose on a provably-disposed local is a bug per §28.3 ownership rules),
-// NOT the §28.2 use-after-dispose warning. The two diagnostics must not be
-// confused: a double-Dispose is an error, a plain use is a warning.
-BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_3_double_dispose_is_error_not_warn) {
+// §28.2: `Dispose()` is idempotent — "a further Dispose() call remains a no-op,
+// not an error, in both modes." A statically-provable second Dispose() on a
+// known-disposed local is therefore a compile-time WARNING (the use-after-
+// dispose subset §28.2 prescribes a warning for), NOT a hard error: rejecting
+// it would refuse the valid idempotent pattern the language guarantees. (Owner
+// decision 2026-06-15; this was previously a hard error.)
+BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_double_dispose_is_warning_not_error) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); x.Dispose(); x.Dispose();"));
-    // The second Dispose() is an error, not the §28.2 use-after-dispose warn.
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
+    // The program is well-formed — idempotent disposal is guaranteed (§28.2).
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // The redundant second Dispose() is flagged with a warning.
+    bool warned = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find("disposed again") != std::string::npos)
+            warned = true;
+    BEZEL_EXPECT_TRUE(warned);
 }

@@ -172,6 +172,26 @@ const char* kExplicitLocalOnly =
     "  end Main; "
     "end R;";
 
+// (a2) §28.2: a REPEATED explicit `x.Dispose()` on the same owned local must be a
+// no-op — idempotent disposal is guaranteed ("a further Dispose() call remains a
+// no-op, not an error, in both modes"). The destructor must run EXACTLY once
+// (exit 1), and the second dispose must NOT re-dispatch the vtable Dispose
+// through the now-nulled slot (a use-after-free / null-deref SIGSEGV). This is
+// the case the old "double-dispose is a compile error" rule masked; with that
+// downgraded to a warning (§28.2), the second call must be a runtime no-op.
+// Load-bearing: must stay ASan/LSan-clean (no UAF, no double-free, no leak).
+const char* kDoubleExplicitDispose =
+    "module M; class R "
+    "  public static _n: int := 0; "
+    "  destructor _n := _n + 1; end destructor; "
+    "  public static method Main(): int "
+    "    var r := new R(); "
+    "    r.Dispose(); "
+    "    r.Dispose(); "
+    "    return _n; "
+    "  end Main; "
+    "end R;";
+
 // (b) §28.2 / §28.12: a `using var` explicitly disposed BEFORE its scope-end
 // auto-dispose. The destructor must run EXACTLY once (exit 1) and the block must
 // be freed EXACTLY once — the explicit dispose reclaims and nulls the slot, so
@@ -246,4 +266,12 @@ BEZEL_TEST(codegen_explicit_dispose_reclaim_415, explicit_local_base_chain_freed
     // §28.4: explicit dispose of a derived local runs Derived(+1)+Base(+100)=101
     // and reclaims the (single) block once after the full base chain.
     expectDisposedAndLeakFree(kExplicitLocalBaseChain, 101);
+}
+
+// §28.2: a repeated explicit `x.Dispose(); x.Dispose();` is a no-op on the second
+// call — destructor runs exactly once (exit 1), and no use-after-free /
+// double-free (the second dispatch is null-guarded). Regression for the
+// Error→Warning downgrade of double-dispose.
+BEZEL_TEST(codegen_explicit_dispose_reclaim_415, double_explicit_dispose_runs_once_no_uaf_28_2) {
+    expectDisposedAndLeakFree(kDoubleExplicitDispose, 1);
 }

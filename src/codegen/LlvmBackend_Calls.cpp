@@ -8489,6 +8489,27 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             explicitDisposeOwnedReceiverSlot(*ma->target,
                                                              slotTy);
                         if (slot) {
+                            // §28.2: a *repeated* explicit `x.Dispose()` on the
+                            // same owned local must be a no-op. The first call
+                            // freed the block and nulled the slot (below), so on
+                            // the second call `recv` (reloaded from that slot) is
+                            // null — dispatching a vtable Dispose through it would
+                            // be a use-after-free / null-deref SIGSEGV. Guard the
+                            // whole dispatch+reclaim on a non-null receiver so the
+                            // second `x.Dispose()` cleanly skips. (Checked mode
+                            // does not null the slot — the object is quarantined —
+                            // so `recv` stays non-null there and the run-once flag
+                            // makes the re-dispatch a no-op.)
+                            auto* nn = llvm::BasicBlock::Create(
+                                llvm_, "disp.nn", currentFn_);
+                            auto* cont = llvm::BasicBlock::Create(
+                                llvm_, "disp.cont", currentFn_);
+                            builder_.CreateCondBr(
+                                builder_.CreateICmpNE(
+                                    recv,
+                                    llvm::ConstantPointerNull::get(ptrTy())),
+                                nn, cont);
+                            builder_.SetInsertPoint(nn);
                             emitDisposeAndReclaim(recv);
                             // §28.2 v0.134 / issue #601: in checked-disposal
                             // mode the object is quarantined (not freed), so
@@ -8500,6 +8521,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                 builder_.CreateStore(
                                     llvm::ConstantPointerNull::get(ptrTy()),
                                     slot);
+                            builder_.CreateBr(cont);
+                            builder_.SetInsertPoint(cont);
                         } else {
                             emitDynamicDispose(recv);
                         }

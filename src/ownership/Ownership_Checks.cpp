@@ -1792,13 +1792,19 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
     auto* st = lookupState(name);
     if (!st) return;
     if (st->state == OwnershipState::Disposed) {
+        // §28.2: `Dispose()` is idempotent — a further call "remains a no-op,
+        // not an error, in both modes." A statically-provable redundant
+        // Dispose() is exactly the use-after-dispose case §28.2 prescribes a
+        // compile-time WARNING for, not a hard error; rejecting it would refuse
+        // the valid idempotent pattern the language guarantees. Warn (not
+        // error) and keep the state Disposed — do NOT Poison it — so the rest
+        // of the analysis proceeds undisturbed.
         report(
-            Severity::Error, loc,
+            Severity::Warning, loc,
             std::string("local `") + std::string(name) +
-            "` was already disposed (§28.3 — `.Dispose()` is "
-            "idempotent but re-calling it on a known-disposed local "
-            "indicates a bug)");
-        st->state = OwnershipState::Poisoned;
+            "` is disposed again here — the second `.Dispose()` is a no-op "
+            "(disposal is idempotent, §28.2); the redundant call usually "
+            "indicates a bug");
         return;
     }
     if (st->state == OwnershipState::MovedFrom) {

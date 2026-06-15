@@ -51,10 +51,17 @@ BEZEL_TEST(own_read, read_of_moved_local_diagnosed) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(own_read, double_dispose_diagnosed) {
+// §28.2: a double Dispose() is a WARNING (idempotent no-op), not an error.
+BEZEL_TEST(own_read, double_dispose_warned_not_errored) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); x.Dispose(); x.Dispose();"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    bool warned = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find("disposed again") != std::string::npos)
+            warned = true;
+    BEZEL_EXPECT_TRUE(warned);
 }
 
 BEZEL_TEST(own_read, double_move_diagnosed) {

@@ -47,12 +47,20 @@ BEZEL_TEST(own_param, borrowed_param_no_obligation) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(own_param, owned_param_double_disposed_diagnosed) {
+// §28.2: a double Dispose() on an owned param is a WARNING (idempotent no-op),
+// not an error — the second call is a guaranteed runtime no-op.
+BEZEL_TEST(own_param, owned_param_double_disposed_warned_not_errored) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Take(owned r: Resource) "
         "  r.Dispose(); r.Dispose(); "
         "end Take;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    bool warned = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find("disposed again") != std::string::npos)
+            warned = true;
+    BEZEL_EXPECT_TRUE(warned);
 }
 
 BEZEL_TEST(own_param, owned_param_moved_then_read_diagnosed) {
