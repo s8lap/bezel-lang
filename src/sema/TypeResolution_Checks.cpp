@@ -1104,6 +1104,17 @@ void Resolver::checkAbstractImplementations() {
 
         std::unordered_set<std::string_view> abstractNames;
         std::unordered_set<std::string_view> concreteNames;
+        // R39 / §11.2 + §12.1: also track each abstract/interface method's
+        // parameter COUNT and the set of parameter counts the class provides
+        // for that name, so an implementation with the right name but the wrong
+        // arity is rejected (it otherwise installs a wrong-signature function in
+        // the v/itable → ABI-corrupt dispatch). Param count is invariant under
+        // generic instantiation and default values, so this is sound without
+        // any generic gating; full param-type/return matching is a follow-up.
+        std::unordered_map<std::string_view, std::unordered_set<std::size_t>>
+            abstractArities;
+        std::unordered_map<std::string_view, std::unordered_set<std::size_t>>
+            concreteArities;
         // §11.2 / §23: interface property names that require a property
         // implementation (a field does NOT satisfy a property contract — per
         // §23, a property is declared with the `property` keyword and
@@ -1129,10 +1140,13 @@ void Resolver::checkAbstractImplementations() {
             bool curIsIface = (cur->kind == ast::TypeDeclKind::Interface);
             for (Symbol* m : cur->members) {
                 if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
-                    if (methodIsAbstract(ms))
+                    if (methodIsAbstract(ms)) {
                         abstractNames.insert(ms->name);
-                    else
+                        abstractArities[ms->name].insert(ms->params.size());
+                    } else {
                         concreteNames.insert(ms->name);
+                        concreteArities[ms->name].insert(ms->params.size());
+                    }
                 }
                 // §11.2 / §23 (#489): interface properties require a matching
                 // PropertySymbol, not merely a same-named FieldSymbol.
@@ -1168,6 +1182,28 @@ void Resolver::checkAbstractImplementations() {
                     std::string(t->name) +
                     "` does not implement inherited abstract member `" +
                     std::string(name) + "` (§12.5)");
+            }
+        }
+        // R39 / §11.2 + §12.1: the implementing method must match the abstract/
+        // interface member's signature — at minimum its parameter COUNT. If the
+        // class provides a method of the right name but no overload with the
+        // required arity, the v/itable slot is filled by a wrong-signature
+        // function and dispatch reads/writes the wrong stack/register layout
+        // (ABI corruption, garbage results). Report it as a conformance error.
+        for (auto& [name, arities] : abstractArities) {
+            if (!concreteNames.count(name)) continue;  // missing name reported above
+            auto cit = concreteArities.find(name);
+            for (std::size_t arity : arities) {
+                if (cit == concreteArities.end() || !cit->second.count(arity)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string("class `") + std::string(t->name) +
+                        "` does not implement inherited member `" +
+                        std::string(name) + "` with the required " +
+                        std::to_string(arity) + "-parameter signature — the "
+                        "implementing method's parameter count must match the "
+                        "abstract/interface member exactly (§11.2 / §12.1)");
+                }
             }
         }
         // §11.2 / §23 (#489): for each interface property, the implementing

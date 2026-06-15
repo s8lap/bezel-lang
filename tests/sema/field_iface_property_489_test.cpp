@@ -198,3 +198,42 @@ BEZEL_TEST(sema_field_iface_property_489, generic_iface_property_not_false_rejec
         "end IntBox;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ── §11.2 / §12.1 (R39): a method implementing an interface/abstract member ──
+// must match its parameter COUNT. A right-name/wrong-arity method left the
+// v/itable slot filled by a wrong-signature function → ABI-corrupt dispatch.
+
+BEZEL_TEST(sema_field_iface_property_489, iface_method_arity_mismatch_diagnoses_r39) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface ICalc method Add(x: int, y: int): int; end ICalc; "
+        "class Calc : ICalc "
+        "  public method Add(x: int): int return x; end Add; "  // 1 param ≠ 2
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "parameter signature"));
+}
+
+// CONTROL: a matching-arity implementation is accepted.
+BEZEL_TEST(sema_field_iface_property_489, iface_method_arity_match_ok_r39) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface ICalc method Add(x: int, y: int): int; end ICalc; "
+        "class Calc : ICalc "
+        "  public method Add(x: int, y: int): int return x + y; end Add; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL: an extra overload alongside the matching one is accepted (the class
+// provides SOME method with the required arity).
+BEZEL_TEST(sema_field_iface_property_489, iface_method_overload_provides_arity_ok_r39) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IGo method Run(x: int): int; end IGo; "
+        "class Impl : IGo "
+        "  public method Run(): int return 0; end Run; "
+        "  public method Run(x: int): int return x; end Run; "
+        "end Impl;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
