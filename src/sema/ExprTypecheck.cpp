@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "sema/ConstFold.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
@@ -1126,6 +1127,29 @@ Symbol* ExprTC::lookupName(std::string_view name) {
     return nullptr;
 }
 
+void ExprTC::foldLocalConstArraySize(TypeRef* declType) {
+    if (!declType || declType->kind != TypeRef::Kind::InlineArray) return;
+    if (declType->arraySizeValue >= 0) return;  // already folded (literal/member)
+    if (!declType->arraySize) return;
+    // Resolve a bare identifier to an in-scope `const`'s int value. lookupName
+    // walks the lexical scope chain (local consts) and the enclosing type
+    // (member consts); either decl form carries the initializer expression.
+    std::function<std::optional<long long>(std::string_view, int)> resolve =
+        [&](std::string_view name, int d) -> std::optional<long long> {
+        Symbol* s = lookupName(name);
+        if (!s) return std::nullopt;
+        const ast::Expr* val = nullptr;
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
+            val = lc->value.get();
+        else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
+            val = cd->value.get();
+        if (!val) return std::nullopt;
+        return foldIntConst(*val, resolve, d + 1);
+    };
+    if (auto v = foldIntConst(*declType->arraySize, resolve, 0))
+        if (*v >= 0) declType->arraySizeValue = *v;
+}
+
 // §12.7: a single `<simple var> is T` / `is not T` type-test contributes a
 // narrowing to one branch. `x is T` narrows the true branch; `x is not T`
 // narrows the else branch (the spec: in the true branch of `is not T` the
@@ -1657,6 +1681,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // Either may be null (plain `var x;` with no init).
             if (ld->type) {
                 lsym->declType = ctx_.resolvedType(*ld->type);
+                // §15.1 (#734): fold a local-`const` inline-array size now that
+                // the const is in scope (member/module consts were folded at
+                // type resolution; locals were not yet bound there).
+                foldLocalConstArraySize(lsym->declType);
                 // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
                 // type-argument inference. When the initializer is a call to a
                 // generic method whose type parameter appears only in the

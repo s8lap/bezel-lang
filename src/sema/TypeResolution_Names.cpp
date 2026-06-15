@@ -1,5 +1,7 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include "sema/ConstFold.hpp"
+
 namespace bezel::sema {
 
 int Resolver::builtinTypeArity(std::string_view n) {
@@ -557,64 +559,23 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
 
 std::optional<long long> Resolver::foldIntConstExpr(const ast::Expr& e,
                                                     Scope* scope, int depth) {
-    if (depth > 32) return std::nullopt;  // cyclic / runaway const reference
-
-    // Integer literal — the leaf case.
-    if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
-        try {
-            return std::stoll(std::string(il->text));
-        } catch (...) {
-            return std::nullopt;  // out of `long long` range
-        }
-    }
-
-    // Unary `+ - ~` on an int-const. (Source parentheses are not their own AST
-    // node — the tree shape already encodes grouping.)
-    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
-        auto v = foldIntConstExpr(*u->operand, scope, depth + 1);
-        if (!v) return std::nullopt;
-        if (u->op == "-") return -*v;
-        if (u->op == "+") return *v;
-        if (u->op == "~") return ~*v;
-        return std::nullopt;
-    }
-
-    // Arithmetic / bitwise on two int-consts (`[BufferSize * 2]byte`, §15.1).
-    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-        auto l = foldIntConstExpr(*b->left, scope, depth + 1);
-        auto r = foldIntConstExpr(*b->right, scope, depth + 1);
-        if (!l || !r) return std::nullopt;
-        if (b->op == "+") return *l + *r;
-        if (b->op == "-") return *l - *r;
-        if (b->op == "*") return *l * *r;
-        if (b->op == "/") return *r == 0 ? std::nullopt
-                                         : std::optional<long long>(*l / *r);
-        if (b->op == "%") return *r == 0 ? std::nullopt
-                                         : std::optional<long long>(*l % *r);
-        if (b->op == "<<") return *l << *r;
-        if (b->op == ">>") return *l >> *r;
-        if (b->op == "&") return *l & *r;
-        if (b->op == "|") return *l | *r;
-        if (b->op == "^") return *l ^ *r;
-        return std::nullopt;
-    }
-
-    // A bare identifier naming a `const` whose initializer is itself an
-    // int-const expression. Member consts live on the enclosing type (tracked
-    // by currentOuterType_) and its class base chain; module-level consts are
-    // reached through the lexical `scope`. (Local consts are not yet registered
-    // at type-resolution time — see resolveTypesInBody — so a local-const size
-    // is not foldable here and falls through to nullopt.)
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+    // Identifier resolution for the shared folder: a bare name is a `const`
+    // whose initializer is itself an int-const expression. Member consts live
+    // on the enclosing type (tracked by currentOuterType_) and its class base
+    // chain; module/enclosing-scope consts are reached through the lexical
+    // `scope`. (Local consts are not yet registered at type-resolution time —
+    // see resolveTypesInBody — so a local-const size is not foldable here; the
+    // ExprTypecheck pass folds those, where locals are in scope.)
+    std::function<std::optional<long long>(std::string_view, int)> resolve =
+        [&](std::string_view name, int d) -> std::optional<long long> {
         for (TypeSymbol* ts = currentOuterType_; ts;) {
             for (Symbol* m : ts->members)
                 if (auto* cms = dynamic_cast<ConstMemberSymbol*>(m))
-                    if (cms->name == id->name)
+                    if (cms->name == name)
                         if (auto* cd =
                                 dynamic_cast<const ast::ConstDecl*>(cms->decl))
                             if (cd->value)
-                                return foldIntConstExpr(*cd->value, scope,
-                                                        depth + 1);
+                                return foldIntConst(*cd->value, resolve, d + 1);
             TypeSymbol* nb = nullptr;
             for (TypeSymbol* base : ts->baseTypes)
                 if (base && base->kind == ast::TypeDeclKind::Class) {
@@ -623,14 +584,13 @@ std::optional<long long> Resolver::foldIntConstExpr(const ast::Expr& e,
                 }
             ts = nb;
         }
-        if (Symbol* s = lookupName(id->name, scope))
+        if (Symbol* s = lookupName(name, scope))
             if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
                 if (cd->value)
-                    return foldIntConstExpr(*cd->value, scope, depth + 1);
+                    return foldIntConst(*cd->value, resolve, d + 1);
         return std::nullopt;
-    }
-
-    return std::nullopt;
+    };
+    return foldIntConst(e, resolve, depth);
 }
 
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {

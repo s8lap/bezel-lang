@@ -324,6 +324,14 @@ private:
 
     Symbol* lookupName(std::string_view name);
 
+    // §15.1 (issue #734): fold a LOCAL-`const` inline-array size onto its
+    // resolved TypeRef. Member/module consts are folded earlier (type
+    // resolution); a local const is only in scope during this pass, so when a
+    // local declaration's type is `[N]T` with N still unfolded (arraySizeValue
+    // < 0) and N resolves to in-scope local consts, set arraySizeValue so
+    // codegen builds `[N x T]` rather than a flat scalar. No-op otherwise.
+    void foldLocalConstArraySize(TypeRef* declType);
+
     // §12.7: collect the flow-narrowings that an `if`/`elif` condition
     // establishes for one branch. `forTrueBranch` selects the controlled
     // (then) block (`x is T` narrows there; `x is not T` does not) versus the

@@ -113,6 +113,7 @@ add_library(bezel_core STATIC
     src/parser/Parser_Stmts.cpp
     src/parser/Parser_Exprs.cpp
     src/sema/TypeChecker.cpp
+    src/sema/ConstFold.cpp
     src/sema/SymbolCollection.cpp
     src/sema/TypeResolution.cpp
     src/sema/TypeResolution_Names.cpp

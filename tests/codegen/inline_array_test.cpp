@@ -311,3 +311,38 @@ BEZEL_TEST(codegen_inline_array, member_const_array_size_arithmetic_734) {
         "  end Main; "
         "end C;"), 48);
 }
+
+// #734 A1 / §15.1: a LOCAL `const` as an inline-array size, with an initializer
+// list. Member/module consts fold at type resolution; a local const is only in
+// scope during ExprTypecheck, which folds it onto the resolved TypeRef. (Before
+// the fold, `[SZ]int` lowered to a flat scalar → "Invalid indices for GEP".)
+BEZEL_TEST(codegen_inline_array, local_const_array_size_734) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  const SZ: int := 3; "
+        "  var arr: [SZ]int := [10, 20, 30]; "
+        "  return arr[0]; "  // 10
+        "end Main; end C;"), 10);
+}
+
+// #734 A2 / §15.1: a LOCAL `const` size with no initializer — `.Length` is N.
+// (Before the fold this compiled but silently read 0.)
+BEZEL_TEST(codegen_inline_array, local_const_array_size_length_734) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  const SZ: int := 3; "
+        "  var arr: [SZ]int; "
+        "  return arr.Length; "  // 3
+        "end Main; end C;"), 3);
+}
+
+// #734 / §15.1: arithmetic on a LOCAL const size, with element store + Length.
+BEZEL_TEST(codegen_inline_array, local_const_array_size_arithmetic_734) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  const SZ := 4; "
+        "  var arr: [SZ * 2]int; "
+        "  arr[7] := 9; "
+        "  return arr[7] + arr.Length; "  // 9 + 8 = 17
+        "end Main; end C;"), 17);
+}
