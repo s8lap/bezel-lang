@@ -406,6 +406,19 @@ BEZEL_TEST(linq_gaps, todict_scalar_value_indexed_read_738) {
         "end Main; end C;"), 15);
 }
 
+// #738 / §5 / §14.1: an UN-ANNOTATED ToDictionary key selector `(x) => x` must
+// infer its param type from the source element T (it is a `(T) -> TKey` lambda).
+// Without seeding, the inferred Dictionary<K,V> result got a wrong key type and
+// an indexed read on a `var d := ...` local IR-failed.
+BEZEL_TEST(linq_gaps, todict_unannotated_key_lambda_inferred_local_738) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var arr: Array<int> := [3, 5, 7]; "
+        "  using var d := arr.ToDictionary((x) => x); "  // un-annotated, inferred local
+        "  return d[3] + d[5]; "  // 8
+        "end Main; end C;"), 8);
+}
+
 // #738 / §5: a ToDictionary with a STRUCT value type (record) keeps the boxed
 // encoding — the indexer read derefs the box. (Regression guard for the inline
 // change.)

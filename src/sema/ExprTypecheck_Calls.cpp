@@ -3456,6 +3456,12 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
         m == "Min" || m == "Max" || m == "Sum" ||
         m == "TakeWhile" || m == "SkipWhile" || m == "SelectMany" ||
         m == "Average" ||
+        // stdlib §5 Materialization (#738): ToDictionary's key selector
+        // `(T) -> TKey` is over the same source element T — seed it so an
+        // un-annotated `(x) => x` types its param as T (else the inferred
+        // Dictionary<K,V> result gets a wrong/null key type and an indexed
+        // read mismatches).
+        m == "ToDictionary" ||
         // stdlib §5 Ordering secondary key (this milestone): ThenBy / ThenByDescending
         // take a `(T) -> TKey` lambda over the same source element T. The receiver is
         // IOrderedEnumerable<T> (the lazy sentinel); genericArgs[0] = T.
