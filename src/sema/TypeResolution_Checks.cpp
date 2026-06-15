@@ -1112,6 +1112,14 @@ void Resolver::checkAbstractImplementations() {
         std::unordered_set<std::string_view> ifacePropertyNames;
         // Property names (PropertySymbol) provided by class or base classes.
         std::unordered_set<std::string_view> concretePropertyNames;
+        // R39 / §11.2: also remember the PropertySymbol (and, for interface
+        // members, the declaring interface) so the implementing property's TYPE
+        // can be checked against the interface's — return/property types must
+        // match exactly (no covariance). Keyed by name; first writer wins, so
+        // the most-derived class property (BFS starts at `t`) is kept.
+        std::unordered_map<std::string_view,
+                           std::pair<PropertySymbol*, TypeSymbol*>> ifaceProps;
+        std::unordered_map<std::string_view, PropertySymbol*> concreteProps;
         // BFS the chain.
         std::vector<TypeSymbol*> frontier{t};
         std::unordered_set<TypeSymbol*> seen{t};
@@ -1137,9 +1145,11 @@ void Resolver::checkAbstractImplementations() {
                     if (curIsIface) {
                         // Record the interface's required property name.
                         ifacePropertyNames.insert(ps->name);
+                        ifaceProps.emplace(ps->name, std::make_pair(ps, cur));
                     } else {
                         // A class PropertySymbol satisfies the contract.
                         concretePropertyNames.insert(ps->name);
+                        concreteProps.emplace(ps->name, ps);
                     }
                 }
             }
@@ -1176,6 +1186,43 @@ void Resolver::checkAbstractImplementations() {
                     "` — a field does not satisfy a property contract;"
                     " declare `public property " + std::string(name) +
                     ": T` (§11.2 / §23)");
+            }
+        }
+        // R39 / §11.2 ("Return types must match exactly — no covariance"): a
+        // provided property must have the SAME type the interface declares.
+        // A mismatch installs a getter of the wrong return type into the itable
+        // (e.g. an i32-returning `Name` for an interface `Name: string`); the
+        // caller reads the i32 as a string pointer and dereferences it →
+        // SIGSEGV. Checked only for fully NON-GENERIC conformance: a generic
+        // interface member's type needs type-argument substitution before it
+        // can be compared, which is deferred (so generic conformance is never
+        // false-rejected here).
+        if (t->genericParams.empty()) {
+            auto propType = [&](PropertySymbol* ps) -> const TypeRef* {
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (!pd || !pd->type) return nullptr;
+                return ctx_.resolvedType(*pd->type);
+            };
+            for (auto& [name, info] : ifaceProps) {
+                PropertySymbol* ips = info.first;
+                TypeSymbol* iface = info.second;
+                if (!iface || !iface->genericParams.empty()) continue;
+                auto cit = concreteProps.find(name);
+                if (cit == concreteProps.end()) continue;  // missing → reported above
+                const TypeRef* itype = propType(ips);
+                const TypeRef* ctype = propType(cit->second);
+                if (!itype || !ctype) continue;
+                if (itype->kind == TypeRef::Kind::Error ||
+                    ctype->kind == TypeRef::Kind::Error) continue;
+                if (!typeRefEqual(itype, ctype)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, cit->second->declLoc,
+                        std::string("property `") + std::string(name) +
+                        "` implements interface `" + std::string(iface->name) +
+                        "` with a different type than the interface declares — "
+                        "property types must match exactly (no covariance) "
+                        "(§11.2)");
+                }
             }
         }
     }

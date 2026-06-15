@@ -157,3 +157,44 @@ BEZEL_TEST(sema_field_iface_property_489, inherited_field_does_not_satisfy_deriv
         "end Derived;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// ── §11.2 (R39): a provided property's TYPE must match the interface's ───────
+// "Return types must match exactly (no covariance)." A class that satisfies an
+// interface property NAME but with a different TYPE was silently accepted — the
+// wrong-return-type getter went into the itable and the caller dereferenced a
+// scalar as a pointer (SIGSEGV). It must be a conformance error.
+
+BEZEL_TEST(sema_field_iface_property_489, iface_property_type_mismatch_diagnoses_r39) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IVal readonly property Name: string; end IVal; "
+        "class Impl : IVal "
+        "  public readonly property Name: int => 42; "  // int ≠ string
+        "end Impl;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(r, "match exactly"));
+}
+
+// CONTROL: a matching property type is accepted.
+BEZEL_TEST(sema_field_iface_property_489, iface_property_type_match_ok_r39) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IVal readonly property Name: string; end IVal; "
+        "class Impl : IVal "
+        "  public readonly property Name: string => \"hi\"; "
+        "end Impl;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL: generic-interface conformance is NOT type-checked here (it needs
+// type-argument substitution), so a generic interface implemented with the
+// substituted concrete type must NOT be falsely rejected.
+BEZEL_TEST(sema_field_iface_property_489, generic_iface_property_not_false_rejected_r39) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IBox<T> readonly property Item: T; end IBox; "
+        "class IntBox : IBox<int> "
+        "  public readonly property Item: int => 7; "
+        "end IntBox;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
